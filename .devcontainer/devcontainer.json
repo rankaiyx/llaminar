@@ -1,0 +1,61 @@
+{
+    "name": "Llaminar CMake Development",
+    "dockerFile": "Dockerfile",
+    "features": {
+        "ghcr.io/devcontainers/features/git:1": {},
+        "ghcr.io/devcontainers/features/github-cli:1": {},
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "20"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-extension-pack",
+                "ms-vscode.cmake-tools",
+                "twxs.cmake",
+                "ms-vscode.cpptools-themes",
+                "ms-python.python",
+                "ms-python.pylint",
+                "ms-python.debugpy",
+                "GitHub.copilot",
+                "GitHub.copilot-chat",
+                "redhat.vscode-yaml",
+                "ms-vscode.vscode-json",
+                "bradlc.vscode-tailwindcss",
+                "esbenp.prettier-vscode"
+            ],
+            "settings": {
+                "cmake.configureOnOpen": true,
+                "cmake.buildBeforeRun": true,
+                "cmake.clearOutputBeforeBuild": true,
+                "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+                "C_Cpp.default.cStandard": "c17",
+                "C_Cpp.default.cppStandard": "c++20",
+                "C_Cpp.default.compilerPath": "/usr/bin/gcc",
+                "files.associations": {
+                    "*.h": "c",
+                    "*.hpp": "cpp",
+                    "*.cpp": "cpp",
+                    "*.cc": "cpp",
+                    "*.cxx": "cpp",
+                    "CMakeLists.txt": "cmake",
+                    "*.cmake": "cmake"
+                },
+                "terminal.integrated.defaultProfile.linux": "bash"
+            }
+        }
+    },
+    "forwardPorts": [
+        8080,
+        3000,
+        5000
+    ],
+    "postCreateCommand": "sudo chown -R vscode:vscode /workspace && cmake --version && gcc --version",
+    "remoteUser": "vscode",
+    "mounts": [
+        "source=${localWorkspaceFolder}/.vscode,target=/workspace/.vscode,type=bind,consistency=cached"
+    ],
+    "workspaceFolder": "/workspace"
+}

@@ -1,0 +1,51 @@
+# Build directories
+build/
+install/
+out/
+
+# IDE and editor files
+.vs/
+.vscode/settings.json.backup
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+
+# Compiled binaries
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Debug files
+*.dSYM/
+*.pdb
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Package managers
+node_modules/
+*.tgz
+
+# MPI temporary files
+*.hosts
