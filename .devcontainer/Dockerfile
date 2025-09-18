@@ -51,6 +51,14 @@ RUN apt-get update && apt-get install -y \
     # Node.js for MCP servers (will be installed via features)
     && rm -rf /var/lib/apt/lists/*
 
+# Install CUDA Toolkit
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    apt-get update && \
+    apt-get -y install cuda-toolkit-12-0 cuda-drivers && \
+    rm -f cuda-keyring_1.1-1_all.deb && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install specific CMake version (latest stable)
 RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null && \
     echo 'deb https://apt.kitware.com/ubuntu/ jammy main' | tee /etc/apt/sources.list.d/kitware.list >/dev/null && \
@@ -76,6 +84,11 @@ WORKDIR /workspace
 # Set environment variables for MPI
 ENV OMPI_ALLOW_RUN_AS_ROOT=1
 ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
+# Set CUDA environment variables
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 
 # Set PATH to include user local bin directory
 ENV PATH="/home/vscode/.local/bin:$PATH"
