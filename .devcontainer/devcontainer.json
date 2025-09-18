@@ -55,7 +55,6 @@
     "postCreateCommand": "sudo chown -R vscode:vscode /workspace && cmake --version && gcc --version",
     "remoteUser": "vscode",
     "mounts": [
-        "source=${localWorkspaceFolder}/.vscode,target=/workspace/.vscode,type=bind,consistency=cached"
-    ],
-    "workspaceFolder": "/workspace"
+        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+    ]
 }

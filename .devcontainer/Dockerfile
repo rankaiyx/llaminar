@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     wget \
+    sudo \
     vim \
     nano \
     tree \
@@ -71,21 +72,26 @@ WORKDIR /workspace
 ENV OMPI_ALLOW_RUN_AS_ROOT=1
 ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
+# Set PATH to include user local bin directory
+ENV PATH="/home/vscode/.local/bin:$PATH"
+
 # Install Python packages that might be useful
 RUN pip3 install --user \
     conan \
-    vcpkg \
     numpy \
     matplotlib \
     pytest
 
+# Install vcpkg (C++ package manager) properly
+RUN git clone https://github.com/Microsoft/vcpkg.git ~/vcpkg && \
+    ~/vcpkg/bootstrap-vcpkg.sh && \
+    echo 'export PATH="$HOME/vcpkg:$PATH"' >> ~/.bashrc
+
 # Install uv (fast Python package manager)
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Set up shell environment
-RUN echo 'export PATH=$PATH:~/.local/bin' >> ~/.bashrc && \
-    echo 'alias ll="ls -la"' >> ~/.bashrc && \
+RUN echo 'alias ll="ls -la"' >> ~/.bashrc && \
     echo 'alias la="ls -la"' >> ~/.bashrc && \
     echo 'alias uvx="uv run --with"' >> ~/.bashrc
 
