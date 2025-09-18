@@ -26,6 +26,11 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -mtune=native")
 # Find required packages
 find_package(MPI REQUIRED)
 find_package(OpenMP REQUIRED)
+
+# MPI executable configuration for tests
+if(NOT MPIEXEC)
+    set(MPIEXEC ${MPIEXEC_EXECUTABLE})
+endif()
 find_package(PkgConfig REQUIRED)
 
 # NUMA support (optional)
@@ -126,6 +131,32 @@ install(TARGETS ${PROJECT_NAME}
 
 # Create src directory and example files if they don't exist
 file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
+
+# Enable testing
+enable_testing()
+
+# Add test to check basic MPI functionality
+add_test(
+    NAME mpi_basic_test
+    COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${PROJECT_NAME}> ${MPIEXEC_POSTFLAGS} --test-mode basic
+)
+
+# Add test for NUMA-aware MPI (one process per NUMA node)
+add_test(
+    NAME mpi_numa_test  
+    COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${PROJECT_NAME}> ${MPIEXEC_POSTFLAGS} --test-mode numa
+)
+
+# Set test properties
+set_tests_properties(mpi_basic_test PROPERTIES
+    TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "Hello from Llaminar.*Process [0-1] of 2 processes"
+)
+
+set_tests_properties(mpi_numa_test PROPERTIES
+    TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "NUMA MPI TEST SUCCESS"
+)
 
 # Print configuration summary
 message(STATUS "=== Llaminar Configuration ===")

@@ -276,7 +276,32 @@
                 "clear": false
             },
             "dependsOn": "cmake: build",
-            "detail": "Run MPI application with 2 processes"
+            "detail": "Run MPI application for Llaminar with 2 processes (2 NUMA nodes)"
+        },
+        {
+            "label": "test: run MPI tests",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--verbose",
+                "--test-dir",
+                "${workspaceFolder}/build"
+            ],
+            "group": "test",
+            "dependsOn": "cmake: build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "detail": "Run the MPI functionality tests via CTest"
+        }
+    ],
+    "inputs": [
         },
         {
             "label": "mpi: run (4 processes)",
