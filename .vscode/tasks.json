@@ -89,6 +89,175 @@
             "detail": "Clean and rebuild the CMake project"
         },
         {
+            "label": "cmake: build llama.cpp",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build",
+                "--target",
+                "llama",
+                "--parallel"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "dependsOn": "cmake: configure",
+            "detail": "Build only the llama.cpp library"
+        },
+        {
+            "label": "cmake: build COSMA",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build",
+                "--target",
+                "cosma",
+                "--parallel"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "dependsOn": "cmake: configure",
+            "detail": "Build only the COSMA library"
+        },
+        {
+            "label": "cmake: build Llaminar",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build",
+                "--target",
+                "Llaminar",
+                "--parallel"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "dependsOn": "cmake: configure",
+            "detail": "Build only the Llaminar executable"
+        },
+        {
+            "label": "cmake: configure Release",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-B",
+                "${workspaceFolder}/build",
+                "-S",
+                "${workspaceFolder}",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DCOSMA_WITH_PROFILING=OFF",
+                "-DBUILD_SHARED_LIBS=OFF",
+                "-DCOSMA_SCALAPACK=CUSTOM",
+                "-DCOSMA_SCALAPACK_LINK_LIBRARIES=/usr/lib/x86_64-linux-gnu/libscalapack-openmpi.so"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "detail": "Configure CMake project with optimized Release settings"
+        },
+        {
+            "label": "cmake: build Release",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build",
+                "--config",
+                "Release",
+                "--parallel"
+            ],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "problemMatcher": [],
+            "detail": "Build the CMake project in Release mode",
+            "dependsOn": "cmake: configure Release"
+        },
+        {
+            "label": "test: run ctest",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--parallel"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run all CTest tests with parallel execution"
+        },
+        {
+            "label": "test: run ctest verbose",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--verbose",
+                "--parallel"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run all CTest tests with verbose output"
+        },
+        {
             "label": "mpi: run (2 processes)",
             "type": "shell",
             "command": "mpirun",
@@ -108,6 +277,48 @@
             },
             "dependsOn": "cmake: build",
             "detail": "Run MPI application with 2 processes"
+        },
+        {
+            "label": "mpi: run (4 processes)",
+            "type": "shell",
+            "command": "mpirun",
+            "args": [
+                "-np",
+                "4",
+                "${workspaceFolder}/build/${input:targetName}"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run MPI application with 4 processes"
+        },
+        {
+            "label": "mpi: run Llaminar (2 processes)",
+            "type": "shell",
+            "command": "mpirun",
+            "args": [
+                "-np",
+                "2",
+                "${workspaceFolder}/build/Llaminar"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build Llaminar",
+            "detail": "Run Llaminar with 2 MPI processes"
         }
     ],
     "inputs": [
