@@ -19,6 +19,11 @@ RUN apt-get update && apt-get install -y \
     openmpi-bin \
     openmpi-common \
     libopenmpi-dev \
+    # Linear algebra libraries for COSMA
+    libopenblas-dev \
+    libscalapack-openmpi-dev \
+    # NUMA support
+    libnuma-dev \
     # Additional tools
     git \
     curl \
