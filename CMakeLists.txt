@@ -1,17 +1,10 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.16)
+project(llaminar LANGUAGES C CXX)
 
-# Project configuration
-project(Llaminar 
-    VERSION 1.0.0
-    DESCRIPTION "An LLM inferencing engine using COSMA / Open MPI for hyper-scalability"
-    LANGUAGES CXX C
-)
-
-# Set C++ and C standards
+# Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Build type
@@ -20,142 +13,168 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Compiler flags
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -mtune=native")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+
+# Include directories
+include_directories(${CMAKE_SOURCE_DIR}/src)
 
 # Find required packages
 find_package(MPI REQUIRED)
 find_package(OpenMP REQUIRED)
 
-# MPI executable configuration for tests
-if(NOT MPIEXEC)
-    set(MPIEXEC ${MPIEXEC_EXECUTABLE})
-endif()
-find_package(PkgConfig REQUIRED)
+# Check for NUMA support
+find_path(NUMA_INCLUDE_DIR numa.h)
+find_library(NUMA_LIBRARY numa)
 
-# NUMA support (optional)
-pkg_check_modules(NUMA numa)
-if(NUMA_FOUND)
+if(NUMA_INCLUDE_DIR AND NUMA_LIBRARY)
+    set(NUMA_FOUND TRUE)
     message(STATUS "NUMA support found")
-    add_compile_definitions(HAVE_NUMA=1)
+    add_definitions(-DHAVE_NUMA)
 else()
+    set(NUMA_FOUND FALSE)
     message(STATUS "NUMA support not found - continuing without it")
 endif()
 
-# COSMA configuration
-message(STATUS "Configuring COSMA submodule...")
-set(COSMA_BLAS "auto" CACHE STRING "BLAS backend for COSMA")
-set(COSMA_SCALAPACK "CUSTOM" CACHE STRING "ScaLAPACK backend for COSMA") 
-set(COSMA_WITH_PROFILING OFF CACHE BOOL "Disable COSMA profiling")
-set(COSMA_WITH_TESTS OFF CACHE BOOL "Disable COSMA tests")
-set(COSMA_WITH_INSTALL OFF CACHE BOOL "Disable COSMA install")
+# Check for CUDA support (optional)
+find_package(CUDA QUIET)
+if(CUDA_FOUND)
+    set(ENABLE_CUDA TRUE)
+    message(STATUS "CUDA support found - enabling GPU detection")
+    add_definitions(-DENABLE_CUDA)
+else()
+    set(ENABLE_CUDA FALSE)
+    message(STATUS "CUDA support not found - GPU detection will be limited")
+endif()
 
-# Add COSMA submodule
+# Check for ROCm support (optional)
+find_path(ROCM_INCLUDE_DIR hip/hip_runtime.h PATHS /opt/rocm/include)
+find_library(HIP_LIBRARY hip PATHS /opt/rocm/lib64)
+if(ROCM_INCLUDE_DIR AND HIP_LIBRARY)
+    set(ENABLE_ROCM TRUE)
+    message(STATUS "ROCm support found - enabling AMD GPU detection")
+    add_definitions(-DENABLE_ROCM)
+else()
+    set(ENABLE_ROCM FALSE)
+    message(STATUS "ROCm support not found - AMD GPU detection disabled")
+endif()
+
+# Configure COSMA submodule
+message(STATUS "Configuring COSMA submodule...")
+set(COSMA_BLAS "CUSTOM" CACHE STRING "BLAS backend for COSMA")
+set(COSMA_SCALAPACK "CUSTOM" CACHE STRING "ScaLAPACK backend for COSMA")
+set(COSMA_WITH_TESTS OFF CACHE BOOL "Build COSMA tests")
+set(COSMA_WITH_APPS OFF CACHE BOOL "Build COSMA applications")
+set(COSMA_WITH_BENCHMARKS OFF CACHE BOOL "Build COSMA benchmarks")
+set(COSMA_WITH_INSTALL OFF CACHE BOOL "Install COSMA")
+set(COSMA_WITH_PROFILING OFF CACHE BOOL "Enable COSMA profiling")
 add_subdirectory(COSMA)
 
-# llama.cpp configuration
+# Configure llama.cpp submodule
 message(STATUS "Configuring llama.cpp submodule...")
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries")
-set(GGML_STATIC ON CACHE BOOL "Build ggml as static library")
-set(GGML_OPENMP ON CACHE BOOL "Enable OpenMP in ggml")
-set(GGML_MPI ON CACHE BOOL "Enable MPI in ggml")
-set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Disable llama.cpp examples")
-set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Disable llama.cpp tests")
-set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Disable llama.cpp server")
-
-# Add llama.cpp submodule
+set(GGML_STATIC ON CACHE BOOL "Build GGML static library")
+set(GGML_OPENMP ON CACHE BOOL "Enable OpenMP in GGML")
+set(GGML_MPI ON CACHE BOOL "Enable MPI in GGML")
+set(GGML_CUDA OFF CACHE BOOL "Disable CUDA in GGML")
+set(GGML_VULKAN OFF CACHE BOOL "Disable Vulkan in GGML")
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries")
+set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Build llama.cpp tests")
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Build llama.cpp examples")
 add_subdirectory(llama.cpp)
 
-# Include directories
-include_directories(${MPI_INCLUDE_PATH})
-include_directories(src)
-include_directories(COSMA/src)
-include_directories(llama.cpp)
-include_directories(llama.cpp/ggml/include)
-include_directories(llama.cpp/include)
-
-# Source files
-set(SOURCES
-    src/main.cpp
-    # Future source files:
-    # src/qwen_inference_engine.cpp
-    # src/numa_deployment.cpp  
-    # src/custom_kernel_scheduler.cpp
-    # src/cosma_backend.cpp
+# Source files for the core library
+set(LLAMINAR_CORE_SOURCES
+    src/common.cpp
+    src/argument_parser.cpp
+    src/topology_manager.cpp
+    src/graph_compute.cpp
+    src/kernel_manager.cpp
+    src/kernels/mul_mat.cpp
+    src/model_loader.cpp
+    src/repacker.cpp
 )
 
-# Create executable
-add_executable(${PROJECT_NAME} ${SOURCES})
+# Create the core library
+add_library(llaminar_core STATIC ${LLAMINAR_CORE_SOURCES})
 
-# Link libraries
-target_link_libraries(${PROJECT_NAME} 
-    PRIVATE 
-        ${MPI_LIBRARIES}
-        OpenMP::OpenMP_CXX
-        cosma
-        cosma_prefixed_pxgemm
-        ggml
-        llama
-)# Add NUMA if available
+# Link libraries to core
+target_link_libraries(llaminar_core
+    PUBLIC
+    MPI::MPI_CXX
+    OpenMP::OpenMP_CXX
+    cosma
+    ggml
+)
+
+# Add NUMA if available
 if(NUMA_FOUND)
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${NUMA_LIBRARIES})
-    target_include_directories(${PROJECT_NAME} PRIVATE ${NUMA_INCLUDE_DIRS})
+    target_include_directories(llaminar_core PRIVATE ${NUMA_INCLUDE_DIR})
+    target_link_libraries(llaminar_core PRIVATE ${NUMA_LIBRARY})
 endif()
 
-# Compile definitions
-target_compile_definitions(${PROJECT_NAME} 
-    PRIVATE
-        COSMA_HAVE_PROFILING=1
-        $<$<BOOL:${NUMA_FOUND}>:NUMA_AWARE_ALLOCATION=1>
+# Add CUDA if available
+if(ENABLE_CUDA)
+    target_include_directories(llaminar_core PRIVATE ${CUDA_INCLUDE_DIRS})
+    target_link_libraries(llaminar_core PRIVATE ${CUDA_LIBRARIES} ${CUDA_NVML_LIBRARY})
+endif()
+
+# Add ROCm if available
+if(ENABLE_ROCM)
+    target_include_directories(llaminar_core PRIVATE ${ROCM_INCLUDE_DIR})
+    target_link_libraries(llaminar_core PRIVATE ${HIP_LIBRARY})
+endif()
+
+# Set compile features
+target_compile_features(llaminar_core PUBLIC cxx_std_17)
+
+# Include directories for core library
+target_include_directories(llaminar_core PUBLIC
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/COSMA/src
+    ${CMAKE_SOURCE_DIR}/llama.cpp/include
+    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
 )
 
-# MPI compile flags
-if(MPI_COMPILE_FLAGS)
-    set_target_properties(${PROJECT_NAME} PROPERTIES
-        COMPILE_FLAGS "${MPI_COMPILE_FLAGS}")
-endif()
-
-# MPI link flags
-if(MPI_LINK_FLAGS)
-    set_target_properties(${PROJECT_NAME} PROPERTIES
-        LINK_FLAGS "${MPI_LINK_FLAGS}")
-endif()
-
-# Enable compile commands for IDE support
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Install target
-install(TARGETS ${PROJECT_NAME}
-    RUNTIME DESTINATION bin
-)
-
-# Create src directory and example files if they don't exist
-file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
+# Main executable
+add_executable(llaminar src/main.cpp)
+target_link_libraries(llaminar llaminar_core)
 
 # Enable testing
 enable_testing()
 
-# Add test to check basic MPI functionality
-add_test(
-    NAME mpi_basic_test
-    COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${PROJECT_NAME}> ${MPIEXEC_POSTFLAGS} --test-mode basic
+# Test sources and executables
+add_executable(test_basic tests/test_basic.cpp)
+target_link_libraries(test_basic llaminar_core)
+add_test(NAME BasicTest COMMAND test_basic)
+
+add_executable(test_numa tests/test_numa.cpp)
+target_link_libraries(test_numa llaminar_core)
+add_test(NAME NumaTest COMMAND test_numa)
+
+add_executable(test_cosma tests/test_cosma.cpp)
+target_link_libraries(test_cosma llaminar_core)
+add_test(NAME CosmaTest COMMAND test_cosma)
+
+add_executable(test_graph tests/test_graph.cpp)
+target_link_libraries(test_graph llaminar_core)
+add_test(NAME GraphTest COMMAND test_graph)
+
+# Set output directories
+set_target_properties(llaminar
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
-# Add test for NUMA-aware MPI (one process per NUMA node)
-add_test(
-    NAME mpi_numa_test  
-    COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${PROJECT_NAME}> ${MPIEXEC_POSTFLAGS} --test-mode numa
+set_target_properties(test_basic test_numa test_cosma test_graph
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
 
-# Set test properties
-set_tests_properties(mpi_basic_test PROPERTIES
-    TIMEOUT 30
-    PASS_REGULAR_EXPRESSION "Hello from Llaminar.*Process [0-1] of 2 processes"
-)
-
-set_tests_properties(mpi_numa_test PROPERTIES
-    TIMEOUT 30
-    PASS_REGULAR_EXPRESSION "NUMA MPI TEST SUCCESS"
+# Custom test target to run all tests
+add_custom_target(run_tests
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS test_basic test_numa test_cosma test_graph
+    COMMENT "Running all tests"
 )
 
 # Print configuration summary

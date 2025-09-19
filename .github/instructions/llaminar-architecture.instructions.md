@@ -1,0 +1,367 @@
+# Llaminar LLM Inference Engine - Architecture Documentation
+
+*Last Updated: September 19, 2025*
+
+## Overview
+
+Llaminar is a high-performance, distributed LLM inference engine built on a modular object-oriented architecture. It combines COSMA's high-performance matrix multiplication with GGUF model support, MPI distributed computing, and comprehensive system topology detection to create a scalable inference platform.
+
+## Core Design Principles
+
+1. **Modular Architecture**: Each component has a single responsibility and clear interfaces
+2. **Distributed Computing**: Built-in MPI support for multi-node inference
+3. **High Performance**: COSMA integration for optimized matrix operations
+4. **System Awareness**: Comprehensive CPU, NUMA, and GPU topology detection
+5. **Extensibility**: Plugin-based kernel registration system
+6. **Observability**: Multi-level logging and performance profiling
+
+## Architecture Components
+
+### 1. Entry Point & Orchestration
+
+**File**: `src/main.cpp` (219 lines)
+- **Purpose**: Application entry point and execution orchestration
+- **Key Features**:
+  - MPI initialization with thread support
+  - 7-stage execution pipeline
+  - Exception handling and graceful shutdown
+  - Performance measurement and reporting
+
+**Execution Pipeline**:
+1. Command line argument parsing
+2. Logging system initialization  
+3. System topology detection
+4. Kernel manager initialization
+5. Model loading (if specified)
+6. Compute graph execution
+7. Performance reporting and cleanup
+
+### 2. Command Line Interface
+
+**Files**: `src/argument_parser.h/cpp`
+- **Class**: `ArgumentParser`
+- **Structure**: `LlaminarParams`
+- **Features**:
+  - POSIX-style argument parsing (`-v`, `--verbose`, etc.)
+  - Multi-level verbosity (`-v`, `-vv`, `-vvv`)
+  - Model file specification (`-m`, `--model`)
+  - System configuration flags
+  - Legacy COSMA parameters
+  - Comprehensive help and version information
+
+**Supported Arguments**:
+```bash
+# Model and Logging
+-m, --model <file>     # GGUF model file path
+-v/-vv/-vvv           # Verbosity levels (INFO/DEBUG/TRACE)
+
+# System Configuration  
+--print-topology      # Display system topology
+--enable-hyperthreading # Use HT cores
+--detect-gpus         # Enable GPU detection
+
+# Performance
+--profile             # Enable kernel profiling
+--validate            # Enable result validation
+--matrix-size <size>  # Matrix dimensions for benchmarks
+--repeat <num>        # Benchmark iterations
+```
+
+### 3. Logging System
+
+**Files**: `src/logger.h`, `src/log_level.h`
+- **Pattern**: Header-only singleton with macros
+- **Levels**: ERROR(0), WARN(1), INFO(2), DEBUG(3), TRACE(4)
+- **Features**:
+  - Timestamped output with millisecond precision
+  - File and line number tracking
+  - Environment variable configuration
+  - Thread-safe singleton pattern
+  - Convenient macros (`LOG_INFO`, `LOG_DEBUG`, etc.)
+
+**Usage Example**:
+```cpp
+LOG_INFO("Model loaded successfully");
+LOG_DEBUG("Processing iteration " << i << "/" << total);
+LOG_ERROR("Failed to load model: " << filename);
+```
+
+### 4. System Topology Detection
+
+**Files**: `src/topology_manager.h/cpp`, `src/common.h/cpp`
+- **Classes**: `TopologyManager`, `CPUTopology`, `SystemTopology`
+- **Features**:
+  - CPU architecture detection (sockets, cores, hyperthreading)
+  - NUMA topology mapping
+  - GPU device enumeration (CUDA/ROCm support planned)
+  - Memory capacity reporting
+  - MPI environment information
+
+**Detection Capabilities**:
+- **CPU**: Socket count, cores per socket, hyperthreading status
+- **NUMA**: Node count, CPU affinity, memory distribution  
+- **Memory**: Total and per-NUMA-node capacity
+- **GPU**: Device enumeration (framework-agnostic detection)
+- **MPI**: Rank, size, process distribution
+
+**Example Output**:
+```
+=== CPU Topology ===
+Total CPUs: 112, Physical cores: 56, Sockets: 2
+Hyperthreading: Yes, Using: No
+
+=== NUMA Topology ===  
+Node 0: 56 CPUs, 376 GB memory
+Node 1: 56 CPUs, 377 GB memory
+```
+
+### 5. Kernel Management System
+
+**Files**: `src/kernel_manager.h/cpp`
+- **Pattern**: Singleton with factory registration
+- **Class**: `KernelManager`
+- **Features**:
+  - Automatic kernel discovery and registration
+  - Runtime kernel selection and execution
+  - Performance profiling and optimization
+  - Plugin-based extensibility
+
+**Kernel Interface**:
+```cpp
+class BaseKernel {
+public:
+    virtual std::string getName() const = 0;
+    virtual bool execute() = 0;
+    virtual ~BaseKernel() = default;
+};
+```
+
+**Registration System**:
+- Kernels self-register using static initialization
+- Factory pattern for kernel instantiation
+- Support for parameterized kernel creation
+
+### 6. Compute Graph Engine
+
+**Files**: `src/graph_compute.h/cpp`
+- **Classes**: `ComputeNode`, `MatMulNode`, `ComputeGraph`
+- **Pattern**: Composite pattern with execution engine
+- **Features**:
+  - Node-based computation representation
+  - Dependency tracking and scheduling
+  - Operator overloading for graph construction
+  - Performance measurement per node
+
+**Node Hierarchy**:
+```cpp
+ComputeNode (abstract base)
+├── MatMulNode (matrix multiplication)
+└── [Future nodes: TransformerBlock, Attention, etc.]
+```
+
+**Usage Pattern**:
+```cpp
+auto graph = ComputeGraph();
+auto matmul = std::make_shared<MatMulNode>("benchmark", m, n, k);
+graph.addNode(matmul);
+graph.execute();
+```
+
+### 7. Matrix Operations
+
+**Files**: `src/kernels/mul_mat.h/cpp`
+- **Class**: `MatMulKernel`
+- **Integration**: COSMA library wrapper
+- **Features**:
+  - High-performance distributed matrix multiplication
+  - Automatic COSMA configuration
+  - MPI-aware execution
+  - Performance monitoring
+
+**COSMA Integration**:
+- Leverages COSMA's optimized PDGEMM implementation
+- Automatic memory layout optimization
+- Distributed execution across MPI ranks
+- ScaLAPACK compatibility layer
+
+### 8. Model Loading System
+
+**Files**: `src/model_loader.h/cpp`
+- **Class**: `ModelLoader`
+- **Format**: GGUF (GPT-Generated Unified Format)
+- **Features**:
+  - GGUF file parsing and validation
+  - Metadata extraction (architecture, parameters)
+  - Tensor loading with format conversion
+  - Quantization support (Q8_0 implemented)
+
+**GGUF Support**:
+- **Architectures**: Qwen2.5, LLaMA family support
+- **Quantization**: Q8_0, F16, F32 (extensible)
+- **Metadata**: Model parameters, tokenizer info, training details
+- **Validation**: Magic number verification, version compatibility
+
+### 9. Data Format Conversion
+
+**Files**: `src/repacker.h/cpp`
+- **Class**: `Repacker`
+- **Purpose**: Convert between GGUF and COSMA tensor formats
+- **Features**:
+  - Memory layout transformation
+  - Type conversion (F16 ↔ F32, quantized formats)
+  - Efficient memory management
+  - Distributed data placement
+
+### 10. Build System & Dependencies
+
+**File**: `CMakeLists.txt`
+- **Pattern**: Modern CMake with submodules
+- **Library Structure**: Core library + executables
+- **Dependencies**:
+  - **COSMA**: High-performance matrix operations
+  - **GGML/LLaMA.cpp**: Model format support and inference kernels
+  - **MPI**: Distributed computing (OpenMPI)
+  - **OpenMP**: Shared-memory parallelism
+  - **NUMA**: Memory affinity management
+  - **CUDA/ROCm**: GPU acceleration (optional)
+
+**Build Targets**:
+```bash
+llaminar_core    # Core library with all components
+llaminar         # Main executable
+test_*          # Unit test executables
+```
+
+## Data Flow Architecture
+
+### Inference Pipeline (Planned)
+
+1. **Model Loading**: GGUF → Parsed tensors → Distributed placement
+2. **Input Processing**: Tokenization → Embeddings → Attention preparation  
+3. **Forward Pass**: Transformer blocks → Matrix operations → Activations
+4. **Output Generation**: Logits → Sampling → Token generation
+5. **Result Collection**: Distributed gather → Response formatting
+
+### Current State (Matrix Benchmarking)
+
+1. **Initialization**: MPI setup → Topology detection → Kernel registration
+2. **Graph Construction**: MatMul nodes → Dependency resolution
+3. **Execution**: COSMA operations → Performance measurement
+4. **Reporting**: Timing collection → GFLOPS calculation
+
+## Performance Characteristics
+
+### Scalability
+- **MPI Distributed**: Multi-node execution with process-based parallelism
+- **NUMA Aware**: Memory locality optimization for large systems
+- **Thread Parallel**: OpenMP integration for shared-memory scaling
+
+### Memory Management
+- **Distributed Tensors**: Automatic sharding across MPI ranks
+- **Format Optimization**: COSMA layout for optimal cache utilization
+- **Quantization**: Reduced precision for memory efficiency
+
+### Compute Optimization
+- **COSMA Integration**: State-of-the-art matrix multiplication algorithms
+- **Kernel Registration**: Pluggable optimization for different operations
+- **Topology Awareness**: Hardware-specific optimizations
+
+## Testing Infrastructure
+
+**Directory**: `tests/`
+- **test_basic.cpp**: MPI initialization and basic functionality
+- **test_numa.cpp**: NUMA topology detection and affinity
+- **test_cosma.cpp**: Matrix multiplication and COSMA integration
+- **test_graph.cpp**: Compute graph construction and execution
+
+**Test Coverage**:
+- Component initialization and configuration
+- MPI communication and coordination
+- System topology detection accuracy
+- Matrix operation correctness and performance
+
+## Development Patterns
+
+### Error Handling
+- Exception-based error propagation
+- MPI-aware error coordination
+- Graceful degradation for optional features
+- Comprehensive logging for debugging
+
+### Memory Management
+- RAII patterns for resource management
+- Smart pointers for automatic cleanup
+- MPI memory coordination
+- NUMA-aware allocation strategies
+
+### Extensibility Points
+- **Kernel Registration**: Add new operations via inheritance
+- **Model Formats**: Extend ModelLoader for new formats
+- **Topology Detection**: Platform-specific detection modules
+- **Communication**: Custom MPI communication patterns
+
+## Configuration & Environment
+
+### Environment Variables
+```bash
+LLAMINAR_LOG_LEVEL    # Override default log level
+MPI_THREAD_MULTIPLE   # Enable MPI threading support
+OMP_NUM_THREADS       # Control OpenMP parallelism
+CUDA_VISIBLE_DEVICES  # GPU device selection
+```
+
+### CMake Configuration
+```bash
+-DCMAKE_BUILD_TYPE=Debug|Release
+-DENABLE_CUDA=ON|OFF
+-DENABLE_ROCM=ON|OFF
+-DCOSMA_SCALAPACK_LINK_LIBRARIES=<path>
+```
+
+## Future Architecture Enhancements
+
+### Planned Components
+1. **Attention Kernels**: Multi-head attention implementation
+2. **Transformer Blocks**: Complete layer implementations
+3. **Memory Manager**: Advanced tensor memory management
+4. **Communication Layer**: Optimized MPI communication patterns
+5. **Inference Engine**: Complete LLM inference pipeline
+6. **Model Zoo**: Pre-trained model repository integration
+
+### Performance Optimizations
+1. **GPU Acceleration**: CUDA/ROCm kernel implementations
+2. **Mixed Precision**: FP16/BF16 computation paths
+3. **Pipeline Parallelism**: Layer-wise distribution
+4. **Tensor Parallelism**: Within-layer distribution
+5. **Memory Optimization**: KV-cache management
+
+### Scalability Improvements
+1. **Dynamic Load Balancing**: Adaptive work distribution
+2. **Hierarchical Communication**: Optimized MPI topologies
+3. **Asynchronous Execution**: Overlapped computation/communication
+4. **Elastic Scaling**: Runtime process addition/removal
+
+## Usage Examples
+
+### Basic Matrix Benchmarking
+```bash
+# Single node execution
+./build/llaminar -v --print-topology
+
+# Multi-node MPI execution  
+mpirun -np 4 ./build/llaminar -vv --matrix-size 2048
+
+# GPU detection and profiling
+./build/llaminar --detect-gpus --profile --trace
+```
+
+### Model Inference (Planned)
+```bash
+# Load and run inference
+./build/llaminar -m models/qwen2.5-7b.gguf -v
+
+# Distributed inference
+mpirun -np 8 ./build/llaminar -m models/llama3.1-70b.gguf --profile
+```
+
+This architecture provides a solid foundation for high-performance, distributed LLM inference while maintaining modularity, extensibility, and observability throughout the system.

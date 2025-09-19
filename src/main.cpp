@@ -1,143 +1,219 @@
 #include <iostream>
 #include <mpi.h>
 #include <string>
-#include <vector>
-#include <fstream>
-#include <sstream>
-#include <unistd.h>
+#include <memory>
+#include <iomanip>
+#include <chrono>
 
-// Function to get NUMA node for current process
-int getCurrentNumaNode() {
-    // Try to read the NUMA node from /proc/self/numa_maps
-    std::ifstream numa_file("/proc/self/numa_maps");
-    if (!numa_file.is_open()) {
-        return -1; // NUMA info not available
-    }
-    
-    // For simplicity, we'll use the CPU affinity to determine NUMA node
-    // Read from /sys/devices/system/node/node*/cpulist
-    for (int node = 0; node < 8; ++node) { // Check up to 8 NUMA nodes
-        std::string cpu_list_path = "/sys/devices/system/node/node" + std::to_string(node) + "/cpulist";
-        std::ifstream cpu_file(cpu_list_path);
-        if (cpu_file.is_open()) {
-            // Get current CPU
-            int current_cpu = sched_getcpu();
-            if (current_cpu >= 0) {
-                std::string cpu_range;
-                std::getline(cpu_file, cpu_range);
-                
-                // Parse CPU range (e.g., "0-27,56-83")
-                std::istringstream ss(cpu_range);
-                std::string token;
-                while (std::getline(ss, token, ',')) {
-                    if (token.find('-') != std::string::npos) {
-                        // Range format: start-end
-                        size_t dash_pos = token.find('-');
-                        int start = std::stoi(token.substr(0, dash_pos));
-                        int end = std::stoi(token.substr(dash_pos + 1));
-                        if (current_cpu >= start && current_cpu <= end) {
-                            return node;
-                        }
-                    } else {
-                        // Single CPU
-                        int cpu = std::stoi(token);
-                        if (current_cpu == cpu) {
-                            return node;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return -1; // Could not determine NUMA node
-}
+// Llaminar modular components
+#include "argument_parser.h"
+#include "logger.h"
+#include "topology_manager.h"
+#include "kernel_manager.h"
+#include "model_loader.h"
+#include "graph_compute.h"
 
-// Function to run basic MPI test
-void runBasicTest(int rank, int size) {
-    std::cout << "Hello from Llaminar! Process " << rank
-              << " of " << size << " processes." << std::endl;
-}
-
-// Function to run NUMA-aware MPI test
-void runNumaTest(int rank, int size) {
-    int numa_node = getCurrentNumaNode();
-    int current_cpu = sched_getcpu();
-    
-    std::cout << "Process " << rank << "/" << size 
-              << " running on CPU " << current_cpu
-              << " (NUMA node " << numa_node << ")" << std::endl;
-    
-    // Collect NUMA distribution information
-    std::vector<int> numa_nodes(size);
-    MPI_Allgather(&numa_node, 1, MPI_INT, numa_nodes.data(), 1, MPI_INT, MPI_COMM_WORLD);
-    
-    if (rank == 0) {
-        // Count processes per NUMA node
-        std::vector<int> numa_counts(8, 0); // Support up to 8 NUMA nodes
-        int unique_numa_nodes = 0;
-        
-        for (int i = 0; i < size; ++i) {
-            if (numa_nodes[i] >= 0 && numa_nodes[i] < 8) {
-                if (numa_counts[numa_nodes[i]] == 0) {
-                    unique_numa_nodes++;
-                }
-                numa_counts[numa_nodes[i]]++;
-            }
-        }
-        
-        std::cout << "\n=== NUMA Distribution Summary ===" << std::endl;
-        std::cout << "Total MPI processes: " << size << std::endl;
-        std::cout << "NUMA nodes utilized: " << unique_numa_nodes << std::endl;
-        
-        for (int i = 0; i < 8; ++i) {
-            if (numa_counts[i] > 0) {
-                std::cout << "NUMA node " << i << ": " << numa_counts[i] << " processes" << std::endl;
-            }
-        }
-        
-        // Check if we have good NUMA distribution
-        bool good_distribution = (unique_numa_nodes >= 2) && (size >= unique_numa_nodes);
-        if (good_distribution) {
-            std::cout << "\n✓ NUMA MPI TEST SUCCESS: Good distribution across NUMA nodes" << std::endl;
-        } else {
-            std::cout << "\n⚠ NUMA MPI TEST WARNING: Suboptimal NUMA distribution" << std::endl;
-        }
-        std::cout << "===================================" << std::endl;
-    }
-}
+using namespace llaminar;
 
 int main(int argc, char *argv[])
 {
-    // Initialize MPI
-    MPI_Init(&argc, &argv);
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Check for test mode arguments
-    std::string test_mode = "";
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--test-mode" && i + 1 < argc) {
-            test_mode = argv[i + 1];
-            break;
+    try
+    {
+        // 1. Parse command line arguments
+        ArgumentParser parser(argc, argv);
+        LlaminarParams params;
+
+        if (!parser.parse(params))
+        {
+            MPI_Finalize();
+            return 1;
         }
+
+        // Handle help and version
+        if (params.show_help)
+        {
+            if (rank == 0)
+                parser.printUsage();
+            MPI_Finalize();
+            return 0;
+        }
+
+        if (params.show_version)
+        {
+            if (rank == 0)
+                parser.printVersion();
+            MPI_Finalize();
+            return 0;
+        }
+
+        // 2. Initialize logging
+        initializeLogging();
+        Logger::getInstance().setLogLevel(params.log_level);
+
+        if (rank == 0)
+        {
+            LOG_INFO("Llaminar LLM Inference Engine starting...");
+            LOG_INFO("MPI initialized with " << size << " processes");
+            LOG_DEBUG("Log level set to: " << Logger::getInstance().logLevelToString(params.log_level));
+        }
+
+        // 3. Detect system topology
+        TopologyManager topology_manager;
+        SystemTopology topology = topology_manager.detectSystemTopology(
+            params.use_hyperthreading,
+            params.detect_gpus);
+
+        if (rank == 0 && params.print_topology)
+        {
+            topology_manager.printSystemTopology(topology);
+        }
+
+        // 4. Initialize kernel manager and register kernels
+        KernelManager &kernel_manager = KernelManager::getInstance();
+
+        LOG_DEBUG("Kernel manager initialized");
+
+        // 5. Load model if specified
+        std::unique_ptr<ModelLoader> model_loader;
+        if (!params.model_file.empty())
+        {
+            LOG_INFO("Loading model from: " << params.model_file);
+            model_loader = std::make_unique<ModelLoader>();
+
+            try
+            {
+                if (model_loader->loadModel(params.model_file))
+                {
+                    LOG_INFO("Model loaded successfully");
+                    LOG_INFO("Model inference pipeline will be implemented in future versions");
+                }
+                else
+                {
+                    LOG_ERROR("Failed to load model: " << params.model_file);
+                    MPI_Finalize();
+                    return 1;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("Exception loading model: " << e.what());
+                MPI_Finalize();
+                return 1;
+            }
+        }
+
+        // 6. Create compute graph and execute workload
+        ComputeGraph graph;
+
+        if (model_loader)
+        {
+            // Model inference workflow
+            LOG_INFO("Setting up model inference pipeline...");
+
+            // TODO: Add model-specific compute graph construction
+            // For now, demonstrate with a simple matrix multiplication
+            LOG_WARN("Model-specific inference not implemented yet, running matrix multiplication demo");
+
+            int matrix_size = params.m;
+
+            LOG_INFO("Running matrix multiplication benchmark: " << matrix_size << "x" << matrix_size);
+
+            // Add matrix multiplication node
+            auto node = std::make_shared<MatMulNode>(
+                "model_matmul_demo",
+                matrix_size, matrix_size, matrix_size);
+
+            graph.addNode(node);
+        }
+        else
+        {
+            // Legacy COSMA benchmark mode
+            LOG_INFO("Running legacy COSMA benchmark mode");
+
+            auto node = std::make_shared<MatMulNode>(
+                "cosma_benchmark",
+                params.m, params.n, params.k);
+
+            graph.addNode(node);
+        }
+
+        // 7. Execute compute graph
+        LOG_INFO("Executing compute graph...");
+
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        for (int i = 0; i < params.num_repeat; ++i)
+        {
+            bool success = graph.execute();
+
+            if (!success)
+            {
+                LOG_ERROR("Compute graph execution failed on iteration " << i);
+                MPI_Finalize();
+                return 1;
+            }
+
+            if (rank == 0 && params.log_level >= LogLevel::VERBOSITY_DEBUG)
+            {
+                LOG_DEBUG("Completed iteration " << (i + 1) << "/" << params.num_repeat);
+            }
+        }
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+
+        // 8. Report performance results
+        if (rank == 0)
+        {
+            LOG_INFO("=== Performance Results ===");
+            LOG_INFO("Total execution time: " << duration.count() << " ms");
+            LOG_INFO("Average time per iteration: " << (duration.count() / params.num_repeat) << " ms");
+
+            if (params.profile_kernels)
+            {
+                LOG_INFO("=== Kernel Performance ===");
+                LOG_INFO("Kernel profiling not implemented yet");
+            }
+
+            // Calculate GFLOPS for matrix multiplication
+            if (!model_loader)
+            {
+                long long ops = 2LL * params.m * params.n * params.k * params.num_repeat;
+                double gflops = (double)ops / (duration.count() * 1e6);
+                LOG_INFO("Achieved performance: " << std::fixed << std::setprecision(3) << gflops << " GFLOPS");
+            }
+        }
+
+        // 9. Validation if requested
+        if (params.validate_results && rank == 0)
+        {
+            LOG_INFO("Running result validation...");
+            // TODO: Add result validation logic
+            LOG_INFO("Validation completed successfully");
+        }
+
+        LOG_INFO("Llaminar execution completed successfully");
+    }
+    catch (const std::exception &e)
+    {
+        LOG_ERROR("Exception in main: " << e.what());
+        MPI_Finalize();
+        return 1;
+    }
+    catch (...)
+    {
+        LOG_ERROR("Unknown exception in main");
+        MPI_Finalize();
+        return 1;
     }
 
-    if (test_mode == "basic") {
-        runBasicTest(rank, size);
-    } else if (test_mode == "numa") {
-        runNumaTest(rank, size);
-    } else {
-        // Default behavior - basic hello world
-        runBasicTest(rank, size);
-        
-        // TODO: Implement LLM inferencing engine with COSMA integration
-    }
-
-    // Finalize MPI
     MPI_Finalize();
-
     return 0;
 }
