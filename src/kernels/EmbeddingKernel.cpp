@@ -1,14 +1,14 @@
 #include "EmbeddingKernel.h"
-#include "graph_compute.h" // For Tensor definition
-#include "logger.h"
-#include <chrono>
+#include "../logger.h"
+#include <algorithm>
 
 namespace llaminar
 {
 
-    EmbeddingKernel::EmbeddingKernel()
+    EmbeddingKernel::EmbeddingKernel(size_t vocab_size, size_t embedding_dim)
+        : vocab_size_(vocab_size), embedding_dim_(embedding_dim)
     {
-        LOG_DEBUG("EmbeddingKernel initialized");
+        LOG_DEBUG("EmbeddingKernel initialized with vocab_size=" << vocab_size << ", embedding_dim=" << embedding_dim);
     }
 
     bool EmbeddingKernel::execute(const std::vector<std::shared_ptr<Tensor>> &inputs,
@@ -16,110 +16,89 @@ namespace llaminar
     {
         if (!validate(inputs, outputs))
         {
+            LOG_ERROR("EmbeddingKernel validation failed");
             return false;
         }
 
-        auto start = std::chrono::high_resolution_clock::now();
+        auto token_ids_tensor = inputs[0];
+        auto embedding_table = inputs[1];
+        auto output = outputs[0];
 
-        // For embedding, we need token IDs as input (stored as float but used as int)
-        auto token_tensor = inputs[0];    // [seq_len] - token IDs
-        auto embedding_table = inputs[1]; // [vocab_size, hidden_size]
-        auto output = outputs[0];         // [seq_len, hidden_size]
+        // Extract token IDs
+        std::vector<int> token_ids(token_ids_tensor->shape[0]);
+        std::copy(token_ids_tensor->data.begin(), token_ids_tensor->data.end(), token_ids.begin());
 
-        int seq_len = token_tensor->shape[0];
-        int vocab_size = embedding_table->shape[0];
-        int hidden_size = embedding_table->shape[1];
+        // Perform embedding lookup
+        computeEmbedding(token_ids.data(), embedding_table->data.data(),
+                         output->data.data(), token_ids.size(), embedding_dim_);
 
-        // Convert float token data to int IDs
-        std::vector<int> token_ids(seq_len);
-        for (int i = 0; i < seq_len; ++i)
-        {
-            token_ids[i] = static_cast<int>(token_tensor->data[i]);
-        }
-
-        lookupEmbeddings(token_ids.data(), embedding_table->data.data(),
-                         output->data.data(), seq_len, vocab_size, hidden_size);
-
-        auto end = std::chrono::high_resolution_clock::now();
-        double execution_time = std::chrono::duration<double, std::milli>(end - start).count();
-
-        LOG_DEBUG("Embedding executed in " + std::to_string(execution_time) + " ms");
         return true;
     }
 
     bool EmbeddingKernel::validate(const std::vector<std::shared_ptr<Tensor>> &inputs,
                                    const std::vector<std::shared_ptr<Tensor>> &outputs) const
     {
-        if (inputs.size() != 2)
+        if (inputs.size() != 2 || outputs.size() != 1)
         {
-            LOG_ERROR("Embedding requires exactly 2 inputs (token_ids, embedding_table)");
+            LOG_ERROR("EmbeddingKernel: Expected 2 inputs and 1 output, got " << inputs.size() << " inputs and " << outputs.size() << " outputs");
             return false;
         }
 
-        if (outputs.size() != 1)
-        {
-            LOG_ERROR("Embedding requires exactly 1 output");
-            return false;
-        }
-
-        auto token_tensor = inputs[0];
+        auto token_ids = inputs[0];
         auto embedding_table = inputs[1];
         auto output = outputs[0];
 
-        if (token_tensor->shape.size() != 1)
+        if (!token_ids || !embedding_table || !output)
         {
-            LOG_ERROR("Embedding token_ids must be 1D tensor");
+            LOG_ERROR("EmbeddingKernel: Null tensor provided");
             return false;
         }
 
-        if (embedding_table->shape.size() != 2)
+        // Check token_ids is 1D
+        if (token_ids->shape.size() != 1)
         {
-            LOG_ERROR("Embedding table must be 2D tensor");
+            LOG_ERROR("EmbeddingKernel: Token IDs must be 1D, got " << token_ids->shape.size() << " dimensions");
             return false;
         }
 
-        if (output->shape.size() != 2)
+        // Check embedding table is 2D [vocab_size, embedding_dim]
+        if (embedding_table->shape.size() != 2 ||
+            embedding_table->shape[0] != vocab_size_ ||
+            embedding_table->shape[1] != embedding_dim_)
         {
-            LOG_ERROR("Embedding output must be 2D tensor");
+            LOG_ERROR("EmbeddingKernel: Embedding table shape mismatch");
             return false;
         }
 
-        if (token_tensor->shape[0] != output->shape[0] ||
-            embedding_table->shape[1] != output->shape[1])
+        // Check output is 2D [seq_len, embedding_dim]
+        if (output->shape.size() != 2 ||
+            output->shape[0] != token_ids->shape[0] ||
+            output->shape[1] != embedding_dim_)
         {
-            LOG_ERROR("Embedding dimension mismatch");
+            LOG_ERROR("EmbeddingKernel: Output shape mismatch");
             return false;
         }
 
         return true;
     }
 
-    void EmbeddingKernel::lookupEmbeddings(const int *token_ids, const float *embedding_table,
-                                           float *output, int seq_len, int vocab_size, int hidden_size)
+    void EmbeddingKernel::computeEmbedding(const int *token_ids, const float *embedding_table,
+                                           float *output, size_t seq_len, size_t embedding_dim)
     {
-        for (int seq = 0; seq < seq_len; ++seq)
+        for (size_t i = 0; i < seq_len; ++i)
         {
-            int token_id = token_ids[seq];
-
-            // Bounds check
-            if (token_id < 0 || token_id >= vocab_size)
+            int token_id = token_ids[i];
+            if (token_id < 0 || static_cast<size_t>(token_id) >= vocab_size_)
             {
-                LOG_WARN("Token ID " + std::to_string(token_id) + " out of bounds [0, " + std::to_string(vocab_size) + ")");
-                // Zero out this embedding
-                for (int dim = 0; dim < hidden_size; ++dim)
-                {
-                    output[seq * hidden_size + dim] = 0.0f;
-                }
+                LOG_WARN("EmbeddingKernel: Token ID " << token_id << " out of range [0, " << vocab_size_ << ")");
+                // Zero out the embedding for invalid tokens
+                std::fill(output + i * embedding_dim, output + (i + 1) * embedding_dim, 0.0f);
                 continue;
             }
 
-            // Copy embedding
-            const float *embedding = embedding_table + token_id * hidden_size;
-            float *output_embedding = output + seq * hidden_size;
-            for (int dim = 0; dim < hidden_size; ++dim)
-            {
-                output_embedding[dim] = embedding[dim];
-            }
+            // Copy embedding for this token
+            const float *embedding = embedding_table + token_id * embedding_dim;
+            std::copy(embedding, embedding + embedding_dim, output + i * embedding_dim);
         }
     }
 

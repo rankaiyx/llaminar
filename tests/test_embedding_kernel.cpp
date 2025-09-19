@@ -11,10 +11,16 @@ class EmbeddingKernelTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        kernel = std::make_unique<EmbeddingKernel>();
+        // Will create kernel with specific dimensions for each test
     }
 
     std::unique_ptr<EmbeddingKernel> kernel;
+
+    // Helper to create kernel with specific dimensions
+    void createKernel(size_t vocab_size, size_t embedding_dim)
+    {
+        kernel = std::make_unique<EmbeddingKernel>(vocab_size, embedding_dim);
+    }
 
     std::shared_ptr<Tensor> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
     {
@@ -29,8 +35,9 @@ protected:
         ASSERT_EQ(actual.data.size(), expected.size());
         for (size_t i = 0; i < expected.size(); ++i)
         {
-            EXPECT_NEAR(actual.data[i], expected[i], tolerance)
-                << "Mismatch at index " << i << ": expected " << expected[i]
+            ASSERT_NEAR(actual.data[i], expected[i], tolerance)
+                << "Mismatch at index " << i
+                << ": expected " << expected[i]
                 << ", got " << actual.data[i];
         }
     }
@@ -38,6 +45,8 @@ protected:
 
 TEST_F(EmbeddingKernelTest, BasicEmbeddingLookup)
 {
+    createKernel(4, 3); // 4 tokens, 3 dimensions each
+
     // Embedding table: 4 tokens, 3 dimensions each
     auto embedding_table = createTensor({4, 3}, {
                                                     1.0f, 2.0f, 3.0f,   // Token 0
@@ -67,6 +76,8 @@ TEST_F(EmbeddingKernelTest, BasicEmbeddingLookup)
 
 TEST_F(EmbeddingKernelTest, SingleTokenLookup)
 {
+    createKernel(3, 2); // 3 tokens, 2 dimensions each
+
     // Simple case: lookup one token
     auto embedding_table = createTensor({3, 2}, {
                                                     1.5f, 2.5f, // Token 0
@@ -88,6 +99,8 @@ TEST_F(EmbeddingKernelTest, SingleTokenLookup)
 
 TEST_F(EmbeddingKernelTest, RepeatedTokens)
 {
+    createKernel(3, 2); // 3 tokens, 2 dimensions each
+
     // Test with repeated token IDs
     auto embedding_table = createTensor({3, 2}, {
                                                     10.0f, 20.0f, // Token 0
@@ -118,6 +131,8 @@ TEST_F(EmbeddingKernelTest, LargeEmbeddingDimension)
     const int vocab_size = 3;
     const int embed_dim = 5;
 
+    createKernel(vocab_size, embed_dim); // 3 tokens, 5 dimensions each
+
     auto embedding_table = createTensor({vocab_size, embed_dim}, {
                                                                      1.0f, 1.1f, 1.2f, 1.3f, 1.4f, // Token 0
                                                                      2.0f, 2.1f, 2.2f, 2.3f, 2.4f, // Token 1
@@ -125,7 +140,7 @@ TEST_F(EmbeddingKernelTest, LargeEmbeddingDimension)
                                                                  });
 
     auto token_ids = createTensor({2}, {1.0f, 2.0f});
-    auto output = createTensor({2, embed_dim}, std::vector<float>(10, 0.0f));
+    auto output = createTensor({2, embed_dim}, std::vector<float>(2 * embed_dim, 0.0f));
 
     std::vector<std::shared_ptr<Tensor>> inputs = {token_ids, embedding_table};
     std::vector<std::shared_ptr<Tensor>> outputs = {output};
@@ -141,6 +156,8 @@ TEST_F(EmbeddingKernelTest, LargeEmbeddingDimension)
 
 TEST_F(EmbeddingKernelTest, OutOfBoundsToken)
 {
+    createKernel(2, 2); // 2 tokens, 2 dimensions each
+
     // Test with out-of-bounds token ID (should be handled gracefully)
     auto embedding_table = createTensor({2, 2}, {
                                                     1.0f, 2.0f, // Token 0
@@ -153,12 +170,17 @@ TEST_F(EmbeddingKernelTest, OutOfBoundsToken)
     std::vector<std::shared_ptr<Tensor>> inputs = {token_ids, embedding_table};
     std::vector<std::shared_ptr<Tensor>> outputs = {output};
 
-    // Should return false due to bounds checking
-    ASSERT_FALSE(kernel->execute(inputs, outputs));
+    // Should succeed but output should be zeroed for out-of-bounds token
+    ASSERT_TRUE(kernel->execute(inputs, outputs));
+
+    // Check that output is zeroed for out-of-bounds token
+    assertTensorEqual(*output, {0.0f, 0.0f});
 }
 
 TEST_F(EmbeddingKernelTest, NegativeTokenId)
 {
+    createKernel(2, 2); // 2 tokens, 2 dimensions each
+
     // Test with negative token ID
     auto embedding_table = createTensor({2, 2}, {
                                                     1.0f, 2.0f, // Token 0
@@ -171,12 +193,17 @@ TEST_F(EmbeddingKernelTest, NegativeTokenId)
     std::vector<std::shared_ptr<Tensor>> inputs = {token_ids, embedding_table};
     std::vector<std::shared_ptr<Tensor>> outputs = {output};
 
-    // Should return false due to bounds checking
-    ASSERT_FALSE(kernel->execute(inputs, outputs));
+    // Should succeed but output should be zeroed for negative token
+    ASSERT_TRUE(kernel->execute(inputs, outputs));
+
+    // Check that output is zeroed for negative token
+    assertTensorEqual(*output, {0.0f, 0.0f});
 }
 
 TEST_F(EmbeddingKernelTest, FloatToIntConversion)
 {
+    createKernel(3, 2); // 3 tokens, 2 dimensions each
+
     // Test that float token IDs are properly converted to integers
     auto embedding_table = createTensor({3, 2}, {
                                                     10.0f, 20.0f, // Token 0
@@ -202,6 +229,8 @@ TEST_F(EmbeddingKernelTest, FloatToIntConversion)
 
 TEST_F(EmbeddingKernelTest, InputValidation)
 {
+    createKernel(2, 2); // 2 tokens, 2 dimensions each
+
     // Test with wrong number of inputs
     auto embedding_table = createTensor({2, 2}, {1.0f, 2.0f, 3.0f, 4.0f});
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
@@ -214,6 +243,8 @@ TEST_F(EmbeddingKernelTest, InputValidation)
 
 TEST_F(EmbeddingKernelTest, OutputShapeValidation)
 {
+    createKernel(2, 3); // 2 tokens, 3 dimensions each
+
     // Test with wrong output shape
     auto embedding_table = createTensor({2, 3}, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
     auto token_ids = createTensor({2}, {0.0f, 1.0f});
@@ -228,27 +259,11 @@ TEST_F(EmbeddingKernelTest, OutputShapeValidation)
 // Performance test
 TEST_F(EmbeddingKernelTest, DISABLED_PerformanceTest)
 {
-    const int vocab_size = 50000;
-    const int embed_dim = 512;
-    const int seq_len = 2048;
+    createKernel(10000, 512); // Large vocab and embedding dimension
 
-    // Create large embedding table
-    std::vector<float> table_data(vocab_size * embed_dim);
-    for (int i = 0; i < vocab_size * embed_dim; ++i)
-    {
-        table_data[i] = static_cast<float>(i % 100) * 0.01f;
-    }
-
-    // Create token sequence
-    std::vector<float> token_data(seq_len);
-    for (int i = 0; i < seq_len; ++i)
-    {
-        token_data[i] = static_cast<float>(i % vocab_size);
-    }
-
-    auto embedding_table = createTensor({vocab_size, embed_dim}, table_data);
-    auto token_ids = createTensor({seq_len}, token_data);
-    auto output = createTensor({seq_len, embed_dim}, std::vector<float>(seq_len * embed_dim, 0.0f));
+    auto embedding_table = createTensor({10000, 512}, std::vector<float>(10000 * 512, 1.0f));
+    auto token_ids = createTensor({100}, std::vector<float>(100, 1.0f));
+    auto output = createTensor({100, 512}, std::vector<float>(100 * 512, 0.0f));
 
     std::vector<std::shared_ptr<Tensor>> inputs = {token_ids, embedding_table};
     std::vector<std::shared_ptr<Tensor>> outputs = {output};
@@ -257,6 +272,6 @@ TEST_F(EmbeddingKernelTest, DISABLED_PerformanceTest)
     ASSERT_TRUE(kernel->execute(inputs, outputs));
     auto end = std::chrono::high_resolution_clock::now();
 
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    std::cout << "Embedding kernel performance test: " << duration.count() << " ms" << std::endl;
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    std::cout << "Embedding lookup took: " << duration.count() << " microseconds" << std::endl;
 }

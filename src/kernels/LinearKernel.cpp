@@ -1,59 +1,16 @@
 #include "LinearKernel.h"
-#include "graph_compute.h" // For Tensor definition
-#include "logger.h"
-#include <cblas.h>
-#include <chrono>
+#include "../logger.h"
+#include <algorithm>
 
 namespace llaminar
 {
-
-    LinearKernel::LinearKernel()
-    {
-        LOG_DEBUG("LinearKernel initialized");
-    }
 
     bool LinearKernel::execute(const std::vector<std::shared_ptr<Tensor>> &inputs,
                                std::vector<std::shared_ptr<Tensor>> &outputs)
     {
         if (!validate(inputs, outputs))
         {
-            return false;
-        }
-
-        auto start = std::chrono::high_resolution_clock::now();
-
-        auto input = inputs[0];                              // [seq_len, input_size]
-        auto weight = inputs[1];                             // [input_size, output_size]
-        auto bias = inputs.size() > 2 ? inputs[2] : nullptr; // [output_size] (optional)
-        auto output = outputs[0];                            // [seq_len, output_size]
-
-        int seq_len = input->shape[0];
-        int input_size = input->shape[1];
-        int output_size = weight->shape[1];
-
-        computeLinearProjection(input->data.data(), weight->data.data(),
-                                bias ? bias->data.data() : nullptr,
-                                output->data.data(), seq_len, input_size, output_size);
-
-        auto end = std::chrono::high_resolution_clock::now();
-        double execution_time = std::chrono::duration<double, std::milli>(end - start).count();
-
-        LOG_DEBUG("Linear executed in " + std::to_string(execution_time) + " ms");
-        return true;
-    }
-
-    bool LinearKernel::validate(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                                const std::vector<std::shared_ptr<Tensor>> &outputs) const
-    {
-        if (inputs.size() < 2 || inputs.size() > 3)
-        {
-            LOG_ERROR("Linear requires 2 or 3 inputs (input, weight, optional bias)");
-            return false;
-        }
-
-        if (outputs.size() != 1)
-        {
-            LOG_ERROR("Linear requires exactly 1 output");
+            LOG_ERROR("LinearKernel validation failed");
             return false;
         }
 
@@ -61,31 +18,79 @@ namespace llaminar
         auto weight = inputs[1];
         auto output = outputs[0];
 
-        if (input->shape.size() != 2 || weight->shape.size() != 2 || output->shape.size() != 2)
+        // Check for optional bias
+        const float *bias = nullptr;
+        if (inputs.size() >= 3 && inputs[2])
         {
-            LOG_ERROR("Linear requires 2D tensors");
+            bias = inputs[2]->data.data();
+        }
+
+        size_t seq_len = input->shape[0];
+        size_t input_size = input->shape[1];
+        size_t output_size = weight->shape[1];
+
+        computeLinear(input->data.data(), weight->data.data(), bias,
+                      output->data.data(), seq_len, input_size, output_size);
+
+        return true;
+    }
+
+    bool LinearKernel::validate(const std::vector<std::shared_ptr<Tensor>> &inputs,
+                                const std::vector<std::shared_ptr<Tensor>> &outputs) const
+    {
+        if (inputs.size() < 2 || inputs.size() > 3 || outputs.size() != 1)
+        {
+            LOG_ERROR("LinearKernel: Expected 2-3 inputs and 1 output, got " << inputs.size() << " inputs and " << outputs.size() << " outputs");
             return false;
         }
 
+        auto input = inputs[0];
+        auto weight = inputs[1];
+        auto output = outputs[0];
+
+        if (!input || !weight || !output)
+        {
+            LOG_ERROR("LinearKernel: Null tensor provided");
+            return false;
+        }
+
+        // Check input is 2D [seq_len, input_size]
+        if (input->shape.size() != 2)
+        {
+            LOG_ERROR("LinearKernel: Input must be 2D, got " << input->shape.size() << " dimensions");
+            return false;
+        }
+
+        // Check weight is 2D [input_size, output_size]
+        if (weight->shape.size() != 2)
+        {
+            LOG_ERROR("LinearKernel: Weight must be 2D, got " << weight->shape.size() << " dimensions");
+            return false;
+        }
+
+        // Check dimensions match
         if (input->shape[1] != weight->shape[0])
         {
-            LOG_ERROR("Linear dimension mismatch: input cols != weight rows");
+            LOG_ERROR("LinearKernel: Input size " << input->shape[1] << " doesn't match weight input size " << weight->shape[0]);
             return false;
         }
 
-        if (input->shape[0] != output->shape[0] || weight->shape[1] != output->shape[1])
+        // Check output is 2D [seq_len, output_size]
+        if (output->shape.size() != 2 ||
+            output->shape[0] != input->shape[0] ||
+            output->shape[1] != weight->shape[1])
         {
-            LOG_ERROR("Linear output dimension mismatch");
+            LOG_ERROR("LinearKernel: Output shape mismatch");
             return false;
         }
 
-        // Validate bias if present
-        if (inputs.size() == 3)
+        // Check optional bias
+        if (inputs.size() == 3 && inputs[2])
         {
             auto bias = inputs[2];
             if (bias->shape.size() != 1 || bias->shape[0] != weight->shape[1])
             {
-                LOG_ERROR("Linear bias dimension mismatch");
+                LOG_ERROR("LinearKernel: Bias shape mismatch");
                 return false;
             }
         }
@@ -93,25 +98,24 @@ namespace llaminar
         return true;
     }
 
-    void LinearKernel::computeLinearProjection(const float *input, const float *weight, const float *bias,
-                                               float *output, int seq_len, int input_size, int output_size)
+    void LinearKernel::computeLinear(const float *input, const float *weight, const float *bias,
+                                     float *output, size_t seq_len, size_t input_size, size_t output_size)
     {
-        // Matrix multiplication: input @ weight
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    seq_len, output_size, input_size,
-                    1.0f, input, input_size,
-                    weight, output_size,
-                    0.0f, output, output_size);
-
-        // Add bias if provided
-        if (bias)
+        // Perform matrix multiplication: output = input * weight + bias
+        for (size_t i = 0; i < seq_len; ++i)
         {
-            for (int seq = 0; seq < seq_len; ++seq)
+            for (size_t j = 0; j < output_size; ++j)
             {
-                for (int out = 0; out < output_size; ++out)
+                float sum = 0.0f;
+                for (size_t k = 0; k < input_size; ++k)
                 {
-                    output[seq * output_size + out] += bias[out];
+                    sum += input[i * input_size + k] * weight[k * output_size + j];
                 }
+                if (bias)
+                {
+                    sum += bias[j];
+                }
+                output[i * output_size + j] = sum;
             }
         }
     }

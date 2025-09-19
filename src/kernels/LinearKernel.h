@@ -1,48 +1,33 @@
 #pragma once
 
+#include "../tensor.h"
+#include "../kernel_base.h"
+#include <string>
 #include <vector>
 #include <memory>
-#include "../tensor.h"
 
 namespace llaminar
 {
 
     /**
-     * @brief Linear projection kernel for transformer layers
-     *
-     * Implements linear transformation: y = x * W + b
-     * where W is the weight matrix and b is the optional bias vector
-     *
-     * Expected inputs:
-     * - input: [seq_len, input_size] - input tensor
-     * - weight: [input_size, output_size] - weight matrix
-     * - bias: [output_size] - bias vector (optional)
-     *
-     * Expected outputs:
-     * - output: [seq_len, output_size] - transformed output tensor
+     * @brief Linear layer kernel for matrix multiplication with optional bias
      */
-    class LinearKernel
+    class LinearKernel : public KernelBase
     {
     public:
-        LinearKernel();
+        LinearKernel() = default;
+        ~LinearKernel() = default;
 
-        /**
-         * @brief Execute linear projection
-         * @param inputs Vector containing input tensor, weight matrix, and optional bias
-         * @param outputs Vector containing output tensor
-         * @return true if execution succeeded, false otherwise
-         */
+        // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs);
+                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) override;
 
-        /**
-         * @brief Validate input and output tensor shapes and types
-         * @param inputs Input tensors to validate
-         * @param outputs Output tensors to validate
-         * @return true if tensors are valid, false otherwise
-         */
         bool validate(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const;
+                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const override;
+
+        std::string getKernelType() const override { return "Linear"; }
+        size_t getExpectedInputCount() const override { return 2; } // input + weight (bias optional)
+        size_t getExpectedOutputCount() const override { return 1; }
 
     private:
         /**
@@ -55,8 +40,8 @@ namespace llaminar
          * @param input_size Input dimension size
          * @param output_size Output dimension size
          */
-        void computeLinearProjection(const float *input, const float *weight, const float *bias,
-                                     float *output, int seq_len, int input_size, int output_size);
+        void computeLinear(const float *input, const float *weight, const float *bias,
+                           float *output, size_t seq_len, size_t input_size, size_t output_size);
     };
 
 } // namespace llaminar

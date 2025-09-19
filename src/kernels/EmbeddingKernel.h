@@ -1,47 +1,33 @@
 #pragma once
 
+#include "../tensor.h"
+#include "../kernel_base.h"
+#include <string>
 #include <vector>
 #include <memory>
-#include "../tensor.h"
 
 namespace llaminar
 {
 
     /**
-     * @brief Embedding lookup kernel for transformer input processing
-     *
-     * Performs embedding table lookup for token IDs:
-     * output[seq, :] = embedding_table[token_ids[seq], :]
-     *
-     * Expected inputs:
-     * - token_ids: [seq_len] - token IDs (stored as float but treated as int)
-     * - embedding_table: [vocab_size, hidden_size] - embedding lookup table
-     *
-     * Expected outputs:
-     * - output: [seq_len, hidden_size] - embedded token representations
+     * @brief Embedding lookup kernel for token embedding
      */
-    class EmbeddingKernel
+    class EmbeddingKernel : public KernelBase
     {
     public:
-        EmbeddingKernel();
+        EmbeddingKernel(size_t vocab_size, size_t embedding_dim);
+        ~EmbeddingKernel() = default;
 
-        /**
-         * @brief Execute embedding lookup
-         * @param inputs Vector containing token IDs and embedding table
-         * @param outputs Vector containing output embeddings
-         * @return true if execution succeeded, false otherwise
-         */
+        // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs);
+                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) override;
 
-        /**
-         * @brief Validate input and output tensor shapes and types
-         * @param inputs Input tensors to validate
-         * @param outputs Output tensors to validate
-         * @return true if tensors are valid, false otherwise
-         */
         bool validate(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const;
+                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const override;
+
+        std::string getKernelType() const override { return "Embedding"; }
+        size_t getExpectedInputCount() const override { return 2; }
+        size_t getExpectedOutputCount() const override { return 1; }
 
     private:
         /**
@@ -50,11 +36,13 @@ namespace llaminar
          * @param embedding_table Embedding table data pointer
          * @param output Output data pointer
          * @param seq_len Sequence length
-         * @param vocab_size Vocabulary size
-         * @param hidden_size Hidden dimension size
+         * @param embedding_dim Embedding dimension
          */
-        void lookupEmbeddings(const int *token_ids, const float *embedding_table,
-                              float *output, int seq_len, int vocab_size, int hidden_size);
+        void computeEmbedding(const int *token_ids, const float *embedding_table,
+                              float *output, size_t seq_len, size_t embedding_dim);
+
+        size_t vocab_size_;
+        size_t embedding_dim_;
     };
 
 } // namespace llaminar

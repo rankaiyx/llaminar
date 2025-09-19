@@ -1,117 +1,107 @@
 #pragma once
 
+#include "../tensor.h"
+#include "../kernel_base.h"
+#include <string>
 #include <vector>
 #include <memory>
-#include "../tensor.h"
 
 namespace llaminar
 {
 
     /**
-     * @brief Multi-head attention kernel for transformer layers
-     *
-     * Implements scaled dot-product multi-head attention with KV caching:
-     * Q = input @ q_weight
-     * K = input @ k_weight
-     * V = input @ v_weight
-     * attention_output = softmax(Q @ K^T / sqrt(head_dim)) @ V
-     * output = attention_output @ output_weight
-     *
-     * Expected inputs:
-     * - input: [seq_len, hidden_size] - input tensor
-     * - q_weight: [hidden_size, hidden_size] - query projection weight
-     * - k_weight: [hidden_size, hidden_size] - key projection weight
-     * - v_weight: [hidden_size, hidden_size] - value projection weight
-     * - output_weight: [hidden_size, hidden_size] - output projection weight
-     * - k_cache: [max_seq_len, n_head_kv, head_dim] - key cache tensor
-     * - v_cache: [max_seq_len, n_head_kv, head_dim] - value cache tensor
-     *
-     * Expected outputs:
-     * - output: [seq_len, hidden_size] - attention output tensor
+     * @brief Multi-head attention kernel for transformer attention mechanism
      */
-    class AttentionKernel
+    class AttentionKernel : public KernelBase
     {
     public:
-        AttentionKernel();
+        AttentionKernel(int n_head, int n_head_kv, int head_dim);
+        ~AttentionKernel() = default;
 
-        /**
-         * @brief Execute multi-head attention
-         * @param inputs Vector containing input and weight tensors, plus KV cache
-         * @param outputs Vector containing output tensor
-         * @return true if execution succeeded, false otherwise
-         */
+        // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs);
+                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) override;
 
-        /**
-         * @brief Validate input and output tensor shapes and types
-         * @param inputs Input tensors to validate
-         * @param outputs Output tensors to validate
-         * @return true if tensors are valid, false otherwise
-         */
         bool validate(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const;
+                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const override;
 
-        // Configuration
+        std::string getKernelType() const override { return "Attention"; }
+        size_t getExpectedInputCount() const override { return 7; } // input, wq, wk, wv, wo, k_cache, v_cache
+        size_t getExpectedOutputCount() const override { return 1; }
+
+        // Configuration methods
         void setHeadDimensions(int n_head, int n_head_kv, int head_dim);
         void setSequencePosition(int n_past) { n_past_ = n_past; }
 
     private:
         /**
-         * @brief Compute Q, K, V projections
+         * @brief Compute query projections
          * @param input Input data pointer
-         * @param q_weight Q weight matrix pointer
-         * @param k_weight K weight matrix pointer
-         * @param v_weight V weight matrix pointer
-         * @param q_bias Q bias vector pointer (can be nullptr)
-         * @param k_bias K bias vector pointer (can be nullptr)
-         * @param v_bias V bias vector pointer (can be nullptr)
-         * @param q_proj Output Q projection pointer
-         * @param k_proj Output K projection pointer
-         * @param v_proj Output V projection pointer
+         * @param wq Query weight matrix
+         * @param query Output query matrix
          * @param seq_len Sequence length
-         * @param hidden_size Hidden dimension size
+         * @param d_model Model dimension
          */
-        void computeQKVProjections(const float *input,
-                                   const float *q_weight, const float *k_weight, const float *v_weight,
-                                   const float *q_bias, const float *k_bias, const float *v_bias,
-                                   float *q_proj, float *k_proj, float *v_proj,
-                                   int seq_len, int hidden_size);
+        void computeQueries(const float *input, const float *wq, float *query,
+                            int seq_len, int d_model);
 
         /**
-         * @brief Compute scaled dot-product attention
-         * @param q Query tensor pointer
-         * @param k Key cache pointer
-         * @param v Value cache pointer
-         * @param attn_weights Attention weights output pointer
-         * @param output Attention output pointer
-         * @param seq_len Current sequence length
-         * @param n_head Number of attention heads
-         * @param head_dim Head dimension size
+         * @brief Compute key projections
+         * @param input Input data pointer
+         * @param wk Key weight matrix
+         * @param key Output key matrix
+         * @param seq_len Sequence length
+         * @param d_model Model dimension
          */
-        void computeScaledDotProductAttention(const float *q, const float *k, const float *v,
-                                              float *attn_weights, float *output,
-                                              int seq_len, int n_head, int head_dim);
+        void computeKeys(const float *input, const float *wk, float *key,
+                         int seq_len, int d_model);
 
         /**
-         * @brief Update KV cache with new key and value tensors
-         * @param k_new New key tensor pointer
-         * @param v_new New value tensor pointer
-         * @param k_cache Key cache pointer
-         * @param v_cache Value cache pointer
-         * @param seq_len Current sequence length
-         * @param n_head_kv Number of key-value heads
-         * @param head_dim Head dimension size
-         * @param n_past Number of past tokens in cache
+         * @brief Compute value projections
+         * @param input Input data pointer
+         * @param wv Value weight matrix
+         * @param value Output value matrix
+         * @param seq_len Sequence length
+         * @param d_model Model dimension
          */
-        void updateKVCache(const float *k_new, const float *v_new,
-                           float *k_cache, float *v_cache,
-                           int seq_len, int n_head_kv, int head_dim, int n_past);
+        void computeValues(const float *input, const float *wv, float *value,
+                           int seq_len, int d_model);
 
-        int n_head_;    ///< Number of attention heads
-        int n_head_kv_; ///< Number of key-value heads (for GQA)
-        int head_dim_;  ///< Dimension per head
-        int n_past_;    ///< Number of past tokens in KV cache
+        /**
+         * @brief Apply rotary position embedding (RoPE)
+         * @param tensor Input tensor to apply RoPE to
+         * @param seq_len Sequence length
+         * @param head_dim Head dimension
+         * @param n_past Number of past tokens for position
+         */
+        void applyRoPE(float *tensor, int seq_len, int head_dim, int n_past);
+
+        /**
+         * @brief Compute attention scores and apply softmax
+         * @param query Query matrix
+         * @param key Key matrix
+         * @param scores Output attention scores
+         * @param seq_len Sequence length
+         * @param head_dim Head dimension
+         */
+        void computeAttentionScores(const float *query, const float *key, float *scores,
+                                    int seq_len, int head_dim);
+
+        /**
+         * @brief Apply attention scores to values
+         * @param scores Attention scores
+         * @param value Value matrix
+         * @param output Output matrix
+         * @param seq_len Sequence length
+         * @param head_dim Head dimension
+         */
+        void applyAttention(const float *scores, const float *value, float *output,
+                            int seq_len, int head_dim);
+
+        int n_head_;    // Number of attention heads
+        int n_head_kv_; // Number of key-value heads (for grouped attention)
+        int head_dim_;  // Dimension per attention head
+        int n_past_;    // Number of past tokens for position embedding
     };
 
 } // namespace llaminar

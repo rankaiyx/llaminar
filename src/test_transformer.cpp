@@ -27,12 +27,12 @@ int main()
     // Create and test RMSNorm node
     auto rms_norm = std::make_shared<RMSNormNode>("test_rmsnorm", weight_tensor, 1e-6f);
     rms_norm->setOutput(output_tensor);
+    rms_norm->setInput(input_tensor); // Set the input tensor
 
     // Create a simple data node for testing
     int seq_len = 1;
     int d_model = 512;
     auto input_node = std::make_shared<DataNode>("input", std::vector<double>(seq_len * d_model, 1.0));
-    rms_norm->addInput(input_node);
 
     // Connect nodes
     rms_norm->addInput(input_node);

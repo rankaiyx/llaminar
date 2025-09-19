@@ -2,7 +2,9 @@
 
 #include <vector>
 #include <memory>
+#include <string>
 #include "../tensor.h"
+#include "../kernel_base.h"
 
 namespace llaminar
 {
@@ -20,28 +22,21 @@ namespace llaminar
      * Expected outputs:
      * - output: [seq_len, hidden_size] - normalized output tensor
      */
-    class RMSNormKernel
+    class RMSNormKernel : public KernelBase
     {
     public:
         RMSNormKernel();
 
-        /**
-         * @brief Execute RMS normalization
-         * @param inputs Vector containing input tensor and weight tensor
-         * @param outputs Vector containing output tensor
-         * @return true if execution succeeded, false otherwise
-         */
+        // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs);
+                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) override;
 
-        /**
-         * @brief Validate input and output tensor shapes and types
-         * @param inputs Input tensors to validate
-         * @param outputs Output tensors to validate
-         * @return true if tensors are valid, false otherwise
-         */
         bool validate(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const;
+                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const override;
+
+        std::string getKernelType() const override { return "RMSNorm"; }
+        size_t getExpectedInputCount() const override { return 2; }
+        size_t getExpectedOutputCount() const override { return 1; }
 
         // Configuration
         void setEpsilon(float eps) { epsilon_ = eps; }

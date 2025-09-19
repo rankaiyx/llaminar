@@ -325,7 +325,19 @@ AttentionNode::AttentionNode(const std::string &name,
     : TransformerNode(name, "Attention"),
       q_weight_(q_weight), k_weight_(k_weight), v_weight_(v_weight),
       out_weight_(out_weight), k_cache_(k_cache), v_cache_(v_cache),
-      n_head_(n_head), n_head_kv_(n_head_kv), n_past_(n_past) {}
+      n_head_(n_head), n_head_kv_(n_head_kv), n_past_(n_past)
+{
+    // Calculate head_dim from q_weight dimensions
+    // Assuming q_weight shape is [d_model, n_head * head_dim]
+    if (q_weight_ && q_weight_->shape.size() >= 2)
+    {
+        head_dim_ = q_weight_->shape[1] / n_head_;
+    }
+    else
+    {
+        head_dim_ = 64; // Default fallback
+    }
+}
 
 bool AttentionNode::execute()
 {
@@ -335,31 +347,40 @@ bool AttentionNode::execute()
         return false;
     }
 
-    const auto &input_shape = input_tensor_->shape;
-    if (input_shape.size() != 2)
+    if (!q_weight_ || !k_weight_ || !v_weight_ || !out_weight_ || !k_cache_ || !v_cache_)
     {
-        LOG_ERROR("Attention: Invalid input shape");
+        LOG_ERROR("Attention: Missing weight or cache tensors");
         return false;
     }
 
-    int seq_len = input_shape[0];
-    int n_embd = input_shape[1];
+    // Create and use AttentionKernel
+    llaminar::AttentionKernel kernel(n_head_, n_head_kv_, head_dim_);
 
-    const float *input_data = input_tensor_->ptr();
-    float *output_data = output_tensor_->ptr();
+    // Configure kernel parameters
+    kernel.setSequencePosition(n_past_);
 
-    // For now, implement a simplified attention (placeholder)
-    // In a full implementation, this would include:
-    // 1. Q, K, V projections with weights and biases
-    // 2. Reshape to multi-head format
-    // 3. Scaled dot-product attention with KV cache
-    // 4. Output projection
+    std::vector<std::shared_ptr<Tensor>> inputs = {
+        input_tensor_,
+        q_weight_,
+        k_weight_,
+        v_weight_,
+        out_weight_,
+        k_cache_,
+        v_cache_};
+    std::vector<std::shared_ptr<Tensor>> outputs = {output_tensor_};
 
-    LOG_INFO("Attention: Simplified implementation - copying input to output");
-    std::copy(input_data, input_data + seq_len * n_embd, output_data);
+    bool success = kernel.execute(inputs, outputs);
 
-    LOG_DEBUG("Attention executed: " << seq_len << "x" << n_embd << " with " << n_head_ << " heads");
-    return true;
+    if (success)
+    {
+        LOG_DEBUG("Attention executed successfully with " << n_head_ << " heads");
+    }
+    else
+    {
+        LOG_ERROR("Attention kernel execution failed");
+    }
+
+    return success;
 }
 
 bool AttentionNode::validate() const
@@ -385,32 +406,30 @@ bool MLPNode::execute()
         return false;
     }
 
-    const auto &input_shape = input_tensor_->shape;
-    if (input_shape.size() != 2)
+    if (!gate_weight_ || !up_weight_ || !down_weight_)
     {
-        LOG_ERROR("MLP: Invalid input shape");
+        LOG_ERROR("MLP: Missing weight tensors");
         return false;
     }
 
-    int seq_len = input_shape[0];
-    int n_embd = input_shape[1];
+    // Create and use MLPKernel
+    llaminar::MLPKernel kernel;
 
-    const float *input_data = input_tensor_->ptr();
-    float *output_data = output_tensor_->ptr();
+    std::vector<std::shared_ptr<Tensor>> inputs = {input_tensor_, gate_weight_, up_weight_, down_weight_};
+    std::vector<std::shared_ptr<Tensor>> outputs = {output_tensor_};
 
-    // Simplified MLP implementation (placeholder)
-    // Full implementation would include:
-    // 1. Gate projection: gate = input * gate_weight
-    // 2. Up projection: up = input * up_weight
-    // 3. SiLU activation: gate = gate * sigmoid(gate)
-    // 4. Element-wise multiply: intermediate = gate * up
-    // 5. Down projection: output = intermediate * down_weight
+    bool success = kernel.execute(inputs, outputs);
 
-    LOG_INFO("MLP: Simplified implementation - copying input to output");
-    std::copy(input_data, input_data + seq_len * n_embd, output_data);
+    if (success)
+    {
+        LOG_DEBUG("MLP executed successfully");
+    }
+    else
+    {
+        LOG_ERROR("MLP kernel execution failed");
+    }
 
-    LOG_DEBUG("MLP executed: " << seq_len << "x" << n_embd);
-    return true;
+    return success;
 }
 
 bool MLPNode::validate() const
@@ -607,4 +626,101 @@ bool LinearNode::execute()
 bool LinearNode::validate() const
 {
     return weight_ && weight_->shape.size() == 2;
+}
+
+// KernelNode implementation
+KernelNode::KernelNode(const std::string &name, std::unique_ptr<llaminar::KernelBase> kernel)
+    : ComputeNode(name, kernel ? kernel->getKernelType() : "Unknown"), kernel_(std::move(kernel))
+{
+}
+
+bool KernelNode::execute()
+{
+    if (!kernel_)
+    {
+        LOG_ERROR("KernelNode " << name_ << ": No kernel implementation");
+        return false;
+    }
+
+    if (input_tensors_.size() != kernel_->getExpectedInputCount())
+    {
+        LOG_ERROR("KernelNode " << name_ << ": Expected " << kernel_->getExpectedInputCount()
+                                << " inputs, got " << input_tensors_.size());
+        return false;
+    }
+
+    if (output_tensors_.size() != kernel_->getExpectedOutputCount())
+    {
+        LOG_ERROR("KernelNode " << name_ << ": Expected " << kernel_->getExpectedOutputCount()
+                                << " outputs, got " << output_tensors_.size());
+        return false;
+    }
+
+    // Validate tensors before execution
+    if (!kernel_->validate(input_tensors_, output_tensors_))
+    {
+        LOG_ERROR("KernelNode " << name_ << ": Tensor validation failed");
+        return false;
+    }
+
+    // Execute the kernel
+    bool success = kernel_->execute(input_tensors_, output_tensors_);
+
+    if (success)
+    {
+        LOG_DEBUG("KernelNode " << name_ << " (" << kernel_->getKernelType() << ") executed successfully");
+    }
+    else
+    {
+        LOG_ERROR("KernelNode " << name_ << " (" << kernel_->getKernelType() << ") execution failed");
+    }
+
+    return success;
+}
+
+bool KernelNode::validate() const
+{
+    if (!kernel_)
+    {
+        return false;
+    }
+
+    if (input_tensors_.size() != kernel_->getExpectedInputCount() ||
+        output_tensors_.size() != kernel_->getExpectedOutputCount())
+    {
+        return false;
+    }
+
+    return kernel_->validate(input_tensors_, output_tensors_);
+}
+
+void KernelNode::setInputTensors(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs)
+{
+    input_tensors_ = inputs;
+}
+
+void KernelNode::setOutputTensors(const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs)
+{
+    output_tensors_ = outputs;
+}
+
+void KernelNode::addInputTensor(std::shared_ptr<llaminar::Tensor> input)
+{
+    input_tensors_.push_back(input);
+}
+
+void KernelNode::addOutputTensor(std::shared_ptr<llaminar::Tensor> output)
+{
+    output_tensors_.push_back(output);
+}
+
+const std::string &KernelNode::getKernelType() const
+{
+    static const std::string unknown = "Unknown";
+    if (kernel_)
+    {
+        static std::string type = kernel_->getKernelType();
+        return type;
+    }
+    return unknown;
 }

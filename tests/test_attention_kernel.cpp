@@ -12,8 +12,8 @@ class AttentionKernelTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        kernel = std::make_unique<AttentionKernel>();
-        kernel->setHeadDimensions(2, 2, 2); // 2 heads, 2 KV heads, 2 dimensions per head
+        // Create kernel with 2 heads, 2 KV heads, 2 head dimension (simplified for testing)
+        kernel = std::make_unique<AttentionKernel>(2, 2, 2);
     }
 
     std::unique_ptr<AttentionKernel> kernel;
@@ -43,12 +43,12 @@ TEST_F(AttentionKernelTest, BasicAttentionComputation)
     // Simple attention test with small dimensions
     const int seq_len = 1;
     const int hidden_size = 4; // 2 heads * 2 head_dim
-    const int max_seq_len = 10;
+    const int max_seq_len = 4; // Smaller cache for testing
 
     // Input: [1, 4]
     auto input = createTensor({seq_len, hidden_size}, {1.0f, 2.0f, 3.0f, 4.0f});
 
-    // Identity weights for Q, K, V projections
+    // Identity weights for Q, K, V projections [hidden_size, hidden_size]
     auto q_weight = createTensor({hidden_size, hidden_size}, {1.0f, 0.0f, 0.0f, 0.0f,
                                                               0.0f, 1.0f, 0.0f, 0.0f,
                                                               0.0f, 0.0f, 1.0f, 0.0f,
@@ -69,23 +69,25 @@ TEST_F(AttentionKernelTest, BasicAttentionComputation)
                                                                    0.0f, 0.0f, 1.0f, 0.0f,
                                                                    0.0f, 0.0f, 0.0f, 1.0f});
 
-    // KV cache (initially zeros)
+    // KV cache (initially zeros) - smaller for testing
     auto k_cache = createTensor({max_seq_len, hidden_size}, std::vector<float>(max_seq_len * hidden_size, 0.0f));
     auto v_cache = createTensor({max_seq_len, hidden_size}, std::vector<float>(max_seq_len * hidden_size, 0.0f));
 
-    auto output = createTensor({seq_len, hidden_size}, {0.0f, 0.0f, 0.0f, 0.0f});
+    auto output = createTensor({seq_len, hidden_size}, std::vector<float>(seq_len * hidden_size, 0.0f));
 
     std::vector<std::shared_ptr<Tensor>> inputs = {
         input, q_weight, k_weight, v_weight, output_weight, k_cache, v_cache};
     std::vector<std::shared_ptr<Tensor>> outputs = {output};
 
-    ASSERT_TRUE(kernel->execute(inputs, outputs));
+    // First check validation
+    ASSERT_TRUE(kernel->validate(inputs, outputs)) << "Kernel validation should pass";
 
-    // With the simplified attention implementation, we expect some combination of Q and V
-    // The exact values depend on the implementation details
-    ASSERT_EQ(output->data.size(), 4);
+    // Then execute - this should not crash
+    ASSERT_TRUE(kernel->execute(inputs, outputs)) << "Kernel execution should succeed";
 
     // Verify the output is not all zeros (attention should produce some result)
+    ASSERT_EQ(output->data.size(), static_cast<size_t>(seq_len * hidden_size));
+
     bool hasNonZero = false;
     for (float val : output->data)
     {
@@ -95,7 +97,7 @@ TEST_F(AttentionKernelTest, BasicAttentionComputation)
             break;
         }
     }
-    EXPECT_TRUE(hasNonZero);
+    EXPECT_TRUE(hasNonZero) << "Output should not be all zeros";
 }
 
 TEST_F(AttentionKernelTest, KVCacheUpdate)

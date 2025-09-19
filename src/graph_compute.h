@@ -1,7 +1,8 @@
 #pragma once
 
 #include "common.h"
-#include "tensor.h" // For legacy Tensor struct
+#include "tensor.h"      // For legacy Tensor struct
+#include "kernel_base.h" // For KernelBase interface
 #include <memory>
 #include <vector>
 #include <string>
@@ -88,6 +89,37 @@ private:
     void dfsVisit(std::shared_ptr<ComputeNode> node,
                   std::unordered_map<std::shared_ptr<ComputeNode>, int> &state,
                   std::vector<std::shared_ptr<ComputeNode>> &result) const;
+};
+
+// Generic kernel execution node - the new flexible architecture
+class KernelNode : public ComputeNode
+{
+public:
+    /**
+     * @brief Create a kernel node with a specific kernel implementation
+     * @param name Node name for identification
+     * @param kernel Unique pointer to the kernel implementation
+     */
+    KernelNode(const std::string &name, std::unique_ptr<llaminar::KernelBase> kernel);
+
+    bool execute() override;
+    bool validate() const override;
+
+    // Tensor management
+    void setInputTensors(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs);
+    void setOutputTensors(const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs);
+    void addInputTensor(std::shared_ptr<llaminar::Tensor> input);
+    void addOutputTensor(std::shared_ptr<llaminar::Tensor> output);
+
+    // Getters
+    const std::vector<std::shared_ptr<llaminar::Tensor>> &getInputTensors() const { return input_tensors_; }
+    const std::vector<std::shared_ptr<llaminar::Tensor>> &getOutputTensors() const { return output_tensors_; }
+    const std::string &getKernelType() const;
+
+private:
+    std::unique_ptr<llaminar::KernelBase> kernel_;
+    std::vector<std::shared_ptr<llaminar::Tensor>> input_tensors_;
+    std::vector<std::shared_ptr<llaminar::Tensor>> output_tensors_;
 };
 
 // Specific node types
@@ -205,6 +237,7 @@ private:
     std::shared_ptr<Tensor> k_cache_, v_cache_;
 
     int n_head_, n_head_kv_, n_past_;
+    int head_dim_;
     int kv_seq_len_ = 0; // Current KV cache length
 };
 
