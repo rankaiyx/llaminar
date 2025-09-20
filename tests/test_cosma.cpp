@@ -1,7 +1,9 @@
 #include "../src/common.h"
 #include "../src/argument_parser.h"
 #include "../src/kernels/MatMulKernel.h"
-#include "../src/tensor.h" // For Tensor definition
+#include "../src/tensors/tensor_base.h"
+#include "../src/tensors/simple_tensor.h"
+#include "../src/tensors/tensor_factory.h"
 #include <mpi.h>
 #include <iostream>
 #include <vector>
@@ -23,11 +25,15 @@ void fillMatrixRandom(std::vector<float> &matrix, size_t size, int seed = 42)
 }
 
 // Validate matrix multiplication result (simple check)
-bool validateResult(const Tensor &A, const Tensor &B, const Tensor &C, double tolerance = 1e-4)
+bool validateResult(const TensorBase &A, const TensorBase &B, const TensorBase &C, double tolerance = 1e-4)
 {
-    int m = A.shape[0];
-    int k = A.shape[1];
-    int n = B.shape[1];
+    const auto &shape_A = A.shape();
+    const auto &shape_B = B.shape();
+    const auto &shape_C = C.shape();
+
+    int m = shape_A[0];
+    int k = shape_A[1];
+    int n = shape_B[1];
 
     // Check a few elements manually for basic correctness
     for (int i = 0; i < std::min(m, 4); ++i)
@@ -37,9 +43,9 @@ bool validateResult(const Tensor &A, const Tensor &B, const Tensor &C, double to
             float expected = 0.0f;
             for (int idx = 0; idx < k; ++idx)
             {
-                expected += A.data[i * k + idx] * B.data[idx * n + j];
+                expected += A.data()[i * k + idx] * B.data()[idx * n + j];
             }
-            float actual = C.data[i * n + j];
+            float actual = C.data()[i * n + j];
             if (std::abs(expected - actual) > tolerance)
             {
                 std::cerr << "Validation failed at C[" << i << "," << j << "]: "
@@ -68,19 +74,14 @@ bool runCOSMAKernelTest(int m, int n, int k, int rank, int size)
     fillMatrixRandom(data_A, m * k, rank);
     fillMatrixRandom(data_B, k * n, rank + 100);
 
-    // Create tensors using new Tensor struct
-    auto tensor_A = std::make_shared<Tensor>(std::vector<int>{m, k});
-    auto tensor_B = std::make_shared<Tensor>(std::vector<int>{k, n});
-    auto tensor_C = std::make_shared<Tensor>(std::vector<int>{m, n});
-
-    // Copy data to tensors
-    tensor_A->data = data_A;
-    tensor_B->data = data_B;
-    tensor_C->data = data_C;
+    // Create tensors using new TensorBase interface
+    auto tensor_A = TensorFactory::create_simple({m, k}, data_A);
+    auto tensor_B = TensorFactory::create_simple({k, n}, data_B);
+    auto tensor_C = TensorFactory::create_simple({m, n}, data_C);
 
     // Prepare inputs and outputs
-    std::vector<std::shared_ptr<Tensor>> inputs = {tensor_A, tensor_B};
-    std::vector<std::shared_ptr<Tensor>> outputs = {tensor_C};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {tensor_A, tensor_B};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {tensor_C};
 
     // Create MatMulKernel instance
     MatMulKernel kernel;
@@ -167,8 +168,8 @@ int main(int argc, char *argv[])
         MatMulKernel kernel;
 
         // Test invalid input count
-        std::vector<std::shared_ptr<Tensor>> empty_inputs;
-        std::vector<std::shared_ptr<Tensor>> empty_outputs;
+        std::vector<std::shared_ptr<TensorBase>> empty_inputs;
+        std::vector<std::shared_ptr<TensorBase>> empty_outputs;
 
         if (kernel.validate(empty_inputs, empty_outputs))
         {

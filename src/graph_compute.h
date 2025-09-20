@@ -1,16 +1,13 @@
 #pragma once
 
 #include "common.h"
-#include "tensor.h"      // For legacy Tensor struct
-#include "kernel_base.h" // For KernelBase interface
+#include "tensors/tensor_base.h" // For modern TensorBase interface
+#include "kernel_base.h"         // For KernelBase interface
 #include <memory>
 #include <vector>
 #include <string>
 #include <functional>
 #include <unordered_map>
-
-// Bring Tensor from llaminar namespace to this scope for backward compatibility
-using llaminar::Tensor;
 
 // Forward declarations
 class ComputeNode;
@@ -106,20 +103,20 @@ public:
     bool validate() const override;
 
     // Tensor management
-    void setInputTensors(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs);
-    void setOutputTensors(const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs);
-    void addInputTensor(std::shared_ptr<llaminar::Tensor> input);
-    void addOutputTensor(std::shared_ptr<llaminar::Tensor> output);
+    void setInputTensors(const std::vector<std::shared_ptr<llaminar::TensorBase>> &inputs);
+    void setOutputTensors(const std::vector<std::shared_ptr<llaminar::TensorBase>> &outputs);
+    void addInputTensor(std::shared_ptr<llaminar::TensorBase> input);
+    void addOutputTensor(std::shared_ptr<llaminar::TensorBase> output);
 
     // Getters
-    const std::vector<std::shared_ptr<llaminar::Tensor>> &getInputTensors() const { return input_tensors_; }
-    const std::vector<std::shared_ptr<llaminar::Tensor>> &getOutputTensors() const { return output_tensors_; }
+    const std::vector<std::shared_ptr<llaminar::TensorBase>> &getInputTensors() const { return input_tensors_; }
+    const std::vector<std::shared_ptr<llaminar::TensorBase>> &getOutputTensors() const { return output_tensors_; }
     const std::string &getKernelType() const;
 
 private:
     std::unique_ptr<llaminar::KernelBase> kernel_;
-    std::vector<std::shared_ptr<llaminar::Tensor>> input_tensors_;
-    std::vector<std::shared_ptr<llaminar::Tensor>> output_tensors_;
+    std::vector<std::shared_ptr<llaminar::TensorBase>> input_tensors_;
+    std::vector<std::shared_ptr<llaminar::TensorBase>> output_tensors_;
 };
 
 // Specific node types
@@ -183,27 +180,27 @@ class TransformerNode : public ComputeNode
 public:
     TransformerNode(const std::string &name, const std::string &operation_type);
 
-    void setInput(std::shared_ptr<Tensor> input) { input_tensor_ = input; }
-    void setOutput(std::shared_ptr<Tensor> output) { output_tensor_ = output; }
-    std::shared_ptr<Tensor> getInputTensor() const { return input_tensor_; }
-    std::shared_ptr<Tensor> getOutputTensor() const { return output_tensor_; }
+    void setInput(std::shared_ptr<llaminar::TensorBase> input) { input_tensor_ = input; }
+    void setOutput(std::shared_ptr<llaminar::TensorBase> output) { output_tensor_ = output; }
+    std::shared_ptr<llaminar::TensorBase> getInputTensor() const { return input_tensor_; }
+    std::shared_ptr<llaminar::TensorBase> getOutputTensor() const { return output_tensor_; }
 
 protected:
-    std::shared_ptr<Tensor> input_tensor_;
-    std::shared_ptr<Tensor> output_tensor_;
+    std::shared_ptr<llaminar::TensorBase> input_tensor_;
+    std::shared_ptr<llaminar::TensorBase> output_tensor_;
 };
 
 // RMS Normalization node
 class RMSNormNode : public TransformerNode
 {
 public:
-    RMSNormNode(const std::string &name, std::shared_ptr<Tensor> weight, float eps = 1e-6f);
+    RMSNormNode(const std::string &name, std::shared_ptr<llaminar::TensorBase> weight, float eps = 1e-6f);
 
     bool execute() override;
     bool validate() const override;
 
 private:
-    std::shared_ptr<Tensor> weight_;
+    std::shared_ptr<llaminar::TensorBase> weight_;
     float eps_;
 };
 
@@ -212,29 +209,29 @@ class AttentionNode : public TransformerNode
 {
 public:
     AttentionNode(const std::string &name,
-                  std::shared_ptr<Tensor> q_weight,
-                  std::shared_ptr<Tensor> k_weight,
-                  std::shared_ptr<Tensor> v_weight,
-                  std::shared_ptr<Tensor> out_weight,
-                  std::shared_ptr<Tensor> k_cache,
-                  std::shared_ptr<Tensor> v_cache,
+                  std::shared_ptr<llaminar::TensorBase> q_weight,
+                  std::shared_ptr<llaminar::TensorBase> k_weight,
+                  std::shared_ptr<llaminar::TensorBase> v_weight,
+                  std::shared_ptr<llaminar::TensorBase> out_weight,
+                  std::shared_ptr<llaminar::TensorBase> k_cache,
+                  std::shared_ptr<llaminar::TensorBase> v_cache,
                   int n_head, int n_head_kv, int n_past);
 
     bool execute() override;
     bool validate() const override;
 
-    void setKVCache(std::shared_ptr<Tensor> k_cache, std::shared_ptr<Tensor> v_cache)
+    void setKVCache(std::shared_ptr<llaminar::TensorBase> k_cache, std::shared_ptr<llaminar::TensorBase> v_cache)
     {
         k_cache_ = k_cache;
         v_cache_ = v_cache;
     }
 
 private:
-    std::shared_ptr<Tensor> q_weight_;
-    std::shared_ptr<Tensor> k_weight_;
-    std::shared_ptr<Tensor> v_weight_;
-    std::shared_ptr<Tensor> out_weight_;
-    std::shared_ptr<Tensor> k_cache_, v_cache_;
+    std::shared_ptr<llaminar::TensorBase> q_weight_;
+    std::shared_ptr<llaminar::TensorBase> k_weight_;
+    std::shared_ptr<llaminar::TensorBase> v_weight_;
+    std::shared_ptr<llaminar::TensorBase> out_weight_;
+    std::shared_ptr<llaminar::TensorBase> k_cache_, v_cache_;
 
     int n_head_, n_head_kv_, n_past_;
     int head_dim_;
@@ -246,17 +243,17 @@ class MLPNode : public TransformerNode
 {
 public:
     MLPNode(const std::string &name,
-            std::shared_ptr<Tensor> gate_weight,
-            std::shared_ptr<Tensor> up_weight,
-            std::shared_ptr<Tensor> down_weight);
+            std::shared_ptr<llaminar::TensorBase> gate_weight,
+            std::shared_ptr<llaminar::TensorBase> up_weight,
+            std::shared_ptr<llaminar::TensorBase> down_weight);
 
     bool execute() override;
     bool validate() const override;
 
 private:
-    std::shared_ptr<Tensor> gate_weight_;
-    std::shared_ptr<Tensor> up_weight_;
-    std::shared_ptr<Tensor> down_weight_;
+    std::shared_ptr<llaminar::TensorBase> gate_weight_;
+    std::shared_ptr<llaminar::TensorBase> up_weight_;
+    std::shared_ptr<llaminar::TensorBase> down_weight_;
 };
 
 // Complete transformer block node
@@ -280,15 +277,15 @@ private:
     std::shared_ptr<MLPNode> mlp_;
 
     // Temporary tensors for residual connections
-    std::shared_ptr<Tensor> attn_residual_;
-    std::shared_ptr<Tensor> ffn_residual_;
+    std::shared_ptr<llaminar::TensorBase> attn_residual_;
+    std::shared_ptr<llaminar::TensorBase> ffn_residual_;
 };
 
 // Embedding lookup node
 class EmbeddingNode : public TransformerNode
 {
 public:
-    EmbeddingNode(const std::string &name, std::shared_ptr<Tensor> embedding_weights);
+    EmbeddingNode(const std::string &name, std::shared_ptr<llaminar::TensorBase> embedding_weights);
 
     bool execute() override;
     bool validate() const override;
@@ -296,7 +293,7 @@ public:
     void setTokenIds(const std::vector<int> &token_ids) { token_ids_ = token_ids; }
 
 private:
-    std::shared_ptr<Tensor> embedding_weights_;
+    std::shared_ptr<llaminar::TensorBase> embedding_weights_;
     std::vector<int> token_ids_;
 };
 
@@ -305,13 +302,14 @@ class LinearNode : public TransformerNode
 {
 public:
     LinearNode(const std::string &name,
-               std::shared_ptr<Tensor> weight,
-               std::shared_ptr<Tensor> bias = nullptr);
+               std::shared_ptr<llaminar::TensorBase> weight,
+               std::shared_ptr<llaminar::TensorBase> bias = nullptr);
 
+public:
     bool execute() override;
     bool validate() const override;
 
 private:
-    std::shared_ptr<Tensor> weight_;
-    std::shared_ptr<Tensor> bias_;
+    std::shared_ptr<llaminar::TensorBase> weight_;
+    std::shared_ptr<llaminar::TensorBase> bias_;
 };

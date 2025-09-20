@@ -3,7 +3,7 @@
 #include <vector>
 #include <memory>
 #include <string>
-#include "tensor.h"
+#include "tensors/tensor_base.h"
 
 namespace llaminar
 {
@@ -24,8 +24,8 @@ namespace llaminar
          * @param outputs Vector of output tensors (should be pre-allocated)
          * @return true if execution succeeded, false otherwise
          */
-        virtual bool execute(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                             std::vector<std::shared_ptr<Tensor>> &outputs) = 0;
+        virtual bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                             std::vector<std::shared_ptr<TensorBase>> &outputs) = 0;
 
         /**
          * @brief Validate input and output tensor shapes and types
@@ -33,8 +33,8 @@ namespace llaminar
          * @param outputs Output tensors to validate
          * @return true if tensors are valid, false otherwise
          */
-        virtual bool validate(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                              const std::vector<std::shared_ptr<Tensor>> &outputs) const = 0;
+        virtual bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                              const std::vector<std::shared_ptr<TensorBase>> &outputs) const = 0;
 
         /**
          * @brief Get the kernel type name for debugging/logging

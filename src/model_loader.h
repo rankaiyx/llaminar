@@ -1,7 +1,8 @@
 #pragma once
 
 #include "common.h"
-#include "tensor.h"
+#include "tensors/tensor_base.h"
+#include "transformer_config.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -117,8 +118,8 @@ public:
     const GGUFModel &getModel() const { return model_; }
 
     // Tensor loading
-    std::shared_ptr<llaminar::Tensor> loadTensor(const std::string &tensor_name);
-    std::vector<std::shared_ptr<llaminar::Tensor>> loadAllTensors();
+    std::shared_ptr<llaminar::TensorBase> loadTensor(const std::string &tensor_name);
+    std::vector<std::shared_ptr<llaminar::TensorBase>> loadAllTensors();
 
     // Model information
     void printModelInfo() const;
@@ -129,6 +130,9 @@ public:
     bool supportsQuantization(GGUFTensorType type) const;
     std::vector<float> dequantizeTensor(const GGUFTensorInfo &tensor_info,
                                         const std::vector<uint8_t> &quantized_data);
+
+    // Model configuration extraction
+    TransformerLayerConfig createLayerConfig() const;
 
 private:
     bool loaded_;

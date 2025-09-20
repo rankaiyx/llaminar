@@ -53,7 +53,22 @@
         "initializer_list": "cpp",
         "ranges": "cpp",
         "regex": "cpp",
-        "valarray": "cpp"
+        "valarray": "cpp",
+        "string": "cpp",
+        "optional": "cpp",
+        "system_error": "cpp",
+        "sstream": "cpp",
+        "atomic": "cpp",
+        "complex": "cpp",
+        "deque": "cpp",
+        "forward_list": "cpp",
+        "list": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "iterator": "cpp",
+        "memory_resource": "cpp",
+        "stop_token": "cpp"
     },
     "files.exclude": {
         "**/build/**": true,

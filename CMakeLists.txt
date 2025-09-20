@@ -13,7 +13,8 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Compiler flags
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
+# Note: Removed -DDEBUG from global flags to prevent COSMA verbose output
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # Include directories
@@ -105,17 +106,30 @@ set(LLAMINAR_CORE_SOURCES
     src/argument_parser.cpp
     src/topology_manager.cpp
     src/graph_compute.cpp
+    src/mpi_kernel_base.cpp
     src/kernels/MatMulKernel.cpp
     src/kernels/RMSNormKernel.cpp
     src/kernels/LinearKernel.cpp
+    src/kernels/MPILinearKernel.cpp
+    src/kernels/MPIRMSNormKernel.cpp
+    src/kernels/MPIAttentionKernel.cpp
+    src/kernels/MPIEmbeddingKernel.cpp
+    src/kernels/MPIMLPKernel.cpp
     src/kernels/EmbeddingKernel.cpp
     src/kernels/MLPKernel.cpp
     src/kernels/AttentionKernel.cpp
+    src/mpi_transformer_pipeline.cpp
     src/tensors/simple_tensor.cpp
     src/tensors/cosma_tensor.cpp
     src/tensors/tensor_factory.cpp
     src/model_loader.cpp
     src/repacker.cpp
+    # Chat interface components
+    src/chat/gguf_tokenizer.cpp
+    src/chat/bpe_processor.cpp
+    src/chat/chat_session.cpp
+    src/chat/response_generator.cpp
+    src/chat/chat_interface.cpp
 )
 
 # Create the core library
@@ -151,6 +165,11 @@ endif()
 # Set compile features
 target_compile_features(llaminar_core PUBLIC cxx_std_17)
 
+# Add DEBUG flag only to our targets (not COSMA) when in Debug build
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_definitions(llaminar_core PRIVATE DEBUG)
+endif()
+
 # Include directories for core library
 target_include_directories(llaminar_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
@@ -161,6 +180,11 @@ target_include_directories(llaminar_core PUBLIC
 # Main executable
 add_executable(llaminar src/main.cpp)
 target_link_libraries(llaminar llaminar_core)
+
+# Add DEBUG flag to main executable when in Debug build
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_definitions(llaminar PRIVATE DEBUG)
+endif()
 
 # Enable testing
 enable_testing()
@@ -246,7 +270,49 @@ if(GTEST_FOUND)
     endif()
     add_test(NAME AttentionKernelTest COMMAND test_attention_kernel)
     
-    set(KERNEL_TEST_TARGETS test_rmsnorm_kernel test_linear_kernel test_embedding_kernel test_mlp_kernel test_attention_kernel)
+    # MPI linear kernel test
+    add_executable(test_mpi_linear_kernel tests/test_mpi_linear_kernel.cpp)
+    target_link_libraries(test_mpi_linear_kernel llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_mpi_linear_kernel GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_mpi_linear_kernel PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_linear_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME MPILinearKernelTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_linear_kernel)
+
+    add_executable(test_mpi_rmsnorm_kernel tests/test_mpi_rmsnorm_kernel.cpp)
+    target_link_libraries(test_mpi_rmsnorm_kernel llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_mpi_rmsnorm_kernel GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_mpi_rmsnorm_kernel PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_rmsnorm_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME MPIRMSNormKernelTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_rmsnorm_kernel)
+
+    add_executable(test_mpi_attention_kernel tests/test_mpi_attention_kernel.cpp)
+    target_link_libraries(test_mpi_attention_kernel llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_mpi_attention_kernel GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_mpi_attention_kernel PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_attention_kernel ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME MPIAttentionKernelTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_attention_kernel)
+    
+    # MPI Transformer Pipeline test
+    add_executable(test_mpi_transformer_pipeline tests/test_mpi_transformer_pipeline.cpp)
+    target_link_libraries(test_mpi_transformer_pipeline llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_mpi_transformer_pipeline GTest::gtest GTest::gtest_main)
+    else()
+        target_include_directories(test_mpi_transformer_pipeline PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_mpi_transformer_pipeline ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    add_test(NAME MPITransformerPipelineTest COMMAND mpirun -np 2 ${CMAKE_BINARY_DIR}/tests/test_mpi_transformer_pipeline)
+    
+    set(KERNEL_TEST_TARGETS test_rmsnorm_kernel test_linear_kernel test_embedding_kernel test_mlp_kernel test_attention_kernel test_mpi_linear_kernel test_mpi_rmsnorm_kernel test_mpi_attention_kernel test_mpi_transformer_pipeline)
 else()
     message(STATUS "Google Test not found - kernel unit tests disabled")
     set(KERNEL_TEST_TARGETS "")
@@ -269,6 +335,24 @@ add_custom_target(run_tests
     DEPENDS test_basic test_numa test_cosma test_graph test_transformer ${KERNEL_TEST_TARGETS}
     COMMENT "Running all tests"
 )
+
+# Add DEBUG flag to all test targets when in Debug build
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # List of all test targets
+    set(TEST_TARGETS test_basic test_numa test_cosma test_graph test_transformer)
+    
+    # Add any kernel test targets if they exist
+    if(GTEST_FOUND)
+        list(APPEND TEST_TARGETS ${KERNEL_TEST_TARGETS})
+    endif()
+    
+    # Apply DEBUG flag to all test targets
+    foreach(target ${TEST_TARGETS})
+        if(TARGET ${target})
+            target_compile_definitions(${target} PRIVATE DEBUG)
+        endif()
+    endforeach()
+endif()
 
 # Print configuration summary
 message(STATUS "=== Llaminar Configuration ===")

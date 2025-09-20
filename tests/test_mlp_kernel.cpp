@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/kernels/MLPKernel.h"
+#include "../src/tensors/tensor_factory.h"
 #include "graph_compute.h"
 #include <memory>
 #include <chrono>
@@ -17,22 +18,20 @@ protected:
 
     std::unique_ptr<MLPKernel> kernel;
 
-    std::shared_ptr<Tensor> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
+    std::shared_ptr<TensorBase> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
     {
-        auto tensor = std::make_shared<Tensor>();
-        tensor->shape = shape;
-        tensor->data = data;
+        auto tensor = llaminar::TensorFactory::create_simple(shape, data);
         return tensor;
     }
 
-    void assertTensorEqual(const Tensor &actual, const std::vector<float> &expected, float tolerance = 1e-5f)
+    void assertTensorEqual(const TensorBase &actual, const std::vector<float> &expected, float tolerance = 1e-5f)
     {
-        ASSERT_EQ(actual.data.size(), expected.size());
+        ASSERT_EQ([](const TensorBase& t){ size_t sz=1; for(int d:t.shape()) sz*=d; return sz; }(actual), expected.size());
         for (size_t i = 0; i < expected.size(); ++i)
         {
-            EXPECT_NEAR(actual.data[i], expected[i], tolerance)
+            EXPECT_NEAR(actual.data()[i], expected[i], tolerance)
                 << "Mismatch at index " << i << ": expected " << expected[i]
-                << ", got " << actual.data[i];
+                << ", got " << actual.data()[i];
         }
     }
 
@@ -61,8 +60,8 @@ TEST_F(MLPKernelTest, BasicSwiGLUComputation)
 
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, gate_weight, up_weight, down_weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, gate_weight, up_weight, down_weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -95,9 +94,9 @@ TEST_F(MLPKernelTest, WithBiases)
 
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {
+    std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, gate_weight, up_weight, down_weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -129,8 +128,8 @@ TEST_F(MLPKernelTest, BatchProcessing)
 
     auto output = createTensor({2, 2}, {0.0f, 0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, gate_weight, up_weight, down_weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, gate_weight, up_weight, down_weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -167,8 +166,8 @@ TEST_F(MLPKernelTest, ZeroInput)
 
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, gate_weight, up_weight, down_weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, gate_weight, up_weight, down_weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -201,8 +200,8 @@ TEST_F(MLPKernelTest, SiLUActivationFunction)
 
     auto output = createTensor({1, 4}, {0.0f, 0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, gate_weight, up_weight, down_weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, gate_weight, up_weight, down_weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -223,8 +222,8 @@ TEST_F(MLPKernelTest, InputValidation)
     auto gate_weight = createTensor({2, 2}, {1.0f, 0.0f, 0.0f, 1.0f});
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, gate_weight}; // Missing weights
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, gate_weight}; // Missing weights
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -238,8 +237,8 @@ TEST_F(MLPKernelTest, DimensionMismatch)
     auto down_weight = createTensor({2, 3}, {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f});
     auto output = createTensor({1, 3}, {0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, gate_weight, up_weight, down_weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, gate_weight, up_weight, down_weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -263,8 +262,8 @@ TEST_F(MLPKernelTest, DISABLED_PerformanceTest)
     auto down_weight = createTensor({intermediate_size, hidden_size}, down_weight_data);
     auto output = createTensor({batch_size, hidden_size}, output_data);
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, gate_weight, up_weight, down_weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, gate_weight, up_weight, down_weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     auto start = std::chrono::high_resolution_clock::now();
     ASSERT_TRUE(kernel->execute(inputs, outputs));

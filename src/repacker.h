@@ -2,7 +2,7 @@
 
 #include "common.h"
 #include "model_loader.h"
-#include "tensor.h"
+#include "tensors/tensor_base.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -32,10 +32,10 @@ public:
     bool isDistributed() const { return distributed_; }
     void setDistributed(bool distributed) { distributed_ = distributed; }
 
-    // Conversion to/from regular Tensor
-    std::shared_ptr<llaminar::Tensor> toTensor() const;
-    static std::shared_ptr<COSMATensor> fromTensor(const std::shared_ptr<llaminar::Tensor> &tensor,
-                                                   const std::string &name = "");
+    // Conversion to/from modern TensorBase
+    std::shared_ptr<llaminar::TensorBase> toTensorBase() const;
+    static std::shared_ptr<COSMATensor> fromTensorBase(const std::shared_ptr<llaminar::TensorBase> &tensor,
+                                                       const std::string &name = "");
 
     // Memory layout optimization for COSMA
     void optimizeForCOSMA();
@@ -60,8 +60,8 @@ public:
     std::shared_ptr<COSMATensor> repackFromGGUF(const GGUFTensorInfo &tensor_info,
                                                 const std::vector<uint8_t> &raw_data);
 
-    std::shared_ptr<COSMATensor> repackFromTensor(const std::shared_ptr<llaminar::Tensor> &tensor,
-                                                  const std::string &name = "");
+    std::shared_ptr<COSMATensor> repackFromTensorBase(const std::shared_ptr<llaminar::TensorBase> &tensor,
+                                                      const std::string &name = "");
 
     // Batch operations
     std::vector<std::shared_ptr<COSMATensor>> repackModel(const GGUFModel &model,
@@ -126,9 +126,9 @@ private:
 namespace TensorConversion
 {
     // Utility functions for tensor conversion
-    std::shared_ptr<COSMATensor> convert(const std::shared_ptr<llaminar::Tensor> &tensor,
+    std::shared_ptr<COSMATensor> convert(const std::shared_ptr<llaminar::TensorBase> &tensor,
                                          const std::string &name = "");
-    std::shared_ptr<llaminar::Tensor> convert(const std::shared_ptr<COSMATensor> &cosma_tensor);
+    std::shared_ptr<llaminar::TensorBase> convert(const std::shared_ptr<COSMATensor> &cosma_tensor);
 
     // Type conversion utilities
     std::vector<double> floatToDouble(const std::vector<float> &float_data);

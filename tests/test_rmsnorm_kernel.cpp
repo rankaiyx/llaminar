@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/kernels/RMSNormKernel.h"
-#include "graph_compute.h"
+#include "../src/tensors/tensor_factory.h"
 #include <memory>
 #include <cmath>
 #include <chrono>
@@ -17,22 +17,27 @@ protected:
 
     std::unique_ptr<RMSNormKernel> kernel;
 
-    std::shared_ptr<Tensor> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
+    std::shared_ptr<TensorBase> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
     {
-        auto tensor = std::make_shared<Tensor>();
-        tensor->shape = shape;
-        tensor->data = data;
+        auto tensor = llaminar::TensorFactory::create_simple(shape, data);
         return tensor;
     }
 
-    void assertTensorEqual(const Tensor &actual, const std::vector<float> &expected, float tolerance = 1e-6f)
+    void assertTensorEqual(const TensorBase &actual, const std::vector<float> &expected, float tolerance = 1e-6f)
     {
-        ASSERT_EQ(actual.data.size(), expected.size());
+        // Calculate total size from shape
+        size_t total_size = 1;
+        for (int dim : actual.shape())
+        {
+            total_size *= dim;
+        }
+        ASSERT_EQ(total_size, expected.size());
         for (size_t i = 0; i < expected.size(); ++i)
         {
-            EXPECT_NEAR(actual.data[i], expected[i], tolerance)
-                << "Mismatch at index " << i << ": expected " << expected[i]
-                << ", got " << actual.data[i];
+            EXPECT_NEAR(actual.data()[i], expected[i], tolerance)
+                << "Mismatch at index " << i
+                << ", expected " << expected[i]
+                << ", got " << actual.data()[i];
         }
     }
 };
@@ -44,8 +49,8 @@ TEST_F(RMSNormKernelTest, BasicNormalization)
     auto weight = createTensor({4}, {1.0f, 1.0f, 1.0f, 1.0f});
     auto output = createTensor({1, 4}, {0.0f, 0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -61,8 +66,8 @@ TEST_F(RMSNormKernelTest, WithScaling)
     auto weight = createTensor({3}, {2.0f, 0.5f, 1.5f});
     auto output = createTensor({1, 3}, {0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -83,8 +88,8 @@ TEST_F(RMSNormKernelTest, MultipleSequences)
     auto output = createTensor({2, 3}, {0.0f, 0.0f, 0.0f,
                                         0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -104,8 +109,8 @@ TEST_F(RMSNormKernelTest, ZeroInput)
     auto weight = createTensor({3}, {1.0f, 1.0f, 1.0f});
     auto output = createTensor({1, 3}, {0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -120,8 +125,8 @@ TEST_F(RMSNormKernelTest, InputValidation)
     auto input = createTensor({1, 4}, {1.0f, 2.0f, 3.0f, 4.0f});
     auto output = createTensor({1, 4}, {0.0f, 0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input}; // Missing weight
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input}; // Missing weight
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -133,8 +138,8 @@ TEST_F(RMSNormKernelTest, ShapeValidation)
     auto weight = createTensor({3}, {1.0f, 1.0f, 1.0f}); // Wrong size
     auto output = createTensor({1, 4}, {0.0f, 0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -154,8 +159,8 @@ TEST_F(RMSNormKernelTest, DISABLED_PerformanceTest)
     auto weight = createTensor({hidden_size}, weight_data);
     auto output = createTensor({seq_len, hidden_size}, output_data);
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     auto start = std::chrono::high_resolution_clock::now();
     ASSERT_TRUE(kernel->execute(inputs, outputs));

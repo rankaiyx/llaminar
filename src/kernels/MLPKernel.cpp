@@ -6,8 +6,8 @@
 namespace llaminar
 {
 
-    bool MLPKernel::execute(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                            std::vector<std::shared_ptr<Tensor>> &outputs)
+    bool MLPKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                            std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         if (!validate(inputs, outputs))
         {
@@ -21,9 +21,9 @@ namespace llaminar
         auto w_down = inputs[3];
         auto output = outputs[0];
 
-        size_t seq_len = input->shape[0];
-        size_t d_model = input->shape[1];
-        size_t d_ff = w_gate->shape[1];
+        size_t seq_len = input->shape()[0];
+        size_t d_model = input->shape()[1];
+        size_t d_ff = w_gate->shape()[1];
 
         // Allocate temporary buffers
         std::vector<float> gate_proj(seq_len * d_ff);
@@ -31,21 +31,21 @@ namespace llaminar
         std::vector<float> activated(seq_len * d_ff);
 
         // Compute gate and up projections
-        computeGateAndUp(input->data.data(), w_gate->data.data(), w_up->data.data(),
+        computeGateAndUp(input->data(), w_gate->data(), w_up->data(),
                          gate_proj.data(), up_proj.data(), seq_len, d_model, d_ff);
 
         // Apply SwiGLU activation
         applySwiGLU(gate_proj.data(), up_proj.data(), activated.data(), seq_len, d_ff);
 
         // Compute down projection
-        computeDown(activated.data(), w_down->data.data(), output->data.data(),
+        computeDown(activated.data(), w_down->data(), output->data(),
                     seq_len, d_ff, d_model);
 
         return true;
     }
 
-    bool MLPKernel::validate(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                             const std::vector<std::shared_ptr<Tensor>> &outputs) const
+    bool MLPKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                             const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         if (inputs.size() != 4 || outputs.size() != 1)
         {
@@ -76,37 +76,37 @@ namespace llaminar
         auto output = outputs[0];
 
         // Check input is 2D [seq_len, d_model]
-        if (input->shape.size() != 2)
+        if (input->shape().size() != 2)
         {
-            LOG_ERROR("MLPKernel: Input must be 2D, got " << input->shape.size() << " dimensions");
+            LOG_ERROR("MLPKernel: Input must be 2D, got " << input->shape().size() << " dimensions");
             return false;
         }
 
-        size_t seq_len = input->shape[0];
-        size_t d_model = input->shape[1];
+        size_t seq_len = input->shape()[0];
+        size_t d_model = input->shape()[1];
 
         // Check weight dimensions
-        if (w_gate->shape.size() != 2 || w_gate->shape[0] != d_model)
+        if (w_gate->shape().size() != 2 || w_gate->shape()[0] != d_model)
         {
             LOG_ERROR("MLPKernel: Gate weight shape mismatch");
             return false;
         }
 
-        if (w_up->shape.size() != 2 || w_up->shape[0] != d_model || w_up->shape[1] != w_gate->shape[1])
+        if (w_up->shape().size() != 2 || w_up->shape()[0] != d_model || w_up->shape()[1] != w_gate->shape()[1])
         {
             LOG_ERROR("MLPKernel: Up weight shape mismatch");
             return false;
         }
 
-        size_t d_ff = w_gate->shape[1];
-        if (w_down->shape.size() != 2 || w_down->shape[0] != d_ff || w_down->shape[1] != d_model)
+        size_t d_ff = w_gate->shape()[1];
+        if (w_down->shape().size() != 2 || w_down->shape()[0] != d_ff || w_down->shape()[1] != d_model)
         {
             LOG_ERROR("MLPKernel: Down weight shape mismatch");
             return false;
         }
 
         // Check output shape
-        if (output->shape.size() != 2 || output->shape[0] != seq_len || output->shape[1] != d_model)
+        if (output->shape().size() != 2 || output->shape()[0] != seq_len || output->shape()[1] != d_model)
         {
             LOG_ERROR("MLPKernel: Output shape mismatch");
             return false;

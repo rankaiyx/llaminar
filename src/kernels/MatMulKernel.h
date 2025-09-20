@@ -1,7 +1,6 @@
 #pragma once
 
 #include "../tensors/tensor_base.h"
-#include "../tensor.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -48,10 +47,6 @@ namespace llaminar
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                      std::vector<std::shared_ptr<TensorBase>> &outputs);
 
-        // Legacy interface for compatibility
-        bool execute(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs);
-
         /**
          * @brief Validate input and output tensor shapes for matrix multiplication
          * @param inputs Input tensors to validate
@@ -60,10 +55,6 @@ namespace llaminar
          */
         bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const;
-
-        // Legacy validation interface
-        bool validate(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const;
 
         // COSMA-specific configuration
         void setStrategy(const std::string &strategy) { strategy_ = strategy; }

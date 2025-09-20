@@ -103,9 +103,14 @@ bool ArgumentParser::parse(LlaminarParams &params)
             params.inference_mode = true; // Auto-enable inference mode
             i++;
         }
+        else if (arg == "--eval")
+        {
+            params.eval_only = true;
+            params.inference_mode = true; // Auto-enable inference mode
+        }
         else if (arg == "--ctx-size" && i + 1 < argc_)
         {
-            params.n_ctx = std::stoi(argv_[i + 1]);
+            params.ctx_size = std::stoi(argv_[i + 1]);
             i++;
         }
         else if (arg == "--predict" && i + 1 < argc_)
@@ -132,6 +137,39 @@ bool ArgumentParser::parse(LlaminarParams &params)
         {
             params.interactive = true;
             params.inference_mode = true; // Auto-enable inference mode
+        }
+        // Chat-specific parameters
+        else if (arg == "--system" && i + 1 < argc_)
+        {
+            params.system_prompt = argv_[i + 1];
+            i++;
+        }
+        else if (arg == "--chat-template" && i + 1 < argc_)
+        {
+            params.chat_template = argv_[i + 1];
+            i++;
+        }
+        else if (arg == "--max-response" && i + 1 < argc_)
+        {
+            params.max_response_tokens = std::stoi(argv_[i + 1]);
+            i++;
+        }
+        else if (arg == "--save-chat")
+        {
+            params.save_conversation = true;
+        }
+        else if (arg == "--no-stream")
+        {
+            params.streaming_output = false;
+        }
+        else if (arg == "--stream")
+        {
+            params.streaming_output = true;
+        }
+        else if (arg == "--load-conversation" && i + 1 < argc_)
+        {
+            params.conversation_file = argv_[i + 1];
+            i++;
         }
         // Performance options
         else if (arg == "--profile")
@@ -199,12 +237,21 @@ void ArgumentParser::printUsage() const
     std::cout << "\nInference Mode:" << std::endl;
     std::cout << "  -i, --inference          Enable inference mode" << std::endl;
     std::cout << "  -p, --prompt <text>      Text prompt to process" << std::endl;
+    std::cout << "  --eval                   Evaluate prompt and exit (no generation)" << std::endl;
     std::cout << "  --interactive            Interactive chat mode" << std::endl;
     std::cout << "  --ctx-size <size>        Context window size (default: 2048)" << std::endl;
     std::cout << "  --predict <tokens>       Max tokens to generate (default: 128)" << std::endl;
     std::cout << "  --temperature <float>    Sampling temperature (default: 0.7)" << std::endl;
     std::cout << "  --top-k <int>            Top-K sampling (default: 40)" << std::endl;
     std::cout << "  --top-p <float>          Top-P sampling (default: 0.9)" << std::endl;
+    std::cout << "\nChat Options:" << std::endl;
+    std::cout << "  --system <text>          Set system prompt for chat" << std::endl;
+    std::cout << "  --chat-template <name>   Chat template to use" << std::endl;
+    std::cout << "  --max-response <tokens>  Max tokens in response (default: 512)" << std::endl;
+    std::cout << "  --save-chat              Save conversation to file" << std::endl;
+    std::cout << "  --load-conversation <f>  Load previous conversation" << std::endl;
+    std::cout << "  --stream                 Enable streaming output (default)" << std::endl;
+    std::cout << "  --no-stream              Disable streaming output" << std::endl;
     std::cout << "\nSystem Configuration:" << std::endl;
     std::cout << "  --enable-hyperthreading  Use hyperthreaded cores (default: physical cores only)" << std::endl;
     std::cout << "  --ht                     Short form of --enable-hyperthreading" << std::endl;

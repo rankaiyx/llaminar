@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/kernels/AttentionKernel.h"
+#include "../src/tensors/tensor_factory.h"
 #include "graph_compute.h"
 #include <memory>
 #include <chrono>
@@ -18,22 +19,20 @@ protected:
 
     std::unique_ptr<AttentionKernel> kernel;
 
-    std::shared_ptr<Tensor> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
+    std::shared_ptr<TensorBase> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
     {
-        auto tensor = std::make_shared<Tensor>();
-        tensor->shape = shape;
-        tensor->data = data;
+        auto tensor = llaminar::TensorFactory::create_simple(shape, data);
         return tensor;
     }
 
-    void assertTensorEqual(const Tensor &actual, const std::vector<float> &expected, float tolerance = 1e-5f)
+    void assertTensorEqual(const TensorBase &actual, const std::vector<float> &expected, float tolerance = 1e-5f)
     {
-        ASSERT_EQ(actual.data.size(), expected.size());
+        ASSERT_EQ([](const TensorBase& t){ size_t sz=1; for(int d:t.shape()) sz*=d; return sz; }(actual), expected.size());
         for (size_t i = 0; i < expected.size(); ++i)
         {
-            EXPECT_NEAR(actual.data[i], expected[i], tolerance)
+            EXPECT_NEAR(actual.data()[i], expected[i], tolerance)
                 << "Mismatch at index " << i << ": expected " << expected[i]
-                << ", got " << actual.data[i];
+                << ", got " << actual.data()[i];
         }
     }
 };
@@ -75,9 +74,9 @@ TEST_F(AttentionKernelTest, BasicAttentionComputation)
 
     auto output = createTensor({seq_len, hidden_size}, std::vector<float>(seq_len * hidden_size, 0.0f));
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {
+    std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, q_weight, k_weight, v_weight, output_weight, k_cache, v_cache};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     // First check validation
     ASSERT_TRUE(kernel->validate(inputs, outputs)) << "Kernel validation should pass";
@@ -125,9 +124,9 @@ TEST_F(AttentionKernelTest, KVCacheUpdate)
 
     auto output = createTensor({seq_len, hidden_size}, std::vector<float>(seq_len * hidden_size, 0.0f));
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {
+    std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, q_weight, k_weight, v_weight, output_weight, k_cache, v_cache};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -170,9 +169,9 @@ TEST_F(AttentionKernelTest, MultipleSequenceLength)
 
     auto output = createTensor({seq_len, hidden_size}, std::vector<float>(seq_len * hidden_size, 0.0f));
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {
+    std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, q_weight, k_weight, v_weight, output_weight, k_cache, v_cache};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -195,8 +194,8 @@ TEST_F(AttentionKernelTest, InputValidation)
     auto weight = createTensor({4, 4}, std::vector<float>(16, 1.0f));
     auto output = createTensor({1, 4}, {0.0f, 0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight}; // Missing inputs
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight}; // Missing inputs
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -219,9 +218,9 @@ TEST_F(AttentionKernelTest, OutputValidation)
     auto output1 = createTensor({seq_len, hidden_size}, std::vector<float>(seq_len * hidden_size, 0.0f));
     auto output2 = createTensor({seq_len, hidden_size}, std::vector<float>(seq_len * hidden_size, 0.0f));
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {
+    std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, q_weight, k_weight, v_weight, output_weight, k_cache, v_cache};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output1, output2}; // Too many outputs
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output1, output2}; // Too many outputs
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -243,9 +242,9 @@ TEST_F(AttentionKernelTest, DimensionMismatch)
 
     auto output = createTensor({seq_len, hidden_size}, std::vector<float>(seq_len * hidden_size, 0.0f));
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {
+    std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, q_weight, k_weight, v_weight, output_weight, k_cache, v_cache};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     // Should fail due to dimension mismatch
     ASSERT_FALSE(kernel->execute(inputs, outputs));
@@ -284,9 +283,9 @@ TEST_F(AttentionKernelTest, DISABLED_PerformanceTest)
 
     auto output = createTensor({seq_len, hidden_size}, std::vector<float>(seq_len * hidden_size, 0.0f));
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {
+    std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, q_weight, k_weight, v_weight, output_weight, k_cache, v_cache};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     auto start = std::chrono::high_resolution_clock::now();
     ASSERT_TRUE(kernel->execute(inputs, outputs));

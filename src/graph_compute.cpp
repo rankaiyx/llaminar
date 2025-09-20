@@ -1,4 +1,5 @@
 #include "graph_compute.h"
+#include "tensors/tensor_factory.h"
 #include "kernels/RMSNormKernel.h"
 #include "kernels/LinearKernel.h"
 #include "kernels/EmbeddingKernel.h"
@@ -276,7 +277,7 @@ TransformerNode::TransformerNode(const std::string &name, const std::string &ope
     : ComputeNode(name, operation_type) {}
 
 // RMSNormNode implementation
-RMSNormNode::RMSNormNode(const std::string &name, std::shared_ptr<Tensor> weight, float eps)
+RMSNormNode::RMSNormNode(const std::string &name, std::shared_ptr<llaminar::TensorBase> weight, float eps)
     : TransformerNode(name, "RMSNorm"), weight_(weight), eps_(eps) {}
 
 bool RMSNormNode::execute()
@@ -291,8 +292,8 @@ bool RMSNormNode::execute()
     llaminar::RMSNormKernel kernel;
     kernel.setEpsilon(eps_);
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input_tensor_, weight_};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output_tensor_};
+    std::vector<std::shared_ptr<llaminar::TensorBase>> inputs = {input_tensor_, weight_};
+    std::vector<std::shared_ptr<llaminar::TensorBase>> outputs = {output_tensor_};
 
     bool success = kernel.execute(inputs, outputs);
 
@@ -310,17 +311,17 @@ bool RMSNormNode::execute()
 
 bool RMSNormNode::validate() const
 {
-    return weight_ && weight_->shape.size() == 1;
+    return weight_ && weight_->shape().size() == 1;
 }
 
 // AttentionNode implementation
 AttentionNode::AttentionNode(const std::string &name,
-                             std::shared_ptr<Tensor> q_weight,
-                             std::shared_ptr<Tensor> k_weight,
-                             std::shared_ptr<Tensor> v_weight,
-                             std::shared_ptr<Tensor> out_weight,
-                             std::shared_ptr<Tensor> k_cache,
-                             std::shared_ptr<Tensor> v_cache,
+                             std::shared_ptr<llaminar::TensorBase> q_weight,
+                             std::shared_ptr<llaminar::TensorBase> k_weight,
+                             std::shared_ptr<llaminar::TensorBase> v_weight,
+                             std::shared_ptr<llaminar::TensorBase> out_weight,
+                             std::shared_ptr<llaminar::TensorBase> k_cache,
+                             std::shared_ptr<llaminar::TensorBase> v_cache,
                              int n_head, int n_head_kv, int n_past)
     : TransformerNode(name, "Attention"),
       q_weight_(q_weight), k_weight_(k_weight), v_weight_(v_weight),
@@ -329,9 +330,9 @@ AttentionNode::AttentionNode(const std::string &name,
 {
     // Calculate head_dim from q_weight dimensions
     // Assuming q_weight shape is [d_model, n_head * head_dim]
-    if (q_weight_ && q_weight_->shape.size() >= 2)
+    if (q_weight_ && q_weight_->shape().size() >= 2)
     {
-        head_dim_ = q_weight_->shape[1] / n_head_;
+        head_dim_ = q_weight_->shape()[1] / n_head_;
     }
     else
     {
@@ -359,7 +360,7 @@ bool AttentionNode::execute()
     // Configure kernel parameters
     kernel.setSequencePosition(n_past_);
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {
+    std::vector<std::shared_ptr<llaminar::TensorBase>> inputs = {
         input_tensor_,
         q_weight_,
         k_weight_,
@@ -367,7 +368,7 @@ bool AttentionNode::execute()
         out_weight_,
         k_cache_,
         v_cache_};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output_tensor_};
+    std::vector<std::shared_ptr<llaminar::TensorBase>> outputs = {output_tensor_};
 
     bool success = kernel.execute(inputs, outputs);
 
@@ -392,9 +393,9 @@ bool AttentionNode::validate() const
 
 // MLPNode implementation
 MLPNode::MLPNode(const std::string &name,
-                 std::shared_ptr<Tensor> gate_weight,
-                 std::shared_ptr<Tensor> up_weight,
-                 std::shared_ptr<Tensor> down_weight)
+                 std::shared_ptr<llaminar::TensorBase> gate_weight,
+                 std::shared_ptr<llaminar::TensorBase> up_weight,
+                 std::shared_ptr<llaminar::TensorBase> down_weight)
     : TransformerNode(name, "MLP"),
       gate_weight_(gate_weight), up_weight_(up_weight), down_weight_(down_weight) {}
 
@@ -415,8 +416,8 @@ bool MLPNode::execute()
     // Create and use MLPKernel
     llaminar::MLPKernel kernel;
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input_tensor_, gate_weight_, up_weight_, down_weight_};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output_tensor_};
+    std::vector<std::shared_ptr<llaminar::TensorBase>> inputs = {input_tensor_, gate_weight_, up_weight_, down_weight_};
+    std::vector<std::shared_ptr<llaminar::TensorBase>> outputs = {output_tensor_};
 
     bool success = kernel.execute(inputs, outputs);
 
@@ -454,15 +455,15 @@ bool TransformerBlockNode::execute()
         return false;
     }
 
-    const auto &input_shape = input_tensor_->shape;
+    const auto &input_shape = input_tensor_->shape();
     int seq_len = input_shape[0];
     int n_embd = input_shape[1];
 
     // Create temporary tensors for intermediate results
-    auto attn_input = std::make_shared<Tensor>(input_shape);
-    auto attn_output = std::make_shared<Tensor>(input_shape);
-    auto ffn_input = std::make_shared<Tensor>(input_shape);
-    auto ffn_output = std::make_shared<Tensor>(input_shape);
+    auto attn_input = llaminar::TensorFactory::create_simple(input_shape);
+    auto attn_output = llaminar::TensorFactory::create_simple(input_shape);
+    auto ffn_input = llaminar::TensorFactory::create_simple(input_shape);
+    auto ffn_output = llaminar::TensorFactory::create_simple(input_shape);
 
     // Attention path: norm -> attention -> residual
     attn_norm_->setInput(input_tensor_);
@@ -474,9 +475,9 @@ bool TransformerBlockNode::execute()
     attention_->execute();
 
     // Residual connection: input + attention_output
-    const float *input_data = input_tensor_->ptr();
-    const float *attn_data = attn_output->ptr();
-    float *ffn_input_data = ffn_input->ptr();
+    const float *input_data = input_tensor_->data();
+    const float *attn_data = attn_output->data();
+    float *ffn_input_data = ffn_input->data();
 
     for (int i = 0; i < seq_len * n_embd; ++i)
     {
@@ -493,8 +494,8 @@ bool TransformerBlockNode::execute()
     mlp_->execute();
 
     // Final residual connection: ffn_input + mlp_output
-    const float *mlp_data = ffn_output->ptr();
-    float *output_data = output_tensor_->ptr();
+    const float *mlp_data = ffn_output->data();
+    float *output_data = output_tensor_->data();
 
     for (int i = 0; i < seq_len * n_embd; ++i)
     {
@@ -511,7 +512,7 @@ bool TransformerBlockNode::validate() const
 }
 
 // EmbeddingNode implementation
-EmbeddingNode::EmbeddingNode(const std::string &name, std::shared_ptr<Tensor> embedding_weights)
+EmbeddingNode::EmbeddingNode(const std::string &name, std::shared_ptr<llaminar::TensorBase> embedding_weights)
     : TransformerNode(name, "Embedding"), embedding_weights_(embedding_weights) {}
 
 bool EmbeddingNode::execute()
@@ -522,7 +523,7 @@ bool EmbeddingNode::execute()
         return false;
     }
 
-    const auto &weight_shape = embedding_weights_->shape;
+    const auto &weight_shape = embedding_weights_->shape();
     if (weight_shape.size() != 2)
     {
         LOG_ERROR("Embedding: Invalid weight shape");
@@ -533,8 +534,8 @@ bool EmbeddingNode::execute()
     int n_embd = weight_shape[1];
     int seq_len = token_ids_.size();
 
-    const float *weight_data = embedding_weights_->ptr();
-    float *output_data = output_tensor_->ptr();
+    const float *weight_data = embedding_weights_->data();
+    float *output_data = output_tensor_->data();
 
     // Lookup embeddings for each token
     for (int s = 0; s < seq_len; ++s)
@@ -558,13 +559,13 @@ bool EmbeddingNode::execute()
 
 bool EmbeddingNode::validate() const
 {
-    return embedding_weights_ && embedding_weights_->shape.size() == 2;
+    return embedding_weights_ && embedding_weights_->shape().size() == 2;
 }
 
 // LinearNode implementation
 LinearNode::LinearNode(const std::string &name,
-                       std::shared_ptr<Tensor> weight,
-                       std::shared_ptr<Tensor> bias)
+                       std::shared_ptr<llaminar::TensorBase> weight,
+                       std::shared_ptr<llaminar::TensorBase> bias)
     : TransformerNode(name, "Linear"), weight_(weight), bias_(bias) {}
 
 bool LinearNode::execute()
@@ -575,8 +576,8 @@ bool LinearNode::execute()
         return false;
     }
 
-    const auto &input_shape = input_tensor_->shape;
-    const auto &weight_shape = weight_->shape;
+    const auto &input_shape = input_tensor_->shape();
+    const auto &weight_shape = weight_->shape();
 
     if (input_shape.size() != 2 || weight_shape.size() != 2)
     {
@@ -594,9 +595,9 @@ bool LinearNode::execute()
         return false;
     }
 
-    const float *input_data = input_tensor_->ptr();
-    const float *weight_data = weight_->ptr();
-    float *output_data = output_tensor_->ptr();
+    const float *input_data = input_tensor_->data();
+    const float *weight_data = weight_->data();
+    float *output_data = output_tensor_->data();
 
     // Matrix multiplication: output = input * weight^T
     // Using CBLAS for efficient computation
@@ -609,7 +610,7 @@ bool LinearNode::execute()
     // Add bias if present
     if (bias_)
     {
-        const float *bias_data = bias_->ptr();
+        const float *bias_data = bias_->data();
         for (int s = 0; s < seq_len; ++s)
         {
             for (int o = 0; o < out_features; ++o)
@@ -625,7 +626,7 @@ bool LinearNode::execute()
 
 bool LinearNode::validate() const
 {
-    return weight_ && weight_->shape.size() == 2;
+    return weight_ && weight_->shape().size() == 2;
 }
 
 // KernelNode implementation
@@ -694,22 +695,22 @@ bool KernelNode::validate() const
     return kernel_->validate(input_tensors_, output_tensors_);
 }
 
-void KernelNode::setInputTensors(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs)
+void KernelNode::setInputTensors(const std::vector<std::shared_ptr<llaminar::TensorBase>> &inputs)
 {
     input_tensors_ = inputs;
 }
 
-void KernelNode::setOutputTensors(const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs)
+void KernelNode::setOutputTensors(const std::vector<std::shared_ptr<llaminar::TensorBase>> &outputs)
 {
     output_tensors_ = outputs;
 }
 
-void KernelNode::addInputTensor(std::shared_ptr<llaminar::Tensor> input)
+void KernelNode::addInputTensor(std::shared_ptr<llaminar::TensorBase> input)
 {
     input_tensors_.push_back(input);
 }
 
-void KernelNode::addOutputTensor(std::shared_ptr<llaminar::Tensor> output)
+void KernelNode::addOutputTensor(std::shared_ptr<llaminar::TensorBase> output)
 {
     output_tensors_.push_back(output);
 }

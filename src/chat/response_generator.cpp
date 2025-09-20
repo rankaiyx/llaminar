@@ -1,0 +1,461 @@
+#include "response_generator.h"
+#include "../logger.h"
+#include <algorithm>
+#include <random>
+#include <numeric>
+#include <cmath>
+#include <chrono>
+
+namespace llaminar
+{
+    namespace chat
+    {
+
+        ResponseGenerator::ResponseGenerator(std::shared_ptr<TokenizerInterface> tokenizer,
+                                             std::shared_ptr<MPITransformerPipeline> pipeline,
+                                             const LlaminarParams &params)
+            : tokenizer_(tokenizer), pipeline_(pipeline), params_(params), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.max_tokens > 0 ? params.max_tokens : 512)
+        {
+            if (!pipeline_)
+            {
+                throw std::invalid_argument("Pipeline cannot be null");
+            }
+
+            // Load model weights
+            LOG_INFO("Loading model weights from: " << params_.model_file);
+            weights_ = loadModelWeights(params_.model_file, pipeline_->getConfig());
+            LOG_INFO("Model weights loaded successfully");
+
+            // Initialize default stop tokens
+            if (tokenizer_)
+            {
+                int32_t eos_token = tokenizer_->getSpecialToken("eos");
+                if (eos_token != -1)
+                {
+                    stop_tokens_.push_back(eos_token);
+                }
+            }
+
+            // Default stop sequences
+            stop_sequences_ = {"<|im_end|>", "</s>", "<|endoftext|>"};
+
+            LOG_INFO("ResponseGenerator initialized - temp: " << temperature_
+                                                              << ", top_k: " << top_k_ << ", top_p: " << top_p_
+                                                              << ", max_tokens: " << max_tokens_);
+        }
+
+        ResponseGenerator::ResponseGenerator(std::shared_ptr<TokenizerInterface> tokenizer,
+                                             std::shared_ptr<MPITransformerPipeline> pipeline,
+                                             const LlaminarParams &params,
+                                             const MPITransformerPipeline::ModelWeights &weights)
+            : tokenizer_(tokenizer), pipeline_(pipeline), params_(params), weights_(weights), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.max_tokens > 0 ? params.max_tokens : 512)
+        {
+            if (!pipeline_)
+            {
+                throw std::invalid_argument("Pipeline cannot be null");
+            }
+
+            LOG_INFO("Using pre-loaded model weights");
+
+            // Initialize default stop tokens
+            if (tokenizer_)
+            {
+                int32_t eos_token = tokenizer_->getSpecialToken("eos");
+                if (eos_token != -1)
+                {
+                    stop_tokens_.push_back(eos_token);
+                }
+            }
+
+            // Default stop sequences
+            stop_sequences_ = {"<|im_end|>", "</s>", "<|endoftext|>"};
+
+            LOG_INFO("ResponseGenerator initialized with pre-loaded weights - temp: " << temperature_
+                                                                                      << ", top_k: " << top_k_ << ", top_p: " << top_p_
+                                                                                      << ", max_tokens: " << max_tokens_);
+        }
+
+        std::string ResponseGenerator::generateResponse(const std::vector<int32_t> &prompt_tokens,
+                                                        ResponseCallback callback)
+        {
+            if (prompt_tokens.empty())
+            {
+                LOG_ERROR("Cannot generate response from empty prompt");
+                return "";
+            }
+
+            LOG_INFO("Starting response generation for " << prompt_tokens.size() << " prompt tokens");
+
+            try
+            {
+                std::vector<int32_t> generated_tokens;
+                std::string response_text;
+
+                // Current token sequence includes prompt + generated tokens
+                std::vector<int32_t> current_sequence = prompt_tokens;
+
+                for (int32_t step = 0; step < max_tokens_; ++step)
+                {
+                    // Run inference to get next token probabilities
+                    std::shared_ptr<TensorBase> output;
+                    bool success = pipeline_->execute(current_sequence, weights_, output);
+
+                    if (!success || !output)
+                    {
+                        LOG_ERROR("Pipeline execution failed at step " << step);
+                        break;
+                    }
+
+                    // Extract logits for next token prediction
+                    // The output should be [seq_len, vocab_size], we want the last position
+                    const float *output_data = output->data();
+                    const auto &shape = output->shape();
+
+                    if (shape.size() != 2)
+                    {
+                        LOG_ERROR("Unexpected output shape from pipeline");
+                        break;
+                    }
+
+                    size_t seq_len = shape[0];
+                    size_t vocab_size = shape[1];
+
+                    // Get logits for the last token position
+                    std::vector<float> logits(output_data + (seq_len - 1) * vocab_size,
+                                              output_data + seq_len * vocab_size);
+
+                    // Sample next token
+                    int32_t next_token = sampleToken(logits);
+
+                    // Debug: Print first few logits and the sampled token
+                    std::cout << "Logits[0-9]: ";
+                    for (size_t i = 0; i < std::min(logits.size(), size_t(10)); ++i)
+                    {
+                        std::cout << logits[i] << " ";
+                    }
+                    std::cout << "... Sampled token: " << next_token << std::endl;
+
+                    if (next_token < 0)
+                    {
+                        LOG_WARN("Invalid token sampled, stopping generation");
+                        break;
+                    }
+
+                    generated_tokens.push_back(next_token);
+                    current_sequence.push_back(next_token);
+
+                    // Convert token to text if we have a tokenizer
+                    std::string token_text;
+                    if (tokenizer_)
+                    {
+                        token_text = tokenizer_->getTokenString(next_token);
+                        response_text += token_text;
+                    }
+                    else
+                    {
+                        token_text = "[" + std::to_string(next_token) + "]";
+                        response_text += token_text;
+                    }
+
+                    // Call streaming callback if provided
+                    if (callback)
+                    {
+                        callback(token_text, false);
+                    }
+
+                    // Check stop conditions
+                    if (shouldStop(generated_tokens, response_text))
+                    {
+                        LOG_DEBUG("Stop condition met at step " << step);
+                        break;
+                    }
+
+                    LOG_TRACE("Generated token " << step << ": " << next_token << " -> \"" << token_text << "\"");
+                }
+
+                // Call final callback
+                if (callback)
+                {
+                    callback("", true);
+                }
+
+                LOG_INFO("Response generation completed. Generated " << generated_tokens.size() << " tokens");
+                return response_text;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("Response generation failed: " << e.what());
+                return "";
+            }
+        }
+
+        std::string ResponseGenerator::generateStreamingResponse(const std::vector<int32_t> &prompt_tokens,
+                                                                 ResponseCallback callback)
+        {
+            // This is essentially the same as generateResponse but ensures callback is called
+            if (!callback)
+            {
+                LOG_WARN("No callback provided for streaming response, using regular generation");
+                return generateResponse(prompt_tokens);
+            }
+
+            return generateResponse(prompt_tokens, callback);
+        }
+
+        void ResponseGenerator::setGenerationParams(float temperature, int32_t top_k,
+                                                    float top_p, int32_t max_tokens)
+        {
+            temperature_ = std::max(0.0f, temperature);
+            top_k_ = std::max(1, top_k);
+            top_p_ = std::max(0.0f, std::min(1.0f, top_p));
+            max_tokens_ = std::max(1, max_tokens);
+
+            LOG_DEBUG("Updated generation parameters - temp: " << temperature_
+                                                               << ", top_k: " << top_k_ << ", top_p: " << top_p_
+                                                               << ", max_tokens: " << max_tokens_);
+        }
+
+        void ResponseGenerator::setStopConditions(const std::vector<int32_t> &stop_tokens,
+                                                  const std::vector<std::string> &stop_sequences)
+        {
+            stop_tokens_ = stop_tokens;
+            stop_sequences_ = stop_sequences;
+
+            LOG_DEBUG("Updated stop conditions - " << stop_tokens_.size() << " tokens, "
+                                                   << stop_sequences_.size() << " sequences");
+        }
+
+        bool ResponseGenerator::shouldStop(const std::vector<int32_t> &tokens,
+                                           const std::string &text) const
+        {
+            // Check stop tokens
+            if (!tokens.empty())
+            {
+                int32_t last_token = tokens.back();
+                if (std::find(stop_tokens_.begin(), stop_tokens_.end(), last_token) != stop_tokens_.end())
+                {
+                    return true;
+                }
+            }
+
+            // Check stop sequences
+            for (const auto &stop_seq : stop_sequences_)
+            {
+                if (text.find(stop_seq) != std::string::npos)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        int32_t ResponseGenerator::sampleToken(const std::vector<float> &logits)
+        {
+            if (logits.empty())
+            {
+                LOG_ERROR("Cannot sample from empty logits");
+                return -1;
+            }
+
+            std::vector<float> processed_logits = logits;
+
+            // Debug: Show initial logit range
+            auto min_max = std::minmax_element(processed_logits.begin(), processed_logits.end());
+            std::cout << "Initial logits range: [" << *min_max.first << ", " << *min_max.second << "]" << std::endl;
+
+            // Apply temperature scaling
+            if (temperature_ != 1.0f)
+            {
+                applyTemperature(processed_logits, temperature_);
+                std::cout << "Applied temperature " << temperature_ << std::endl;
+            }
+
+            // Apply top-k filtering
+            if (top_k_ > 0 && top_k_ < static_cast<int32_t>(processed_logits.size()))
+            {
+                applyTopK(processed_logits, top_k_);
+                std::cout << "Applied top-k " << top_k_ << std::endl;
+            }
+
+            // Apply top-p filtering
+            if (top_p_ < 1.0f)
+            {
+                applyTopP(processed_logits, top_p_);
+                std::cout << "Applied top-p " << top_p_ << std::endl;
+            }
+
+            // Convert to probabilities and sample
+            std::vector<float> probs = softmax(processed_logits);
+
+            // Debug: Show top probabilities
+            std::vector<std::pair<float, int32_t>> top_probs;
+            for (size_t i = 0; i < std::min(probs.size(), size_t(5)); ++i)
+            {
+                top_probs.emplace_back(probs[i], static_cast<int32_t>(i));
+            }
+            std::sort(top_probs.begin(), top_probs.end(), std::greater<>());
+
+            std::cout << "Top probabilities: ";
+            for (const auto &p : top_probs)
+            {
+                std::cout << "tok" << p.second << "=" << p.first << " ";
+            }
+            std::cout << std::endl;
+
+            return sampleFromProbs(probs);
+        }
+
+        void ResponseGenerator::applyTemperature(std::vector<float> &logits, float temperature)
+        {
+            if (temperature <= 0.0f)
+            {
+                // Set to deterministic (argmax)
+                auto max_it = std::max_element(logits.begin(), logits.end());
+                std::fill(logits.begin(), logits.end(), -std::numeric_limits<float>::infinity());
+                *max_it = 0.0f;
+            }
+            else
+            {
+                for (auto &logit : logits)
+                {
+                    logit /= temperature;
+                }
+            }
+        }
+
+        void ResponseGenerator::applyTopK(std::vector<float> &logits, int32_t k)
+        {
+            if (k <= 0 || k >= static_cast<int32_t>(logits.size()))
+            {
+                return;
+            }
+
+            // Find the k-th largest element
+            std::vector<std::pair<float, size_t>> indexed_logits;
+            for (size_t i = 0; i < logits.size(); ++i)
+            {
+                indexed_logits.emplace_back(logits[i], i);
+            }
+
+            std::nth_element(indexed_logits.begin(),
+                             indexed_logits.begin() + k,
+                             indexed_logits.end(),
+                             std::greater<std::pair<float, size_t>>());
+
+            float threshold = indexed_logits[k].first;
+
+            // Zero out logits below threshold
+            for (size_t i = 0; i < logits.size(); ++i)
+            {
+                if (logits[i] < threshold)
+                {
+                    logits[i] = -std::numeric_limits<float>::infinity();
+                }
+            }
+        }
+
+        void ResponseGenerator::applyTopP(std::vector<float> &logits, float p)
+        {
+            if (p >= 1.0f)
+            {
+                return;
+            }
+
+            // Convert to probabilities for top-p calculation
+            std::vector<float> probs = softmax(logits);
+
+            // Sort indices by probability
+            std::vector<size_t> indices(probs.size());
+            std::iota(indices.begin(), indices.end(), 0);
+            std::sort(indices.begin(), indices.end(),
+                      [&probs](size_t a, size_t b)
+                      { return probs[a] > probs[b]; });
+
+            // Find cumulative probability cutoff
+            float cumulative_prob = 0.0f;
+            size_t cutoff_idx = indices.size();
+
+            for (size_t i = 0; i < indices.size(); ++i)
+            {
+                cumulative_prob += probs[indices[i]];
+                if (cumulative_prob >= p)
+                {
+                    cutoff_idx = i + 1;
+                    break;
+                }
+            }
+
+            // Zero out logits beyond cutoff
+            for (size_t i = cutoff_idx; i < indices.size(); ++i)
+            {
+                logits[indices[i]] = -std::numeric_limits<float>::infinity();
+            }
+        }
+
+        std::vector<float> ResponseGenerator::softmax(const std::vector<float> &logits)
+        {
+            if (logits.empty())
+            {
+                return {};
+            }
+
+            // Find max for numerical stability
+            float max_logit = *std::max_element(logits.begin(), logits.end());
+
+            // Compute exponentials
+            std::vector<float> probs(logits.size());
+            float sum = 0.0f;
+
+            for (size_t i = 0; i < logits.size(); ++i)
+            {
+                probs[i] = std::exp(logits[i] - max_logit);
+                sum += probs[i];
+            }
+
+            // Normalize
+            if (sum > 0.0f)
+            {
+                for (auto &prob : probs)
+                {
+                    prob /= sum;
+                }
+            }
+
+            return probs;
+        }
+
+        int32_t ResponseGenerator::sampleFromProbs(const std::vector<float> &probs)
+        {
+            if (probs.empty())
+            {
+                return -1;
+            }
+
+            // Use random generator with current time seed
+            static thread_local std::mt19937 gen(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+
+            float random_value = dis(gen);
+            float cumulative = 0.0f;
+
+            std::cout << "Random value: " << random_value << ", sampling..." << std::endl;
+
+            for (size_t i = 0; i < probs.size(); ++i)
+            {
+                cumulative += probs[i];
+                if (random_value <= cumulative)
+                {
+                    std::cout << "Selected token " << i << " at cumulative " << cumulative << std::endl;
+                    return static_cast<int32_t>(i);
+                }
+            }
+
+            // Fallback to last token
+            std::cout << "Fallback to last token " << (probs.size() - 1) << std::endl;
+            return static_cast<int32_t>(probs.size() - 1);
+        }
+
+    } // namespace chat
+} // namespace llaminar

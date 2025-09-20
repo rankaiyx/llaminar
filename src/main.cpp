@@ -11,6 +11,14 @@
 #include "topology_manager.h"
 #include "graph_compute.h"
 #include "model_loader.h"
+#include "mpi_transformer_pipeline.h"
+
+// Chat interface components
+#include "chat/tokenizer_interface.h"
+#include "chat/gguf_tokenizer.h"
+#include "chat/chat_session.h"
+#include "chat/chat_interface.h"
+#include "chat/response_generator.h"
 // Note: inference_engine.h removed until llama.cpp dependency is resolved
 
 using namespace llaminar;
@@ -77,23 +85,20 @@ int main(int argc, char *argv[])
 
         LOG_DEBUG("System initialization complete");
 
-        // 4. Handle COSMA testing vs benchmark mode
-        if (params.inference_mode || !params.model_file.empty())
+        // 4. Handle different execution modes
+        if (params.interactive && !params.model_file.empty())
         {
-            // COSMA testing mode (inference engine temporarily disabled)
-            LOG_INFO("Running COSMA testing mode");
-            LOG_INFO("Note: Full inference mode is temporarily disabled while removing llama.cpp dependency");
-            LOG_INFO("Use 'mpirun -np 2 ./build/tests/test_cosma' to test COSMA kernels");
-
-            if (rank == 0)
+            // Interactive chat mode - this will be implemented after model loading
+            LOG_INFO("Interactive chat mode requested");
+            LOG_INFO("Model file: " << params.model_file);
+        }
+        else if (params.inference_mode || !params.model_file.empty())
+        {
+            // Standard inference mode (non-interactive)
+            LOG_INFO("Running inference mode");
+            if (!params.model_file.empty())
             {
-                std::cout << "\n=== COSMA MatMul Kernel Available ===" << std::endl;
-                std::cout << "The refactored MatMulKernel is ready for use:" << std::endl;
-                std::cout << "- Uses high-performance COSMA library" << std::endl;
-                std::cout << "- Works with new Tensor architecture" << std::endl;
-                std::cout << "- No kernel manager registration needed" << std::endl;
-                std::cout << "- Compatible with other kernels (RMSNorm, Linear, etc.)" << std::endl;
-                std::cout << "======================================" << std::endl;
+                LOG_INFO("Model file: " << params.model_file);
             }
         }
         else
@@ -148,6 +153,9 @@ int main(int argc, char *argv[])
 
         // 5. Load model if specified
         std::unique_ptr<ModelLoader> model_loader;
+        std::unique_ptr<MPITransformerPipeline> transformer_pipeline;
+        std::unique_ptr<MPITransformerPipeline::ModelWeights> model_weights;
+
         if (!params.model_file.empty())
         {
             LOG_INFO("Loading model from: " << params.model_file);
@@ -158,7 +166,34 @@ int main(int argc, char *argv[])
                 if (model_loader->loadModel(params.model_file))
                 {
                     LOG_INFO("Model loaded successfully");
-                    LOG_INFO("Model inference pipeline will be implemented in future versions");
+
+                    // Extract transformer configuration from GGUF metadata
+                    auto config = model_loader->createLayerConfig();
+                    LOG_INFO("Extracted model config: " << config.n_layers << " layers, "
+                                                        << config.n_head << " heads, " << config.d_model << " dimensions");
+                    LOG_INFO("Model config details: vocab_size=" << config.vocab_size
+                                                                 << ", max_seq_len=" << config.max_seq_len << ", d_ff=" << config.d_ff);
+
+                    // Model is fully loaded (including weights) after successful loadModel() call
+                    LOG_INFO("Model weights are available for tensor loading");
+
+                    // Initialize MPI transformer pipeline with model configuration
+                    transformer_pipeline = std::make_unique<MPITransformerPipeline>(config);
+                    LOG_INFO("Transformer pipeline initialized successfully");
+
+                    // Load model weights for transformer pipeline
+                    try
+                    {
+                        model_weights = std::make_unique<MPITransformerPipeline::ModelWeights>(
+                            loadModelWeights(params.model_file, config));
+                        LOG_INFO("Model weights loaded for transformer pipeline");
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_ERROR("Failed to load model weights: " << e.what());
+                        MPI_Finalize();
+                        return 1;
+                    }
                 }
                 else
                 {
@@ -178,20 +213,182 @@ int main(int argc, char *argv[])
         // 6. Create compute graph and execute workload
         ComputeGraph graph;
 
-        if (model_loader)
+        // Interactive chat mode
+        if (params.interactive && transformer_pipeline)
+        {
+            if (rank == 0)
+            {
+                // Create tokenizer
+                auto tokenizer = chat::createTokenizer(*model_loader);
+                if (!tokenizer || !tokenizer->isReady())
+                {
+                    LOG_ERROR("Failed to initialize tokenizer for chat interface");
+                    MPI_Finalize();
+                    return 1;
+                }
+                // Create shared tokenizer for multiple usage
+                auto tokenizer_shared = std::shared_ptr<chat::TokenizerInterface>(tokenizer.release());
+
+                // Create chat session - needs a copy of tokenizer
+                auto tokenizer_copy = chat::createTokenizer(*model_loader);
+                auto session = std::make_unique<chat::ChatSession>(std::move(tokenizer_copy), params);
+
+                // Create response generator
+                auto shared_pipeline = std::shared_ptr<MPITransformerPipeline>(std::move(transformer_pipeline));
+                auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params);
+
+                // Launch chat interface
+                chat::ChatInterface chat_ui(std::move(session), shared_pipeline, std::move(generator), params);
+                chat_ui.run();
+            }
+            else
+            {
+                // Non-root ranks: wait for inference requests (to be implemented)
+                // For now, just idle
+                while (true)
+                {
+                    MPI_Barrier(MPI_COMM_WORLD);
+                }
+            }
+            MPI_Finalize();
+            return 0;
+        }
+
+        // Non-interactive prompt processing (--prompt or --eval)
+        if (transformer_pipeline && (!params.prompt.empty() || params.eval_only))
+        {
+            if (rank == 0)
+            {
+                LOG_INFO("Running non-interactive prompt processing");
+
+                // Create tokenizer
+                auto tokenizer = chat::createTokenizer(*model_loader);
+                if (!tokenizer || !tokenizer->isReady())
+                {
+                    LOG_ERROR("Failed to initialize tokenizer for prompt processing");
+                    MPI_Finalize();
+                    return 1;
+                }
+                auto tokenizer_shared = std::shared_ptr<chat::TokenizerInterface>(tokenizer.release());
+
+                // Create response generator with pre-loaded weights
+                auto shared_pipeline = std::shared_ptr<MPITransformerPipeline>(std::move(transformer_pipeline));
+                auto generator = std::make_unique<chat::ResponseGenerator>(tokenizer_shared, shared_pipeline, params, *model_weights);
+
+                // Process prompt
+                std::string prompt_text = params.prompt.empty() ? "hello world" : params.prompt;
+                LOG_INFO("Processing prompt: \"" << prompt_text << "\"");
+
+                // Tokenize prompt
+                std::vector<int32_t> prompt_tokens = tokenizer_shared->tokenize(prompt_text);
+                LOG_INFO("Tokenized to " << prompt_tokens.size() << " tokens");
+
+                if (params.eval_only)
+                {
+                    // Just print tokenization and exit
+                    std::cout << "Prompt: \"" << prompt_text << "\"" << std::endl;
+                    std::cout << "Tokens: [";
+                    for (size_t i = 0; i < prompt_tokens.size(); ++i)
+                    {
+                        if (i > 0)
+                            std::cout << ", ";
+                        std::cout << prompt_tokens[i];
+                    }
+                    std::cout << "]" << std::endl;
+                    std::cout << "Token count: " << prompt_tokens.size() << std::endl;
+
+                    // Optionally print token strings
+                    std::cout << "Token strings: [";
+                    for (size_t i = 0; i < prompt_tokens.size(); ++i)
+                    {
+                        if (i > 0)
+                            std::cout << ", ";
+                        std::string token_str = tokenizer_shared->detokenize({prompt_tokens[i]});
+                        std::cout << "\"" << token_str << "\"";
+                    }
+                    std::cout << "]" << std::endl;
+                }
+                else
+                {
+                    // Generate response
+                    try
+                    {
+                        std::string response = generator->generateResponse(prompt_tokens);
+                        std::cout << "Response: " << response << std::endl;
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_ERROR("Exception during response generation: " << e.what());
+                        MPI_Finalize();
+                        return 1;
+                    }
+                }
+
+                // Signal completion to other ranks
+                int completion_signal = 1;
+                MPI_Bcast(&completion_signal, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            }
+            else
+            {
+                // Non-root ranks: wait for completion signal
+                int completion_signal = 0;
+                MPI_Bcast(&completion_signal, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                LOG_DEBUG("Non-root rank " << rank << " received completion signal");
+            }
+            MPI_Finalize();
+            return 0;
+        }
+
+        if (transformer_pipeline && model_weights)
         {
             // Model inference workflow
-            LOG_INFO("Setting up model inference pipeline...");
+            LOG_INFO("Setting up transformer inference pipeline...");
 
-            // TODO: Add model-specific compute graph construction
-            // For now, demonstrate with a simple matrix multiplication
-            LOG_WARN("Model-specific inference not implemented yet, running matrix multiplication demo");
+            // Test inference with simple token sequence
+            std::vector<int> input_tokens = {1, 2, 3, 4, 5}; // Simple test sequence
+            LOG_INFO("Running inference on " << input_tokens.size() << " tokens");
+
+            try
+            {
+                std::shared_ptr<TensorBase> output;
+                bool success = transformer_pipeline->execute(input_tokens, *model_weights, output);
+
+                if (success && rank == 0)
+                {
+                    LOG_INFO("Inference completed successfully!");
+                    LOG_INFO("Output shape: [" << output->shape()[0] << ", " << output->shape()[1] << "]");
+
+                    // Print first few output values
+                    const float *output_data = output->data();
+                    LOG_INFO("First 10 output values:");
+                    for (int i = 0; i < std::min(10, (int)output->shape()[1]); ++i)
+                    {
+                        LOG_INFO("  [" << i << "] = " << output_data[i]);
+                    }
+                }
+                else if (!success)
+                {
+                    LOG_ERROR("Transformer pipeline execution failed");
+                    MPI_Finalize();
+                    return 1;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("Exception during inference: " << e.what());
+                MPI_Finalize();
+                return 1;
+            }
+        }
+        else if (model_loader)
+        {
+            // Model loaded but no transformer pipeline (fallback)
+            LOG_INFO("Model loaded but transformer pipeline not initialized");
+            LOG_WARN("Running matrix multiplication demo instead");
 
             int matrix_size = params.m;
-
             LOG_INFO("Running matrix multiplication benchmark: " << matrix_size << "x" << matrix_size);
 
-            // Add matrix multiplication node
             auto node = std::make_shared<MatMulNode>(
                 "model_matmul_demo",
                 matrix_size, matrix_size, matrix_size);
@@ -210,51 +407,58 @@ int main(int argc, char *argv[])
             graph.addNode(node);
         }
 
-        // 7. Execute compute graph
-        LOG_INFO("Executing compute graph...");
-
-        auto start_time = std::chrono::high_resolution_clock::now();
-
-        for (int i = 0; i < params.num_repeat; ++i)
+        // 7. Execute compute graph (if not already executed by transformer pipeline)
+        if (!transformer_pipeline || !model_weights)
         {
-            bool success = graph.execute();
+            LOG_INFO("Executing compute graph...");
 
-            if (!success)
+            auto start_time = std::chrono::high_resolution_clock::now();
+
+            for (int i = 0; i < params.num_repeat; ++i)
             {
-                LOG_ERROR("Compute graph execution failed on iteration " << i);
-                MPI_Finalize();
-                return 1;
+                bool success = graph.execute();
+
+                if (!success)
+                {
+                    LOG_ERROR("Compute graph execution failed on iteration " << i);
+                    MPI_Finalize();
+                    return 1;
+                }
+
+                if (rank == 0 && params.log_level >= LogLevel::VERBOSITY_DEBUG)
+                {
+                    LOG_DEBUG("Completed iteration " << (i + 1) << "/" << params.num_repeat);
+                }
             }
 
-            if (rank == 0 && params.log_level >= LogLevel::VERBOSITY_DEBUG)
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+
+            // 8. Report performance results
+            if (rank == 0)
             {
-                LOG_DEBUG("Completed iteration " << (i + 1) << "/" << params.num_repeat);
+                LOG_INFO("=== Performance Results ===");
+                LOG_INFO("Total execution time: " << duration.count() << " ms");
+                LOG_INFO("Average time per iteration: " << (duration.count() / params.num_repeat) << " ms");
+
+                if (params.profile_kernels)
+                {
+                    LOG_INFO("=== Kernel Performance ===");
+                    LOG_INFO("Kernel profiling not implemented yet");
+                }
+
+                // Calculate GFLOPS for matrix multiplication
+                if (!model_loader)
+                {
+                    long long ops = 2LL * params.m * params.n * params.k * params.num_repeat;
+                    double gflops = (double)ops / (duration.count() * 1e6);
+                    LOG_INFO("Achieved performance: " << std::fixed << std::setprecision(3) << gflops << " GFLOPS");
+                }
             }
         }
-
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-
-        // 8. Report performance results
-        if (rank == 0)
+        else
         {
-            LOG_INFO("=== Performance Results ===");
-            LOG_INFO("Total execution time: " << duration.count() << " ms");
-            LOG_INFO("Average time per iteration: " << (duration.count() / params.num_repeat) << " ms");
-
-            if (params.profile_kernels)
-            {
-                LOG_INFO("=== Kernel Performance ===");
-                LOG_INFO("Kernel profiling not implemented yet");
-            }
-
-            // Calculate GFLOPS for matrix multiplication
-            if (!model_loader)
-            {
-                long long ops = 2LL * params.m * params.n * params.k * params.num_repeat;
-                double gflops = (double)ops / (duration.count() * 1e6);
-                LOG_INFO("Achieved performance: " << std::fixed << std::setprecision(3) << gflops << " GFLOPS");
-            }
+            LOG_INFO("Transformer inference completed - skipping compute graph execution");
         }
 
         // 9. Validation if requested

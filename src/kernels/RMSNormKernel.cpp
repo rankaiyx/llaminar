@@ -12,8 +12,8 @@ namespace llaminar
         LOG_DEBUG("RMSNormKernel initialized with epsilon=" + std::to_string(epsilon_));
     }
 
-    bool RMSNormKernel::execute(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                                std::vector<std::shared_ptr<Tensor>> &outputs)
+    bool RMSNormKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                                std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         if (!validate(inputs, outputs))
         {
@@ -26,11 +26,11 @@ namespace llaminar
         auto weight = inputs[1];  // [hidden_size]
         auto output = outputs[0]; // [seq_len, hidden_size]
 
-        int seq_len = input->shape[0];
-        int hidden_size = input->shape[1];
+        int seq_len = input->shape()[0];
+        int hidden_size = input->shape()[1];
 
-        computeRMSNorm(input->data.data(), weight->data.data(),
-                       output->data.data(), seq_len, hidden_size);
+        computeRMSNorm(input->data(), weight->data(),
+                       output->data(), seq_len, hidden_size);
 
         auto end = std::chrono::high_resolution_clock::now();
         double execution_time = std::chrono::duration<double, std::milli>(end - start).count();
@@ -39,8 +39,8 @@ namespace llaminar
         return true;
     }
 
-    bool RMSNormKernel::validate(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                                 const std::vector<std::shared_ptr<Tensor>> &outputs) const
+    bool RMSNormKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                                 const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         if (inputs.size() != 2)
         {
@@ -58,15 +58,15 @@ namespace llaminar
         auto weight = inputs[1];
         auto output = outputs[0];
 
-        if (input->shape.size() != 2 || weight->shape.size() != 1 || output->shape.size() != 2)
+        if (input->shape().size() != 2 || weight->shape().size() != 1 || output->shape().size() != 2)
         {
             LOG_ERROR("RMSNorm tensor shape mismatch");
             return false;
         }
 
-        if (input->shape[1] != weight->shape[0] ||
-            input->shape[0] != output->shape[0] ||
-            input->shape[1] != output->shape[1])
+        if (input->shape()[1] != weight->shape()[0] ||
+            input->shape()[0] != output->shape()[0] ||
+            input->shape()[1] != output->shape()[1])
         {
             LOG_ERROR("RMSNorm dimension mismatch");
             return false;

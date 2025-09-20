@@ -79,20 +79,4 @@ namespace llaminar
     // Forward declaration - full definition in tensor_factory.h
     class TensorFactory;
 
-    // Graph Compute Compatibility Bridge
-    class GraphTensorBridge
-    {
-    public:
-        // Convert legacy Tensor to optimal TensorBase for kernels
-        static std::shared_ptr<TensorBase> optimize_for_kernel(std::shared_ptr<llaminar::Tensor> legacy_tensor,
-                                                               const std::string &operation_type = "");
-
-        // Convert TensorBase back to legacy Tensor for graph system
-        static std::shared_ptr<llaminar::Tensor> to_graph_tensor(std::shared_ptr<TensorBase> tensor);
-
-        // Auto-upgrade tensor for kernel execution (zero-copy when possible)
-        static std::shared_ptr<TensorBase> auto_upgrade(std::shared_ptr<llaminar::Tensor> legacy_tensor,
-                                                        const std::string &kernel_type = "");
-    };
-
 } // namespace llaminar

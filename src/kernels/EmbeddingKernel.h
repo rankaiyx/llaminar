@@ -1,6 +1,5 @@
 #pragma once
 
-#include "../tensor.h"
 #include "../kernel_base.h"
 #include <string>
 #include <vector>
@@ -19,11 +18,11 @@ namespace llaminar
         ~EmbeddingKernel() = default;
 
         // KernelBase interface implementation
-        bool execute(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                     std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) override;
+        bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                     std::vector<std::shared_ptr<TensorBase>> &outputs) override;
 
-        bool validate(const std::vector<std::shared_ptr<llaminar::Tensor>> &inputs,
-                      const std::vector<std::shared_ptr<llaminar::Tensor>> &outputs) const override;
+        bool validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                      const std::vector<std::shared_ptr<TensorBase>> &outputs) const override;
 
         std::string getKernelType() const override { return "Embedding"; }
         size_t getExpectedInputCount() const override { return 2; }

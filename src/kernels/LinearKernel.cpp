@@ -5,8 +5,8 @@
 namespace llaminar
 {
 
-    bool LinearKernel::execute(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                               std::vector<std::shared_ptr<Tensor>> &outputs)
+    bool LinearKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                               std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         if (!validate(inputs, outputs))
         {
@@ -22,21 +22,21 @@ namespace llaminar
         const float *bias = nullptr;
         if (inputs.size() >= 3 && inputs[2])
         {
-            bias = inputs[2]->data.data();
+            bias = inputs[2]->data();
         }
 
-        size_t seq_len = input->shape[0];
-        size_t input_size = input->shape[1];
-        size_t output_size = weight->shape[1];
+        size_t seq_len = input->shape()[0];
+        size_t input_size = input->shape()[1];
+        size_t output_size = weight->shape()[1];
 
-        computeLinear(input->data.data(), weight->data.data(), bias,
-                      output->data.data(), seq_len, input_size, output_size);
+        computeLinear(input->data(), weight->data(), bias,
+                      output->data(), seq_len, input_size, output_size);
 
         return true;
     }
 
-    bool LinearKernel::validate(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                                const std::vector<std::shared_ptr<Tensor>> &outputs) const
+    bool LinearKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                                const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         if (inputs.size() < 2 || inputs.size() > 3 || outputs.size() != 1)
         {
@@ -55,30 +55,30 @@ namespace llaminar
         }
 
         // Check input is 2D [seq_len, input_size]
-        if (input->shape.size() != 2)
+        if (input->shape().size() != 2)
         {
-            LOG_ERROR("LinearKernel: Input must be 2D, got " << input->shape.size() << " dimensions");
+            LOG_ERROR("LinearKernel: Input must be 2D, got " << input->shape().size() << " dimensions");
             return false;
         }
 
         // Check weight is 2D [input_size, output_size]
-        if (weight->shape.size() != 2)
+        if (weight->shape().size() != 2)
         {
-            LOG_ERROR("LinearKernel: Weight must be 2D, got " << weight->shape.size() << " dimensions");
+            LOG_ERROR("LinearKernel: Weight must be 2D, got " << weight->shape().size() << " dimensions");
             return false;
         }
 
         // Check dimensions match
-        if (input->shape[1] != weight->shape[0])
+        if (input->shape()[1] != weight->shape()[0])
         {
-            LOG_ERROR("LinearKernel: Input size " << input->shape[1] << " doesn't match weight input size " << weight->shape[0]);
+            LOG_ERROR("LinearKernel: Input size " << input->shape()[1] << " doesn't match weight input size " << weight->shape()[0]);
             return false;
         }
 
         // Check output is 2D [seq_len, output_size]
-        if (output->shape.size() != 2 ||
-            output->shape[0] != input->shape[0] ||
-            output->shape[1] != weight->shape[1])
+        if (output->shape().size() != 2 ||
+            output->shape()[0] != input->shape()[0] ||
+            output->shape()[1] != weight->shape()[1])
         {
             LOG_ERROR("LinearKernel: Output shape mismatch");
             return false;
@@ -88,7 +88,7 @@ namespace llaminar
         if (inputs.size() == 3 && inputs[2])
         {
             auto bias = inputs[2];
-            if (bias->shape.size() != 1 || bias->shape[0] != weight->shape[1])
+            if (bias->shape().size() != 1 || bias->shape()[0] != weight->shape()[1])
             {
                 LOG_ERROR("LinearKernel: Bias shape mismatch");
                 return false;

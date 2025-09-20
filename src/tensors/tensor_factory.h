@@ -3,7 +3,6 @@
 #include "tensor_base.h"
 #include "simple_tensor.h"
 #include "cosma_tensor.h"
-#include "../tensor.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -44,14 +43,6 @@ namespace llaminar
         // Type-specific accessors
         static std::shared_ptr<SimpleTensor> to_simple_tensor(std::shared_ptr<llaminar::TensorBase> tensor);
         static std::shared_ptr<COSMATensor> to_cosma_tensor(std::shared_ptr<llaminar::TensorBase> tensor);
-
-        // Legacy tensor conversion
-        static std::shared_ptr<llaminar::TensorBase> from_tensor(std::shared_ptr<llaminar::Tensor> legacy_tensor);
-        static std::shared_ptr<llaminar::Tensor> to_tensor(std::shared_ptr<llaminar::TensorBase> tensor);
-
-        // Utility functions
-        static void copy_from_simple_tensor(std::shared_ptr<llaminar::Tensor> source,
-                                            std::shared_ptr<llaminar::TensorBase> destination);
 
     private:
         TensorFactory() = default; // Static class, no instantiation

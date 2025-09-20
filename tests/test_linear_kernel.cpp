@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/kernels/LinearKernel.h"
+#include "../src/tensors/tensor_factory.h"
 #include "graph_compute.h"
 #include <memory>
 #include <chrono>
@@ -16,22 +17,20 @@ protected:
 
     std::unique_ptr<LinearKernel> kernel;
 
-    std::shared_ptr<Tensor> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
+    std::shared_ptr<TensorBase> createTensor(const std::vector<int> &shape, const std::vector<float> &data)
     {
-        auto tensor = std::make_shared<Tensor>();
-        tensor->shape = shape;
-        tensor->data = data;
+        auto tensor = llaminar::TensorFactory::create_simple(shape, data);
         return tensor;
     }
 
-    void assertTensorEqual(const Tensor &actual, const std::vector<float> &expected, float tolerance = 1e-6f)
+    void assertTensorEqual(const TensorBase &actual, const std::vector<float> &expected, float tolerance = 1e-6f)
     {
-        ASSERT_EQ(actual.data.size(), expected.size());
+        ASSERT_EQ([](const TensorBase& t){ size_t sz=1; for(int d:t.shape()) sz*=d; return sz; }(actual), expected.size());
         for (size_t i = 0; i < expected.size(); ++i)
         {
-            EXPECT_NEAR(actual.data[i], expected[i], tolerance)
+            EXPECT_NEAR(actual.data()[i], expected[i], tolerance)
                 << "Mismatch at index " << i << ": expected " << expected[i]
-                << ", got " << actual.data[i];
+                << ", got " << actual.data()[i];
         }
     }
 };
@@ -43,8 +42,8 @@ TEST_F(LinearKernelTest, BasicMatrixMultiplication)
     auto weight = createTensor({2, 2}, {1.0f, 3.0f, 2.0f, 4.0f}); // Column-major order
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -60,8 +59,8 @@ TEST_F(LinearKernelTest, WithBias)
     auto bias = createTensor({2}, {10.0f, 20.0f});
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight, bias};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight, bias};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -76,8 +75,8 @@ TEST_F(LinearKernelTest, BatchProcessing)
     auto weight = createTensor({2, 2}, {1.0f, 3.0f, 2.0f, 4.0f});
     auto output = createTensor({2, 2}, {0.0f, 0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -92,8 +91,8 @@ TEST_F(LinearKernelTest, DifferentDimensions)
     auto weight = createTensor({3, 1}, {1.0f, 2.0f, 3.0f});
     auto output = createTensor({1, 1}, {0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -108,8 +107,8 @@ TEST_F(LinearKernelTest, ZeroWeights)
     auto weight = createTensor({2, 2}, {0.0f, 0.0f, 0.0f, 0.0f});
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -126,8 +125,8 @@ TEST_F(LinearKernelTest, IdentityTransform)
                                         0.0f, 0.0f, 1.0f});
     auto output = createTensor({1, 3}, {0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -142,8 +141,8 @@ TEST_F(LinearKernelTest, LargeNumbers)
     auto weight = createTensor({2, 2}, {0.01f, 0.03f, 0.02f, 0.04f});
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_TRUE(kernel->execute(inputs, outputs));
 
@@ -159,8 +158,8 @@ TEST_F(LinearKernelTest, InputValidation)
     auto input = createTensor({1, 2}, {1.0f, 2.0f});
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input}; // Missing weight
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input}; // Missing weight
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -172,8 +171,8 @@ TEST_F(LinearKernelTest, DimensionMismatch)
     auto weight = createTensor({2, 2}, {1.0f, 2.0f, 3.0f, 4.0f}); // Wrong input size
     auto output = createTensor({1, 2}, {0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -186,8 +185,8 @@ TEST_F(LinearKernelTest, BiasShapeMismatch)
     auto bias = createTensor({2}, {1.0f, 2.0f}); // Should be size 3
     auto output = createTensor({1, 3}, {0.0f, 0.0f, 0.0f});
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight, bias};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight, bias};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     ASSERT_FALSE(kernel->execute(inputs, outputs));
 }
@@ -207,8 +206,8 @@ TEST_F(LinearKernelTest, DISABLED_PerformanceTest)
     auto weight = createTensor({input_size, output_size}, weight_data);
     auto output = createTensor({batch_size, output_size}, output_data);
 
-    std::vector<std::shared_ptr<Tensor>> inputs = {input, weight};
-    std::vector<std::shared_ptr<Tensor>> outputs = {output};
+    std::vector<std::shared_ptr<TensorBase>> inputs = {input, weight};
+    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     auto start = std::chrono::high_resolution_clock::now();
     ASSERT_TRUE(kernel->execute(inputs, outputs));

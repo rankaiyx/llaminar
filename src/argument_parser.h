@@ -19,12 +19,22 @@ struct LlaminarParams
     LogLevel log_level = LogLevel::INFO; // -v, -vv, -vvv
     bool inference_mode = false;         // --inference, -i
     std::string prompt = "";             // -p, --prompt
-    int32_t n_ctx = 2048;                // --ctx-size
+    bool eval_only = false;              // --eval (prompt evaluation only)
+    int32_t ctx_size = 2048;             // --ctx-size (renamed from n_ctx)
     int32_t n_predict = 128;             // --predict
     float temperature = 0.7f;            // --temperature
     int32_t top_k = 40;                  // --top-k
     float top_p = 0.9f;                  // --top-p
+    int32_t max_tokens = 128;            // --predict (alias)
     bool interactive = false;            // --interactive
+
+    // Chat-specific parameters
+    std::string system_prompt = "";     // --system
+    std::string chat_template = "";     // --chat-template
+    bool save_conversation = false;     // --save-chat
+    int32_t max_response_tokens = 512;  // --max-response
+    bool streaming_output = true;       // --stream / --no-stream
+    std::string conversation_file = ""; // --load-conversation
 
     // System configuration
     bool use_hyperthreading = false;

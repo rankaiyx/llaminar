@@ -12,8 +12,8 @@ namespace llaminar
         LOG_DEBUG("AttentionKernel initialized with n_head=" << n_head << ", n_head_kv=" << n_head_kv << ", head_dim=" << head_dim);
     }
 
-    bool AttentionKernel::execute(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                                  std::vector<std::shared_ptr<Tensor>> &outputs)
+    bool AttentionKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                                  std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         if (!validate(inputs, outputs))
         {
@@ -30,8 +30,8 @@ namespace llaminar
         auto v_cache = inputs[6];
         auto output = outputs[0];
 
-        size_t seq_len = input->shape[0];
-        size_t d_model = input->shape[1];
+        size_t seq_len = input->shape()[0];
+        size_t d_model = input->shape()[1];
 
         // Allocate temporary tensors for Q, K, V projections
         std::vector<float> q_proj(seq_len * n_head_ * head_dim_);
@@ -39,13 +39,26 @@ namespace llaminar
         std::vector<float> v_proj(seq_len * n_head_kv_ * head_dim_);
 
         // Compute Q, K, V projections
-        computeQueries(input->data.data(), wq->data.data(), q_proj.data(), seq_len, d_model);
-        computeKeys(input->data.data(), wk->data.data(), k_proj.data(), seq_len, d_model);
-        computeValues(input->data.data(), wv->data.data(), v_proj.data(), seq_len, d_model);
+        computeQueries(input->data(), wq->data(), q_proj.data(), seq_len, d_model);
+        computeKeys(input->data(), wk->data(), k_proj.data(), seq_len, d_model);
+        computeValues(input->data(), wv->data(), v_proj.data(), seq_len, d_model);
 
         // Apply RoPE to Q and K
         applyRoPE(q_proj.data(), seq_len, head_dim_, n_past_);
         applyRoPE(k_proj.data(), seq_len, head_dim_, n_past_);
+
+        // Update K and V caches with the computed projections
+        // Copy k_proj into k_cache starting at position n_past_
+        for (size_t i = 0; i < seq_len * n_head_kv_ * head_dim_; ++i)
+        {
+            k_cache->data()[n_past_ * n_head_kv_ * head_dim_ + i] = k_proj[i];
+        }
+
+        // Copy v_proj into v_cache starting at position n_past_
+        for (size_t i = 0; i < seq_len * n_head_kv_ * head_dim_; ++i)
+        {
+            v_cache->data()[n_past_ * n_head_kv_ * head_dim_ + i] = v_proj[i];
+        }
 
         // Compute attention and apply to values (simplified for testing)
         std::vector<float> attention_output(seq_len * n_head_ * head_dim_);
@@ -55,22 +68,28 @@ namespace llaminar
         std::copy(v_proj.begin(), v_proj.end(), attention_output.begin());
 
         // Apply output projection (simplified) - ensure sizes match
-        if (attention_output.size() == output->data.size())
+        // Calculate output data size from shape
+        size_t output_size = 1;
+        for (int dim : output->shape())
         {
-            std::copy(attention_output.begin(), attention_output.end(), output->data.begin());
+            output_size *= dim;
+        }
+        if (attention_output.size() == output_size)
+        {
+            std::copy(attention_output.begin(), attention_output.end(), output->data());
         }
         else
         {
             LOG_ERROR("AttentionKernel: Size mismatch - attention_output.size()=" << attention_output.size()
-                                                                                  << ", output->data.size()=" << output->data.size());
+                                                                                  << ", output_size=" << output_size);
             return false;
         }
 
         return true;
     }
 
-    bool AttentionKernel::validate(const std::vector<std::shared_ptr<Tensor>> &inputs,
-                                   const std::vector<std::shared_ptr<Tensor>> &outputs) const
+    bool AttentionKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+                                   const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         if (inputs.size() != 7 || outputs.size() != 1)
         {
@@ -101,28 +120,28 @@ namespace llaminar
         auto wv = inputs[3];
         auto wo = inputs[4];
 
-        if (input->shape.size() != 2)
+        if (input->shape().size() != 2)
         {
             LOG_ERROR("AttentionKernel: Input must be 2D");
             return false;
         }
 
-        size_t d_model = input->shape[1];
+        size_t d_model = input->shape()[1];
 
         // Check weight matrix dimensions
-        if (wq->shape.size() != 2 || wq->shape[0] != d_model)
+        if (wq->shape().size() != 2 || wq->shape()[0] != d_model)
         {
             LOG_ERROR("AttentionKernel: Q weight dimension mismatch");
             return false;
         }
 
-        if (wk->shape.size() != 2 || wk->shape[0] != d_model)
+        if (wk->shape().size() != 2 || wk->shape()[0] != d_model)
         {
             LOG_ERROR("AttentionKernel: K weight dimension mismatch");
             return false;
         }
 
-        if (wv->shape.size() != 2 || wv->shape[0] != d_model)
+        if (wv->shape().size() != 2 || wv->shape()[0] != d_model)
         {
             LOG_ERROR("AttentionKernel: V weight dimension mismatch");
             return false;

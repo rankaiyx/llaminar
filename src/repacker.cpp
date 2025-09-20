@@ -1,6 +1,7 @@
 #include "repacker.h"
 #include "graph_compute.h"
-#include "tensor.h"
+#include "tensors/tensor_base.h"
+#include "tensors/tensor_factory.h"
 #include <iostream>
 #include <algorithm>
 #include <numeric>
@@ -12,20 +13,47 @@ COSMATensor::COSMATensor(const std::vector<int> &shape, const std::vector<double
                          const std::string &name)
     : shape_(shape), data_(data), name_(name), distributed_(false), optimized_(false) {}
 
-std::shared_ptr<llaminar::Tensor> COSMATensor::toTensor() const
+std::shared_ptr<llaminar::TensorBase> COSMATensor::toTensorBase() const
 {
-    return std::make_shared<llaminar::Tensor>(shape_, data_);
+    // Convert int vector to size_t for TensorFactory (which needs vector<int>)
+    std::vector<int> int_shape(shape_.begin(), shape_.end());
+    auto tensor = llaminar::TensorFactory::create_simple(int_shape);
+
+    // Copy data (need to convert double to float)
+    float *tensor_data = tensor->data();
+    for (size_t i = 0; i < data_.size(); ++i)
+    {
+        tensor_data[i] = static_cast<float>(data_[i]);
+    }
+
+    return tensor;
 }
 
-std::shared_ptr<COSMATensor> COSMATensor::fromTensor(const std::shared_ptr<llaminar::Tensor> &tensor,
-                                                     const std::string &name)
+std::shared_ptr<COSMATensor> COSMATensor::fromTensorBase(const std::shared_ptr<llaminar::TensorBase> &tensor,
+                                                         const std::string &name)
 {
     if (!tensor)
         return nullptr;
 
+    // Convert shape from vector<int> to vector<int>
+    const auto &tensor_shape = tensor->shape();
+    std::vector<int> int_shape(tensor_shape.begin(), tensor_shape.end());
+
     // Convert float data to double for COSMA
-    std::vector<double> double_data(tensor->data.begin(), tensor->data.end());
-    return std::make_shared<COSMATensor>(tensor->shape, double_data, name);
+    const float *tensor_data = tensor->data();
+    size_t data_size = 1;
+    for (int dim : int_shape)
+    {
+        data_size *= dim;
+    }
+
+    std::vector<double> double_data(data_size);
+    for (size_t i = 0; i < data_size; ++i)
+    {
+        double_data[i] = static_cast<double>(tensor_data[i]);
+    }
+
+    return std::make_shared<COSMATensor>(int_shape, double_data, name);
 }
 
 void COSMATensor::optimizeForCOSMA()
@@ -136,13 +164,13 @@ std::shared_ptr<COSMATensor> TensorRepacker::repackFromGGUF(const GGUFTensorInfo
     return cosma_tensor;
 }
 
-std::shared_ptr<COSMATensor> TensorRepacker::repackFromTensor(const std::shared_ptr<llaminar::Tensor> &tensor,
-                                                              const std::string &name)
+std::shared_ptr<COSMATensor> TensorRepacker::repackFromTensorBase(const std::shared_ptr<llaminar::TensorBase> &tensor,
+                                                                  const std::string &name)
 {
     if (!tensor)
         return nullptr;
 
-    auto cosma_tensor = COSMATensor::fromTensor(tensor, name);
+    auto cosma_tensor = COSMATensor::fromTensorBase(tensor, name);
 
     if (optimize_memory_layout_)
     {
@@ -168,7 +196,7 @@ std::vector<std::shared_ptr<COSMATensor>> TensorRepacker::repackModel(const GGUF
         auto regular_tensor = loader.loadTensor(tensor_info.name);
         if (regular_tensor)
         {
-            auto cosma_tensor = repackFromTensor(regular_tensor, tensor_info.name);
+            auto cosma_tensor = repackFromTensorBase(regular_tensor, tensor_info.name);
             if (cosma_tensor)
             {
                 cosma_tensors.push_back(cosma_tensor);
