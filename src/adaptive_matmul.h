@@ -210,7 +210,7 @@ namespace llaminar
                     auto C_view = prefill_mgr.matmul(A_view, W_handle, m, k, n, false, alpha, beta);
                     prefill_mgr.to_row_major(C_view, C);
                     prefill_mgr.debug_compare_original(A_view, m, k, A);
-                    prefill_mgr.debug_compare_original(W_handle.view, k, n, (const float*)B);
+                    prefill_mgr.debug_compare_original(W_handle.view, k, n, (const float *)B);
                     success = true;
                 }
                 catch (const std::exception &e)

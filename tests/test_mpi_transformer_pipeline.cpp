@@ -239,10 +239,14 @@ TEST_F(MPITransformerPipelineTest, DifferentSequenceLengths)
         {
             // Collect first token's first 5 logits reference on rank 0 then broadcast
             std::array<float, 5> ref_vals{};
-            int rank = -1; int rc_rank = MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            if (rc_rank != MPI_SUCCESS) {
+            int rank = -1;
+            int rc_rank = MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            if (rc_rank != MPI_SUCCESS)
+            {
                 LOG_ERROR("[ReplicatedDiag] MPI_Comm_rank failed inside replicated check (rc=" << rc_rank << ")");
-            } else {
+            }
+            else
+            {
                 LOG_INFO("[ReplicatedDiag] Enter replicated block: seq_len=" << seq_len << ", rank=" << rank << ", world_size=" << world_size);
             }
             if (rank == 0)
@@ -268,7 +272,8 @@ TEST_F(MPITransformerPipelineTest, DifferentSequenceLengths)
                 LOG_INFO(post_capture.str());
                 // Also emit to stderr directly to bypass logger filtering (debug)
                 std::cerr << "[ReplicatedDiag-STDERR] Rank 0 captured first logits: ";
-                for (int i = 0; i < 5; ++i) std::cerr << ref_vals[i] << (i+1<5?' ':'\n');
+                for (int i = 0; i < 5; ++i)
+                    std::cerr << ref_vals[i] << (i + 1 < 5 ? ' ' : '\n');
             }
             MPI_Bcast(ref_vals.data(), 5, MPI_FLOAT, 0, MPI_COMM_WORLD);
             // Post-broadcast diagnostics on all ranks
@@ -286,7 +291,8 @@ TEST_F(MPITransformerPipelineTest, DifferentSequenceLengths)
                 }
                 LOG_INFO(post_bcast.str());
                 std::cerr << "[ReplicatedDiag-STDERR] Rank " << rank << " broadcast ref_vals: ";
-                for (int i = 0; i < 5; ++i) std::cerr << ref_vals[i] << (i+1<5?' ':'\n');
+                for (int i = 0; i < 5; ++i)
+                    std::cerr << ref_vals[i] << (i + 1 < 5 ? ' ' : '\n');
             }
             for (int i = 0; i < 5 && i < config_.vocab_size; ++i)
             {
@@ -299,22 +305,28 @@ TEST_F(MPITransformerPipelineTest, DifferentSequenceLengths)
 }
 
 // Lightweight FNV-1a 64-bit hash for validating cross-rank identical outputs
-static uint64_t fnv1a_hash(const float* data, size_t count) {
+static uint64_t fnv1a_hash(const float *data, size_t count)
+{
     const uint64_t FNV_OFFSET = 1469598103934665603ULL;
     const uint64_t FNV_PRIME = 1099511628211ULL;
     uint64_t h = FNV_OFFSET;
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < count; ++i)
+    {
         // Reinterpret float bits to stable uint32_t then mix
-        uint32_t bits; std::memcpy(&bits, &data[i], sizeof(uint32_t));
-        h ^= bits; h *= FNV_PRIME;
+        uint32_t bits;
+        std::memcpy(&bits, &data[i], sizeof(uint32_t));
+        h ^= bits;
+        h *= FNV_PRIME;
     }
     return h;
 }
 
 TEST_F(MPITransformerPipelineTest, SmallSequenceFastPath)
 {
-    int world_size = 1; MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-    if (world_size < 2) {
+    int world_size = 1;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    if (world_size < 2)
+    {
         GTEST_SKIP() << "SmallSequenceFastPath test requires world_size >= 2 to trigger fast path reliably";
     }
     // Reset counter
@@ -460,7 +472,8 @@ int main(int argc, char **argv)
     MPI_Init(&argc, &argv);
 
     // Initialize logging. If user hasn't specified LLAMINAR_LOG_LEVEL, default tests to DEBUG for better visibility.
-    if (!std::getenv("LLAMINAR_LOG_LEVEL")) {
+    if (!std::getenv("LLAMINAR_LOG_LEVEL"))
+    {
         Logger::getInstance().setLogLevel(LogLevel::VERBOSITY_DEBUG);
     }
     initializeLogging(); // will apply env override if present
@@ -471,17 +484,29 @@ int main(int argc, char **argv)
     // actionable diagnostics instead of a silent hang.
     static std::atomic<bool> watchdog_done{false};
     int internal_timeout_ms = 55000; // keep < external 60000ms timeout
-    if (const char* env = std::getenv("LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS")) {
-        int v = std::atoi(env); if (v > 0) internal_timeout_ms = v; else if (v==0) internal_timeout_ms = -1; // 0 disables
+    if (const char *env = std::getenv("LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS"))
+    {
+        int v = std::atoi(env);
+        if (v > 0)
+            internal_timeout_ms = v;
+        else if (v == 0)
+            internal_timeout_ms = -1; // 0 disables
     }
     auto start_tp = std::chrono::steady_clock::now();
-    auto stack_dump = [](int rank){
-        void* frames[128]; int n = ::backtrace(frames, 128); char** syms = ::backtrace_symbols(frames, n);
+    auto stack_dump = [](int rank)
+    {
+        void *frames[128];
+        int n = ::backtrace(frames, 128);
+        char **syms = ::backtrace_symbols(frames, n);
         fprintf(stderr, "[WATCHDOG][MPITransformerPipelineTest][rank %d] === STACK TRACE (%d frames) ===\n", rank, n);
-        for(int i=0;i<n;i++) fprintf(stderr, "[WATCHDOG][rank %d] %s\n", rank, syms[i]);
-        if (syms) free(syms); fflush(stderr);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "[WATCHDOG][rank %d] %s\n", rank, syms[i]);
+        if (syms)
+            free(syms);
+        fflush(stderr);
     };
-    std::thread watchdog([&](){
+    std::thread watchdog([&]()
+                         {
         if (internal_timeout_ms < 0) return; // disabled
         while(!watchdog_done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -493,9 +518,16 @@ int main(int argc, char **argv)
                 stack_dump(r);
                 ::raise(SIGABRT);
             }
+        } });
+    struct WatchdogJoin
+    {
+        std::thread &t;
+        ~WatchdogJoin()
+        {
+            if (t.joinable())
+                t.join();
         }
-    });
-    struct WatchdogJoin { std::thread &t; ~WatchdogJoin(){ if(t.joinable()) t.join(); } } _wd_join{watchdog};
+    } _wd_join{watchdog};
     // ------------------------------------------------------------------
 
     // Initialize Google Test

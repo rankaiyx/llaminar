@@ -56,10 +56,11 @@ namespace llaminar
         WeightDescriptor desc;
     };
 
-    struct GemmStrategies {
-        const cosma::Strategy* A; // strategy chosen for operand A (m x k)
-        const cosma::Strategy* B; // strategy chosen for operand B (k x n)
-        const cosma::Strategy* C; // unified strategy for result (m x n)
+    struct GemmStrategies
+    {
+        const cosma::Strategy *A; // strategy chosen for operand A (m x k)
+        const cosma::Strategy *B; // strategy chosen for operand B (k x n)
+        const cosma::Strategy *C; // unified strategy for result (m x n)
     };
 
     class StrategyCache
@@ -83,18 +84,19 @@ namespace llaminar
         static CosmaPrefillManager &instance();
         ~CosmaPrefillManager();
 
-    bool enabled_for(int seq_len) const; // threshold + env flag + force override
+        bool enabled_for(int seq_len) const; // threshold + env flag + force override
 
-    // Explicit force enable/disable (API knob) irrespective of sequence length threshold.
-    // Still requires multi-rank and not ADAPTIVE_DISABLE_COSMA.
-    void set_force_cosma(bool enable) { force_cosma_ = enable; }
-    bool force_cosma() const { return force_cosma_; }
+        // Explicit force enable/disable (API knob) irrespective of sequence length threshold.
+        // Still requires multi-rank and not ADAPTIVE_DISABLE_COSMA.
+        void set_force_cosma(bool enable) { force_cosma_ = enable; }
+        bool force_cosma() const { return force_cosma_; }
 
-    // Unified strategy helper: always use the same strategy for A,B,C of an m x n x k GEMM.
-    const cosma::Strategy &unified_strategy(int m, int n, int k) { return strategy_cache_.get(m, n, k, world_size_); }
+        // Unified strategy helper: always use the same strategy for A,B,C of an m x n x k GEMM.
+        const cosma::Strategy &unified_strategy(int m, int n, int k) { return strategy_cache_.get(m, n, k, world_size_); }
 
         // Derive per-operand strategies (currently may map to different bucketed keys).
-        GemmStrategies derive_strategies(int m, int n, int k) {
+        GemmStrategies derive_strategies(int m, int n, int k)
+        {
             auto &sA = strategy_cache_.get(m, k, k, world_size_);
             auto &sB = strategy_cache_.get(k, n, k, world_size_);
             auto &sC = strategy_cache_.get(m, n, k, world_size_);
@@ -109,8 +111,8 @@ namespace llaminar
         const cosma::Strategy &strategy_for(int m, int n, int k) { return strategy_cache_.get(m, n, k, world_size_); }
         CosmaWeightHandle load_weight(const WeightDescriptor &desc);
         CosmaWeightHandle load_weight_with_strategy(const WeightDescriptor &desc, const cosma::Strategy &strat);
-    CosmaView convert_activation_operand(const float* row_major, int m, int k, const cosma::Strategy &strat);
-    CosmaWeightHandle load_weight_operand(const WeightDescriptor &desc, const cosma::Strategy &strat);
+        CosmaView convert_activation_operand(const float *row_major, int m, int k, const cosma::Strategy &strat);
+        CosmaWeightHandle load_weight_operand(const WeightDescriptor &desc, const cosma::Strategy &strat);
 
         CosmaView matmul(const CosmaView &A,
                          const CosmaWeightHandle &W,
@@ -120,16 +122,16 @@ namespace llaminar
                          float beta = 0.f);
 
         void to_row_major(const CosmaView &src, float *dst) const;
-    // Generic reconstruction helper (optionally normalization when overlapping ownership occurs)
-    void reconstruct_matrix(const CosmaView &src, float *dst, bool normalize=true) const;
-    // Debug: reconstruct and compare to original row-major (env LLAMINAR_COSMA_DEBUG_RECON)
-    void debug_compare_original(const CosmaView &src, int rows, int cols, const float* original) const;
-    // Diagnostics: global checksum & norm (activated via LLAMINAR_COSMA_DIAG)
-    void diag_global_checksum(const CosmaView &src, const char *tag) const;
-    // Diagnostics: sample a set of (row,col) pairs and log value vs original (env LLAMINAR_COSMA_DIAG_SAMPLES="r0,c0;r1,c1")
-    void diag_sample_points(const CosmaView &src, const float *original, const char *tag) const;
-    // Diagnostics: compare two row-major matrices (A,B) computing rel L2 & max abs; logs if env LLAMINAR_COSMA_DIAG_GEMM
-    void diag_compare_row_major(const float *A, const float *B, int m, int n, const char *tagA, const char *tagB) const;
+        // Generic reconstruction helper (optionally normalization when overlapping ownership occurs)
+        void reconstruct_matrix(const CosmaView &src, float *dst, bool normalize = true) const;
+        // Debug: reconstruct and compare to original row-major (env LLAMINAR_COSMA_DEBUG_RECON)
+        void debug_compare_original(const CosmaView &src, int rows, int cols, const float *original) const;
+        // Diagnostics: global checksum & norm (activated via LLAMINAR_COSMA_DIAG)
+        void diag_global_checksum(const CosmaView &src, const char *tag) const;
+        // Diagnostics: sample a set of (row,col) pairs and log value vs original (env LLAMINAR_COSMA_DIAG_SAMPLES="r0,c0;r1,c1")
+        void diag_sample_points(const CosmaView &src, const float *original, const char *tag) const;
+        // Diagnostics: compare two row-major matrices (A,B) computing rel L2 & max abs; logs if env LLAMINAR_COSMA_DIAG_GEMM
+        void diag_compare_row_major(const float *A, const float *B, int m, int n, const char *tagA, const char *tagB) const;
         void release_weight(CosmaWeightHandle &&handle);
 
         void set_threshold(int t) { threshold_ = t; }
@@ -158,9 +160,9 @@ namespace llaminar
         const StrategyCache::Stats &strategy_stats() const { return strategy_cache_.stats; }
 
         // Phase 1b additions
-        void dump_stats_json(const std::string &path) const; // structured stats export
-        void reset_stats(); // test isolation helper
-        static const std::vector<std::string>& recognized_env_vars(); // env audit support
+        void dump_stats_json(const std::string &path) const;          // structured stats export
+        void reset_stats();                                           // test isolation helper
+        static const std::vector<std::string> &recognized_env_vars(); // env audit support
 
     private:
         CosmaPrefillManager();
@@ -175,7 +177,8 @@ namespace llaminar
 
         StrategyCache strategy_cache_;
 
-        struct AllocationRecord {
+        struct AllocationRecord
+        {
             std::weak_ptr<cosma::CosmaMatrix<float>> ref;
             long long bytes{0};
         };

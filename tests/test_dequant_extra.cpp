@@ -92,13 +92,13 @@ TEST_F(DequantExtraTest, Q5_0BasicBlock)
     // Other low-nibble indices (1,2,3,9,10,11,...) have no high bit: raw=5 -> -11 -> -22.0
     // High-nibble half (16..31): high nibble 0 possibly plus high bits at 16 & 24 -> values either 10.0 (if high bit) or -32.0.
 
-    EXPECT_FLOAT_EQ(result[0], 10.0f);   // element 0: low nibble with high bit
-    EXPECT_FLOAT_EQ(result[1], -22.0f);  // element 1: low nibble 5 no high bit
-    EXPECT_FLOAT_EQ(result[2], -22.0f);  // element 2: low nibble 5 no high bit
-    EXPECT_FLOAT_EQ(result[3], -22.0f);  // element 3: low nibble 5 no high bit
+    EXPECT_FLOAT_EQ(result[0], 10.0f);  // element 0: low nibble with high bit
+    EXPECT_FLOAT_EQ(result[1], -22.0f); // element 1: low nibble 5 no high bit
+    EXPECT_FLOAT_EQ(result[2], -22.0f); // element 2: low nibble 5 no high bit
+    EXPECT_FLOAT_EQ(result[3], -22.0f); // element 3: low nibble 5 no high bit
 
-    EXPECT_FLOAT_EQ(result[8], 10.0f);   // element 8: low nibble with high bit
-    EXPECT_FLOAT_EQ(result[9], -22.0f);  // element 9: low nibble 5 no high bit
+    EXPECT_FLOAT_EQ(result[8], 10.0f);  // element 8: low nibble with high bit
+    EXPECT_FLOAT_EQ(result[9], -22.0f); // element 9: low nibble 5 no high bit
 }
 
 TEST_F(DequantExtraTest, Q2_KBasicSuperBlock)

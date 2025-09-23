@@ -44,20 +44,29 @@ TEST(CosmaPrefillManagerMultiTest, SmallFastPathDistributed)
     // ---------------- Watchdog with rank-local stack dump ----------------
     static std::atomic<bool> done{false};
     int internal_timeout_ms = 30000; // must be < CTest TIMEOUT (60s)
-    if (const char* env = std::getenv("LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS")) {
-        int v = std::atoi(env); if (v > 0) internal_timeout_ms = v; else if (v==0) internal_timeout_ms = -1; // 0 disables
+    if (const char *env = std::getenv("LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS"))
+    {
+        int v = std::atoi(env);
+        if (v > 0)
+            internal_timeout_ms = v;
+        else if (v == 0)
+            internal_timeout_ms = -1; // 0 disables
     }
     auto start_tp = std::chrono::steady_clock::now();
-    auto stack_dump = [](int rank){
-        void* frames[64];
+    auto stack_dump = [](int rank)
+    {
+        void *frames[64];
         int n = ::backtrace(frames, 64);
-        char** syms = ::backtrace_symbols(frames, n);
+        char **syms = ::backtrace_symbols(frames, n);
         fprintf(stderr, "[WATCHDOG][rank %d] === STACK TRACE (%d frames) ===\n", rank, n);
-        for (int i=0;i<n;i++) fprintf(stderr, "[WATCHDOG][rank %d] %s\n", rank, syms[i]);
-        if (syms) free(syms);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "[WATCHDOG][rank %d] %s\n", rank, syms[i]);
+        if (syms)
+            free(syms);
         fflush(stderr);
     };
-    std::thread watchdog([&](){
+    std::thread watchdog([&]()
+                         {
         if (internal_timeout_ms < 0) return; // disabled
         while (!done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -70,9 +79,17 @@ TEST(CosmaPrefillManagerMultiTest, SmallFastPathDistributed)
                 // Use abort so CTest registers failure quickly with stack output preserved
                 ::raise(SIGABRT);
             }
+        } });
+    struct WatchdogJoin
+    {
+        std::thread &t;
+        ~WatchdogJoin()
+        {
+            done.store(true);
+            if (t.joinable())
+                t.join();
         }
-    });
-    struct WatchdogJoin { std::thread &t; ~WatchdogJoin(){ done.store(true); if (t.joinable()) t.join(); } } _wd_join{watchdog};
+    } _wd_join{watchdog};
     // ---------------------------------------------------------------------
     int initialized = 0;
     MPI_Initialized(&initialized);

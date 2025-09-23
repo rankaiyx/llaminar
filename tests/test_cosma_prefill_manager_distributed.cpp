@@ -23,30 +23,31 @@
 
 using namespace llaminar;
 
-namespace {
-struct MPIFinalizerFull
+namespace
 {
-    ~MPIFinalizerFull()
+    struct MPIFinalizerFull
     {
-        int init = 0, fin = 0;
-        MPI_Initialized(&init);
-        if (init)
+        ~MPIFinalizerFull()
         {
-            MPI_Finalized(&fin);
-            if (!fin)
-                MPI_Finalize();
+            int init = 0, fin = 0;
+            MPI_Initialized(&init);
+            if (init)
+            {
+                MPI_Finalized(&fin);
+                if (!fin)
+                    MPI_Finalize();
+            }
         }
-    }
-};
-static MPIFinalizerFull mpi_finalizer_full;
+    };
+    static MPIFinalizerFull mpi_finalizer_full;
 
-void fill_rand(std::vector<float> &v, int seed)
-{
-    std::mt19937 gen(seed);
-    std::uniform_real_distribution<float> dist(-1.f, 1.f);
-    for (auto &x : v)
-        x = dist(gen);
-}
+    void fill_rand(std::vector<float> &v, int seed)
+    {
+        std::mt19937 gen(seed);
+        std::uniform_real_distribution<float> dist(-1.f, 1.f);
+        for (auto &x : v)
+            x = dist(gen);
+    }
 } // namespace
 
 TEST(CosmaPrefillManagerDistributedFullTest, LargeMatMulDistributedCorrectness)
@@ -54,17 +55,29 @@ TEST(CosmaPrefillManagerDistributedFullTest, LargeMatMulDistributedCorrectness)
     // ---------------- Watchdog with rank-local stack dump ----------------
     static std::atomic<bool> done{false};
     int internal_timeout_ms = 45000; // < external 60s CTest timeout
-    if (const char* env = std::getenv("LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS")) {
-        int v = std::atoi(env); if (v > 0) internal_timeout_ms = v; else if (v==0) internal_timeout_ms = -1; // 0 disables
+    if (const char *env = std::getenv("LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS"))
+    {
+        int v = std::atoi(env);
+        if (v > 0)
+            internal_timeout_ms = v;
+        else if (v == 0)
+            internal_timeout_ms = -1; // 0 disables
     }
     auto start_tp = std::chrono::steady_clock::now();
-    auto stack_dump = [](int rank){
-        void* frames[64]; int n = ::backtrace(frames, 64); char** syms = ::backtrace_symbols(frames, n);
+    auto stack_dump = [](int rank)
+    {
+        void *frames[64];
+        int n = ::backtrace(frames, 64);
+        char **syms = ::backtrace_symbols(frames, n);
         fprintf(stderr, "[WATCHDOG-FULL][rank %d] === STACK TRACE (%d frames) ===\n", rank, n);
-        for(int i=0;i<n;i++) fprintf(stderr, "[WATCHDOG-FULL][rank %d] %s\n", rank, syms[i]);
-        if (syms) free(syms); fflush(stderr);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "[WATCHDOG-FULL][rank %d] %s\n", rank, syms[i]);
+        if (syms)
+            free(syms);
+        fflush(stderr);
     };
-    std::thread watchdog([&](){
+    std::thread watchdog([&]()
+                         {
         if (internal_timeout_ms < 0) return;
         while(!done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -76,9 +89,17 @@ TEST(CosmaPrefillManagerDistributedFullTest, LargeMatMulDistributedCorrectness)
                 stack_dump(r);
                 ::raise(SIGABRT);
             }
+        } });
+    struct WatchdogJoin
+    {
+        std::thread &t;
+        ~WatchdogJoin()
+        {
+            done.store(true);
+            if (t.joinable())
+                t.join();
         }
-    });
-    struct WatchdogJoin { std::thread &t; ~WatchdogJoin(){ done.store(true); if (t.joinable()) t.join(); } } _wd_join{watchdog};
+    } _wd_join{watchdog};
     // ---------------------------------------------------------------------
     int initialized = 0;
     MPI_Initialized(&initialized);

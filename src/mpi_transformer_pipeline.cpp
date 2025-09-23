@@ -126,7 +126,7 @@ namespace llaminar
         {
             small_seq_fast_path_calls_.fetch_add(1, std::memory_order_relaxed);
             LOG_DEBUG("[SmallSeqFastPath] Activate (seq_len=" << seq_len << ", world=" << world_size
-                                                             << ") rank=" << getRank());
+                                                              << ") rank=" << getRank());
             // Local naive implementation performed entirely on rank 0, then broadcast.
             if (getRank() == 0)
             {
@@ -142,17 +142,21 @@ namespace llaminar
                 // Temporary buffers (row-major)
                 std::vector<float> hidden(seq_len * config_.d_model, 0.f);
                 std::vector<float> tmp(seq_len * config_.d_model, 0.f);
-                auto rmsnorm = [&](std::vector<float> &mat, const float *wn) {
+                auto rmsnorm = [&](std::vector<float> &mat, const float *wn)
+                {
                     for (int i = 0; i < seq_len; ++i)
                     {
                         float sum_sq = 0.f;
                         float *row = &mat[i * config_.d_model];
-                        for (int j = 0; j < config_.d_model; ++j) sum_sq += row[j] * row[j];
+                        for (int j = 0; j < config_.d_model; ++j)
+                            sum_sq += row[j] * row[j];
                         float inv_rms = 1.f / std::sqrt(sum_sq / config_.d_model + config_.eps);
-                        for (int j = 0; j < config_.d_model; ++j) row[j] = row[j] * inv_rms * wn[j];
+                        for (int j = 0; j < config_.d_model; ++j)
+                            row[j] = row[j] * inv_rms * wn[j];
                     }
                 };
-                auto matmul = [&](const std::vector<float> &A, const float *B, int k, int n, std::vector<float> &C) {
+                auto matmul = [&](const std::vector<float> &A, const float *B, int k, int n, std::vector<float> &C)
+                {
                     // A: (seq_len x k), B: (k x n), C: (seq_len x n)
                     C.assign(seq_len * n, 0.f);
                     for (int i = 0; i < seq_len; ++i)
@@ -168,11 +172,15 @@ namespace llaminar
                         }
                     }
                 };
-                auto elementwise_add = [&](std::vector<float> &A, const std::vector<float> &B) {
-                    for (size_t i = 0; i < A.size(); ++i) A[i] += B[i];
+                auto elementwise_add = [&](std::vector<float> &A, const std::vector<float> &B)
+                {
+                    for (size_t i = 0; i < A.size(); ++i)
+                        A[i] += B[i];
                 };
-                auto sigmoid = [](float x) { return 1.f / (1.f + std::exp(-x)); };
-                auto swiglu = [&](const std::vector<float> &up, const std::vector<float> &gate, std::vector<float> &out, int dim) {
+                auto sigmoid = [](float x)
+                { return 1.f / (1.f + std::exp(-x)); };
+                auto swiglu = [&](const std::vector<float> &up, const std::vector<float> &gate, std::vector<float> &out, int dim)
+                {
                     out.resize(up.size());
                     for (size_t i = 0; i < up.size(); ++i)
                         out[i] = up[i] * sigmoid(gate[i]);
@@ -204,17 +212,20 @@ namespace llaminar
                     for (int i = 0; i < seq_len; ++i)
                     {
                         const float *vrow = &V[i * ctx_dim];
-                        for (int j = 0; j < ctx_dim; ++j) v_mean[j] += vrow[j];
+                        for (int j = 0; j < ctx_dim; ++j)
+                            v_mean[j] += vrow[j];
                     }
-                    for (int j = 0; j < ctx_dim; ++j) v_mean[j] /= std::max(1, seq_len);
+                    for (int j = 0; j < ctx_dim; ++j)
+                        v_mean[j] /= std::max(1, seq_len);
                     for (int i = 0; i < seq_len; ++i)
                     {
                         float *crow = &context[i * ctx_dim];
-                        for (int j = 0; j < ctx_dim; ++j) crow[j] = 0.5f * (crow[j] + v_mean[j]);
+                        for (int j = 0; j < ctx_dim; ++j)
+                            crow[j] = 0.5f * (crow[j] + v_mean[j]);
                     }
                     // Output projection Wo (ctx_dim -> d_model)
                     matmul(context, weights.wo[layer]->data(), ctx_dim, config_.d_model, tmp); // tmp now d_model sized rows
-                    elementwise_add(tmp, hidden); // residual
+                    elementwise_add(tmp, hidden);                                              // residual
                     hidden = tmp;
 
                     // FFN norm
@@ -243,7 +254,8 @@ namespace llaminar
                 int preview = std::min(5, static_cast<int>(logits.size()));
                 std::ostringstream oss;
                 oss << "Small-seq fast path (pre-broadcast) first " << preview << " logits: ";
-                for (int i = 0; i < preview; ++i) oss << logits[i] << (i + 1 < preview ? ' ' : '\0');
+                for (int i = 0; i < preview; ++i)
+                    oss << logits[i] << (i + 1 < preview ? ' ' : '\0');
                 LOG_DEBUG(oss.str());
                 LOG_TRACE("[SmallSeqFastPath] Rank 0 finishing local forward");
             }
@@ -269,7 +281,8 @@ namespace llaminar
                 const float *data = output->data();
                 std::ostringstream oss;
                 oss << "Small-seq fast path (post-broadcast) rank " << getRank() << " first " << preview << " logits: ";
-                for (int i = 0; i < preview; ++i) oss << data[i] << (i + 1 < preview ? ' ' : '\0');
+                for (int i = 0; i < preview; ++i)
+                    oss << data[i] << (i + 1 < preview ? ' ' : '\0');
                 LOG_DEBUG(oss.str());
             }
 
@@ -398,11 +411,11 @@ namespace llaminar
         int seq_len = input->shape()[0];
 
         // Create temporary tensors for layer computation
-    auto attn_norm_out = createLocalTensor({seq_len, config_.d_model});
-    auto attn_out = createLocalTensor({seq_len, config_.d_model});
-    auto ffn_norm_out = createLocalTensor({seq_len, config_.d_model});
-    auto ffn_out = createLocalTensor({seq_len, config_.d_model});
-    auto residual_tmp = createLocalTensor({seq_len, config_.d_model});
+        auto attn_norm_out = createLocalTensor({seq_len, config_.d_model});
+        auto attn_out = createLocalTensor({seq_len, config_.d_model});
+        auto ffn_norm_out = createLocalTensor({seq_len, config_.d_model});
+        auto ffn_out = createLocalTensor({seq_len, config_.d_model});
+        auto residual_tmp = createLocalTensor({seq_len, config_.d_model});
 
         // 1. Attention path: RMSNorm -> Attention -> Residual
         DEBUG_ASSERT(input, "Input tensor null before layer " + std::to_string(layer_idx));
@@ -438,11 +451,11 @@ namespace llaminar
         }
 
         std::vector<std::shared_ptr<TensorBase>> attn_inputs = {
-            attn_norm_out,                 // Input sequence
-            weights.wq[layer_idx],         // Wq
-            weights.wk[layer_idx],         // Wk
-            weights.wv[layer_idx],         // Wv
-            weights.wo[layer_idx],         // Wo
+            attn_norm_out,                                                                                            // Input sequence
+            weights.wq[layer_idx],                                                                                    // Wq
+            weights.wk[layer_idx],                                                                                    // Wk
+            weights.wv[layer_idx],                                                                                    // Wv
+            weights.wo[layer_idx],                                                                                    // Wo
             use_kv_cache_ ? k_cache_[layer_idx] : createLocalTensor({seq_len, config_.n_head_kv * config_.head_dim}), // K cache (or temp)
             use_kv_cache_ ? v_cache_[layer_idx] : createLocalTensor({seq_len, config_.n_head_kv * config_.head_dim})  // V cache (or temp)
         };
@@ -818,7 +831,8 @@ namespace llaminar
                                           const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Minimal shape checks; pipeline primary API differs.
-        if (inputs.empty() || outputs.empty()) return false;
+        if (inputs.empty() || outputs.empty())
+            return false;
         return true;
     }
 

@@ -1071,10 +1071,12 @@ std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorTy
     (void)type;
     constexpr int QK_K = 256;
     size_t n_elements = std::accumulate(info.dimensions.begin(), info.dimensions.end(), 1ULL, std::multiplies<uint64_t>());
-    if (n_elements == 0 || !data) return {};
+    if (n_elements == 0 || !data)
+        return {};
     size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
     std::vector<float> out(n_blocks * QK_K);
-    auto fp16 = [](const uint8_t *p){ uint16_t h; std::memcpy(&h,p,2); return ggml_compute_fp16_to_fp32(h); };
+    auto fp16 = [](const uint8_t *p)
+    { uint16_t h; std::memcpy(&h,p,2); return ggml_compute_fp16_to_fp32(h); };
 
     // Two supported serialized layouts:
     //  A) Canonical (16 scale bytes): scales[16], qs[64], d(2), dmin(2) => 86 bytes per block
@@ -1086,19 +1088,25 @@ std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorTy
     bool looks_variant_B = true;
     {
         // Basic plausibility: half-precision exponents not all zero & scale bytes non-zero increasing pattern (test fixture uses 1..12)
-        uint16_t d_half, dmin_half; std::memcpy(&d_half, data, 2); std::memcpy(&dmin_half, data+2, 2);
-        if (d_half == 0 && dmin_half == 0) looks_variant_B = false; // unlikely real data
+        uint16_t d_half, dmin_half;
+        std::memcpy(&d_half, data, 2);
+        std::memcpy(&dmin_half, data + 2, 2);
+        if (d_half == 0 && dmin_half == 0)
+            looks_variant_B = false; // unlikely real data
     }
-    if (looks_variant_B) {
+    if (looks_variant_B)
+    {
         // Attempt variant B decode; fallback to A if something implausible encountered.
         const uint8_t *ptr = data;
-        for (size_t b = 0; b < n_blocks; ++b) {
+        for (size_t b = 0; b < n_blocks; ++b)
+        {
             const float d = fp16(ptr);
             const float dmin = fp16(ptr + 2);
             const uint8_t *scales12 = ptr + 4; // 12 bytes (scale/min packed nibbles)
             const uint8_t *qs = scales12 + 12; // 64 bytes packed 2-bit values
             // Simple decode: sequentially unpack 2-bit groups; assign scale/min groups every 32 values cycling through scales12.
-            for (int i = 0; i < QK_K; ++i) {
+            for (int i = 0; i < QK_K; ++i)
+            {
                 int byte_index = i / 4;
                 int shift = 2 * (i % 4);
                 uint8_t raw2 = (qs[byte_index] >> shift) & 0x3; // 0..3
@@ -1119,27 +1127,32 @@ std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorTy
     {
         const uint8_t *ptr = data;
         size_t out_index = 0;
-        for (size_t b = 0; b < n_blocks; ++b) {
+        for (size_t b = 0; b < n_blocks; ++b)
+        {
             const uint8_t *scales = ptr;                // 16 bytes
             const uint8_t *qs = scales + QK_K / 16;     // +16 => 64 bytes of 2-bit packed
             const float d = fp16(qs + QK_K / 4);        // after qs: d
             const float dmin = fp16(qs + QK_K / 4 + 2); // dmin
             const uint8_t *q = qs;
             int is = 0;
-            for (int n = 0; n < QK_K; n += 128) {
+            for (int n = 0; n < QK_K; n += 128)
+            {
                 int shift = 0;
-                for (int j = 0; j < 4; ++j) {
+                for (int j = 0; j < 4; ++j)
+                {
                     uint8_t sc = scales[is++];
                     float dl = d * (sc & 0xF);
                     float ml = dmin * (sc >> 4);
-                    for (int l = 0; l < 16; ++l) {
+                    for (int l = 0; l < 16; ++l)
+                    {
                         uint8_t v = (q[l] >> shift) & 0x3;
                         out[out_index++] = dl * v - ml;
                     }
                     sc = scales[is++];
                     dl = d * (sc & 0xF);
                     ml = dmin * (sc >> 4);
-                    for (int l = 0; l < 16; ++l) {
+                    for (int l = 0; l < 16; ++l)
+                    {
                         uint8_t v = (q[l + 16] >> shift) & 0x3;
                         out[out_index++] = dl * v - ml;
                     }

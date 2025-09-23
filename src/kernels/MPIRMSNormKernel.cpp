@@ -203,19 +203,21 @@ namespace llaminar
         float local_max = -std::numeric_limits<float>::infinity();
         double local_sum = 0.0;
         size_t local_count = local_seq_len * hidden_size;
-#pragma omp parallel for reduction(min:local_min) reduction(max:local_max) reduction(+:local_sum) schedule(static)
+#pragma omp parallel for reduction(min : local_min) reduction(max : local_max) reduction(+ : local_sum) schedule(static)
         for (long long i = 0; i < (long long)local_count; ++i)
         {
             float v = local_input[i];
-            if (v < local_min) local_min = v;
-            if (v > local_max) local_max = v;
+            if (v < local_min)
+                local_min = v;
+            if (v > local_max)
+                local_max = v;
             local_sum += v;
         }
         double local_mean = local_count ? (local_sum / local_count) : 0.0;
 
         // Compute local contribution to global RMS (parallel)
         float local_sum_sq = 0.0f;
-#pragma omp parallel for reduction(+:local_sum_sq) collapse(2) schedule(static)
+#pragma omp parallel for reduction(+ : local_sum_sq) collapse(2) schedule(static)
         for (long long i = 0; i < (long long)local_seq_len; ++i)
             for (long long j = 0; j < (long long)hidden_size; ++j)
             {
@@ -279,12 +281,14 @@ namespace llaminar
         float out_local_min = std::numeric_limits<float>::infinity();
         float out_local_max = -std::numeric_limits<float>::infinity();
         double out_local_sum = 0.0;
-#pragma omp parallel for reduction(min:out_local_min) reduction(max:out_local_max) reduction(+:out_local_sum) schedule(static)
+#pragma omp parallel for reduction(min : out_local_min) reduction(max : out_local_max) reduction(+ : out_local_sum) schedule(static)
         for (long long i = 0; i < (long long)local_count; ++i)
         {
             float v = local_output[i];
-            if (v < out_local_min) out_local_min = v;
-            if (v > out_local_max) out_local_max = v;
+            if (v < out_local_min)
+                out_local_min = v;
+            if (v > out_local_max)
+                out_local_max = v;
             out_local_sum += v;
         }
         float out_global_min = 0.0f, out_global_max = 0.0f;

@@ -8,11 +8,19 @@ using namespace llaminar;
 
 TEST(CosmaPrefillManagerStatsDumpTest, JsonFileContainsCoreFields)
 {
-    int init=0; MPI_Initialized(&init); if(!init){ int argc=0; char** argv=nullptr; MPI_Init(&argc,&argv);}    
+    int init = 0;
+    MPI_Initialized(&init);
+    if (!init)
+    {
+        int argc = 0;
+        char **argv = nullptr;
+        MPI_Init(&argc, &argv);
+    }
     auto &mgr = CosmaPrefillManager::instance();
     mgr.reset_stats();
     // Minimal operation to populate a few counters (single rank safe)
-    int m=4,k=4,n=4; std::vector<float> A(m*k,1.f), B(k*n,2.f), C(m*n,0.f);
+    int m = 4, k = 4, n = 4;
+    std::vector<float> A(m * k, 1.f), B(k * n, 2.f), C(m * n, 0.f);
     WeightDescriptor desc{"Wdump", k, n, (int64_t)n, 1, 0, B.data()};
     auto A_view = mgr.convert_activation_in(A.data(), m, k);
     auto W_handle = mgr.load_weight(desc);
@@ -20,8 +28,10 @@ TEST(CosmaPrefillManagerStatsDumpTest, JsonFileContainsCoreFields)
     mgr.to_row_major(C_view, C.data());
     std::string path = "cosma_prefill_stats_test.json";
     mgr.dump_stats_json(path);
-    int rank=0; MPI_Comm_rank(MPI_COMM_WORLD,&rank);
-    if(rank==0){
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank == 0)
+    {
         std::ifstream ifs(path);
         ASSERT_TRUE(ifs.is_open());
         std::string content((std::istreambuf_iterator<char>(ifs)), {});

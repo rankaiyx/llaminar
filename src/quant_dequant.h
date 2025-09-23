@@ -62,12 +62,16 @@ namespace llaminar
     inline void dequant_block_q5_0(const uint8_t *block, float *dst, int n_vals = 32)
     {
         const int QK = 32;
-        if (n_vals != QK) ; // allow alternative but assume 32 for indexing
-        uint16_t hd; std::memcpy(&hd, block, 2);
+        if (n_vals != QK)
+            ; // allow alternative but assume 32 for indexing
+        uint16_t hd;
+        std::memcpy(&hd, block, 2);
         float d = qd_fp16_to_fp32(hd);
-        uint32_t qh; std::memcpy(&qh, block + 2, 4); // qh[4] packed into 32 bits
+        uint32_t qh;
+        std::memcpy(&qh, block + 2, 4); // qh[4] packed into 32 bits
         const uint8_t *qs = block + 6;
-        for (int j = 0; j < QK/2; ++j) {
+        for (int j = 0; j < QK / 2; ++j)
+        {
             // Match ggml high-bit placement (second half uses +12 offset)
             const uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
             const uint8_t xh_1 = ((qh >> (j + 12))) & 0x10;
@@ -75,7 +79,7 @@ namespace llaminar
             const int32_t x0 = ((q & 0x0F) | xh_0) - 16;
             const int32_t x1 = ((q >> 4) | xh_1) - 16;
             dst[j + 0] = x0 * d;
-            dst[j + QK/2] = x1 * d;
+            dst[j + QK / 2] = x1 * d;
         }
     }
 

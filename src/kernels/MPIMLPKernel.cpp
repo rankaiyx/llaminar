@@ -190,13 +190,18 @@ namespace llaminar
 
         size_t total_elements = seq_len * local_d_ff;
         // OpenMP parallelization: use single thread for very small ops to avoid overhead
-        if (total_elements < 8192) {
-            for (size_t i = 0; i < total_elements; ++i) {
+        if (total_elements < 8192)
+        {
+            for (size_t i = 0; i < total_elements; ++i)
+            {
                 output_data[i] = silu(gate_data[i]) * up_data[i];
             }
-        } else {
-            #pragma omp parallel for schedule(static)
-            for (size_t i = 0; i < total_elements; ++i) {
+        }
+        else
+        {
+#pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < total_elements; ++i)
+            {
                 // vectorization hint
                 output_data[i] = silu(gate_data[i]) * up_data[i];
             }

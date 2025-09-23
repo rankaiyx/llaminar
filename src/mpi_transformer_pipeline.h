@@ -69,7 +69,7 @@ namespace llaminar
          */
         explicit MPITransformerPipeline(const LayerConfig &config);
 
-    ~MPITransformerPipeline() override; // defined out-of-line to ensure vtable emission
+        ~MPITransformerPipeline() override; // defined out-of-line to ensure vtable emission
 
         /**
          * @brief Execute complete transformer forward pass
@@ -138,16 +138,16 @@ namespace llaminar
          */
         size_t getExpectedOutputCount() const override { return 1; } // output_logits
 
-    /**
-     * @brief Get number of times the replicated small-sequence fast path executed (process-local count).
-     * Used by tests to verify activation behavior for seq_len < world_size.
-     */
-    static size_t getSmallSeqFastPathCount() { return small_seq_fast_path_calls_.load(); }
+        /**
+         * @brief Get number of times the replicated small-sequence fast path executed (process-local count).
+         * Used by tests to verify activation behavior for seq_len < world_size.
+         */
+        static size_t getSmallSeqFastPathCount() { return small_seq_fast_path_calls_.load(); }
 
-    /**
-     * @brief Reset the small sequence fast path counter (primarily for test isolation).
-     */
-    static void resetSmallSeqFastPathCount() { small_seq_fast_path_calls_.store(0); }
+        /**
+         * @brief Reset the small sequence fast path counter (primarily for test isolation).
+         */
+        static void resetSmallSeqFastPathCount() { small_seq_fast_path_calls_.store(0); }
 
     private:
         /**

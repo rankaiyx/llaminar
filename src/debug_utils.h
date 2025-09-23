@@ -146,9 +146,9 @@ namespace llaminar
             double mean = (size - nan_count - inf_count) > 0 ? sum / (size - nan_count - inf_count) : 0.0;
 
             LOG_TRACE("[" << stage << "] " << name << " shape=" << shape_str
-                      << " size=" << size << " values=[" << values_str << "]");
+                          << " size=" << size << " values=[" << values_str << "]");
             LOG_TRACE("[" << stage << "] " << name << " stats: min=" << min_val << " max=" << max_val
-                      << " mean=" << mean << " zeros=" << zero_count << " NaN=" << nan_count << " Inf=" << inf_count);
+                          << " mean=" << mean << " zeros=" << zero_count << " NaN=" << nan_count << " Inf=" << inf_count);
         }
 
         static void logMatMulOperation(const std::shared_ptr<TensorBase> &input,
