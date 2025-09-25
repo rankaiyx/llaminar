@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include "../src/model_loader.h"
+#include "../src/quant_dequant.h"
+#include <array>
 #include <vector>
 #include <cstring>
 #include <cmath>
@@ -7,6 +9,11 @@
 // Test utilities for synthetic block construction
 namespace
 {
+    inline float synthetic_sample(size_t index, float offset = 0.0f)
+    {
+        return 0.1f + 2.0f * std::cos(static_cast<float>(index) + offset);
+    }
+
     uint16_t float_to_fp16_bits(float f)
     {
         // Simple IEEE 754 binary32 -> binary16 conversion for test purposes
@@ -103,65 +110,36 @@ TEST_F(DequantExtraTest, Q5_0BasicBlock)
 
 TEST_F(DequantExtraTest, Q2_KBasicSuperBlock)
 {
-    // Test Q2_K with minimal super-block (256 values)
-    // Layout (test synthetic variant): uint16_t d, uint16_t dmin, uint8_t scales[12], uint8_t qs[64]
-    // Total: 2 + 2 + 12 + 64 = 80 bytes. Model loader supports both this compact form and the canonical 16-scale form.
-
-    std::vector<uint8_t> block_data(80);
-
-    // Set d = 1.0, dmin = 0.5
-    float d = 1.0f, dmin = 0.5f;
-    uint16_t d_bits = float_to_fp16_bits(d);
-    uint16_t dmin_bits = float_to_fp16_bits(dmin);
-    std::memcpy(block_data.data(), &d_bits, 2);
-    std::memcpy(block_data.data() + 2, &dmin_bits, 2);
-
-    // Set scales[12] to simple pattern for unpacking test
-    // After bit reshuffling, we expect 8 scale and 8 min values
-    // Use a pattern that survives the kmask operations
-    for (int i = 0; i < 12; ++i)
+    // Construct a canonical block_q2_K via ggml quantization to ensure realistic data layout.
+    std::array<float, QK_K> source{};
+    for (size_t i = 0; i < source.size(); ++i)
     {
-        block_data[4 + i] = static_cast<uint8_t>(i + 1); // 1,2,3,...,12
+        source[i] = synthetic_sample(i);
     }
 
-    // Set qs to simple 2-bit pattern: all bytes = 0x1B (binary 00011011)
-    // This gives 2-bit values: 3,2,1,0 per byte (reading bits 0-1, 2-3, 4-5, 6-7)
-    for (int i = 0; i < 64; ++i)
-    {
-        block_data[16 + i] = 0x1B;
-    }
+    block_q2_K block{};
+    quantize_row_q2_K_ref(source.data(), &block, QK_K);
 
-    // Create tensor info for 256 elements
-    GGUFTensorInfo info;
-    info.dimensions = {256};
+    // Serialize canonical layout (scales + qs + {d,dmin}).
+    std::vector<uint8_t> block_data(sizeof(block));
+    std::memcpy(block_data.data(), &block, block_data.size());
 
-    // Decode
+    GGUFTensorInfo info{};
+    info.type = GGUFTensorType::Q2_K;
+    info.dimensions = {QK_K};
+    info.size_bytes = block_data.size();
+
     auto result = loader.dequantizeQ2_K(block_data.data(), GGUFTensorType::Q2_K, "test_q2k", info);
 
-    ASSERT_EQ(result.size(), 256);
+    ASSERT_EQ(result.size(), source.size());
 
-    // The exact expected values depend on the scale/min unpacking and bit shuffles.
-    // We only assert general sanity: finite values and non-trivial variation.
-    float min_v = std::numeric_limits<float>::infinity();
-    float max_v = -std::numeric_limits<float>::infinity();
-    for (const auto &val : result)
+    std::vector<float> expected(source.size());
+    dequantize_row_q2_K(&block, expected.data(), QK_K);
+
+    for (size_t i = 0; i < expected.size(); ++i)
     {
-        EXPECT_FALSE(std::isnan(val));
-        if (val < min_v)
-            min_v = val;
-        if (val > max_v)
-            max_v = val;
+        EXPECT_NEAR(result[i], expected[i], 1e-5f) << "Mismatch at index " << i;
     }
-    // Loose bounds – with synthetic scales (1..12) raw formula can yield larger magnitudes.
-    EXPECT_GT(max_v, -min_v * 0.2f); // ensure not all negative dominated
-    EXPECT_LT(std::fabs(min_v), 1000.0f);
-    EXPECT_LT(std::fabs(max_v), 1000.0f);
-
-    // Verify first few values match expected pattern based on formula: d*scale*q - dmin*min
-    // With our 2-bit pattern (3,2,1,0), we expect different values for each position
-    EXPECT_NE(result[0], result[1]);
-    EXPECT_NE(result[1], result[2]);
-    EXPECT_NE(result[2], result[3]);
 }
 
 TEST_F(DequantExtraTest, Q5_KSmoke)

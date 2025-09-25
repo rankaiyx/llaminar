@@ -1070,19 +1070,68 @@ std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorTy
         return {};
 
     size_t n_blocks = (n_elements + QK_K - 1) / QK_K;
-    constexpr size_t BLOCK_BYTES = sizeof(block_q2_K);
-    size_t expected_bytes = n_blocks * BLOCK_BYTES;
-    if (info.size_bytes < expected_bytes)
+    constexpr size_t CANONICAL_BLOCK_BYTES = sizeof(block_q2_K);
+    constexpr size_t QS_BYTES = QK_K / 4;     // 64
+    constexpr size_t SCALE_BYTES = QK_K / 16; // 16
+
+    size_t block_stride = CANONICAL_BLOCK_BYTES;
+    if (info.size_bytes != 0)
     {
-        LOG_ERROR("Tensor '" << tensor_name << "' has insufficient data for Q2_K dequantization: expected " << expected_bytes << " bytes, got " << info.size_bytes);
+        if (info.size_bytes % n_blocks != 0)
+        {
+            LOG_ERROR("Tensor '" << tensor_name << "' size " << info.size_bytes << " does not align with " << n_blocks << " Q2_K blocks (" << CANONICAL_BLOCK_BYTES << " bytes each)");
+            return {};
+        }
+        block_stride = info.size_bytes / n_blocks;
+    }
+
+    const bool compact_header_first = (block_stride < CANONICAL_BLOCK_BYTES) && (block_stride >= (2 * sizeof(uint16_t) + QS_BYTES));
+    if (!compact_header_first && block_stride < CANONICAL_BLOCK_BYTES)
+    {
+        LOG_ERROR("Tensor '" << tensor_name << "' Q2_K block stride " << block_stride << " is smaller than canonical layout and not recognized as compact header-first variant");
         return {};
     }
+
     std::vector<float> out(n_blocks * QK_K);
     const uint8_t *block_ptr = data;
     for (size_t b = 0; b < n_blocks; ++b)
     {
         block_q2_K blk{};
-        std::memcpy(&blk, block_ptr, sizeof(block_q2_K));
+        if (compact_header_first)
+        {
+            uint16_t d_bits = 0;
+            uint16_t dmin_bits = 0;
+            std::memcpy(&d_bits, block_ptr, sizeof(uint16_t));
+            std::memcpy(&dmin_bits, block_ptr + sizeof(uint16_t), sizeof(uint16_t));
+            blk.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d = d_bits;
+            blk.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin = dmin_bits;
+
+            const uint8_t *compact_scales = block_ptr + 2 * sizeof(uint16_t);
+            size_t compact_scale_bytes = block_stride - (2 * sizeof(uint16_t) + QS_BYTES);
+            compact_scale_bytes = std::min(compact_scale_bytes, SCALE_BYTES);
+            std::memset(blk.scales, 0, SCALE_BYTES);
+            if (compact_scale_bytes > 0)
+                std::memcpy(blk.scales, compact_scales, compact_scale_bytes);
+
+            const uint8_t *compact_qs = compact_scales + (block_stride - (2 * sizeof(uint16_t) + QS_BYTES));
+            std::memcpy(blk.qs, compact_qs, QS_BYTES);
+
+            if (b == 0)
+            {
+                std::cout << "[Q2K compact debug] tensor='" << tensor_name
+                          << "' stride=" << block_stride
+                          << " d_bits=0x" << std::hex << d_bits << std::dec
+                          << " dmin_bits=0x" << std::hex << dmin_bits << std::dec
+                          << " scale0=" << int(blk.scales[0])
+                          << " scale1=" << int(blk.scales[1])
+                          << " qs0=0x" << std::hex << int(blk.qs[0]) << std::dec
+                          << std::endl;
+            }
+        }
+        else
+        {
+            std::memcpy(&blk, block_ptr, sizeof(block_q2_K));
+        }
         float *dst_block = out.data() + b * QK_K;
         dequantize_row_q2_K(&blk, dst_block, QK_K);
         if (std::isnan(dst_block[0]))
@@ -1095,7 +1144,7 @@ std::vector<float> ModelLoader::dequantizeQ2_K(const uint8_t *data, GGUFTensorTy
                                              << " scale1=" << int(blk.scales[1])
                                              << " q0=" << int(blk.qs[0]) << " q1=" << int(blk.qs[1]));
         }
-        block_ptr += BLOCK_BYTES;
+        block_ptr += block_stride;
     }
     out.resize(n_elements);
     logDequantStats(tensor_name, type, out, 8);
