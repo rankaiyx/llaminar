@@ -80,6 +80,70 @@ namespace
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
             MPI_Barrier(MPI_COMM_WORLD);
     }
+
+    inline void run_reference_gemm(const float *A_ptr,
+                                   const float *B_ptr,
+                                   float *C_ptr,
+                                   bool transposeW,
+                                   int m,
+                                   int n,
+                                   int k,
+                                   float alpha,
+                                   float beta,
+                                   int rank)
+    {
+        if (!A_ptr || !B_ptr || !C_ptr)
+            return;
+
+        if (transposeW)
+        {
+            if (rank == 0)
+            {
+                LOG_WARN("[run_reference_gemm] transposeW=true: using manual i-j-p loop m=" << m
+                                                                                           << " n=" << n
+                                                                                           << " k=" << k);
+            }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int i = 0; i < m; ++i)
+            {
+                for (int j = 0; j < n; ++j)
+                {
+                    float sum = 0.f;
+                    for (int p = 0; p < k; ++p)
+                    {
+                        sum += A_ptr[(size_t)i * k + p] * B_ptr[(size_t)p * n + j];
+                    }
+                    float prev = beta != 0.f ? C_ptr[(size_t)i * n + j] : 0.f;
+                    C_ptr[(size_t)i * n + j] = alpha * sum + prev;
+                }
+            }
+            return;
+        }
+
+        int lda = k;
+        int ldb = n;
+        if (rank == 0)
+        {
+            LOG_WARN("[run_reference_gemm] BLAS path: m=" << m << " n=" << n << " k=" << k << " lda=" << lda
+                                                           << " ldb=" << ldb);
+        }
+        cblas_sgemm(CblasRowMajor,
+                    CblasNoTrans,
+                    CblasNoTrans,
+                    m,
+                    n,
+                    k,
+                    alpha,
+                    A_ptr,
+                    lda,
+                    B_ptr,
+                    ldb,
+                    beta,
+                    C_ptr,
+                    n);
+    }
 }
 
 namespace llaminar
@@ -1188,46 +1252,16 @@ namespace llaminar
                 {
                     LOG_DEBUG("[CosmaPrefill][fallback-replicated] executing reference GEMM");
                 }
-                // Define the lambda to take all parameters as arguments
-                auto run_reference_gemm = [](const float *A_ptr, const float *B_ptr, float *C_ptr,
-                                            bool transposeW, int m, int n, int k, float alpha, float beta, int rank_) {
-                    if (!A_ptr || !B_ptr || !C_ptr) return;
-                    if (transposeW) {
-                        if (rank_ == 0) {
-                            LOG_WARN("[run_reference_gemm] transposeW=true: using manual i-j-p loop m=" << m << " n=" << n << " k=" << k);
-                        }
-                        #ifdef _OPENMP
-                        #pragma omp parallel for schedule(static)
-                        #endif
-                        for (int i = 0; i < m; ++i) {
-                            for (int j = 0; j < n; ++j) {
-                                float sum = 0.f;
-                                for (int p = 0; p < k; ++p) {
-                                    sum += A_ptr[(size_t)i * k + p] * B_ptr[(size_t)p * n + j];
-                                }
-                                float prev = beta != 0.f ? C_ptr[(size_t)i * n + j] : 0.f;
-                                C_ptr[(size_t)i * n + j] = alpha * sum + prev;
-                            }
-                        }
-                        return;
-                    }
-                    int lda = k;
-                    int ldb = n;
-                    if (rank_ == 0) {
-                        LOG_WARN("[run_reference_gemm] BLAS path: m=" << m << " n=" << n << " k=" << k << " lda=" << lda << " ldb=" << ldb);
-                    }
-                    cblas_sgemm(CblasRowMajor,
-                                CblasNoTrans,
-                                CblasNoTrans,
-                                m, n, k,
-                                alpha,
-                                A_ptr, lda,
-                                B_ptr, ldb,
-                                beta,
-                                C_ptr, n);
-                };
-                run_reference_gemm(A_full_storage.data(), B_full_storage.data(), C_rep.host_owned->data(),
-                                   transposeW, m, n, k, alpha, beta, rank_);
+                run_reference_gemm(A_full_storage.data(),
+                                   B_full_storage.data(),
+                                   C_rep.host_owned->data(),
+                                   transposeW,
+                                   m,
+                                   n,
+                                   k,
+                                   alpha,
+                                   beta,
+                                   rank_);
             }
 
             if (mpi_is_initialized() && mpi_world_size_safe() > 1)
