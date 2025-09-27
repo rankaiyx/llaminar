@@ -199,7 +199,7 @@ namespace llaminar
                                                 float softmax_scale = 1.0f,
                                                 bool transpose_k = false);
 
-        void to_row_major(const CosmaView &src, float *dst) const;
+        void to_row_major(const CosmaView &src, float *dst, bool force_normalize = false) const;
         // Generic reconstruction helper (optionally normalization when overlapping ownership occurs)
         void reconstruct_matrix(const CosmaView &src, float *dst, bool normalize = true) const;
         // Debug: reconstruct and compare to original row-major (env LLAMINAR_COSMA_DEBUG_RECON)
@@ -306,6 +306,9 @@ namespace llaminar
             bool overlap_verbose = false;
             bool preflight_disable = false;
             bool rmsnorm_validate = false;
+            bool rmsnorm_trace = false;
+            bool rmsnorm_trace_points_active = false;
+            std::string rmsnorm_trace_points_spec;
             bool diag_perm_infer_active = false;
             bool diag_samples_active = false;
             bool preflight_safety_override = false;

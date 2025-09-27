@@ -14,8 +14,308 @@
 #include <iomanip>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <limits>
 #include <numeric>
+#include <algorithm>
+#include <cblas.h>
 #include <omp.h>
+#include <sstream>
+#include <tuple>
+#include <mutex>
+#include <unordered_map>
+
+namespace
+{
+    struct BufferStats
+    {
+        double min = 0.0;
+        double max = 0.0;
+        double mean = 0.0;
+        double l2 = 0.0;
+        double rms = 0.0;
+        double stddev = 0.0;
+    };
+
+    BufferStats computeBufferStats(const float *data, size_t size)
+    {
+        BufferStats stats;
+        if (!data || size == 0)
+        {
+            return stats;
+        }
+
+        double sum = 0.0;
+        double sumsq = 0.0;
+        double min_v = static_cast<double>(data[0]);
+        double max_v = static_cast<double>(data[0]);
+        for (size_t i = 0; i < size; ++i)
+        {
+            double v = static_cast<double>(data[i]);
+            sum += v;
+            sumsq += v * v;
+            if (v < min_v)
+                min_v = v;
+            if (v > max_v)
+                max_v = v;
+        }
+        double mean = sum / static_cast<double>(size);
+        double variance = std::max(0.0, sumsq / static_cast<double>(size) - mean * mean);
+        stats.min = min_v;
+        stats.max = max_v;
+        stats.mean = mean;
+        stats.rms = std::sqrt(sumsq / static_cast<double>(size));
+        stats.l2 = std::sqrt(sumsq);
+        stats.stddev = std::sqrt(variance);
+        return stats;
+    }
+
+    struct DiffSummary
+    {
+        double max_abs = 0.0;
+        double mean_abs = 0.0;
+        double rel_l2 = 0.0;
+        size_t worst_index = 0;
+        float value_a = 0.0f;
+        float value_b = 0.0f;
+    };
+
+    DiffSummary computeDiffSummary(const float *a, const float *b, size_t size)
+    {
+        DiffSummary summary;
+        if (!a || !b || size == 0)
+        {
+            return summary;
+        }
+        double max_abs = 0.0;
+        size_t worst = 0;
+        float worst_a = 0.0f;
+        float worst_b = 0.0f;
+        double sum_abs = 0.0;
+        long double sum_sq = 0.0L;
+        long double denom_sq = 0.0L;
+        for (size_t i = 0; i < size; ++i)
+        {
+            double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            double abs_diff = std::fabs(diff);
+            sum_abs += abs_diff;
+            sum_sq += diff * diff;
+            double base = static_cast<double>(b[i]);
+            denom_sq += base * base;
+            if (abs_diff > max_abs)
+            {
+                max_abs = abs_diff;
+                worst = i;
+                worst_a = a[i];
+                worst_b = b[i];
+            }
+        }
+        summary.max_abs = max_abs;
+        summary.mean_abs = sum_abs / static_cast<double>(size);
+        summary.rel_l2 = std::sqrt(static_cast<double>(sum_sq)) / (std::sqrt(static_cast<double>(denom_sq)) + 1e-30);
+        summary.worst_index = worst;
+        summary.value_a = worst_a;
+        summary.value_b = worst_b;
+        return summary;
+    }
+
+    std::vector<std::tuple<size_t, float, float, double>> collectTopDiffSamples(const float *a,
+                                                                                const float *b,
+                                                                                size_t size,
+                                                                                size_t top_n)
+    {
+        std::vector<std::tuple<size_t, float, float, double>> samples;
+        if (!a || !b || size == 0 || top_n == 0)
+        {
+            return samples;
+        }
+        samples.reserve(std::min(size, top_n));
+        for (size_t i = 0; i < size; ++i)
+        {
+            double diff = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+            if (diff <= 0.0)
+            {
+                continue;
+            }
+            if (samples.size() < top_n)
+            {
+                samples.emplace_back(i, a[i], b[i], diff);
+            }
+            else
+            {
+                auto min_it = std::min_element(samples.begin(), samples.end(),
+                                               [](const auto &lhs, const auto &rhs)
+                                               { return std::get<3>(lhs) < std::get<3>(rhs); });
+                if (diff > std::get<3>(*min_it))
+                {
+                    *min_it = std::make_tuple(i, a[i], b[i], diff);
+                }
+            }
+        }
+        std::sort(samples.begin(), samples.end(),
+                  [](const auto &lhs, const auto &rhs)
+                  { return std::get<3>(lhs) > std::get<3>(rhs); });
+        return samples;
+    }
+
+    std::string formatDiffSamples(const std::vector<std::tuple<size_t, float, float, double>> &samples,
+                                  int cols)
+    {
+        if (samples.empty())
+        {
+            return std::string("<none>");
+        }
+        std::ostringstream oss;
+        for (size_t i = 0; i < samples.size(); ++i)
+        {
+            size_t idx = std::get<0>(samples[i]);
+            oss << "[idx=" << idx;
+            if (cols > 0)
+            {
+                int row = static_cast<int>(idx / static_cast<size_t>(cols));
+                int col = static_cast<int>(idx % static_cast<size_t>(cols));
+                oss << " r=" << row << " c=" << col;
+            }
+            oss << " cosma=" << std::get<1>(samples[i])
+                << " ref=" << std::get<2>(samples[i])
+                << " diff=" << std::get<3>(samples[i]) << "]";
+            if (i + 1 < samples.size())
+            {
+                oss << ' ';
+            }
+        }
+        return oss.str();
+    }
+
+    constexpr const char *kCaptureBaselineEnv = "LLAMINAR_PREFILL_CAPTURE_BASELINE";
+    constexpr const char *kCompareBaselineEnv = "LLAMINAR_PREFILL_COMPARE_BASELINE";
+
+    class PrefillBaselineRegistry
+    {
+    public:
+        static PrefillBaselineRegistry &instance()
+        {
+            static PrefillBaselineRegistry inst;
+            return inst;
+        }
+
+        void clear()
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            storage_.clear();
+        }
+
+        void store(const std::string &name, const float *data, size_t count)
+        {
+            if (!data || count == 0)
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> guard(mutex_);
+            storage_[name] = std::vector<float>(data, data + count);
+        }
+
+        bool fetch(const std::string &name, std::vector<float> &out) const
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            auto it = storage_.find(name);
+            if (it == storage_.end())
+            {
+                return false;
+            }
+            out = it->second;
+            return true;
+        }
+
+    private:
+        PrefillBaselineRegistry() = default;
+        PrefillBaselineRegistry(const PrefillBaselineRegistry &) = delete;
+        PrefillBaselineRegistry &operator=(const PrefillBaselineRegistry &) = delete;
+
+        mutable std::mutex mutex_;
+        std::unordered_map<std::string, std::vector<float>> storage_;
+    };
+
+    void handle_prefill_stage_snapshot(int rank,
+                                       const std::string &name,
+                                       const float *data,
+                                       size_t count,
+                                       int cols,
+                                       double warn_threshold,
+                                       bool capture_enabled,
+                                       bool compare_enabled)
+    {
+        if ((!capture_enabled && !compare_enabled) || !data || count == 0)
+        {
+            return;
+        }
+
+        constexpr const char *tag = "[PrefillBaseline]";
+        auto &registry = PrefillBaselineRegistry::instance();
+
+        if (capture_enabled && rank == 0)
+        {
+            registry.store(name, data, count);
+            LOG_DEBUG(tag << " captured stage '" << name << "' elements=" << count);
+        }
+
+        if (compare_enabled && rank == 0)
+        {
+            std::vector<float> baseline;
+            if (!registry.fetch(name, baseline))
+            {
+                LOG_WARN(tag << " missing baseline for stage '" << name << "'");
+                return;
+            }
+            if (baseline.size() != count)
+            {
+                LOG_WARN(tag << " size mismatch for stage '" << name << "' baseline=" << baseline.size()
+                             << " current=" << count);
+                return;
+            }
+
+            auto diff = computeDiffSummary(data, baseline.data(), count);
+            auto samples = collectTopDiffSamples(data, baseline.data(), count, 8);
+            if (diff.rel_l2 > warn_threshold)
+            {
+                LOG_WARN(tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                             << " max_abs=" << diff.max_abs
+                             << " mean_abs=" << diff.mean_abs
+                             << " worst_index=" << diff.worst_index
+                             << " cosma=" << diff.value_a
+                             << " baseline=" << diff.value_b);
+            }
+            else
+            {
+                LOG_INFO(tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                             << " max_abs=" << diff.max_abs
+                             << " mean_abs=" << diff.mean_abs
+                             << " worst_index=" << diff.worst_index
+                             << " cosma=" << diff.value_a
+                             << " baseline=" << diff.value_b);
+            }
+            LOG_INFO(tag << " " << name << " diff samples: " << formatDiffSamples(samples, cols));
+        }
+    }
+
+    bool findFirstNonFinite(const float *data, size_t size, size_t &index, float &value)
+    {
+        if (!data)
+        {
+            return false;
+        }
+        for (size_t i = 0; i < size; ++i)
+        {
+            if (!std::isfinite(data[i]))
+            {
+                index = i;
+                value = data[i];
+                return true;
+            }
+        }
+        return false;
+    }
+} // namespace
 
 namespace llaminar
 {
@@ -118,6 +418,13 @@ namespace llaminar
         }
 
         int seq_len = token_ids.size();
+        const bool capture_baseline = std::getenv(kCaptureBaselineEnv) != nullptr;
+        const bool compare_baseline = std::getenv(kCompareBaselineEnv) != nullptr;
+        if (capture_baseline && getRank() == 0)
+        {
+            PrefillBaselineRegistry::instance().clear();
+            LOG_DEBUG("[PrefillBaseline] cleared registry at execute start");
+        }
         if (seq_len <= 0 || seq_len > config_.max_seq_len)
         {
             LOG_ERROR("MPITransformerPipeline: Invalid sequence length " << seq_len);
@@ -292,6 +599,11 @@ namespace llaminar
             // Bookkeeping timing
             // Finish timing (not aggregated into per-stage stats beyond existing counters)
             LOG_DEBUG("[SmallSeqFastPath] Complete rank=" << getRank());
+            if (compare_baseline && getRank() == 0)
+            {
+                PrefillBaselineRegistry::instance().clear();
+                LOG_DEBUG("[PrefillBaseline] cleared registry after comparison run (small seq path)");
+            }
             return true;
         }
 
@@ -342,6 +654,12 @@ namespace llaminar
                                                 << "Attention: " << total_attention_time_ << "ms, "
                                                 << "Linear: " << total_linear_time_ << "ms, "
                                                 << "Norm: " << total_norm_time_ << "ms");
+        }
+
+        if (compare_baseline && getRank() == 0)
+        {
+            PrefillBaselineRegistry::instance().clear();
+            LOG_DEBUG("[PrefillBaseline] cleared registry after comparison run");
         }
 
         return true;
@@ -425,6 +743,87 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(input, "Input tensor has NaN before layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(input, "layer_" + std::to_string(layer_idx) + "_input");
 
+        const int hidden_size = config_.d_model;
+        const int d_ff = config_.d_ff;
+
+        const bool trace_io = std::getenv("LLAMINAR_COSMA_PREFILL_TRACE_IO") != nullptr;
+        const bool debug_compare = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_COMPARE") != nullptr;
+        const bool debug_attention = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_ATTENTION") != nullptr;
+        const bool debug_output = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_OUTPUT") != nullptr;
+        const bool run_reference = trace_io || debug_compare || debug_attention || debug_output;
+
+        const bool capture_baseline = std::getenv(kCaptureBaselineEnv) != nullptr;
+        const bool compare_baseline = std::getenv(kCompareBaselineEnv) != nullptr;
+        const int baseline_rank = getRank();
+        auto baseline_snapshot = [&](const std::string &name,
+                                     const float *data,
+                                     size_t count,
+                                     int cols,
+                                     double warn_threshold)
+        {
+            handle_prefill_stage_snapshot(baseline_rank, name, data, count, cols, warn_threshold, capture_baseline, compare_baseline);
+        };
+
+        const char *diag_tag = "[PrefillFFN]";
+        if (trace_io)
+        {
+            diag_tag = "[PrefillDiag]";
+        }
+        else if (debug_attention)
+        {
+            diag_tag = "[PrefillAttention]";
+        }
+        else if (debug_output)
+        {
+            diag_tag = "[PrefillOutput]";
+        }
+        else if (debug_compare)
+        {
+            diag_tag = "[PrefillCompare]";
+        }
+
+        auto log_stage_diff = [&](const std::string &name,
+                                  const float *actual,
+                                  const float *reference,
+                                  size_t count,
+                                  int cols,
+                                  double warn_threshold)
+        {
+            if (!run_reference || getRank() != 0 || !actual || !reference || count == 0)
+            {
+                return;
+            }
+            auto diff = computeDiffSummary(actual, reference, count);
+            auto samples = collectTopDiffSamples(actual, reference, count, 8);
+            if (diff.rel_l2 > warn_threshold)
+            {
+                LOG_WARN(diag_tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                                  << " max_abs=" << diff.max_abs
+                                  << " mean_abs=" << diff.mean_abs
+                                  << " worst_index=" << diff.worst_index
+                                  << " cosma=" << diff.value_a
+                                  << " ref=" << diff.value_b);
+            }
+            else
+            {
+                LOG_INFO(diag_tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                                  << " max_abs=" << diff.max_abs
+                                  << " mean_abs=" << diff.mean_abs
+                                  << " worst_index=" << diff.worst_index
+                                  << " cosma=" << diff.value_a
+                                  << " ref=" << diff.value_b);
+            }
+            LOG_INFO(diag_tag << " " << name << " diff samples: " << formatDiffSamples(samples, cols));
+        };
+
+        std::vector<float> residual_ref_storage;
+        std::vector<float> ffn_norm_ref_storage;
+        std::vector<float> gate_ref_storage;
+        std::vector<float> up_ref_storage;
+        std::vector<float> swiglu_ref_storage;
+        std::vector<float> ffn_down_ref_storage;
+        std::vector<float> final_ref_storage;
+
         PrefillAttentionTiming cosma_timing;
         if (shouldUseCosmaPrefill(seq_len))
         {
@@ -487,9 +886,19 @@ namespace llaminar
 
         ASSERT_TENSOR_NOT_NAN(attn_norm_out, "Attention norm output has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(attn_norm_out, "layer_" + std::to_string(layer_idx) + "_attn_norm_out");
+        baseline_snapshot("layer_" + std::to_string(layer_idx) + "_attn_norm_out",
+                          attn_norm_out->data(),
+                          static_cast<size_t>(seq_len) * hidden_size,
+                          hidden_size,
+                          1e-5);
 
         ASSERT_TENSOR_NOT_NAN(attn_out, "Attention output has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(attn_out, "layer_" + std::to_string(layer_idx) + "_attn_out");
+        baseline_snapshot("layer_" + std::to_string(layer_idx) + "_attn_out",
+                          attn_out->data(),
+                          static_cast<size_t>(seq_len) * hidden_size,
+                          hidden_size,
+                          1e-3);
 
         // Attention residual connection using registered residual kernel
         std::vector<std::shared_ptr<TensorBase>> residual_inputs = {input, attn_out};
@@ -503,6 +912,25 @@ namespace llaminar
 
         ASSERT_TENSOR_NOT_NAN(residual_tmp, "Attention residual has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(residual_tmp, "layer_" + std::to_string(layer_idx) + "_attn_residual");
+        baseline_snapshot("layer_" + std::to_string(layer_idx) + "_attn_residual",
+                          residual_tmp->data(),
+                          static_cast<size_t>(seq_len) * hidden_size,
+                          hidden_size,
+                          1e-6);
+
+        if (run_reference && getRank() == 0)
+        {
+            const float *input_ptr = input->data();
+            const float *attn_ptr = attn_out->data();
+            size_t elems = static_cast<size_t>(seq_len) * hidden_size;
+            residual_ref_storage.resize(elems);
+            for (size_t idx = 0; idx < elems; ++idx)
+            {
+                residual_ref_storage[idx] = input_ptr[idx] + attn_ptr[idx];
+            }
+            std::string label = "layer_" + std::to_string(layer_idx) + "_attn_residual";
+            log_stage_diff(label, residual_tmp->data(), residual_ref_storage.data(), elems, hidden_size, 1e-6);
+        }
 
         // 2. Feed-forward path: RMSNorm -> Gate/Up -> SwiGLU -> Down -> Residual
         auto norm_start = std::chrono::high_resolution_clock::now();
@@ -519,6 +947,39 @@ namespace llaminar
 
         ASSERT_TENSOR_NOT_NAN(ffn_norm_out, "FFN norm output has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(ffn_norm_out, "layer_" + std::to_string(layer_idx) + "_ffn_norm_out");
+        baseline_snapshot("layer_" + std::to_string(layer_idx) + "_ffn_norm_out",
+                          ffn_norm_out->data(),
+                          static_cast<size_t>(seq_len) * hidden_size,
+                          hidden_size,
+                          1e-5);
+
+        if (run_reference && getRank() == 0)
+        {
+            const float *gamma_ptr = weights.ffn_norm_weight[layer_idx] ? weights.ffn_norm_weight[layer_idx]->data() : nullptr;
+            if (gamma_ptr)
+            {
+                size_t elems = static_cast<size_t>(seq_len) * hidden_size;
+                ffn_norm_ref_storage.resize(elems);
+                for (int r = 0; r < seq_len; ++r)
+                {
+                    const float *row = residual_ref_storage.data() + static_cast<size_t>(r) * hidden_size;
+                    double sum = 0.0;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        double v = static_cast<double>(row[c]);
+                        sum += v * v;
+                    }
+                    double inv = 1.0 / std::sqrt(sum / std::max(1, hidden_size) + config_.eps);
+                    float *dst = ffn_norm_ref_storage.data() + static_cast<size_t>(r) * hidden_size;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        dst[c] = static_cast<float>(row[c] * inv * gamma_ptr[c]);
+                    }
+                }
+                std::string label = "layer_" + std::to_string(layer_idx) + "_ffn_norm";
+                log_stage_diff(label, ffn_norm_out->data(), ffn_norm_ref_storage.data(), elems, hidden_size, 1e-5);
+            }
+        }
 
         auto norm_end = std::chrono::high_resolution_clock::now();
         total_norm_time_ += std::chrono::duration<double, std::milli>(norm_end - norm_start).count();
@@ -550,6 +1011,34 @@ namespace llaminar
             return false;
         }
 
+        if (run_reference && getRank() == 0)
+        {
+            size_t elems = static_cast<size_t>(seq_len) * d_ff;
+            gate_ref_storage.resize(elems);
+            up_ref_storage.resize(elems);
+            if (!ffn_norm_ref_storage.empty())
+            {
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            seq_len, d_ff, hidden_size,
+                            1.0f,
+                            ffn_norm_ref_storage.data(), hidden_size,
+                            weights.w_gate[layer_idx]->data(), d_ff,
+                            0.0f,
+                            gate_ref_storage.data(), d_ff);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            seq_len, d_ff, hidden_size,
+                            1.0f,
+                            ffn_norm_ref_storage.data(), hidden_size,
+                            weights.w_up[layer_idx]->data(), d_ff,
+                            0.0f,
+                            up_ref_storage.data(), d_ff);
+                std::string gate_label = "layer_" + std::to_string(layer_idx) + "_ffn_gate";
+                log_stage_diff(gate_label, gate_out->data(), gate_ref_storage.data(), elems, d_ff, 1e-3);
+                std::string up_label = "layer_" + std::to_string(layer_idx) + "_ffn_up";
+                log_stage_diff(up_label, up_out->data(), up_ref_storage.data(), elems, d_ff, 1e-3);
+            }
+        }
+
         auto linear_mid = std::chrono::high_resolution_clock::now();
 
         // SwiGLU activation using registered SwiGLU kernel
@@ -568,6 +1057,32 @@ namespace llaminar
         auto activation_end = std::chrono::high_resolution_clock::now();
         total_activation_time_ += std::chrono::duration<double, std::milli>(activation_end - activation_start).count();
 
+        if (run_reference && getRank() == 0)
+        {
+            size_t elems = static_cast<size_t>(seq_len) * d_ff;
+            swiglu_ref_storage.resize(elems);
+            for (size_t idx = 0; idx < elems; ++idx)
+            {
+                float up_val = up_ref_storage[idx];
+                float silu_val;
+                if (up_val > 20.0f)
+                {
+                    silu_val = up_val;
+                }
+                else if (up_val < -20.0f)
+                {
+                    silu_val = 0.0f;
+                }
+                else
+                {
+                    silu_val = up_val / (1.0f + std::exp(-up_val));
+                }
+                swiglu_ref_storage[idx] = gate_ref_storage[idx] * silu_val;
+            }
+            std::string swiglu_label = "layer_" + std::to_string(layer_idx) + "_ffn_swiglu";
+            log_stage_diff(swiglu_label, swiglu_out->data(), swiglu_ref_storage.data(), elems, d_ff, 1e-3);
+        }
+
         // Down projection using registered linear kernel
         std::vector<std::shared_ptr<TensorBase>> down_inputs = {swiglu_out, weights.w_down[layer_idx]};
         std::vector<std::shared_ptr<TensorBase>> down_outputs = {ffn_out};
@@ -580,6 +1095,29 @@ namespace llaminar
 
         ASSERT_TENSOR_NOT_NAN(ffn_out, "FFN output has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(ffn_out, "layer_" + std::to_string(layer_idx) + "_ffn_out");
+        baseline_snapshot("layer_" + std::to_string(layer_idx) + "_ffn_out",
+                          ffn_out->data(),
+                          static_cast<size_t>(seq_len) * hidden_size,
+                          hidden_size,
+                          1e-3);
+
+        if (run_reference && getRank() == 0)
+        {
+            size_t elems = static_cast<size_t>(seq_len) * hidden_size;
+            ffn_down_ref_storage.resize(elems);
+            if (!swiglu_ref_storage.empty())
+            {
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            seq_len, hidden_size, d_ff,
+                            1.0f,
+                            swiglu_ref_storage.data(), d_ff,
+                            weights.w_down[layer_idx]->data(), hidden_size,
+                            0.0f,
+                            ffn_down_ref_storage.data(), hidden_size);
+                std::string down_label = "layer_" + std::to_string(layer_idx) + "_ffn_down";
+                log_stage_diff(down_label, ffn_out->data(), ffn_down_ref_storage.data(), elems, hidden_size, 1e-3);
+            }
+        }
 
         auto linear_end = std::chrono::high_resolution_clock::now();
         total_linear_time_ += std::chrono::duration<double, std::milli>(linear_end - linear_start).count();
@@ -596,6 +1134,25 @@ namespace llaminar
 
         ASSERT_TENSOR_NOT_NAN(output, "Layer output has NaN in layer " + std::to_string(layer_idx));
         TensorLogger::logTensorStats(output, "layer_" + std::to_string(layer_idx) + "_output");
+        baseline_snapshot("layer_" + std::to_string(layer_idx) + "_output",
+                          output->data(),
+                          static_cast<size_t>(seq_len) * hidden_size,
+                          hidden_size,
+                          1e-6);
+
+        if (run_reference && getRank() == 0 && !residual_ref_storage.empty() && !ffn_down_ref_storage.empty())
+        {
+            size_t elems = static_cast<size_t>(seq_len) * hidden_size;
+            final_ref_storage.resize(elems);
+            for (size_t idx = 0; idx < elems; ++idx)
+            {
+                float residual = residual_ref_storage[idx];
+                float ffn_val = ffn_down_ref_storage[idx];
+                final_ref_storage[idx] = residual + ffn_val;
+            }
+            std::string final_label = "layer_" + std::to_string(layer_idx) + "_output_residual";
+            log_stage_diff(final_label, output->data(), final_ref_storage.data(), elems, hidden_size, 1e-6);
+        }
 
         LOG_DEBUG("Layer " << layer_idx << " completed on rank " << getRank());
         return true;
@@ -659,7 +1216,7 @@ namespace llaminar
                                                hidden_size,
                                                config_.eps,
                                                scale,
-                                               true);
+                                               false);
         auto fused_end = std::chrono::high_resolution_clock::now();
 
         if ((!fused.normalized.mat && !fused.normalized.host_owned) ||
@@ -678,9 +1235,9 @@ namespace llaminar
         std::vector<float> q_buf(static_cast<size_t>(seq_len) * total_head_dim, 0.f);
         std::vector<float> k_buf(static_cast<size_t>(seq_len) * kv_head_dim, 0.f);
         std::vector<float> v_buf(static_cast<size_t>(seq_len) * kv_head_dim, 0.f);
-        manager.to_row_major(fused.q, q_buf.data());
-        manager.to_row_major(fused.k, k_buf.data());
-        manager.to_row_major(fused.v, v_buf.data());
+        manager.to_row_major(fused.q, q_buf.data(), true);
+        manager.to_row_major(fused.k, k_buf.data(), true);
+        manager.to_row_major(fused.v, v_buf.data(), true);
 
         timing.norm_ms = std::chrono::duration<double, std::milli>(fused_end - fused_start).count();
 
@@ -689,12 +1246,188 @@ namespace llaminar
         std::vector<float> k_head(static_cast<size_t>(seq_len) * head_dim, 0.f);
         std::vector<float> v_head(static_cast<size_t>(seq_len) * head_dim, 0.f);
         std::vector<float> scores(static_cast<size_t>(seq_len) * seq_len, 0.f);
-        std::vector<float> softmax_buf(static_cast<size_t>(seq_len) * seq_len, 0.f);
         std::vector<float> context_head(static_cast<size_t>(seq_len) * head_dim, 0.f);
+        const bool trace_io = std::getenv("LLAMINAR_COSMA_PREFILL_TRACE_IO") != nullptr;
+        const bool debug_compare = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_COMPARE") != nullptr;
+        const bool debug_attention = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_ATTENTION") != nullptr;
+        const bool debug_output = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_OUTPUT") != nullptr;
+        const bool run_reference = trace_io || debug_compare || debug_attention || debug_output;
+        const char *diag_tag = "[PrefillDebug]";
+        if (trace_io)
+        {
+            diag_tag = "[PrefillDiag]";
+        }
+        else if (debug_attention)
+        {
+            diag_tag = "[PrefillAttention]";
+        }
+        else if (debug_output)
+        {
+            diag_tag = "[PrefillOutput]";
+        }
+        else if (debug_compare)
+        {
+            diag_tag = "[PrefillCompare]";
+        }
+
+        auto log_buffer = [&](const std::string &name, const float *data, size_t size, int rows, int cols)
+        {
+            if (!trace_io || rank_ != 0 || !data || size == 0)
+            {
+                return;
+            }
+            auto stats = computeBufferStats(data, size);
+            LOG_INFO("[PrefillDiag] " << name << " stats rows=" << rows
+                                      << " cols=" << cols
+                                      << " min=" << stats.min
+                                      << " max=" << stats.max
+                                      << " mean=" << stats.mean
+                                      << " stddev=" << stats.stddev
+                                      << " rms=" << stats.rms
+                                      << " l2=" << stats.l2);
+            size_t bad_idx = 0;
+            float bad_val = 0.f;
+            if (findFirstNonFinite(data, size, bad_idx, bad_val))
+            {
+                if (cols > 0)
+                {
+                    int row = static_cast<int>(bad_idx / static_cast<size_t>(cols));
+                    int col = static_cast<int>(bad_idx % static_cast<size_t>(cols));
+                    LOG_WARN("[PrefillDiag] " << name << " non-finite value at idx=" << bad_idx
+                                              << " (row=" << row << " col=" << col << ") value=" << bad_val);
+                }
+                else
+                {
+                    LOG_WARN("[PrefillDiag] " << name << " non-finite value at idx=" << bad_idx
+                                              << " value=" << bad_val);
+                }
+            }
+        };
+
+        auto log_diff_summary = [&](const std::string &name,
+                                    const std::vector<float> &buf,
+                                    const std::vector<float> &ref,
+                                    int cols,
+                                    double warn_threshold)
+        {
+            if (!run_reference || rank_ != 0 || buf.size() != ref.size() || buf.empty())
+            {
+                return;
+            }
+            auto diff = computeDiffSummary(buf.data(), ref.data(), ref.size());
+            auto samples = collectTopDiffSamples(buf.data(), ref.data(), ref.size(), 5);
+            if (diff.max_abs > warn_threshold)
+            {
+                LOG_WARN(diag_tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                                  << " max_abs=" << diff.max_abs
+                                  << " mean_abs=" << diff.mean_abs
+                                  << " worst_index=" << diff.worst_index
+                                  << " cosma=" << diff.value_a
+                                  << " ref=" << diff.value_b);
+            }
+            else
+            {
+                LOG_INFO(diag_tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                                  << " max_abs=" << diff.max_abs
+                                  << " mean_abs=" << diff.mean_abs
+                                  << " worst_index=" << diff.worst_index
+                                  << " cosma=" << diff.value_a
+                                  << " ref=" << diff.value_b);
+            }
+            LOG_INFO(diag_tag << " " << name << " diff samples: " << formatDiffSamples(samples, cols));
+        };
+
+        const float *layer_input_ptr = input ? input->data() : nullptr;
+        const size_t norm_elems = static_cast<size_t>(seq_len) * hidden_size;
+        if (trace_io && layer_input_ptr)
+        {
+            log_buffer("layer_input", layer_input_ptr, norm_elems, seq_len, hidden_size);
+        }
+        if (trace_io)
+        {
+            log_buffer("rmsnorm_output", norm_buf.data(), norm_buf.size(), seq_len, hidden_size);
+            log_buffer("Q_buffer", q_buf.data(), q_buf.size(), seq_len, total_head_dim);
+            log_buffer("K_buffer", k_buf.data(), k_buf.size(), seq_len, kv_head_dim);
+            log_buffer("V_buffer", v_buf.data(), v_buf.size(), seq_len, kv_head_dim);
+        }
+
+        std::vector<float> norm_ref;
+        if (trace_io && layer_input_ptr)
+        {
+            norm_ref.assign(norm_buf.size(), 0.f);
+            const float *gamma_ptr = weights.attn_norm_weight[layer_idx]->data();
+            for (int r = 0; r < seq_len; ++r)
+            {
+                const float *row = layer_input_ptr + static_cast<size_t>(r) * hidden_size;
+                double sum = 0.0;
+                for (int c = 0; c < hidden_size; ++c)
+                {
+                    double v = static_cast<double>(row[c]);
+                    sum += v * v;
+                }
+                double inv = 1.0 / std::sqrt(sum / std::max(1, hidden_size) + config_.eps);
+                float *dst_row = norm_ref.data() + static_cast<size_t>(r) * hidden_size;
+                for (int c = 0; c < hidden_size; ++c)
+                {
+                    dst_row[c] = static_cast<float>(row[c] * inv * gamma_ptr[c]);
+                }
+            }
+            log_diff_summary("RMSNorm", norm_buf, norm_ref, hidden_size, 1e-5);
+        }
+
+        std::vector<float> q_ref;
+        std::vector<float> k_ref;
+        std::vector<float> v_ref;
+        if (run_reference)
+        {
+            q_ref.assign(static_cast<size_t>(seq_len) * total_head_dim, 0.f);
+            k_ref.assign(static_cast<size_t>(seq_len) * kv_head_dim, 0.f);
+            v_ref.assign(static_cast<size_t>(seq_len) * kv_head_dim, 0.f);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, total_head_dim, hidden_size,
+                        1.0f,
+                        norm_buf.data(), hidden_size,
+                        weights.wq[layer_idx]->data(), total_head_dim,
+                        0.0f,
+                        q_ref.data(), total_head_dim);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, kv_head_dim, hidden_size,
+                        1.0f,
+                        norm_buf.data(), hidden_size,
+                        weights.wk[layer_idx]->data(), kv_head_dim,
+                        0.0f,
+                        k_ref.data(), kv_head_dim);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, kv_head_dim, hidden_size,
+                        1.0f,
+                        norm_buf.data(), hidden_size,
+                        weights.wv[layer_idx]->data(), kv_head_dim,
+                        0.0f,
+                        v_ref.data(), kv_head_dim);
+            log_diff_summary("Q", q_buf, q_ref, total_head_dim, 1e-3);
+            log_diff_summary("K", k_buf, k_ref, kv_head_dim, 1e-3);
+            log_diff_summary("V", v_buf, v_ref, kv_head_dim, 1e-3);
+        }
+
+        constexpr float theta_base = 10000.0f;
+
+        std::vector<float> context_ref_concat;
+        std::vector<float> q_head_ref;
+        std::vector<float> k_head_ref;
+        std::vector<float> v_head_ref;
+        std::vector<float> context_head_ref;
+        std::vector<float> scores_head_ref;
+        if (run_reference)
+        {
+            context_ref_concat.assign(static_cast<size_t>(seq_len) * total_head_dim, 0.f);
+            q_head_ref.resize(static_cast<size_t>(seq_len) * head_dim);
+            k_head_ref.resize(static_cast<size_t>(seq_len) * head_dim);
+            v_head_ref.resize(static_cast<size_t>(seq_len) * head_dim);
+            context_head_ref.resize(static_cast<size_t>(seq_len) * head_dim);
+            scores_head_ref.resize(static_cast<size_t>(seq_len) * seq_len);
+        }
 
         auto attention_start = std::chrono::high_resolution_clock::now();
-        const auto &score_strategy = manager.strategy_for(seq_len, seq_len, head_dim);
-
         for (int head = 0; head < n_heads; ++head)
         {
             const int kv_head = head % n_kv_heads;
@@ -706,51 +1439,174 @@ namespace llaminar
                 std::memcpy(q_head.data() + static_cast<size_t>(row) * head_dim, q_src, head_dim * sizeof(float));
                 std::memcpy(k_head.data() + static_cast<size_t>(row) * head_dim, k_src, head_dim * sizeof(float));
                 std::memcpy(v_head.data() + static_cast<size_t>(row) * head_dim, v_src, head_dim * sizeof(float));
+                if (run_reference)
+                {
+                    const float *q_ref_src = q_ref.data() + static_cast<size_t>(row) * total_head_dim + head * head_dim;
+                    const float *k_ref_src = k_ref.data() + static_cast<size_t>(row) * kv_head_dim + kv_head * head_dim;
+                    const float *v_ref_src = v_ref.data() + static_cast<size_t>(row) * kv_head_dim + kv_head * head_dim;
+                    std::memcpy(q_head_ref.data() + static_cast<size_t>(row) * head_dim, q_ref_src, head_dim * sizeof(float));
+                    std::memcpy(k_head_ref.data() + static_cast<size_t>(row) * head_dim, k_ref_src, head_dim * sizeof(float));
+                    std::memcpy(v_head_ref.data() + static_cast<size_t>(row) * head_dim, v_ref_src, head_dim * sizeof(float));
+                }
             }
 
-            LOG_DEBUG("Attention head " << head << ": invoking adaptiveMatMul for QK^T (seq_len=" << seq_len
-                                        << ", head_dim=" << head_dim << ") on rank " << rank_);
-            if (!adaptiveMatMul(q_head.data(), k_head.data(), scores.data(),
-                                seq_len, seq_len, head_dim,
-                                true, false, false, true))
+            for (int row = 0; row < seq_len; ++row)
             {
-                LOG_ERROR("AdaptiveMatMul failed computing attention scores for head " << head);
-                return false;
+                float *q_row = q_head.data() + static_cast<size_t>(row) * head_dim;
+                float *k_row = k_head.data() + static_cast<size_t>(row) * head_dim;
+                float *q_ref_row = run_reference ? (q_head_ref.data() + static_cast<size_t>(row) * head_dim) : nullptr;
+                float *k_ref_row = run_reference ? (k_head_ref.data() + static_cast<size_t>(row) * head_dim) : nullptr;
+                const float position = static_cast<float>(n_past_ + row);
+                for (int dim_pair = 0; dim_pair < head_dim / 2; ++dim_pair)
+                {
+                    float theta = 1.0f / std::pow(theta_base, (2.0f * static_cast<float>(dim_pair)) / static_cast<float>(head_dim));
+                    float cos_theta = std::cos(position * theta);
+                    float sin_theta = std::sin(position * theta);
+
+                    float q0 = q_row[2 * dim_pair];
+                    float q1 = q_row[2 * dim_pair + 1];
+                    q_row[2 * dim_pair] = q0 * cos_theta - q1 * sin_theta;
+                    q_row[2 * dim_pair + 1] = q0 * sin_theta + q1 * cos_theta;
+
+                    float k0 = k_row[2 * dim_pair];
+                    float k1 = k_row[2 * dim_pair + 1];
+                    k_row[2 * dim_pair] = k0 * cos_theta - k1 * sin_theta;
+                    k_row[2 * dim_pair + 1] = k0 * sin_theta + k1 * cos_theta;
+
+                    if (run_reference)
+                    {
+                        float rk0 = k_ref_row[2 * dim_pair];
+                        float rk1 = k_ref_row[2 * dim_pair + 1];
+                        k_ref_row[2 * dim_pair] = rk0 * cos_theta - rk1 * sin_theta;
+                        k_ref_row[2 * dim_pair + 1] = rk0 * sin_theta + rk1 * cos_theta;
+
+                        float rq0 = q_ref_row[2 * dim_pair];
+                        float rq1 = q_ref_row[2 * dim_pair + 1];
+                        q_ref_row[2 * dim_pair] = rq0 * cos_theta - rq1 * sin_theta;
+                        q_ref_row[2 * dim_pair + 1] = rq0 * sin_theta + rq1 * cos_theta;
+                    }
+                }
             }
-            LOG_DEBUG("Attention head " << head << ": adaptiveMatMul for QK^T completed on rank " << rank_);
 
-            for (float &value : scores)
+            if (run_reference)
             {
-                value *= scale;
+                std::fill(scores_head_ref.begin(), scores_head_ref.end(), 0.0f);
+                std::fill(context_head_ref.begin(), context_head_ref.end(), 0.0f);
             }
 
-            LOG_DEBUG("Attention head " << head << ": converting scores to COSMA layout on rank " << rank_);
-            auto scores_view = manager.convert_activation_in_with_strategy(scores.data(), seq_len, seq_len, score_strategy);
-            LOG_DEBUG("Attention head " << head << ": scores view mat=" << (scores_view.mat ? 1 : 0)
-                                        << " local_size=" << (scores_view.mat ? scores_view.mat->matrix_size() : 0)
-                                        << " orig_ptr=" << (scores_view.original_row_major ? 1 : 0)
-                                        << " on rank " << rank_);
-            auto softmax_view = manager.convert_activation_in_with_strategy(softmax_buf.data(), seq_len, seq_len, score_strategy);
-            LOG_DEBUG("Attention head " << head << ": softmax view mat=" << (softmax_view.mat ? 1 : 0)
-                                        << " local_size=" << (softmax_view.mat ? softmax_view.mat->matrix_size() : 0)
-                                        << " orig_ptr=" << (softmax_view.original_row_major ? 1 : 0)
-                                        << " on rank " << rank_);
-
-            LOG_DEBUG("Attention head " << head << ": softmax_in_layout start on rank " << rank_);
-            if (!manager.softmax_in_layout(scores_view, softmax_view, seq_len, seq_len, 1.0f))
+            for (int row = 0; row < seq_len; ++row)
             {
-                LOG_ERROR("Distributed softmax failed for head " << head);
-                return false;
-            }
-            LOG_DEBUG("Attention head " << head << ": softmax_in_layout complete on rank " << rank_);
-            manager.to_row_major(softmax_view, softmax_buf.data());
+                const float *q_row = q_head.data() + static_cast<size_t>(row) * head_dim;
+                float *score_row = scores.data() + static_cast<size_t>(row) * seq_len;
+                const float *q_ref_row = run_reference ? (q_head_ref.data() + static_cast<size_t>(row) * head_dim) : nullptr;
+                float *score_ref_row = run_reference ? (scores_head_ref.data() + static_cast<size_t>(row) * seq_len) : nullptr;
 
-            if (!adaptiveMatMul(softmax_buf.data(), v_head.data(), context_head.data(),
-                                seq_len, head_dim, seq_len,
-                                true))
-            {
-                LOG_ERROR("AdaptiveMatMul failed computing attention context for head " << head);
-                return false;
+                float row_max = -std::numeric_limits<float>::infinity();
+                float row_max_ref = -std::numeric_limits<float>::infinity();
+                for (int col = 0; col <= row; ++col)
+                {
+                    const float *k_row = k_head.data() + static_cast<size_t>(col) * head_dim;
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d)
+                    {
+                        dot += q_row[d] * k_row[d];
+                    }
+                    float scaled = dot * scale;
+                    score_row[col] = scaled;
+                    if (scaled > row_max)
+                    {
+                        row_max = scaled;
+                    }
+
+                    if (run_reference)
+                    {
+                        const float *k_ref_row = k_head_ref.data() + static_cast<size_t>(col) * head_dim;
+                        float dot_ref = 0.0f;
+                        for (int d = 0; d < head_dim; ++d)
+                        {
+                            dot_ref += q_ref_row[d] * k_ref_row[d];
+                        }
+                        float scaled_ref = dot_ref * scale;
+                        score_ref_row[col] = scaled_ref;
+                        if (scaled_ref > row_max_ref)
+                        {
+                            row_max_ref = scaled_ref;
+                        }
+                    }
+                }
+                for (int col = row + 1; col < seq_len; ++col)
+                {
+                    score_row[col] = -std::numeric_limits<float>::infinity();
+                    if (run_reference)
+                    {
+                        score_ref_row[col] = -std::numeric_limits<float>::infinity();
+                    }
+                }
+
+                double denom = 0.0;
+                double denom_ref = 0.0;
+                for (int col = 0; col <= row; ++col)
+                {
+                    float val = std::exp(score_row[col] - row_max);
+                    score_row[col] = val;
+                    denom += val;
+
+                    if (run_reference)
+                    {
+                        float ref_val = std::exp(score_ref_row[col] - row_max_ref);
+                        score_ref_row[col] = ref_val;
+                        denom_ref += ref_val;
+                    }
+                }
+                float inv = denom > 0.0 ? static_cast<float>(1.0 / denom) : 1.0f;
+                for (int col = 0; col <= row; ++col)
+                {
+                    score_row[col] *= inv;
+                }
+                for (int col = row + 1; col < seq_len; ++col)
+                {
+                    score_row[col] = 0.0f;
+                }
+
+                if (run_reference)
+                {
+                    float inv_ref = denom_ref > 0.0 ? static_cast<float>(1.0 / denom_ref) : 1.0f;
+                    for (int col = 0; col <= row; ++col)
+                    {
+                        score_ref_row[col] *= inv_ref;
+                    }
+                    for (int col = row + 1; col < seq_len; ++col)
+                    {
+                        score_ref_row[col] = 0.0f;
+                    }
+                }
+
+                float *context_row = context_head.data() + static_cast<size_t>(row) * head_dim;
+                std::fill(context_row, context_row + head_dim, 0.0f);
+                float *context_ref_row = run_reference ? (context_head_ref.data() + static_cast<size_t>(row) * head_dim) : nullptr;
+                if (run_reference)
+                {
+                    std::fill(context_ref_row, context_ref_row + head_dim, 0.0f);
+                }
+                for (int col = 0; col <= row; ++col)
+                {
+                    const float *v_row = v_head.data() + static_cast<size_t>(col) * head_dim;
+                    float weight = score_row[col];
+                    for (int d = 0; d < head_dim; ++d)
+                    {
+                        context_row[d] += weight * v_row[d];
+                    }
+
+                    if (run_reference)
+                    {
+                        const float *v_ref_row = v_head_ref.data() + static_cast<size_t>(col) * head_dim;
+                        float weight_ref = score_ref_row[col];
+                        for (int d = 0; d < head_dim; ++d)
+                        {
+                            context_ref_row[d] += weight_ref * v_ref_row[d];
+                        }
+                    }
+                }
             }
 
             for (int row = 0; row < seq_len; ++row)
@@ -758,26 +1614,73 @@ namespace llaminar
                 float *dst = context_concat.data() + static_cast<size_t>(row) * total_head_dim + head * head_dim;
                 const float *src = context_head.data() + static_cast<size_t>(row) * head_dim;
                 std::memcpy(dst, src, head_dim * sizeof(float));
+                if (run_reference)
+                {
+                    float *dst_ref = context_ref_concat.data() + static_cast<size_t>(row) * total_head_dim + head * head_dim;
+                    const float *src_ref = context_head_ref.data() + static_cast<size_t>(row) * head_dim;
+                    std::memcpy(dst_ref, src_ref, head_dim * sizeof(float));
+                }
+            }
+
+            if (run_reference && rank_ == 0)
+            {
+                std::string head_context_label = "attention_context_head_" + std::to_string(head);
+                log_diff_summary(head_context_label, context_head, context_head_ref, head_dim, 1e-3);
+
+                std::string head_scores_label = "attention_scores_head_" + std::to_string(head);
+                log_diff_summary(head_scores_label, scores, scores_head_ref, seq_len, 1e-3);
             }
         }
 
         auto attention_end = std::chrono::high_resolution_clock::now();
+        if (trace_io)
+        {
+            log_buffer("attention_scores", scores.data(), scores.size(), seq_len, seq_len);
+            log_buffer("context_concat", context_concat.data(), context_concat.size(), seq_len, total_head_dim);
+            if (run_reference)
+            {
+                log_buffer("attention_scores_ref", scores_head_ref.data(), scores_head_ref.size(), seq_len, seq_len);
+                log_buffer("context_concat_ref", context_ref_concat.data(), context_ref_concat.size(), seq_len, total_head_dim);
+            }
+        }
+        if (run_reference && rank_ == 0)
+        {
+            log_diff_summary("attention_context_all_heads", context_concat, context_ref_concat, total_head_dim, 1e-3);
+        }
         timing.attention_ms = std::chrono::duration<double, std::milli>(attention_end - attention_start).count();
 
         auto proj_start = std::chrono::high_resolution_clock::now();
-        if (!adaptiveMatMul(context_concat.data(),
-                            weights.wo[layer_idx]->data(),
-                            attn_out->data(),
-                            seq_len,
-                            hidden_size,
-                            total_head_dim,
-                            true))
-        {
-            LOG_ERROR("AdaptiveMatMul failed for output projection in layer " << layer_idx);
-            return false;
-        }
+        // TODO(Phase2): once the COSMA matmul path for the output projection is validated,
+        // restore a distributed implementation. For now we rely on local OpenBLAS to guarantee
+        // correctness for the attention output projection.
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    seq_len, hidden_size, total_head_dim,
+                    1.0f,
+                    context_concat.data(), total_head_dim,
+                    weights.wo[layer_idx]->data(), hidden_size,
+                    0.0f,
+                    attn_out->data(), hidden_size);
         auto proj_end = std::chrono::high_resolution_clock::now();
         timing.linear_ms = std::chrono::duration<double, std::milli>(proj_end - proj_start).count();
+
+        if (run_reference || trace_io)
+        {
+            std::vector<float> attn_out_vec(static_cast<size_t>(seq_len) * hidden_size, 0.f);
+            std::memcpy(attn_out_vec.data(), attn_out->data(), attn_out_vec.size() * sizeof(float));
+            log_buffer("attention_output", attn_out_vec.data(), attn_out_vec.size(), seq_len, hidden_size);
+            if (run_reference)
+            {
+                std::vector<float> attn_ref(attn_out_vec.size(), 0.f);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            seq_len, hidden_size, total_head_dim,
+                            1.0f,
+                            context_concat.data(), total_head_dim,
+                            weights.wo[layer_idx]->data(), hidden_size,
+                            0.0f,
+                            attn_ref.data(), hidden_size);
+                log_diff_summary("attention_output", attn_out_vec, attn_ref, hidden_size, 1e-3);
+            }
+        }
 
         return true;
     }
@@ -786,57 +1689,195 @@ namespace llaminar
                                                          const ModelWeights &weights,
                                                          std::shared_ptr<TensorBase> &output)
     {
+        DEBUG_ASSERT(input, "Input tensor null before final normalization");
         int seq_len = input->shape()[0];
+        const int hidden_size = config_.d_model;
+        const int vocab_size = config_.vocab_size;
+
+        const bool trace_io = std::getenv("LLAMINAR_COSMA_PREFILL_TRACE_IO") != nullptr;
+        const bool debug_compare = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_COMPARE") != nullptr;
+        const bool debug_attention = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_ATTENTION") != nullptr;
+        const bool debug_output = std::getenv("LLAMINAR_COSMA_PREFILL_DEBUG_OUTPUT") != nullptr;
+        const bool run_reference = trace_io || debug_compare || debug_attention || debug_output;
+
+        const bool capture_baseline = std::getenv(kCaptureBaselineEnv) != nullptr;
+        const bool compare_baseline = std::getenv(kCompareBaselineEnv) != nullptr;
+        const int baseline_rank = getRank();
+        auto baseline_snapshot = [&](const std::string &name,
+                                     const float *data,
+                                     size_t count,
+                                     int cols,
+                                     double warn_threshold)
+        {
+            handle_prefill_stage_snapshot(baseline_rank, name, data, count, cols, warn_threshold, capture_baseline, compare_baseline);
+        };
+
+        const char *diag_tag = "[PrefillOutput]";
+        if (trace_io)
+        {
+            diag_tag = "[PrefillDiag]";
+        }
+        else if (debug_output)
+        {
+            diag_tag = "[PrefillOutput]";
+        }
+        else if (debug_attention)
+        {
+            diag_tag = "[PrefillAttention]";
+        }
+        else if (debug_compare)
+        {
+            diag_tag = "[PrefillCompare]";
+        }
+
+        auto log_buffer = [&](const std::string &name, const float *data, size_t size, int rows, int cols)
+        {
+            if (!trace_io || rank_ != 0 || !data || size == 0)
+            {
+                return;
+            }
+            auto stats = computeBufferStats(data, size);
+            LOG_INFO("[PrefillDiag] " << name << " stats rows=" << rows
+                                      << " cols=" << cols
+                                      << " min=" << stats.min
+                                      << " max=" << stats.max
+                                      << " mean=" << stats.mean
+                                      << " stddev=" << stats.stddev
+                                      << " rms=" << stats.rms
+                                      << " l2=" << stats.l2);
+            size_t bad_idx = 0;
+            float bad_val = 0.f;
+            if (findFirstNonFinite(data, size, bad_idx, bad_val))
+            {
+                if (cols > 0)
+                {
+                    int row = static_cast<int>(bad_idx / static_cast<size_t>(cols));
+                    int col = static_cast<int>(bad_idx % static_cast<size_t>(cols));
+                    LOG_WARN("[PrefillDiag] " << name << " non-finite value at idx=" << bad_idx
+                                              << " (row=" << row << " col=" << col << ") value=" << bad_val);
+                }
+                else
+                {
+                    LOG_WARN("[PrefillDiag] " << name << " non-finite value at idx=" << bad_idx
+                                              << " value=" << bad_val);
+                }
+            }
+        };
+
+        auto log_diff_summary = [&](const std::string &name,
+                                    const std::vector<float> &buf,
+                                    const std::vector<float> &ref,
+                                    int cols,
+                                    float warn_threshold)
+        {
+            if (!run_reference || rank_ != 0 || buf.size() != ref.size() || buf.empty())
+            {
+                return;
+            }
+            auto diff = computeDiffSummary(buf.data(), ref.data(), ref.size());
+            auto samples = collectTopDiffSamples(buf.data(), ref.data(), ref.size(), 8);
+            if (diff.rel_l2 > warn_threshold)
+            {
+                LOG_WARN(diag_tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                                  << " max_abs=" << diff.max_abs
+                                  << " mean_abs=" << diff.mean_abs
+                                  << " worst_index=" << diff.worst_index
+                                  << " cosma=" << diff.value_a
+                                  << " ref=" << diff.value_b);
+            }
+            else
+            {
+                LOG_INFO(diag_tag << " " << name << " diff rel_l2=" << diff.rel_l2
+                                  << " max_abs=" << diff.max_abs
+                                  << " mean_abs=" << diff.mean_abs
+                                  << " worst_index=" << diff.worst_index
+                                  << " cosma=" << diff.value_a
+                                  << " ref=" << diff.value_b);
+            }
+            LOG_INFO(diag_tag << " " << name << " diff samples: " << formatDiffSamples(samples, cols));
+        };
+
+        auto log_preview = [&](const std::string &label, const float *ptr, size_t count)
+        {
+            if (!(debug_output || trace_io) || rank_ != 0 || !ptr || count == 0)
+            {
+                return;
+            }
+            size_t preview = std::min<size_t>(5, count);
+            std::ostringstream oss;
+            oss << diag_tag << " " << label << " first " << preview << " values:";
+            for (size_t i = 0; i < preview; ++i)
+            {
+                oss << ' ' << ptr[i];
+            }
+            LOG_DEBUG(oss.str());
+        };
+
         LOG_INFO("Starting output projection for seq_len=" << seq_len);
 
-        // Final RMS normalization using registered RMSNorm kernel
-        auto norm_out = createLocalTensor({seq_len, config_.d_model});
-        LOG_INFO("Created norm_out tensor for output normalization");
-
-        // Debug: Check input to final normalization
-        const float *input_data = input->data();
-        LOG_INFO("Input to final norm - First 5 values: " << input_data[0] << " " << input_data[1] << " " << input_data[2] << " " << input_data[3] << " " << input_data[4]);
-
-        // Check norm weights
-        const float *norm_weight_data = weights.output_norm_weight->data();
-        LOG_INFO("Norm weight - First 5 values: " << norm_weight_data[0] << " " << norm_weight_data[1] << " " << norm_weight_data[2] << " " << norm_weight_data[3] << " " << norm_weight_data[4]);
-
-        DEBUG_ASSERT(input, "Input tensor null before final normalization");
+        auto norm_out = createLocalTensor({seq_len, hidden_size});
         ASSERT_TENSOR_NOT_NAN(input, "Input tensor has NaN before final normalization");
         TensorLogger::logTensorStats(input, "final_norm_input");
+        log_preview("final_norm_input", input->data(), static_cast<size_t>(seq_len) * hidden_size);
 
-        // Final normalization using registered RMSNorm kernel
         std::vector<std::shared_ptr<TensorBase>> norm_inputs = {input, weights.output_norm_weight};
         std::vector<std::shared_ptr<TensorBase>> norm_outputs = {norm_out};
 
-        LOG_INFO("Starting output normalization...");
+        LOG_INFO("Executing final RMSNorm kernel...");
         if (!executeKernel("rmsnorm", norm_inputs, norm_outputs))
         {
             LOG_ERROR("Output normalization failed");
             return false;
         }
-        LOG_INFO("Output normalization completed successfully");
 
         ASSERT_TENSOR_NOT_NAN(norm_out, "Final norm output has NaN - THIS IS THE SOURCE!");
         TensorLogger::logTensorStats(norm_out, "final_norm_output");
+        baseline_snapshot("final_norm_output",
+                          norm_out->data(),
+                          static_cast<size_t>(seq_len) * hidden_size,
+                          hidden_size,
+                          1e-5);
+        log_preview("final_norm_output", norm_out->data(), static_cast<size_t>(seq_len) * hidden_size);
+        log_buffer("final_norm_output", norm_out->data(), static_cast<size_t>(seq_len) * hidden_size, seq_len, hidden_size);
 
-        // Language model head projection using registered linear kernel
-        LOG_INFO("Preparing LM head projection with vocab_size=" << config_.vocab_size);
-        LOG_INFO("LM head weight shape: [" << weights.lm_head->shape()[0] << ", " << weights.lm_head->shape()[1] << "]");
+        std::vector<float> norm_ref;
+        std::vector<float> norm_cosma_copy;
+        const float *input_data = input ? input->data() : nullptr;
+        if (run_reference && input_data)
+        {
+            norm_cosma_copy.resize(static_cast<size_t>(seq_len) * hidden_size);
+            std::memcpy(norm_cosma_copy.data(), norm_out->data(), norm_cosma_copy.size() * sizeof(float));
 
-        // Create output tensor for LM head projection
-        output = createLocalTensor({seq_len, config_.vocab_size});
-        LOG_INFO("Created output tensor shape: [" << output->shape()[0] << ", " << output->shape()[1] << "]");
+            norm_ref.assign(norm_cosma_copy.size(), 0.f);
+            const float *gamma_ptr = weights.output_norm_weight->data();
+            for (int r = 0; r < seq_len; ++r)
+            {
+                const float *row = input_data + static_cast<size_t>(r) * hidden_size;
+                double sum = 0.0;
+                for (int c = 0; c < hidden_size; ++c)
+                {
+                    double v = static_cast<double>(row[c]);
+                    sum += v * v;
+                }
+                double inv = 1.0 / std::sqrt(sum / std::max(1, hidden_size) + config_.eps);
+                float *dst_row = norm_ref.data() + static_cast<size_t>(r) * hidden_size;
+                for (int c = 0; c < hidden_size; ++c)
+                {
+                    dst_row[c] = static_cast<float>(row[c] * inv * gamma_ptr[c]);
+                }
+            }
+            log_diff_summary("final_norm_output", norm_cosma_copy, norm_ref, hidden_size, 1e-5f);
+        }
 
-        // Debug: Check norm_out before LM head
-        const float *norm_data = norm_out->data();
-        LOG_INFO("Norm output before LM head - First 5 values: " << norm_data[0] << " " << norm_data[1] << " " << norm_data[2] << " " << norm_data[3] << " " << norm_data[4]);
+        LOG_INFO("Preparing LM head projection with vocab_size=" << vocab_size);
+        LOG_DEBUG(diag_tag << " LM head weight shape: [" << weights.lm_head->shape()[0] << ", " << weights.lm_head->shape()[1] << "]");
 
-        // Language model head projection using registered linear kernel
+        output = createLocalTensor({seq_len, vocab_size});
+
         std::vector<std::shared_ptr<TensorBase>> lm_inputs = {norm_out, weights.lm_head};
         std::vector<std::shared_ptr<TensorBase>> lm_outputs = {output};
 
-        LOG_INFO("Starting LM head projection...");
+        LOG_INFO("Executing LM head linear kernel...");
         if (!executeKernel("linear", lm_inputs, lm_outputs))
         {
             LOG_ERROR("LM head projection failed");
@@ -845,16 +1886,45 @@ namespace llaminar
 
         ASSERT_TENSOR_NOT_NAN(output, "LM head output has NaN - final pipeline output contaminated!");
         TensorLogger::logTensorStats(output, "lm_head_output");
+        baseline_snapshot("lm_head_output",
+                          output->data(),
+                          static_cast<size_t>(seq_len) * vocab_size,
+                          vocab_size,
+                          1e-3);
+        log_preview("lm_head_output", output->data(), static_cast<size_t>(seq_len) * vocab_size);
+        log_buffer("lm_head_output", output->data(), static_cast<size_t>(seq_len) * vocab_size, seq_len, vocab_size);
 
-        // Debug: Check output after LM head
-        const float *lm_output_data = output->data();
-        LOG_INFO("LM head output - First 5 values: " << lm_output_data[0] << " " << lm_output_data[1] << " " << lm_output_data[2] << " " << lm_output_data[3] << " " << lm_output_data[4]);
+        if (run_reference)
+        {
+            std::vector<float> logits_cosma(static_cast<size_t>(seq_len) * vocab_size, 0.f);
+            std::memcpy(logits_cosma.data(), output->data(), logits_cosma.size() * sizeof(float));
 
-        LOG_INFO("LM head projection completed successfully");
+            std::vector<float> logits_ref(logits_cosma.size(), 0.f);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, vocab_size, hidden_size,
+                        1.0f,
+                        norm_out->data(), hidden_size,
+                        weights.lm_head->data(), vocab_size,
+                        0.0f,
+                        logits_ref.data(), vocab_size);
+            log_diff_summary("lm_head_output", logits_cosma, logits_ref, vocab_size, 1e-3f);
 
-        LOG_DEBUG("Output projection completed: " << seq_len << "x" << config_.d_model
-                                                  << " -> " << seq_len << "x" << config_.vocab_size);
+            if (!norm_ref.empty())
+            {
+                std::vector<float> logits_ref_manual(logits_cosma.size(), 0.f);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            seq_len, vocab_size, hidden_size,
+                            1.0f,
+                            norm_ref.data(), hidden_size,
+                            weights.lm_head->data(), vocab_size,
+                            0.0f,
+                            logits_ref_manual.data(), vocab_size);
+                log_diff_summary("lm_head_ref_norm_out_vs_manual_norm", logits_ref, logits_ref_manual, vocab_size, 1e-6f);
+            }
+        }
 
+        LOG_DEBUG("Output projection completed: " << seq_len << "x" << hidden_size
+                                                  << " -> " << seq_len << "x" << vocab_size);
         return true;
     }
 

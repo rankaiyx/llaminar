@@ -11,7 +11,7 @@
 
 extern "C"
 {
-#include "ggml.h" // pulled via ggml_min
+#include "ggml.h" // provided via llama.cpp ggml integration
 #include "ggml-quants.h"
 }
 

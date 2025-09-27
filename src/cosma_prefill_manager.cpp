@@ -21,6 +21,7 @@
 #include <fstream>
 #include <sstream>
 #include <random>
+#include <unordered_set>
 #include <future>
 #include <limits>
 #include <cmath>
@@ -81,6 +82,87 @@ namespace
             MPI_Barrier(MPI_COMM_WORLD);
     }
 
+    inline std::string trim_token(const std::string &token)
+    {
+        size_t start = 0;
+        while (start < token.size() && std::isspace(static_cast<unsigned char>(token[start])))
+            ++start;
+        size_t end = token.size();
+        while (end > start && std::isspace(static_cast<unsigned char>(token[end - 1])))
+            --end;
+        return token.substr(start, end - start);
+    }
+
+    inline bool parse_int_token(const std::string &token, int &value)
+    {
+        std::string trimmed = trim_token(token);
+        if (trimmed.empty())
+            return false;
+        char *endptr = nullptr;
+        long parsed = std::strtol(trimmed.c_str(), &endptr, 10);
+        if (!endptr || *endptr != '\0')
+            return false;
+        value = static_cast<int>(parsed);
+        return true;
+    }
+
+    std::vector<int> parse_rmsnorm_trace_rows(const std::string &spec)
+    {
+        constexpr size_t kMaxEntries = 4096;
+        std::vector<int> rows;
+        rows.reserve(8);
+        std::unordered_set<int> seen;
+        size_t pos = 0;
+        while (pos < spec.size() && rows.size() < kMaxEntries)
+        {
+            size_t next = pos;
+            while (next < spec.size() && spec[next] != ',' && spec[next] != ';')
+                ++next;
+            std::string token = trim_token(spec.substr(pos, next - pos));
+            if (!token.empty())
+            {
+                size_t range_delim = token.find_first_of(":-");
+                if (range_delim != std::string::npos)
+                {
+                    int start = 0;
+                    int finish = 0;
+                    if (parse_int_token(token.substr(0, range_delim), start) && parse_int_token(token.substr(range_delim + 1), finish))
+                    {
+                        if (start <= finish)
+                        {
+                            for (int v = start; v <= finish && rows.size() < kMaxEntries; ++v)
+                            {
+                                if (seen.insert(v).second)
+                                    rows.push_back(v);
+                            }
+                        }
+                        else
+                        {
+                            for (int v = start; v >= finish && rows.size() < kMaxEntries; --v)
+                            {
+                                if (seen.insert(v).second)
+                                    rows.push_back(v);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    int value = 0;
+                    if (parse_int_token(token, value) && seen.insert(value).second)
+                    {
+                        rows.push_back(value);
+                    }
+                }
+            }
+            if (next == spec.size())
+                break;
+            pos = next + 1;
+        }
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    }
+
     inline void run_reference_gemm(const float *A_ptr,
                                    const float *B_ptr,
                                    float *C_ptr,
@@ -95,43 +177,18 @@ namespace
         if (!A_ptr || !B_ptr || !C_ptr)
             return;
 
-        if (transposeW)
-        {
-            if (rank == 0)
-            {
-                LOG_WARN("[run_reference_gemm] transposeW=true: using manual i-j-p loop m=" << m
-                                                                                            << " n=" << n
-                                                                                            << " k=" << k);
-            }
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-            for (int i = 0; i < m; ++i)
-            {
-                for (int j = 0; j < n; ++j)
-                {
-                    float sum = 0.f;
-                    for (int p = 0; p < k; ++p)
-                    {
-                        sum += A_ptr[(size_t)i * k + p] * B_ptr[(size_t)p * n + j];
-                    }
-                    float prev = beta != 0.f ? C_ptr[(size_t)i * n + j] : 0.f;
-                    C_ptr[(size_t)i * n + j] = alpha * sum + prev;
-                }
-            }
-            return;
-        }
-
-        int lda = k;
-        int ldb = n;
+        const CBLAS_TRANSPOSE transB = transposeW ? CblasTrans : CblasNoTrans;
+        const int lda = k;
+        const int ldb = transposeW ? k : n;
         if (rank == 0)
         {
-            LOG_WARN("[run_reference_gemm] BLAS path: m=" << m << " n=" << n << " k=" << k << " lda=" << lda
-                                                          << " ldb=" << ldb);
+            LOG_DEBUG("[run_reference_gemm] BLAS path m=" << m << " n=" << n << " k=" << k
+                                                          << " lda=" << lda << " ldb=" << ldb
+                                                          << " transB=" << (transposeW ? "T" : "N"));
         }
         cblas_sgemm(CblasRowMajor,
                     CblasNoTrans,
-                    CblasNoTrans,
+                    transB,
                     m,
                     n,
                     k,
@@ -327,6 +384,15 @@ namespace llaminar
         env.overlap_verbose = std::getenv("LLAMINAR_COSMA_OVERLAP_VERBOSE") != nullptr;
         env.preflight_disable = std::getenv("LLAMINAR_COSMA_PREFLIGHT_DISABLE") != nullptr;
         env.rmsnorm_validate = std::getenv("LLAMINAR_COSMA_RMSNORM_VALIDATE") != nullptr;
+        env.rmsnorm_trace = std::getenv("LLAMINAR_COSMA_RMSNORM_TRACE") != nullptr;
+        if (const char *points = std::getenv("LLAMINAR_COSMA_RMSNORM_TRACE_POINTS"))
+        {
+            if (points[0] != '\0')
+            {
+                env.rmsnorm_trace_points_active = true;
+                env.rmsnorm_trace_points_spec = points;
+            }
+        }
         if (const char *direct_env = std::getenv("LLAMINAR_COSMA_DIRECT_THRESHOLD_OPS"))
         {
             long long parsed = std::atoll(direct_env);
@@ -869,7 +935,6 @@ namespace llaminar
         const bool diag_local_probe = env.diag_local_probe;
         const bool diag_local_probe_deep = env.diag_local_probe_deep;
         const bool auto_fix_transpose = env.auto_fix_transpose;
-        const bool force_unified_strategy = env.force_unified_strategy;
         const bool pop_forward_legacy = env.pop_forward_legacy;
         const bool diag_recon_bypass = env.diag_recon_bypass;
         const bool diag_recon_transpose = env.diag_recon_transpose;
@@ -1227,26 +1292,6 @@ namespace llaminar
                 }
             }
 
-            if (transposeW)
-            {
-                if (rank_ == 0)
-                {
-                    std::vector<float> transposed((size_t)n * k, 0.f);
-                    for (int row = 0; row < n; ++row)
-                    {
-                        for (int col = 0; col < k; ++col)
-                        {
-                            transposed[(size_t)row * k + col] = B_full_storage[(size_t)col * n + row];
-                        }
-                    }
-                    B_full_storage.swap(transposed);
-                }
-                if (mpi_is_initialized() && mpi_world_size_safe() > 1)
-                {
-                    safe_bcast(B_full_storage.data(), k * n, MPI_FLOAT, 0);
-                }
-            }
-
             if (rank_ == 0)
             {
                 if (should_log(3))
@@ -1346,16 +1391,12 @@ namespace llaminar
                                                         << " alpha=" << alpha << " beta=" << beta << " world_size=" << world_size_
                                                         << " volume=" << full_volume);
         }
-        // Strategy selection: COSMA permits different strategies per operand (A: m x k, B: k x n, C: m x n).
-        // Earlier we forced a unified strategy (stratC) for A and B, which appears to produce a systematic
-        // permutation mismatch (relA≈1, cos≈0.5). Here we revert to per-operand strategies unless explicitly
-        // overridden by an env flag (LLAMINAR_COSMA_FORCE_UNIFIED) for regression diagnostics.
-        const auto &sA = strategy_cache_.get(m, k, k, world_size_);
-        const auto &sB = strategy_cache_.get(k, n, k, world_size_);
+        // COSMA requires that all operands participating in a GEMM share the same strategy.
+        // Using per-operand strategies causes the mapper to disagree on ownership, producing
+        // large reconstruction errors (observed rel L2 ≈ 1.2 in AdaptiveMatMulTest).
         const auto &sC = strategy_cache_.get(m, n, k, world_size_);
-        const bool use_unified_strategy = force_unified_strategy;
-        const cosma::Strategy &chosenA = use_unified_strategy ? sC : sA;
-        const cosma::Strategy &chosenB = use_unified_strategy ? sC : sB;
+        const cosma::Strategy &chosenA = sC;
+        const cosma::Strategy &chosenB = sC;
         const cosma::Strategy &stratC_ref = sC; // result always uses (m,n,k)
 
         CosmaView A_compat = A; // start with original view
@@ -2308,11 +2349,11 @@ namespace llaminar
     }
 
     // Convert COSMA view back to row-major; normalize only for non-output tensors.
-    void CosmaPrefillManager::to_row_major(const CosmaView &src, float *dst) const
+    void CosmaPrefillManager::to_row_major(const CosmaView &src, float *dst, bool force_normalize) const
     {
         if (!dst)
             return;
-        bool normalize = src.label != 'C';
+        bool normalize = force_normalize || src.label != 'C';
         reconstruct_matrix(src, dst, normalize);
     }
 
@@ -2507,7 +2548,23 @@ namespace llaminar
         {
             normalize = false;
         }
-        if (normalize)
+
+        bool has_duplicates = false;
+        for (size_t idx = 0; idx < total; ++idx)
+        {
+            if (ownership_counts[idx] > 1)
+            {
+                has_duplicates = true;
+                break;
+            }
+        }
+
+        if (has_duplicates && !normalize && rank_ == 0 && should_log(1))
+        {
+            LOG_WARN("[CosmaPrefill][recon] Detected duplicate ownership counts while normalize=false; averaging duplicates to maintain correctness.");
+        }
+
+        if (normalize || has_duplicates)
         {
             for (size_t idx = 0; idx < total; ++idx)
             {
@@ -2976,6 +3033,8 @@ namespace llaminar
             "LLAMINAR_COSMA_PREFILL_THRESHOLD",
             "LLAMINAR_COSMA_RECON_FORCE_LEGACY",
             "LLAMINAR_COSMA_REPLICATE_B",
+            "LLAMINAR_COSMA_RMSNORM_TRACE",
+            "LLAMINAR_COSMA_RMSNORM_TRACE_POINTS",
             "LLAMINAR_COSMA_TEST_TRACE",
             "LLAMINAR_COSMA_VALIDATE_TILE",
             "LLAMINAR_OPENBLAS_THREADS",
@@ -3101,53 +3160,56 @@ namespace llaminar
         float *dst_local = dst.mat->matrix_pointer();
         const float *src_local = src.mat->matrix_pointer();
         size_t local_size = src.mat->matrix_size();
-        if (!dst_local || !src_local)
+        bool has_local_tiles = local_size > 0;
+        if (has_local_tiles && (!dst_local || !src_local))
         {
-            // Some ranks may legitimately own no tiles (matrix_size()==0) -> treat as no-op success.
-            if (local_size == 0)
-            {
-                if (should_log(5))
-                {
-                    LOG_TRACE("[CosmaPrefill][rmsnorm] rank " << rank_ << " owns no tiles (size=0) -> no-op success");
-                }
-                return true;
-            }
             if (should_log(4))
             {
                 LOG_DEBUG("[CosmaPrefill][rmsnorm] distributed path abort: null local pointer despite local_size>0 src_local=" << (void *)src_local << " dst_local=" << (void *)dst_local << " local_size=" << local_size << " rank=" << rank_);
             }
             return false;
         }
-        if (local_size == 0)
-            return true; // nothing owned on this rank
+        if (!has_local_tiles && should_log(5))
+        {
+            LOG_TRACE("[CosmaPrefill][rmsnorm] rank " << rank_ << " owns no tiles (size=0) -> participating with zeros");
+        }
         auto mat_ptr = src.mat.get();
         // Gather local indices grouped by row (sequence position).
         std::vector<std::vector<int>> row_indices(seq_len);
         row_indices.reserve(seq_len);
-        for (size_t li = 0; li < local_size; ++li)
+        if (has_local_tiles)
         {
-            auto g = mat_ptr->global_coordinates(static_cast<int>(li));
-            int gi = g.first;
-            int gj = g.second;
-            if ((unsigned)gi < (unsigned)seq_len && (unsigned)gj < (unsigned)hidden_size)
-                row_indices[gi].push_back(static_cast<int>(li));
+            for (size_t li = 0; li < local_size; ++li)
+            {
+                auto g = mat_ptr->global_coordinates(static_cast<int>(li));
+                int gi = g.first;
+                int gj = g.second;
+                if ((unsigned)gi < (unsigned)seq_len && (unsigned)gj < (unsigned)hidden_size)
+                    row_indices[gi].push_back(static_cast<int>(li));
+            }
         }
 
         std::vector<double> local_sum_sq(seq_len, 0.0);
         std::vector<int> local_counts(seq_len, 0);
-#pragma omp parallel for schedule(static)
-        for (int r = 0; r < seq_len; ++r)
+        if (has_local_tiles)
         {
-            const auto &idxs = row_indices[r];
-            double accum = 0.0;
-            for (int li : idxs)
+#pragma omp parallel for schedule(static)
+            for (int r = 0; r < seq_len; ++r)
             {
-                float v = src_local[li];
-                accum += double(v) * double(v);
+                const auto &idxs = row_indices[r];
+                double accum = 0.0;
+                for (int li : idxs)
+                {
+                    float v = src_local[li];
+                    accum += double(v) * double(v);
+                }
+                local_sum_sq[r] = accum;
+                local_counts[r] = static_cast<int>(idxs.size());
             }
-            local_sum_sq[r] = accum;
-            local_counts[r] = static_cast<int>(idxs.size());
         }
+
+        std::vector<double> local_sum_sq_rank = local_sum_sq;
+        std::vector<int> local_counts_rank = local_counts;
 
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
         {
@@ -3155,61 +3217,567 @@ namespace llaminar
             MPI_Allreduce(MPI_IN_PLACE, local_counts.data(), seq_len, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
         }
 
-#pragma omp parallel for schedule(static)
-        for (int r = 0; r < seq_len; ++r)
+        if (env.rmsnorm_trace)
         {
-            const auto &idxs = row_indices[r];
-            if (idxs.empty())
-                continue;
-            double sum_sq = local_sum_sq[r];
-            int count = local_counts[r];
-            int denom_count = count > 0 ? count : hidden_size;
-            if (denom_count <= 0)
-                continue;
-            double inv_scale = 1.0 / std::sqrt(sum_sq / static_cast<double>(std::max(1, denom_count)) + eps);
-            for (int li : idxs)
+            std::vector<int> trace_rows;
+            size_t dropped_trace_rows = 0;
+            if (env.rmsnorm_trace_points_active)
             {
-                int gj = mat_ptr->global_coordinates(li).second;
-                float gamma = (gj >= 0 && gj < hidden_size) ? weight[gj] : 1.f;
-                dst_local[li] = float(src_local[li] * inv_scale * gamma);
+                trace_rows = parse_rmsnorm_trace_rows(env.rmsnorm_trace_points_spec);
+                const size_t before_filter = trace_rows.size();
+                trace_rows.erase(std::remove_if(trace_rows.begin(), trace_rows.end(), [&](int row)
+                                                { return row < 0 || row >= seq_len; }),
+                                 trace_rows.end());
+                dropped_trace_rows = before_filter > trace_rows.size() ? (before_filter - trace_rows.size()) : 0;
+            }
+            const double near_zero_threshold = 1e-12;
+            double min_sum_sq = std::numeric_limits<double>::infinity();
+            double max_sum_sq = 0.0;
+            double min_avg_sq = std::numeric_limits<double>::infinity();
+            double max_avg_sq = 0.0;
+            double min_inv_scale = std::numeric_limits<double>::infinity();
+            double max_inv_scale = 0.0;
+            size_t zero_rows_trace = 0;
+            size_t partial_rows_trace = 0;
+            size_t near_zero_rows_trace = 0;
+            size_t nan_rows_trace = 0;
+            size_t negative_rows_trace = 0;
+            std::vector<size_t> mismatch_rows_trace;
+            mismatch_rows_trace.reserve(8);
+
+            for (int r = 0; r < seq_len; ++r)
+            {
+                double sum = local_sum_sq[r];
+                int count = local_counts[r];
+                if (!std::isfinite(sum))
+                {
+                    nan_rows_trace++;
+                    continue;
+                }
+                if (sum < 0.0)
+                {
+                    negative_rows_trace++;
+                    continue;
+                }
+                if (count == 0)
+                    zero_rows_trace++;
+                if (count != hidden_size)
+                {
+                    partial_rows_trace++;
+                    if (mismatch_rows_trace.size() < 8)
+                        mismatch_rows_trace.push_back(static_cast<size_t>(r));
+                }
+                int denom_count = count > 0 ? count : hidden_size;
+                if (denom_count <= 0)
+                    continue;
+                double avg = sum / static_cast<double>(std::max(1, denom_count));
+                if (!std::isfinite(avg))
+                    continue;
+                min_avg_sq = std::min(min_avg_sq, avg);
+                max_avg_sq = std::max(max_avg_sq, avg);
+                if (avg < near_zero_threshold)
+                    near_zero_rows_trace++;
+                double inv_scale = 1.0 / std::sqrt(avg + eps);
+                if (std::isfinite(inv_scale))
+                {
+                    min_inv_scale = std::min(min_inv_scale, inv_scale);
+                    max_inv_scale = std::max(max_inv_scale, inv_scale);
+                }
+                min_sum_sq = std::min(min_sum_sq, sum);
+                max_sum_sq = std::max(max_sum_sq, sum);
+            }
+
+            if (!std::isfinite(min_sum_sq))
+                min_sum_sq = 0.0;
+            if (!std::isfinite(min_avg_sq))
+                min_avg_sq = 0.0;
+            if (!std::isfinite(min_inv_scale))
+                min_inv_scale = 0.0;
+
+            if (rank_ == 0 && should_log(2))
+            {
+                std::string mismatch_rows_list;
+                if (!mismatch_rows_trace.empty())
+                {
+                    std::ostringstream oss;
+                    for (size_t i = 0; i < mismatch_rows_trace.size(); ++i)
+                    {
+                        if (i)
+                            oss << ",";
+                        oss << mismatch_rows_trace[i];
+                    }
+                    mismatch_rows_list = oss.str();
+                }
+                LOG_INFO("[CosmaPrefill][rmsnorm-trace] seq_len=" << seq_len
+                                                                  << " hidden=" << hidden_size
+                                                                  << " zero_rows=" << zero_rows_trace
+                                                                  << " partial_rows=" << partial_rows_trace
+                                                                  << " near_zero_rows=" << near_zero_rows_trace
+                                                                  << " nan_rows=" << nan_rows_trace
+                                                                  << " neg_rows=" << negative_rows_trace
+                                                                  << " sum_sq_range=[" << min_sum_sq << "," << max_sum_sq << "]"
+                                                                  << " avg_range=[" << min_avg_sq << "," << max_avg_sq << "]"
+                                                                  << " inv_scale_range=[" << min_inv_scale << "," << max_inv_scale << "]"
+                                                                  << (mismatch_rows_list.empty() ? "" : " mismatch_rows=") << mismatch_rows_list);
+                if (env.rmsnorm_trace_points_active)
+                {
+                    if (trace_rows.empty())
+                    {
+                        LOG_INFO("[CosmaPrefill][rmsnorm-trace] trace_points_spec yielded no valid rows (spec='" << env.rmsnorm_trace_points_spec
+                                                                                                                 << "' seq_len=" << seq_len << ")");
+                    }
+                    else
+                    {
+                        for (int row : trace_rows)
+                        {
+                            double sum = local_sum_sq[row];
+                            int count = local_counts[row];
+                            double avg_actual = count > 0 ? sum / static_cast<double>(std::max(1, count)) : 0.0;
+                            double inv_actual = count > 0 ? 1.0 / std::sqrt(avg_actual + eps) : 0.0;
+                            double avg_expected = hidden_size > 0 ? sum / static_cast<double>(std::max(1, hidden_size)) : 0.0;
+                            double inv_expected = hidden_size > 0 ? 1.0 / std::sqrt(avg_expected + eps) : 0.0;
+                            double coverage = hidden_size > 0 ? static_cast<double>(count) / static_cast<double>(hidden_size) : 0.0;
+                            LOG_INFO("[CosmaPrefill][rmsnorm-trace-row] row=" << row
+                                                                              << " count=" << count << "/" << hidden_size
+                                                                              << " coverage=" << coverage
+                                                                              << " sum_sq=" << sum
+                                                                              << " avg_actual=" << avg_actual
+                                                                              << " inv_actual=" << inv_actual
+                                                                              << " avg_expected=" << avg_expected
+                                                                              << " inv_expected=" << inv_expected);
+                        }
+                    }
+                }
+            }
+
+            if (env.rmsnorm_trace_points_active && !trace_rows.empty() && should_log(4))
+            {
+                constexpr size_t kPreviewLimit = 12;
+                for (int row : trace_rows)
+                {
+                    const auto &idxs = row_indices[row];
+                    std::vector<int> cols_preview;
+                    cols_preview.reserve(std::min(kPreviewLimit, idxs.size()));
+                    if (has_local_tiles)
+                    {
+                        for (int li : idxs)
+                        {
+                            auto coords = mat_ptr->global_coordinates(li);
+                            int gj = coords.second;
+                            if ((unsigned)gj < (unsigned)hidden_size)
+                            {
+                                cols_preview.push_back(gj);
+                                if (cols_preview.size() >= kPreviewLimit)
+                                    break;
+                            }
+                        }
+                    }
+                    std::sort(cols_preview.begin(), cols_preview.end());
+                    cols_preview.erase(std::unique(cols_preview.begin(), cols_preview.end()), cols_preview.end());
+                    std::ostringstream preview_stream;
+                    for (size_t i = 0; i < cols_preview.size(); ++i)
+                    {
+                        if (i)
+                            preview_stream << ",";
+                        preview_stream << cols_preview[i];
+                    }
+                    if (idxs.size() > kPreviewLimit)
+                    {
+                        preview_stream << ",...";
+                    }
+                    double local_sum = (row >= 0 && row < static_cast<int>(local_sum_sq_rank.size())) ? local_sum_sq_rank[row] : 0.0;
+                    int local_count = (row >= 0 && row < static_cast<int>(local_counts_rank.size())) ? local_counts_rank[row] : 0;
+                    double local_coverage = hidden_size > 0 ? static_cast<double>(local_count) / static_cast<double>(hidden_size) : 0.0;
+                    LOG_TRACE("[CosmaPrefill][rmsnorm-trace-row-local] row=" << row
+                                                                             << " rank=" << rank_
+                                                                             << " local_count=" << local_count
+                                                                             << " local_coverage=" << local_coverage
+                                                                             << " local_sum_sq=" << local_sum
+                                                                             << " preview_cols=" << preview_stream.str());
+                }
+            }
+
+            if (env.rmsnorm_trace_points_active && dropped_trace_rows > 0 && rank_ == 0 && should_log(3))
+            {
+                LOG_DEBUG("[CosmaPrefill][rmsnorm-trace] dropped " << dropped_trace_rows
+                                                                   << " trace rows outside valid range from spec='" << env.rmsnorm_trace_points_spec
+                                                                   << "'");
             }
         }
 
-        if (env.rmsnorm_validate && src.original_row_major)
+        bool needs_row_major_fallback = false;
+        bool fallback_due_to_zero_row = false;
+        bool fallback_due_to_partial_row = false;
+        bool fallback_due_to_safety_limit = false;
+        bool fallback_due_to_empty_matrix = false;
+        bool fallback_due_to_column_mismatch = false;
+        size_t first_problem_row = std::numeric_limits<size_t>::max();
+        int first_problem_row_count = 0;
+        int min_row_count = hidden_size;
+        int max_row_count = 0;
+        size_t zero_row_count = 0;
+        size_t partial_row_count = 0;
+        if (world_size_ > 1)
         {
-            std::vector<float> dst_row_major((size_t)seq_len * hidden_size, 0.f);
-            reconstruct_matrix(dst, dst_row_major.data(), false);
-            if (rank_ == 0)
+            for (int r = 0; r < seq_len; ++r)
             {
-                std::vector<float> ref((size_t)seq_len * hidden_size, 0.f);
-                for (int r = 0; r < seq_len; ++r)
+                int total_count = local_counts[r];
+                min_row_count = std::min(min_row_count, total_count);
+                max_row_count = std::max(max_row_count, total_count);
+                if (total_count == 0)
                 {
-                    const float *row = src.original_row_major + (size_t)r * hidden_size;
-                    double sum = 0.0;
-                    for (int c = 0; c < hidden_size; ++c)
+                    // Nothing owned for this row after reduction – rely on fallback to ensure coverage.
+                    needs_row_major_fallback = true;
+                    fallback_due_to_zero_row = true;
+                    ++zero_row_count;
+                    if (first_problem_row == std::numeric_limits<size_t>::max())
                     {
-                        double v = row[c];
-                        sum += v * v;
-                    }
-                    double inv = 1.0 / std::sqrt(sum / std::max(1, hidden_size) + eps);
-                    float *dst_row = ref.data() + (size_t)r * hidden_size;
-                    for (int c = 0; c < hidden_size; ++c)
-                    {
-                        dst_row[c] = float(row[c] * inv * weight[c]);
+                        first_problem_row = static_cast<size_t>(r);
+                        first_problem_row_count = total_count;
                     }
                 }
-                long double num = 0.0L, den = 0.0L, max_abs = 0.0L;
-                size_t total = (size_t)seq_len * hidden_size;
+                else if (total_count != hidden_size)
+                {
+                    needs_row_major_fallback = true;
+                    fallback_due_to_partial_row = true;
+                    ++partial_row_count;
+                    if (first_problem_row == std::numeric_limits<size_t>::max())
+                    {
+                        first_problem_row = static_cast<size_t>(r);
+                        first_problem_row_count = total_count;
+                    }
+                }
+            }
+
+            if (!needs_row_major_fallback)
+            {
+                constexpr size_t kColumnCountSafetyLimit = 1ull << 20; // ~1M entries (4 MB for int32)
+                const size_t total_positions = static_cast<size_t>(seq_len) * static_cast<size_t>(hidden_size);
+                if (total_positions == 0)
+                {
+                    needs_row_major_fallback = true;
+                    fallback_due_to_empty_matrix = true;
+                }
+                else if (total_positions > kColumnCountSafetyLimit)
+                {
+                    // Avoid excessive temporary allocations – prefer correctness.
+                    needs_row_major_fallback = true;
+                    fallback_due_to_safety_limit = true;
+                }
+                else
+                {
+                    std::vector<int> column_counts(total_positions, 0);
+                    size_t duplicate_columns = 0;
+                    size_t missing_columns = 0;
+                    size_t first_duplicate_linear = std::numeric_limits<size_t>::max();
+                    int first_duplicate_count = 0;
+                    size_t first_missing_linear = std::numeric_limits<size_t>::max();
+
+                    if (has_local_tiles)
+                    {
+                        for (int r = 0; r < seq_len; ++r)
+                        {
+                            const auto &idxs = row_indices[r];
+                            for (int li : idxs)
+                            {
+                                auto coords = mat_ptr->global_coordinates(li);
+                                int gi = coords.first;
+                                int gj = coords.second;
+                                if ((unsigned)gi < (unsigned)seq_len && (unsigned)gj < (unsigned)hidden_size)
+                                {
+                                    size_t offset = static_cast<size_t>(gi) * hidden_size + static_cast<size_t>(gj);
+                                    column_counts[offset] += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    if (mpi_is_initialized() && mpi_world_size_safe() > 1)
+                    {
+                        MPI_Allreduce(MPI_IN_PLACE, column_counts.data(), static_cast<int>(total_positions), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+                    }
+
+                    for (size_t idx = 0; idx < total_positions; ++idx)
+                    {
+                        if (column_counts[idx] == 0)
+                        {
+                            missing_columns++;
+                            if (first_missing_linear == std::numeric_limits<size_t>::max())
+                                first_missing_linear = idx;
+                        }
+                        else if (column_counts[idx] != 1)
+                        {
+                            duplicate_columns += static_cast<size_t>(std::max(0, column_counts[idx] - 1));
+                            if (first_duplicate_linear == std::numeric_limits<size_t>::max())
+                            {
+                                first_duplicate_linear = idx;
+                                first_duplicate_count = column_counts[idx];
+                            }
+                        }
+                    }
+
+                    if (missing_columns > 0 || duplicate_columns > 0)
+                    {
+                        needs_row_major_fallback = true;
+                        fallback_due_to_column_mismatch = true;
+                        if (first_problem_row == std::numeric_limits<size_t>::max())
+                        {
+                            size_t ref_linear = (missing_columns > 0) ? first_missing_linear : first_duplicate_linear;
+                            first_problem_row = ref_linear / static_cast<size_t>(hidden_size);
+                            first_problem_row_count = missing_columns > 0 ? 0 : first_duplicate_count;
+                        }
+                        if (rank_ == 0 && should_log(2))
+                        {
+                            size_t ref_linear = (first_duplicate_linear != std::numeric_limits<size_t>::max()) ? first_duplicate_linear : first_missing_linear;
+                            size_t ref_col = hidden_size > 0 ? ref_linear % static_cast<size_t>(hidden_size) : 0;
+                            LOG_INFO("[CosmaPrefill][rmsnorm] detected column count mismatch: duplicates="
+                                     << duplicate_columns << " missing=" << missing_columns
+                                     << " first_mismatch_row=" << (first_problem_row == std::numeric_limits<size_t>::max() ? -1 : static_cast<long long>(first_problem_row))
+                                     << " first_mismatch_col=" << static_cast<long long>(ref_col)
+                                     << " first_count=" << first_problem_row_count);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (needs_row_major_fallback)
+        {
+            if (should_log(3))
+            {
+                LOG_DEBUG("[CosmaPrefill][rmsnorm] falling back to row-major normalization (rank=" << rank_ << ")");
+            }
+            if (rank_ == 0 && should_log(2))
+            {
+                LOG_INFO("[CosmaPrefill][rmsnorm] fallback details: zero_rows=" << zero_row_count
+                                                                                << " partial_rows=" << partial_row_count
+                                                                                << " min_row_count=" << min_row_count
+                                                                                << " max_row_count=" << max_row_count
+                                                                                << " zero_row_trigger=" << (fallback_due_to_zero_row ? "yes" : "no")
+                                                                                << " partial_row_trigger=" << (fallback_due_to_partial_row ? "yes" : "no")
+                                                                                << " seq_len=" << seq_len
+                                                                                << " hidden=" << hidden_size
+                                                                                << " safety_limit_trigger=" << (fallback_due_to_safety_limit ? "yes" : "no")
+                                                                                << " empty_matrix=" << (fallback_due_to_empty_matrix ? "yes" : "no")
+                                                                                << " column_mismatch=" << (fallback_due_to_column_mismatch ? "yes" : "no"));
+            }
+
+            const size_t total = static_cast<size_t>(seq_len) * hidden_size;
+            const float *row_major_ptr = src.original_row_major;
+            std::vector<float> reconstructed;
+            if (!row_major_ptr)
+            {
+                reconstructed.resize(total, 0.f);
+                reconstruct_matrix(src, reconstructed.data(), false);
+                row_major_ptr = reconstructed.data();
+            }
+
+            if (!row_major_ptr)
+            {
+                if (should_log(1) && rank_ == 0)
+                {
+                    LOG_WARN("[CosmaPrefill][rmsnorm] unable to obtain row-major source for fallback path");
+                }
+                return false;
+            }
+
+            std::vector<float> normalized(total, 0.f);
+            for (int r = 0; r < seq_len; ++r)
+            {
+                const float *row = row_major_ptr + static_cast<size_t>(r) * hidden_size;
+                double sum = 0.0;
+                for (int c = 0; c < hidden_size; ++c)
+                {
+                    double v = row[c];
+                    sum += v * v;
+                }
+                double inv = 1.0 / std::sqrt(sum / std::max(1, hidden_size) + eps);
+                float *dst_row = normalized.data() + static_cast<size_t>(r) * hidden_size;
+                for (int c = 0; c < hidden_size; ++c)
+                {
+                    dst_row[c] = static_cast<float>(row[c] * inv * weight[c]);
+                }
+            }
+
+            fill_activation(dst, normalized.data(), seq_len, hidden_size, env);
+
+            if (dst.mat && std::getenv("LLAMINAR_COSMA_PREFILL_TRACE_IO"))
+            {
+                std::vector<float> recon(total, 0.f);
+                reconstruct_matrix(dst, recon.data(), false);
+                long double num = 0.0L;
+                long double den = 0.0L;
+                double max_abs = 0.0;
                 for (size_t i = 0; i < total; ++i)
                 {
-                    long double diff = (long double)dst_row_major[i] - (long double)ref[i];
+                    double diff = static_cast<double>(recon[i]) - static_cast<double>(normalized[i]);
+                    max_abs = std::max(max_abs, std::fabs(diff));
                     num += diff * diff;
-                    long double refv = (long double)ref[i];
-                    den += refv * refv;
-                    max_abs = std::max(max_abs, fabsl(diff));
+                    double ref = static_cast<double>(normalized[i]);
+                    den += ref * ref;
                 }
-                double rel = std::sqrt((double)num) / (std::sqrt((double)den) + 1e-30);
-                LOG_INFO("[CosmaPrefill][rmsnorm-validate] rel_l2=" << rel << " max_abs=" << (double)max_abs);
+                double rel_l2 = std::sqrt(static_cast<double>(num)) / (std::sqrt(static_cast<double>(den)) + 1e-30);
+                if (rank_ == 0 && should_log(2))
+                {
+                    LOG_INFO("[CosmaPrefill][rmsnorm] fallback verification rel_l2=" << rel_l2 << " max_abs=" << max_abs
+                                                                                     << " seq_len=" << seq_len << " hidden=" << hidden_size);
+                }
+            }
+            return true;
+        }
+
+        if (has_local_tiles && dst_local)
+        {
+#pragma omp parallel for schedule(static)
+            for (int r = 0; r < seq_len; ++r)
+            {
+                const auto &idxs = row_indices[r];
+                if (idxs.empty())
+                    continue;
+                double sum_sq = local_sum_sq[r];
+                int count = local_counts[r];
+                int denom_count = count > 0 ? count : hidden_size;
+                if (denom_count <= 0)
+                    continue;
+                double inv_scale = 1.0 / std::sqrt(sum_sq / static_cast<double>(std::max(1, denom_count)) + eps);
+                for (int li : idxs)
+                {
+                    int gj = mat_ptr->global_coordinates(li).second;
+                    float gamma = (gj >= 0 && gj < hidden_size) ? weight[gj] : 1.f;
+                    dst_local[li] = float(src_local[li] * inv_scale * gamma);
+                }
+            }
+        }
+
+        if (env.rmsnorm_validate || env.rmsnorm_trace)
+        {
+            size_t total = static_cast<size_t>(std::max(seq_len, 0)) * static_cast<size_t>(std::max(hidden_size, 0));
+            const float *row_major_src = src.original_row_major;
+            std::vector<float> reconstructed_src;
+            if (!row_major_src)
+            {
+                reconstructed_src.resize(total, 0.f);
+                reconstruct_matrix(src, reconstructed_src.data(), false);
+                row_major_src = reconstructed_src.data();
+            }
+
+            std::vector<float> dst_row_major(total, 0.f);
+            reconstruct_matrix(dst, dst_row_major.data(), false);
+
+            if (rank_ == 0)
+            {
+                std::vector<float> ref(total, 0.f);
+                long double global_num = 0.0L;
+                long double global_den = 0.0L;
+                double global_max_abs = 0.0;
+                double worst_row_rel = 0.0;
+                double worst_row_max_abs = 0.0;
+                size_t worst_row_index = 0;
+                std::vector<size_t> spike_rows;
+                spike_rows.reserve(8);
+                const double rel_spike_threshold = 1e-5;
+
+                for (int r = 0; r < seq_len; ++r)
+                {
+                    const float *src_row = row_major_src + static_cast<size_t>(r) * hidden_size;
+                    float *ref_row = ref.data() + static_cast<size_t>(r) * hidden_size;
+                    long double sum = 0.0L;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        long double v = static_cast<long double>(src_row[c]);
+                        sum += v * v;
+                    }
+                    long double inv = 1.0L / std::sqrt(static_cast<double>(sum) / std::max(1, hidden_size) + eps);
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        ref_row[c] = static_cast<float>(src_row[c] * static_cast<double>(inv) * weight[c]);
+                    }
+
+                    const float *dst_row = dst_row_major.data() + static_cast<size_t>(r) * hidden_size;
+                    long double row_num = 0.0L;
+                    long double row_den = 0.0L;
+                    double row_max_abs = 0.0;
+                    for (int c = 0; c < hidden_size; ++c)
+                    {
+                        long double diff = static_cast<long double>(dst_row[c]) - static_cast<long double>(ref_row[c]);
+                        row_num += diff * diff;
+                        long double refv = static_cast<long double>(ref_row[c]);
+                        row_den += refv * refv;
+                        row_max_abs = std::max(row_max_abs, static_cast<double>(fabsl(diff)));
+                    }
+                    global_num += row_num;
+                    global_den += row_den;
+                    global_max_abs = std::max(global_max_abs, row_max_abs);
+                    double row_rel = std::sqrt(static_cast<double>(row_num)) / (std::sqrt(static_cast<double>(row_den)) + 1e-30);
+                    if (row_rel > worst_row_rel)
+                    {
+                        worst_row_rel = row_rel;
+                        worst_row_max_abs = row_max_abs;
+                        worst_row_index = static_cast<size_t>(r);
+                    }
+                    if (row_rel > rel_spike_threshold && spike_rows.size() < 8)
+                    {
+                        spike_rows.push_back(static_cast<size_t>(r));
+                    }
+                }
+
+                double rel = std::sqrt(static_cast<double>(global_num)) / (std::sqrt(static_cast<double>(global_den)) + 1e-30);
+                if (env.rmsnorm_validate)
+                {
+                    LOG_INFO("[CosmaPrefill][rmsnorm-validate] rel_l2=" << rel
+                                                                        << " max_abs=" << global_max_abs
+                                                                        << " worst_row=" << static_cast<long long>(worst_row_index)
+                                                                        << " worst_row_rel=" << worst_row_rel
+                                                                        << " worst_row_max_abs=" << worst_row_max_abs);
+                }
+
+                if (env.rmsnorm_trace)
+                {
+                    int worst_count = (worst_row_index < local_counts.size()) ? local_counts[worst_row_index] : 0;
+                    double worst_sum_sq = (worst_row_index < local_sum_sq.size()) ? local_sum_sq[worst_row_index] : 0.0;
+                    size_t sample_cols = std::min(static_cast<size_t>(std::max(hidden_size, 0)), static_cast<size_t>(8));
+                    std::ostringstream ref_stream;
+                    std::ostringstream dst_stream;
+                    const float *ref_row = ref.data() + worst_row_index * static_cast<size_t>(hidden_size);
+                    const float *dst_row = dst_row_major.data() + worst_row_index * static_cast<size_t>(hidden_size);
+                    for (size_t c = 0; c < sample_cols; ++c)
+                    {
+                        if (c)
+                        {
+                            ref_stream << ",";
+                            dst_stream << ",";
+                        }
+                        ref_stream << ref_row[c];
+                        dst_stream << dst_row[c];
+                    }
+                    std::string spike_rows_list;
+                    if (!spike_rows.empty())
+                    {
+                        std::ostringstream spike_stream;
+                        for (size_t i = 0; i < spike_rows.size(); ++i)
+                        {
+                            if (i)
+                                spike_stream << ",";
+                            spike_stream << spike_rows[i];
+                        }
+                        spike_rows_list = spike_stream.str();
+                    }
+                    LOG_INFO("[CosmaPrefill][rmsnorm-trace] worst_row=" << static_cast<long long>(worst_row_index)
+                                                                        << " count=" << worst_count
+                                                                        << " sum_sq=" << worst_sum_sq
+                                                                        << " row_rel=" << worst_row_rel
+                                                                        << " row_max_abs=" << worst_row_max_abs
+                                                                        << " ref_head=[" << ref_stream.str() << "]"
+                                                                        << " dst_head=[" << dst_stream.str() << "]"
+                                                                        << (spike_rows_list.empty() ? "" : " spike_rows=") << spike_rows_list);
+                }
+            }
+
+            if (env.rmsnorm_trace)
+            {
+                auto buffer = std::make_shared<std::vector<float>>(std::move(dst_row_major));
+                dst.host_owned = buffer;
+                dst.original_row_major = buffer->data();
             }
         }
         return true;

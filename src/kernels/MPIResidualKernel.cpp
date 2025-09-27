@@ -1,6 +1,7 @@
 #include "MPIResidualKernel.h"
 #include "../debug_utils.h"
 #include "../performance_timer.h"
+#include "../tensors/simple_tensor.h"
 #include <chrono>
 #include <algorithm>
 #include <iomanip>
@@ -63,6 +64,20 @@ namespace llaminar
         // Configure OpenMP threading based on problem size
         configureOpenMPThreading(total_elements);
 
+        const bool input_distributed = input_tensor->is_distributed();
+        const bool residual_distributed = residual_tensor->is_distributed();
+        const bool output_distributed = output_tensor->is_distributed();
+
+        const bool replicated_inputs = !input_distributed && !residual_distributed && !output_distributed;
+
+        LOG_DEBUG("MPIResidualKernel tensor types: input=" << input_tensor->type_name()
+                                                           << " residual=" << residual_tensor->type_name()
+                                                           << " output=" << output_tensor->type_name()
+                                                           << " distributed_flags=(" << (input_distributed ? "D" : "R")
+                                                           << "," << (residual_distributed ? "D" : "R")
+                                                           << "," << (output_distributed ? "D" : "R")
+                                                           << ") replicated=" << (replicated_inputs ? "true" : "false"));
+
         const float *input_data = input_tensor->data();
         const float *residual_data = residual_tensor->data();
         float *output_data = output_tensor->data();
@@ -83,10 +98,10 @@ namespace llaminar
             switch (strategy_)
             {
             case DistributionStrategy::SEQUENCE_WISE:
-                executeSequenceWise(input_data, residual_data, output_data, seq_len, hidden_size);
+                executeSequenceWise(input_data, residual_data, output_data, seq_len, hidden_size, replicated_inputs);
                 break;
             case DistributionStrategy::ELEMENT_WISE:
-                executeElementWise(input_data, residual_data, output_data, total_elements);
+                executeElementWise(input_data, residual_data, output_data, total_elements, replicated_inputs);
                 break;
             default:
                 LOG_ERROR("MPIResidualKernel: Unknown distribution strategy");
@@ -211,8 +226,20 @@ namespace llaminar
         LOG_DEBUG("MPIResidualKernel: Using " << max_threads << " threads for tensor (" << tensor_size << " elements)");
     }
 
-    void MPIResidualKernel::distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx) const
+    void MPIResidualKernel::distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx, bool replicated) const
     {
+        if (replicated || getSize() <= 1)
+        {
+            start_idx = 0;
+            end_idx = total_elements;
+            if (replicated)
+            {
+                LOG_DEBUG("MPIResidualKernel: Replicated tensors detected; each rank processing full range [0, "
+                          << total_elements << ")");
+            }
+            return;
+        }
+
         int rank = getRank();
         int size = getSize();
 
@@ -239,12 +266,12 @@ namespace llaminar
     }
 
     void MPIResidualKernel::executeSequenceWise(const float *input_data, const float *residual_data, float *output_data,
-                                                int seq_len, int hidden_size)
+                                                int seq_len, int hidden_size, bool replicated)
     {
         // Distribute sequence positions across MPI ranks
         size_t total_positions = seq_len;
         size_t start_pos, end_pos;
-        distributeMPIWork(total_positions, start_pos, end_pos);
+        distributeMPIWork(total_positions, start_pos, end_pos, replicated);
 
         // Process assigned sequence positions with OpenMP parallelization
         auto omp_start = std::chrono::high_resolution_clock::now();
@@ -266,16 +293,19 @@ namespace llaminar
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
         LOG_DEBUG("MPIResidualKernel sequence-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
-        // Synchronize all ranks before proceeding
-        MPI_Barrier(MPI_COMM_WORLD);
+        // Synchronize all ranks before proceeding when work was partitioned
+        if (!replicated && getSize() > 1)
+        {
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
     }
 
     void MPIResidualKernel::executeElementWise(const float *input_data, const float *residual_data, float *output_data,
-                                               size_t total_elements)
+                                               size_t total_elements, bool replicated)
     {
         // Distribute all elements across MPI ranks
         size_t start_idx, end_idx;
-        distributeMPIWork(total_elements, start_idx, end_idx);
+        distributeMPIWork(total_elements, start_idx, end_idx, replicated);
 
         // Process assigned elements with OpenMP SIMD parallelization
         auto omp_start = std::chrono::high_resolution_clock::now();
@@ -290,8 +320,11 @@ namespace llaminar
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
         LOG_DEBUG("MPIResidualKernel element-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
-        // Synchronize all ranks before proceeding
-        MPI_Barrier(MPI_COMM_WORLD);
+        // Synchronize all ranks before proceeding when work was partitioned
+        if (!replicated && getSize() > 1)
+        {
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
     }
 
     bool MPIResidualKernel::areShapesCompatible(const std::vector<int> &input_shape,

@@ -41,6 +41,19 @@ namespace llaminar
         size_t total_elements = seq_len * d_ff;
         configureOpenMPThreading(total_elements);
 
+        const bool gate_distributed = gate_tensor->is_distributed();
+        const bool up_distributed = up_tensor->is_distributed();
+        const bool output_distributed = output_tensor->is_distributed();
+        const bool replicated_inputs = !gate_distributed && !up_distributed && !output_distributed;
+
+        LOG_DEBUG("MPISwiGLUKernel tensor types: gate=" << gate_tensor->type_name()
+                                                        << " up=" << up_tensor->type_name()
+                                                        << " output=" << output_tensor->type_name()
+                                                        << " distributed_flags=(" << (gate_distributed ? "D" : "R")
+                                                        << "," << (up_distributed ? "D" : "R")
+                                                        << "," << (output_distributed ? "D" : "R")
+                                                        << ") replicated=" << (replicated_inputs ? "true" : "false"));
+
         const float *gate_data = gate_tensor->data();
         const float *up_data = up_tensor->data();
         float *output_data = output_tensor->data();
@@ -61,10 +74,10 @@ namespace llaminar
             switch (strategy_)
             {
             case DistributionStrategy::SEQUENCE_WISE:
-                executeSequenceWise(gate_data, up_data, output_data, seq_len, d_ff);
+                executeSequenceWise(gate_data, up_data, output_data, seq_len, d_ff, replicated_inputs);
                 break;
             case DistributionStrategy::FEATURE_WISE:
-                executeFeatureWise(gate_data, up_data, output_data, seq_len, d_ff);
+                executeFeatureWise(gate_data, up_data, output_data, seq_len, d_ff, replicated_inputs);
                 break;
             default:
                 LOG_ERROR("MPISwiGLUKernel: Unknown distribution strategy");
@@ -216,12 +229,22 @@ namespace llaminar
     }
 
     void MPISwiGLUKernel::executeSequenceWise(const float *gate_data, const float *up_data, float *output_data,
-                                              int seq_len, int d_ff)
+                                              int seq_len, int d_ff, bool replicated_inputs)
     {
         // Distribute sequence positions across MPI ranks
         size_t total_positions = seq_len;
-        size_t start_pos, end_pos;
-        distributeMPIWork(total_positions, start_pos, end_pos);
+        size_t start_pos = 0;
+        size_t end_pos = total_positions;
+
+        if (!replicated_inputs)
+        {
+            distributeMPIWork(total_positions, start_pos, end_pos);
+        }
+        else
+        {
+            LOG_DEBUG("MPISwiGLUKernel: Replicated tensors detected; each rank processing full range [0, "
+                      << total_positions << ")");
+        }
 
         // Process assigned sequence positions with OpenMP parallelization
         auto omp_start = std::chrono::high_resolution_clock::now();
@@ -253,12 +276,22 @@ namespace llaminar
     }
 
     void MPISwiGLUKernel::executeFeatureWise(const float *gate_data, const float *up_data, float *output_data,
-                                             int seq_len, int d_ff)
+                                             int seq_len, int d_ff, bool replicated_inputs)
     {
         // Distribute feature dimensions across MPI ranks
         size_t total_features = d_ff;
-        size_t start_feature, end_feature;
-        distributeMPIWork(total_features, start_feature, end_feature);
+        size_t start_feature = 0;
+        size_t end_feature = total_features;
+
+        if (!replicated_inputs)
+        {
+            distributeMPIWork(total_features, start_feature, end_feature);
+        }
+        else
+        {
+            LOG_DEBUG("MPISwiGLUKernel: Replicated tensors detected; each rank processing full range [0, "
+                      << total_features << ")");
+        }
 
         // Process assigned features across all sequence positions
         auto omp_start = std::chrono::high_resolution_clock::now();

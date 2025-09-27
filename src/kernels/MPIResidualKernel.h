@@ -137,7 +137,7 @@ namespace llaminar
          * @param start_idx Output: starting index for this rank
          * @param end_idx Output: ending index for this rank
          */
-        void distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx) const;
+        void distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx, bool replicated) const;
 
         /**
          * @brief Execute sequence-wise distributed residual addition
@@ -148,7 +148,7 @@ namespace llaminar
          * @param hidden_size Hidden dimension size
          */
         void executeSequenceWise(const float *input_data, const float *residual_data, float *output_data,
-                                 int seq_len, int hidden_size);
+                                 int seq_len, int hidden_size, bool replicated);
 
         /**
          * @brief Execute element-wise distributed residual addition
@@ -158,7 +158,7 @@ namespace llaminar
          * @param total_elements Total number of elements
          */
         void executeElementWise(const float *input_data, const float *residual_data, float *output_data,
-                                size_t total_elements);
+                                size_t total_elements, bool replicated);
 
         /**
          * @brief Check if tensor shapes are compatible for residual connection

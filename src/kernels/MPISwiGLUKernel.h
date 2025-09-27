@@ -135,7 +135,7 @@ namespace llaminar
          * @param d_ff Feed-forward dimension
          */
         void executeSequenceWise(const float *gate_data, const float *up_data, float *output_data,
-                                 int seq_len, int d_ff);
+                                 int seq_len, int d_ff, bool replicated_inputs);
 
         /**
          * @brief Execute feature-wise distributed SwiGLU
@@ -146,7 +146,7 @@ namespace llaminar
          * @param d_ff Feed-forward dimension
          */
         void executeFeatureWise(const float *gate_data, const float *up_data, float *output_data,
-                                int seq_len, int d_ff);
+                                int seq_len, int d_ff, bool replicated_inputs);
 
         /**
          * @brief Compute SiLU activation: x / (1 + exp(-x))

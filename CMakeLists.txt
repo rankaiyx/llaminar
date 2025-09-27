@@ -98,6 +98,19 @@ set(COSMA_WITH_NCCL OFF CACHE BOOL "Disable NCCL for COSMA")
 set(COSMA_WITH_GPU OFF CACHE BOOL "Disable GPU for COSMA")
 add_subdirectory(COSMA)
 
+message(STATUS "Configuring llama.cpp submodule...")
+set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Disable llama.cpp tests" FORCE)
+set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Disable llama.cpp CLI tools" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Disable llama.cpp examples" FORCE)
+set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Disable llama.cpp server" FORCE)
+set(LLAMA_BUILD_COMMON OFF CACHE BOOL "Disable llama.cpp common utils" FORCE)
+set(LLAMA_CURL OFF CACHE BOOL "Disable llama.cpp libcurl dependency" FORCE)
+set(GGML_CUDA OFF CACHE BOOL "Disable GGML CUDA backend" FORCE)
+set(GGML_METAL OFF CACHE BOOL "Disable GGML Metal backend" FORCE)
+set(GGML_SYCL OFF CACHE BOOL "Disable GGML SYCL backend" FORCE)
+set(GGML_RPC OFF CACHE BOOL "Disable GGML RPC backend" FORCE)
+add_subdirectory(llama.cpp)
+
 
 
 # Source files for the core library
@@ -146,8 +159,8 @@ target_link_libraries(llaminar_core
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
     cosma
+    ggml
     ${BLAS_LIBRARIES}
-    ggml_min
 )
 
 # Add NUMA if available
@@ -181,6 +194,9 @@ target_include_directories(llaminar_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/COSMA/src
     ${CBLAS_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
+    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
+    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml
 )
 
 # Main executable
@@ -246,26 +262,6 @@ function(add_llaminar_mpi_test TEST_NAME NUM_PROCS TARGET_NAME)
 
     set_tests_properties(${TEST_NAME} PROPERTIES ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1")
 endfunction()
-
-# Minimal ggml reference library for golden quant/dequant (Option A)
-add_library(ggml_min STATIC
-    llama.cpp/ggml/src/ggml.c
-    llama.cpp/ggml/src/ggml-quants.c
-    tests/ggml_backend_stubs.c
-)
-target_include_directories(ggml_min PUBLIC
-    llama.cpp/ggml/src
-    llama.cpp/ggml/include
-    llama.cpp/ggml
-)
-target_compile_definitions(ggml_min PRIVATE GGML_USE_FAKE_DEPS=1)
-target_compile_definitions(ggml_min PRIVATE
-    GGML_VERSION="0.0.0"
-    GGML_COMMIT="llaminar-min"
-    GGML_USE_K_QUANTS=1
-    GGML_USE_QKK_64=1
-)
-
 
 # Test sources and executables
 add_executable(test_basic tests/test_basic.cpp)
@@ -454,6 +450,11 @@ if(GTEST_FOUND)
     add_llaminar_mpi_test(CosmaPrefillManagerPopulationPerfTest 2 test_cosma_prefill_population_perf)
     set_tests_properties(CosmaPrefillManagerPopulationPerfTest PROPERTIES TIMEOUT 120)
 
+    add_executable(test_prefill_attention_golden tests/test_prefill_attention_golden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_prefill_attention_golden PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
+    add_llaminar_mpi_test(PrefillAttentionGoldenTest 2 test_prefill_attention_golden)
+    set_tests_properties(PrefillAttentionGoldenTest PROPERTIES TIMEOUT 180)
+
     # Dequantization tests (Q4_0 correctness + Q4_K placeholder sanity)
     add_executable(test_dequant tests/test_dequant.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_dequant llaminar_core)
@@ -483,7 +484,7 @@ if(GTEST_FOUND)
         llama.cpp/ggml/include
         llama.cpp/ggml
     )
-    target_link_libraries(test_dequant_golden llaminar_core ggml_min)
+    target_link_libraries(test_dequant_golden llaminar_core llama)
     if(GTest_FOUND)
         target_link_libraries(test_dequant_golden GTest::gtest GTest::gtest_main)
     else()

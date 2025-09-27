@@ -46,15 +46,20 @@ namespace llaminar
         std::vector<float> generateRandomMatrix(int rows, int cols, float min_val = -1.0f, float max_val = 1.0f)
         {
             std::vector<float> matrix(rows * cols);
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_real_distribution<float> dis(min_val, max_val);
-
-            for (auto &val : matrix)
+            if (rank_ == 0)
             {
-                val = dis(gen);
+                std::random_device rd;
+                std::mt19937 gen(rd());
+                std::uniform_real_distribution<float> dis(min_val, max_val);
+                for (auto &val : matrix)
+                {
+                    val = dis(gen);
+                }
             }
-
+            if (size_ > 1)
+            {
+                MPI_Bcast(matrix.data(), rows * cols, MPI_FLOAT, 0, MPI_COMM_WORLD);
+            }
             return matrix;
         }
 

@@ -558,17 +558,11 @@ namespace llaminar
             PERF_SCOPED_TIMER("gatherOutput::MPI_Allreduce");
             LOG_WARN("PERFORMANCE: Using expensive MPI_Allreduce for " << (seq_len * d_model) << " elements");
 
-            // Multi-process case - use averaging instead of summing
+            // Each rank computes partial contributions for its head shard.
+            // Summing across ranks yields the full output; avoid extra averaging.
             checkMPIError(MPI_Allreduce(local_output->data(), global_output->data(),
                                         static_cast<int>(seq_len * d_model), MPI_FLOAT, MPI_SUM, getComm()),
                           "MPI_Allreduce in gatherOutput");
-
-            // Scale down by the number of processes to avoid value explosion
-            float scale = 1.0f / size;
-            for (size_t i = 0; i < seq_len * d_model; ++i)
-            {
-                global_output->data()[i] *= scale;
-            }
         }
 
         LOG_DEBUG("Gathered output: [" << seq_len << ", " << d_model << "] on rank " << getRank());

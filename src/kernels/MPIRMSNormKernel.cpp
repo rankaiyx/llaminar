@@ -5,6 +5,7 @@
 #include <chrono>
 #include <algorithm>
 #include <limits>
+#include <vector>
 #include <mpi.h>
 
 namespace llaminar
@@ -216,22 +217,39 @@ namespace llaminar
         }
         double local_mean = local_count ? (local_sum / local_count) : 0.0;
 
-        // Compute local contribution to global RMS (parallel)
-        float local_sum_sq = 0.0f;
-#pragma omp parallel for reduction(+ : local_sum_sq) collapse(2) schedule(static)
-        for (long long i = 0; i < (long long)local_seq_len; ++i)
-            for (long long j = 0; j < (long long)hidden_size; ++j)
+        // Compute per-row RMS (RMSNorm is applied independently per sequence position)
+        std::vector<float> row_inv_rms(local_seq_len, 0.f);
+        double local_sum_sq_total = 0.0;
+        size_t denom = hidden_size > 0 ? hidden_size : 1;
+
+#pragma omp parallel for reduction(+ : local_sum_sq_total) schedule(static)
+        for (long long row = 0; row < (long long)local_seq_len; ++row)
+        {
+            const float *row_ptr = local_input + row * (long long)hidden_size;
+            double row_sum_sq = 0.0;
+            for (long long col = 0; col < (long long)hidden_size; ++col)
             {
-                float val = local_input[i * (long long)hidden_size + j];
-                local_sum_sq += val * val;
+                float val = row_ptr[col];
+                row_sum_sq += static_cast<double>(val) * static_cast<double>(val);
             }
+            local_sum_sq_total += row_sum_sq;
+            double denom_safe = static_cast<double>(denom);
+            double inv = 0.0;
+            if (denom_safe > 0.0)
+            {
+                inv = 1.0 / std::sqrt(row_sum_sq / denom_safe + static_cast<double>(epsilon_));
+            }
+            row_inv_rms[static_cast<size_t>(row)] = static_cast<float>(inv);
+        }
 
-        // Compute global RMS via MPI reduction
-        float global_sum_sq = 0.0f;
-        checkMPIError(MPI_Allreduce(&local_sum_sq, &global_sum_sq, 1, MPI_FLOAT, MPI_SUM, getComm()),
-                      "MPI_Allreduce for RMS computation");
+        // Aggregate statistics for logging (global averages are informational only)
+        double global_sum_sq = 0.0;
+        checkMPIError(MPI_Allreduce(&local_sum_sq_total, &global_sum_sq, 1, MPI_DOUBLE, MPI_SUM, getComm()),
+                      "MPI_Allreduce for RMS statistics");
 
-        float rms = std::sqrt(global_sum_sq / (global_seq_len * hidden_size) + epsilon_);
+        double rms_global = std::sqrt((global_seq_len * hidden_size)
+                                          ? (global_sum_sq / static_cast<double>(global_seq_len * hidden_size) + static_cast<double>(epsilon_))
+                                          : static_cast<double>(epsilon_));
 
         // Gather global stats for debugging (min, max, mean)
         float global_min = 0.0f, global_max = 0.0f;
@@ -265,19 +283,25 @@ namespace llaminar
         if (getRank() == 0)
         {
             LOG_INFO("[MPIRMSNormKernel] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
-                                                               << " global_sum_sq=" << global_sum_sq << " rms=" << rms);
+                                                               << " global_sum_sq=" << global_sum_sq << " rms_avg=" << rms_global);
             LOG_INFO("[MPIRMSNormKernel] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
         }
 
-        // Apply RMS normalization locally using the global RMS value
-#pragma omp parallel for collapse(2) schedule(static)
-        for (long long i = 0; i < (long long)local_seq_len; ++i)
+        // Apply RMS normalization locally using per-row normalization factors
+#pragma omp parallel for schedule(static)
+        for (long long row = 0; row < (long long)local_seq_len; ++row)
         {
-            for (long long j = 0; j < (long long)hidden_size; ++j)
+            float scale = row_inv_rms[static_cast<size_t>(row)];
+            const float *row_in = local_input + row * (long long)hidden_size;
+            float *row_out = local_output + row * (long long)hidden_size;
+            if (scale == 0.0f)
             {
-                size_t idx = static_cast<size_t>(i) * hidden_size + static_cast<size_t>(j);
-                float val = local_input[idx];
-                local_output[idx] = (val / rms) * weight[j];
+                std::fill(row_out, row_out + hidden_size, 0.0f);
+                continue;
+            }
+            for (long long col = 0; col < (long long)hidden_size; ++col)
+            {
+                row_out[col] = row_in[col] * scale * weight[col];
             }
         }
 
@@ -306,8 +330,8 @@ namespace llaminar
             LOG_INFO("[MPIRMSNormKernel] Post-Norm stats: min=" << out_global_min << " max=" << out_global_max << " mean=" << out_global_mean);
         }
 
-        LOG_DEBUG("Computed distributed RMS normalization: rms=" << rms
-                                                                 << ", local_seq_len=" << local_seq_len << " on rank " << getRank());
+        LOG_DEBUG("Computed distributed RMS normalization: rms_avg=" << rms_global
+                                                                     << ", local_seq_len=" << local_seq_len << " on rank " << getRank());
     }
 
     std::shared_ptr<TensorBase> MPIRMSNormKernel::createLocalTensor(const std::vector<size_t> &shape)
