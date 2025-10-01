@@ -225,7 +225,9 @@ namespace llaminar
 
         // Create local attended output tensor. For GatherHeadsPreProjection optimization we store
         // directly in heads-major layout [local_head_dim, seq_len] to skip a reorder later.
-        bool pre_mode = (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection);
+    // Treat Replicated as an alias of GatherHeadsPreProjection (single global projection path)
+    bool pre_mode = (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
+             output_mode_ == AttentionOutputMode::Replicated);
         auto local_attended_output = pre_mode
                                          ? createLocalSimpleTensor({local_head_dim, seq_len})
                                          : createLocalSimpleTensor({seq_len, local_head_dim});
@@ -259,7 +261,8 @@ namespace llaminar
         // Pre-projection gather path: gather head contexts BEFORE output projection so we do the
         // expensive WO matmul only once globally (optionally TP split later). We skip computing
         // local output projection in this branch.
-        if (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection)
+        if (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
+            output_mode_ == AttentionOutputMode::Replicated)
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::gatherHeadsPreProjection");
             size_t total_head_dim = static_cast<size_t>(n_head_) * head_dim_;
@@ -352,6 +355,7 @@ namespace llaminar
             }
 
             // Populate metadata early and return.
+            // Preserve the originally requested mode (Replicated remains distinguishable in metadata)
             last_meta_.mode = output_mode_;
             last_meta_.local_head_offset = head_offset;
             last_meta_.local_head_count = local_heads;
@@ -361,7 +365,10 @@ namespace llaminar
             double ms_pre = std::chrono::duration<double, std::milli>(end_pre - start).count();
             if (getRank() == 0)
             {
-                LOG_DEBUG("MPIAttention (GatherHeadsPreProjection) executed in " << ms_pre << " ms heads=" << n_head_);
+                if (output_mode_ == AttentionOutputMode::Replicated)
+                    LOG_DEBUG("MPIAttention (Replicated alias -> gather_pre) executed in " << ms_pre << " ms heads=" << n_head_);
+                else
+                    LOG_DEBUG("MPIAttention (GatherHeadsPreProjection) executed in " << ms_pre << " ms heads=" << n_head_);
                 LOG_DEBUG("AttentionResultMeta mode=" << (int)last_meta_.mode
                                                       << " heads_off=" << last_meta_.local_head_offset
                                                       << " heads_cnt=" << last_meta_.local_head_count
@@ -452,13 +459,7 @@ namespace llaminar
             last_meta_.concatenated = true;
             last_meta_.replicated = true;
         }
-        else if (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
-                 output_mode_ == AttentionOutputMode::Replicated)
-        {
-            // Not implemented yet
-            last_meta_.concatenated = false;
-            last_meta_.replicated = false;
-        }
+        // (GatherHeadsPreProjection / Replicated) early-returned above with metadata populated.
         if (getRank() == 0)
         {
             LOG_DEBUG("AttentionResultMeta mode=" << (int)last_meta_.mode

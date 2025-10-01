@@ -156,14 +156,12 @@ Local projection using row-partitioned W_O yields additive hidden contributions;
 ### 6.3 GatherHeadsPreProjection (implemented)
 `MPI_Allgatherv` of per-rank head contexts into full heads-major buffer, reorder to standard layout, then single global projection. Sets metadata: concatenated=true, replicated=true.
 
-### 6.4 Replicated
-For legacy consumers or debug; forces full gather irrespective of efficiency.
-1. Local QKV projection (input shard × shard-local weight slice): produces Q_local, K_local, V_local (local heads subset).
-2. Local per-head attention → context_local (still head-sharded).
-3. Output projection W_O:
-   - Layout: columns partitioned by heads*head_dim groups (so each rank owns columns that correspond to its heads). This makes matmul local; result is still **partial contribution** to hidden dimension.
-4. If W_O is column-sharded, the result is already *the full hidden dimension subset for this rank* (no need to sum). No inter-rank dependency: **Skip collective**.
-5. Optionally perform **RMSNorm pre-MLP locally** (needs global variance? For RMSNorm over hidden: compute local sum of squares, Allreduce a single scalar per sequence position, finalize scaling).
+### 6.4 Replicated (Alias IMPLEMENTED Rev 2.2)
+Now implemented as a semantic alias of `GatherHeadsPreProjection`:
+* Selecting `LLAMINAR_ATTN_OUTPUT_MODE=replicated` executes the pre-projection gather path (Allgatherv head contexts, single global W_O matmul) but preserves `mode=Replicated` in metadata for downstream logic / diagnostics.
+* Metadata: `concatenated=true`, `replicated=true` identical to gather_pre.
+* Rationale: Avoid duplicate code while providing a stable legacy/debug mode token.
+* Future: If a distinct fully replicated fast path diverges, the alias can split without changing external semantics.
 
 ### 6.5 Future (ReduceScatter Path)
 Row-sharded WO + fused ReduceScatter to produce hidden shards directly; saves gather if subsequent layers remain sharded.
@@ -378,7 +376,7 @@ bool ShardedAttention::execute(const DistTensor& x, DistTensor& out) {
 
 ---
 ## 23. Immediate Next Actions (Execution Queue – Updated)
-1. Replicated mode alias to gather_pre (metadata distinction) + env selection.
+1. (DONE) Replicated mode alias to gather_pre (metadata distinction) + env selection.
 2. Integrate TP executors into WO path (column split baseline) behind `LLAMINAR_ATTN_TP_DISABLE`.
 3. RMSNorm shard stats test (scalar Allreduce parity) preparing hidden sharding.
 4. Performance instrumentation: gather_pre vs gather_post timing across S={128,2k,8k}; log GFLOPS & comm ms.
