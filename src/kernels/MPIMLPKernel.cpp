@@ -67,7 +67,8 @@ namespace llaminar
         const auto &perf_env = debugEnv().performance;
         auto t_layer_start = std::chrono::high_resolution_clock::now();
         double gate_ms = 0.0, up_ms = 0.0, act_ms = 0.0, down_ms = 0.0, gather_ms = 0.0, parity_ms = 0.0;
-        auto time_block = [](auto &&fn) {
+        auto time_block = [](auto &&fn)
+        {
             auto t0 = std::chrono::high_resolution_clock::now();
             fn();
             auto t1 = std::chrono::high_resolution_clock::now();
@@ -158,14 +159,16 @@ namespace llaminar
             TPGemmExecutor gate_exec(matmul_local, cfg_gate, seq_len, global_ff, d_model);
             ExecCfg cfg_up{Mode::Column, tp_parts, tp_rank};
             TPGemmExecutor up_exec(matmul_local, cfg_up, seq_len, global_ff, d_model);
-            auto gate_part = [&]() {
+            auto gate_part = [&]()
+            {
                 PerfMatmulPhaseScope phase(1,1); // MLP gate
                 auto t0 = std::chrono::high_resolution_clock::now();
                 auto r = gate_exec.run(input->data(), w_gate->data());
                 auto t1 = std::chrono::high_resolution_clock::now();
                 gate_ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
                 return r; }();
-            auto up_part = [&]() {
+            auto up_part = [&]()
+            {
                 PerfMatmulPhaseScope phase(1,2); // MLP up
                 auto t0 = std::chrono::high_resolution_clock::now();
                 auto r = up_exec.run(input->data(), w_up->data());
@@ -188,31 +191,35 @@ namespace llaminar
         else
         {
             // Step 1: Gate projection
-            gate_ms = time_block([&](){ PerfMatmulPhaseScope phase(1,1); run_matmul("gate", input, w_gate, gate_proj, seq_len, local_d_ff, d_model); });
+            gate_ms = time_block([&]()
+                                 { PerfMatmulPhaseScope phase(1,1); run_matmul("gate", input, w_gate, gate_proj, seq_len, local_d_ff, d_model); });
             // Step 2: Up projection
-            up_ms = time_block([&](){ PerfMatmulPhaseScope phase(1,2); run_matmul("up", input, w_up, up_proj, seq_len, local_d_ff, d_model); });
+            up_ms = time_block([&]()
+                               { PerfMatmulPhaseScope phase(1,2); run_matmul("up", input, w_up, up_proj, seq_len, local_d_ff, d_model); });
         }
 
         // Step 3: Apply SwiGLU activation locally (no MPI communication)
-    act_ms = time_block([&](){ applySwiGLU(gate_proj, up_proj, activated, seq_len, local_d_ff); });
+        act_ms = time_block([&]()
+                            { applySwiGLU(gate_proj, up_proj, activated, seq_len, local_d_ff); });
 
         // Step 4: Down projection
         if (tp_mlp_enabled)
         {
             // Down projection over this partition slice only: use corresponding rows of w_down
             const float *w_down_slice = w_down->data() + tp_ff_offset * d_model;
-            down_ms = time_block([&](){
+            down_ms = time_block([&]()
+                                 {
                 PerfMatmulPhaseScope phase(1,3); // MLP down
                 if (!adaptive_matmul(activated->data(), w_down_slice, local_output->data(), (int)seq_len, (int)d_model, (int)local_d_ff, is_prefill_like))
                 {
                     LOG_ERROR("MLP down matmul (TP slice) failed seq_len=" << seq_len << " d_model=" << d_model << " local_d_ff=" << local_d_ff);
                     throw std::runtime_error("MLP TP down matmul failure");
-                }
-            });
+                } });
         }
         else
         {
-            down_ms = time_block([&](){ PerfMatmulPhaseScope phase(1,3); run_matmul("down", activated, w_down, local_output, seq_len, d_model, local_d_ff); });
+            down_ms = time_block([&]()
+                                 { PerfMatmulPhaseScope phase(1,3); run_matmul("down", activated, w_down, local_output, seq_len, d_model, local_d_ff); });
         }
 
         // Step 5: Gather final output using MPI_Allreduce (only if this rank produced partial result)
@@ -236,7 +243,8 @@ namespace llaminar
             need_allreduce = true;
         if (need_allreduce)
         {
-            gather_ms = time_block([&](){ gatherFinalOutput(local_output, output, seq_len, d_model); });
+            gather_ms = time_block([&]()
+                                   { gatherFinalOutput(local_output, output, seq_len, d_model); });
         }
         else
         {
@@ -304,19 +312,19 @@ namespace llaminar
             double total_ms = std::chrono::duration_cast<std::chrono::microseconds>(t_layer_end - t_layer_start).count() / 1000.0;
             double other_ms = std::max(0.0, total_ms - (gate_ms + up_ms + act_ms + down_ms + gather_ms));
             LOG_INFO("MLP_LAYER_TIMING seq_len=" << seq_len
-                                                  << " d_model=" << d_model
-                                                  << " local_d_ff=" << local_d_ff
-                                                  << " tp_enabled=" << (tp_mlp_enabled?1:0)
-                                                  << " tp_parts=" << (tp_mlp_enabled?tp_parts:1)
-                                                  << " prefill_like=" << (is_prefill_like?1:0)
-                                                  << " gate_ms=" << gate_ms
-                                                  << " up_ms=" << up_ms
-                                                  << " act_ms=" << act_ms
-                                                  << " down_ms=" << down_ms
-                                                  << " gather_ms=" << gather_ms
-                                                  << " other_ms=" << other_ms
-                                                  << " total_ms=" << total_ms
-                                                  << " layer_idx=" << PerformanceCounters::tl_phase_.layer_index);
+                                                 << " d_model=" << d_model
+                                                 << " local_d_ff=" << local_d_ff
+                                                 << " tp_enabled=" << (tp_mlp_enabled ? 1 : 0)
+                                                 << " tp_parts=" << (tp_mlp_enabled ? tp_parts : 1)
+                                                 << " prefill_like=" << (is_prefill_like ? 1 : 0)
+                                                 << " gate_ms=" << gate_ms
+                                                 << " up_ms=" << up_ms
+                                                 << " act_ms=" << act_ms
+                                                 << " down_ms=" << down_ms
+                                                 << " gather_ms=" << gather_ms
+                                                 << " other_ms=" << other_ms
+                                                 << " total_ms=" << total_ms
+                                                 << " layer_idx=" << PerformanceCounters::tl_phase_.layer_index);
             if (perf_env.layer_verbose)
             {
                 LOG_DEBUG("MLP_LAYER_VERBOSE parity_ms=" << parity_ms);

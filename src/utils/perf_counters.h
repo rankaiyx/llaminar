@@ -77,16 +77,31 @@ namespace llaminar
         }
 
         // Thread-local phase context for correlating matmuls with higher-level layer phases.
-        struct PhaseContext { uint8_t layer_type=0; uint8_t phase=0; int32_t layer_index=-1; };
+        struct PhaseContext
+        {
+            uint8_t layer_type = 0;
+            uint8_t phase = 0;
+            int32_t layer_index = -1;
+        };
         static thread_local PhaseContext tl_phase_;
-        static void setPhase(uint8_t layer_type, uint8_t phase, int32_t layer_index=-1) {
+        static void setPhase(uint8_t layer_type, uint8_t phase, int32_t layer_index = -1)
+        {
             tl_phase_.layer_type = layer_type;
             tl_phase_.phase = phase;
             // Preserve existing layer index if caller passes -1 (inheritance semantics)
             if (layer_index >= 0)
                 tl_phase_.layer_index = layer_index;
         }
-        struct PhaseScope { PhaseContext prev_; PhaseScope(uint8_t lt, uint8_t ph, int32_t idx=-1){ prev_=tl_phase_; setPhase(lt,ph,idx);} ~PhaseScope(){ tl_phase_=prev_; } };
+        struct PhaseScope
+        {
+            PhaseContext prev_;
+            PhaseScope(uint8_t lt, uint8_t ph, int32_t idx = -1)
+            {
+                prev_ = tl_phase_;
+                setPhase(lt, ph, idx);
+            }
+            ~PhaseScope() { tl_phase_ = prev_; }
+        };
 
         void record_matmul(uint64_t m, uint64_t n, uint64_t k, double ms, int backend, bool is_prefill)
         {
@@ -128,8 +143,16 @@ namespace llaminar
             if (env.performance.log_each_matmul && rank_cached_ == env.performance.log_rank)
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                MatmulOpSample s; s.m=m; s.n=n; s.k=k; s.ms=ms; s.gflops=gflops; s.backend=backend;
-                s.layer_type = tl_phase_.layer_type; s.phase = tl_phase_.phase; s.layer_index = tl_phase_.layer_index;
+                MatmulOpSample s;
+                s.m = m;
+                s.n = n;
+                s.k = k;
+                s.ms = ms;
+                s.gflops = gflops;
+                s.backend = backend;
+                s.layer_type = tl_phase_.layer_type;
+                s.phase = tl_phase_.phase;
+                s.layer_index = tl_phase_.layer_index;
                 samples_.push_back(s);
             }
         }
@@ -253,9 +276,50 @@ namespace llaminar
                 return "UNKNOWN";
             }
         }
-        static const char *layerTypeName(uint8_t lt){ switch(lt){ case 1: return "MLP"; case 2: return "ATTN"; default: return "UNK"; } }
-        static const char *mlpPhaseName(uint8_t ph){ switch(ph){ case 1: return "gate"; case 2: return "up"; case 3: return "down"; case 4: return "parity_ref"; default: return "other"; } }
-        static const char *attnPhaseName(uint8_t ph){ switch(ph){ case 1: return "q_proj"; case 2: return "k_proj"; case 3: return "v_proj"; case 4: return "out_proj"; default: return "other"; } }
+        static const char *layerTypeName(uint8_t lt)
+        {
+            switch (lt)
+            {
+            case 1:
+                return "MLP";
+            case 2:
+                return "ATTN";
+            default:
+                return "UNK";
+            }
+        }
+        static const char *mlpPhaseName(uint8_t ph)
+        {
+            switch (ph)
+            {
+            case 1:
+                return "gate";
+            case 2:
+                return "up";
+            case 3:
+                return "down";
+            case 4:
+                return "parity_ref";
+            default:
+                return "other";
+            }
+        }
+        static const char *attnPhaseName(uint8_t ph)
+        {
+            switch (ph)
+            {
+            case 1:
+                return "q_proj";
+            case 2:
+                return "k_proj";
+            case 3:
+                return "v_proj";
+            case 4:
+                return "out_proj";
+            default:
+                return "other";
+            }
+        }
 
     private:
         PerformanceCounters()
@@ -306,8 +370,12 @@ namespace llaminar
     };
 
     inline PerformanceCounters &perfCounters() { return PerformanceCounters::instance(); }
-    inline void setPerfMatmulPhase(uint8_t layer_type, uint8_t phase, int32_t layer_index=-1){ PerformanceCounters::setPhase(layer_type, phase, layer_index); }
-    struct PerfMatmulPhaseScope { PerformanceCounters::PhaseScope scope; PerfMatmulPhaseScope(uint8_t lt, uint8_t ph, int32_t idx=-1): scope(lt,ph,idx){} };
+    inline void setPerfMatmulPhase(uint8_t layer_type, uint8_t phase, int32_t layer_index = -1) { PerformanceCounters::setPhase(layer_type, phase, layer_index); }
+    struct PerfMatmulPhaseScope
+    {
+        PerformanceCounters::PhaseScope scope;
+        PerfMatmulPhaseScope(uint8_t lt, uint8_t ph, int32_t idx = -1) : scope(lt, ph, idx) {}
+    };
 
     // Definition of thread-local phase context
     inline thread_local PerformanceCounters::PhaseContext PerformanceCounters::tl_phase_{};

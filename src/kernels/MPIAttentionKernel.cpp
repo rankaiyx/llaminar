@@ -99,14 +99,15 @@ namespace llaminar
     bool MPIAttentionKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                      std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
-     PERF_SCOPED_TIMER("MPIAttentionKernel::execute");
-     auto t_exec_start = std::chrono::high_resolution_clock::now();
-     // Layer timing accumulators (wall ms). Only filled if perf flag enabled.
-     double t_distribute_ms=0.0, t_proj_ms=0.0, t_rope_ms=0.0, t_attn_ms=0.0,
-         t_gather_pre_ms=0.0, t_reconstruct_wo_ms=0.0, t_output_proj_ms=0.0,
-         t_gather_post_ms=0.0, t_emit_ms=0.0;
-     const auto &perf_env = debugEnv().performance;
-     auto time_block = [](auto &&fn){ auto t0=std::chrono::high_resolution_clock::now(); fn(); auto t1=std::chrono::high_resolution_clock::now(); return std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count()/1000.0; };
+        PERF_SCOPED_TIMER("MPIAttentionKernel::execute");
+        auto t_exec_start = std::chrono::high_resolution_clock::now();
+        // Layer timing accumulators (wall ms). Only filled if perf flag enabled.
+        double t_distribute_ms = 0.0, t_proj_ms = 0.0, t_rope_ms = 0.0, t_attn_ms = 0.0,
+               t_gather_pre_ms = 0.0, t_reconstruct_wo_ms = 0.0, t_output_proj_ms = 0.0,
+               t_gather_post_ms = 0.0, t_emit_ms = 0.0;
+        const auto &perf_env = debugEnv().performance;
+        auto time_block = [](auto &&fn)
+        { auto t0=std::chrono::high_resolution_clock::now(); fn(); auto t1=std::chrono::high_resolution_clock::now(); return std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count()/1000.0; };
 
         if (!validate(inputs, outputs))
         {
@@ -212,8 +213,9 @@ namespace llaminar
             local_wo = createLocalSimpleTensor({local_head_dim, d_model});
             {
                 PERF_SCOPED_TIMER("MPIAttentionKernel::distributeInputs");
-                t_distribute_ms = time_block([&]{ distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
-                                 local_wq, local_wk, local_wv, local_wo, seq_len, d_model); });
+                t_distribute_ms = time_block([&]
+                                             { distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
+                                                                local_wq, local_wk, local_wv, local_wo, seq_len, d_model); });
             }
         }
         // Create local projection tensors
@@ -224,13 +226,15 @@ namespace llaminar
         // Compute Q, K, V projections for local heads using COSMA
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalProjections");
-            t_proj_ms = time_block([&]{ computeLocalProjections(global_input, local_wq, local_wk, local_wv,
-                                    local_q, local_k, local_v, seq_len, d_model); });
+            t_proj_ms = time_block([&]
+                                   { computeLocalProjections(global_input, local_wq, local_wk, local_wv,
+                                                             local_q, local_k, local_v, seq_len, d_model); });
         }
         // Apply RoPE to local Q and K
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::applyLocalRoPE");
-            t_rope_ms = time_block([&]{ applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_heads); });
+            t_rope_ms = time_block([&]
+                                   { applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_heads); });
         }
 
         // Create local attended output tensor. For GatherHeadsPreProjection optimization we store
@@ -245,7 +249,8 @@ namespace llaminar
         // Compute attention for local heads
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalAttention");
-            t_attn_ms = time_block([&]{
+            t_attn_ms = time_block([&]
+                                   {
                 if (pre_mode)
                 {
                     auto tmp_std = createLocalSimpleTensor({seq_len, local_head_dim});
@@ -264,8 +269,7 @@ namespace llaminar
                 {
                     computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
                                           local_attended_output->data(), seq_len, local_heads);
-                }
-            });
+                } });
         }
 
         // Pre-projection gather path: gather head contexts BEFORE output projection so we do the
@@ -337,7 +341,8 @@ namespace llaminar
             std::shared_ptr<TensorBase> full_wo = global_wo;
             if (wo_head_sharded)
             {
-                t_reconstruct_wo_ms = time_block([&]{
+                t_reconstruct_wo_ms = time_block([&]
+                                                 {
                     PERF_SCOPED_TIMER("MPIAttentionKernel::reconstructWO");
                     full_wo = createLocalSimpleTensor({total_head_dim, d_model});
                     std::vector<int> w_recvcounts(getSize());
@@ -354,20 +359,19 @@ namespace llaminar
                     }
                     size_t w_send_elems = local_head_dim * d_model;
                     MPI_Allgatherv(local_wo->data(), (int)w_send_elems, MPI_FLOAT,
-                                   full_wo->data(), w_recvcounts.data(), w_displs.data(), MPI_FLOAT, MPI_COMM_WORLD);
-                });
+                                   full_wo->data(), w_recvcounts.data(), w_displs.data(), MPI_FLOAT, MPI_COMM_WORLD); });
             }
 
             // 5. Single (global) output projection: [seq_len, total_head_dim] * [total_head_dim, d_model]
-            t_output_proj_ms = time_block([&]{
+            t_output_proj_ms = time_block([&]
+                                          {
                 PerfMatmulPhaseScope phase(2,4); // Attention output projection (gather-pre path)
                 if (!adaptive_matmul(full_attended->data(), full_wo->data(), global_output->data(),
                                  seq_len, d_model, total_head_dim, false))
                 {
                     LOG_ERROR("MPIAttentionKernel: pre-projection gathered output projection failed");
                     throw std::runtime_error("Attention output projection failed");
-                }
-            });
+                } });
             {
                 LOG_ERROR("MPIAttentionKernel: pre-projection gathered output projection failed");
                 return false;
@@ -401,19 +405,19 @@ namespace llaminar
                 double accounted = t_distribute_ms + t_proj_ms + t_rope_ms + t_attn_ms + t_reconstruct_wo_ms + t_output_proj_ms;
                 double other = std::max(0.0, total_ms - accounted);
                 LOG_INFO("ATTN_LAYER_TIMING seq_len=" << seq_len
-                                                       << " heads=" << n_head_
-                                                       << " head_dim=" << head_dim_
-                                                       << " local_heads=" << local_heads
-                                                       << " mode=pre_projection" 
-                                                       << " distribute_ms=" << t_distribute_ms
-                                                       << " proj_ms=" << t_proj_ms
-                                                       << " rope_ms=" << t_rope_ms
-                                                       << " attn_ms=" << t_attn_ms
-                                                       << " recon_wo_ms=" << t_reconstruct_wo_ms
-                                                       << " out_proj_ms=" << t_output_proj_ms
-                                                       << " total_ms=" << total_ms
-                                                       << " other_ms=" << other
-                                                       << " layer_idx=" << PerformanceCounters::tl_phase_.layer_index);
+                                                      << " heads=" << n_head_
+                                                      << " head_dim=" << head_dim_
+                                                      << " local_heads=" << local_heads
+                                                      << " mode=pre_projection"
+                                                      << " distribute_ms=" << t_distribute_ms
+                                                      << " proj_ms=" << t_proj_ms
+                                                      << " rope_ms=" << t_rope_ms
+                                                      << " attn_ms=" << t_attn_ms
+                                                      << " recon_wo_ms=" << t_reconstruct_wo_ms
+                                                      << " out_proj_ms=" << t_output_proj_ms
+                                                      << " total_ms=" << total_ms
+                                                      << " other_ms=" << other
+                                                      << " layer_idx=" << PerformanceCounters::tl_phase_.layer_index);
             }
             return true;
         }
@@ -424,7 +428,8 @@ namespace llaminar
         // Compute output projection for local heads using COSMA
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalOutputProjection");
-            t_output_proj_ms = time_block([&]{ PerfMatmulPhaseScope phase(2,4); computeLocalOutputProjection(local_attended_output, local_wo,
+            t_output_proj_ms = time_block([&]
+                                          { PerfMatmulPhaseScope phase(2,4); computeLocalOutputProjection(local_attended_output, local_wo,
                                          local_final_output, seq_len, local_heads, d_model); });
         }
 
@@ -435,15 +440,17 @@ namespace llaminar
             // Row-partition of W_o yields additive partial contributions; sum to reconstruct.
             if (getSize() > 1)
             {
-                t_gather_post_ms = time_block([&]{ PerfAllreduce(local_final_output->data(), global_output->data(),
-                              (int)(seq_len * d_model), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD); });
+                t_gather_post_ms = time_block([&]
+                                              { PerfAllreduce(local_final_output->data(), global_output->data(),
+                                                              (int)(seq_len * d_model), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD); });
                 performed_collective = true;
             }
             else
             {
-                t_gather_post_ms = time_block([&]{ std::copy(local_final_output->data(),
-                          local_final_output->data() + seq_len * d_model,
-                          global_output->data()); });
+                t_gather_post_ms = time_block([&]
+                                              { std::copy(local_final_output->data(),
+                                                          local_final_output->data() + seq_len * d_model,
+                                                          global_output->data()); });
             }
             if (getRank() == 0)
                 LOG_DEBUG("MPIAttentionKernel: GatherHeadsPostProjection reconstructed full hidden via "
@@ -455,9 +462,10 @@ namespace llaminar
         else if (output_mode_ == AttentionOutputMode::LocalHeads)
         {
             PERF_SCOPED_TIMER("MPIAttentionKernel::emitLocalPartial");
-            t_emit_ms = time_block([&]{ std::copy(local_final_output->data(),
-                      local_final_output->data() + seq_len * d_model,
-                      global_output->data()); });
+            t_emit_ms = time_block([&]
+                                   { std::copy(local_final_output->data(),
+                                               local_final_output->data() + seq_len * d_model,
+                                               global_output->data()); });
             if (getShardingDebugConfig().assert_replicated_misuse)
             {
                 global_output->data()[seq_len * d_model - 1] += (float)(1e-30 * (getRank() + 1));
@@ -469,15 +477,16 @@ namespace llaminar
         {
             // Unsupported modes (pre-gather, replicated) fallback to LocalHeads behavior for now.
             PERF_SCOPED_TIMER("MPIAttentionKernel::emitLocalPartialFallback");
-            t_emit_ms = time_block([&]{ std::copy(local_final_output->data(),
-                      local_final_output->data() + seq_len * d_model,
-                      global_output->data()); });
+            t_emit_ms = time_block([&]
+                                   { std::copy(local_final_output->data(),
+                                               local_final_output->data() + seq_len * d_model,
+                                               global_output->data()); });
             if (getRank() == 0)
                 LOG_WARN("MPIAttentionKernel: output mode not implemented (" << (int)output_mode_ << ") falling back to LocalHeads partial");
         }
 
-    auto end = std::chrono::high_resolution_clock::now();
-    double execution_time = std::chrono::duration<double, std::milli>(end - t_exec_start).count();
+        auto end = std::chrono::high_resolution_clock::now();
+        double execution_time = std::chrono::duration<double, std::milli>(end - t_exec_start).count();
 
         LOG_DEBUG("MPIAttention executed in " + std::to_string(execution_time) +
                   " ms on rank " + std::to_string(getRank()) +
@@ -512,23 +521,23 @@ namespace llaminar
         {
             double accounted = t_distribute_ms + t_proj_ms + t_rope_ms + t_attn_ms + t_output_proj_ms + t_gather_post_ms + t_emit_ms;
             double other = std::max(0.0, execution_time - accounted);
-            std::string mode_str = (output_mode_ == AttentionOutputMode::GatherHeadsPostProjection ? "gather_post" :
-                                    output_mode_ == AttentionOutputMode::LocalHeads ? "local_heads" : "other");
+            std::string mode_str = (output_mode_ == AttentionOutputMode::GatherHeadsPostProjection ? "gather_post" : output_mode_ == AttentionOutputMode::LocalHeads ? "local_heads"
+                                                                                                                                                                     : "other");
             LOG_INFO("ATTN_LAYER_TIMING seq_len=" << seq_len
-                                                   << " heads=" << n_head_
-                                                   << " head_dim=" << head_dim_
-                                                   << " local_heads=" << local_heads
-                                                   << " mode=" << mode_str
-                                                   << " distribute_ms=" << t_distribute_ms
-                                                   << " proj_ms=" << t_proj_ms
-                                                   << " rope_ms=" << t_rope_ms
-                                                   << " attn_ms=" << t_attn_ms
-                                                   << " out_proj_ms=" << t_output_proj_ms
-                                                   << " gather_post_ms=" << t_gather_post_ms
-                                                   << " emit_ms=" << t_emit_ms
-                                                   << " total_ms=" << execution_time
-                                                   << " other_ms=" << other
-                                                   << " layer_idx=" << PerformanceCounters::tl_phase_.layer_index);
+                                                  << " heads=" << n_head_
+                                                  << " head_dim=" << head_dim_
+                                                  << " local_heads=" << local_heads
+                                                  << " mode=" << mode_str
+                                                  << " distribute_ms=" << t_distribute_ms
+                                                  << " proj_ms=" << t_proj_ms
+                                                  << " rope_ms=" << t_rope_ms
+                                                  << " attn_ms=" << t_attn_ms
+                                                  << " out_proj_ms=" << t_output_proj_ms
+                                                  << " gather_post_ms=" << t_gather_post_ms
+                                                  << " emit_ms=" << t_emit_ms
+                                                  << " total_ms=" << execution_time
+                                                  << " other_ms=" << other
+                                                  << " layer_idx=" << PerformanceCounters::tl_phase_.layer_index);
         }
         return true;
     }
@@ -882,7 +891,7 @@ namespace llaminar
             else
             {
                 {
-                    PerfMatmulPhaseScope phase(2,1); // Attention Q projection
+                    PerfMatmulPhaseScope phase(2, 1); // Attention Q projection
                     static bool logged_once = false;
                     if (!logged_once && getRank() == 0)
                     {
@@ -960,7 +969,7 @@ namespace llaminar
             else
             {
                 {
-                    PerfMatmulPhaseScope phase(2,2); // Attention K projection
+                    PerfMatmulPhaseScope phase(2, 2); // Attention K projection
                     bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
                     if (is_prefill_like)
                     {
@@ -1026,7 +1035,7 @@ namespace llaminar
             else
             {
                 {
-                    PerfMatmulPhaseScope phase(2,3); // Attention V projection
+                    PerfMatmulPhaseScope phase(2, 3); // Attention V projection
                     bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
                     if (is_prefill_like)
                     {
