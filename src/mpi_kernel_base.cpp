@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include "utils/perf_counters.h"
 
 namespace llaminar
 {
@@ -163,13 +164,13 @@ namespace llaminar
 
     void MPIKernelBase::allReduceSum(const float *send_data, float *recv_data, int count) const
     {
-        checkMPIError(MPI_Allreduce(send_data, recv_data, count, MPI_FLOAT, MPI_SUM, comm_),
+        checkMPIError(PerfAllreduce(send_data, recv_data, count, MPI_FLOAT, MPI_SUM, comm_),
                       "MPI_Allreduce (SUM)");
     }
 
     void MPIKernelBase::allReduceMax(const float *send_data, float *recv_data, int count) const
     {
-        checkMPIError(MPI_Allreduce(send_data, recv_data, count, MPI_FLOAT, MPI_MAX, comm_),
+        checkMPIError(PerfAllreduce(send_data, recv_data, count, MPI_FLOAT, MPI_MAX, comm_),
                       "MPI_Allreduce (MAX)");
     }
 

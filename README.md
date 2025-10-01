@@ -238,6 +238,61 @@ Phase 1 introduces an optional COSMA-backed prefill path focused on large contex
 | `LLAMINAR_COSMA_DUMP_STATS_PATH` | Override destination for JSON stats when dump enabled. | Defaults to `cosma_prefill_stats.json`. |
 | `LLAMINAR_COSMA_DISABLE_FUSED_DEQUANT` | Disable fused quantized weight dequant + COSMA population (revert to two-step path). | Safety fallback for new fused path. |
 
+## Tensor Parallel (TP) Simulation (Output Projection)
+
+The TP simulation path allows exercising row- or column-partitioned attention output projection logic
+without requiring an actual multi-process tensor parallel deployment. It reconstructs the full
+projection result from per-partition matmuls performed serially inside a single process. This is
+primarily a correctness and heuristic development tool.
+
+### Goals
+1. Validate reconstruction correctness of row vs column partitioning strategies.
+2. Prototype auto heuristic (choose column if hidden dimension divisible by partitions; else row if sequence length divisible).
+3. Provide a stable harness for future performance modeling before integrating real multi-rank TP.
+
+### Environment Flags
+| Variable | Purpose | Values / Default | Notes |
+|----------|---------|------------------|-------|
+| `LLAMINAR_TP_WO_SIM_ENABLE` | Enable TP simulation path in the attention output projection. | `0` or unset = disabled, any non-zero enables | When disabled, baseline single GEMM is used. |
+| `LLAMINAR_TP_WO_SIM_PARTITIONS` | Number of simulated partitions. | Integer ≥2; default: 2 | Drives row/col slicing. |
+| `LLAMINAR_TP_WO_SIM_MODE` | Force partition axis. | `row`, `col`, `auto` (default) | `auto`: column if `d_model % parts == 0`, else row if `seq_len % parts == 0`, else column fallback. |
+
+### How It Works
+1. Baseline path: single matmul `Y = Attended * W_O` (shape: `[seq_len, d_model] = [M,K] * [K,K]`).
+2. Simulation path:
+  - Column mode: Slice output columns (N) into partitions. Pack each weight sub-block (K x N_p) and compute per-part GEMM, then stitch column regions.
+  - Row mode: Slice input rows (M). For each partition perform GEMM on its row slice; stitch via row memcpy.
+3. Reconstruction yields a buffer bitwise equivalent (within floating rounding) to the baseline GEMM.
+
+### Guarantees & Tolerances
+Current test tolerances: `max_abs < 1e-5`, `relative L2 < 1e-6` across random inputs.
+
+### Test Coverage
+| Test | Scope | Notes |
+|------|-------|-------|
+| `AttentionTPSimParityTest` | Direct executor parity (row, col, auto) | Verifies manual reconstruction logic. |
+| `AttentionTPSimIntegrationTest` | Environment-driven kernel path | Ensures env toggles route through simulation branch producing identical output. |
+
+### Usage Example
+```bash
+export LLAMINAR_TP_WO_SIM_ENABLE=1
+export LLAMINAR_TP_WO_SIM_PARTITIONS=4
+export LLAMINAR_TP_WO_SIM_MODE=auto
+ctest --test-dir build -R AttentionTPSimIntegration -V
+```
+
+### Limitations / Future Work
+| Area | Planned Enhancement |
+|------|---------------------|
+| Performance Modeling | Introduce timing instrumentation and FLOP accounting per partition. |
+| Mixed Partition Heuristics | Combine head-wise distribution with TP simulation for hybrid scenarios. |
+| Real Multi-Rank TP | Replace serial loop with per-rank execution + collectives. |
+| Overlap | Explore streaming of column weight tiles with compute. |
+
+Reference implementation lives in `MPIAttentionKernel::computeLocalOutputProjection` guarded by the
+`debugEnv().tp_sim.*` snapshot fields. A dedicated executor (`tp_output_projection_executor`) isolates
+the partitioned GEMM loops for reuse.
+
 ### Instrumentation Counters
 Exposed via `CosmaPrefillManager::stats()`:
 - `single_rank_calls`, `fast_path_calls`, `cosma_path_calls`

@@ -31,6 +31,7 @@
 #include <iostream>
 #include <cstdio>
 #include <iomanip>
+#include "utils/perf_counters.h"
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -86,22 +87,22 @@ namespace
     inline void safe_allreduce_float_inplace(float *buf, int count, MPI_Op op)
     {
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
-            MPI_Allreduce(MPI_IN_PLACE, buf, count, MPI_FLOAT, op, MPI_COMM_WORLD);
+            llaminar::PerfAllreduce(MPI_IN_PLACE, buf, count, MPI_FLOAT, op, MPI_COMM_WORLD);
     }
     inline void safe_allreduce_int_inplace(int *buf, int count, MPI_Op op)
     {
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
-            MPI_Allreduce(MPI_IN_PLACE, buf, count, MPI_INT, op, MPI_COMM_WORLD);
+            llaminar::PerfAllreduce(MPI_IN_PLACE, buf, count, MPI_INT, op, MPI_COMM_WORLD);
     }
     inline void safe_bcast(void *buf, int count, MPI_Datatype dt, int root)
     {
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
-            MPI_Bcast(buf, count, dt, root, MPI_COMM_WORLD);
+            llaminar::PerfBcast(buf, count, dt, root, MPI_COMM_WORLD);
     }
     inline void safe_barrier()
     {
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
-            MPI_Barrier(MPI_COMM_WORLD);
+            llaminar::PerfBarrier(MPI_COMM_WORLD);
     }
 
     inline std::string trim_token(const std::string &token)
@@ -1327,7 +1328,7 @@ namespace llaminar
             int all_flag = local_flag;
             if (mpi_is_initialized() && mpi_world_size_safe() > 1)
             {
-                MPI_Allreduce(&local_flag, &all_flag, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+                PerfAllreduce(&local_flag, &all_flag, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
             }
             if (!all_flag)
                 return;
@@ -1510,7 +1511,7 @@ namespace llaminar
             // Replicated inputs => each rank already has identical result; broadcast rank 0's buffer for safety
             if (world_size_ > 1)
             {
-                MPI_Bcast(C.host_owned->data(), m * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
+                PerfBcast(C.host_owned->data(), m * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
             }
             capture_path(A, W.view, C, false, true, "multi-rank-fast-path");
             return C;
@@ -1534,7 +1535,7 @@ namespace llaminar
             const float *A_ptr = A.original_row_major;
             const float *B_ptr = W.view.original_row_major;
             run_reference_gemm(A_ptr, B_ptr, C_rep.host_owned->data(), transposeW, m, n, k, alpha, beta, rank_);
-            MPI_Bcast(C_rep.host_owned->data(), m * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
+            PerfBcast(C_rep.host_owned->data(), m * n, MPI_FLOAT, 0, MPI_COMM_WORLD);
             capture_path(A, W.view, C_rep, false, false, "force-large-replicated");
             return C_rep;
         }
@@ -2059,8 +2060,8 @@ namespace llaminar
                     std::fill(B_pop.begin(), B_pop.end(), 0.f);
                 if (mpi_is_initialized() && mpi_world_size_safe() > 1)
                 {
-                    MPI_Bcast(A_pop.data(), (int)A_pop.size(), MPI_FLOAT, 0, MPI_COMM_WORLD);
-                    MPI_Bcast(B_pop.data(), (int)B_pop.size(), MPI_FLOAT, 0, MPI_COMM_WORLD);
+                    PerfBcast(A_pop.data(), (int)A_pop.size(), MPI_FLOAT, 0, MPI_COMM_WORLD);
+                    PerfBcast(B_pop.data(), (int)B_pop.size(), MPI_FLOAT, 0, MPI_COMM_WORLD);
                 }
                 if (rank_ == 0 && should_log(3))
                     LOG_INFO("[CosmaPrefill][diag] Reconstruction BYPASS active");
@@ -2137,7 +2138,7 @@ namespace llaminar
                                 }
                             }
                         }
-                        MPI_Bcast(out.data(), (int)out.size(), MPI_FLOAT, 0, MPI_COMM_WORLD);
+                        PerfBcast(out.data(), (int)out.size(), MPI_FLOAT, 0, MPI_COMM_WORLD);
                     };
                     do_swap_recon(A_compat, A_pop_swap, m, k);
                     do_swap_recon(B_compat, B_pop_swap, k, n);
@@ -2532,8 +2533,8 @@ namespace llaminar
             }
             if (mpi_is_initialized() && mpi_world_size_safe() > 1)
             {
-                MPI_Allreduce(MPI_IN_PLACE, ownA.data(), (int)ownA.size(), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-                MPI_Allreduce(MPI_IN_PLACE, ownB.data(), (int)ownB.size(), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+                PerfAllreduce(MPI_IN_PLACE, ownA.data(), (int)ownA.size(), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+                PerfAllreduce(MPI_IN_PLACE, ownB.data(), (int)ownB.size(), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
             }
             int dupA = 0, dupB = 0;
             for (int v : ownA)
@@ -2640,7 +2641,7 @@ namespace llaminar
         {
             LOG_INFO("[CosmaPrefill][direct] entering pre-multiply barrier");
         }
-        MPI_Barrier(MPI_COMM_WORLD);
+        PerfBarrier(MPI_COMM_WORLD);
         if (rank_ == 0 && should_log(2))
         {
             LOG_INFO("[CosmaPrefill][direct] exited pre-multiply barrier");
@@ -2661,7 +2662,7 @@ namespace llaminar
         {
             LOG_ERROR("[CosmaPrefill][direct] cosma::multiply exception: " << e.what());
         }
-        MPI_Barrier(MPI_COMM_WORLD);
+        PerfBarrier(MPI_COMM_WORLD);
         if (rank_ == 0 && should_log(2))
         {
             LOG_INFO("[CosmaPrefill][direct] exited post-multiply barrier");
@@ -2840,13 +2841,13 @@ namespace llaminar
         if (src.host_owned)
         {
             std::memcpy(dst, src.host_owned->data(), total * sizeof(float));
-            MPI_Bcast(dst, static_cast<int>(total), MPI_FLOAT, 0, MPI_COMM_WORLD);
+            PerfBcast(dst, static_cast<int>(total), MPI_FLOAT, 0, MPI_COMM_WORLD);
             return;
         }
         if (!src.mat)
         {
             std::fill(dst, dst + total, 0.f);
-            MPI_Bcast(dst, static_cast<int>(total), MPI_FLOAT, 0, MPI_COMM_WORLD);
+            PerfBcast(dst, static_cast<int>(total), MPI_FLOAT, 0, MPI_COMM_WORLD);
             return;
         }
 
@@ -2875,8 +2876,8 @@ namespace llaminar
                     }
                 }
             }
-            MPI_Allreduce(MPI_IN_PLACE, dst, (int)total, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, counts.data(), (int)total, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(MPI_IN_PLACE, dst, (int)total, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(MPI_IN_PLACE, counts.data(), (int)total, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
             if (normalize)
             {
                 for (size_t i = 0; i < total; ++i)
@@ -2944,8 +2945,8 @@ namespace llaminar
         std::vector<int> global_counts = ownership_counts;
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
         {
-            MPI_Allreduce(local_acc.data(), dst, static_cast<int>(total), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(ownership_counts.data(), global_counts.data(), static_cast<int>(total), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(local_acc.data(), dst, static_cast<int>(total), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(ownership_counts.data(), global_counts.data(), static_cast<int>(total), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
         }
         else
         {
@@ -3079,7 +3080,7 @@ namespace llaminar
         double global[3] = {local_sum, local_sq, (double)local_count};
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
         {
-            MPI_Allreduce(MPI_IN_PLACE, global, 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(MPI_IN_PLACE, global, 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         }
         if (rank_ == 0 && should_log(3))
         {
@@ -3131,7 +3132,7 @@ namespace llaminar
             }
             if (mpi_is_initialized() && mpi_world_size_safe() > 1)
             {
-                MPI_Bcast(&recon_val, 1, MPI_FLOAT, owner, MPI_COMM_WORLD);
+                PerfBcast(&recon_val, 1, MPI_FLOAT, owner, MPI_COMM_WORLD);
             }
             float orig_val = original ? original[(size_t)gi * src.global_cols + gj] : 0.f;
             if (rank_ == 0 && should_log(4))
@@ -3838,8 +3839,8 @@ namespace llaminar
 
         if (mpi_is_initialized() && mpi_world_size_safe() > 1)
         {
-            MPI_Allreduce(MPI_IN_PLACE, local_sum_sq.data(), seq_len, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(MPI_IN_PLACE, local_counts.data(), seq_len, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(MPI_IN_PLACE, local_sum_sq.data(), seq_len, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(MPI_IN_PLACE, local_counts.data(), seq_len, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
         }
 
         if (env.rmsnorm_trace)
@@ -4119,7 +4120,7 @@ namespace llaminar
 
                     if (mpi_is_initialized() && mpi_world_size_safe() > 1)
                     {
-                        MPI_Allreduce(MPI_IN_PLACE, column_counts.data(), static_cast<int>(total_positions), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+                        PerfAllreduce(MPI_IN_PLACE, column_counts.data(), static_cast<int>(total_positions), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
                     }
 
                     for (size_t idx = 0; idx < total_positions; ++idx)
@@ -4677,7 +4678,7 @@ namespace llaminar
             }
             int global_zero_tiles = 0;
             if (mpi_is_initialized())
-                MPI_Allreduce(&local_zero_tile, &global_zero_tiles, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+                PerfAllreduce(&local_zero_tile, &global_zero_tiles, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
             if (global_zero_tiles > 0 && global_zero_tiles < world_size_)
             {
                 if (rank_ == 0 && should_log(2))
@@ -4685,7 +4686,7 @@ namespace llaminar
                     LOG_DEBUG("[FusedRmsnormQkv][preprobe] mixed zero-tile strategy detected (" << global_zero_tiles << "/" << world_size_ << ") – using replicated host fallback before conversion");
                 }
                 if (mpi_is_initialized())
-                    MPI_Barrier(MPI_COMM_WORLD);
+                    PerfBarrier(MPI_COMM_WORLD);
                 const int S = seq_len;
                 const int H = hidden_size;
                 const int Oq = wq.cols;
@@ -4819,7 +4820,7 @@ namespace llaminar
             int global_zero_tiles = 0;
             if (mpi_is_initialized())
             {
-                MPI_Allreduce(&local_zero_tile, &global_zero_tiles, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+                PerfAllreduce(&local_zero_tile, &global_zero_tiles, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
             }
             // Mixed case: some zero-tile (global_zero_tiles>0 but not all ranks) -> unsupported safe exit
             if (global_zero_tiles > 0 && global_zero_tiles < world_size_)
@@ -4831,7 +4832,7 @@ namespace llaminar
                 }
                 if (mpi_is_initialized())
                 {
-                    MPI_Barrier(MPI_COMM_WORLD); // synchronize before heavy host work
+                    PerfBarrier(MPI_COMM_WORLD); // synchronize before heavy host work
                 }
                 const int S = seq_len;
                 const int H = hidden_size;
@@ -4903,7 +4904,7 @@ namespace llaminar
                 // Activation guard: retain original row-major pointer (no distributed resources to release).
                 replicated.activation_guard.original_row_major = activation_row_major;
                 if (mpi_is_initialized())
-                    MPI_Barrier(MPI_COMM_WORLD);
+                    PerfBarrier(MPI_COMM_WORLD);
                 auto t1_fallback = std::chrono::high_resolution_clock::now();
                 stats_.fused_rmsnorm_qkv_invocations++;
                 stats_.mixed_zero_tile_fallbacks++;

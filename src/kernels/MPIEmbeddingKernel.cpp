@@ -32,6 +32,7 @@
 #include "MPIEmbeddingKernel.h"
 #include "../logger.h"
 #include "../utils/debug_env.h"
+#include "../utils/perf_counters.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -651,7 +652,7 @@ namespace llaminar
         }
 
         // Reduce (sum) partial embeddings across ranks
-        checkMPIError(MPI_Allreduce(local_output->data(), global_output->data(),
+        checkMPIError(PerfAllreduce(local_output->data(), global_output->data(),
                                     static_cast<int>(seq_len * embedding_dim), MPI_FLOAT, MPI_SUM, getComm()),
                       "MPI_Allreduce in gatherEmbeddings");
     }

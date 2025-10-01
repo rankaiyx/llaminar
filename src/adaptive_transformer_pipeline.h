@@ -17,6 +17,7 @@
 #include <memory>
 #include <chrono>
 #include <cmath>
+#include "utils/perf_counters.h"
 
 namespace llaminar
 {
@@ -322,8 +323,8 @@ namespace llaminar
                 // In MPI context, we'd use MPI_Allreduce for global max
                 if (getSize() > 1)
                 {
-                    MPI_Barrier(MPI_COMM_WORLD); // Ensure all ranks reach this point
-                    MPI_Allreduce(&max_val, &global_max, 1, MPI_FLOAT, MPI_MAX, MPI_COMM_WORLD);
+                    PerfBarrier(MPI_COMM_WORLD); // Ensure all ranks reach this point
+                    PerfAllreduce(&max_val, &global_max, 1, MPI_FLOAT, MPI_MAX, MPI_COMM_WORLD);
                 }
 
                 // Compute exp and sum
@@ -337,8 +338,8 @@ namespace llaminar
                 float global_sum = sum;
                 if (getSize() > 1)
                 {
-                    MPI_Barrier(MPI_COMM_WORLD); // Ensure all ranks complete local sum
-                    MPI_Allreduce(&sum, &global_sum, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+                    PerfBarrier(MPI_COMM_WORLD); // Ensure all ranks complete local sum
+                    PerfAllreduce(&sum, &global_sum, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
                 }
 
                 // Normalize

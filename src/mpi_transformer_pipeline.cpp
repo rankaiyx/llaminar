@@ -3551,7 +3551,7 @@ namespace llaminar
             throw std::runtime_error("Failed to load token embedding");
         }
         // Allow late-setting of LLAMINAR_SHARD_LOAD_DIAG inside tests by also checking getenv
-        bool shard_diag = debugEnv().sharding.shard_load_diag || std::getenv("LLAMINAR_SHARD_LOAD_DIAG");
+        bool shard_diag = debugEnv().sharding.shard_load_diag; // snapshot authoritative (tests can call debugEnvRefresh after setenv)
         if (shard_diag)
         {
             int rank = 0;
@@ -4386,7 +4386,7 @@ namespace llaminar
             LOG_ERROR("Failed to load token embedding");
             throw std::runtime_error("Failed to load token embedding");
         }
-        bool shard_diag2 = debugEnv().sharding.shard_load_diag || std::getenv("LLAMINAR_SHARD_LOAD_DIAG");
+        bool shard_diag2 = debugEnv().sharding.shard_load_diag;
         if (shard_diag2)
         {
             int rank = 0;

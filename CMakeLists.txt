@@ -12,6 +12,18 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Option: enable heavy RMSNorm reference validation code
+option(LLAMINAR_ENABLE_RMSNORM_REFERENCE "Enable RMSNorm reference validation path" ON)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    # Default OFF in Release unless explicitly turned on
+    if(NOT DEFINED CACHE{LLAMINAR_ENABLE_RMSNORM_REFERENCE_SET})
+        set(LLAMINAR_ENABLE_RMSNORM_REFERENCE OFF)
+    endif()
+endif()
+if(LLAMINAR_ENABLE_RMSNORM_REFERENCE)
+    add_compile_definitions(LLAMINAR_ENABLE_RMSNORM_REFERENCE)
+endif()
+
 # Compiler flags
 # Note: Removed -DDEBUG from global flags to prevent COSMA verbose output
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
@@ -23,6 +35,9 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 # Find required packages
 find_package(MPI REQUIRED)
 find_package(OpenMP REQUIRED)
+
+# Ensure MPI dependent code paths are enabled
+add_compile_definitions(LLAMINAR_HAVE_MPI)
 
 # Find Google Test for unit testing
 find_package(GTest QUIET)
@@ -156,10 +171,15 @@ set(LLAMINAR_CORE_SOURCES
     src/chat/chat_session.cpp
     src/chat/response_generator.cpp
     src/chat/chat_interface.cpp
+    # Weight slicing Phase 0 helpers
+    src/weights/weight_roles.cpp
 )
 
 # Create the core library
 add_library(llaminar_core STATIC ${LLAMINAR_CORE_SOURCES})
+
+# Redundant safety: explicitly add weight_roles.cpp in case list edits are missed
+target_sources(llaminar_core PRIVATE src/weights/weight_roles.cpp)
 
 # Link libraries to core
 target_link_libraries(llaminar_core
@@ -233,6 +253,23 @@ endif()
 # Enable testing
 enable_testing()
 
+# Weight role classification unit test (non-MPI)
+if(GTEST_FOUND)
+    add_executable(test_weight_role_classification
+        tests/test_weight_role_classification.cpp
+        src/weights/weight_roles.cpp
+        src/utils/debug_env.cpp
+    )
+    target_link_libraries(test_weight_role_classification
+        PRIVATE
+        llaminar_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_test(NAME WeightRoleClassification COMMAND test_weight_role_classification)
+endif()
+
+
 function(add_llaminar_mpi_test TEST_NAME NUM_PROCS TARGET_NAME)
     if(NOT MPIEXEC_EXECUTABLE)
         message(FATAL_ERROR "MPI executable not available for ${TEST_NAME}")
@@ -274,6 +311,22 @@ function(add_llaminar_mpi_test TEST_NAME NUM_PROCS TARGET_NAME)
 
     set_tests_properties(${TEST_NAME} PROPERTIES ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1")
 endfunction()
+
+# Weight slice parity validation test (requires MPI, launched with 2 ranks)
+if(GTEST_FOUND)
+    add_executable(test_weight_slice_parity
+        tests/test_weight_slice_parity.cpp
+        src/weights/weight_roles.cpp
+        src/utils/debug_env.cpp
+    )
+    target_link_libraries(test_weight_slice_parity
+        PRIVATE
+        llaminar_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_llaminar_mpi_test(WeightSliceParity 2 test_weight_slice_parity)
+endif()
 
 # Test sources and executables
 add_executable(test_basic tests/test_basic.cpp)
@@ -380,6 +433,68 @@ if(GTEST_FOUND)
     target_link_libraries(test_mlp_shard_parity llaminar_core)
     set_target_properties(test_mlp_shard_parity PROPERTIES OUTPUT_NAME test_mlp_shard_parity)
 
+    # MLP tensor-parallel executor parity test (replicated weights, env-driven TP enable)
+    add_executable(test_mlp_tp_parity tests/test_mlp_tp_parity.cpp)
+    target_link_libraries(test_mlp_tp_parity llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_mlp_tp_parity GTest::gtest GTest::gtest_main)
+    else()
+        if(GTEST_INCLUDE_DIR)
+            target_include_directories(test_mlp_tp_parity PRIVATE ${GTEST_INCLUDE_DIR})
+        endif()
+        if(GTEST_LIBRARY AND GTEST_MAIN_LIBRARY)
+            target_link_libraries(test_mlp_tp_parity ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+        endif()
+    endif()
+    # Register individual GTest cases from test_mlp_tp_parity binary.
+    # Each uses --gtest_filter to isolate the case; global env already drives TP enable.
+    add_test(NAME MLPTPParity_SmallOddDff70
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.SmallOddDff70)
+    set_tests_properties(MLPTPParity_SmallOddDff70 PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;ragged")
+    add_test(NAME MLPTPParity_EvenDff64
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.EvenDff64)
+    set_tests_properties(MLPTPParity_EvenDff64 PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;balanced")
+    add_test(NAME MLPTPParity_SmallEdgeDff33
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.SmallEdgeDff33)
+    set_tests_properties(MLPTPParity_SmallEdgeDff33 PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;edge")
+    add_test(NAME MLPTPParity_RaggedDff65
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.RaggedDff65)
+    set_tests_properties(MLPTPParity_RaggedDff65 PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;ragged")
+    add_test(NAME MLPTPParity_LargerEvenDff128
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.LargerEvenDff128)
+    set_tests_properties(MLPTPParity_LargerEvenDff128 PROPERTIES TIMEOUT 60 LABELS "mlp;tp;parity;larger")
+    # Negative test: intentionally induce mismatch (added in source) filtered separately
+    add_test(NAME MLPTPParity_NegativeMismatch
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.NegativeMismatch)
+    set_tests_properties(MLPTPParity_NegativeMismatch PROPERTIES TIMEOUT 40 LABELS "mlp;tp;parity;negative")
+    # Stress test (added in source) with larger seq_len approaching backend threshold
+    add_test(NAME MLPTPParity_StressLongPrefill
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.StressLongPrefill)
+    set_tests_properties(MLPTPParity_StressLongPrefill PROPERTIES TIMEOUT 90 LABELS "mlp;tp;parity;stress")
+    # 3-way TP variants (must be launched with 3 ranks)
+    add_test(NAME MLPTPParity_TP3_RaggedDff97
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 3 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.TP3_RaggedDff97)
+    set_tests_properties(MLPTPParity_TP3_RaggedDff97 PROPERTIES TIMEOUT 50 LABELS "mlp;tp;parity;ragged;tp3")
+    add_test(NAME MLPTPParity_TP3_EvenDff90
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 3 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.TP3_EvenDff90)
+    set_tests_properties(MLPTPParity_TP3_EvenDff90 PROPERTIES TIMEOUT 50 LABELS "mlp;tp;parity;balanced;tp3")
+    # 4-way TP variants
+    add_test(NAME MLPTPParity_TP4_EvenDff128
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.TP4_EvenDff128)
+    set_tests_properties(MLPTPParity_TP4_EvenDff128 PROPERTIES TIMEOUT 60 LABELS "mlp;tp;parity;balanced;tp4")
+    add_test(NAME MLPTPParity_TP4_RaggedDff130
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.TP4_RaggedDff130)
+    set_tests_properties(MLPTPParity_TP4_RaggedDff130 PROPERTIES TIMEOUT 60 LABELS "mlp;tp;parity;ragged;tp4")
+    # COSMA-prefill mode trigger (still 2 ranks; threshold lowered via env in test)
+    add_test(NAME MLPTPParity_PrefillCosmaMode
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_tp_parity> --gtest_filter=MLP_TP_Parity.PrefillCosmaMode)
+    set_tests_properties(MLPTPParity_PrefillCosmaMode PROPERTIES TIMEOUT 50 LABELS "mlp;tp;parity;prefill;cosma")
+
+    # Matrix driver script (aggregates multiple cases & ranks) - optional umbrella test
+    add_test(NAME MLPTPParity_Matrix
+             COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/run_mlp_tp_parity_matrix.sh)
+    set_tests_properties(MLPTPParity_Matrix PROPERTIES TIMEOUT 300 LABELS "mlp;tp;parity;matrix")
+
     # Small (even-ish) partition
     add_test(NAME MLPShardParity_Small COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_mlp_shard_parity> --seq-len=5 --d-model=48 --d-ff=64)
     # Medium uneven d_ff
@@ -457,6 +572,16 @@ if(GTEST_FOUND)
     add_test(NAME RMSNormShardStats_Parity
                  COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_rmsnorm_shard_stats>)
 
+    # RMSNorm sharded gamma parity test (validates gamma shard scaling parity)
+    add_executable(test_rmsnorm_sharded_gamma tests/test_rmsnorm_sharded_gamma.cpp)
+    target_link_libraries(test_rmsnorm_sharded_gamma llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_rmsnorm_sharded_gamma GTest::gtest GTest::gtest_main)
+    endif()
+    add_test(NAME RMSNormShardedGamma_Parity
+                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 $<TARGET_FILE:test_rmsnorm_sharded_gamma>)
+    set_tests_properties(RMSNormShardedGamma_Parity PROPERTIES TIMEOUT 40 LABELS "rmsnorm;sharding;gamma;parity")
+
     # TP splitters unit tests (pure local, no MPI required)
     add_executable(test_tp_splitters tests/test_tp_splitters.cpp)
     target_link_libraries(test_tp_splitters llaminar_core)
@@ -472,6 +597,33 @@ if(GTEST_FOUND)
         target_link_libraries(test_attention_tp_parity GTest::gtest GTest::gtest_main)
     endif()
     add_test(NAME AttentionTPParityTest COMMAND test_attention_tp_parity)
+
+    # Generic TP GEMM executor parity test (row & column partition, uneven splits)
+    add_executable(test_tp_generic_gemm_executor tests/test_tp_generic_gemm_executor.cpp)
+    target_link_libraries(test_tp_generic_gemm_executor llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_tp_generic_gemm_executor GTest::gtest GTest::gtest_main)
+    endif()
+    add_test(NAME TPGemmGenericParityTest COMMAND test_tp_generic_gemm_executor)
+    set_tests_properties(TPGemmGenericParityTest PROPERTIES TIMEOUT 25 LABELS "tp;gemm;parity")
+
+    # Attention TP simulation parity test (row/col & auto heuristic)
+    add_executable(test_attention_tp_sim_parity tests/test_attention_tp_sim_parity.cpp)
+    target_link_libraries(test_attention_tp_sim_parity llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_attention_tp_sim_parity GTest::gtest GTest::gtest_main)
+    endif()
+    add_test(NAME AttentionTPSimParityTest COMMAND test_attention_tp_sim_parity)
+    set_tests_properties(AttentionTPSimParityTest PROPERTIES TIMEOUT 30 LABELS "attention;parity;tp;simulation")
+
+    # Attention TP simulation integration test (env-driven computeLocalOutputProjection path)
+    add_executable(test_attention_tp_sim_integration tests/test_attention_tp_sim_integration.cpp)
+    target_link_libraries(test_attention_tp_sim_integration llaminar_core)
+    if(GTest_FOUND)
+        target_link_libraries(test_attention_tp_sim_integration GTest::gtest GTest::gtest_main)
+    endif()
+    add_test(NAME AttentionTPSimIntegrationTest COMMAND test_attention_tp_sim_integration)
+    set_tests_properties(AttentionTPSimIntegrationTest PROPERTIES TIMEOUT 30 LABELS "attention;integration;tp;simulation")
 
     # Negative misuse test: ensures missing reduction leads to detectable mismatch
     add_test(NAME AttentionShardMissingReduction_Negative
@@ -657,6 +809,11 @@ if(GTEST_FOUND)
     endif()
     add_test(NAME CosmaPrefillManagerStatsTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_cosma_prefill_manager_stats)
     set_tests_properties(CosmaPrefillManagerStatsTest PROPERTIES TIMEOUT 60)
+
+    # TP output projection executor (simulation) test
+    add_executable(test_tp_output_projection_executor tests/test_tp_output_projection_executor.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
+    target_link_libraries(test_tp_output_projection_executor llaminar_core)
+    add_test(NAME TPOutputProjectionExecutorTest COMMAND ${CMAKE_BINARY_DIR}/tests/test_tp_output_projection_executor)
 
     add_executable(test_cosma_prefill_manager_stats_dump tests/test_cosma_prefill_manager_stats_dump.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_manager_stats_dump llaminar_core)
@@ -923,6 +1080,41 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     foreach(target ${TEST_TARGETS})
         if(TARGET ${target})
             target_compile_definitions(${target} PRIVATE DEBUG)
+        endif()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# Global Test Environment Injection (Threading & Topology Defaults)
+#
+# We want ctest-driven executions to inherit the same canonical threading
+# defaults that the run_llaminar.sh launcher provides, without requiring
+# contributors to manually export environment variables. This block appends
+# (does not overwrite) two environment variables to every registered test:
+#   LLAMINAR_OMP_USE_PHYSICAL=1   -> prefer physical core count for OpenMP
+#   LLAMINAR_BIND_PER_SOCKET=1    -> engage per-socket binding heuristics
+#
+# If a test already defines ENVIRONMENT, we extend it unless the variables
+# are already present (idempotent across re-configures). A user can still
+# override behavior at runtime with LLAMINAR_OMP_FORCE which the code checks
+# with higher precedence.
+# ---------------------------------------------------------------------------
+get_property(_ALL_LLAMINAR_TESTS DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY TESTS)
+if(_ALL_LLAMINAR_TESTS)
+    foreach(_t IN LISTS _ALL_LLAMINAR_TESTS)
+        get_test_property(${_t} ENVIRONMENT _CURRENT_ENV)
+        if(_CURRENT_ENV)
+            string(FIND "${_CURRENT_ENV}" "LLAMINAR_OMP_USE_PHYSICAL" _have_phys)
+            if(_have_phys EQUAL -1)
+                set(_CURRENT_ENV "${_CURRENT_ENV};LLAMINAR_OMP_USE_PHYSICAL=1")
+            endif()
+            string(FIND "${_CURRENT_ENV}" "LLAMINAR_BIND_PER_SOCKET" _have_bind)
+            if(_have_bind EQUAL -1)
+                set(_CURRENT_ENV "${_CURRENT_ENV};LLAMINAR_BIND_PER_SOCKET=1")
+            endif()
+            set_tests_properties(${_t} PROPERTIES ENVIRONMENT "${_CURRENT_ENV}")
+        else()
+            set_tests_properties(${_t} PROPERTIES ENVIRONMENT "LLAMINAR_OMP_USE_PHYSICAL=1;LLAMINAR_BIND_PER_SOCKET=1")
         endif()
     endforeach()
 endif()

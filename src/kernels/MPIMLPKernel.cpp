@@ -3,8 +3,10 @@
 #include "../backends/prefill_backend.h"
 #include "../backends/inference_backend.h"
 #include "../logger.h"
+#include "../tensors/tp_generic_matmul_executor.h" // Added for TPGemmExecutor / TPGemmExecConfig
 #include <algorithm>
 #include <cmath>
+#include "../utils/perf_counters.h"
 
 namespace llaminar
 {
@@ -27,11 +29,13 @@ namespace llaminar
         auto input = inputs[0];
         auto w_gate = inputs[1];
         auto w_up = inputs[2];
-        auto w_down = inputs[3];
+    auto w_down = inputs[3];
         auto output = outputs[0];
 
-        size_t seq_len = input->shape()[0];
-        size_t d_model = input->shape()[1];
+    size_t seq_len = input->shape()[0];
+    size_t d_model = input->shape()[1];
+    // Capture full (unpartitioned) feed-forward dimension before any TP slicing
+    size_t global_d_ff_full = w_gate->shape()[1];
 
         // Detect sharding of feed-forward dimension (column sharding of gate/up)
         bool ff_sharded = false;
@@ -52,9 +56,9 @@ namespace llaminar
                                                       << ", d_model=" << d_model << ", local_d_ff=" << local_d_ff);
 
         // Create temporary buffers for intermediate results
-        auto gate_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
-        auto up_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
-        auto activated = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
+    auto gate_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
+    auto up_proj = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
+    auto activated = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(local_d_ff)});
         // Down projection always produces the full d_model columns locally (partial over rows of w_down if row sharded)
         auto local_output = TensorFactory::create_simple({static_cast<int>(seq_len), static_cast<int>(d_model)});
 
@@ -106,17 +110,83 @@ namespace llaminar
             }
         };
 
-        // Step 1: Gate projection
-        run_matmul("gate", input, w_gate, gate_proj, seq_len, local_d_ff, d_model);
+        const auto &env = debugEnv();
+        bool tp_mlp_enabled = env.mlp_tp.enable && env.mlp_tp.partitions > 1;
+        int tp_parts = env.mlp_tp.partitions;
+        // Gate/up TP only applies if weights are not already feature sharded externally
+        // (If already sharded, we treat current local slice as authoritative.)
+        bool weight_already_sharded = ff_sharded; // reuse earlier detection
+        if (tp_mlp_enabled && weight_already_sharded)
+        {
+            if (getRank() == 0)
+                LOG_INFO("[MLP_TP] Requested TP but weights already sharded; skipping TP executor");
+            tp_mlp_enabled = false;
+        }
 
-        // Step 2: Up projection
-        run_matmul("up", input, w_up, up_proj, seq_len, local_d_ff, d_model);
+        // Track TP slice offset (within d_ff) when partitioning columns of gate/up
+        size_t tp_ff_offset = 0;
+        if (tp_mlp_enabled)
+        {
+            if (getRank() == 0)
+            {
+                LOG_INFO("MLP_TP_ENABLED partitions=" << tp_parts
+                                                       << " d_model=" << d_model
+                                                       << " global_d_ff(local)=" << local_d_ff);
+            }
+            // Use generic TP GEMM executor abstraction (column split for gate & up)
+            size_t global_ff = global_d_ff_full; // full dimension prior to slicing
+            // Partition N dimension (D_ff)
+            // We'll run each local partition sequentially on this rank? No: simple simulation maps rank->tp_rank by modulo.
+            int tp_rank = getRank() % tp_parts;
+            using ExecCfg = TPGemmExecConfig;
+            using Mode = TPGemmExecConfig::Mode;
+            auto matmul_local = [&](const float *A, const float *B, float *C, std::size_t M, std::size_t N, std::size_t K) -> bool
+            { return adaptive_matmul(A, B, C, (int)M, (int)N, (int)K, is_prefill_like); };
+            ExecCfg cfg_gate{Mode::Column, tp_parts, tp_rank};
+            TPGemmExecutor gate_exec(matmul_local, cfg_gate, seq_len, global_ff, d_model);
+            ExecCfg cfg_up{Mode::Column, tp_parts, tp_rank};
+            TPGemmExecutor up_exec(matmul_local, cfg_up, seq_len, global_ff, d_model);
+            auto gate_part = gate_exec.run(input->data(), w_gate->data());
+            auto up_part = up_exec.run(input->data(), w_up->data());
+            // Resize gate_proj/up_proj to local dims and copy results
+            if (gate_part.N_local != up_part.N_local)
+                throw std::runtime_error("MLP_TP gate/up local dims mismatch");
+            local_d_ff = gate_part.N_local; // effective local slice width
+            tp_ff_offset = gate_part.partB.local_offset; // record slice offset for down projection slice
+            // Reallocate intermediates sized to local slice
+            gate_proj = TensorFactory::create_simple({(int)seq_len, (int)local_d_ff});
+            up_proj = TensorFactory::create_simple({(int)seq_len, (int)local_d_ff});
+            std::memcpy(gate_proj->data(), gate_part.buffer.data(), sizeof(float) * seq_len * local_d_ff);
+            std::memcpy(up_proj->data(), up_part.buffer.data(), sizeof(float) * seq_len * local_d_ff);
+            // Adjust activated buffer shape
+            activated = TensorFactory::create_simple({(int)seq_len, (int)local_d_ff});
+        }
+        else
+        {
+            // Step 1: Gate projection
+            run_matmul("gate", input, w_gate, gate_proj, seq_len, local_d_ff, d_model);
+            // Step 2: Up projection
+            run_matmul("up", input, w_up, up_proj, seq_len, local_d_ff, d_model);
+        }
 
         // Step 3: Apply SwiGLU activation locally (no MPI communication)
         applySwiGLU(gate_proj, up_proj, activated, seq_len, local_d_ff);
 
         // Step 4: Down projection
-        run_matmul("down", activated, w_down, local_output, seq_len, d_model, local_d_ff);
+        if (tp_mlp_enabled)
+        {
+            // Down projection over this partition slice only: use corresponding rows of w_down
+            const float *w_down_slice = w_down->data() + tp_ff_offset * d_model;
+            if (!adaptive_matmul(activated->data(), w_down_slice, local_output->data(), (int)seq_len, (int)d_model, (int)local_d_ff, is_prefill_like))
+            {
+                LOG_ERROR("MLP down matmul (TP slice) failed seq_len=" << seq_len << " d_model=" << d_model << " local_d_ff=" << local_d_ff);
+                throw std::runtime_error("MLP TP down matmul failure");
+            }
+        }
+        else
+        {
+            run_matmul("down", activated, w_down, local_output, seq_len, d_model, local_d_ff);
+        }
 
         // Step 5: Gather final output using MPI_Allreduce (only if this rank produced partial result)
         // Heuristic: if down weight is row-sharded (its first dimension < global d_ff) we need Allreduce.
@@ -134,6 +204,9 @@ namespace llaminar
                 need_allreduce = true; // replicated path; still Allreduce acts as identity but cheap for small sizes
             }
         }
+        // If TP MLP enabled we always need reduction across partitions even if original weights replicated
+        if (tp_mlp_enabled)
+            need_allreduce = true;
         if (need_allreduce)
         {
             gatherFinalOutput(local_output, output, seq_len, d_model);
@@ -142,6 +215,50 @@ namespace llaminar
         {
             // Direct copy (should not happen with current strategies but keeps logic explicit)
             std::memcpy(output->data(), local_output->data(), sizeof(float) * seq_len * d_model);
+        }
+
+        // Optional local parity validation (small tensors only) when tp enabled
+        if (tp_mlp_enabled && env.mlp_tp.validate && getRank() == 0)
+        {
+            // Reference uses full (global) feed-forward dimension
+            size_t elems = seq_len * d_model * global_d_ff_full;
+            if (elems <= 8ull * 1024ull * 1024ull) // guard very large shapes
+            {
+                // Recompute reference full path (serial) using adaptive matmul without partitioning
+                std::vector<float> ref_gate(seq_len * global_d_ff_full);
+                std::vector<float> ref_up(seq_len * global_d_ff_full);
+                std::vector<float> ref_act(seq_len * global_d_ff_full);
+                if (!adaptive_matmul(input->data(), w_gate->data(), ref_gate.data(), (int)seq_len, (int)global_d_ff_full, (int)d_model, is_prefill_like))
+                    LOG_WARN("MLP_TP parity: reference gate matmul failed");
+                if (!adaptive_matmul(input->data(), w_up->data(), ref_up.data(), (int)seq_len, (int)global_d_ff_full, (int)d_model, is_prefill_like))
+                    LOG_WARN("MLP_TP parity: reference up matmul failed");
+                // silu * up over full dimension
+                for (size_t i = 0; i < seq_len * global_d_ff_full; ++i)
+                {
+                    float g = ref_gate[i];
+                    ref_act[i] = (g / (1.0f + std::exp(-g))) * ref_up[i];
+                }
+                std::vector<float> ref_out(seq_len * d_model);
+                if (!adaptive_matmul(ref_act.data(), w_down->data(), ref_out.data(), (int)seq_len, (int)d_model, (int)global_d_ff_full, is_prefill_like))
+                    LOG_WARN("MLP_TP parity: reference down matmul failed");
+                // Compare with output->data()
+                double diff_sq = 0.0, ref_sq = 0.0, max_abs = 0.0;
+                size_t worst = 0; size_t total = seq_len * d_model;
+                const float *cur = output->data();
+                for (size_t i = 0; i < total; ++i)
+                {
+                    double d = (double)cur[i] - (double)ref_out[i];
+                    double ad = std::fabs(d);
+                    if (ad > max_abs) { max_abs = ad; worst = i; }
+                    diff_sq += d * d; ref_sq += (double)ref_out[i] * (double)ref_out[i];
+                }
+                double rel_l2 = ref_sq > 0.0 ? std::sqrt(diff_sq) / std::sqrt(ref_sq) : 0.0;
+                LOG_INFO("MLP_TP_PARITY rel_l2=" << rel_l2 << " max_abs=" << max_abs << " worst_index=" << worst);
+            }
+            else if (getRank() == 0)
+            {
+                LOG_INFO("MLP_TP_PARITY skip large_tensor elems=" << elems);
+            }
         }
 
         return true;
@@ -326,7 +443,7 @@ namespace llaminar
                                          size_t seq_len, size_t d_model)
     {
         // Sum contributions from all ranks using MPI_Allreduce
-        checkMPIError(MPI_Allreduce(local_output->data(), global_output->data(),
+        checkMPIError(PerfAllreduce(local_output->data(), global_output->data(),
                                     static_cast<int>(seq_len * d_model), MPI_FLOAT, MPI_SUM, getComm()),
                       "MPI_Allreduce in gatherFinalOutput");
 

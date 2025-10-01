@@ -136,6 +136,7 @@ namespace llaminar
         bool force_unit_gamma = false; // LLAMINAR_RMSNORM_FORCE_UNIT_GAMMA
         bool gamma_checksum = false;   // LLAMINAR_RMSNORM_GAMMA_CHECKSUM (kernel)
         std::string trace_rows_spec;   // LLAMINAR_RMSNORM_TRACE_ROWS
+        bool verbose = false;          // LLAMINAR_RMSNORM_VERBOSE (extra row-sum and stats logging)
     };
 
     struct SwiGLUEnv
@@ -253,6 +254,30 @@ namespace llaminar
         double eps_override = 0.0;
     };
 
+    // General TP policy (separate from simulation executor flags)
+    struct TPPolicyEnv
+    {
+        int force_blas_threads = 0;     // LLAMINAR_TP_FORCE_BLAS_THREADS (>0 overrides per partition threads)
+        int max_blas_threads = 0;       // LLAMINAR_TP_MAX_BLAS_THREADS (cap)
+        int seq_len_hint = 0;           // LLAMINAR_SEQ_LEN_HINT (guides small decode heuristics)
+        bool outer_parallel = false;    // LLAMINAR_TP_OUTER_PARALLEL (request outer parallel loop)
+        bool disable_outer_par = false; // LLAMINAR_TP_DISABLE_OUTER_PAR (force disable outer loop)
+    };
+
+    struct LoggerEnv
+    {
+        size_t buffer_lines_override = 0; // LLAMINAR_LOG_BUFFER_LINES (>0 => override ring size)
+    };
+
+    struct MLPTPEnv
+    {
+        bool enable = false;      // LLAMINAR_TP_MLP_ENABLE
+        int partitions = 1;       // LLAMINAR_TP_MLP_SIZE
+        bool validate = false;    // LLAMINAR_TP_MLP_VALIDATE (run parity check for small shapes)
+        bool force_column = false;// LLAMINAR_TP_MLP_FORCE_COLUMN (override auto)
+        bool force_row = false;   // LLAMINAR_TP_MLP_FORCE_ROW
+    };
+
     // Embedding warnings
     struct EmbeddingWarnEnv
     {
@@ -280,6 +305,74 @@ namespace llaminar
         int param_threshold_billions = 32;    // LLAMINAR_SHARDING_PARAM_THRESHOLD (billions)
         double model_mem_fraction_max = 0.55; // LLAMINAR_MODEL_MEM_FRACTION_MAX
     };
+
+    struct PerformanceEnv
+    {
+        bool enable = false;          // LLAMINAR_PERF_ENABLE
+        bool log_each_matmul = false; // LLAMINAR_PERF_LOG_EACH_MATMUL
+        int log_rank = 0;             // LLAMINAR_PERF_LOG_RANK (only rank prints per-op)
+    };
+
+    // ---------------------------------------------------------------------
+    // Phase 0 Weight Slicing Infrastructure
+    // ---------------------------------------------------------------------
+    // Lightweight role registry for model weight matrices. This will evolve
+    // as slicing phases add coverage (initial attention Q/K/V + MLP W1/W2/W3).
+    // Keeping the enum here avoids scattering role string heuristics across
+    // loader and slicing policy code. Future additions (e.g., RMSNormGamma,
+    // RopeFreq, ClassifierHead) can extend this safely – only append new
+    // values to preserve stable underlying integers if any serialization
+    // later appears.
+    enum class WeightRole : uint8_t
+    {
+        Unknown = 0,
+        W_Q,      // Attention query projection
+        W_K,      // Attention key projection
+        W_V,      // Attention value projection
+        W_O,      // Attention output projection
+        W1,       // FFN first (gate) / up projection (model specific naming)
+        W2,       // FFN down / output projection
+        W3,       // FFN secondary (SwiGLU) projection (if present)
+        Embedding // Token embedding matrix
+    };
+
+    // Convert role enum to canonical short string (stable identifiers).
+    const char *weightRoleToString(WeightRole r);
+    // Parse a (lower-cased) string into a WeightRole. Accepts a small set of
+    // common aliases so that loader naming differences do not derail early
+    // experimentation. Unrecognized => WeightRole::Unknown.
+    WeightRole weightRoleFromString(const std::string &name);
+
+    struct WeightSlicingEnv
+    {
+        bool disable = false;  // LLAMINAR_DISABLE_WEIGHT_SHARDING : hard off switch
+        bool force = false;    // LLAMINAR_FORCE_WEIGHT_SHARDING   : force enable even if heuristics say no
+        bool validate = false; // LLAMINAR_WEIGHT_SLICE_VALIDATE   : run post-slice parity checks
+        int min_cols = 0;      // LLAMINAR_WEIGHT_SLICE_MIN_COLS   : skip slicing if global cols < this
+        // Reserved / future:
+        // bool verbose = false;  // Potential future detailed logging toggle
+    };
+
+    // Lightweight global counters & per-weight stats for slicing (Phase 1 observability)
+    struct WeightSlicingCounters
+    {
+        uint64_t captured = 0;       // weights captured for parity
+        uint64_t sliced = 0;         // weights actually sliced
+        uint64_t validated_ok = 0;   // validations passed
+        uint64_t validated_fail = 0; // validations failed
+        struct PerWeightStat
+        {
+            std::string name;
+            WeightRole role;
+            int rows;
+            int cols_global;
+            int cols_local;
+        };
+        std::vector<PerWeightStat> per_weight; // only rank 0 required for summary; still filled for simplicity
+    };
+
+    // Accessor for mutable counters (not thread-safe; model load is single-threaded today)
+    WeightSlicingCounters &weightSlicingCounters();
 
     struct DebugEnvSnapshot
     {
@@ -310,14 +403,63 @@ namespace llaminar
         TestHarnessEnv test_harness;
         LoggingEnv logging;
         DistributionEnvConfig distribution; // new group for high-level mode selection
+        PerformanceEnv performance;         // performance instrumentation controls
+        WeightSlicingEnv weight_slicing;    // phase 0: foundational weight slicing flags
+        TPPolicyEnv tp_policy;              // tensor parallel policy settings
+        LoggerEnv logger;                   // logger ring buffer sizing
+    MLPTPEnv mlp_tp;                    // MLP tensor parallel execution controls
+        struct ThreadingEnv
+        {                                 // Global OpenMP / threading policy
+            bool use_physical = false;    // LLAMINAR_OMP_USE_PHYSICAL (if set => restrict to physical cores per rank)
+            int force_threads = 0;        // LLAMINAR_OMP_FORCE (if >0 overrides everything)
+            bool configured = false;      // internal: whether we already applied global policy
+            bool bind_per_socket = false; // LLAMINAR_BIND_PER_SOCKET (if set => bind each rank to one socket's primary cores)
+        } threading;
+        struct TPSimEnv
+        {                        // Tensor Parallel simulation for local W/O executor
+            bool enable = false; // LLAMINAR_TP_WO_SIM_ENABLE (gates simulation mode)
+            int partitions = 0;  // LLAMINAR_TP_WO_SIM_PARTITIONS (>0 => shard count)
+            enum class Mode
+            {
+                Auto = 0,
+                Row,
+                Col
+            } mode = Mode::Auto; // LLAMINAR_TP_WO_SIM_MODE=row|col|auto
+        } tp_sim;
     };
 
     // Accessor (lazy init, thread-safe via magic statics)
     const DebugEnvSnapshot &debugEnv();
 
-    // Produce human-readable summary lines describing enabled / configured flags.
-    // Intended for rank 0 startup logging. Each string is a full line (already
-    // prefixed with [DebugEnv]). Caller is responsible for choosing log level.
-    std::vector<std::string> formatDebugEnvSummary(const DebugEnvSnapshot &snap);
+    /**
+     * @brief Refresh the cached debug environment snapshot.
+     *
+     * The project guidelines mandate avoiding repeated getenv calls in hot paths
+     * by capturing a single immutable snapshot on first access. Certain tests
+     * (e.g. weight slicing parity) need to mutate environment variables at
+     * runtime before constructing model loader state. In CI these tests export
+     * variables at process start, but when invoked programmatically via GTest
+     * with setenv() calls, the snapshot may already have been materialized by
+     * an earlier indirect debugEnv() access (e.g. through another component's
+     * static initialization).
+     *
+     * This function re-parses the environment and replaces the cached snapshot.
+     * It should ONLY be used in test code and never inside performance critical
+     * inference loops.
+     */
+    void debugEnvRefresh();
+
+    // Configure a global OpenMP thread policy based on the debug environment and
+    // detected topology. Safe to call multiple times; only first successful
+    // application per process has effect (idempotent via snapshot.threading.configured).
+    // Heuristic:
+    // 1. If LLAMINAR_OMP_FORCE>0 => omp_set_num_threads(force)
+    // 2. Else if LLAMINAR_OMP_USE_PHYSICAL set => derive physical cores per MPI rank.
+    //    a) Detect topology (hyperthreading disabled for core count) and compute
+    //       per-rank = physical_cores / mpi_size (>=1).
+    //    b) Clamp to at least 1.
+    // 3. Else do nothing (respect external OMP_NUM_THREADS or runtime defaults).
+    // Logs a single INFO line on rank 0 summarizing decision.
+    void configureGlobalOpenMPThreads();
 
 } // namespace llaminar

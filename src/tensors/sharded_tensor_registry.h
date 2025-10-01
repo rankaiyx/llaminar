@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <algorithm>
 #include <unordered_map>
 #include <sstream>
@@ -30,22 +31,23 @@ namespace llaminar
 
         void register_tensor(const std::shared_ptr<ShardedSimpleTensor> &t)
         {
-            std::lock_guard<std::mutex> lock(m_);
+            // Exclusive writer lock
+            std::unique_lock<std::shared_mutex> lock(m_);
             records_.push_back({t});
             last_ = t;
-            prune_locked();
+            prune_locked(); // prune under exclusive lock
         }
         void prune()
         {
-            std::lock_guard<std::mutex> lock(m_);
+            std::unique_lock<std::shared_mutex> lock(m_);
             prune_locked();
         }
 
         template <typename Fn>
         void for_each(Fn fn)
         {
-            std::lock_guard<std::mutex> lock(m_);
-            prune_locked();
+            // Shared reader lock: skip pruning to avoid write contention, expired entries ignored.
+            std::shared_lock<std::shared_mutex> lock(m_);
             for (auto &rec : records_)
             {
                 if (auto sp = rec.tensor.lock())
@@ -87,8 +89,8 @@ namespace llaminar
 
         Snapshot snapshot()
         {
-            std::lock_guard<std::mutex> lock(m_);
-            prune_locked();
+            // Shared reader lock: non-intrusive; does not mutate registry (no pruning) for concurrency.
+            std::shared_lock<std::shared_mutex> lock(m_);
             Snapshot snap;
             std::unordered_map<int, AxisMetrics> axis_map; // key = static_cast<int>(axis)
             for (auto &rec : records_)
@@ -137,12 +139,16 @@ namespace llaminar
                                           { return r.tensor.expired(); }),
                            records_.end());
         }
-        std::mutex m_;
+        mutable std::shared_mutex m_;
         std::vector<ShardedTensorRecord> records_;
         std::weak_ptr<ShardedSimpleTensor> last_;
 
     public:
-        std::shared_ptr<ShardedSimpleTensor> last() { return last_.lock(); }
+        std::shared_ptr<ShardedSimpleTensor> last()
+        {
+            std::shared_lock<std::shared_mutex> lock(m_);
+            return last_.lock();
+        }
     };
 
 } // namespace llaminar

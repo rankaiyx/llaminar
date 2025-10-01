@@ -40,16 +40,24 @@ attempted=()
 
 preflight_check() {
   local url="$1"
-  # Fast HEAD probe to avoid long curl output for known-missing variants
+  # Fast HEAD probe first (may fail on some hosts that don't support HEAD correctly for large objects)
   if curl -s -I -L "$url" | head -n1 | grep -q " 200"; then
+    [[ -n "${LLAMINAR_FETCH_VERBOSE:-}" ]] && echo "[fetch_test_models][preflight] HEAD 200 $url" >&2
     return 0
   fi
+  # Fallback: perform a ranged GET (first byte) which often succeeds even if HEAD blocked.
+  if curl -L -s --fail -H 'Range: bytes=0-0' -o /dev/null "$url"; then
+    [[ -n "${LLAMINAR_FETCH_VERBOSE:-}" ]] && echo "[fetch_test_models][preflight] RANGED GET OK (HEAD failed) $url" >&2
+    return 0
+  fi
+  [[ -n "${LLAMINAR_FETCH_VERBOSE:-}" ]] && echo "[fetch_test_models][preflight] UNAVAILABLE $url" >&2
   return 1
 }
 for f in "${MODELS[@]}"; do
   if [[ -s "$MODEL_DIR/$f" ]]; then
     echo "[fetch_test_models] Found existing $f (skip)"
     have_any=1
+    skipped_existing+=("$f")
     continue
   fi
   if [[ -n "${LLAMINAR_SKIP_MODEL_DOWNLOAD:-}" ]]; then
@@ -76,6 +84,44 @@ for f in "${MODELS[@]}"; do
     missing+=("$f")
   fi
 done
+
+# Optional large FP32 model(s) (full precision) – gated to avoid CI timeouts / large bandwidth by default.
+if [[ -n "${LLAMINAR_FETCH_FP32:-}" ]]; then
+  echo "[fetch_test_models] LLAMINAR_FETCH_FP32 set – attempting full precision model fetch" >&2
+  FP32_URLS=(
+    "https://huggingface.co/Geraldine/Gemini-Distill-Qwen2.5-0.5B-ead-GGUF/resolve/main/Gemini-Distill-Qwen2.5-0.5B-ead-fp32.gguf"
+  )
+  for url in "${FP32_URLS[@]}"; do
+    fname=$(basename "$url")
+    if [[ -s "$MODEL_DIR/$fname" ]]; then
+      echo "[fetch_test_models] Found existing fp32 $fname (skip)"
+      skipped_existing+=("$fname")
+      continue
+    fi
+    if [[ -n "${LLAMINAR_SKIP_MODEL_DOWNLOAD:-}" ]]; then
+      echo "[fetch_test_models] Skipping fp32 download for $fname due to LLAMINAR_SKIP_MODEL_DOWNLOAD"
+      continue
+    fi
+    attempted+=("$fname")
+    if ! preflight_check "$url"; then
+      echo "[fetch_test_models][WARN] FP32 preflight failed (404?) $fname" >&2
+      missing+=("$fname")
+      continue
+    fi
+    echo "[fetch_test_models] Downloading FP32 model $fname from $url" >&2
+    if curl -L --fail --retry 3 --retry-delay 3 -o "$MODEL_DIR/$fname.part" "$url" 2>&1; then
+      mv "$MODEL_DIR/$fname.part" "$MODEL_DIR/$fname"
+      size=$(du -h "$MODEL_DIR/$fname" | cut -f1)
+      echo "[fetch_test_models] Downloaded FP32 $fname ($size)" >&2
+      downloaded+=("$fname:$size")
+      have_any=1
+    else
+      echo "[fetch_test_models][ERROR] Failed to download FP32 $fname" >&2
+      rm -f "$MODEL_DIR/$fname.part"
+      missing+=("$fname")
+    fi
+  done
+fi
 
 if [[ $have_any -eq 0 ]]; then
   echo "[fetch_test_models][WARN] No models present after fetch attempts." >&2

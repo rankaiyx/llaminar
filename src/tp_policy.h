@@ -35,8 +35,14 @@ namespace llaminar
         d.partitions = std::max(1, partitions);
         // Base threads: try to infer from OMP_NUM_THREADS / partitions
         int omp_threads = 1;
-        if (const char *p = std::getenv("OMP_NUM_THREADS"))
+        // Prefer snapshot OMP thread force if configured; else consult runtime env once (outer code already set via configureGlobalOpenMPThreads)
+        const auto &snap = ::llaminar::debugEnv();
+        if (snap.threading.force_threads > 0)
         {
+            omp_threads = snap.threading.force_threads;
+        }
+        else if (const char *p = std::getenv("OMP_NUM_THREADS"))
+        { // fallback (not hot loop)
             omp_threads = std::max(1, atoi(p));
         }
         int suggested = std::max(1, omp_threads / d.partitions);
@@ -46,30 +52,16 @@ namespace llaminar
         {                                         // ~32M mults per partition
             suggested = std::min(omp_threads, 2); // modest bump
         }
-        if (const char *f = std::getenv("LLAMINAR_TP_FORCE_BLAS_THREADS"))
-        {
-            int v = atoi(f);
-            if (v > 0)
-                suggested = v;
-        }
-        if (const char *cap = std::getenv("LLAMINAR_TP_MAX_BLAS_THREADS"))
-        {
-            int c = atoi(cap);
-            if (c > 0)
-                suggested = std::min(suggested, c);
-        }
+        if (snap.tp_policy.force_blas_threads > 0)
+            suggested = snap.tp_policy.force_blas_threads;
+        if (snap.tp_policy.max_blas_threads > 0)
+            suggested = std::min(suggested, snap.tp_policy.max_blas_threads);
         // Sequence length hint: if tiny decode (<256) force 1
-        if (const char *h = std::getenv("LLAMINAR_SEQ_LEN_HINT"))
-        {
-            int hint = atoi(h);
-            if (hint > 0 && hint < 256)
-                suggested = 1;
-        }
+        if (snap.tp_policy.seq_len_hint > 0 && snap.tp_policy.seq_len_hint < 256)
+            suggested = 1;
         d.blas_threads = suggested;
-        bool want_outer = false;
-        if (std::getenv("LLAMINAR_TP_OUTER_PARALLEL"))
-            want_outer = true;
-        if (std::getenv("LLAMINAR_TP_DISABLE_OUTER_PAR"))
+        bool want_outer = snap.tp_policy.outer_parallel;
+        if (snap.tp_policy.disable_outer_par)
             want_outer = false;
 #ifdef _OPENMP
         if (want_outer && d.blas_threads == 1 && d.partitions > 1)

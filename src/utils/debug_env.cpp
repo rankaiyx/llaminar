@@ -1,4 +1,12 @@
 #include "debug_env.h"
+#include "logger.h"
+#include "topology_manager.h"
+#include <omp.h>
+#include <sched.h>
+#include <unistd.h>
+#ifdef LLAMINAR_HAVE_MPI
+#include <mpi.h>
+#endif
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -11,10 +19,70 @@ namespace llaminar
     static int to_int(const char *v, int d) { return v ? std::atoi(v) : d; }
     static long long to_ll(const char *v, long long d) { return v ? std::atoll(v) : d; }
 
+    // ---------------------------------------------------------------------
+    // Weight role helpers (Phase 0 weight slicing infra)
+    // ---------------------------------------------------------------------
+    const char *weightRoleToString(WeightRole r)
+    {
+        switch (r)
+        {
+        case WeightRole::W_Q:
+            return "w_q";
+        case WeightRole::W_K:
+            return "w_k";
+        case WeightRole::W_V:
+            return "w_v";
+        case WeightRole::W_O:
+            return "w_o";
+        case WeightRole::W1:
+            return "w1";
+        case WeightRole::W2:
+            return "w2";
+        case WeightRole::W3:
+            return "w3";
+        case WeightRole::Embedding:
+            return "embedding";
+        case WeightRole::Unknown:
+        default:
+            return "unknown";
+        }
+    }
+
+    WeightRole weightRoleFromString(const std::string &name)
+    {
+        if (name.empty())
+            return WeightRole::Unknown;
+        std::string norm = name;
+        for (char &c : norm)
+            c = (char)std::tolower(c);
+        if (norm == "w_q" || norm == "q" || norm == "query")
+            return WeightRole::W_Q;
+        if (norm == "w_k" || norm == "k" || norm == "key")
+            return WeightRole::W_K;
+        if (norm == "w_v" || norm == "v" || norm == "value")
+            return WeightRole::W_V;
+        if (norm == "w_o" || norm == "o" || norm == "out" || norm == "output")
+            return WeightRole::W_O;
+        if (norm == "w1" || norm == "ffn_w1" || norm == "gate" || norm == "up")
+            return WeightRole::W1;
+        if (norm == "w2" || norm == "ffn_w2" || norm == "down" || norm == "proj")
+            return WeightRole::W2;
+        if (norm == "w3" || norm == "ffn_w3")
+            return WeightRole::W3;
+        if (norm == "embedding" || norm == "embed" || norm == "tok_embedding")
+            return WeightRole::Embedding;
+        return WeightRole::Unknown;
+    }
+
+    // Use indirection so we can refresh in tests by replacing the pointed snapshot.
+    static DebugEnvSnapshot *g_snapshot = nullptr;
+
     const DebugEnvSnapshot &debugEnv()
     {
-        static DebugEnvSnapshot snap = []()
+        if (!g_snapshot)
         {
+            g_snapshot = new DebugEnvSnapshot([]()
+                                              {
         DebugEnvSnapshot s;
         // Sharding
         s.sharding.debug_materialize_attention = flag(std::getenv("LLAMINAR_DEBUG_MATERIALIZE_ATTENTION"));
@@ -29,6 +97,7 @@ namespace llaminar
         s.cosma.fast_path_threshold = to_int(std::getenv("LLAMINAR_COSMA_FAST_PATH_THRESHOLD"), -1);
         s.cosma.validate_tile = to_int(std::getenv("LLAMINAR_COSMA_VALIDATE_TILE"), 0);
         s.cosma.log_level = to_int(std::getenv("LLAMINAR_COSMA_LOG_LEVEL"), 2);
+        // (weight role helpers defined at namespace scope above)
         s.cosma.max_resident_mb = to_ll(std::getenv("LLAMINAR_COSMA_MAX_RESIDENT_MB"), 2048);
         s.cosma.disable = flag(std::getenv("LLAMINAR_COSMA_DISABLE"));
         s.cosma.force = flag(std::getenv("LLAMINAR_COSMA_FORCE"));
@@ -125,6 +194,7 @@ namespace llaminar
     s.rmsnorm.force_unit_gamma = flag(std::getenv("LLAMINAR_RMSNORM_FORCE_UNIT_GAMMA"));
     s.rmsnorm.gamma_checksum = flag(std::getenv("LLAMINAR_RMSNORM_GAMMA_CHECKSUM"));
     if(const char* rr = std::getenv("LLAMINAR_RMSNORM_TRACE_ROWS")){ if(*rr) s.rmsnorm.trace_rows_spec = rr; }
+    s.rmsnorm.verbose = flag(std::getenv("LLAMINAR_RMSNORM_VERBOSE"));
     // SwiGLU
     s.swiglu.validate = flag(std::getenv("LLAMINAR_SWIGLU_VALIDATE"));
     if(const char* algo = std::getenv("LLAMINAR_SWIGLU_ALGO")) s.swiglu.algo = algo;
@@ -198,6 +268,10 @@ namespace llaminar
     if(!s.ffn_shard_trace.rows_spec.empty()) s.ffn_shard_trace.rows = parse_simple_index_list(s.ffn_shard_trace.rows_spec);
     if(!s.ffn_shard_trace.cols_spec.empty()) s.ffn_shard_trace.cols = parse_simple_index_list(s.ffn_shard_trace.cols_spec);
     // Fused RMS forensics
+    // Performance instrumentation
+    s.performance.enable = flag(std::getenv("LLAMINAR_PERF_ENABLE"));
+    s.performance.log_each_matmul = flag(std::getenv("LLAMINAR_PERF_LOG_EACH_MATMUL"));
+    if(const char* pr = std::getenv("LLAMINAR_PERF_LOG_RANK")) { int v=std::atoi(pr); if(v>=0) s.performance.log_rank = v; }
     if(const char* fr = std::getenv("LLAMINAR_RMS_FORENSICS_FUSED")) if(*fr) s.rms_fused.forensics = true;
     if(const char* rr2 = std::getenv("LLAMINAR_RMS_FUSED_ROWS")) if(*rr2){ int v=std::atoi(rr2); if(v>0) s.rms_fused.rows_preview = v; }
     if(const char* cc2 = std::getenv("LLAMINAR_RMS_FUSED_COLS")) if(*cc2){ int v=std::atoi(cc2); if(v>0) s.rms_fused.cols_preview = v; }
@@ -210,14 +284,290 @@ namespace llaminar
 
     // Logging
     if(const char* lvl = std::getenv("LLAMINAR_LOG_LEVEL")) { if(*lvl){ s.logging.log_level_active=true; s.logging.log_level = lvl; } }
+    // TP policy (general)
+    if(const char* fbt = std::getenv("LLAMINAR_TP_FORCE_BLAS_THREADS")) { int v=std::atoi(fbt); if(v>0) s.tp_policy.force_blas_threads = v; }
+    if(const char* mbt = std::getenv("LLAMINAR_TP_MAX_BLAS_THREADS")) { int v=std::atoi(mbt); if(v>0) s.tp_policy.max_blas_threads = v; }
+    if(const char* slh = std::getenv("LLAMINAR_SEQ_LEN_HINT")) { int v=std::atoi(slh); if(v>0) s.tp_policy.seq_len_hint = v; }
+    if(std::getenv("LLAMINAR_TP_OUTER_PARALLEL")) s.tp_policy.outer_parallel = true;
+    if(std::getenv("LLAMINAR_TP_DISABLE_OUTER_PAR")) s.tp_policy.disable_outer_par = true;
+    // Logger buffer override
+    if(const char* lbl = std::getenv("LLAMINAR_LOG_BUFFER_LINES")) { try { long long v = std::stoll(lbl); if(v>0 && v < 2000000) s.logger.buffer_lines_override = (size_t)v; } catch(...){} }
         // Distribution Mode (two-tier policy)
         if(const char* dm = std::getenv("LLAMINAR_DISTRIBUTION_MODE")) { if(*dm) s.distribution.distribution_mode = dm; }
         s.distribution.force_replicated = flag(std::getenv("LLAMINAR_FORCE_REPLICATED"));
         s.distribution.force_sharded    = flag(std::getenv("LLAMINAR_FORCE_SHARDED"));
         if(const char* pt = std::getenv("LLAMINAR_SHARDING_PARAM_THRESHOLD")) { int v=std::atoi(pt); if(v>0) s.distribution.param_threshold_billions = v; }
         if(const char* mf = std::getenv("LLAMINAR_MODEL_MEM_FRACTION_MAX")) { try { double d=std::stod(mf); if(d>0.0 && d<0.99) s.distribution.model_mem_fraction_max = d; } catch(...){} }
-        return s; }();
-        return snap;
+        // Weight slicing (Phase 0 flags)
+        s.weight_slicing.disable = flag(std::getenv("LLAMINAR_DISABLE_WEIGHT_SHARDING"));
+        s.weight_slicing.force   = flag(std::getenv("LLAMINAR_FORCE_WEIGHT_SHARDING"));
+        s.weight_slicing.validate= flag(std::getenv("LLAMINAR_WEIGHT_SLICE_VALIDATE"));
+        if(const char* mc = std::getenv("LLAMINAR_WEIGHT_SLICE_MIN_COLS")) { int v=std::atoi(mc); if(v>0) s.weight_slicing.min_cols = v; }
+        if(s.weight_slicing.force || s.weight_slicing.validate) {
+            LOG_INFO("[DEBUG_ENV_INIT] weight_slicing disable=" << s.weight_slicing.disable
+                     << " force=" << s.weight_slicing.force
+                     << " validate=" << s.weight_slicing.validate
+                     << " min_cols=" << s.weight_slicing.min_cols);
+        }
+        // Threading (global OpenMP policy)
+    if(const char* tf = std::getenv("LLAMINAR_OMP_FORCE")) { int v = std::atoi(tf); if(v>0) s.threading.force_threads = v; }
+    if(std::getenv("LLAMINAR_OMP_USE_PHYSICAL")) s.threading.use_physical = true;
+    if(std::getenv("LLAMINAR_BIND_PER_SOCKET")) s.threading.bind_per_socket = true;
+    // TP simulation (local W/O executor experimentation)
+    if(std::getenv("LLAMINAR_TP_WO_SIM_ENABLE")) s.tp_sim.enable = true;
+    if(const char* tpp = std::getenv("LLAMINAR_TP_WO_SIM_PARTITIONS")) { int v=std::atoi(tpp); if(v>0 && v < 4096) s.tp_sim.partitions = v; }
+    if(const char* md = std::getenv("LLAMINAR_TP_WO_SIM_MODE")) {
+        std::string m(md); for(char &c: m) c = (char)std::tolower(c);
+        if(m=="row" || m=="rows") s.tp_sim.mode = DebugEnvSnapshot::TPSimEnv::Mode::Row;
+        else if(m=="col" || m=="cols" || m=="column") s.tp_sim.mode = DebugEnvSnapshot::TPSimEnv::Mode::Col;
+        else s.tp_sim.mode = DebugEnvSnapshot::TPSimEnv::Mode::Auto;
+    }
+    // MLP TP
+    if(std::getenv("LLAMINAR_TP_MLP_ENABLE")) s.mlp_tp.enable = true;
+    if(const char* ms = std::getenv("LLAMINAR_TP_MLP_SIZE")) { int v=std::atoi(ms); if(v>1 && v<4096) s.mlp_tp.partitions = v; }
+    if(std::getenv("LLAMINAR_TP_MLP_VALIDATE")) s.mlp_tp.validate = true;
+    if(std::getenv("LLAMINAR_TP_MLP_FORCE_COLUMN")) s.mlp_tp.force_column = true;
+    if(std::getenv("LLAMINAR_TP_MLP_FORCE_ROW")) s.mlp_tp.force_row = true;
+    return s; }());
+        }
+        return *g_snapshot;
+    }
+
+    void debugEnvRefresh()
+    {
+        // Rebuild snapshot; safe in tests before weight loading. Not thread-safe.
+        if (g_snapshot)
+        {
+            *g_snapshot = [&]()
+            { DebugEnvSnapshot s; 
+                // Minimal reparse: replicate logic from original construction (keep in sync!)
+                // Sharding
+                s.sharding.debug_materialize_attention = flag(std::getenv("LLAMINAR_DEBUG_MATERIALIZE_ATTENTION"));
+                s.sharding.dump_shards = flag(std::getenv("LLAMINAR_DUMP_SHARDS"));
+                s.sharding.dump_shards_n = to_int(std::getenv("LLAMINAR_DUMP_SHARDS_N"), 16);
+                if(s.sharding.dump_shards_n <= 0 || s.sharding.dump_shards_n > 8192) s.sharding.dump_shards_n = 16;
+                s.sharding.shard_parity_check = flag(std::getenv("LLAMINAR_SHARD_PARITY_CHECK"));
+                s.sharding.assert_replicated_misuse = flag(std::getenv("LLAMINAR_ASSERT_REPLICATED_MISUSE"));
+                s.sharding.shard_load_diag = flag(std::getenv("LLAMINAR_SHARD_LOAD_DIAG"));
+                // COSMA subset
+                s.cosma.prefill_threshold = to_int(std::getenv("LLAMINAR_COSMA_PREFILL_THRESHOLD"), 4096);
+                s.cosma.fast_path_threshold = to_int(std::getenv("LLAMINAR_COSMA_FAST_PATH_THRESHOLD"), -1);
+                s.cosma.validate_tile = to_int(std::getenv("LLAMINAR_COSMA_VALIDATE_TILE"), 0);
+                s.cosma.log_level = to_int(std::getenv("LLAMINAR_COSMA_LOG_LEVEL"), 2);
+                s.cosma.max_resident_mb = to_ll(std::getenv("LLAMINAR_COSMA_MAX_RESIDENT_MB"), 2048);
+                s.cosma.disable = flag(std::getenv("LLAMINAR_COSMA_DISABLE"));
+                s.cosma.force = flag(std::getenv("LLAMINAR_COSMA_FORCE"));
+                // Distribution
+                if(const char* dm = std::getenv("LLAMINAR_DISTRIBUTION_MODE")) if(*dm) s.distribution.distribution_mode = dm;
+                s.distribution.force_replicated = flag(std::getenv("LLAMINAR_FORCE_REPLICATED"));
+                s.distribution.force_sharded    = flag(std::getenv("LLAMINAR_FORCE_SHARDED"));
+                if(const char* pt = std::getenv("LLAMINAR_SHARDING_PARAM_THRESHOLD")) { int v=std::atoi(pt); if(v>0) s.distribution.param_threshold_billions = v; }
+                if(const char* mf = std::getenv("LLAMINAR_MODEL_MEM_FRACTION_MAX")) { try { double d=std::stod(mf); if(d>0.0 && d<0.99) s.distribution.model_mem_fraction_max = d; } catch(...){} }
+                // Weight slicing
+                s.weight_slicing.disable = flag(std::getenv("LLAMINAR_DISABLE_WEIGHT_SHARDING"));
+                s.weight_slicing.force   = flag(std::getenv("LLAMINAR_FORCE_WEIGHT_SHARDING"));
+                s.weight_slicing.validate= flag(std::getenv("LLAMINAR_WEIGHT_SLICE_VALIDATE"));
+                if(const char* mc = std::getenv("LLAMINAR_WEIGHT_SLICE_MIN_COLS")) { int v=std::atoi(mc); if(v>0) s.weight_slicing.min_cols = v; }
+                if(s.weight_slicing.force || s.weight_slicing.validate) {
+                    LOG_INFO("[DEBUG_ENV_REFRESH] weight_slicing disable=" << s.weight_slicing.disable
+                             << " force=" << s.weight_slicing.force
+                             << " validate=" << s.weight_slicing.validate
+                             << " min_cols=" << s.weight_slicing.min_cols);
+                }
+                // Threading (refresh)
+                if(const char* tf = std::getenv("LLAMINAR_OMP_FORCE")) { int v = std::atoi(tf); if(v>0) s.threading.force_threads = v; }
+                if(std::getenv("LLAMINAR_OMP_USE_PHYSICAL")) s.threading.use_physical = true;
+                if(std::getenv("LLAMINAR_BIND_PER_SOCKET")) s.threading.bind_per_socket = true;
+                // TP simulation (refresh subset)
+                if(std::getenv("LLAMINAR_TP_WO_SIM_ENABLE")) s.tp_sim.enable = true;
+                if(const char* tpp2 = std::getenv("LLAMINAR_TP_WO_SIM_PARTITIONS")) { int v=std::atoi(tpp2); if(v>0 && v<4096) s.tp_sim.partitions = v; }
+                if(const char* md2 = std::getenv("LLAMINAR_TP_WO_SIM_MODE")) {
+                    std::string m(md2); for(char &c: m) c = (char)std::tolower(c);
+                    if(m=="row" || m=="rows") s.tp_sim.mode = DebugEnvSnapshot::TPSimEnv::Mode::Row;
+                    else if(m=="col" || m=="cols" || m=="column") s.tp_sim.mode = DebugEnvSnapshot::TPSimEnv::Mode::Col;
+                    else s.tp_sim.mode = DebugEnvSnapshot::TPSimEnv::Mode::Auto;
+                }
+                // MLP TP refresh
+                if(std::getenv("LLAMINAR_TP_MLP_ENABLE")) s.mlp_tp.enable = true;
+                if(const char* ms2 = std::getenv("LLAMINAR_TP_MLP_SIZE")) { int v=std::atoi(ms2); if(v>1 && v<4096) s.mlp_tp.partitions = v; }
+                if(std::getenv("LLAMINAR_TP_MLP_VALIDATE")) s.mlp_tp.validate = true;
+                if(std::getenv("LLAMINAR_TP_MLP_FORCE_COLUMN")) s.mlp_tp.force_column = true;
+                if(std::getenv("LLAMINAR_TP_MLP_FORCE_ROW")) s.mlp_tp.force_row = true;
+                // TP policy refresh
+                if(const char* fbt = std::getenv("LLAMINAR_TP_FORCE_BLAS_THREADS")) { int v=std::atoi(fbt); if(v>0) s.tp_policy.force_blas_threads = v; }
+                if(const char* mbt = std::getenv("LLAMINAR_TP_MAX_BLAS_THREADS")) { int v=std::atoi(mbt); if(v>0) s.tp_policy.max_blas_threads = v; }
+                if(const char* slh = std::getenv("LLAMINAR_SEQ_LEN_HINT")) { int v=std::atoi(slh); if(v>0) s.tp_policy.seq_len_hint = v; }
+                if(std::getenv("LLAMINAR_TP_OUTER_PARALLEL")) s.tp_policy.outer_parallel = true;
+                if(std::getenv("LLAMINAR_TP_DISABLE_OUTER_PAR")) s.tp_policy.disable_outer_par = true;
+                // Logger buffer override
+                if(const char* lbl = std::getenv("LLAMINAR_LOG_BUFFER_LINES")) { try { long long v = std::stoll(lbl); if(v>0 && v < 2000000) s.logger.buffer_lines_override = (size_t)v; } catch(...){} }
+                // Logging level
+                if(const char* lvl = std::getenv("LLAMINAR_LOG_LEVEL")) { if(*lvl){ s.logging.log_level_active=true; s.logging.log_level = lvl; } }
+                return s; }();
+        }
+        else
+        {
+            // If not yet built, just access debugEnv() which will build with current env.
+            (void)debugEnv();
+        }
+    }
+
+    void configureGlobalOpenMPThreads()
+    {
+        auto &snap = const_cast<DebugEnvSnapshot &>(debugEnv());
+        if (snap.threading.configured)
+            return; // idempotent
+
+        int rank = 0, size = 1;
+#ifdef LLAMINAR_HAVE_MPI
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &size);
+#endif
+        int chosen = 0;
+        std::string reason;
+        if (snap.threading.force_threads > 0)
+        {
+            chosen = snap.threading.force_threads;
+            reason = "force";
+        }
+        else if (snap.threading.use_physical)
+        {
+            try
+            {
+                // Lightweight topology query (hyperthreading disabled for baseline core count)
+                TopologyManager tm; // include header
+                auto cpuTopo = tm.detectCPUTopology(false);
+                int per_rank = 0;
+                if (snap.threading.bind_per_socket)
+                {
+                    if (cpuTopo.sockets >= size)
+                    {
+                        // Intent: one rank per socket; each rank gets that socket's physical cores
+                        // Map rank -> socket by simple ordering
+                        per_rank = cpuTopo.cores_per_socket;
+                        reason = "physical_socket";
+                    }
+                    else
+                    {
+                        if (rank == 0)
+                        {
+                            LOG_WARN("[THREAD_CONFIG] bind_per_socket requested but sockets=" << cpuTopo.sockets << " < mpi_size=" << size << "; falling back to shared physical division");
+                        }
+                        per_rank = cpuTopo.physical_cores > 0 ? cpuTopo.physical_cores / std::max(1, size) : 0;
+                    }
+                }
+                else
+                {
+                    per_rank = cpuTopo.physical_cores > 0 ? cpuTopo.physical_cores / std::max(1, size) : 0;
+                }
+                if (per_rank <= 0)
+                    per_rank = 1;
+                chosen = per_rank;
+                if (reason.empty())
+                    reason = "physical";
+            }
+            catch (...)
+            {
+                // Fallback: leave default
+                chosen = 0;
+                reason = "error";
+            }
+        }
+        if (chosen > 0)
+        {
+            omp_set_num_threads(chosen);
+            if (rank == 0)
+            {
+                LOG_INFO("[THREAD_CONFIG] global OpenMP threads=" << chosen << " reason=" << reason << (snap.threading.bind_per_socket ? " bind_per_socket=on" : ""));
+            }
+            // If binding per socket requested, attempt to export placement hints (best-effort)
+            if (snap.threading.bind_per_socket)
+            {
+                // Set OMP env hints for downstream library phases (cannot unset existing)
+                if (std::getenv("OMP_PLACES") == nullptr)
+                    setenv("OMP_PLACES", "sockets", 1);
+                if (std::getenv("OMP_PROC_BIND") == nullptr)
+                    setenv("OMP_PROC_BIND", "close", 1);
+                // Emit per-rank socket assignment + primary cores list (best-effort)
+                if (reason == "physical_socket")
+                {
+                    try
+                    {
+                        TopologyManager tm_socket;
+                        auto topo_socket = tm_socket.detectCPUTopology(false);
+                        int socket_id = rank;
+                        if (topo_socket.sockets > 0 && socket_id >= topo_socket.sockets)
+                            socket_id = socket_id % topo_socket.sockets;
+                        auto it = topo_socket.socket_to_primary_cpus.find(socket_id);
+                        std::vector<int> primaries;
+                        if (it != topo_socket.socket_to_primary_cpus.end())
+                            primaries = it->second;
+                        size_t limit = std::min<size_t>(32, primaries.size());
+                        std::ostringstream oss;
+                        oss << "[THREAD_CONFIG] rank=" << rank << " socket_id=" << socket_id << " primary_cores=";
+                        for (size_t i = 0; i < limit; i++)
+                        {
+                            if (i)
+                                oss << ',';
+                            oss << primaries[i];
+                        }
+                        if (primaries.size() > limit)
+                            oss << ",... (total=" << primaries.size() << ")";
+                        else
+                            oss << " (total=" << primaries.size() << ")";
+                        LOG_INFO(oss.str());
+                    }
+                    catch (...)
+                    {
+                        if (rank == 0)
+                            LOG_WARN("[THREAD_CONFIG] failed to enumerate primary cores for socket logging");
+                    }
+                }
+            }
+            // Emit actual CPU affinity list for observability (rank-specific)
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            if (sched_getaffinity(0, sizeof(mask), &mask) == 0)
+            {
+                std::vector<int> cpus;
+                cpus.reserve(256);
+                int max_probe = 4096; // safety upper bound
+                for (int cpu = 0; cpu < max_probe; ++cpu)
+                {
+                    if (CPU_ISSET(cpu, &mask))
+                        cpus.push_back(cpu);
+                    if (cpu > 4 && cpus.size() > 0 && cpu > 128 && cpu > (int)cpus.back() + 256)
+                        break; // soft break condition
+                }
+                // Limit display to first 32 then ellipsis if longer
+                std::ostringstream oss;
+                oss << "[THREAD_CONFIG] rank=" << rank << " affinity_cpus=";
+                size_t limit = std::min<size_t>(32, cpus.size());
+                for (size_t i = 0; i < limit; i++)
+                {
+                    if (i)
+                        oss << ',';
+                    oss << cpus[i];
+                }
+                if (cpus.size() > limit)
+                    oss << ",... (total=" << cpus.size() << ")";
+                else
+                    oss << " (total=" << cpus.size() << ")";
+                LOG_INFO(oss.str());
+            }
+            else if (rank == 0)
+            {
+                LOG_WARN("[THREAD_CONFIG] unable to query sched_getaffinity");
+            }
+        }
+        else
+        {
+            if (rank == 0 && (snap.threading.force_threads > 0 || snap.threading.use_physical))
+            {
+                LOG_INFO("[THREAD_CONFIG] no change (reason=" << reason << ")");
+            }
+        }
+        snap.threading.configured = true;
     }
 
     std::vector<std::string> formatDebugEnvSummary(const DebugEnvSnapshot &s)
@@ -320,6 +670,15 @@ namespace llaminar
             lines.push_back(std::string("[DebugEnv] lm_head: raw_orientation=") + on(s.lm_head.raw_orientation) +
                             " cosine_diag=" + on(s.lm_head.cosine_diag));
         }
+        // Threading summary (only if any override present)
+        if (s.threading.force_threads > 0 || s.threading.use_physical || s.threading.bind_per_socket)
+        {
+            std::ostringstream oss;
+            oss << "[DebugEnv] threading: force_threads=" << s.threading.force_threads
+                << " use_physical=" << on(s.threading.use_physical)
+                << " bind_per_socket=" << on(s.threading.bind_per_socket);
+            lines.push_back(oss.str());
+        }
         if (s.cosma_capture.capture_last_gemm || s.cosma_capture.dump_stats || s.cosma_capture.dump_gemm_snapshots)
         {
             std::ostringstream oss;
@@ -376,7 +735,44 @@ namespace llaminar
         {
             lines.push_back(std::string("[DebugEnv] logging: level=") + s.logging.log_level);
         }
+        if (s.weight_slicing.disable || s.weight_slicing.force || s.weight_slicing.validate || s.weight_slicing.min_cols > 0)
+        {
+            std::ostringstream oss;
+            oss << "[DebugEnv] weight_slicing: disable=" << on(s.weight_slicing.disable)
+                << " force=" << on(s.weight_slicing.force)
+                << " validate=" << on(s.weight_slicing.validate)
+                << " min_cols=" << s.weight_slicing.min_cols;
+            lines.push_back(oss.str());
+        }
+        if (s.tp_sim.enable || s.tp_sim.partitions > 0)
+        {
+            auto mode_to_str = [&](DebugEnvSnapshot::TPSimEnv::Mode m)
+            {
+                switch (m)
+                {
+                case DebugEnvSnapshot::TPSimEnv::Mode::Row:
+                    return "row";
+                case DebugEnvSnapshot::TPSimEnv::Mode::Col:
+                    return "col";
+                case DebugEnvSnapshot::TPSimEnv::Mode::Auto:
+                default:
+                    return "auto";
+                }
+            };
+            std::ostringstream oss;
+            oss << "[DebugEnv] tp_sim: enable=" << on(s.tp_sim.enable)
+                << " mode=" << mode_to_str(s.tp_sim.mode)
+                << " partitions=" << s.tp_sim.partitions;
+            lines.push_back(oss.str());
+        }
         return lines;
     }
 
 } // namespace llaminar
+
+// Global counters implementation (outside namespace block above due to closing brace)
+llaminar::WeightSlicingCounters &llaminar::weightSlicingCounters()
+{
+    static WeightSlicingCounters ctrs;
+    return ctrs;
+}

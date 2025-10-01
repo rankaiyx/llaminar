@@ -1,6 +1,6 @@
 # Hybrid Head + Tensor Parallel Sharding Plan
 
-> Status: Rev 2.1 (adds backend abstraction alignment + replicated vs sharded mode integration)
+> Status: Rev 2.2 (adds Replicated alias clarification, backend phase latency metrics, Allreduce reconstruction wording, instrumentation output documentation, and legacy intra-socket TP note)
 > Scope: Introduce a two-level parallel layout: inter-socket (MPI) head sharding + intra-socket tensor parallel (TP) for dense projections (CPU today, GPU-ready). Replace legacy implicit gathers with explicit shard metadata & selectable output modes.
 
 ---
@@ -222,8 +222,10 @@ Two orthogonal axes in this phase:
 1. Head Axis (inter-socket) – each MPI rank owns a contiguous block of heads (may be uneven by +1 head for remainders).
 2. Hidden Axis (intra-socket TP) – dense matmuls split by row or column depending on kernel phase.
 
-### 3.1 Intra-Socket Tensor Parallel Abstraction (NEW)
-We introduce a lightweight, CPU-first tensor parallel specification: `TPPartitionSpec` (see `src/tensors/tp_partition.h`).
+### 3.1 Intra-Socket Tensor Parallel Abstraction (LEGACY SCAFFOLD)
+We introduced a lightweight, CPU-first tensor parallel specification: `TPPartitionSpec` (see `src/tensors/tp_partition.h`).
+
+NOTE (Rev 2.2): This was an experimental harness for validating reconstruction & uneven partition logic. Architectural TP (appendix) is inter-rank/device weight sharding. The local splitter remains only for parity tests—avoid adding production pathways that rely on it.
 
 Purpose:
 * Decouple logical model parallel decisions from kernel implementation details.
@@ -340,7 +342,12 @@ All kernels refuse to silently densify; any attempt to pass a sharded tensor whe
 Compute attention per head shard, project locally, return partial. No inter-socket comm.
 
 ### 6.2 GatherHeadsPostProjection (implemented: Allreduce)
-Local projection using row-partitioned W_O yields additive hidden contributions; reconstruction performed via `MPI_Allreduce` (SUM). If future W_O column-partition is adopted this may switch to Allgather.
+Local projection uses the *local head slice* as input and (currently) a fully replicated `W_O`. Each rank computes a partial hidden contribution from disjoint heads; partials are **additive** and combined via `MPI_Allreduce` (SUM) over `[seq_len, d_model]`.
+
+Clarifications (Rev 2.2):
+* Earlier wording "row-partitioned W_O" was misleading—`W_O` is still replicated; redundant compute will be removed once weight slicing lands.
+* This Allreduce is intentional (whitelisted in §17) and distinct from deprecated full activation reductions.
+* Post-slicing the same additive pattern persists without redundant FLOPs.
 
 ### 6.3 GatherHeadsPreProjection (implemented)
 `MPI_Allgatherv` of per-rank head contexts into full heads-major buffer, reorder to standard layout, then single global projection. Sets metadata: concatenated=true, replicated=true.
@@ -355,8 +362,8 @@ Now implemented as a semantic alias of `GatherHeadsPreProjection`:
 ### 6.5 Future (ReduceScatter Path)
 Row-sharded WO + fused ReduceScatter to produce hidden shards directly; saves gather if subsequent layers remain sharded.
 
-### 6.6 Removed Operations
-- No `MPI_Allreduce` over full activation.
+### 6.6 Removed / Restricted Operations
+- No unintended `MPI_Allreduce` over full activations (only permitted additive reconstruction in GatherHeadsPostProjection and RMSNorm scalars).
 - No staging of concatenated heads unless explicit debug flag: `LLAMINAR_DEBUG_MATERIALIZE_ATTENTION=1` triggers a safeguarded `Allgather`.
 
 ---
@@ -477,6 +484,10 @@ Benefit: Eliminates dominating term for large H, improves scaling.
 | `LLAMINAR_DUMP_SHARDS` | Logs first N scalars per shard (N=16). | Off |
 | `LLAMINAR_SHARD_PARITY_CHECK` | After each major kernel, reconstruct global (Allgather) and diff vs rank0 baseline (small configs). | Off |
 | `LLAMINAR_ASSERT_REPLICATED_MISUSE` | Abort if a kernel consumes a replicated tensor where sharded expected or vice versa. | On |
+| `LLAMINAR_WEIGHT_SLICE_VALIDATE` | After load, reconstruct each sliced weight (MPI Allgatherv) & diff vs captured baseline (rel L2 + max abs). | Off |
+| `LLAMINAR_FORCE_WEIGHT_SHARDING` | Force enable weight slicing even if heuristics would skip. | Off |
+| `LLAMINAR_DISABLE_WEIGHT_SHARDING` | Disable weight slicing regardless of thresholds (fast rollback). | Off |
+| `LLAMINAR_WEIGHT_SLICE_MIN_COLS` | Minimum global column size required to attempt slicing (skip tiny shapes). | 0 |
 
 ---
 ## 15. Failure Modes & Mitigations
@@ -495,22 +506,78 @@ Benefit: Eliminates dominating term for large H, improves scaling.
 3. (DONE) GatherHeadsPreProjection path (Allgatherv + single projection) + multi-rank parity test.
 4. (DONE) Heuristic auto-switch (seq length threshold) LocalHeads ↔ gather_pre.
 5. (DONE) Intra-socket TP abstraction (TPPartitionSpec + trivial splitter + unit tests).
-6. (PLANNED) Integrate TP executors into WO + MLP; TP parity tests (row & col).
+6. (IN PROGRESS) Integrate TP executors into WO + MLP; executor primitives & parity harness scaffolding exist; wiring + tests pending.
 7. (PLANNED) Overlap (nonblocking collectives / compute) prototypes.
 8. (PLANNED) ReduceScatter WO experimental path.
 9. (DONE) Replicated mode alias (implemented Rev 2.2) + pending minor legacy flag cleanup.
 10. (DONE) Prefill/Inference backend abstraction wiring (attention + MLP) with fallback & rank0 summary log.
 
+### 16.a Weight Slicing Roadmap (Integrated Plan)
+This sub-roadmap sequences enabling *true* weight sharding (memory + FLOP reduction) while preserving existing correctness & performance guardrails.
+
+Prerequisites (already satisfied unless noted):
+1. Shard metadata (`ShardSpec`) & factory helpers (done).
+2. Output mode variants & additive reconstruction path (done).
+3. Performance counters with backend + phase metrics (done).
+4. RMSNorm scalar Allreduce parity (done).
+5. Role registry for weights (PENDING – will standardize naming). 
+
+Phases:
+| Phase | Goal | Key Tasks | Output / Exit Criteria |
+|-------|------|-----------|------------------------|
+| 0 | Foundation hardening | Introduce weight role registry (`enum WeightRole { W_Q, W_K, W_V, W_O, W1, W2, W3, ... }`) | COMPLETE (enum + classification + capture registry) |
+| 1 | Attention & initial FFN slicing (Q,K,V + W1/W2/W3) | Physically slice by contiguous column blocks across ranks; loader emits slices; attention parity test implemented | COMPLETE (column slicing implemented & validated) |
+| 1b | W_O logical slice & redundancy removal | Physically slice W_O on input (head*head_dim) axis; switch GatherHeadsPostProjection to use only local slice before Allreduce | Measured reduction in per-rank WO matmul FLOPs; Allreduce volume unchanged |
+| 2 | MLP weight slicing | Slice W1/W3 (column) & W2 (row); add `MLPWeightSliceParityTest` | Parity tests pass; aggregate memory drop |
+| 3 | Loader integration optimization | Avoid loading full replicated weight then slicing; mmap or strided read only local shard | Peak load RSS reduced; load time regression <5% |
+| 4 | Optional ReduceScatter WO experiment | Row-shard W_O output path → direct hidden shards (env gated) | Functional parity; perf delta recorded |
+| 5 | Policy & tuning | Heuristics for when to enable slicing (model size, memory fraction, rank count) + override flags | Logging shows selection rationale lines |
+
+Heuristics (initial sketch):
+```
+if disable flag => replicated
+else if force flag => sliced
+else if est_model_bytes > 0.55 * dev_mem OR hidden_dim * head_count > head_gate_threshold => sliced
+else replicated
+```
+
+Instrumentation Additions:
+* Add per-layer weight_sliced=1/0 flag in PERF_SUMMARY extension (planned JSON export) to track adoption.
+* Track redundant FLOPs avoided once W_O slicing lands; interim counter until removed.
+
+Risks & Mitigations:
+| Risk | Mitigation |
+|------|------------|
+| Slice misalignment across ranks | Full reconstruction with rel L2 / max abs diff (future: checksum shortcut) |
+| Memory savings not realized (copy leftover) | `[WEIGHT_SLICE_SUMMARY]` logs global vs local elems & bytes saved |
+| Small-shape regression | `LLAMINAR_WEIGHT_SLICE_MIN_COLS` gate + force/disable overrides |
+| Debug complexity | Unified logging lines: `[WEIGHT_SLICE]`, `[WEIGHT_SLICE_VALIDATE]`, and final `[WEIGHT_SLICE_SUMMARY]` |
+
+Definition of "Start Weight Slicing": Phase 1 completion (first weight matrices physically resident only as slices, with passing parity + validation enabled path). 
+
+Open Tasks (tracked via todos): introduce role registry (Phase 0) and loader slicing (Phase 3).
+
 ---
 ## 17. Success Criteria & Sign-off Checklist (Updated)
+
+### Weight Slicing Logging Examples
+```
+[WEIGHT_SLICE] name=layers.0.attention.wq.weight role=W_Q rows=4096 cols_global=11008 cols_local=5504 world=2
+[WEIGHT_SLICE_VALIDATE] name=layers.0.attention.wq.weight role=W_Q rel_l2=0 max_abs=0 elems=45088768
+[WEIGHT_SLICE_SUMMARY] sliced_weights=96 captured=96 sliced=96 validated_ok=96 validated_fail=0 global_elems=123456789 local_elems=61728394 bytes_saved=247000000 pct_reduction=50.0
+```
 - [ ] All existing attention-related tests updated to shard-aware versions.
 - [ ] New shard parity test passes for {H=64, 128, 192} with p=2,3,4.
 - [ ] Micro attention test max_abs < 1e-5 multi-rank vs single-rank.
 - [ ] Memory footprint (RSS) reduced ~1/p for large H (instrumented sample case).
-- [ ] No uses of `MPI_Allreduce` over full `[seq, hidden]` remain (except RMSNorm scalars).
+- [ ] No *unintended* uses of `MPI_Allreduce` over full `[seq, hidden]`; permitted only: (a) additive reconstruction in GatherHeadsPostProjection, (b) RMSNorm scalar reductions.
 - [ ] OutputMode switching validated: local ↔ gather_post ↔ gather_pre produce identical concatenated tensor.
 - [ ] TP matmul parity: max_abs < 1e-5 vs single-rank across {row, col} split.
 - [ ] Topology printout lists each tensor with correct offset/size.
+- [ ] Weight slicing Phase 1: Q,K,V sliced parity pass & memory reduction observed.
+- [ ] Weight slicing Phase 1b: W_O redundant FLOPs eliminated (matmul input dims reduced) & additive Allreduce preserved.
+- [ ] Weight slicing Phase 2: MLP W1/W2/W3 sliced parity pass.
+- [ ] Loader slicing Phase 3: no full-size temporary for sliced weights; peak load RSS ~ replicated_size / world_size ± 10%.
 
 ---
 ## 18. Out-of-Scope / Explicit Deferrals
@@ -523,8 +590,37 @@ Benefit: Eliminates dominating term for large H, improves scaling.
 
 ---
 ## 19. Monitoring & Instrumentation Additions
-- `PerfCounters::record_shard_bytes(comm_bytes, compute_flops, seq_len)` to correlate diminishing comm cost.
+- `PerfCounters::record_shard_bytes(comm_bytes, compute_flops, seq_len)` to correlate diminishing comm cost. (Placeholder – implementation pending)
 - Diff logger: on parity failure, auto-dump per-rank shard slices + reconstruction snippet.
+
+### 19.a Instrumentation Outputs (Rev 2.2)
+Enhanced performance counters emit per-backend aggregated metrics with prefill vs decode phase segmentation and latency statistics.
+
+Sample:
+```
+PERF_SUMMARY matmuls=812 total_flops=1.23456e+12 total_time_ms=5421.37 aggregate_gflops=227.73 \
+    comm_bytes=987654321 comm_time_ms=412.55 comm_pct=7.07 comm_bw_MBps=2311.44
+BACKEND_DISTRIBUTION total_backends=2
+BACKEND name=OPENBLAS backend_id=0 count=790 flops=9.87e+11 time_ms=3210.44 pct_time=59.20 pct_flops=80.00 \
+    agg_gflops=307.50 avg_ms=4.06 min_ms=0.03 max_ms=28.44 prefill_count=120 prefill_time_ms=950.12 \
+    prefill_avg_ms=7.92 prefill_min_ms=0.90 prefill_max_ms=28.44 decode_count=670 decode_time_ms=2260.32 \
+    decode_avg_ms=3.37 decode_min_ms=0.03 decode_max_ms=14.11
+BACKEND name=COSMA backend_id=1 count=22 flops=2.47e+11 time_ms=2210.93 pct_time=40.80 pct_flops=20.00 \
+    agg_gflops=111.71 avg_ms=100.50 min_ms=82.13 max_ms=143.27 prefill_count=22 prefill_time_ms=2210.93 \
+    prefill_avg_ms=100.50 prefill_min_ms=82.13 prefill_max_ms=143.27 decode_count=0 decode_time_ms=0.00 \
+    decode_avg_ms=0.00 decode_min_ms=0.00 decode_max_ms=0.00
+```
+
+Key Fields:
+* `aggregate_gflops`: total matmul FLOPs / accumulated matmul time.
+* Backend `agg_gflops`: per-backend GFLOPS (ms aggregated over that backend only).
+* Phase metrics (`prefill_*`, `decode_*`) support COSMA threshold tuning.
+* `min_ms` / `max_ms`: latency outliers for tail analysis.
+* `comm_bw_MBps`: aggregate (all collectives) bandwidth; per-op breakdown planned.
+
+Planned Extensions:
+* Per-collective latency + bandwidth.
+* Optional JSON export (`LLAMINAR_PERF_JSON=path`).
 
 ---
 ## 20. Example Flow (Decode Step, p=4)
@@ -610,7 +706,7 @@ Recent experimental code introduced per-socket column partition logic and splitt
 - Local kernel micro-optimizations (packing, loop tiling, OpenMP)
 - True TP (multi-rank coordinated layout & communication semantics)
 
-Removing the in-process splitter reflects the decision: until we introduce multi-rank head or MLP weight distribution, we stay with a single GEMM per rank.
+Removing (or sidelining) the in-process splitter reflects the decision: until we introduce multi-rank head or MLP weight distribution, we stay with a single GEMM per rank. The splitter utilities persist solely for parity & reconstruction tests.
 
 ## Scope of Tensor Parallel in Llaminar
 | Aspect | In-Scope (TP) | Out-of-Scope (Not TP) |
@@ -680,8 +776,8 @@ Q: Can COSMA replace TP for large GEMMs?
 A: COSMA distributes a single GEMM but still assumes full operands per rank or well-defined process grids; TP is a *model-graph level* partitioning of weights/activations feeding multiple GEMMs across layers.
 
 ## Action Items (Post-Clarification)
-- [ ] Add a lightweight `TPLayout` placeholder (no behavior) to anchor future PRs.
-- [ ] Audit existing code for any residual intra-rank TP artifacts (now removed from attention kernel projection).
+- [ ] (Deferred) Introduce a `TPLayout` placeholder or extend `ShardSpec` multi-axis once real weight slicing starts.
+- [ ] Audit existing code for residual intra-rank TP artifacts (attention projection simplified).
 - [ ] Add documentation link reference in `README.md` under Architecture.
 
 ---

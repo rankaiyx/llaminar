@@ -39,6 +39,7 @@ Thumbs.db
 
 # Logs
 *.log
+*.csv
 
 # Temporary files
 *.tmp

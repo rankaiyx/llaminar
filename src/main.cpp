@@ -16,6 +16,7 @@
 #include "graph_compute.h" // contains MatMulNode definition
 #include "performance_timer.h"
 #include "utils/debug_env.h"
+#include "utils/perf_counters.h"
 #include "tensors/sharded_tensor_registry.h"
 #include "tensors/tensor_factory.h"
 #include "chat/tokenizer_interface.h"
@@ -31,6 +32,8 @@ int main(int argc, char **argv)
     int rank = 0, size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    // Initialize performance counters rank context (no-op if disabled)
+    ::llaminar::perfCounters().set_rank(rank);
     int exit_code = 0;
 
     auto finalize = [&]()
@@ -42,7 +45,7 @@ int main(int argc, char **argv)
         if (initialized && !finalized)
         {
             int global_code = exit_code;
-            MPI_Allreduce(&exit_code, &global_code, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+            PerfAllreduce(&exit_code, &global_code, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
             exit_code = global_code;
             MPI_Barrier(MPI_COMM_WORLD);
             MPI_Finalize();
@@ -112,6 +115,8 @@ int main(int argc, char **argv)
         {
             topology_manager.printSystemTopology(topology);
         }
+        // Apply global OpenMP thread policy (physical core restriction or forced count)
+        configureGlobalOpenMPThreads();
         LOG_DEBUG("System initialization complete");
 
         // 4. Determine execution mode (informational)
@@ -404,6 +409,86 @@ int main(int argc, char **argv)
         }
 
         LOG_INFO("Llaminar execution completed successfully");
+        // Performance counters summary (only if enabled and rank matches)
+        const auto &perf_env = debugEnv().performance;
+        if (perf_env.enable && rank == perf_env.log_rank)
+        {
+            auto snap = perfCounters().snapshot();
+            double agg_ms = snap.total_time_ms; // wall time sum of measured matmuls
+            double flops = static_cast<double>(snap.total_flops);
+            double gflops = (agg_ms > 0.0) ? flops / (agg_ms * 1e6) : 0.0;
+            double comm_ms = snap.total_comm_time_ms;
+            double compute_ms = agg_ms;                                                                        // currently only matmul time; future: subtract comm overlap if needed
+            double comm_bw = (comm_ms > 0.0) ? (double)snap.total_comm_bytes / (comm_ms / 1000.0) / 1e6 : 0.0; // MB/s
+            LOG_INFO("PERF_SUMMARY matmuls=" << snap.total_matmuls
+                                             << " total_flops=" << flops
+                                             << " total_time_ms=" << agg_ms
+                                             << " aggregate_gflops=" << std::fixed << std::setprecision(2) << gflops
+                                             << " comm_bytes=" << snap.total_comm_bytes
+                                             << " comm_time_ms=" << comm_ms
+                                             << " comm_pct=" << (comm_ms > 0 && (compute_ms + comm_ms) > 0 ? (comm_ms / (compute_ms + comm_ms)) * 100.0 : 0.0)
+                                             << " comm_bw_MBps=" << std::setprecision(2) << comm_bw);
+            if (snap.total_comm_bytes > 0)
+            {
+                static const char *kCommNames[] = {"Bcast", "Allreduce", "Allgather", "Allgatherv", "Reduce", "ReduceScatter", "Alltoall", "Alltoallv", "Barrier"};
+                for (size_t i = 0; i < snap.comm.size() && i < 9; ++i)
+                {
+                    const auto &cs = snap.comm[i];
+                    if (cs.calls == 0)
+                        continue;
+                    double op_bw = 0.0; // future: require per-op time to compute
+                    LOG_INFO(std::string("COMM_OP ") + kCommNames[i] + " calls=" + std::to_string(cs.calls) + " bytes=" + std::to_string(cs.bytes));
+                }
+            }
+            if (!snap.backends.empty())
+            {
+                LOG_INFO("BACKEND_DISTRIBUTION total_backends=" << snap.backends.size());
+                for (const auto &b : snap.backends)
+                {
+                    double b_gflops = (b.time_ms > 0.0) ? (double)b.flops / (b.time_ms * 1e6) : 0.0;
+                    double pct_time = (snap.total_time_ms > 0.0) ? (b.time_ms / snap.total_time_ms) * 100.0 : 0.0;
+                    double pct_flops = (snap.total_flops > 0) ? ((double)b.flops / (double)snap.total_flops) * 100.0 : 0.0;
+                    double avg_ms = (b.count > 0) ? b.time_ms / (double)b.count : 0.0;
+                    double prefill_avg = (b.prefill_count > 0) ? b.prefill_time_ms / (double)b.prefill_count : 0.0;
+                    double decode_avg = (b.decode_count > 0) ? b.decode_time_ms / (double)b.decode_count : 0.0;
+                    LOG_INFO("BACKEND name=" << PerformanceCounters::backendName(b.backend) << " backend_id=" << b.backend
+                                             << " count=" << b.count
+                                             << " flops=" << b.flops
+                                             << " time_ms=" << b.time_ms
+                                             << " pct_time=" << std::fixed << std::setprecision(2) << pct_time
+                                             << " pct_flops=" << std::fixed << std::setprecision(2) << pct_flops
+                                             << " agg_gflops=" << std::fixed << std::setprecision(2) << b_gflops
+                                             << " avg_ms=" << avg_ms
+                                             << " min_ms=" << b.min_ms
+                                             << " max_ms=" << b.max_ms
+                                             << " prefill_count=" << b.prefill_count
+                                             << " prefill_time_ms=" << b.prefill_time_ms
+                                             << " prefill_avg_ms=" << prefill_avg
+                                             << " prefill_min_ms=" << b.prefill_min_ms
+                                             << " prefill_max_ms=" << b.prefill_max_ms
+                                             << " decode_count=" << b.decode_count
+                                             << " decode_time_ms=" << b.decode_time_ms
+                                             << " decode_avg_ms=" << decode_avg
+                                             << " decode_min_ms=" << b.decode_min_ms
+                                             << " decode_max_ms=" << b.decode_max_ms);
+                }
+            }
+            if (perf_env.log_each_matmul && !snap.samples.empty())
+            {
+                LOG_INFO("PERF_SAMPLES count=" << snap.samples.size());
+                size_t limit = std::min<size_t>(snap.samples.size(), 32); // cap log volume
+                for (size_t i = 0; i < limit; ++i)
+                {
+                    const auto &s = snap.samples[i];
+                    LOG_DEBUG("MATMUL_SAMPLE i=" << i << " m=" << s.m << " n=" << s.n << " k=" << s.k
+                                                 << " ms=" << s.ms << " gflops=" << s.gflops << " backend=" << s.backend);
+                }
+                if (snap.samples.size() > limit)
+                {
+                    LOG_INFO("PERF_SAMPLES truncated remaining=" << (snap.samples.size() - limit));
+                }
+            }
+        }
     }
     catch (const std::exception &e)
     {

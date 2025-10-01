@@ -1,6 +1,7 @@
 #include "pipeline_base.h"
 #include "debug_utils.h"
 #include "performance_timer.h"
+#include "utils/perf_counters.h"
 #include <chrono>
 #include <algorithm>
 #include <iomanip>
@@ -104,7 +105,7 @@ namespace llaminar
         auto start_time = std::chrono::high_resolution_clock::now();
 
         // Use the base class sync with timeout
-        MPI_Barrier(MPI_COMM_WORLD);
+        PerfBarrier(MPI_COMM_WORLD);
 
         auto end_time = std::chrono::high_resolution_clock::now();
         double sync_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
@@ -133,7 +134,7 @@ namespace llaminar
 
             // Perform broadcast
             size_t total_elements = tensor->total_elements();
-            checkMPIError(MPI_Bcast(tensor->data(), total_elements, MPI_FLOAT, root_rank, getComm()),
+            checkMPIError(PerfBcast(tensor->data(), total_elements, MPI_FLOAT, root_rank, getComm()),
                           "Tensor broadcast");
 
             // Ensure broadcast completed on all ranks
@@ -326,8 +327,8 @@ namespace llaminar
             syncAllRanks("pre-allreduce");
 
             // Perform all-reduce
-            checkMPIError(MPI_Allreduce(local_tensor->data(), result_tensor->data(),
-                                        local_elements, MPI_FLOAT, op, getComm()),
+            checkMPIError(PerfAllreduce(local_tensor->data(), result_tensor->data(),
+                                        (int)local_elements, MPI_FLOAT, op, getComm()),
                           "Tensor all-reduce");
 
             // Copy result back to input tensor

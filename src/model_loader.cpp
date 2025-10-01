@@ -2,6 +2,7 @@
 #include "model_loader.h"
 #include "logger.h"
 #include "quant_dequant.h"
+#include "weights/weight_roles.h"
 #include "../llama.cpp/ggml/src/ggml-quants.h" // upstream dequantize_row_q*_1
 #include <cstring>
 #include <numeric>
@@ -18,6 +19,9 @@ extern "C"
 #include <cmath>
 #include <limits>
 #include <sstream>
+#ifdef LLAMINAR_HAVE_MPI
+#include <mpi.h>
+#endif
 #include "graph_compute.h"
 #include <filesystem>
 #include "tensors/simple_tensor.h"
@@ -634,11 +638,31 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
         else if (info->type == GGUFTensorType::F16)
         {
             data_f32.resize(n_elems);
-            for (size_t i = 0; i < n_elems; ++i)
+            const uint8_t *src_bytes = raw.data();
+            // Parallelize large fp16->fp32 expansion; keep small tensors serial to avoid overhead.
+            const size_t parallel_threshold = 1ull << 15; // 32K elements
+#ifdef _OPENMP
+            if (n_elems >= parallel_threshold)
             {
-                uint16_t h;
-                std::memcpy(&h, raw.data() + 2 * i, 2);
-                data_f32[i] = ggml_compute_fp16_to_fp32(h);
+#pragma omp parallel for schedule(static)
+                for (long long i = 0; i < (long long)n_elems; ++i)
+                {
+                    uint16_t h;
+                    std::memcpy(&h, src_bytes + (size_t)2 * i, 2);
+                    data_f32[i] = ggml_compute_fp16_to_fp32(h);
+                }
+            }
+            else
+#endif
+            {
+// Vectorization hint for compilers
+#pragma omp simd
+                for (size_t i = 0; i < n_elems; ++i)
+                {
+                    uint16_t h;
+                    std::memcpy(&h, src_bytes + 2 * i, 2);
+                    data_f32[i] = ggml_compute_fp16_to_fp32(h);
+                }
             }
             if (dbg)
             {
@@ -656,13 +680,237 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
             return nullptr;
         }
     }
+    // Weight role classification (Phase 0): identify role for potential future slicing
+    llaminar::WeightRole role = llaminar::WeightRole::Unknown;
+    {
+        // Avoid extra work unless validation or future slicing toggles are active
+        const auto &env_ws = llaminar::debugEnv();
+        if (env_ws.weight_slicing.force || env_ws.weight_slicing.validate)
+        {
+            role = llaminar::classifyWeightRole(tensor_name);
+            if (env_ws.weight_slicing.validate && role != llaminar::WeightRole::Unknown)
+            {
+                // Capture original tensor for later parity comparison with sliced load paths
+                llaminar::WeightParityRegistry::instance().record(tensor_name, role, data_f32);
+            }
+            // Diagnostic: report role classification for potential slicing targets
+            if (role == llaminar::WeightRole::W_Q || role == llaminar::WeightRole::W_K || role == llaminar::WeightRole::W_V ||
+                role == llaminar::WeightRole::W1 || role == llaminar::WeightRole::W2 || role == llaminar::WeightRole::W3)
+            {
+                LOG_INFO("[WEIGHT_SLICE_ROLE] name=" << tensor_name << " role=" << llaminar::weightRoleToString(role)
+                                                     << " force=" << env_ws.weight_slicing.force << " disable=" << env_ws.weight_slicing.disable
+                                                     << " validate=" << env_ws.weight_slicing.validate);
+            }
+        }
+    }
+    // Phase 1: Column slicing prototype (extended) for attention & FFN projection weights
+    // Roles covered: W_Q,W_K,W_V (attention) and W1,W2,W3 (FFN). Embedding & W_O currently skipped.
+    // Conditions:
+    //  - env.weight_slicing.force enabled and !env.weight_slicing.disable
+    //  - 2D tensor with shape [rows, cols]
+    //  - MPI initialized with size > 1
+    //  - global cols >= world size and >= min_cols (if set)
+    bool sliced_applied = false;
+    int sliced_rows = 0, sliced_cols = 0; // for post dimension adjust
+    if (role == llaminar::WeightRole::W_Q || role == llaminar::WeightRole::W_K || role == llaminar::WeightRole::W_V ||
+        role == llaminar::WeightRole::W1 || role == llaminar::WeightRole::W2 || role == llaminar::WeightRole::W3)
+    {
+        const auto &env_ws = llaminar::debugEnv();
+        if (!env_ws.weight_slicing.disable && env_ws.weight_slicing.force)
+        {
+            int mpi_flag = 0;
+#ifdef LLAMINAR_HAVE_MPI
+            MPI_Initialized(&mpi_flag);
+#endif
+            // Diagnostic: MPI initialization state for slicing
+            if (mpi_flag == 0)
+            {
+                LOG_INFO("[WEIGHT_SLICE_DIAG] name=" << tensor_name << " role=" << llaminar::weightRoleToString(role)
+                                                     << " mpi_flag=0 (MPI not initialized yet) -- skipping slicing");
+            }
+            if (mpi_flag)
+            {
+                int world = 1, rank = 0;
+#ifdef LLAMINAR_HAVE_MPI
+                MPI_Comm_size(MPI_COMM_WORLD, &world);
+                MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#endif
+                if (rank == 0)
+                {
+                    LOG_INFO("[WEIGHT_SLICE_DIAG] name=" << tensor_name << " role=" << llaminar::weightRoleToString(role)
+                                                         << " world=" << world << " entering slicing gating");
+                }
+                if (world > 1)
+                {
+                    // Ensure 2D
+                    if (info->dimensions.size() == 2)
+                    {
+                        int rows = static_cast<int>(info->dimensions[0]);
+                        int cols = static_cast<int>(info->dimensions[1]);
+                        // Temporary gating diagnostics (remove once issue resolved)
+                        if (rank == 0)
+                        {
+                            LOG_INFO("[WEIGHT_SLICE_DIAG] name=" << tensor_name
+                                                                 << " role=" << llaminar::weightRoleToString(role)
+                                                                 << " force=" << env_ws.weight_slicing.force
+                                                                 << " disable=" << env_ws.weight_slicing.disable
+                                                                 << " world=" << world
+                                                                 << " rows=" << rows << " cols=" << cols
+                                                                 << " min_cols=" << env_ws.weight_slicing.min_cols);
+                        }
+                        if (cols >= world && (env_ws.weight_slicing.min_cols == 0 || cols >= env_ws.weight_slicing.min_cols))
+                        {
+                            // Partition columns as contiguous blocks: [start,end)
+                            int start = (cols * rank) / world;
+                            int end = (cols * (rank + 1)) / world;
+                            int local_cols = end - start;
+                            if (local_cols > 0 && start < end && end <= cols)
+                            {
+                                std::vector<float> sliced;
+                                sliced.resize(static_cast<size_t>(rows) * local_cols);
+                                // Row-major copy: for each row copy the slice contiguous block
+                                for (int r = 0; r < rows; ++r)
+                                {
+                                    const float *src_row = &data_f32[static_cast<size_t>(r) * cols];
+                                    float *dst_row = &sliced[static_cast<size_t>(r) * local_cols];
+                                    std::memcpy(dst_row, src_row + start, sizeof(float) * local_cols);
+                                }
+                                data_f32.swap(sliced);
+                                sliced_applied = true;
+                                sliced_rows = rows;
+                                sliced_cols = local_cols;
+                                // Update counters & per-weight stats (only once per tensor load)
+                                auto &ctr = llaminar::weightSlicingCounters();
+                                ctr.sliced++;
+                                ctr.per_weight.push_back({tensor_name, role, rows, cols, local_cols});
+                                if (rank == 0)
+                                {
+                                    LOG_INFO("[WEIGHT_SLICE] name=" << tensor_name << " role=" << llaminar::weightRoleToString(role)
+                                                                    << " rows=" << rows << " cols_global=" << cols << " cols_local=" << local_cols
+                                                                    << " world=" << world << (env_ws.weight_slicing.min_cols ? " min_cols=" + std::to_string(env_ws.weight_slicing.min_cols) : ""));
+                                }
+                                // Parity validation (Phase 1) if enabled: reconstruct full tensor and compare.
+                                if (env_ws.weight_slicing.validate)
+                                {
+                                    llaminar::WeightParityRegistry::Entry full_entry;
+                                    if (llaminar::WeightParityRegistry::instance().get(tensor_name, full_entry))
+                                    {
+#ifdef LLAMINAR_HAVE_MPI
+                                        size_t full_elems = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+                                        // Prepare Allgatherv parameters for concatenated column blocks.
+                                        std::vector<int> recv_counts(world), displs(world);
+                                        for (int rnk = 0; rnk < world; ++rnk)
+                                        {
+                                            int s2 = (cols * rnk) / world;
+                                            int e2 = (cols * (rnk + 1)) / world;
+                                            int lc2 = e2 - s2;
+                                            recv_counts[rnk] = rows * lc2;
+                                        }
+                                        displs[0] = 0;
+                                        for (int rnk = 1; rnk < world; ++rnk)
+                                            displs[rnk] = displs[rnk - 1] + recv_counts[rnk - 1];
+                                        std::vector<float> all_concat(displs.back() + recv_counts.back());
+                                        MPI_Allgatherv(data_f32.data(), rows * local_cols, MPI_FLOAT,
+                                                       all_concat.data(), recv_counts.data(), displs.data(), MPI_FLOAT, MPI_COMM_WORLD);
+                                        // Reconstruct full matrix
+                                        std::vector<float> recon(full_elems, 0.0f);
+                                        size_t off = 0;
+                                        for (int rnk = 0; rnk < world; ++rnk)
+                                        {
+                                            int s2 = (cols * rnk) / world;
+                                            int e2 = (cols * (rnk + 1)) / world;
+                                            int lc2 = e2 - s2;
+                                            for (int rr = 0; rr < rows; ++rr)
+                                            {
+                                                const float *src = &all_concat[off + static_cast<size_t>(rr) * lc2];
+                                                float *dst = &recon[static_cast<size_t>(rr) * cols + s2];
+                                                std::memcpy(dst, src, sizeof(float) * lc2);
+                                            }
+                                            off += static_cast<size_t>(rows) * lc2;
+                                        }
+                                        // Compute metrics
+                                        double sum_sq_diff = 0.0, sum_sq_ref = 0.0, max_abs = 0.0;
+                                        // Parallelize the validation scan for larger tensors to speed up test execution.
+                                        // Threshold chosen to avoid OpenMP overhead on tiny matrices.
+                                        const size_t parallel_threshold = 32768; // ~128 KB of data at float32
+#ifdef _OPENMP
+                                        if (full_elems >= parallel_threshold)
+                                        {
+#pragma omp parallel for reduction(+ : sum_sq_diff, sum_sq_ref) reduction(max : max_abs) schedule(static)
+                                            for (long long i = 0; i < (long long)full_elems; ++i)
+                                            {
+                                                double ref = full_entry.data[i];
+                                                double got = recon[i];
+                                                double diff = got - ref;
+                                                sum_sq_diff += diff * diff;
+                                                sum_sq_ref += ref * ref;
+                                                double ad = std::fabs(diff);
+                                                if (ad > max_abs)
+                                                    max_abs = ad;
+                                            }
+                                        }
+                                        else
+#endif
+                                        {
+                                            for (size_t i = 0; i < full_elems; ++i)
+                                            {
+                                                double ref = full_entry.data[i];
+                                                double got = recon[i];
+                                                double diff = got - ref;
+                                                sum_sq_diff += diff * diff;
+                                                sum_sq_ref += ref * ref;
+                                                double ad = std::fabs(diff);
+                                                if (ad > max_abs)
+                                                    max_abs = ad;
+                                            }
+                                        }
+                                        double rel_l2 = (sum_sq_ref > 0.0) ? std::sqrt(sum_sq_diff / sum_sq_ref) : 0.0;
+                                        if (rank == 0)
+                                        {
+                                            LOG_INFO("[WEIGHT_SLICE_VALIDATE] name=" << tensor_name << " role=" << llaminar::weightRoleToString(role)
+                                                                                     << " rel_l2=" << rel_l2 << " max_abs=" << max_abs
+                                                                                     << " elems=" << full_elems);
+                                        }
+                                        if (rel_l2 <= 1e-8 && max_abs <= 1e-7)
+                                            llaminar::weightSlicingCounters().validated_ok++;
+                                        else
+                                            llaminar::weightSlicingCounters().validated_fail++;
+#endif
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Allocate simple tensor (row-major) -- placeholder until hybrid tensors integrated
     std::vector<int> dims;
     dims.reserve(info->dimensions.size());
-    for (auto d : info->dimensions)
-        dims.push_back(static_cast<int>(d));
+    for (size_t i = 0; i < info->dimensions.size(); ++i)
+    {
+        dims.push_back(static_cast<int>(info->dimensions[i]));
+    }
+    // If we sliced, adjust the last dimension to match data length
+    if (sliced_applied && info->dimensions.size() == 2)
+    {
+        size_t rows = static_cast<size_t>(info->dimensions[0]);
+        size_t inferred_cols = rows ? (data_f32.size() / rows) : 0;
+        if (rows * inferred_cols == data_f32.size())
+        {
+            dims[1] = static_cast<int>(inferred_cols);
+        }
+    }
     auto simple = std::make_shared<llaminar::SimpleTensor>(dims, data_f32);
-    LOG_INFO("Loaded tensor '" << tensor_name << "' elements=" << n_elems << " first=" << (data_f32.empty() ? 0 : data_f32[0]));
+    if (role != llaminar::WeightRole::Unknown)
+    {
+        LOG_INFO("Loaded tensor '" << tensor_name << "' role=" << llaminar::weightRoleToString(role) << " elements=" << n_elems << " first=" << (data_f32.empty() ? 0 : data_f32[0]));
+    }
+    else
+    {
+        LOG_INFO("Loaded tensor '" << tensor_name << "' elements=" << n_elems << " first=" << (data_f32.empty() ? 0 : data_f32[0]));
+    }
     return simple;
 }
 
@@ -675,6 +923,42 @@ std::vector<std::shared_ptr<llaminar::TensorBase>> ModelLoader::loadAllTensors()
     for (auto const &ti : model_.tensors)
     {
         tensors.push_back(loadTensor(ti.name));
+    }
+    // Post-load slicing summary (rank 0) if any slicing occurred
+    const auto &env_ws = llaminar::debugEnv();
+    if (env_ws.weight_slicing.force && !env_ws.weight_slicing.disable)
+    {
+        auto &ctr = llaminar::weightSlicingCounters();
+        if (!ctr.per_weight.empty())
+        {
+#ifdef LLAMINAR_HAVE_MPI
+            int rank = 0;
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#else
+            int rank = 0;
+#endif
+            if (rank == 0)
+            {
+                uint64_t global_elems_total = 0;
+                uint64_t local_elems_total = 0;
+                for (auto &pw : ctr.per_weight)
+                {
+                    global_elems_total += static_cast<uint64_t>(pw.rows) * pw.cols_global;
+                    local_elems_total += static_cast<uint64_t>(pw.rows) * pw.cols_local;
+                }
+                double bytes_saved = static_cast<double>(global_elems_total - local_elems_total) * sizeof(float);
+                double pct_reduction = global_elems_total ? (100.0 * (double)(global_elems_total - local_elems_total) / (double)global_elems_total) : 0.0;
+                LOG_INFO("[WEIGHT_SLICE_SUMMARY] sliced_weights=" << ctr.per_weight.size()
+                                                                  << " captured=" << ctr.captured
+                                                                  << " sliced=" << ctr.sliced
+                                                                  << " validated_ok=" << ctr.validated_ok
+                                                                  << " validated_fail=" << ctr.validated_fail
+                                                                  << " global_elems=" << global_elems_total
+                                                                  << " local_elems=" << local_elems_total
+                                                                  << " bytes_saved=" << (uint64_t)bytes_saved
+                                                                  << " pct_reduction=" << pct_reduction);
+            }
+        }
     }
     return tensors;
 }
@@ -1466,11 +1750,29 @@ const ModelLoader::CachedFullTensor *ModelLoader::getOrCacheFullQuantTensor(cons
         else if (info.type == GGUFTensorType::F16)
         {
             decoded.resize(n_elems);
-            for (size_t i = 0; i < n_elems; ++i)
+            const uint8_t *src_bytes = raw.data();
+            const size_t parallel_threshold = 1ull << 15; // 32K elements
+#ifdef _OPENMP
+            if (n_elems >= parallel_threshold)
             {
-                uint16_t h;
-                std::memcpy(&h, raw.data() + 2 * i, 2);
-                decoded[i] = ggml_compute_fp16_to_fp32(h);
+#pragma omp parallel for schedule(static)
+                for (long long i = 0; i < (long long)n_elems; ++i)
+                {
+                    uint16_t h;
+                    std::memcpy(&h, src_bytes + (size_t)2 * i, 2);
+                    decoded[i] = ggml_compute_fp16_to_fp32(h);
+                }
+            }
+            else
+#endif
+            {
+#pragma omp simd
+                for (size_t i = 0; i < n_elems; ++i)
+                {
+                    uint16_t h;
+                    std::memcpy(&h, src_bytes + 2 * i, 2);
+                    decoded[i] = ggml_compute_fp16_to_fp32(h);
+                }
             }
         }
         else

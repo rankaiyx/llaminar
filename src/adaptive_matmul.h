@@ -29,7 +29,8 @@
 #include <cosma/strategy.hpp>
 #include <cosma/context.hpp>
 #include "cosma_prefill_manager.h"
-#include "utils/debug_env.h" // Added for centralized debug environment access (debugEnv())
+#include "utils/debug_env.h"     // Added for centralized debug environment access (debugEnv())
+#include "utils/perf_counters.h" // performance instrumentation
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -333,6 +334,7 @@ namespace llaminar
                             bool transpose_A, bool transpose_B,
                             float alpha, float beta)
         {
+            auto t0 = std::chrono::high_resolution_clock::now();
             // New COSMA integration using C interface multiply_using_layout.
             // Strategy: simple 1D row partition of A (m x k) and C (m x n) across ranks;
             // 1D partition of B along k dimension. This lets COSMA perform internal
@@ -531,6 +533,9 @@ namespace llaminar
                 MPI_Allgatherv(c_slice_ptr, c_slice_elems, MPI_FLOAT,
                                C, recvcounts.data(), displs.data(), MPI_FLOAT,
                                MPI_COMM_WORLD);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::COSMA, true);
                 return true;
             }
             catch (const std::exception &e)
@@ -539,6 +544,9 @@ namespace llaminar
                 {
                     LOG_ERROR("COSMA layout multiply failed, falling back to OpenBLAS: " << e.what());
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::COSMA, true);
                 return multiply_openblas(A, B, C, m, n, k, transpose_A, transpose_B, alpha, beta);
             }
         }
@@ -597,6 +605,7 @@ namespace llaminar
                                bool transpose_A, bool transpose_B,
                                float alpha, float beta)
         {
+            auto t0 = std::chrono::high_resolution_clock::now();
             try
             {
                 // Adaptive threading: allow multi-thread for large standalone ops unless user overrides.
@@ -645,6 +654,9 @@ namespace llaminar
                             alpha, A, lda,
                             B, ldb,
                             beta, C, ldc);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::OPENBLAS, false);
                 return true;
             }
             catch (const std::exception &e)
@@ -653,6 +665,9 @@ namespace llaminar
                 {
                     LOG_ERROR("OpenBLAS matmul failed: " << e.what());
                 }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+                perfCounters().record_matmul(m, n, k, ms, (int)MatMulBackend::OPENBLAS, false);
                 return false;
             }
         }

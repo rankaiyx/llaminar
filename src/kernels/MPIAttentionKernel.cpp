@@ -38,6 +38,7 @@
  * @author David Sanftenberg
  */
 #include "MPIAttentionKernel.h"
+#include "../utils/perf_counters.h"
 #include "../utils/debug_env.h"
 #include "../utils/debug_sharding.h"
 #include "kernels/common/attention_primitives.h" // for optional validation
@@ -50,6 +51,7 @@
 #include "../tensors/tensor_factory.h"
 #include "../tensors/sharded_simple_tensor.h"
 #include "../tensors/shard_spec.h"
+#include "../tensors/tp_output_projection_executor.h" // TP simulation executor
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -397,7 +399,7 @@ namespace llaminar
             // Row-partition of W_o yields additive partial contributions; sum to reconstruct.
             if (getSize() > 1)
             {
-                MPI_Allreduce(local_final_output->data(), global_output->data(),
+                PerfAllreduce(local_final_output->data(), global_output->data(),
                               (int)(seq_len * d_model), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
                 performed_collective = true;
             }
@@ -1304,91 +1306,203 @@ namespace llaminar
                                                           size_t seq_len, int local_heads, size_t d_model)
     {
         size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-        const auto &attnEnv3 = debugEnv().attention;
-        int tp_parts = attnEnv3.tp_partitions;
-        bool tp_disable = attnEnv3.tp_disable;
-        bool auto_escalated = false;
-        if (!tp_disable && tp_parts == 1 && attnEnv3.tp_auto && d_model >= 2048 && (d_model % 2 == 0))
+        bool tp_sim_done = false; // if simulation path executes successfully, skip baseline path
+
+        // ---------------------------------------------------------------------
+        // Tensor-Parallel (simulation) path (Task 2)
+        // When enabled via tp_sim.* env snapshot we synthesize an intra-process
+        // tensor parallel execution of the output projection, partitioning either
+        // rows (M dimension / sequence length) or columns (N / d_model) and
+        // reconstructing the full output. This is a correctness exploration tool
+        // that does not (yet) overlap or distribute work across MPI ranks.
+        // ---------------------------------------------------------------------
+        const auto &tpSim = debugEnv().tp_sim;
+        if (tpSim.enable && tpSim.partitions > 1)
         {
-            tp_parts = 2;
-            auto_escalated = true;
-        }
-        size_t op_elems_proxy = seq_len * d_model * local_head_dim; // approximate cost proxy
-        if (auto_escalated && op_elems_proxy < 4096ULL)
-        {
-            // Revert tiny auto-escalations – explicit user tp_partitions still honored.
-            tp_parts = 1;
-            auto_escalated = false;
-        }
-        bool use_tp = (tp_parts > 1) && !tp_disable;
-        if (!use_tp)
-        {
-            PERF_SCOPED_TIMER("OutputProjection::single_gemm");
+            PERF_SCOPED_TIMER("OutputProjection::tp_sim");
+            int parts = tpSim.partitions;
+            bool row_split = false;
+            switch (tpSim.mode)
             {
-                bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
-                if (is_prefill_like)
+            case DebugEnvSnapshot::TPSimEnv::Mode::Row:
+                row_split = true;
+                break;
+            case DebugEnvSnapshot::TPSimEnv::Mode::Col:
+                row_split = false;
+                break;
+            case DebugEnvSnapshot::TPSimEnv::Mode::Auto:
+            default:
+                // Heuristic: prefer column split if d_model divisible, else row if seq_len divisible, else column fallback.
+                if (d_model % static_cast<size_t>(parts) == 0)
+                    row_split = false;
+                else if (seq_len % static_cast<size_t>(parts) == 0)
+                    row_split = true;
+                else
+                    row_split = false;
+                break;
+            }
+
+            auto matmul_fn = [&](const float *A, const float *B, float *C, std::size_t M, std::size_t N, std::size_t K) -> bool
+            {
+                return adaptive_matmul(A, B, C, (int)M, (int)N, (int)K, false);
+            };
+
+            // Build executor configs for each simulated partition and run sequentially (single process simulation).
+            std::vector<TPOutputLocalResult> local_parts;
+            local_parts.reserve(parts);
+            bool failed = false;
+            for (int p = 0; p < parts; ++p)
+            {
+                TPOutputExecConfig cfg;
+                cfg.tp_size = parts;
+                cfg.tp_rank = p;
+                cfg.row_split = row_split;
+                try
                 {
-                    static auto prefill_backend = PrefillBackendFactory::create();
-                    PrefillOpDesc desc;
-                    desc.kind = PrefillOpKind::MatMul;
-                    desc.M = seq_len;
-                    desc.N = d_model;
-                    desc.K = local_head_dim;
-                    desc.is_prefill = true;
-                    PrefillLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
-                    auto decision = prefill_backend->launch(desc, ctx);
-                    if (decision.status != PrefillStatus::Success)
+                    TPOutputProjectionExecutor exec(matmul_fn, cfg, seq_len, d_model, local_head_dim);
+                    local_parts.push_back(exec.run(local_attended_output->data(), local_wo->data()));
+                }
+                catch (const std::exception &e)
+                {
+                    failed = true;
+                    if (getRank() == 0)
+                        LOG_ERROR("[TP-Sim] partition execution failed p=" << p << " err=" << e.what());
+                    break;
+                }
+            }
+            if (!failed)
+            {
+                // Reconstruct into final output buffer.
+                try
+                {
+                    if (row_split)
+                        TPOutputProjectionExecutor::reconstruct_rows(local_parts, local_final_output->data(), seq_len, d_model);
+                    else
+                        TPOutputProjectionExecutor::reconstruct_columns(local_parts, local_final_output->data(), seq_len, d_model);
+                    if (getRank() == 0)
+                        LOG_DEBUG("[TP-Sim] output projection reconstructed mode=" << (row_split ? "row" : "col")
+                                                                                   << " parts=" << parts
+                                                                                   << " seq_len=" << seq_len
+                                                                                   << " d_model=" << d_model
+                                                                                   << " local_head_dim=" << local_head_dim);
+                }
+                catch (const std::exception &e)
+                {
+                    failed = true;
+                    if (getRank() == 0)
+                        LOG_ERROR("[TP-Sim] reconstruction failed: " << e.what());
+                }
+            }
+            if (!failed)
+            {
+                // Optional: reference scalar validation may still run below if attention.validate_output enabled.
+                if (debugEnv().attention.validate_output && getRank() == 0)
+                    LOG_DEBUG("[TP-Sim] validation (scalar ref) will run after simulation path");
+                tp_sim_done = true; // ensure baseline logic skipped
+            }
+            else
+            {
+                // Fallback: execute baseline path if simulation failed.
+                if (getRank() == 0)
+                    LOG_WARN("[TP-Sim] falling back to baseline single-path output projection due to prior errors");
+                // Continue into baseline logic below (no early return).
+            }
+            // NOTE: We intentionally do not 'return' here so scalar validation below still applies.
+            // Baseline logic guarded further down by absence of simulation gating state.
+        }
+        if (!tp_sim_done)
+        {
+            const auto &attnEnv3 = debugEnv().attention;
+            int tp_parts = attnEnv3.tp_partitions;
+            bool tp_disable = attnEnv3.tp_disable;
+            bool auto_escalated = false;
+            if (!tp_disable && tp_parts == 1 && attnEnv3.tp_auto && d_model >= 2048 && (d_model % 2 == 0))
+            {
+                tp_parts = 2;
+                auto_escalated = true;
+            }
+            size_t op_elems_proxy = seq_len * d_model * local_head_dim; // approximate cost proxy
+            if (auto_escalated && op_elems_proxy < 4096ULL)
+            {
+                // Revert tiny auto-escalations – explicit user tp_partitions still honored.
+                tp_parts = 1;
+                auto_escalated = false;
+            }
+            bool use_tp = (tp_parts > 1) && !tp_disable;
+            if (!use_tp)
+            {
+                PERF_SCOPED_TIMER("OutputProjection::single_gemm");
+                {
+                    bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
+                    if (is_prefill_like)
                     {
-                        LOG_WARN("Output projection prefill fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                        if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false))
+                        static auto prefill_backend = PrefillBackendFactory::create();
+                        PrefillOpDesc desc;
+                        desc.kind = PrefillOpKind::MatMul;
+                        desc.M = seq_len;
+                        desc.N = d_model;
+                        desc.K = local_head_dim;
+                        desc.is_prefill = true;
+                        PrefillLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
+                        auto decision = prefill_backend->launch(desc, ctx);
+                        if (decision.status != PrefillStatus::Success)
                         {
-                            LOG_ERROR("Output projection failed on rank " << getRank());
-                            return;
+                            LOG_WARN("Output projection prefill fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                            if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false))
+                            {
+                                LOG_ERROR("Output projection failed on rank " << getRank());
+                                return;
+                            }
                         }
                     }
-                }
-                else
-                {
-                    static auto infer_backend = InferenceBackendFactory::create();
-                    InferenceOpDesc desc;
-                    desc.kind = InferenceOpKind::MatMul;
-                    desc.M = seq_len;
-                    desc.N = d_model;
-                    desc.K = local_head_dim;
-                    desc.latency_critical = true;
-                    InferenceLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
-                    auto decision = infer_backend->launch(desc, ctx);
-                    if (decision.status != InferenceStatus::Success)
+                    else
                     {
-                        LOG_WARN("Output projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                        if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false))
+                        static auto infer_backend = InferenceBackendFactory::create();
+                        InferenceOpDesc desc;
+                        desc.kind = InferenceOpKind::MatMul;
+                        desc.M = seq_len;
+                        desc.N = d_model;
+                        desc.K = local_head_dim;
+                        desc.latency_critical = true;
+                        InferenceLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
+                        auto decision = infer_backend->launch(desc, ctx);
+                        if (decision.status != InferenceStatus::Success)
                         {
-                            LOG_ERROR("Output projection failed on rank " << getRank());
-                            return;
+                            LOG_WARN("Output projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
+                            if (!adaptive_matmul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false))
+                            {
+                                LOG_ERROR("Output projection failed on rank " << getRank());
+                                return;
+                            }
                         }
                     }
                 }
             }
-        }
-        else
-        {
-            PERF_SCOPED_TIMER("OutputProjection::tp_partition");
-            float *C = local_final_output->data();
-            const float *B = local_wo->data();
-            auto do_part = [&](int part)
+            else
             {
-                auto spec = compute_tp_partition(d_model, tp_parts, part, TPPartitionSpec::Axis::Col);
-                int n_sub = (int)spec.local_dim;
-                int col_off = (int)spec.local_offset;
-                const float *B_sub = B + col_off;
-                float *C_sub = C + col_off;
-                if (!adaptive_matmul(local_attended_output->data(), B_sub, C_sub, seq_len, n_sub, local_head_dim, false))
+                PERF_SCOPED_TIMER("OutputProjection::tp_partition");
+                float *C = local_final_output->data();
+                const float *B = local_wo->data();
+                auto do_part = [&](int part)
                 {
-                    LOG_ERROR("[TP] partition projection failed part=" << part);
-                }
-            };
-            for (int p = 0; p < tp_parts; ++p)
-                do_part(p);
+                    auto spec = compute_tp_partition(d_model, tp_parts, part, TPPartitionSpec::Axis::Col);
+                    int n_sub = (int)spec.local_dim;
+                    int col_off = (int)spec.local_offset;
+                    const float *B_sub = B + col_off;
+                    float *C_sub = C + col_off;
+                    if (!adaptive_matmul(local_attended_output->data(), B_sub, C_sub, seq_len, n_sub, local_head_dim, false))
+                    {
+                        LOG_ERROR("[TP] partition projection failed part=" << part);
+                    }
+                };
+                for (int p = 0; p < tp_parts; ++p)
+                    do_part(p);
+            }
+            // Logging only if baseline executed
+            if (use_tp)
+                LOG_DEBUG("Computed output projection (TP col) heads=" << local_heads << " parts=" << tp_parts << " rank=" << getRank());
+            else
+                LOG_DEBUG("Computed output projection (single GEMM) heads=" << local_heads << " rank=" << getRank());
         }
 
         // Optional scalar reference validation for output projection (pre-gather).
@@ -1445,10 +1559,8 @@ namespace llaminar
             }
         }
 
-        if (use_tp)
-            LOG_DEBUG("Computed output projection (TP col) heads=" << local_heads << " parts=" << tp_parts << " rank=" << getRank());
-        else
-            LOG_DEBUG("Computed output projection (single GEMM) heads=" << local_heads << " rank=" << getRank());
+        if (tp_sim_done && getRank() == 0)
+            LOG_DEBUG("[TP-Sim] output projection complete (validation stage passed)");
     }
 
     std::shared_ptr<TensorBase> MPIAttentionKernel::createLocalSimpleTensor(const std::vector<size_t> &shape) const

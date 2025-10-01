@@ -1,5 +1,6 @@
 #pragma once
 #include <mpi.h>
+#include "perf_counters.h"
 #include <memory>
 #include <cstring>
 #include "../tensors/tensor_base.h"
@@ -33,7 +34,7 @@ namespace llaminar
         {
             if (treat_nonsharded_as_additive)
             {
-                MPI_Allreduce(MPI_IN_PLACE, tensor->data(), (int)tensor->size(), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+                PerfAllreduce(MPI_IN_PLACE, tensor->data(), (int)tensor->size(), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
             }
             return; // replicated or other tensor type (unless forced additive)
         }
@@ -46,7 +47,7 @@ namespace llaminar
             }
             return; // replicated
         }
-        MPI_Allreduce(MPI_IN_PLACE, tensor->data(), (int)tensor->size(), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+        PerfAllreduce(MPI_IN_PLACE, tensor->data(), (int)tensor->size(), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
     }
 
 } // namespace llaminar

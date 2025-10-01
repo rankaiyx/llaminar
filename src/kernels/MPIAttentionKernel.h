@@ -136,6 +136,21 @@ namespace llaminar
          */
         std::pair<int, int> getHeadDistribution(int rank) const;
 
+        /**
+         * @brief Test harness helper: invoke the private output projection path directly.
+         *        Exposed for unit/integration testing of TP simulation logic without
+         *        running the full attention pipeline.
+         * @note  Not intended for production use; keeps underlying implementation private.
+         */
+        void testInvokeOutputProjection(const std::shared_ptr<TensorBase> &local_attended_output,
+                                        const std::shared_ptr<TensorBase> &local_wo,
+                                        std::shared_ptr<TensorBase> &local_final_output,
+                                        size_t seq_len, int local_heads, size_t d_model)
+        {
+            computeLocalOutputProjection(local_attended_output, local_wo, local_final_output,
+                                         seq_len, local_heads, d_model);
+        }
+
     private:
         /**
          * @brief Distribute input data and weights to all processes

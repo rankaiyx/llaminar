@@ -101,21 +101,11 @@ public:
 private:
     Logger() : current_level_(LogLevel::INFO)
     {
-        // Allow overriding ring buffer size via environment variable
-        if (const char *env = std::getenv("LLAMINAR_LOG_BUFFER_LINES"))
+        // Defer snapshot acquisition until after static init of debug_env but still early.
+        const auto &snap = ::llaminar::debugEnv();
+        if (snap.logger.buffer_lines_override > 0)
         {
-            try
-            {
-                size_t v = static_cast<size_t>(std::stoull(env));
-                if (v > 0 && v < 2000000)
-                { // cap to a reasonable upper bound
-                    max_buffer_ = v;
-                }
-            }
-            catch (...)
-            {
-                // ignore parse errors
-            }
+            max_buffer_ = snap.logger.buffer_lines_override;
         }
     }
     LogLevel current_level_;

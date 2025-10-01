@@ -32,6 +32,7 @@
 #include "../debug_utils.h"
 #include "../performance_timer.h"
 #include "../utils/debug_env.h"
+#include "../utils/perf_counters.h"
 #include <chrono>
 #include <cmath>
 #include <algorithm>
@@ -363,8 +364,8 @@ namespace llaminar
             MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
             double global_abs = 0.0;
             double global_max = 0.0;
-            MPI_Allreduce(&accum_abs_diff, &global_abs, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(&accum_max_diff, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            PerfAllreduce(&accum_abs_diff, &global_abs, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(&accum_max_diff, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
             size_t local_elems = (end_pos - start_pos) * static_cast<size_t>(d_ff);
             size_t global_elems = static_cast<size_t>(seq_len) * static_cast<size_t>(d_ff);
             double mean_abs = global_abs / static_cast<double>(global_elems);
@@ -457,8 +458,8 @@ namespace llaminar
             MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
             double global_abs = 0.0;
             double global_max = 0.0;
-            MPI_Allreduce(&accum_abs_diff, &global_abs, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            MPI_Allreduce(&accum_max_diff, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            PerfAllreduce(&accum_abs_diff, &global_abs, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            PerfAllreduce(&accum_max_diff, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
             size_t shard_elems = static_cast<size_t>(seq_len) * (end_feature - start_feature);
             size_t global_elems = static_cast<size_t>(seq_len) * static_cast<size_t>(d_ff);
             double mean_abs = global_abs / static_cast<double>(global_elems);
