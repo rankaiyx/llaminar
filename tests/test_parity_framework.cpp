@@ -2,10 +2,10 @@
  * @file test_parity_framework.cpp
  * @brief Parity test framework for comparing Llaminar with llama.cpp
  * @author David Sanftenberg
- * 
+ *
  * This test validates the distributed attention pipeline by comparing intermediate
  * tensor snapshots from Llaminar against llama.cpp reference implementation.
- * 
+ *
  * The framework is designed to be extensible to other model architectures.
  */
 
@@ -36,8 +36,8 @@ using namespace llaminar::parity;
 
 namespace
 {
-    constexpr const char* kParityCaptureEnv = "LLAMINAR_PARITY_CAPTURE";
-    constexpr const char* kParityCompareEnv = "LLAMINAR_PARITY_COMPARE";
+    constexpr const char *kParityCaptureEnv = "LLAMINAR_PARITY_CAPTURE";
+    constexpr const char *kParityCompareEnv = "LLAMINAR_PARITY_COMPARE";
 
     struct MPIFinalizer
     {
@@ -71,10 +71,9 @@ namespace
 
         const std::vector<std::string> preferred = {
             "qwen2.5-0.5b-instruct-q4_0.gguf",
-            "qwen2.5-0.5b-instruct-fp16.gguf"
-        };
+            "qwen2.5-0.5b-instruct-fp16.gguf"};
 
-        for (const auto& candidate : preferred)
+        for (const auto &candidate : preferred)
         {
             fs::path path = models_dir / candidate;
             if (fs::exists(path))
@@ -89,18 +88,18 @@ namespace
     /**
      * @brief Helper to broadcast string across MPI ranks
      */
-    void broadcast_string(std::string& value, int root, MPI_Comm comm)
+    void broadcast_string(std::string &value, int root, MPI_Comm comm)
     {
         int length = static_cast<int>(value.size());
         MPI_Bcast(&length, 1, MPI_INT, root, comm);
-        
+
         int rank = 0;
         MPI_Comm_rank(comm, &rank);
         if (rank != root)
         {
             value.assign(length, '\0');
         }
-        
+
         if (length > 0)
         {
             MPI_Bcast(value.data(), length, MPI_CHAR, root, comm);
@@ -112,8 +111,8 @@ namespace
      */
     struct LlamaContextGuard
     {
-        llama_model* model{nullptr};
-        llama_context* ctx{nullptr};
+        llama_model *model{nullptr};
+        llama_context *ctx{nullptr};
 
         ~LlamaContextGuard()
         {
@@ -130,58 +129,66 @@ namespace
 
     /**
      * @brief Custom snapshot hook for Llaminar pipeline
-     * 
+     *
      * This function can be called from within the pipeline to capture
      * intermediate states for parity testing.
      */
     class ParityTestHook
     {
     public:
-        static void capture_embedding(int seq_len, int d_model, const float* data)
+        static void capture_embedding(int seq_len, int d_model, const float *data)
         {
-            if (!LlaminarSnapshotHook::is_enabled()) return;
+            if (!LlaminarSnapshotHook::is_enabled())
+                return;
             LlaminarSnapshotHook::capture(PipelineStage::EMBEDDING, -1, data, seq_len, d_model);
         }
 
-        static void capture_attention_norm(int layer, int seq_len, int d_model, const float* data)
+        static void capture_attention_norm(int layer, int seq_len, int d_model, const float *data)
         {
-            if (!LlaminarSnapshotHook::is_enabled()) return;
+            if (!LlaminarSnapshotHook::is_enabled())
+                return;
             LlaminarSnapshotHook::capture(PipelineStage::ATTENTION_NORM, layer, data, seq_len, d_model);
         }
 
-        static void capture_attention_output(int layer, int seq_len, int d_model, const float* data)
+        static void capture_attention_output(int layer, int seq_len, int d_model, const float *data)
         {
-            if (!LlaminarSnapshotHook::is_enabled()) return;
+            if (!LlaminarSnapshotHook::is_enabled())
+                return;
             LlaminarSnapshotHook::capture(PipelineStage::ATTENTION_OUTPUT, layer, data, seq_len, d_model);
         }
 
-        static void capture_ffn_norm(int layer, int seq_len, int d_model, const float* data)
+        static void capture_ffn_norm(int layer, int seq_len, int d_model, const float *data)
         {
-            if (!LlaminarSnapshotHook::is_enabled()) return;
+            if (!LlaminarSnapshotHook::is_enabled())
+                return;
             LlaminarSnapshotHook::capture(PipelineStage::FFN_NORM, layer, data, seq_len, d_model);
         }
 
-        static void capture_ffn_gate(int layer, int seq_len, int d_ff, const float* data)
+        static void capture_ffn_gate(int layer, int seq_len, int d_ff, const float *data)
         {
-            if (!LlaminarSnapshotHook::is_enabled()) return;
+            if (!LlaminarSnapshotHook::is_enabled())
+                return;
             LlaminarSnapshotHook::capture(PipelineStage::FFN_GATE, layer, data, seq_len, d_ff);
         }
 
-        static void capture_ffn_output(int layer, int seq_len, int d_model, const float* data)
+        static void capture_ffn_output(int layer, int seq_len, int d_model, const float *data)
         {
-            if (!LlaminarSnapshotHook::is_enabled()) return;
+            if (!LlaminarSnapshotHook::is_enabled())
+                return;
             LlaminarSnapshotHook::capture(PipelineStage::FFN_DOWN, layer, data, seq_len, d_model);
         }
 
-        static void capture_final_norm(int seq_len, int d_model, const float* data)
+        static void capture_final_norm(int seq_len, int d_model, const float *data)
         {
-            if (!LlaminarSnapshotHook::is_enabled()) return;
+            if (!LlaminarSnapshotHook::is_enabled())
+                return;
             LlaminarSnapshotHook::capture(PipelineStage::FINAL_NORM, -1, data, seq_len, d_model);
         }
 
-        static void capture_logits(int seq_len, int vocab_size, const float* data)
+        static void capture_logits(int seq_len, int vocab_size, const float *data)
         {
-            if (!LlaminarSnapshotHook::is_enabled()) return;
+            if (!LlaminarSnapshotHook::is_enabled())
+                return;
             LlaminarSnapshotHook::capture(PipelineStage::LM_HEAD, -1, data, seq_len, vocab_size);
         }
     };
@@ -193,12 +200,12 @@ namespace
  */
 TEST(ParityFramework, BasicSnapshotCapture)
 {
-    SnapshotRegistry& registry = SnapshotRegistry::instance();
+    SnapshotRegistry &registry = SnapshotRegistry::instance();
     registry.clear();
 
     // Create a test snapshot
     std::vector<float> test_data = {1.0f, 2.0f, 3.0f, 4.0f};
-    
+
     SnapshotMetadata meta;
     meta.stage_name = "test_stage";
     meta.stage = PipelineStage::CUSTOM;
@@ -208,16 +215,16 @@ TEST(ParityFramework, BasicSnapshotCapture)
     meta.source = "test";
 
     TensorSnapshot snapshot(meta, test_data.data(), test_data.size());
-    
+
     std::string key = registry.make_key("test", "test_stage", 0);
     registry.register_snapshot(key, snapshot);
 
     EXPECT_TRUE(registry.has_snapshot(key));
-    
+
     TensorSnapshot retrieved;
     ASSERT_TRUE(registry.get_snapshot(key, retrieved));
     ASSERT_EQ(retrieved.data.size(), test_data.size());
-    
+
     for (size_t i = 0; i < test_data.size(); ++i)
     {
         EXPECT_FLOAT_EQ(retrieved.data[i], test_data[i]);
@@ -267,7 +274,7 @@ TEST(ParityFramework, SnapshotComparison)
 
 /**
  * @brief Main parity test comparing Llaminar pipeline with llama.cpp
- * 
+ *
  * This test:
  * 1. Runs llama.cpp inference to get reference outputs
  * 2. Runs Llaminar pipeline with snapshot hooks enabled
@@ -297,11 +304,11 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
     ModelLoader loader;
     ASSERT_TRUE(loader.loadModel(model_path)) << "Failed to load GGUF model: " << model_path;
     TransformerLayerConfig base_config = loader.createLayerConfig();
-    
+
     // Use a small test scenario
     const int test_seq_len = 8;
     const int test_layers = std::min(2, base_config.n_layers);
-    
+
     TransformerLayerConfig config = base_config;
     config.n_layers = test_layers;
     config.max_seq_len = test_seq_len;
@@ -321,7 +328,7 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
     if (rank == 0)
     {
         std::cout << "[PARITY_TEST] Running llama.cpp reference..." << std::endl;
-        
+
         llama_backend_init();
 
         llama_model_params mparams = llama_model_default_params();
@@ -359,25 +366,25 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
         // Extract logits
         for (int i = 0; i < test_seq_len; ++i)
         {
-            float* row = llama_get_logits_ith(guard.ctx, i);
+            float *row = llama_get_logits_ith(guard.ctx, i);
             ASSERT_NE(row, nullptr);
             std::memcpy(llama_logits.data() + static_cast<int64_t>(i) * vocab,
-                       row, sizeof(float) * static_cast<size_t>(vocab));
+                        row, sizeof(float) * static_cast<size_t>(vocab));
         }
 
         // Extract pre-LM hidden state as a reference snapshot
         std::vector<float> llama_final_hidden(static_cast<size_t>(test_seq_len) * config.d_model);
         for (int i = 0; i < test_seq_len; ++i)
         {
-            float* emb_row = llama_get_embeddings_ith(guard.ctx, i);
+            float *emb_row = llama_get_embeddings_ith(guard.ctx, i);
             ASSERT_NE(emb_row, nullptr);
             std::memcpy(llama_final_hidden.data() + static_cast<size_t>(i) * config.d_model,
-                       emb_row, sizeof(float) * static_cast<size_t>(config.d_model));
+                        emb_row, sizeof(float) * static_cast<size_t>(config.d_model));
         }
 
         // Register llama.cpp reference snapshots
-        SnapshotRegistry& registry = SnapshotRegistry::instance();
-        
+        SnapshotRegistry &registry = SnapshotRegistry::instance();
+
         SnapshotMetadata final_hidden_meta;
         final_hidden_meta.stage_name = "final_norm";
         final_hidden_meta.stage = PipelineStage::FINAL_NORM;
@@ -385,7 +392,7 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
         final_hidden_meta.seq_len = test_seq_len;
         final_hidden_meta.feature_dim = config.d_model;
         final_hidden_meta.source = "llama.cpp";
-        
+
         TensorSnapshot final_hidden_snap(final_hidden_meta, llama_final_hidden.data(), llama_final_hidden.size());
         registry.register_snapshot(registry.make_key("llama.cpp", "final_norm", -1), final_hidden_snap);
 
@@ -396,7 +403,7 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
         logits_meta.seq_len = test_seq_len;
         logits_meta.feature_dim = vocab;
         logits_meta.source = "llama.cpp";
-        
+
         TensorSnapshot logits_snap(logits_meta, llama_logits.data(), llama_logits.size());
         registry.register_snapshot(registry.make_key("llama.cpp", "lm_head", -1), logits_snap);
 
@@ -405,7 +412,8 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
     }
 
     // Broadcast reference logits to all ranks
-    const int broadcast_count = static_cast<int>(total_logits);
+    // total_logit_elements holds seq_len * vocab (defined earlier). Use that for broadcast sizing.
+    const int broadcast_count = static_cast<int>(total_logit_elements);
     MPI_Bcast(llama_logits.data(), broadcast_count, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     // ========== Run Llaminar pipeline with snapshot capture ==========
@@ -427,11 +435,11 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
     std::shared_ptr<TensorBase> llaminar_output;
     ASSERT_TRUE(pipeline.execute(token_ids, weights, llaminar_output));
 
-    std::vector<float> llaminar_logits(total_logits, 0.0f);
+    std::vector<float> llaminar_logits(total_logit_elements, 0.0f);
     if (llaminar_output && llaminar_output->data())
     {
         std::memcpy(llaminar_logits.data(), llaminar_output->data(),
-                   sizeof(float) * static_cast<size_t>(total_logits));
+                    sizeof(float) * static_cast<size_t>(total_logit_elements));
     }
     MPI_Bcast(llaminar_logits.data(), broadcast_count, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
@@ -461,10 +469,10 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
         }
 
         // Compare pre-LM hidden state if available
-        const auto& pre_lm_hidden = DistributedTransformerPipeline::getLastPreLMHidden();
+        const auto &pre_lm_hidden = DistributedTransformerPipeline::getLastPreLMHidden();
         if (!pre_lm_hidden.empty())
         {
-            SnapshotRegistry& registry = SnapshotRegistry::instance();
+            SnapshotRegistry &registry = SnapshotRegistry::instance();
             TensorSnapshot llama_final_hidden;
             if (registry.get_snapshot(registry.make_key("llama.cpp", "final_norm", -1), llama_final_hidden))
             {
@@ -483,7 +491,7 @@ TEST(ParityFramework, DistributedPipelineVsLlamaCpp)
     }
 }
 
-int main(int argc, char** argv)
+int main(int argc, char **argv)
 {
     // Initialize MPI
     int provided;
