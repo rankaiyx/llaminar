@@ -140,6 +140,9 @@ mpirun -np 2 ./build/llaminar
 
 # Run specific tests with MPI
 mpirun -np 2 ./build/test_cosma
+
+# DEBUGGING: Capture the backtrace of a segfault in MPI with gdb
+bash -lc 'set -m; mpirun -np 2 gdb -q --batch -ex "handle SIGUSR1 pass nostop noprint" -ex run -ex bt -ex bt full --args ./build/test_incremental_decode_parity --gtest_filter=IncrementalDecodeParity.ReplayVsIncrementalMultiRank 2>&1 | tee gdb_mpi_bt.log'
 ```
 
 ### Test Categories
