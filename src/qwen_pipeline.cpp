@@ -56,6 +56,7 @@
 #include "qwen_pipeline.h"
 #include "qwen_pipeline_adapter.h" // For QwenModelWeights
 #include "prefill_diagnostics.h"   // For baseline comparison and FFN tracing
+#include "prefill_provider.h"      // For PrefillProviderFactory
 #include "model_loader.h"
 #include "kernels/MPISwiGLUKernel.h"
 #include "kernels/MPIRoPEKernel.h"
@@ -1548,18 +1549,58 @@ namespace llaminar
             LOG_ERROR("prefill: invalid weights type");
             return false;
         }
-        auto output = TensorFactory::create_simple({(int)tokens.size(), config_.getLayerConfig().vocab_size});
-        if (!execute(tokens, w->inner, output))
+
+        // Use PrefillProviderFactory for optimal backend selection
+        auto provider = PrefillProviderFactory::create(
+            config_,
+            mpi_ctx_,
+            static_cast<int>(tokens.size()));
+
+        if (!provider)
+        {
+            LOG_ERROR("prefill: Failed to create PrefillProvider");
             return false;
+        }
+
+        // Execute prefill via provider
+        std::shared_ptr<TensorBase> output;
+        PrefillMetrics metrics;
+        bool success = provider->execute(tokens, weights_iface, output, ctx, metrics);
+
+        if (!success)
+        {
+            LOG_ERROR("prefill: Provider execution failed");
+            return false;
+        }
+
+        // Log metrics
+        if (getRank() == 0)
+        {
+            LOG_INFO("Prefill metrics [" << provider->name() << "]: "
+                                         << "total=" << metrics.total_ms() << "ms, "
+                                         << "embed=" << metrics.embedding_ms << "ms, "
+                                         << "norm=" << metrics.norm_ms << "ms, "
+                                         << "attn=" << metrics.attention_ms << "ms, "
+                                         << "ffn=" << metrics.ffn_ms << "ms, "
+                                         << "lm_head=" << metrics.lm_head_ms << "ms, "
+                                         << "snapshots=" << metrics.snapshots_captured);
+        }
+
+        // Store output logits
         last_logits_ = output;
+
+        // Update KV cache state
         kv_snapshot_.capacity_tokens = getKVCacheCapacity();
         kv_snapshot_.used_tokens = getKVCacheUsed();
         kv_snapshot_.growth_events = getKVCacheGrowthEvents();
+
+        // Update stage context
         ctx.stage = InferenceStage::Prefill;
         ctx.seq_len = (int)tokens.size();
         ctx.generated = 0;
         ctx.kv_capacity = kv_snapshot_.capacity_tokens;
         ctx.kv_used = kv_snapshot_.used_tokens;
+
         return true;
     }
 

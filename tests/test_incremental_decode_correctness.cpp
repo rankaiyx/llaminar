@@ -78,7 +78,7 @@ namespace
 
 } // namespace
 
-TEST(IncrementalDecodeParity, ReplayVsIncrementalSingleRank)
+TEST(IncrementalDecode, ReplayVsIncrementalSingleRank)
 {
     int world = 1;
     MPI_Comm_size(MPI_COMM_WORLD, &world);
@@ -178,7 +178,7 @@ TEST(IncrementalDecodeParity, ReplayVsIncrementalSingleRank)
 }
 
 // Multi-rank parity skeleton: run only if world size >=2 (uses MPI but still single-process test binary launched via mpirun)
-TEST(IncrementalDecodeParity, ReplayVsIncrementalMultiRank)
+TEST(IncrementalDecode, ReplayVsIncrementalMultiRank)
 {
     int world = 1;
     MPI_Comm_size(MPI_COMM_WORLD, &world);

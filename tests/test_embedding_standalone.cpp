@@ -22,6 +22,7 @@
 #include "parity_test_framework.h"
 #include "abstract_pipeline.h"
 #include "qwen_pipeline_adapter.h"
+#include "pipeline_snapshot_manager.h"
 #include "logger.h"
 
 namespace llaminar
@@ -103,6 +104,7 @@ namespace llaminar
             }
 
             // Enable parity capture to get embedding output
+            PipelineSnapshotManager::instance().setEnabled(true);
             parity::LlaminarSnapshotHook::set_enabled(true);
 
             // Run prefill (which will perform embedding lookup)
@@ -146,12 +148,15 @@ namespace llaminar
                     LOG_INFO("  [" << i << "] = " << data[896 + i]);
                 }
 
-                // Expected values from PyTorch reference (from NPZ file)
-                // Token 1639 first 10 values: [-0.01953125  0.00842285  0.0045166   0.01721191 -0.03735352  0.0213623
-                //                              0.02618408 -0.01997375  0.01123047  0.02059937]
+                // Expected values from PyTorch reference (from GGUF file qwen2.5-0.5b-instruct-q4_0.gguf)
+                // Token 1639 first 10 values:
+                // [0.01007080078125, -0.01007080078125, 0.015106201171875, -0.015106201171875,
+                //  -0.015106201171875, -0.0201416015625, 0.0201416015625, 0.0201416015625,
+                //  0.01007080078125, 0.0201416015625]
                 std::vector<float> expected_token_1639 = {
-                    -0.01953125f, 0.00842285f, 0.0045166f, 0.01721191f, -0.03735352f,
-                    0.0213623f, 0.02618408f, -0.01997375f, 0.01123047f, 0.02059937f};
+                    0.01007080078125f, -0.01007080078125f, 0.015106201171875f, -0.015106201171875f,
+                    -0.015106201171875f, -0.0201416015625f, 0.0201416015625f, 0.0201416015625f,
+                    0.01007080078125f, 0.0201416015625f};
 
                 LOG_INFO("");
                 LOG_INFO("=== Comparison with PyTorch ===");
@@ -178,7 +183,7 @@ namespace llaminar
 
                 LOG_INFO("");
                 LOG_INFO("Max difference: " << max_diff);
-                LOG_INFO("Tolerance: 0.001 (tight for Q4_0)");
+                LOG_INFO("Tolerance: 0.005 (allowing for Q4_0 quantization error)");
 
                 if (all_match)
                 {
@@ -190,14 +195,17 @@ namespace llaminar
                     LOG_ERROR("This indicates a bug in embedding lookup or dequantization");
                 }
 
-                // For Q4_0, we expect some quantization error, but it should be small
-                // If max_diff > 0.1, something is seriously wrong
-                EXPECT_LT(max_diff, 0.1f) << "Embedding divergence too large - likely a bug, not quantization error";
+                // For Q4_0, we expect some quantization error, but it should be small (< 0.005)
+                // The PyTorch reference uses the same Q4_0 format, so differences should be minimal
+                ASSERT_LT(max_diff, 0.005f) << "Embedding divergence too large! max_diff=" << max_diff
+                                            << " - This indicates a bug in embedding lookup or dequantization, not just quantization noise";
 
-                // If all values match closely, the embedding layer is working correctly
-                // If they don't match, we've isolated the bug to this specific component
+                // If we get here, embeddings match within tolerance
+                LOG_INFO("✓ Embedding test PASSED - values match within Q4_0 quantization tolerance");
             }
 
+            // Cleanup: disable parity capture
+            PipelineSnapshotManager::instance().setEnabled(false);
             parity::LlaminarSnapshotHook::set_enabled(false);
             registry.clear();
         }

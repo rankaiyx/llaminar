@@ -33,7 +33,7 @@ namespace
     };
 }
 
-class LinearOrientationParityTestFixture : public ::testing::Test
+class LinearOrientationTestFixture : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -62,7 +62,7 @@ static void fill_sequential(std::shared_ptr<TensorBase> &t, float offset = 0.f)
         t->data()[i] = offset + float(i % 97) * 0.01f; // bounded predictable
 }
 
-TEST_F(LinearOrientationParityTestFixture, ParitySmallShapes)
+TEST_F(LinearOrientationTestFixture, ParitySmallShapes)
 {
     // A small battery of (M,K,N) shapes to catch orientation mistakes early.
     struct Case
@@ -114,7 +114,7 @@ TEST_F(LinearOrientationParityTestFixture, ParitySmallShapes)
     }
 }
 
-TEST_F(LinearOrientationParityTestFixture, RandomizedBatched)
+TEST_F(LinearOrientationTestFixture, RandomizedBatched)
 {
     testutils::PRNG rng(1234);
     MPILinearKernel kernel;

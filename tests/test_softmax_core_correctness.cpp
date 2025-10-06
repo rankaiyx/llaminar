@@ -66,11 +66,11 @@ static double rel_l2(const std::vector<float> &a, const std::vector<float> &b)
     return std::sqrt(num / den);
 }
 
-class SoftmaxCoreParityTest : public ::testing::TestWithParam<std::tuple<int, int, bool, float>>
+class SoftmaxCoreTest : public ::testing::TestWithParam<std::tuple<int, int, bool, float>>
 {
 };
 
-TEST_P(SoftmaxCoreParityTest, RowMajorParity)
+TEST_P(SoftmaxCoreTest, RowMajorParity)
 {
     auto [rows, cols, causal, scale] = GetParam();
     std::mt19937 rng(1234);
@@ -96,7 +96,7 @@ TEST_P(SoftmaxCoreParityTest, RowMajorParity)
     ASSERT_LT(rl2, 1e-7) << "Relative L2 too large rl2=" << rl2;
 }
 
-INSTANTIATE_TEST_SUITE_P(SoftmaxShapes, SoftmaxCoreParityTest,
+INSTANTIATE_TEST_SUITE_P(SoftmaxShapes, SoftmaxCoreTest,
                          ::testing::Values(
                              std::make_tuple(1, 16, false, 1.0f),
                              std::make_tuple(4, 32, true, 1.0f),

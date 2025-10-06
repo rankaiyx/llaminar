@@ -86,6 +86,63 @@ mpirun -np 2 --bind-to socket --map-by socket \
   ./build/llaminar [arguments]
 ```
 
+## Test Organization
+
+Llaminar has a comprehensive test suite organized into 5 categories for different development workflows:
+
+| Category | Tests | Runtime | Pass Rate | Use Case |
+|----------|-------|---------|-----------|----------|
+| **Smoke** | 14 | 1.16s | 100% | Every build, pre-commit hooks |
+| **Unit** | 99 | 2m30s | 89% | Pull requests, development |
+| **Parity** | 4 | 24.5s | 75% | Cross-implementation validation |
+| **Integration** | 26 | 3m0s | 81% | Major features, releases |
+| **Full** | 123 | 3m0s | 86% | Pre-release, comprehensive |
+
+### Quick Test Commands
+
+```bash
+# Smoke tests - Ultra-fast validation (1.16s)
+# VSCode: Ctrl+Shift+P → "Tasks: Run Task" → "test: smoke tests"
+ctest --test-dir build --output-on-failure --parallel \
+  -R "^(BasicTest|NumaTest|PipelineFactoryTest|DequantTest|TPPartitionSpecTest|LargeMatmulPlanTest|WeightRoleClassification|MPILinearKernelTest|MPIRMSNormKernelTest|MPIAttentionKernelTest|MPISoftmaxCorrectnessTest|RMSNormCoreCorrectness|SoftmaxCoreCorrectness|LinearOrientationCorrectnessTest)$"
+
+# Unit tests - Comprehensive kernel validation (2m30s)
+# VSCode: Ctrl+Shift+P → "Tasks: Run Task" → "test: unit tests"
+ctest --test-dir build --output-on-failure --parallel \
+  -E "(Integration|ParityFramework|Incremental|Qwen|Prefill|.*Stress.*)"
+
+# Full test suite (3m0s)
+# VSCode: Ctrl+Shift+P → "Tasks: Run Task" → "test: run all tests"
+ctest --test-dir build --output-on-failure --parallel
+```
+
+### Test Naming Conventions
+
+**"Parity" Tests** - Reserved for cross-implementation validation:
+- `test_parity_framework.cpp` - Validates against llama.cpp and PyTorch
+- `test_abstract_pipeline_parity.cpp` - Pipeline interface consistency
+
+**"Correctness" Tests** - Internal validation and unit tests:
+- `test_*_correctness.cpp` - Self-contained correctness checks
+- Mathematical properties, component contracts, internal consistency
+
+### Smoke Test Coverage (1.16s)
+
+The smoke test suite provides maximum coverage with minimal runtime:
+
+- ✅ **Infrastructure**: MPI initialization, NUMA topology, pipeline factory
+- ✅ **Core Kernels**: Linear, RMSNorm, Attention, Softmax (distributed & local)
+- ✅ **Tensor Operations**: Partition specs, quantization/dequantization
+- ✅ **Configuration**: Weight role classification, COSMA planning
+
+**Recommended Usage**: Run smoke tests on every build during development for instant feedback.
+
+### Detailed Documentation
+
+- **[Test Categories Reference](docs/TEST_CATEGORIES.md)** - Complete test organization guide
+- **[Task Profile Validation](TASK_PROFILE_VALIDATION.md)** - Detailed validation report
+- **[Smoke Test Documentation](SMOKE_TEST_COMPLETE.md)** - Comprehensive smoke test guide
+
 ## Architecture
 
 ### Architecture Overview

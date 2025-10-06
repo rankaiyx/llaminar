@@ -46,7 +46,7 @@ namespace
     }
 }
 
-TEST(QuantDequantParity, Q4_0ReferenceMatchesFusedHelper)
+TEST(QuantDequant, Q4_0ReferenceMatchesFusedHelper)
 {
     int initialized = 0;
     MPI_Initialized(&initialized);

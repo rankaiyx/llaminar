@@ -75,7 +75,7 @@ namespace
     }
 }
 
-TEST(WeightSliceParity, AttentionProjectionColumns)
+TEST(WeightSlice, AttentionProjectionColumns)
 {
     int init_flag = 0;
     MPI_Initialized(&init_flag);

@@ -902,51 +902,30 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
         }
     }
 
-    // GGUF stores embedding matrices transposed: [d_model, vocab_size] instead of [vocab_size, d_model]
-    // We need to transpose the data and swap dimensions for embedding tensors
-    bool need_transpose = false;
+    // DIMENSION FIX: After reversing GGUF dimensions in parseTensorInfo,
+    // dimensions are now in standard row-major order: [vocab_size, d_model] for embeddings
+    // NO TRANSPOSE NEEDED - dimensions are already correct!
     LOG_INFO("[TRANSPOSE_CHECK] tensor_name='" << tensor_name << "' n_dims=" << info->dimensions.size());
     if (tensor_name == "token_embd.weight" || tensor_name == "output.weight")
     {
-        LOG_INFO("[TRANSPOSE_MATCH] Found embedding tensor: " << tensor_name);
-        if (info->dimensions.size() == 2)
-        {
-            // GGUF has [d_model, vocab_size], we want [vocab_size, d_model]
-            // Swap dimensions
-            std::swap(dims[0], dims[1]);
-            need_transpose = true;
-            LOG_INFO("Transposing embedding tensor '" << tensor_name << "' from GGUF format ["
-                                                      << info->dimensions[0] << "x" << info->dimensions[1] << "] to ["
-                                                      << dims[0] << "x" << dims[1] << "]");
-        }
-    }
-
-    // Transpose data if needed
-    if (need_transpose)
-    {
-        int rows = static_cast<int>(info->dimensions[0]); // d_model in GGUF
-        int cols = static_cast<int>(info->dimensions[1]); // vocab_size in GGUF
-        std::vector<float> transposed(data_f32.size());
-
-// Transpose: GGUF[d_model, vocab] -> Our[vocab, d_model]
-// GGUF stores row-major: data[row * cols + col]
-// We want: transposed[col * rows + row]
-// Parallelize for large tensors
-#pragma omp parallel for schedule(static) if (rows * cols > 100000)
-        for (int r = 0; r < rows; ++r)
-        {
-            for (int c = 0; c < cols; ++c)
-            {
-                transposed[c * rows + r] = data_f32[r * cols + c];
-            }
-        }
-        data_f32 = std::move(transposed);
+        LOG_INFO("[TRANSPOSE_SKIP] Embedding tensor '" << tensor_name << "' dimensions already correct: ["
+                                                       << info->dimensions[0] << "x" << info->dimensions[1] << "]");
     }
 
     auto simple = std::make_shared<llaminar::SimpleTensor>(dims, data_f32);
-    if (role != llaminar::WeightRole::Unknown)
+    if (role != llaminar::WeightRole::Unknown || tensor_name.find("attn_k") != std::string::npos)
     {
-        LOG_INFO("Loaded tensor '" << tensor_name << "' role=" << llaminar::weightRoleToString(role) << " elements=" << n_elems << " first=" << (data_f32.empty() ? 0 : data_f32[0]));
+        std::string shape_str = "[";
+        for (size_t i = 0; i < dims.size(); ++i)
+        {
+            if (i > 0)
+                shape_str += "x";
+            shape_str += std::to_string(dims[i]);
+        }
+        shape_str += "]";
+        LOG_INFO("Loaded tensor '" << tensor_name << "' role=" << llaminar::weightRoleToString(role)
+                                   << " shape=" << shape_str << " elements=" << n_elems
+                                   << " first=" << (data_f32.empty() ? 0 : data_f32[0]));
     }
     else
     {
@@ -1191,6 +1170,11 @@ bool ModelLoader::parseTensorInfo()
             return false;
 
         // Read dimensions
+        // NOTE: GGUF spec stores dimensions in specific order that depends on tensor type
+        // - For embedding matrices (token_embd.weight, output.weight): GGUF stores [d_model, vocab_size]
+        //   but we want [vocab_size, d_model], so they need reversal
+        // - For weight matrices (attention, FFN): GGUF stores [out_features, in_features] which matches
+        //   PyTorch convention but Llaminar expects [in_features, out_features], so NO reversal
         tensor.dimensions.resize(n_dims);
         for (uint32_t j = 0; j < n_dims; ++j)
         {
@@ -1198,11 +1182,20 @@ bool ModelLoader::parseTensorInfo()
                 return false;
         }
 
-        // Debug: Log raw dimensions from GGUF for embedding tensor
-        if (tensor.name == "token_embd.weight")
+        // ONLY reverse dimensions for embedding tensors (not weight matrices)
+        bool is_embedding = (tensor.name == "token_embd.weight" || tensor.name == "output.weight");
+        if (is_embedding && tensor.dimensions.size() == 2)
+        {
+            std::reverse(tensor.dimensions.begin(), tensor.dimensions.end());
+            LOG_INFO("[GGUF_DIMS] Embedding tensor '" << tensor.name << "' reversed to ["
+                                                      << tensor.dimensions[0] << "x" << tensor.dimensions[1] << "]");
+        }
+
+        // Debug: Log dimensions for key tensors
+        if (tensor.name == "token_embd.weight" || tensor.name == "blk.0.attn_k.weight")
         {
             std::ostringstream oss;
-            oss << "[GGUF_DIMS_RAW] tensor='" << tensor.name << "' n_dims=" << n_dims << " dims=[";
+            oss << "[GGUF_DIMS] tensor='" << tensor.name << "' n_dims=" << n_dims << " dims=[";
             for (uint32_t j = 0; j < n_dims; ++j)
             {
                 if (j > 0)

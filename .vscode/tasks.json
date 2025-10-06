@@ -389,6 +389,124 @@
             },
             "dependsOn": "cmake: build main",
             "detail": "Run llaminar with 2 MPI processes"
+        },
+        {
+            "label": "test: smoke (fast core tests)",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--parallel",
+                "-R",
+                "^(BasicTest|NumaTest|PipelineFactoryTest|DequantTest|TPPartitionSpecTest|LargeMatmulPlanTest|WeightRoleClassification|MPILinearKernelTest|MPIRMSNormKernelTest|MPIAttentionKernelTest|MPISoftmaxCorrectnessTest|RMSNormCoreCorrectness|SoftmaxCoreCorrectness|LinearOrientationCorrectnessTest)$"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run quick smoke tests (~5s total, 14 tests) - core functionality validation"
+        },
+        {
+            "label": "test: unit (all unit tests)",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--parallel",
+                "-E",
+                "(Integration|ParityFramework|Incremental|Qwen|Prefill|.*Stress.*)"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run all unit tests, no heavy integration (<5min)"
+        },
+        {
+            "label": "test: parity integration",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--verbose",
+                "-R",
+                "(ParityFramework|AbstractPipelineParity)"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run only ParityFramework tests - llama.cpp and PyTorch comparisons (~2min)"
+        },
+        {
+            "label": "test: integration (heavy tests)",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--verbose",
+                "-R",
+                "(Integration|Incremental|Qwen|Prefill|End2End|KVCache)"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run integration tests with model loading (<10min)"
+        },
+        {
+            "label": "test: full suite",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build",
+                "--output-on-failure",
+                "--parallel"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared",
+                "showReuseMessage": true,
+                "clear": false
+            },
+            "dependsOn": "cmake: build",
+            "detail": "Run complete test suite - all ~120 tests (<15min)"
         }
     ],
     "inputs": [

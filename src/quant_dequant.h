@@ -89,10 +89,13 @@ namespace llaminar
             const uint8_t packed = qs[j];
             const int x0i = j;        // first half position
             const int x1i = j + half; // second half position
+            // Cast to int BEFORE subtraction to avoid unsigned wraparound
+            const int x0 = (int)(packed & 0x0F) - 8;
+            const int x1 = (int)(packed >> 4) - 8;
             if (x0i < values)
-                dst[x0i] = (float)((packed & 0x0F) - 8) * d;
+                dst[x0i] = (float)x0 * d;
             if (x1i < values)
-                dst[x1i] = (float)((packed >> 4) - 8) * d;
+                dst[x1i] = (float)x1 * d;
         }
     }
 
