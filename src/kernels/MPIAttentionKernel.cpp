@@ -1565,6 +1565,25 @@ namespace llaminar
         if (snapshot_callback_ && getRank() == 0)
         {
             auto [local_h, _] = getHeadDistribution();
+            
+            // DEBUG: Log snapshot buffer statistics
+            const float *q_data = local_q->data();
+            size_t total_q_elements = seq_len * local_h * head_dim_;
+            float q_min = q_data[0], q_max = q_data[0];
+            float q_sum_abs = 0.0f;
+            for (size_t i = 0; i < total_q_elements; ++i) {
+                q_min = std::min(q_min, q_data[i]);
+                q_max = std::max(q_max, q_data[i]);
+                q_sum_abs += std::abs(q_data[i]);
+            }
+            float q_mean_abs = q_sum_abs / total_q_elements;
+            
+            LOG_INFO("SNAPSHOT Q_PROJECTION_layer" << layer_index_ 
+                     << " stats: min=" << q_min << " max=" << q_max 
+                     << " mean_abs=" << q_mean_abs
+                     << " shape=[" << seq_len << "," << (local_h * head_dim_) << "]"
+                     << " q[0,559]=" << q_data[559]);
+            
             snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, local_q->data(), seq_len, local_h * head_dim_);
         }
 
