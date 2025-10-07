@@ -266,6 +266,40 @@ namespace llaminar
                 local_wk = global_wk;
                 local_wv = global_wv;
                 local_wo = global_wo;
+                
+                // ASSERTIONS: Verify weight dimensions match expected PyTorch nn.Linear format
+                // PyTorch stores weights as [out_features, in_features]
+                auto assert_weight_shape = [&](const std::shared_ptr<TensorBase>& w, const char* name, 
+                                               int expected_out, int expected_in) {
+                    if (!w || w->shape().size() != 2) {
+                        throw std::runtime_error(std::string(name) + ": weight must be 2D tensor");
+                    }
+                    int actual_out = w->shape()[0];
+                    int actual_in = w->shape()[1];
+                    if (actual_out != expected_out || actual_in != expected_in) {
+                        std::ostringstream oss;
+                        oss << name << ": weight shape mismatch! "
+                            << "Expected [" << expected_out << "," << expected_in << "], "
+                            << "got [" << actual_out << "," << actual_in << "]";
+                        throw std::runtime_error(oss.str());
+                    }
+                    if (getRank() == 0 && layer_index_ == 0) {
+                        LOG_DEBUG(name << " weight shape OK: [" << actual_out << "," << actual_in << "]");
+                    }
+                };
+                
+                // Q: [n_head*head_dim, d_model] = [14*64, 896] = [896, 896]
+                assert_weight_shape(local_wq, "wq", n_head_ * head_dim_, d_model);
+                
+                // K: [n_head_kv*head_dim, d_model] = [2*64, 896] = [128, 896]
+                assert_weight_shape(local_wk, "wk", n_head_kv_ * head_dim_, d_model);
+                
+                // V: [n_head_kv*head_dim, d_model] = [2*64, 896] = [128, 896]
+                assert_weight_shape(local_wv, "wv", n_head_kv_ * head_dim_, d_model);
+                
+                // Wo: [d_model, n_head*head_dim] = [896, 896]
+                assert_weight_shape(local_wo, "wo", d_model, n_head_ * head_dim_);
+                
                 if (getRank() == 0)
                 {
                     LOG_DEBUG("MPIAttentionKernel: single-rank execution, using global weights directly (no distribution)");
@@ -1342,6 +1376,37 @@ namespace llaminar
             }
             size_t local_head_dim = static_cast<size_t>(OUT->shape()[1]);
             
+            // ASSERTIONS: Validate dimensions for matmul operation
+            // Operation: OUT[seq_len, local_head_dim] = input[seq_len, d_model] @ W.T
+            // Where W is stored as [local_head_dim, d_model] (PyTorch format)
+            if (W->shape().size() != 2) {
+                LOG_ERROR(tag << " projection: weight must be 2D, got " << W->shape().size() << "D");
+                return false;
+            }
+            
+            int w_out = W->shape()[0];  // out_features (local_head_dim)
+            int w_in = W->shape()[1];   // in_features (d_model)
+            
+            // Verify weight output dimension matches output tensor feature dimension
+            if (static_cast<size_t>(w_out) != local_head_dim) {
+                std::ostringstream oss;
+                oss << tag << " projection: weight out_features mismatch! "
+                    << "Weight shape=[" << w_out << "," << w_in << "], "
+                    << "Output shape=[" << OUT->shape()[0] << "," << OUT->shape()[1] << "]. "
+                    << "Expected weight[0]=" << local_head_dim;
+                LOG_ERROR(oss.str());
+                return false;
+            }
+            
+            // Verify weight input dimension matches d_model
+            if (static_cast<size_t>(w_in) != d_model) {
+                std::ostringstream oss;
+                oss << tag << " projection: weight in_features mismatch! "
+                    << "Expected weight[1]=" << d_model << ", got " << w_in;
+                LOG_ERROR(oss.str());
+                return false;
+            }
+            
             // Debug: Log weight and output shapes
             if (getRank() == 0 && layer_index_ == 0)
             {
@@ -1352,6 +1417,9 @@ namespace llaminar
                 const float *w_data = W->data();
                 LOG_INFO(tag << " weight samples: w[0]=" << w_data[0] << ", w[1]=" << w_data[1] 
                          << ", w[10]=" << w_data[10] << ", w[100]=" << w_data[100]);
+                LOG_DEBUG(tag << " MATMUL: C[" << seq_len << "," << local_head_dim 
+                          << "] = A[" << seq_len << "," << d_model << "] @ B.T where B=[" 
+                          << w_out << "," << w_in << "]");
             }
             
             if (force_scalar)
@@ -1365,6 +1433,18 @@ namespace llaminar
             }
             else
             {
+                // ASSERT: Validate backend abstraction inputs
+                assert(input->data() != nullptr && "Input data pointer must not be null");
+                assert(W->data() != nullptr && "Weight data pointer must not be null");
+                assert(OUT->data() != nullptr && "Output data pointer must not be null");
+                assert(seq_len > 0 && local_head_dim > 0 && d_model > 0 && 
+                       "Backend dimensions must be positive");
+                
+                if (getRank() == 0 && layer_index_ == 0) {
+                    LOG_DEBUG(tag << " BACKEND: M=" << seq_len << " N=" << local_head_dim 
+                             << " K=" << d_model << " transpose_B=true");
+                }
+                
                 PerfMatmulPhaseScope phase(2, phase_id);
                 bool prefill_like = seq_len >= (size_t)debugEnv().cosma.prefill_threshold;
                 if (prefill_like)
@@ -1412,6 +1492,48 @@ namespace llaminar
                             return false;
                         }
                     }
+                }
+            }
+            
+            // ASSERT: Post-projection output validation
+            {
+                const float *out_data = OUT->data();
+                size_t total_elements = seq_len * local_head_dim;
+                
+                // Check for NaN/Inf
+                bool has_nan_inf = false;
+                for (size_t i = 0; i < total_elements; ++i) {
+                    if (std::isnan(out_data[i]) || std::isinf(out_data[i])) {
+                        has_nan_inf = true;
+                        if (getRank() == 0) {
+                            LOG_ERROR(tag << " output contains NaN/Inf at index " << i 
+                                     << " value=" << out_data[i]);
+                        }
+                        break;
+                    }
+                }
+                assert(!has_nan_inf && "Projection output must not contain NaN or Inf");
+                
+                // Check output is not all zeros (common bug indicator)
+                float sum_abs = 0.0f;
+                for (size_t i = 0; i < total_elements; ++i) {
+                    sum_abs += std::abs(out_data[i]);
+                }
+                float mean_abs = sum_abs / total_elements;
+                assert(mean_abs > 1e-8f && "Projection output suspiciously close to zero");
+                
+                // Log output statistics for debugging
+                if (getRank() == 0 && layer_index_ == 0) {
+                    float min_val = out_data[0], max_val = out_data[0];
+                    for (size_t i = 1; i < total_elements; ++i) {
+                        min_val = std::min(min_val, out_data[i]);
+                        max_val = std::max(max_val, out_data[i]);
+                    }
+                    LOG_DEBUG(tag << " OUTPUT: mean_abs=" << mean_abs 
+                             << " min=" << min_val << " max=" << max_val
+                             << " samples: [0]=" << out_data[0] 
+                             << " [10]=" << out_data[std::min(10UL, total_elements-1)]
+                             << " [last]=" << out_data[total_elements-1]);
                 }
             }
             
