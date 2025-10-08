@@ -19,8 +19,8 @@ TEST(AttentionPrimitives, FusedMatchesStep)
     fill(k, 0.015f);
     fill(v, 0.02f);
     auto q2 = q, k2 = k;
-    apply_rope(q.data(), k.data(), seq, head_dim, heads, 0, 10000.f);
-    apply_rope(q2.data(), k2.data(), seq, head_dim, heads, 0, 10000.f);
+    apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, 10000.f);
+    apply_rope(q2.data(), k2.data(), seq, head_dim, heads, heads, 0, 10000.f);
     std::vector<float> scores(size_t(heads) * seq * seq);
     compute_qk_scores(q.data(), k.data(), scores.data(), seq, head_dim, heads, true, true);
     std::vector<float> out_step(seq * heads * head_dim);
@@ -38,7 +38,7 @@ TEST(AttentionPrimitives, SoftmaxProperties)
     fill(q, 0.01f);
     fill(k, 0.011f);
     fill(v, 0.012f);
-    apply_rope(q.data(), k.data(), seq, head_dim, heads, 0, 10000.f);
+    apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, 10000.f);
     std::vector<float> scores(size_t(heads) * seq * seq);
     compute_qk_scores(q.data(), k.data(), scores.data(), seq, head_dim, heads, true, true);
     auto stats = validate_softmax_rows(scores.data(), seq, heads);
@@ -64,7 +64,7 @@ TEST(AttentionPrimitives, RoPEPairNormInvariant)
             before.push_back(std::sqrt(a * a + b * b));
         }
     }
-    apply_rope(q.data(), k.data(), seq, head_dim, heads, 0, 10000.f);
+    apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, 10000.f);
     int idx = 0;
     for (int t = 0; t < seq; ++t)
     {
@@ -76,4 +76,258 @@ TEST(AttentionPrimitives, RoPEPairNormInvariant)
             ASSERT_NEAR(r, before[idx++], 1e-6f);
         }
     }
+}
+
+// Test RoPE at position 0 should be identity (cos=1, sin=0)
+TEST(AttentionPrimitives, RoPEPositionZeroIsIdentity)
+{
+    const int heads = 2, head_dim = 8, seq = 1;
+    std::vector<float> q(seq * heads * head_dim), k(q.size());
+    fill(q, 0.01f);
+    fill(k, 0.02f);
+
+    auto q_orig = q;
+    auto k_orig = k;
+
+    // Apply RoPE at position 0 (n_past=0, seq=1 means only position 0)
+    apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, 10000.f);
+
+    // At position 0, angle = 0 * theta = 0, so cos=1, sin=0
+    // Rotation should be identity: x' = x*1 - y*0 = x, y' = x*0 + y*1 = y
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        ASSERT_NEAR(q[i], q_orig[i], 1e-6f) << "Q mismatch at position " << i;
+        ASSERT_NEAR(k[i], k_orig[i], 1e-6f) << "K mismatch at position " << i;
+    }
+}
+
+// Test RoPE with explicit manual calculation for a simple case
+TEST(AttentionPrimitives, RoPEManualCalculation)
+{
+    const int heads = 1, head_dim = 4, seq = 2;
+    const float freq_base = 10000.f;
+
+    // Create simple input: [1, 0, 2, 0] for first token, [3, 0, 4, 0] for second
+    std::vector<float> q(seq * heads * head_dim);
+    q[0] = 1.0f;
+    q[1] = 0.0f;
+    q[2] = 2.0f;
+    q[3] = 0.0f; // token 0
+    q[4] = 3.0f;
+    q[5] = 0.0f;
+    q[6] = 4.0f;
+    q[7] = 0.0f; // token 1
+
+    std::vector<float> k = q; // Same for K
+
+    // Calculate expected values manually
+    // For head_dim=4, we have 2 pairs (pairs = head_dim/2 = 2)
+    // pair 0: indices (0,1), pair 1: indices (2,3)
+
+    // Theta calculation: theta[p] = 1 / (freq_base^(2*p/head_dim))
+    float theta0 = 1.0f / std::pow(freq_base, 0.0f / head_dim); // = 1.0
+    float theta1 = 1.0f / std::pow(freq_base, 2.0f / head_dim); // = 1 / 10000^0.5 = ~0.01
+
+    // Token 0 (position 0): angle = 0 for both pairs -> identity
+    // Expected: no change
+
+    // Token 1 (position 1):
+    // pair 0: angle = 1 * theta0 = 1.0 rad
+    //   cos(1.0) ≈ 0.5403, sin(1.0) ≈ 0.8415
+    //   q[4] = 3.0*0.5403 - 0.0*0.8415 ≈ 1.6209
+    //   q[5] = 3.0*0.8415 + 0.0*0.5403 ≈ 2.5245
+
+    // pair 1: angle = 1 * theta1 ≈ 0.01 rad
+    //   cos(0.01) ≈ 0.99995, sin(0.01) ≈ 0.01
+    //   q[6] = 4.0*0.99995 - 0.0*0.01 ≈ 3.9998
+    //   q[7] = 4.0*0.01 + 0.0*0.99995 ≈ 0.04
+
+    apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, freq_base);
+
+    // Token 0 should be unchanged (position 0)
+    EXPECT_NEAR(q[0], 1.0f, 1e-5f);
+    EXPECT_NEAR(q[1], 0.0f, 1e-5f);
+    EXPECT_NEAR(q[2], 2.0f, 1e-5f);
+    EXPECT_NEAR(q[3], 0.0f, 1e-5f);
+
+    // Token 1 calculations
+    float cos1 = std::cos(1.0f * theta0);
+    float sin1 = std::sin(1.0f * theta0);
+    EXPECT_NEAR(q[4], 3.0f * cos1, 1e-4f) << "pair 0, first element";
+    EXPECT_NEAR(q[5], 3.0f * sin1, 1e-4f) << "pair 0, second element";
+
+    float angle_pair1 = 1.0f * theta1;
+    float cos_p1 = std::cos(angle_pair1);
+    float sin_p1 = std::sin(angle_pair1);
+    EXPECT_NEAR(q[6], 4.0f * cos_p1, 1e-4f) << "pair 1, first element";
+    EXPECT_NEAR(q[7], 4.0f * sin_p1, 1e-4f) << "pair 1, second element";
+}
+
+// Test RoPE with multi-head layout to expose tensor layout issues
+TEST(AttentionPrimitives, RoPEMultiHeadLayout)
+{
+    const int heads = 2, head_dim = 4, seq = 2;
+    const float freq_base = 10000.f;
+
+    // Create input with distinguishable pattern for each head
+    std::vector<float> q(seq * heads * head_dim);
+
+    // Token 0, Head 0: [1, 0, 2, 0]
+    q[0] = 1.0f;
+    q[1] = 0.0f;
+    q[2] = 2.0f;
+    q[3] = 0.0f;
+    // Token 0, Head 1: [10, 0, 20, 0]
+    q[4] = 10.0f;
+    q[5] = 0.0f;
+    q[6] = 20.0f;
+    q[7] = 0.0f;
+
+    // Token 1, Head 0: [3, 0, 4, 0]
+    q[8] = 3.0f;
+    q[9] = 0.0f;
+    q[10] = 4.0f;
+    q[11] = 0.0f;
+    // Token 1, Head 1: [30, 0, 40, 0]
+    q[12] = 30.0f;
+    q[13] = 0.0f;
+    q[14] = 40.0f;
+    q[15] = 0.0f;
+
+    std::vector<float> k = q;
+
+    // Apply RoPE
+    apply_rope(q.data(), k.data(), seq, head_dim, heads, heads, 0, freq_base);
+
+    // Token 0 should be unchanged (position 0)
+    EXPECT_NEAR(q[0], 1.0f, 1e-5f) << "Token 0, Head 0, dim 0";
+    EXPECT_NEAR(q[4], 10.0f, 1e-5f) << "Token 0, Head 1, dim 0";
+
+    // Token 1, Head 0 - check rotation was applied
+    float theta0 = 1.0f / std::pow(freq_base, 0.0f / head_dim);
+    float cos1 = std::cos(1.0f * theta0);
+    float sin1 = std::sin(1.0f * theta0);
+
+    // The indexing here depends on the expected layout
+    // If layout is [token][head][dim], index = token * (heads*head_dim) + head * head_dim + dim
+    // Token 1, Head 0, pair 0: indices 8, 9
+    EXPECT_NEAR(q[8], 3.0f * cos1, 1e-4f) << "Token 1, Head 0, pair 0, first";
+    EXPECT_NEAR(q[9], 3.0f * sin1, 1e-4f) << "Token 1, Head 0, pair 0, second";
+
+    // Token 1, Head 1, pair 0: indices 12, 13
+    EXPECT_NEAR(q[12], 30.0f * cos1, 1e-4f) << "Token 1, Head 1, pair 0, first";
+    EXPECT_NEAR(q[13], 30.0f * sin1, 1e-4f) << "Token 1, Head 1, pair 0, second";
+}
+
+// Test to verify theta (frequency) calculation matches PyTorch
+TEST(AttentionPrimitives, RoPEThetaCalculation)
+{
+    const int head_dim = 128;
+    const float freq_base = 10000.0f;
+    const int pairs = head_dim / 2;
+
+    // Calculate theta values as our code does
+    std::vector<float> theta(pairs);
+    for (int p = 0; p < pairs; ++p)
+        theta[p] = 1.0f / std::pow(freq_base, (2.0f * p) / head_dim);
+
+    // Verify a few key values
+    // pair 0: theta = 1 / 10000^0 = 1.0
+    EXPECT_NEAR(theta[0], 1.0f, 1e-6f);
+
+    // pair 1: theta = 1 / 10000^(2/128) = 1 / 10000^0.015625
+    float expected_theta1 = 1.0f / std::pow(10000.0f, 2.0f / 128.0f);
+    EXPECT_NEAR(theta[1], expected_theta1, 1e-6f);
+
+    // last pair (63): theta = 1 / 10000^(126/128) = 1 / 10000^0.984375
+    float expected_theta_last = 1.0f / std::pow(10000.0f, 126.0f / 128.0f);
+    EXPECT_NEAR(theta[63], expected_theta_last, 1e-6f);
+
+    // Theta should be monotonically decreasing
+    for (int p = 1; p < pairs; ++p)
+    {
+        EXPECT_LT(theta[p], theta[p - 1]) << "Theta not decreasing at pair " << p;
+    }
+}
+
+// Test highlighting potential tensor layout issue with local head sharding
+// This test simulates what happens in MPI: each rank gets a shard of heads
+TEST(AttentionPrimitives, RoPELocalHeadSharding)
+{
+    // Simulate a scenario like the actual model:
+    // Total Q heads: 14, Total KV heads: 2
+    // On 2 MPI ranks: each rank gets local_q_heads=7, local_k_heads=1
+    const int total_q_heads = 14;
+    const int total_k_heads = 2;
+    const int ranks = 2;
+    const int local_q_heads = total_q_heads / ranks; // 7
+    const int local_k_heads = total_k_heads / ranks; // 1
+    const int head_dim = 64;
+    const int seq_len = 2;
+    const float freq_base = 10000.0f;
+
+    // Create full Q tensor [seq_len, total_q_heads * head_dim]
+    std::vector<float> full_q(seq_len * total_q_heads * head_dim);
+    for (size_t i = 0; i < full_q.size(); ++i)
+        full_q[i] = float(i % 100) * 0.01f; // Simple pattern
+
+    // Simulate rank 0's local shard: first 7 heads
+    // Layout: [seq_len, local_q_heads * head_dim]
+    std::vector<float> local_q_rank0(seq_len * local_q_heads * head_dim);
+    for (int t = 0; t < seq_len; ++t)
+    {
+        // Copy the first local_q_heads heads from full tensor
+        for (int h = 0; h < local_q_heads; ++h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                int src_idx = t * (total_q_heads * head_dim) + h * head_dim + d;
+                int dst_idx = t * (local_q_heads * head_dim) + h * head_dim + d;
+                local_q_rank0[dst_idx] = full_q[src_idx];
+            }
+        }
+    }
+
+    // Create dummy K (not testing K here)
+    std::vector<float> dummy_k(seq_len * local_k_heads * head_dim, 0.0f);
+
+    // Apply RoPE to local shard
+    // BUG: apply_rope uses q_heads parameter but the data only contains local_q_heads!
+    // This is the test case that should fail if there's a layout mismatch
+    auto local_q_copy = local_q_rank0;
+
+    // This should work correctly because the tensor IS laid out as [seq, heads, head_dim]
+    // even though it's a shard
+    apply_rope(local_q_copy.data(), dummy_k.data(), seq_len, head_dim,
+               local_q_heads, local_k_heads, 0, freq_base);
+
+    // Verify that values changed (rotation applied) for position > 0
+    // At position 0, rotation is identity
+    for (int h = 0; h < local_q_heads; ++h)
+    {
+        for (int d = 0; d < head_dim; ++d)
+        {
+            int idx_t0 = 0 * local_q_heads * head_dim + h * head_dim + d;
+            EXPECT_NEAR(local_q_copy[idx_t0], local_q_rank0[idx_t0], 1e-5f)
+                << "Position 0 should be identity at h=" << h << " d=" << d;
+        }
+    }
+
+    // At position 1, values should be rotated (different from original)
+    bool some_values_changed = false;
+    for (int h = 0; h < local_q_heads; ++h)
+    {
+        for (int d = 0; d < head_dim; d += 2) // Check pairs
+        {
+            int idx_t1 = 1 * local_q_heads * head_dim + h * head_dim + d;
+            if (std::abs(local_q_copy[idx_t1] - local_q_rank0[idx_t1]) > 1e-5f)
+            {
+                some_values_changed = true;
+                break;
+            }
+        }
+        if (some_values_changed)
+            break;
+    }
+    EXPECT_TRUE(some_values_changed) << "Position 1 should have rotated values";
 }

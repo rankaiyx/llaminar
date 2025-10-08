@@ -541,7 +541,7 @@ namespace llaminar
             // Apply RoPE and attention with expanded K/V
             llaminar::attn::apply_rope(
                 q_buf.data(), k_expanded.data(),
-                seq_len, head_dim, n_heads,
+                seq_len, head_dim, n_heads, n_heads,
                 n_past_, config().getLayerConfig().rope_freq_base);
 
             llaminar::attn::fused_attention(
@@ -564,7 +564,7 @@ namespace llaminar
             // Apply RoPE to Q and K in-place
             llaminar::attn::apply_rope(
                 q_buf.data(), k_expanded.data(),
-                seq_len, head_dim, n_heads,
+                seq_len, head_dim, n_heads, n_heads,
                 n_past_, config().getLayerConfig().rope_freq_base);
 
             // Compute full attention

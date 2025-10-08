@@ -25,6 +25,20 @@ namespace llaminar
         auto loaded = llaminar::loadModelWeights_impl_bridge(loader, cfg_.getLayerConfig());
         auto weights = std::make_unique<QwenModelWeights>();
         weights->inner = std::move(loaded);
+
+        // CRITICAL: Validate all weights against canonical GGUF format contracts
+        // This ensures kernels can trust the weight dimensions/orientations without runtime detection
+        try
+        {
+            weights->validate(cfg_.getLayerConfig());
+            LOG_INFO("✓ All weights validated against canonical GGUF format");
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("Weight validation failed: " << e.what());
+            throw; // Re-throw to fail fast with clear error
+        }
+
         return weights;
     }
     bool QwenPipelineAdapter::prefill(const std::vector<int> &tokens, const IModelWeights &weights_base, StageContext &ctx)

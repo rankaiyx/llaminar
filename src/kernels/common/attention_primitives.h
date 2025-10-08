@@ -27,7 +27,7 @@
 namespace llaminar::attn
 {
 
-    void apply_rope(float *q, float *k, int seq_len, int head_dim, int heads, int n_past, float freq_base);
+    void apply_rope(float *q, float *k, int seq_len, int head_dim, int q_heads, int k_heads, int n_past, float freq_base);
     void compute_qk_scores(const float *q, const float *k, float *scores, int seq_len, int head_dim, int heads, bool causal, bool apply_softmax);
     void apply_scores_to_v(const float *scores, const float *v, float *out, int seq_len, int head_dim, int heads);
     void fused_attention(const float *q, const float *k, const float *v, float *out, int seq_len, int head_dim, int heads, bool causal);

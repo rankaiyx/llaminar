@@ -1,79 +1,135 @@
 /**
  * @file MPIAttentionKernel.cpp
- * @brief Multi-head self-attention (prefill / decode) with optional grouped (GQA) key/value heads in MPI context.
- *
- * @section Contract
- * Inputs:
- *  - inputs[0]: Query tensor Q [seq_len_q, n_heads, head_dim].
- *  - inputs[1]: Key tensor K   [seq_len_k, n_kv_heads, head_dim].
- *  - inputs[2]: Value tensor V [seq_len_k, n_kv_heads, head_dim].
- *  - inputs[3] (optional): Causal mask or attention bias structure.
- * Outputs:
- *  - outputs[0]: Context tensor C [seq_len_q, n_heads, head_dim].
- * Semantics:
- *  - Scaled dot-product attention with RoPE already applied upstream.
- *  - Grouped attention: heads mapped so each query head attends corresponding kv group (n_heads multiple of n_kv_heads).
- * Scaling & Masking:
- *  - Score_ij = (Q_i · K_j) / sqrt(head_dim).
- *  - If causal, j > i positions masked (set to -inf before softmax).
- * Numerical Expectations:
- *  - Softmax stability: Max-subtraction per row; overflow-safe for typical head_dim <= 256.
- *  - Relative error vs reference < 5e-5 (accumulation order dependent) for float32.
- * Distribution Strategy (current):
- *  - Replicated computation across ranks (future: sequence or head partition + AllReduce).
- * Error Modes:
- *  - Dimension mismatch, invalid head grouping (n_heads % n_kv_heads != 0), null inputs.
- *  - seq_len_k < seq_len_q under causal mask unsupported.
- * Threading:
- *  - Parallelized across (seq_len_q * n_heads) independent softmax+matmul tasks.
- * Performance Notes:
- *  - Potential optimization: fuse QK^T + softmax + PV with block tiling and cache-friendly layout.
- * Future Extensions:
- *  - Flash-attention style block-sparse kernel, distributed head partition.
- *  - Mixed precision (FP16/BF16) with accumulation in float32.
- * Safety:
- *  - Checks for NaN/Inf after softmax optionally (debug build) could be enabled via env flag (TBD).
- * @warning Ensure RoPE applied before this kernel for correct positional alignment.
- * @todo Introduce streaming KV cache update path for decode stage.
+ * @brief Clean, minimal implementation of MPI attention kernel
  * @author David Sanftenberg
+ *
+ * This is a simplified rewrite focusing on clarity and correctness.
+ * Key improvements:
+ * - No lambdas - all proper member functions
+ * - Single execution path - no conditional debug branches
+ * - Uses TensorFactory throughout - no type conversion issues
+ * - Direct BLAS calls - no backend abstraction layers
+ * - Optimized primitives for softmax, RoPE, attention
+ * - Optional validation (zero overhead when disabled)
+ *
+ * Architecture: 7 sequential steps
+ * 1. Extract inputs & validate count
+ * 2. Distribute weights (single-rank: use directly, multi-rank: slice by heads)
+ * 3. Compute Q/K/V projections with optional bias
+ * 4. Apply RoPE to Q and K
+ * 5. Expand K/V for GQA if needed
+ * 6. Compute attention: QK^T → softmax → @V
+ * 7. Output projection + MPI gather
  */
+
 #include "MPIAttentionKernel.h"
-#include "attention/AttentionValidator.h"
-#include "../utils/perf_counters.h"
-#include "../utils/debug_env.h"
-#include "../utils/debug_sharding.h"
-#include "kernels/common/attention_primitives.h" // shared fast paths (RoPE, QK scores, scores@V)
-#include "kernels/common/softmax_core.h" // softmax primitives for attention scores
-#include "../adaptive_matmul.h"
-#include "../backends/prefill_backend.h"
-#include "../backends/inference_backend.h"
-#include "../tp_policy.h"
 #include "../logger.h"
-#include "../performance_timer.h"
 #include "../tensors/tensor_factory.h"
-#include "../tensors/sharded_simple_tensor.h"
-#include "../tensors/shard_spec.h"
-#include "../tensors/tp_output_projection_executor.h" // TP simulation executor
-#include "../pipeline_snapshot_manager.h" // For parity testing snapshots
+#include "../matmul_backend_selection.h"
+#include "common/attention_primitives.h"
+#include "common/softmax_core.h"
+#include "attention/AttentionStageContracts.h"
+#include "attention/AttentionValidator.h"
+#include "../utils/debug_env.h"
+#include <cblas.h>
 #include <cmath>
-#include <algorithm>
 #include <cstring>
-#include <chrono>
-#include <iostream>
-#include <sstream>
 #include <mpi.h>
-#include "tensors/tp_partition.h"
-#include "../qwen_pipeline.h" // for LayerTokenDiffRow instrumentation
 
 namespace llaminar
 {
 
-    MPIAttentionKernel::MPIAttentionKernel(int n_head, int n_head_kv, int head_dim, float rope_freq_base, DistributionStrategy strategy)
+    // ============================================================================
+    // Helper: Granular tensor validation (detects NaN, Inf, uninitialized data)
+    // ============================================================================
+    struct TensorHealthCheck
+    {
+        std::string name;
+        int nan_count = 0;
+        int inf_count = 0;
+        int zero_count = 0;
+        int normal_count = 0;
+        float min_val = std::numeric_limits<float>::max();
+        float max_val = std::numeric_limits<float>::lowest();
+        float abs_sum = 0.0f;
+
+        TensorHealthCheck(const std::string &n) : name(n) {}
+
+        void check(const float *data, size_t size)
+        {
+            for (size_t i = 0; i < size; ++i)
+            {
+                float val = data[i];
+                if (std::isnan(val))
+                {
+                    nan_count++;
+                }
+                else if (std::isinf(val))
+                {
+                    inf_count++;
+                }
+                else if (val == 0.0f)
+                {
+                    zero_count++;
+                }
+                else
+                {
+                    normal_count++;
+                    min_val = std::min(min_val, val);
+                    max_val = std::max(max_val, val);
+                    abs_sum += std::abs(val);
+                }
+            }
+        }
+
+        bool is_healthy() const
+        {
+            return nan_count == 0 && inf_count == 0 && normal_count > 0;
+        }
+
+        bool is_uninitialized() const
+        {
+            // Heuristic: if min/max are huge or all zeros, likely uninitialized
+            return (normal_count > 0 && (std::abs(min_val) > 1e10f || std::abs(max_val) > 1e10f)) ||
+                   (normal_count == 0 && zero_count > 0);
+        }
+
+        void log(int rank = -1) const
+        {
+            std::string prefix = (rank >= 0) ? "[Rank " + std::to_string(rank) + "] " : "";
+            if (!is_healthy())
+            {
+                LOG_ERROR(prefix << "UNHEALTHY " << name << ": NaN=" << nan_count
+                                 << " Inf=" << inf_count << " Zero=" << zero_count
+                                 << " Normal=" << normal_count);
+                if (normal_count > 0)
+                {
+                    LOG_ERROR(prefix << "  Range: [" << min_val << ", " << max_val << "], Sum=" << abs_sum);
+                }
+            }
+            else if (is_uninitialized())
+            {
+                LOG_WARN(prefix << "SUSPICIOUS " << name << ": Range [" << min_val << ", " << max_val
+                                << "] suggests uninitialized data");
+            }
+            else
+            {
+                LOG_DEBUG(prefix << "HEALTHY " << name << ": " << normal_count << " values in ["
+                                 << min_val << ", " << max_val << "], sum=" << abs_sum);
+            }
+        }
+    };
+
+    // ============================================================================
+    // Constructor
+    // ============================================================================
+    MPIAttentionKernel::MPIAttentionKernel(int n_head, int n_head_kv, int head_dim,
+                                           float rope_freq_base, DistributionStrategy strategy)
         : n_head_(n_head),
           n_head_kv_(n_head_kv),
           head_dim_(head_dim),
-          n_past_(0),                  // Initialize to 0 for first token
-          d_model_(n_head * head_dim), // Initialize based on architecture
+          n_past_(0),
+          d_model_(n_head * head_dim),
           rope_freq_base_(rope_freq_base),
           strategy_(strategy)
     {
@@ -87,1154 +143,9 @@ namespace llaminar
         }
     }
 
-    bool MPIAttentionKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                     std::vector<std::shared_ptr<TensorBase>> &outputs)
-    {
-        // Execution timing scaffolding (per-phase breakdown)
-        auto t_exec_start = std::chrono::high_resolution_clock::now();
-        double t_distribute_ms = 0.0, t_proj_ms = 0.0, t_rope_ms = 0.0, t_attn_ms = 0.0;
-        double t_reconstruct_wo_ms = 0.0, t_output_proj_ms = 0.0, t_gather_pre_ms = 0.0, t_gather_post_ms = 0.0, t_emit_ms = 0.0;
-        const auto &perf_env = debugEnv().performance;
-        auto time_block = [](auto &&fn)
-        {
-            auto t0 = std::chrono::high_resolution_clock::now();
-            fn();
-            auto t1 = std::chrono::high_resolution_clock::now();
-            return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
-        };
-
-        if (!validate(inputs, outputs))
-        {
-            return false;
-        }
-
-        // Extract inputs: input, wq, wk, wv, wo, k_cache, v_cache
-        auto global_input = inputs[0];
-        auto global_wq = inputs[1];
-        auto global_wk = inputs[2];
-        auto global_wv = inputs[3];
-        auto global_wo = inputs[4];
-        auto k_cache = inputs[5]; // TODO: Handle KV cache in future version
-        auto v_cache = inputs[6]; // TODO: Handle KV cache in future version
-        auto global_output = outputs[0];
-
-        size_t seq_len = static_cast<size_t>(global_input->shape()[0]);
-        size_t d_model = static_cast<size_t>(global_input->shape()[1]);
-
-        // DEBUG: Trace execution at the very start
-        if (getRank() == 0 && layer_index_ == 0) {
-            std::cout << "[ATTN_ENTRY] layer=0 seq_len=" << seq_len << " d_model=" << d_model << std::endl;
-            std::cout << std::flush;
-        }
-
-        // Heuristic auto-switch: if user did NOT explicitly request a mode via env var earlier,
-        // choose GatherHeadsPreProjection when sequence length exceeds threshold.
-        // Threshold controlled by LLAMINAR_ATTN_GATHER_THRESHOLD (default 1024).
-        static bool env_mode_forced = debugEnv().attention.output_mode_forced;
-        if (!env_mode_forced)
-        {
-            int threshold = 1024;
-            if (debugEnv().attention.gather_threshold >= 1)
-                threshold = debugEnv().attention.gather_threshold;
-            AttentionOutputMode decided = output_mode_; // current (likely LocalHeads)
-            if (seq_len >= (size_t)threshold)
-            {
-                decided = AttentionOutputMode::GatherHeadsPreProjection;
-            }
-            if (decided != output_mode_ && getRank() == 0)
-            {
-                LOG_INFO("Attention heuristic switching mode -> gather_pre (seq_len=" << seq_len
-                                                                                      << ", threshold=" << threshold << ")");
-            }
-            output_mode_ = decided;
-        }
-
-        // Ensure input is replicated across all ranks for tests that only initialize on rank 0.
-        // This avoids undefined values on other ranks influencing local computations.
-        if (getSize() > 1)
-        {
-            MPI_Bcast(global_input->data(), (int)global_input->size(), MPI_FLOAT, 0, MPI_COMM_WORLD);
-        }
-
-        // Get local head distribution
-        auto [local_heads, head_offset] = getHeadDistribution();
-        size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-
-        // Get K/V head distribution for GQA models (where n_head_kv != n_head)
-        auto [local_kv_heads, kv_head_offset] = getKVHeadDistribution();
-        size_t local_kv_head_dim = static_cast<size_t>(local_kv_heads * head_dim_);
-
-        // Detect pre-sharded weights (Head axis) to bypass legacy distributeInputs.
-        auto is_head_sharded = [](const std::shared_ptr<TensorBase> &t) -> bool
-        {
-            if (!t)
-                return false;
-            // Dynamic cast to ShardedSimpleTensor if available.
-            if (auto *raw = dynamic_cast<ShardedSimpleTensor *>(t.get()))
-            {
-                const auto &spec = raw->shard_spec();
-                return spec.is_sharded() && spec.axis == ShardSpec::Axis::Heads;
-            }
-            return false;
-        };
-
-        bool pre_sharded = is_head_sharded(global_wq) && is_head_sharded(global_wk) &&
-                           is_head_sharded(global_wv) && is_head_sharded(global_wo);
-
-        // CRITICAL ASSERTION: Detect invalid output mode configuration
-        //
-        // If weights are NOT head-sharded (i.e., replicated or row-partitioned) AND we have
-        // multiple MPI ranks, then LocalHeads mode is INCORRECT because it will only return
-        // partial contributions without summing across ranks.
-        //
-        // This was the root cause of 98.6% parity test failures - see investigation in
-        // docs/OPENBLAS_PREFILL_ROOT_CAUSE_ANALYSIS.md
-        if (!pre_sharded && getSize() > 1 && output_mode_ == AttentionOutputMode::LocalHeads)
-        {
-            LOG_ERROR("MPIAttentionKernel: INVALID CONFIGURATION DETECTED!");
-            LOG_ERROR("  - Weights are NOT head-sharded (replicated or row-partitioned)");
-            LOG_ERROR("  - Running with multiple MPI ranks (" << getSize() << " ranks)");
-            LOG_ERROR("  - Output mode is LocalHeads (returns only partial results)");
-            LOG_ERROR("  - This will produce INCORRECT outputs (missing contributions from other ranks)");
-            LOG_ERROR("  - SOLUTION: Call setOutputMode(AttentionOutputMode::GatherHeadsPostProjection)");
-            LOG_ERROR("             before registering the kernel to enable MPI_Allreduce");
-            throw std::runtime_error(
-                "MPIAttentionKernel: LocalHeads mode requires head-sharded weights. "
-                "For replicated/row-partitioned weights with multiple ranks, use GatherHeadsPostProjection mode.");
-        }
-
-        std::shared_ptr<TensorBase> local_wq;
-        std::shared_ptr<TensorBase> local_wk;
-        std::shared_ptr<TensorBase> local_wv;
-        std::shared_ptr<TensorBase> local_wo;
-
-        if (local_heads == 0)
-        {
-            // No Q heads assigned to this rank (imbalanced head/world configuration). Allocate minimal tensors and skip work.
-            local_wq = createLocalSimpleTensor({d_model, 0});
-            local_wk = createLocalSimpleTensor({d_model, 0});
-            local_wv = createLocalSimpleTensor({d_model, 0});
-            local_wo = createLocalSimpleTensor({0, d_model});
-            // Still need empty Q/K/V to satisfy downstream shapes
-            auto local_q = createLocalSimpleTensor({seq_len, 0});
-            auto local_k = createLocalSimpleTensor({seq_len, 0});
-            auto local_v = createLocalSimpleTensor({seq_len, 0});
-            // Produce a zeroed attention output (residual path will just add zero)
-            if (!outputs.empty() && outputs[0])
-            {
-                auto &attn_out_zero = outputs[0];
-                if (attn_out_zero->shape().size() == 2 && attn_out_zero->shape()[0] == (int)seq_len && attn_out_zero->shape()[1] == d_model)
-                {
-                    memset(attn_out_zero->data(), 0, seq_len * d_model * sizeof(float));
-                }
-            }
-            if (getRank() == 0)
-                LOG_WARN("MPIAttentionKernel: rank has zero local heads; producing zero contribution");
-            return true;
-        }
-
-        if (pre_sharded)
-        {
-            // Assume each provided weight already holds only this rank's slice.
-            // Validate slice dimensionality matches our expected local_head_dim.
-            size_t wq_cols = static_cast<size_t>(global_wq->shape()[1]);
-            size_t wk_cols = static_cast<size_t>(global_wk->shape()[1]);
-            size_t wv_cols = static_cast<size_t>(global_wv->shape()[1]);
-            size_t wo_rows = static_cast<size_t>(global_wo->shape()[0]);
-            if (wq_cols != local_head_dim || wk_cols != local_kv_head_dim || wv_cols != local_kv_head_dim || wo_rows != local_head_dim)
-            {
-                LOG_ERROR("MPIAttentionKernel: pre-sharded weight dims mismatch local expectation (Q expected " << local_head_dim << ", KV expected " << local_kv_head_dim << ")");
-                return false;
-            }
-            local_wq = global_wq;
-            local_wk = global_wk;
-            local_wv = global_wv;
-            local_wo = global_wo;
-            if (getRank() == 0)
-            {
-                LOG_DEBUG("MPIAttentionKernel: detected pre-sharded head-axis weights; skipping distributeInputs");
-            }
-        }
-        else
-        {
-            // Legacy path: allocate local slices then copy/distribute.
-            // For single-rank execution, skip distribution and use global weights directly
-            if (getSize() == 1)
-            {
-                // Single rank: use full global weights (no distribution needed)
-                local_wq = global_wq;
-                local_wk = global_wk;
-                local_wv = global_wv;
-                local_wo = global_wo;
-                
-                // ASSERTIONS: Verify weight dimensions match expected PyTorch nn.Linear format
-                // PyTorch stores weights as [out_features, in_features]
-                auto assert_weight_shape = [&](const std::shared_ptr<TensorBase>& w, const char* name, 
-                                               int expected_out, int expected_in) {
-                    if (!w || w->shape().size() != 2) {
-                        throw std::runtime_error(std::string(name) + ": weight must be 2D tensor");
-                    }
-                    int actual_out = w->shape()[0];
-                    int actual_in = w->shape()[1];
-                    if (actual_out != expected_out || actual_in != expected_in) {
-                        std::ostringstream oss;
-                        oss << name << ": weight shape mismatch! "
-                            << "Expected [" << expected_out << "," << expected_in << "], "
-                            << "got [" << actual_out << "," << actual_in << "]";
-                        throw std::runtime_error(oss.str());
-                    }
-                    if (getRank() == 0 && layer_index_ == 0) {
-                        LOG_DEBUG(name << " weight shape OK: [" << actual_out << "," << actual_in << "]");
-                    }
-                };
-                
-                // Q: [n_head*head_dim, d_model] = [14*64, 896] = [896, 896]
-                assert_weight_shape(local_wq, "wq", n_head_ * head_dim_, d_model);
-                
-                // K: [n_head_kv*head_dim, d_model] = [2*64, 896] = [128, 896]
-                assert_weight_shape(local_wk, "wk", n_head_kv_ * head_dim_, d_model);
-                
-                // V: [n_head_kv*head_dim, d_model] = [2*64, 896] = [128, 896]
-                assert_weight_shape(local_wv, "wv", n_head_kv_ * head_dim_, d_model);
-                
-                // Wo: [d_model, n_head*head_dim] = [896, 896]
-                assert_weight_shape(local_wo, "wo", d_model, n_head_ * head_dim_);
-                
-                if (getRank() == 0)
-                {
-                    LOG_DEBUG("MPIAttentionKernel: single-rank execution, using global weights directly (no distribution)");
-                }
-            }
-            else
-            {
-                // Multi-rank: allocate local slices and distribute
-                local_wq = createLocalSimpleTensor({d_model, local_head_dim});
-                local_wk = createLocalSimpleTensor({d_model, local_kv_head_dim});  // Use K/V dimensions for GQA
-                local_wv = createLocalSimpleTensor({d_model, local_kv_head_dim});  // Use K/V dimensions for GQA
-                local_wo = createLocalSimpleTensor({local_head_dim, d_model});
-                {
-                    PERF_SCOPED_TIMER("MPIAttentionKernel::distributeInputs");
-                    t_distribute_ms = time_block([&]
-                                                 { distributeInputs(global_input, global_wq, global_wk, global_wv, global_wo,
-                                                                    local_wq, local_wk, local_wv, local_wo, seq_len, d_model); });
-                }
-            }
-        }
-        // Create local projection tensors
-        auto local_q = createLocalSimpleTensor({seq_len, local_head_dim});
-        auto local_k = createLocalSimpleTensor({seq_len, local_kv_head_dim});  // Use K/V dimensions for GQA
-        auto local_v = createLocalSimpleTensor({seq_len, local_kv_head_dim});  // Use K/V dimensions for GQA
-
-        // Compute Q, K, V projections for local heads using COSMA
-        {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalProjections");
-            t_proj_ms = time_block([&]
-                                   { computeLocalProjections(global_input, local_wq, local_wk, local_wv,
-                                                             local_q, local_k, local_v, seq_len, d_model); });
-        }
-        if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
-        {
-            size_t slice = (size_t)local_heads * head_dim_;
-            size_t offset = (seq_len - 1) * slice;
-            bool incr = (seq_len == 1 && n_past_ > 0);
-            int capture_seq_len_meta = incr ? (n_past_ + 1) : (int)seq_len;
-            QwenPipeline::appendInternalAttnRow(nullptr,
-                                                layer_index_, capture_seq_len_meta, incr,
-                                                "attn_int_q_proj", local_q->data() + offset, slice);
-            QwenPipeline::appendInternalAttnRow(nullptr,
-                                                layer_index_, capture_seq_len_meta, incr,
-                                                "attn_int_k_proj", local_k->data() + offset, slice);
-        }
-        // Apply RoPE to local Q and K
-        {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::applyLocalRoPE");
-            t_rope_ms = time_block([&]
-                                   { applyLocalRoPE(local_q->data(), local_k->data(), seq_len, local_kv_heads); });  // Use K/V head count for RoPE
-        }
-        
-        // For GQA (n_head != n_head_kv), replicate K and V to match Q head dimensions
-        // This allows the attention computation to work with the expected dimensions
-        std::shared_ptr<TensorBase> local_k_replicated, local_v_replicated;
-        if (n_head_ != n_head_kv_)
-        {
-            // Allocate replicated K/V with Q head dimensions
-            local_k_replicated = createLocalSimpleTensor({seq_len, local_head_dim});
-            local_v_replicated = createLocalSimpleTensor({seq_len, local_head_dim});
-            
-            // Replicate K/V heads to match Q
-            for (size_t s = 0; s < seq_len; ++s)
-            {
-                for (int q_head = 0; q_head < local_heads; ++q_head)
-                {
-                    int global_q_head = head_offset + q_head;
-                    int kv_head = global_q_head % n_head_kv_;  // Map Q head to corresponding K/V head
-                    int local_kv_head = kv_head - kv_head_offset;  // Local K/V head index
-                    
-                    if (local_kv_head >= 0 && local_kv_head < local_kv_heads)
-                    {
-                        // Copy this K/V head to the Q head position
-                        const float *src_k = local_k->data() + s * local_kv_head_dim + local_kv_head * head_dim_;
-                        const float *src_v = local_v->data() + s * local_kv_head_dim + local_kv_head * head_dim_;
-                        float *dst_k = local_k_replicated->data() + s * local_head_dim + q_head * head_dim_;
-                        float *dst_v = local_v_replicated->data() + s * local_head_dim + q_head * head_dim_;
-                        memcpy(dst_k, src_k, head_dim_ * sizeof(float));
-                        memcpy(dst_v, src_v, head_dim_ * sizeof(float));
-                    }
-                }
-            }
-            
-            // Use replicated versions for attention
-            local_k = local_k_replicated;
-            local_v = local_v_replicated;
-        }
-        
-        // Capture Q and K after RoPE for parity testing
-        if (snapshot_callback_ && getRank() == 0)
-        {
-            auto [local_h, _] = getHeadDistribution();
-            // Capture full Q tensor post-RoPE (flatten from [seq_len, local_heads, head_dim] to [seq_len, local_head_dim])
-            snapshot_callback_(PipelineStage::ROPE_APPLICATION, layer_index_, local_q->data(), seq_len, local_h * head_dim_);
-            // Note: We capture Q for ROPE_APPLICATION stage; K is also RoPE'd but can be validated via attention scores
-        }
-        
-        if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
-        {
-            size_t slice = (size_t)local_heads * head_dim_;
-            size_t offset = (seq_len - 1) * slice;
-            bool incr = (seq_len == 1 && n_past_ > 0);
-            int capture_seq_len_meta = incr ? (n_past_ + 1) : (int)seq_len;
-            QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, incr, "attn_int_q_rope", local_q->data() + offset, slice);
-            QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, incr, "attn_int_k_rope", local_k->data() + offset, slice);
-        }
-
-        // Prefill KV cache population (only once at sequence start). Support both full and grouped KV heads.
-        // For grouped KV (multi-query) we map each query head to its KV head via (q_head % n_head_kv_). We may
-        // write duplicate KV slices when multiple query heads map to the same KV head; duplicates are identical
-        // and therefore harmless for correctness in this diagnostic path.
-        if (n_past_ == 0 && seq_len > 1)
-        {
-            float *k_cache_ptr = k_cache->data();
-            float *v_cache_ptr = v_cache->data();
-            size_t kv_dim = static_cast<size_t>(n_head_kv_) * head_dim_;
-            const float *local_k_ptr = local_k->data();
-            const float *local_v_ptr = local_v->data();
-            int group_size = (n_head_kv_ == 0) ? 1 : (n_head_ / n_head_kv_);
-            for (size_t t = 0; t < seq_len; ++t)
-            {
-                const float *k_row_local = local_k_ptr + t * local_head_dim;
-                const float *v_row_local = local_v_ptr + t * local_head_dim;
-                for (int lh = 0; lh < local_heads; ++lh)
-                {
-                    size_t global_q_head = head_offset + lh;
-                    size_t kv_head = static_cast<size_t>(global_q_head % n_head_kv_);
-                    // For grouped KV ensure only canonical query head (lowest in group) writes to cache to avoid
-                    // clobbering with potentially different numeric projections across ranks.
-                    if (n_head_kv_ != n_head_)
-                    {
-                        if ((global_q_head % group_size) != 0)
-                            continue; // skip non-canonical heads
-                    }
-                    float *k_dest = k_cache_ptr + t * kv_dim + kv_head * head_dim_;
-                    float *v_dest = v_cache_ptr + t * kv_dim + kv_head * head_dim_;
-                    const float *k_src = k_row_local + lh * head_dim_;
-                    const float *v_src = v_row_local + lh * head_dim_;
-                    std::memcpy(k_dest, k_src, head_dim_ * sizeof(float));
-                    std::memcpy(v_dest, v_src, head_dim_ * sizeof(float));
-                }
-            }
-            if (getRank() == 0)
-                LOG_DEBUG("MPIAttentionKernel: populated KV cache for prefill seq_len=" << seq_len << (n_head_kv_ == n_head_ ? "" : " (grouped)"));
-        }
-
-        // Create local attended output tensor. For GatherHeadsPreProjection optimization we store
-        // directly in heads-major layout [local_head_dim, seq_len] to skip a reorder later.
-        // Treat Replicated as an alias of GatherHeadsPreProjection (single global projection path)
-        bool pre_mode = (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
-                         output_mode_ == AttentionOutputMode::Replicated);
-        bool incremental_single = (seq_len == 1 && n_past_ > 0); // single-token decode with history
-        int capture_seq_len_meta = incremental_single ? (n_past_ + 1) : (int)seq_len;
-        auto local_attended_output = pre_mode
-                                         ? createLocalSimpleTensor({local_head_dim, seq_len})
-                                         : createLocalSimpleTensor({seq_len, local_head_dim});
-
-        // Incremental decode specialized path: use KV cache (inputs[5], inputs[6]) to attend over all past tokens + current
-        if (incremental_single)
-        {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::incrementalAttention");
-            t_attn_ms = time_block([&]
-                                   {
-                // Support grouped KV incremental decode (n_head_kv_ <= n_head_). When grouped, all query heads map
-                // to a (possibly smaller) set of KV heads. We re-use the populated KV cache and perform attention
-                // over all past tokens + current.
-
-                size_t kv_dim = static_cast<size_t>(n_head_kv_) * head_dim_;
-                // Safety check on cache shapes (optional)
-                if ((size_t)k_cache->shape()[1] != kv_dim || (size_t)v_cache->shape()[1] != kv_dim)
-                {
-                    LOG_ERROR("MPIAttentionKernel: KV cache dim mismatch for incremental path");
-                    throw std::runtime_error("KV cache dimension mismatch");
-                }
-
-                float *k_cache_ptr = k_cache->data();
-                float *v_cache_ptr = v_cache->data();
-                const float *q_cur = local_q->data(); // [1, local_head_dim]
-                const float *k_cur = local_k->data();
-                const float *v_cur = local_v->data();
-                // Write current token K/V into cache for each (possibly grouped) KV head mapping.
-                // Duplicate writes for grouped heads are harmless (identical data) and keep logic simple.
-                int group_size = (n_head_kv_ == 0) ? 1 : (n_head_ / n_head_kv_);
-                for (int lh = 0; lh < local_heads; ++lh)
-                {
-                    size_t global_q_head = head_offset + lh;
-                    size_t kv_head = static_cast<size_t>(global_q_head % n_head_kv_);
-                    if (n_head_kv_ != n_head_)
-                    {
-                        if ((global_q_head % group_size) != 0)
-                            continue; // only canonical query head writes
-                    }
-                    float *k_dest = k_cache_ptr + n_past_ * kv_dim + kv_head * head_dim_;
-                    float *v_dest = v_cache_ptr + n_past_ * kv_dim + kv_head * head_dim_;
-                    const float *k_src = k_cur + lh * head_dim_;
-                    const float *v_src = v_cur + lh * head_dim_;
-                    std::memcpy(k_dest, k_src, head_dim_ * sizeof(float));
-                    std::memcpy(v_dest, v_src, head_dim_ * sizeof(float));
-                }
-
-                // For each local query head, compute attention over tokens [0, n_past_] using its mapped KV head.
-                const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
-                for (int lh = 0; lh < local_heads; ++lh)
-                {
-                    size_t global_q_head = head_offset + lh;
-                    size_t kv_head = static_cast<size_t>(global_q_head % n_head_kv_);
-                    const float *q_vec = q_cur + lh * head_dim_;
-                    // Temporary score buffer (stack) limited by max seq len (assumed small in tests)
-                    std::vector<float> scores(n_past_ + 1);
-                    float max_score = -std::numeric_limits<float>::infinity();
-                    for (int t = 0; t < n_past_; ++t)
-                    {
-                        const float *k_vec = k_cache_ptr + t * kv_dim + kv_head * head_dim_;
-                        float dot = 0.f;
-                        for (int d = 0; d < head_dim_; ++d)
-                            dot += q_vec[d] * k_vec[d];
-                        dot *= scale;
-                        scores[t] = dot;
-                        if (dot > max_score)
-                            max_score = dot;
-                    }
-                    // Current token score
-                    {
-                        const float *k_vec = k_cache_ptr + n_past_ * kv_dim + kv_head * head_dim_;
-                        float dot = 0.f;
-                        for (int d = 0; d < head_dim_; ++d)
-                            dot += q_vec[d] * k_vec[d];
-                        dot *= scale;
-                        scores[n_past_] = dot;
-                        if (dot > max_score)
-                            max_score = dot;
-                    }
-                    // Softmax
-                    float sum_exp = 0.f;
-                    for (float &s : scores)
-                    {
-                        s = std::exp(s - max_score);
-                        sum_exp += s;
-                    }
-                    float inv_sum = 1.f / (sum_exp + 1e-9f);
-                    for (float &s : scores)
-                        s *= inv_sum;
-                    // Weighted value accumulation
-                    float *out_base = pre_mode ? (local_attended_output->data() + lh * head_dim_ * seq_len) : local_attended_output->data();
-                    float *out_vec = pre_mode ? (out_base) : (out_base + lh * head_dim_); // seq_len==1 in incremental
-                    std::fill(out_vec, out_vec + head_dim_, 0.f);
-                    for (int t = 0; t < n_past_; ++t)
-                    {
-                        const float *v_vec = v_cache_ptr + t * kv_dim + kv_head * head_dim_;
-                        float w = scores[t];
-                        for (int d = 0; d < head_dim_; ++d)
-                            out_vec[d] += w * v_vec[d];
-                    }
-                    // Current token contribution
-                    {
-                        const float *v_vec = v_cache_ptr + n_past_ * kv_dim + kv_head * head_dim_;
-                        float w = scores[n_past_];
-                        for (int d = 0; d < head_dim_; ++d)
-                            out_vec[d] += w * v_vec[d];
-                    }
-                }
-
-                // NOTE: We already wrote current token K/V for (canonical) heads above.
-                // The previous implementation redundantly attempted to memcpy a contiguous
-                // block for all local heads assuming a per-query-head cache layout. That
-                // layout is only valid when n_head_kv_ == n_head_. For grouped KV (GQA)
-                // it caused out-of-bounds writes (global_head >= n_head_kv_) and numerical
-                // drift. We remove it and rely solely on the canonical per-kv-head writes.
-
-                size_t T = (size_t)n_past_ + 1; // total tokens including current
-                size_t expected_T = expected_total_window_ ? expected_total_window_ : T;
-                const auto &ade = debugEnv().attention_decode;
-                if(ade.decode_diag && getRank()==0) {
-                    int cache_rows = k_cache ? k_cache->shape()[0] : -1;
-                    if(cache_rows >=0 && (size_t)cache_rows < T) {
-                        LOG_WARN("[DecodeAttnDiag] cache underrun: layer="<<layer_index_<<" token_pos="<<n_past_
-                                 <<" cache_rows="<<cache_rows<<" expected>="<<T);
-                    }
-                    LOG_WARN("[DecodeAttnDiag] layer="<<layer_index_<<" token_pos="<<n_past_
-                             <<" local_heads="<<local_heads<<" head_offset="<<head_offset
-                             <<" T="<<T<<" expected_T="<<expected_T<<" head_dim="<<head_dim_<<" cache_rows="<<cache_rows);
-                    if(expected_total_window_ && T != expected_T) {
-                        LOG_WARN("[DecodeAttnDiag] WINDOW_MISMATCH layer="<<layer_index_<<" token_pos="<<n_past_
-                                 <<" actual_T="<<T<<" expected_T="<<expected_T);
-                    }
-                }
-                // Per-instance monotonic check (resets on new decode stream when expected_T==1)
-                if(expected_T == 1) {
-                    last_seen_decode_T_ = 0; // new stream (first token)
-                }
-                if(ade.decode_diag && T < last_seen_decode_T_ && getRank()==0) {
-                    LOG_WARN("[DecodeAttnDiag] NON_MONOTONIC_INSTANCE_T previous="<<last_seen_decode_T_<<" current="<<T
-                             <<" layer="<<layer_index_<<" token_pos="<<n_past_);
-                }
-                if(T > last_seen_decode_T_) last_seen_decode_T_ = T;
-                if(ade.decode_diag && k_cache && getRank()==0) {
-                    int cache_rows = k_cache->shape()[0];
-                    if((int)T > cache_rows) {
-                        LOG_WARN("[DecodeAttnDiag] T exceeds cache_rows: T="<<T<<" cache_rows="<<cache_rows<<" layer="<<layer_index_);
-                    }
-                }
-                // Build contiguous Q/K/V blocks representing the full causal window [0..T-1]
-                // so we can invoke the standard computeLocalAttention path for numerical parity.
-                size_t local_head_dim_sz = local_head_dim;
-                auto full_q = createLocalSimpleTensor({T, local_head_dim_sz});
-                auto full_k = createLocalSimpleTensor({T, local_head_dim_sz});
-                auto full_v = createLocalSimpleTensor({T, local_head_dim_sz});
-                float *fq = full_q->data();
-                float *fk = full_k->data();
-                float *fv = full_v->data();
-                // Populate K/V from cache for past tokens (0..T-1)
-                for (size_t t = 0; t < T; ++t)
-                {
-                    for (int lh = 0; lh < local_heads; ++lh)
-                    {
-                        int global_head = head_offset + lh;
-                        int kv_head = (n_head_kv_ == n_head_) ? global_head : (global_head % n_head_kv_);
-                        const float *k_src = k_cache_ptr + t * kv_dim + kv_head * head_dim_;
-                        const float *v_src = v_cache_ptr + t * kv_dim + kv_head * head_dim_;
-                        float *k_dst = fk + t * local_head_dim_sz + lh * head_dim_;
-                        float *v_dst = fv + t * local_head_dim_sz + lh * head_dim_;
-                        std::memcpy(k_dst, k_src, head_dim_ * sizeof(float));
-                        std::memcpy(v_dst, v_src, head_dim_ * sizeof(float));
-                    }
-                }
-                // Populate Q: only last row (T-1) has real query; earlier rows unused for our output row.
-                std::memset(fq, 0, T * local_head_dim_sz * sizeof(float));
-                std::memcpy(fq + (T - 1) * local_head_dim_sz, q_cur, local_head_dim_sz * sizeof(float));
-
-                // Compute attention across window using existing numerically stable path.
-                auto full_out = createLocalSimpleTensor({T, local_head_dim_sz});
-                computeLocalAttention(fq, fk, fv, full_out->data(), T, local_heads);
-                // Internal diff capture: full window context (reconstructed incremental path)
-                if(debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank()==0) {
-                    size_t slice = (size_t)local_heads * head_dim_;
-                    const float *last_row_full = full_out->data() + (T - 1) * slice;
-                    QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, (int)T, true, "attn_int_context_full", last_row_full, slice);
-                }
-                if(ade.decode_diag && ade.dump_full_qkv && getRank()==0 && (int)local_head_dim_sz <= ade.dump_limit) {
-                    auto dump_vec = [&](const char* tag, const float* ptr){ std::ostringstream oss; oss<<"[DecodeAttnDump] "<<tag<<":"; for(size_t i=0;i<local_head_dim_sz;++i){ oss<<ptr[i]; if(i+1<local_head_dim_sz) oss<<","; } LOG_WARN(oss.str()); };
-                    dump_vec("q_last", fq + (T-1)*local_head_dim_sz);
-                    if(T>1) dump_vec("k_prev", fk + (T-2)*local_head_dim_sz);
-                    dump_vec("k_last", fk + (T-1)*local_head_dim_sz);
-                }
-
-                // Extract last row into expected output layout.
-                const float *last_row = full_out->data() + (T - 1) * local_head_dim_sz;
-                if (pre_mode)
-                {
-                    float *dstA = local_attended_output->data(); // heads-major [local_head_dim, 1]
-                    for (size_t h = 0; h < local_head_dim_sz; ++h)
-                        dstA[h * seq_len + 0] = last_row[h];
-                }
-                else
-                {
-                    float *dst = local_attended_output->data(); // [1, local_head_dim]
-                    std::memcpy(dst, last_row, local_head_dim_sz * sizeof(float));
-                } });
-            // Internal diff capture: incremental context after mapping to local_attended_output layout
-            if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0)
-            {
-                size_t slice = (size_t)local_heads * head_dim_;
-                std::vector<float> tmp(slice);
-                const float *src_base = local_attended_output->data();
-                if (pre_mode)
-                {
-                    for (size_t h = 0; h < slice; ++h)
-                        tmp[h] = src_base[h * seq_len + 0];
-                }
-                else
-                {
-                    std::memcpy(tmp.data(), src_base, slice * sizeof(float));
-                }
-                QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, true, "attn_int_context", tmp.data(), slice);
-            }
-        }
-        else
-        {
-            // Standard (prefill or trivial single-token) attention over provided seq_len window
-            PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalAttention");
-            t_attn_ms = time_block([&]
-                                   {
-                if (pre_mode)
-                {
-                    auto tmp_std = createLocalSimpleTensor({seq_len, local_head_dim});
-                    computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
-                                          tmp_std->data(), seq_len, local_heads);
-                    const float *srcA = tmp_std->data();
-                    float *dstA = local_attended_output->data();
-                    for (size_t s = 0; s < seq_len; ++s)
-                    {
-                        const float *row = srcA + s * local_head_dim;
-                        for (size_t h = 0; h < local_head_dim; ++h)
-                            dstA[h * seq_len + s] = row[h];
-                    }
-                }
-                else
-                {
-                    computeLocalAttention(local_q->data(), local_k->data(), local_v->data(),
-                                          local_attended_output->data(), seq_len, local_heads);
-                } });
-            // Internal diff capture: prefill / standard context last token row
-            if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
-            {
-                size_t slice = (size_t)local_heads * head_dim_;
-                std::vector<float> tmp(slice);
-                if (pre_mode)
-                {
-                    const float *src = local_attended_output->data();
-                    size_t last_idx = (size_t)(seq_len - 1);
-                    for (size_t h = 0; h < slice; ++h)
-                        tmp[h] = src[h * seq_len + last_idx];
-                }
-                else
-                {
-                    const float *src = local_attended_output->data() + (seq_len - 1) * slice;
-                    std::memcpy(tmp.data(), src, slice * sizeof(float));
-                }
-                QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, (seq_len == 1 && n_past_ > 0), "attn_int_context", tmp.data(), slice);
-            }
-        }
-
-        // Pre-projection gather path: gather head contexts BEFORE output projection so we do the
-        // expensive WO matmul only once globally (optionally TP split later). We skip computing
-        // local output projection in this branch.
-        if (output_mode_ == AttentionOutputMode::GatherHeadsPreProjection ||
-            output_mode_ == AttentionOutputMode::Replicated)
-        {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::gatherHeadsPreProjection");
-            size_t total_head_dim = static_cast<size_t>(n_head_) * head_dim_;
-            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-            // local_attended_output is already heads-major if optimization active; if not, transpose.
-            std::shared_ptr<TensorBase> local_heads_major = local_attended_output;
-            if (local_attended_output->shape().size() == 2 && local_attended_output->shape()[0] == (int)seq_len)
-            {
-                // Need transpose to heads-major
-                auto tmp_heads_major = createLocalSimpleTensor({local_head_dim, seq_len});
-                const float *src = local_attended_output->data();
-                float *dst = tmp_heads_major->data();
-                for (size_t s = 0; s < seq_len; ++s)
-                {
-                    const float *row = src + s * local_head_dim;
-                    for (size_t h = 0; h < local_head_dim; ++h)
-                        dst[h * seq_len + s] = row[h];
-                }
-                local_heads_major = tmp_heads_major;
-            }
-
-            auto global_heads_major = createLocalSimpleTensor({total_head_dim, seq_len});
-            std::vector<int> recvcounts(getSize());
-            std::vector<int> displs(getSize());
-            size_t running = 0;
-            for (int r = 0; r < getSize(); ++r)
-            {
-                auto [r_heads, r_off] = getHeadDistribution(r);
-                size_t r_head_dim = static_cast<size_t>(r_heads * head_dim_);
-                size_t elems = r_head_dim * seq_len;
-                recvcounts[r] = static_cast<int>(elems);
-                displs[r] = static_cast<int>(running);
-                running += elems;
-            }
-            size_t send_elems = local_head_dim * seq_len;
-            (void)pre_mode; // silence unused warning
-            MPI_Allgatherv(local_heads_major->data(), (int)send_elems, MPI_FLOAT,
-                           global_heads_major->data(), recvcounts.data(), displs.data(), MPI_FLOAT, MPI_COMM_WORLD);
-
-            // 3. Reorder heads-major global buffer back to [seq_len, total_head_dim]
-            auto full_attended = createLocalSimpleTensor({seq_len, total_head_dim});
-            float *dst_full = full_attended->data();
-            const float *src_heads_major = global_heads_major->data();
-            for (size_t h = 0; h < total_head_dim; ++h)
-            {
-                const float *head_vec = src_heads_major + h * seq_len;
-                for (size_t s = 0; s < seq_len; ++s)
-                {
-                    dst_full[s * total_head_dim + h] = head_vec[s];
-                }
-            }
-
-            // 4. Ensure we have full (replicated) WO. If input WO was head-sharded, reconstruct it.
-            bool wo_head_sharded = false;
-            if (auto *pwo = dynamic_cast<ShardedSimpleTensor *>(global_wo.get()))
-            {
-                if (pwo->shard_spec().is_sharded() && pwo->shard_spec().axis == ShardSpec::Axis::Heads)
-                {
-                    wo_head_sharded = true;
-                }
-            }
-            std::shared_ptr<TensorBase> full_wo = global_wo;
-            if (wo_head_sharded)
-            {
-                t_reconstruct_wo_ms = time_block([&]
-                                                 {
-                    PERF_SCOPED_TIMER("MPIAttentionKernel::reconstructWO");
-                    full_wo = createLocalSimpleTensor({total_head_dim, d_model});
-                    std::vector<int> w_recvcounts(getSize());
-                    std::vector<int> w_displs(getSize());
-                    size_t wrunning = 0;
-                    for (int r = 0; r < getSize(); ++r)
-                    {
-                        auto [r_heads, r_off] = getHeadDistribution(r);
-                        size_t r_head_dim = static_cast<size_t>(r_heads * head_dim_);
-                        size_t elems = r_head_dim * d_model;
-                        w_recvcounts[r] = (int)elems;
-                        w_displs[r] = (int)wrunning;
-                        wrunning += elems;
-                    }
-                    size_t w_send_elems = local_head_dim * d_model;
-                    MPI_Allgatherv(local_wo->data(), (int)w_send_elems, MPI_FLOAT,
-                                   full_wo->data(), w_recvcounts.data(), w_displs.data(), MPI_FLOAT, MPI_COMM_WORLD); });
-            }
-
-            // 5. Single (global) output projection: [seq_len, total_head_dim] * [total_head_dim, d_model]
-            t_output_proj_ms = time_block([&]
-                                          {
-                PerfMatmulPhaseScope phase(2,4); // Attention output projection (gather-pre path)
-                if (!adaptive_matmul(full_attended->data(), full_wo->data(), global_output->data(),
-                                     seq_len, d_model, total_head_dim, false))
-                {
-                    LOG_ERROR("MPIAttentionKernel: pre-projection gathered output projection failed");
-                    throw std::runtime_error("Attention output projection failed");
-                } });
-
-            // Populate metadata early and return.
-            // Preserve the originally requested mode (Replicated remains distinguishable in metadata)
-            last_meta_.mode = output_mode_;
-            last_meta_.local_head_offset = head_offset;
-            last_meta_.local_head_count = local_heads;
-            last_meta_.concatenated = true;
-            last_meta_.replicated = true; // full projection identical across ranks
-            auto end_pre = std::chrono::high_resolution_clock::now();
-            double ms_pre = std::chrono::duration<double, std::milli>(end_pre - t_exec_start).count();
-            t_gather_pre_ms = ms_pre; // aggregate path timing (full since start).
-            if (getRank() == 0)
-            {
-                if (output_mode_ == AttentionOutputMode::Replicated)
-                    LOG_DEBUG("MPIAttention (Replicated alias -> gather_pre) executed in " << ms_pre << " ms heads=" << n_head_);
-                else
-                    LOG_DEBUG("MPIAttention (GatherHeadsPreProjection) executed in " << ms_pre << " ms heads=" << n_head_);
-                LOG_DEBUG("AttentionResultMeta mode=" << (int)last_meta_.mode
-                                                      << " heads_off=" << last_meta_.local_head_offset
-                                                      << " heads_cnt=" << last_meta_.local_head_count
-                                                      << " concat=" << last_meta_.concatenated
-                                                      << " repl=" << last_meta_.replicated);
-            }
-            if (perf_env.layer_attention && getRank() == perf_env.log_rank)
-            {
-                double total_ms = ms_pre;
-                double accounted = t_distribute_ms + t_proj_ms + t_rope_ms + t_attn_ms + t_reconstruct_wo_ms + t_output_proj_ms;
-                double other = std::max(0.0, total_ms - accounted);
-                LOG_INFO("ATTN_LAYER_TIMING seq_len=" << seq_len
-                                                      << " heads=" << n_head_
-                                                      << " head_dim=" << head_dim_
-                                                      << " local_heads=" << local_heads
-                                                      << " mode=pre_projection"
-                                                      << " distribute_ms=" << t_distribute_ms
-                                                      << " proj_ms=" << t_proj_ms
-                                                      << " rope_ms=" << t_rope_ms
-                                                      << " attn_ms=" << t_attn_ms
-                                                      << " recon_wo_ms=" << t_reconstruct_wo_ms
-                                                      << " out_proj_ms=" << t_output_proj_ms
-                                                      << " total_ms=" << total_ms
-                                                      << " other_ms=" << other
-                                                      << " layer_idx=" << PerformanceCounters::tl_phase_.layer_index);
-            }
-            return true;
-        }
-
-        // Create local final output tensor
-        auto local_final_output = createLocalSimpleTensor({seq_len, d_model});
-
-        // DEBUG: Always log layer 0 context values for debugging (temporary)
-        if (layer_index_ == 0 && seq_len > 0 && getRank() == 0)
-        {
-            const float *context_data = local_attended_output->data();
-            int local_head_dim = local_heads * head_dim_;
-            size_t dim_842 = 842;
-            if (dim_842 < static_cast<size_t>(local_head_dim))
-            {
-                float val_842 = context_data[dim_842];  // Position 0, dim 842
-                std::cout << "[LLAMINAR_CONTEXT] layer=0 pos=0 dim=842 value=" << val_842
-                          << " (PyTorch: -0.000191)" << std::endl;
-                
-                // Also log min/max/mean for position 0
-                float min_val = context_data[0];
-                float max_val = context_data[0];
-                double sum = 0.0;
-                for (int i = 0; i < local_head_dim; ++i)
-                {
-                    float v = context_data[i];
-                    if (v < min_val) min_val = v;
-                    if (v > max_val) max_val = v;
-                    sum += v;
-                }
-                double mean_val = sum / local_head_dim;
-                std::cout << "[LLAMINAR_CONTEXT] layer=0 pos=0 min=" << min_val 
-                          << " max=" << max_val << " mean=" << mean_val << std::endl;
-            }
-        }
-        
-        // Capture ATTENTION_CONTEXT (before output projection) for parity testing
-        // This is the attention-weighted sum of values (attention @ V) before the final o_proj
-        if (PipelineSnapshotManager::instance().isEnabled() && getRank() == 0)
-        {
-            // For multi-rank attention, local_attended_output contains partial heads
-            // We capture the local contribution which will be aggregated later
-            int local_head_dim = local_heads * head_dim_;
-            PipelineSnapshotManager::instance().capture(
-                PipelineStage::ATTENTION_CONTEXT,
-                layer_index_,
-                local_attended_output->data(),
-                seq_len,
-                local_head_dim,
-                "llaminar");
-            
-            // DEBUG: Log specific values for layer 0 to diagnose divergence
-            if (layer_index_ == 0 && seq_len > 0)
-            {
-                const float *context_data = local_attended_output->data();
-                size_t dim_842 = 842;
-                if (dim_842 < static_cast<size_t>(local_head_dim))
-                {
-                    float val_842 = context_data[dim_842];  // Position 0, dim 842
-                    std::cout << "[ATTENTION_CONTEXT_DEBUG] layer=0 pos=0 dim=842 value=" << val_842
-                              << " (PyTorch expects: -0.000191)" << std::endl;
-                    
-                    // Also log min/max/mean for position 0
-                    float min_val = context_data[0];
-                    float max_val = context_data[0];
-                    double sum = 0.0;
-                    for (int i = 0; i < local_head_dim; ++i)
-                    {
-                        float v = context_data[i];
-                        if (v < min_val) min_val = v;
-                        if (v > max_val) max_val = v;
-                        sum += v;
-                    }
-                    double mean_val = sum / local_head_dim;
-                    std::cout << "[ATTENTION_CONTEXT_DEBUG] layer=0 pos=0 min=" << min_val 
-                              << " max=" << max_val << " mean=" << mean_val << std::endl;
-                }
-            }
-        }
-
-        // Compute output projection for local heads using COSMA
-        {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::computeLocalOutputProjection");
-            t_output_proj_ms = time_block([&]
-                                          { PerfMatmulPhaseScope phase(2,4); computeLocalOutputProjection(local_attended_output, local_wo,
-                                         local_final_output, seq_len, local_heads, d_model); });
-        }
-        if (debugEnv().attention.internal_diff && debugEnv().pipeline.layer_token_diff && getRank() == 0 && seq_len > 0)
-        {
-            const float *src = local_final_output->data() + (seq_len - 1) * d_model;
-            QwenPipeline::appendInternalAttnRow(nullptr, layer_index_, capture_seq_len_meta, (seq_len == 1 && n_past_ > 0), "attn_int_out_partial", src, (size_t)d_model);
-        }
-
-        bool performed_collective = false;
-        if (output_mode_ == AttentionOutputMode::GatherHeadsPostProjection)
-        {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::gatherHeadsPostProjection");
-            // Row-partition of W_o yields additive partial contributions; sum to reconstruct.
-            if (getSize() > 1)
-            {
-                t_gather_post_ms = time_block([&]
-                                              { PerfAllreduce(local_final_output->data(), global_output->data(),
-                                                              (int)(seq_len * d_model), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD); });
-                performed_collective = true;
-            }
-            else
-            {
-                t_gather_post_ms = time_block([&]
-                                              { std::copy(local_final_output->data(),
-                                                          local_final_output->data() + seq_len * d_model,
-                                                          global_output->data()); });
-            }
-            if (getRank() == 0)
-                LOG_DEBUG("MPIAttentionKernel: GatherHeadsPostProjection reconstructed full hidden via "
-                          << (performed_collective ? "Allreduce (SUM)" : "local copy"));
-            // Metadata: full hidden now available & replicated
-            last_meta_.concatenated = true; // assembled full hidden dimension
-            last_meta_.replicated = true;   // identical across ranks
-        }
-        else if (output_mode_ == AttentionOutputMode::LocalHeads)
-        {
-            PERF_SCOPED_TIMER("MPIAttentionKernel::emitLocalPartial");
-            t_emit_ms = time_block([&]
-                                   { std::copy(local_final_output->data(),
-                                               local_final_output->data() + seq_len * d_model,
-                                               global_output->data()); });
-            if (getShardingDebugConfig().assert_replicated_misuse)
-            {
-                global_output->data()[seq_len * d_model - 1] += (float)(1e-30 * (getRank() + 1));
-            }
-            if (getRank() == 0)
-                LOG_DEBUG("MPIAttentionKernel: emitted local partial head contribution (LocalHeads mode)");
-        }
-        else
-        {
-            // Unsupported modes (pre-gather, replicated) fallback to LocalHeads behavior for now.
-            PERF_SCOPED_TIMER("MPIAttentionKernel::emitLocalPartialFallback");
-            t_emit_ms = time_block([&]
-                                   { std::copy(local_final_output->data(),
-                                               local_final_output->data() + seq_len * d_model,
-                                               global_output->data()); });
-            if (getRank() == 0)
-                LOG_WARN("MPIAttentionKernel: output mode not implemented (" << (int)output_mode_ << ") falling back to LocalHeads partial");
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        double execution_time = std::chrono::duration<double, std::milli>(end - t_exec_start).count();
-
-        LOG_DEBUG("MPIAttention executed in " + std::to_string(execution_time) +
-                  " ms on rank " + std::to_string(getRank()) +
-                  " (local_heads=" + std::to_string(local_heads) + ")");
-
-        // Populate result metadata including final (possibly heuristic-adjusted) mode.
-        last_meta_.mode = output_mode_;
-        last_meta_.local_head_offset = head_offset;
-        last_meta_.local_head_count = local_heads;
-        // If we performed a gather above, metadata already set. Ensure LocalHeads defaults remain false.
-        if (output_mode_ == AttentionOutputMode::LocalHeads)
-        {
-            last_meta_.concatenated = false;
-            last_meta_.replicated = false;
-        }
-        else if (output_mode_ == AttentionOutputMode::GatherHeadsPostProjection && !performed_collective)
-        {
-            // Single-rank edge case
-            last_meta_.concatenated = true;
-            last_meta_.replicated = true;
-        }
-        // (GatherHeadsPreProjection / Replicated) early-returned above with metadata populated.
-        if (getRank() == 0)
-        {
-            LOG_DEBUG("AttentionResultMeta mode=" << (int)last_meta_.mode
-                                                  << " heads_off=" << last_meta_.local_head_offset
-                                                  << " heads_cnt=" << last_meta_.local_head_count
-                                                  << " concat=" << last_meta_.concatenated
-                                                  << " repl=" << last_meta_.replicated);
-        }
-        if (perf_env.layer_attention && getRank() == perf_env.log_rank)
-        {
-            double accounted = t_distribute_ms + t_proj_ms + t_rope_ms + t_attn_ms + t_output_proj_ms + t_gather_post_ms + t_emit_ms;
-            double other = std::max(0.0, execution_time - accounted);
-            std::string mode_str = (output_mode_ == AttentionOutputMode::GatherHeadsPostProjection ? "gather_post" : output_mode_ == AttentionOutputMode::LocalHeads ? "local_heads"
-                                                                                                                                                                     : "other");
-            LOG_INFO("ATTN_LAYER_TIMING seq_len=" << seq_len
-                                                  << " heads=" << n_head_
-                                                  << " head_dim=" << head_dim_
-                                                  << " local_heads=" << local_heads
-                                                  << " mode=" << mode_str
-                                                  << " distribute_ms=" << t_distribute_ms
-                                                  << " proj_ms=" << t_proj_ms
-                                                  << " rope_ms=" << t_rope_ms
-                                                  << " attn_ms=" << t_attn_ms
-                                                  << " out_proj_ms=" << t_output_proj_ms
-                                                  << " gather_post_ms=" << t_gather_post_ms
-                                                  << " emit_ms=" << t_emit_ms
-                                                  << " total_ms=" << execution_time
-                                                  << " other_ms=" << other
-                                                  << " layer_idx=" << PerformanceCounters::tl_phase_.layer_index);
-        }
-        return true;
-    }
-
-    bool MPIAttentionKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
-                                      const std::vector<std::shared_ptr<TensorBase>> &outputs) const
-    {
-        if (inputs.size() != 7)
-        {
-            LOG_ERROR("MPIAttentionKernel: Expected 7 inputs (input, wq, wk, wv, wo, k_cache, v_cache), got " << inputs.size());
-            return false;
-        }
-
-        if (outputs.size() != 1)
-        {
-            LOG_ERROR("MPIAttentionKernel: Expected 1 output, got " << outputs.size());
-            return false;
-        }
-
-        auto input = inputs[0];
-        auto wq = inputs[1];
-        auto wk = inputs[2];
-        auto wv = inputs[3];
-        auto wo = inputs[4];
-        auto output = outputs[0];
-
-        if (input->shape().size() != 2)
-        {
-            LOG_ERROR("MPIAttentionKernel: Input must be 2D [seq_len, d_model], got shape size " << input->shape().size());
-            return false;
-        }
-
-        size_t seq_len = static_cast<size_t>(input->shape()[0]);
-        size_t d_model = static_cast<size_t>(input->shape()[1]);
-        size_t total_head_dim = static_cast<size_t>(n_head_ * head_dim_);
-        bool wq_head_sharded = false, wk_head_sharded = false, wv_head_sharded = false, wo_head_sharded = false;
-        auto chk = [](const std::shared_ptr<TensorBase> &t) -> const ShardSpec *
-        {
-            if(!t) return nullptr; auto *p = dynamic_cast<ShardedSimpleTensor*>(t.get()); return p ? &p->shard_spec() : nullptr; };
-        const ShardSpec *spec_wq = chk(wq);
-        if (spec_wq && spec_wq->axis == ShardSpec::Axis::Heads)
-            wq_head_sharded = spec_wq->is_sharded();
-        const ShardSpec *spec_wk = chk(wk);
-        if (spec_wk && spec_wk->axis == ShardSpec::Axis::Heads)
-            wk_head_sharded = spec_wk->is_sharded();
-        const ShardSpec *spec_wv = chk(wv);
-        if (spec_wv && spec_wv->axis == ShardSpec::Axis::Heads)
-            wv_head_sharded = spec_wv->is_sharded();
-        const ShardSpec *spec_wo = chk(wo);
-        if (spec_wo && spec_wo->axis == ShardSpec::Axis::Heads)
-            wo_head_sharded = spec_wo->is_sharded();
-
-        bool any_sharded = wq_head_sharded || wk_head_sharded || wv_head_sharded || wo_head_sharded;
-        if (any_sharded)
-        {
-            // For head-sharded mode accept local dimensions instead of global aggregate.
-            auto [local_heads, head_offset] = getHeadDistribution();
-            size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-            if (wq_head_sharded)
-            {
-                if (wq->shape().size() != 2 || (size_t)wq->shape()[0] != local_head_dim || (size_t)wq->shape()[1] != d_model)
-                {
-                    LOG_ERROR("MPIAttentionKernel: pre-sharded wq shape mismatch - expected [" << local_head_dim << ", " << d_model << "], got [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
-                    return false;
-                }
-            }
-            else if (wq->shape().size() != 2 || (size_t)wq->shape()[0] != total_head_dim || (size_t)wq->shape()[1] != d_model)
-            {
-                LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch - expected [" << total_head_dim << ", " << d_model << "], got [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
-                return false;
-            }
-            if (wk_head_sharded)
-            {
-                if (wk->shape().size() != 2 || (size_t)wk->shape()[0] != local_head_dim || (size_t)wk->shape()[1] != d_model)
-                {
-                    LOG_ERROR("MPIAttentionKernel: pre-sharded wk shape mismatch - expected [" << local_head_dim << ", " << d_model << "], got [" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
-                    return false;
-                }
-            }
-            else if (wk->shape().size() != 2 || (size_t)wk->shape()[0] != (size_t)(n_head_kv_ * head_dim_) || (size_t)wk->shape()[1] != d_model)
-            {
-                LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch - expected [" << (n_head_kv_ * head_dim_) << ", " << d_model << "], got [" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
-                return false;
-            }
-            if (wv_head_sharded)
-            {
-                if (wv->shape().size() != 2 || (size_t)wv->shape()[0] != local_head_dim || (size_t)wv->shape()[1] != d_model)
-                {
-                    LOG_ERROR("MPIAttentionKernel: pre-sharded wv shape mismatch - expected [" << local_head_dim << ", " << d_model << "], got [" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
-                    return false;
-                }
-            }
-            else if (wv->shape().size() != 2 || (size_t)wv->shape()[0] != (size_t)(n_head_kv_ * head_dim_) || (size_t)wv->shape()[1] != d_model)
-            {
-                LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch - expected [" << (n_head_kv_ * head_dim_) << ", " << d_model << "], got [" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
-                return false;
-            }
-            if (wo_head_sharded)
-            {
-                if (wo->shape().size() != 2 || (size_t)wo->shape()[0] != d_model || (size_t)wo->shape()[1] != local_head_dim)
-                {
-                    LOG_ERROR("MPIAttentionKernel: pre-sharded wo shape mismatch - expected [" << d_model << ", " << local_head_dim << "], got [" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
-                    return false;
-                }
-            }
-            else if (wo->shape().size() != 2 || (size_t)wo->shape()[0] != d_model || (size_t)wo->shape()[1] != total_head_dim)
-            {
-                LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch - expected [" << d_model << ", " << total_head_dim << "], got [" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
-                return false;
-            }
-        }
-        else
-        {
-            // Original global dimension checks (unchanged)
-            // DEBUG: Log actual weight shapes received
-            LOG_ERROR("[WEIGHT_DEBUG] wq shape=[" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
-            LOG_ERROR("[WEIGHT_DEBUG] wk shape=[" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
-            LOG_ERROR("[WEIGHT_DEBUG] wv shape=[" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
-            LOG_ERROR("[WEIGHT_DEBUG] wo shape=[" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
-            LOG_ERROR("[WEIGHT_DEBUG] Expected: wk=[" << (n_head_kv_ * head_dim_) << ", " << d_model << "]");
-            
-            if (wq->shape().size() != 2 || static_cast<size_t>(wq->shape()[0]) != total_head_dim ||
-                static_cast<size_t>(wq->shape()[1]) != d_model)
-            {
-                LOG_ERROR("MPIAttentionKernel: Query weight dimension mismatch - expected [" << total_head_dim << ", " << d_model << "], got [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
-                return false;
-            }
-            if (wk->shape().size() != 2 || static_cast<size_t>(wk->shape()[0]) != static_cast<size_t>(n_head_kv_ * head_dim_) ||
-                static_cast<size_t>(wk->shape()[1]) != d_model)
-            {
-                LOG_ERROR("MPIAttentionKernel: Key weight dimension mismatch - expected [" << (n_head_kv_ * head_dim_) << ", " << d_model << "], got [" << wk->shape()[0] << ", " << wk->shape()[1] << "]");
-                return false;
-            }
-            if (wv->shape().size() != 2 || static_cast<size_t>(wv->shape()[0]) != static_cast<size_t>(n_head_kv_ * head_dim_) ||
-                static_cast<size_t>(wv->shape()[1]) != d_model)
-            {
-                LOG_ERROR("MPIAttentionKernel: Value weight dimension mismatch - expected [" << (n_head_kv_ * head_dim_) << ", " << d_model << "], got [" << wv->shape()[0] << ", " << wv->shape()[1] << "]");
-                return false;
-            }
-            if (wo->shape().size() != 2 || static_cast<size_t>(wo->shape()[0]) != d_model ||
-                static_cast<size_t>(wo->shape()[1]) != total_head_dim)
-            {
-                LOG_ERROR("MPIAttentionKernel: Output weight dimension mismatch - expected [" << d_model << ", " << total_head_dim << "], got [" << wo->shape()[0] << ", " << wo->shape()[1] << "]");
-                return false;
-            }
-        }
-
-        // (Removed duplicate global-dimension validation for sharded path.)
-
-        // Validate output dimensions
-        if (output->shape().size() != 2 || static_cast<size_t>(output->shape()[0]) != seq_len ||
-            static_cast<size_t>(output->shape()[1]) != d_model)
-        {
-            LOG_ERROR("MPIAttentionKernel: Output dimension mismatch");
-            return false;
-        }
-
-        return true;
-    }
-
-    void MPIAttentionKernel::setHeadDimensions(int n_head, int n_head_kv, int head_dim)
-    {
-        n_head_ = n_head;
-        n_head_kv_ = n_head_kv;
-        head_dim_ = head_dim;
-
-        if (n_head_ % getSize() != 0)
-        {
-            LOG_WARN("Number of heads (" << n_head_ << ") not evenly divisible by MPI size ("
-                                         << getSize() << "). Load balancing may be suboptimal.");
-        }
-    }
-
+    // ============================================================================
+    // Helper: Head distribution methods
+    // ============================================================================
     std::pair<int, int> MPIAttentionKernel::getHeadDistribution() const
     {
         return getHeadDistribution(getRank());
@@ -1267,891 +178,1383 @@ namespace llaminar
         return {local_heads, head_offset};
     }
 
-    void MPIAttentionKernel::distributeInputs(const std::shared_ptr<TensorBase> &global_input,
-                                              const std::shared_ptr<TensorBase> &global_wq,
-                                              const std::shared_ptr<TensorBase> &global_wk,
-                                              const std::shared_ptr<TensorBase> &global_wv,
-                                              const std::shared_ptr<TensorBase> &global_wo,
-                                              std::shared_ptr<TensorBase> &local_wq,
-                                              std::shared_ptr<TensorBase> &local_wk,
-                                              std::shared_ptr<TensorBase> &local_wv,
-                                              std::shared_ptr<TensorBase> &local_wo,
-                                              size_t seq_len, size_t d_model)
+    // ============================================================================
+    // Validation
+    // ============================================================================
+    bool MPIAttentionKernel::validate(
+        const std::vector<std::shared_ptr<TensorBase>> &inputs,
+        const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
-        auto [local_heads, head_offset] = getHeadDistribution();
-        size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-        size_t head_offset_dim = static_cast<size_t>(head_offset * head_dim_);
-
-        // Get K/V head distribution for GQA
-        auto [local_kv_heads, kv_head_offset] = getKVHeadDistribution();
-        size_t local_kv_head_dim = static_cast<size_t>(local_kv_heads * head_dim_);
-        size_t kv_head_offset_dim = static_cast<size_t>(kv_head_offset * head_dim_);
-
-        const float *global_wq_ptr = global_wq ? global_wq->data() : nullptr;
-        const float *global_wk_ptr = global_wk ? global_wk->data() : nullptr;
-        const float *global_wv_ptr = global_wv ? global_wv->data() : nullptr;
-        const float *global_wo_ptr = global_wo ? global_wo->data() : nullptr;
-        float *local_wq_ptr = local_wq ? local_wq->data() : nullptr;
-        float *local_wk_ptr = local_wk ? local_wk->data() : nullptr;
-        float *local_wv_ptr = local_wv ? local_wv->data() : nullptr;
-        float *local_wo_ptr = local_wo ? local_wo->data() : nullptr;
-
-        auto require_data = [&](const char *name, const float *ptr)
+        if (inputs.size() != 10)
         {
-            if (ptr)
-                return;
-            LOG_ERROR("MPIAttentionKernel::distributeInputs null data pointer for " << name << " on rank " << getRank());
-            throw std::runtime_error("Null tensor data pointer");
-        };
-        auto require_data_mut = [&](const char *name, float *ptr)
-        {
-            if (ptr)
-                return;
-            LOG_ERROR("MPIAttentionKernel::distributeInputs null writable pointer for " << name << " on rank " << getRank());
-            throw std::runtime_error("Null tensor data pointer");
-        };
-
-        require_data("global_wq", global_wq_ptr);
-        require_data("global_wk", global_wk_ptr);
-        require_data("global_wv", global_wv_ptr);
-        require_data("global_wo", global_wo_ptr);
-        require_data_mut("local_wq", local_wq_ptr);
-        require_data_mut("local_wk", local_wk_ptr);
-        require_data_mut("local_wv", local_wv_ptr);
-        require_data_mut("local_wo", local_wo_ptr);
-
-        // Extract local query weights (columns for assigned heads)
-        for (size_t i = 0; i < d_model; ++i)
-        {
-            const float *global_row = global_wq_ptr + i * n_head_ * head_dim_;
-            float *local_row = local_wq_ptr + i * local_head_dim;
-            memcpy(local_row, global_row + head_offset_dim, local_head_dim * sizeof(float));
+            LOG_ERROR("MPIAttentionKernel: Expected 10 inputs, got " << inputs.size());
+            return false;
         }
 
-        // Extract local K and V weights (for GQA, these use K/V head dimensions, not Q)
-        // Simply copy the slice for this rank's K/V heads without replication
-        for (size_t i = 0; i < d_model; ++i)
+        if (outputs.size() != 1)
         {
-            const float *global_k_row = global_wk_ptr + i * n_head_kv_ * head_dim_;
-            const float *global_v_row = global_wv_ptr + i * n_head_kv_ * head_dim_;
-            float *local_k_row = local_wk_ptr + i * local_kv_head_dim;
-            float *local_v_row = local_wv_ptr + i * local_kv_head_dim;
-
-            // Copy the K/V head slice for this rank
-            memcpy(local_k_row, global_k_row + kv_head_offset_dim, local_kv_head_dim * sizeof(float));
-            memcpy(local_v_row, global_v_row + kv_head_offset_dim, local_kv_head_dim * sizeof(float));
+            LOG_ERROR("MPIAttentionKernel: Expected 1 output, got " << outputs.size());
+            return false;
         }
 
-        // Extract local output weights (rows for assigned heads)
-        for (size_t i = 0; i < local_head_dim; ++i)
+        auto input = inputs[0];
+        if (input->shape().size() != 2)
         {
-            const float *global_row = global_wo_ptr + (head_offset_dim + i) * d_model;
-            float *local_row = local_wo_ptr + i * d_model;
-            memcpy(local_row, global_row, d_model * sizeof(float));
+            LOG_ERROR("MPIAttentionKernel: Input must be 2D [seq_len, d_model], got shape size "
+                      << input->shape().size());
+            return false;
         }
 
-        LOG_DEBUG("Distributed weights: local_heads=" << local_heads << ", head_offset=" << head_offset << " on rank " << getRank());
+        return true;
     }
 
-    void MPIAttentionKernel::computeLocalProjections(const std::shared_ptr<TensorBase> &input,
-                                                     const std::shared_ptr<TensorBase> &local_wq,
-                                                     const std::shared_ptr<TensorBase> &local_wk,
-                                                     const std::shared_ptr<TensorBase> &local_wv,
-                                                     std::shared_ptr<TensorBase> &local_q,
-                                                     std::shared_ptr<TensorBase> &local_k,
-                                                     std::shared_ptr<TensorBase> &local_v,
-                                                     size_t seq_len, size_t d_model)
+    // ============================================================================
+    // Helper: Matrix multiplication with optional bias
+    // ============================================================================
+    void matmul_with_bias(const float *input, const float *weight, float *output,
+                          const float *bias, int M, int N, int K)
     {
-        const auto &attnEnv = debugEnv().attention;
-        bool force_scalar = attnEnv.force_scalar;
-        bool validate_proj = attnEnv.validate_proj;
+        // Force single-threaded execution to avoid threading bugs
+        openblas_set_num_threads(1);
 
-        auto do_projection = [&](const char *tag, const std::shared_ptr<TensorBase> &W, std::shared_ptr<TensorBase> &OUT, int phase_id)
+        // output = input @ weight^T  (input is MxK, weight is NxK, output is MxN)
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    M, N, K,
+                    1.0f, input, K, weight, K,
+                    0.0f, output, N);
+
+        // Add bias if provided
+        if (bias)
         {
-            // Infer projection dimension from output tensor shape (handles both Q and K/V)
-            if (OUT->shape().size() < 2)
+            for (int m = 0; m < M; ++m)
             {
-                LOG_ERROR(tag << " projection: invalid output shape");
-                return false;
-            }
-            size_t local_head_dim = static_cast<size_t>(OUT->shape()[1]);
-            
-            // ASSERTIONS: Validate dimensions for matmul operation
-            // Operation: OUT[seq_len, local_head_dim] = input[seq_len, d_model] @ W.T
-            // Where W is stored as [local_head_dim, d_model] (PyTorch format)
-            if (W->shape().size() != 2) {
-                LOG_ERROR(tag << " projection: weight must be 2D, got " << W->shape().size() << "D");
-                return false;
-            }
-            
-            int w_out = W->shape()[0];  // out_features (local_head_dim)
-            int w_in = W->shape()[1];   // in_features (d_model)
-            
-            // Verify weight output dimension matches output tensor feature dimension
-            if (static_cast<size_t>(w_out) != local_head_dim) {
-                std::ostringstream oss;
-                oss << tag << " projection: weight out_features mismatch! "
-                    << "Weight shape=[" << w_out << "," << w_in << "], "
-                    << "Output shape=[" << OUT->shape()[0] << "," << OUT->shape()[1] << "]. "
-                    << "Expected weight[0]=" << local_head_dim;
-                LOG_ERROR(oss.str());
-                return false;
-            }
-            
-            // Verify weight input dimension matches d_model
-            if (static_cast<size_t>(w_in) != d_model) {
-                std::ostringstream oss;
-                oss << tag << " projection: weight in_features mismatch! "
-                    << "Expected weight[1]=" << d_model << ", got " << w_in;
-                LOG_ERROR(oss.str());
-                return false;
-            }
-            
-            // Debug: Log weight and output shapes
-            if (getRank() == 0 && layer_index_ == 0)
-            {
-                LOG_INFO(tag << " projection: weight shape=[" << W->shape()[0] << "," << W->shape()[1] 
-                         << "], output shape=[" << OUT->shape()[0] << "," << OUT->shape()[1]
-                         << "], M=" << seq_len << ", N=" << local_head_dim << ", K=" << d_model);
-                // Sample first few weight values
-                const float *w_data = W->data();
-                LOG_INFO(tag << " weight samples: w[0]=" << w_data[0] << ", w[1]=" << w_data[1] 
-                         << ", w[10]=" << w_data[10] << ", w[100]=" << w_data[100]);
-                LOG_DEBUG(tag << " MATMUL: C[" << seq_len << "," << local_head_dim 
-                          << "] = A[" << seq_len << "," << d_model << "] @ B.T where B=[" 
-                          << w_out << "," << w_in << "]");
-            }
-            
-            if (force_scalar)
-            {
-                // Use scalar reference implementation for debugging
-                attention::AttentionValidator::scalarMatMul(
-                    input->data(), W->data(), OUT->data(),
-                    seq_len, local_head_dim, d_model,
-                    true  // transpose_B=true for PyTorch nn.Linear convention
-                );
-            }
-            else
-            {
-                // ASSERT: Validate backend abstraction inputs
-                assert(input->data() != nullptr && "Input data pointer must not be null");
-                assert(W->data() != nullptr && "Weight data pointer must not be null");
-                assert(OUT->data() != nullptr && "Output data pointer must not be null");
-                assert(seq_len > 0 && local_head_dim > 0 && d_model > 0 && 
-                       "Backend dimensions must be positive");
-                
-                if (getRank() == 0 && layer_index_ == 0) {
-                    LOG_DEBUG(tag << " BACKEND: M=" << seq_len << " N=" << local_head_dim 
-                             << " K=" << d_model << " transpose_B=true");
-                }
-                
-                PerfMatmulPhaseScope phase(2, phase_id);
-                bool prefill_like = seq_len >= (size_t)debugEnv().cosma.prefill_threshold;
-                if (prefill_like)
+                for (int n = 0; n < N; ++n)
                 {
-                    static auto prefill_backend = PrefillBackendFactory::create();
-                    PrefillOpDesc desc;
-                    desc.kind = PrefillOpKind::MatMul;
-                    desc.M = seq_len;
-                    desc.N = local_head_dim;
-                    desc.K = d_model;
-                    desc.is_prefill = true;
-                    desc.transpose_B = true;  // PyTorch nn.Linear uses x @ weight.T
-                    PrefillLaunchContext ctx{input->data(), W->data(), OUT->data()};
-                    auto decision = prefill_backend->launch(desc, ctx);
-                    if (decision.status != PrefillStatus::Success)
+                    output[m * N + n] += bias[n];
+                }
+            }
+        }
+    }
+
+    // ============================================================================
+    // MAIN EXECUTE FUNCTION
+    // ============================================================================
+    bool MPIAttentionKernel::execute(
+        const std::vector<std::shared_ptr<TensorBase>> &inputs,
+        std::vector<std::shared_ptr<TensorBase>> &outputs)
+    {
+        const int rank = getRank();
+        const int world_size = getSize();
+        const bool enable_validation = debugEnv().attention.validate_output;
+        const bool validate_projections = debugEnv().attention.validate_proj;
+
+        // ========================================================================
+        // STEP 1: Validate inputs and extract parameters
+        // ========================================================================
+        if (inputs.size() < 10)
+        {
+            LOG_ERROR("MPIAttentionKernel: Expected 10 inputs (input, wq, wk, wv, wo, bq, bk, bv, k_cache, v_cache), got " << inputs.size());
+            return false;
+        }
+
+        // Extract inputs
+        auto input = inputs[0];
+        auto wq_global = inputs[1];
+        auto wk_global = inputs[2];
+        auto wv_global = inputs[3];
+        auto wo_global = inputs[4];
+        auto bq_global = inputs[5];
+        auto bk_global = inputs[6];
+        auto bv_global = inputs[7];
+        // k_cache = inputs[8];  // Not used in prefill mode
+        // v_cache = inputs[9];  // Not used in prefill mode
+
+        const int seq_len = static_cast<int>(input->shape()[0]);
+        const int d_model = static_cast<int>(input->shape()[1]);
+
+        // Get head distribution
+        auto [local_heads, head_offset] = getHeadDistribution();
+        auto [local_kv_heads, kv_head_offset] = getKVHeadDistribution();
+        const int local_head_dim = local_heads * head_dim_;
+        const int local_kv_head_dim = local_kv_heads * head_dim_;
+
+        // VALIDATION: Bias tensor sizes must match projection output dimensions
+        // Bias is broadcast across batch/sequence dimension, so should have size = output_features
+        // Note: We allow size <= 1 biases (nullptr or dummy single-element tensors) to be skipped
+        if (bq_global && bq_global->data() && bq_global->size() > 1)
+        {
+            if (bq_global->size() != local_head_dim && bq_global->size() != (n_head_ * head_dim_))
+            {
+                LOG_ERROR("Q bias size mismatch: got " << bq_global->size()
+                                                       << ", expected " << local_head_dim << " (local) or "
+                                                       << (n_head_ * head_dim_) << " (global). "
+                                                       << "Bias must match output feature dimension or be nullptr/size-1 to skip.");
+                return false;
+            }
+        }
+        if (bk_global && bk_global->data() && bk_global->size() > 1)
+        {
+            if (bk_global->size() != local_kv_head_dim && bk_global->size() != (n_head_kv_ * head_dim_))
+            {
+                LOG_ERROR("K bias size mismatch: got " << bk_global->size()
+                                                       << ", expected " << local_kv_head_dim << " (local) or "
+                                                       << (n_head_kv_ * head_dim_) << " (global). "
+                                                       << "Bias must match output feature dimension or be nullptr/size-1 to skip.");
+                return false;
+            }
+        }
+        if (bv_global && bv_global->data() && bv_global->size() > 1)
+        {
+            if (bv_global->size() != local_kv_head_dim && bv_global->size() != (n_head_kv_ * head_dim_))
+            {
+                LOG_ERROR("V bias size mismatch: got " << bv_global->size()
+                                                       << ", expected " << local_kv_head_dim << " (local) or "
+                                                       << (n_head_kv_ * head_dim_) << " (global). "
+                                                       << "Bias must match output feature dimension or be nullptr/size-1 to skip.");
+                return false;
+            }
+        }
+
+        // WEIGHT FORMAT CONTRACT:
+        // All weights are guaranteed by QwenModelWeights to be in canonical GGUF format:
+        // - wq, wk, wv: [out_features, in_features] = [n_head*head_dim, d_model] or [local_head_dim, d_model] if sharded
+        // - wo: [in_features, out_features] = [d_model, n_head*head_dim] or [d_model, local_head_dim] if sharded
+        // Sharding detection: check if first dimension matches local vs global head dimension
+
+        const int wq_rows = static_cast<int>(wq_global->shape()[0]);
+        const bool weights_are_sharded = (wq_rows == local_head_dim);
+
+        // Expected shapes based on sharding status
+        const int expected_wq_rows = weights_are_sharded ? local_head_dim : (n_head_ * head_dim_);
+        const int expected_wk_rows = weights_are_sharded ? local_kv_head_dim : (n_head_kv_ * head_dim_);
+        const int expected_wv_rows = weights_are_sharded ? local_kv_head_dim : (n_head_kv_ * head_dim_);
+        const int expected_wo_cols = weights_are_sharded ? local_head_dim : (n_head_ * head_dim_);
+
+        // CRITICAL: Always validate weight dimensions before matmul to prevent crashes
+        // (regardless of enable_validation flag)
+        const int wq_cols = static_cast<int>(wq_global->shape()[1]);
+        const int wk_rows = static_cast<int>(wk_global->shape()[0]);
+        const int wk_cols = static_cast<int>(wk_global->shape()[1]);
+        const int wv_rows = static_cast<int>(wv_global->shape()[0]);
+        const int wv_cols = static_cast<int>(wv_global->shape()[1]);
+        const int wo_rows = static_cast<int>(wo_global->shape()[0]);
+        const int wo_cols = static_cast<int>(wo_global->shape()[1]);
+
+        if (wq_rows != expected_wq_rows || wq_cols != d_model)
+        {
+            LOG_ERROR("wq dimension mismatch: got [" << wq_rows << "," << wq_cols << "], expected ["
+                                                     << expected_wq_rows << "," << d_model << "]");
+            return false;
+        }
+        if (wk_rows != expected_wk_rows || wk_cols != d_model)
+        {
+            LOG_ERROR("wk dimension mismatch: got [" << wk_rows << "," << wk_cols << "], expected ["
+                                                     << expected_wk_rows << "," << d_model << "]");
+            return false;
+        }
+        if (wv_rows != expected_wv_rows || wv_cols != d_model)
+        {
+            LOG_ERROR("wv dimension mismatch: got [" << wv_rows << "," << wv_cols << "], expected ["
+                                                     << expected_wv_rows << "," << d_model << "]");
+            return false;
+        }
+        if (wo_rows != d_model || wo_cols != expected_wo_cols)
+        {
+            LOG_ERROR("wo dimension mismatch: got [" << wo_rows << "," << wo_cols << "], expected ["
+                                                     << d_model << "," << expected_wo_cols << "]");
+            return false;
+        }
+
+        if (rank == 0)
+        {
+            LOG_INFO("Attention layer " << layer_index_ << ": seq_len=" << seq_len
+                                        << ", d_model=" << d_model << ", local_heads=" << local_heads
+                                        << "/" << n_head_ << ", local_kv_heads=" << local_kv_heads << "/" << n_head_kv_
+                                        << ", weights_sharded=" << (weights_are_sharded ? "yes" : "no"));
+        }
+
+        // CONTRACT: Input validation (handle both sharded and full weights)
+        if (enable_validation)
+        {
+            StageContract input_contract("InputValidation");
+            input_contract.inputs = {
+                TensorContract("input", ShapeSpec({seq_len, d_model}, {"seq_len", "d_model"}),
+                               TensorLayout::RowMajor, TensorSemantic::Activation),
+                TensorContract("wq", ShapeSpec({expected_wq_rows, d_model}),
+                               TensorLayout::RowMajor, TensorSemantic::Weight),
+                TensorContract("wk", ShapeSpec({expected_wk_rows, d_model}),
+                               TensorLayout::RowMajor, TensorSemantic::Weight),
+                TensorContract("wv", ShapeSpec({expected_wv_rows, d_model}),
+                               TensorLayout::RowMajor, TensorSemantic::Weight),
+                TensorContract("wo", ShapeSpec({d_model, expected_wo_cols}),
+                               TensorLayout::RowMajor, TensorSemantic::Weight)};
+
+            try
+            {
+                input_contract.validate_inputs({input, wq_global, wk_global, wv_global, wo_global});
+                if (rank == 0)
+                    LOG_DEBUG("✓ Input shape contracts validated (sharded=" << weights_are_sharded << ")");
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("Input contract violation: " << e.what());
+                return false;
+            }
+
+            // HEALTH CHECK: Detect uninitialized/corrupted input data
+            if (rank == 0)
+            {
+                TensorHealthCheck checks[] = {
+                    TensorHealthCheck("input"),
+                    TensorHealthCheck("wq_global"),
+                    TensorHealthCheck("wk_global"),
+                    TensorHealthCheck("wv_global"),
+                    TensorHealthCheck("wo_global")};
+                const float *data_ptrs[] = {
+                    input->data(), wq_global->data(), wk_global->data(),
+                    wv_global->data(), wo_global->data()};
+                size_t sizes[] = {
+                    input->size(), wq_global->size(), wk_global->size(),
+                    wv_global->size(), wo_global->size()};
+
+                bool all_healthy = true;
+                for (int i = 0; i < 5; ++i)
+                {
+                    checks[i].check(data_ptrs[i], sizes[i]);
+                    checks[i].log(rank);
+                    if (!checks[i].is_healthy())
                     {
-                        LOG_WARN(tag << " projection abstraction fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                        // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
-                        if (!adaptiveMatMul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model, false, false, false, true))
-                        {
-                            LOG_ERROR(tag << " projection failed on rank " << getRank());
-                            return false;
-                        }
+                        all_healthy = false;
                     }
                 }
-                else
+
+                if (!all_healthy)
                 {
-                    static auto infer_backend = InferenceBackendFactory::create();
-                    InferenceOpDesc desc;
-                    desc.kind = InferenceOpKind::MatMul;
-                    desc.M = seq_len;
-                    desc.N = local_head_dim;
-                    desc.K = d_model;
-                    desc.latency_critical = true;
-                    desc.transpose_B = true;  // PyTorch nn.Linear uses x @ weight.T
-                    InferenceLaunchContext ctx{input->data(), W->data(), OUT->data()};
-                    auto decision = infer_backend->launch(desc, ctx);
-                    if (decision.status != InferenceStatus::Success)
-                    {
-                        LOG_WARN(tag << " projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                        // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
-                        if (!adaptiveMatMul(input->data(), W->data(), OUT->data(), seq_len, local_head_dim, d_model, false, false, false, true))
-                        {
-                            LOG_ERROR(tag << " projection failed on rank " << getRank());
-                            return false;
-                        }
-                    }
+                    LOG_ERROR("❌ Input tensors contain NaN/Inf - aborting execution");
+                    return false;
+                }
+
+                // Add detailed input statistics for debugging
+                float input_min = *std::min_element(input->data(), input->data() + input->size());
+                float input_max = *std::max_element(input->data(), input->data() + input->size());
+                float input_sum = std::accumulate(input->data(), input->data() + input->size(), 0.0f);
+                float input_mean = input_sum / input->size();
+
+                float wq_min = *std::min_element(wq_global->data(), wq_global->data() + wq_global->size());
+                float wq_max = *std::max_element(wq_global->data(), wq_global->data() + wq_global->size());
+                float wq_sum = std::accumulate(wq_global->data(), wq_global->data() + wq_global->size(), 0.0f);
+                float wq_mean = wq_sum / wq_global->size();
+
+                LOG_INFO("[INPUT_DEBUG] Layer " << layer_index_ << " Input stats: "
+                                                << "size=" << input->size() << " shape=[" << seq_len << "," << d_model << "] "
+                                                << "min=" << input_min << " max=" << input_max << " mean=" << input_mean << " "
+                                                << "sample[0:5]=[" << input->data()[0] << "," << input->data()[1] << ","
+                                                << input->data()[2] << "," << input->data()[3] << "," << input->data()[4] << "]");
+
+                LOG_INFO("[INPUT_DEBUG] Layer " << layer_index_ << " WQ stats: "
+                                                << "size=" << wq_global->size() << " shape=[" << expected_wq_rows << "," << d_model << "] "
+                                                << "min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean << " "
+                                                << "sample[0:5]=[" << wq_global->data()[0] << "," << wq_global->data()[1] << ","
+                                                << wq_global->data()[2] << "," << wq_global->data()[3] << "," << wq_global->data()[4] << "]");
+            }
+        }
+
+        // Broadcast input to all ranks
+        if (world_size > 1)
+        {
+            MPI_Bcast(input->data(), input->size(), MPI_FLOAT, 0, MPI_COMM_WORLD);
+        }
+
+        // ========================================================================
+        // STEP 2: Distribute weights by head dimension
+        // ========================================================================
+        std::shared_ptr<TensorBase> local_wq, local_wk, local_wv, local_wo;
+        std::shared_ptr<TensorBase> local_bq, local_bk, local_bv;
+
+        if (weights_are_sharded)
+        {
+            // Weights are already sharded - use them directly
+            local_wq = wq_global;
+            local_wk = wk_global;
+            local_wv = wv_global;
+            local_wo = wo_global;
+            // Only use bias if it's a real bias (size > 1), not a dummy placeholder
+            local_bq = (bq_global && bq_global->size() > 1) ? bq_global : nullptr;
+            local_bk = (bk_global && bk_global->size() > 1) ? bk_global : nullptr;
+            local_bv = (bv_global && bv_global->size() > 1) ? bv_global : nullptr;
+
+            if (rank == 0)
+            {
+                LOG_DEBUG("Using pre-sharded weights directly (local_head_dim=" << local_head_dim << ")");
+                fprintf(stderr, "[kernel-test] rank %d local_wo shape: [%d, %d]\n",
+                        rank, (int)local_wo->shape()[0], (int)local_wo->shape()[1]);
+                fprintf(stderr, "[kernel-test] rank %d local_wo[0,0:4]: %.6f, %.6f, %.6f, %.6f\n",
+                        rank, local_wo->data()[0], local_wo->data()[1],
+                        local_wo->data()[2], local_wo->data()[3]);
+                fflush(stderr);
+            }
+        }
+        else if (world_size == 1)
+        {
+            // Single-rank: use global weights directly
+            local_wq = wq_global;
+            local_wk = wk_global;
+            local_wv = wv_global;
+            local_wo = wo_global;
+            // Only use bias if it's a real bias (size > 1), not a dummy placeholder
+            local_bq = (bq_global && bq_global->size() > 1) ? bq_global : nullptr;
+            local_bk = (bk_global && bk_global->size() > 1) ? bk_global : nullptr;
+            local_bv = (bv_global && bv_global->size() > 1) ? bv_global : nullptr;
+        }
+        else
+        {
+            // Multi-rank with global weights: slice weights by head dimension
+            local_wq = TensorFactory::create_simple({local_head_dim, d_model});
+            local_wk = TensorFactory::create_simple({local_kv_head_dim, d_model});
+            local_wv = TensorFactory::create_simple({local_kv_head_dim, d_model});
+            local_wo = TensorFactory::create_simple({d_model, local_head_dim});
+
+            // Copy weight slices (row-wise slicing for wq/wk/wv, column-wise for wo)
+            const int wq_offset = head_offset * head_dim_ * d_model;
+            const int kv_offset = kv_head_offset * head_dim_ * d_model;
+
+            memcpy(local_wq->data(), wq_global->data() + wq_offset, local_head_dim * d_model * sizeof(float));
+            memcpy(local_wk->data(), wk_global->data() + kv_offset, local_kv_head_dim * d_model * sizeof(float));
+            memcpy(local_wv->data(), wv_global->data() + kv_offset, local_kv_head_dim * d_model * sizeof(float));
+
+            // Copy output weight (column slice)
+            for (int row = 0; row < d_model; ++row)
+            {
+                const float *src = wo_global->data() + row * (n_head_ * head_dim_) + (head_offset * head_dim_);
+                float *dst = local_wo->data() + row * local_head_dim;
+                memcpy(dst, src, local_head_dim * sizeof(float));
+            }
+
+            // Distribute biases
+            if (bq_global && bq_global->data() && bq_global->size() > 1)
+            {
+                local_bq = TensorFactory::create_simple({local_head_dim});
+                const int bq_offset = head_offset * head_dim_;
+                memcpy(local_bq->data(), bq_global->data() + bq_offset, local_head_dim * sizeof(float));
+            }
+
+            if (bk_global && bk_global->data() && bk_global->size() > 1)
+            {
+                local_bk = TensorFactory::create_simple({local_kv_head_dim});
+                const int bk_offset = kv_head_offset * head_dim_;
+                memcpy(local_bk->data(), bk_global->data() + bk_offset, local_kv_head_dim * sizeof(float));
+            }
+
+            if (bv_global && bv_global->data() && bv_global->size() > 1)
+            {
+                local_bv = TensorFactory::create_simple({local_kv_head_dim});
+                const int bv_offset = kv_head_offset * head_dim_;
+                memcpy(local_bv->data(), bv_global->data() + bv_offset, local_kv_head_dim * sizeof(float));
+            }
+        }
+
+        // ========================================================================
+        // STEP 3: Compute Q, K, V projections
+        // ========================================================================
+        auto local_q = TensorFactory::create_simple({seq_len, local_head_dim});
+        auto local_k = TensorFactory::create_simple({seq_len, local_kv_head_dim});
+        auto local_v = TensorFactory::create_simple({seq_len, local_kv_head_dim});
+
+        if (rank == 0)
+        {
+            std::cerr << "[DEBUG-MATMUL] local_q created: size=" << local_q->size()
+                      << " data_ptr=" << (void *)local_q->data()
+                      << " first=" << local_q->data()[0]
+                      << " last=" << local_q->data()[local_q->size() - 1] << std::endl;
+        }
+
+        matmul_with_bias(input->data(), local_wq->data(), local_q->data(),
+                         local_bq ? local_bq->data() : nullptr,
+                         seq_len, local_head_dim, d_model);
+
+        // IMMEDIATE INLINE CHECK - grab the value BEFORE any code
+        float immediate_val_8 = (local_q->size() > 8) ? local_q->data()[8] : -999.0f;
+
+        if (rank == 0)
+        {
+            std::cerr << "[CHECK-INLINE] Immediate inline value at index 8: " << immediate_val_8 << std::endl;
+
+            // IMMEDIATE check - before any other code runs
+            asm volatile("" ::: "memory");
+            float *q_ptr = local_q->data();
+            std::cerr << "[CHECK-1] Q ptr IMMEDIATELY after matmul call: " << (void *)q_ptr << std::endl;
+            std::cerr << "[CHECK-1] Q[8] via ptr: " << q_ptr[8] << std::endl;
+            std::cerr << "[CHECK-1] Q[8] via local_q->data(): " << local_q->data()[8] << std::endl;
+
+            // Scan for garbage
+            bool has_garbage = false;
+            for (int i = 0; i < local_q->size(); ++i)
+            {
+                if (std::abs(q_ptr[i]) > 1e10f)
+                {
+                    std::cerr << "[CHECK-1] GARBAGE at index " << i << ": " << q_ptr[i] << std::endl;
+                    has_garbage = true;
+                    break;
                 }
             }
-            
-            // ASSERT: Post-projection output validation
+            if (!has_garbage)
             {
-                const float *out_data = OUT->data();
-                size_t total_elements = seq_len * local_head_dim;
-                
-                // Check for NaN/Inf
-                bool has_nan_inf = false;
-                for (size_t i = 0; i < total_elements; ++i) {
-                    if (std::isnan(out_data[i]) || std::isinf(out_data[i])) {
-                        has_nan_inf = true;
-                        if (getRank() == 0) {
-                            LOG_ERROR(tag << " output contains NaN/Inf at index " << i 
-                                     << " value=" << out_data[i]);
-                        }
+                std::cerr << "[CHECK-1] NO GARBAGE - all values look normal!" << std::endl;
+            }
+        }
+
+        if (rank == 0)
+        {
+            // Force compiler to not reorder this code
+            asm volatile("" ::: "memory");
+            float *q_ptr = local_q->data();
+            std::cerr << "[DEBUG-MATMUL] Q ptr after matmul: " << (void *)q_ptr << std::endl;
+            float min_q = q_ptr[0], max_q = q_ptr[0];
+            int garbage_idx = -1;
+            for (int i = 0; i < local_q->size(); ++i)
+            {
+                float val = q_ptr[i];
+                if (std::abs(val) > 1e10f && garbage_idx < 0)
+                {
+                    garbage_idx = i;
+                    std::cerr << "[DEBUG-MATMUL] GARBAGE FOUND at index " << i << ": " << val << std::endl;
+                }
+                min_q = std::min(min_q, val);
+                max_q = std::max(max_q, val);
+            }
+            std::cerr << "[DEBUG-MATMUL] IMMEDIATELY after Q matmul: range=["
+                      << min_q << ", " << max_q << "]" << std::endl;
+            // Print first and last few values
+            std::cerr << "[DEBUG-MATMUL] Q first 4: " << q_ptr[0] << ", " << q_ptr[1] << ", " << q_ptr[2] << ", " << q_ptr[3] << std::endl;
+            std::cerr << "[DEBUG-MATMUL] Q last 4: " << q_ptr[124] << ", " << q_ptr[125] << ", " << q_ptr[126] << ", " << q_ptr[127] << std::endl;
+        }
+
+        matmul_with_bias(input->data(), local_wk->data(), local_k->data(),
+                         local_bk ? local_bk->data() : nullptr,
+                         seq_len, local_kv_head_dim, d_model);
+
+        if (rank == 0)
+        {
+            float min_k = local_k->data()[0], max_k = local_k->data()[0];
+            for (int i = 0; i < local_k->size(); ++i)
+            {
+                min_k = std::min(min_k, local_k->data()[i]);
+                max_k = std::max(max_k, local_k->data()[i]);
+            }
+            std::cerr << "[DEBUG-MATMUL] IMMEDIATELY after K matmul: range=["
+                      << min_k << ", " << max_k << "]" << std::endl;
+
+            // CHECK IF Q WAS CORRUPTED
+            float *q_ptr = local_q->data();
+            bool q_corrupted = false;
+            for (int i = 0; i < local_q->size(); ++i)
+            {
+                if (std::abs(q_ptr[i]) > 1e10f)
+                {
+                    std::cerr << "[CHECK-AFTER-K] ⚠️ Q CORRUPTED after K matmul! Garbage at index " << i << ": " << q_ptr[i] << std::endl;
+                    q_corrupted = true;
+                    break;
+                }
+            }
+            if (!q_corrupted)
+            {
+                std::cerr << "[CHECK-AFTER-K] Q still clean after K matmul" << std::endl;
+            }
+        }
+
+        matmul_with_bias(input->data(), local_wv->data(), local_v->data(),
+                         local_bv ? local_bv->data() : nullptr,
+                         seq_len, local_kv_head_dim, d_model);
+
+        if (rank == 0)
+        {
+            float min_v = local_v->data()[0], max_v = local_v->data()[0];
+            for (int i = 0; i < local_v->size(); ++i)
+            {
+                min_v = std::min(min_v, local_v->data()[i]);
+                max_v = std::max(max_v, local_v->data()[i]);
+            }
+            std::cerr << "[DEBUG-MATMUL] IMMEDIATELY after V matmul: range=["
+                      << min_v << ", " << max_v << "]" << std::endl;
+
+            // CHECK IF Q WAS CORRUPTED
+            float *q_ptr = local_q->data();
+            bool q_corrupted = false;
+            for (int i = 0; i < local_q->size(); ++i)
+            {
+                if (std::abs(q_ptr[i]) > 1e10f)
+                {
+                    std::cerr << "[CHECK-AFTER-V] ⚠️ Q CORRUPTED after V matmul! Garbage at index " << i << ": " << q_ptr[i] << std::endl;
+                    q_corrupted = true;
+                    break;
+                }
+            }
+            if (!q_corrupted)
+            {
+                std::cerr << "[CHECK-AFTER-V] Q still clean after V matmul" << std::endl;
+            }
+        }
+
+        // CONTRACT: QKV projections
+        if (enable_validation)
+        {
+            // CHECK: Q before contract validation
+            {
+                float *q_ptr = local_q->data();
+                bool q_corrupted = false;
+                for (int i = 0; i < local_q->size(); ++i)
+                {
+                    if (std::abs(q_ptr[i]) > 1e10f)
+                    {
+                        std::cerr << "[CHECK-BEFORE-CONTRACT] ⚠️ Q CORRUPTED before contract! Garbage at index " << i << ": " << q_ptr[i] << std::endl;
+                        q_corrupted = true;
                         break;
                     }
                 }
-                assert(!has_nan_inf && "Projection output must not contain NaN or Inf");
-                
-                // Check output is not all zeros (common bug indicator)
-                float sum_abs = 0.0f;
-                for (size_t i = 0; i < total_elements; ++i) {
-                    sum_abs += std::abs(out_data[i]);
-                }
-                float mean_abs = sum_abs / total_elements;
-                assert(mean_abs > 1e-8f && "Projection output suspiciously close to zero");
-                
-                // Log output statistics for debugging
-                if (getRank() == 0 && layer_index_ == 0) {
-                    float min_val = out_data[0], max_val = out_data[0];
-                    for (size_t i = 1; i < total_elements; ++i) {
-                        min_val = std::min(min_val, out_data[i]);
-                        max_val = std::max(max_val, out_data[i]);
-                    }
-                    LOG_DEBUG(tag << " OUTPUT: mean_abs=" << mean_abs 
-                             << " min=" << min_val << " max=" << max_val
-                             << " samples: [0]=" << out_data[0] 
-                             << " [10]=" << out_data[std::min(10UL, total_elements-1)]
-                             << " [last]=" << out_data[total_elements-1]);
+                if (!q_corrupted)
+                {
+                    std::cerr << "[CHECK-BEFORE-CONTRACT] Q clean before contract validation" << std::endl;
                 }
             }
-            
-            // Validation: compare against scalar reference if enabled
-            if (validate_proj || force_scalar)
+
+            StageContract qkv_contract("QKV_Projections");
+            qkv_contract.outputs = {
+                TensorContract("local_q", ShapeSpec({seq_len, local_head_dim}),
+                               TensorLayout::HeadInterleaved, TensorSemantic::Activation),
+                TensorContract("local_k", ShapeSpec({seq_len, local_kv_head_dim}),
+                               TensorLayout::HeadInterleaved, TensorSemantic::Activation),
+                TensorContract("local_v", ShapeSpec({seq_len, local_kv_head_dim}),
+                               TensorLayout::HeadInterleaved, TensorSemantic::Activation)};
+
+            try
             {
-                auto result = attention::AttentionValidator::validateProjection(
-                    input->data(), W->data(), OUT->data(),
-                    seq_len, local_head_dim, d_model,
-                    true  // transpose_B=true for PyTorch nn.Linear
-                );
-                
-                if (!result.passed)
+                qkv_contract.validate_outputs({local_q, local_k, local_v});
+
+                // CHECK: Q after contract validation
                 {
-                    if (getRank() == 0) {
-                        LOG_WARN("Projection validation diverged tag=" << tag 
-                                << " max_abs=" << result.max_abs 
-                                << " rel_l2=" << result.rel_l2);
+                    float *q_ptr = local_q->data();
+                    bool q_corrupted = false;
+                    for (int i = 0; i < local_q->size(); ++i)
+                    {
+                        if (std::abs(q_ptr[i]) > 1e10f)
+                        {
+                            std::cerr << "[CHECK-AFTER-CONTRACT] ⚠️ Q CORRUPTED after contract! Garbage at index " << i << ": " << q_ptr[i] << std::endl;
+                            q_corrupted = true;
+                            break;
+                        }
+                    }
+                    if (!q_corrupted)
+                    {
+                        std::cerr << "[CHECK-AFTER-CONTRACT] Q clean after contract validation" << std::endl;
                     }
                 }
+                if (rank == 0)
+                    LOG_DEBUG("✓ QKV projection shape contracts validated");
             }
-            return true;
-        };
-
-        // Q, K, V
-        if (!do_projection("Q", local_wq, local_q, 1))
-            return;
-        // Capture Q projection snapshot (before RoPE)
-        if (snapshot_callback_ && getRank() == 0)
-        {
-            auto [local_h, _] = getHeadDistribution();
-            
-            // DEBUG: Log snapshot buffer statistics
-            const float *q_data = local_q->data();
-            size_t total_q_elements = seq_len * local_h * head_dim_;
-            float q_min = q_data[0], q_max = q_data[0];
-            float q_sum_abs = 0.0f;
-            for (size_t i = 0; i < total_q_elements; ++i) {
-                q_min = std::min(q_min, q_data[i]);
-                q_max = std::max(q_max, q_data[i]);
-                q_sum_abs += std::abs(q_data[i]);
-            }
-            float q_mean_abs = q_sum_abs / total_q_elements;
-            
-            LOG_INFO("SNAPSHOT Q_PROJECTION_layer" << layer_index_ 
-                     << " stats: min=" << q_min << " max=" << q_max 
-                     << " mean_abs=" << q_mean_abs
-                     << " shape=[" << seq_len << "," << (local_h * head_dim_) << "]"
-                     << " q[0,559]=" << q_data[559]);
-            
-            snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, local_q->data(), seq_len, local_h * head_dim_);
-        }
-
-        if (!do_projection("K", local_wk, local_k, 2))
-            return;
-        // Capture K projection snapshot (before RoPE)
-        if (snapshot_callback_ && getRank() == 0)
-        {
-            auto [local_kv_h, _] = getKVHeadDistribution();  // Use K/V head distribution for GQA
-            snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, local_k->data(), seq_len, local_kv_h * head_dim_);
-        }
-
-        if (!do_projection("V", local_wv, local_v, 3))
-            return;
-        // Capture V projection snapshot (no RoPE applied to V)
-        if (snapshot_callback_ && getRank() == 0)
-        {
-            auto [local_kv_h, _] = getKVHeadDistribution();  // Use K/V head distribution for GQA
-            snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, local_v->data(), seq_len, local_kv_h * head_dim_);
-        }
-
-        auto [lh_final, _off] = getHeadDistribution();
-        LOG_DEBUG("Computed local projections using COSMA/adaptive for " << lh_final << " heads on rank " << getRank());
-    }
-
-    void MPIAttentionKernel::computeLocalAttention(const float *local_q, const float *local_k, const float *local_v,
-                                                   float *local_output, size_t seq_len, int local_heads)
-    {
-        // Create temporary storage for attention scores
-        size_t scores_size = seq_len * seq_len * static_cast<size_t>(local_heads);
-        auto scores = std::make_unique<float[]>(scores_size);
-
-        // Compute attention scores and apply softmax
-        computeLocalAttentionScores(local_q, local_k, scores.get(), seq_len, local_heads);
-
-        // Capture attention scores after softmax (attention weights)
-        if (snapshot_callback_ && getRank() == 0)
-        {
-            // Note: Scores are in [heads, seq_len, seq_len] layout
-            // For snapshot we'll capture as [seq_len * local_heads, seq_len]
-            snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, scores.get(), seq_len * local_heads, seq_len);
-        }
-
-        // Apply attention to values
-        applyLocalAttention(scores.get(), local_v, local_output, seq_len, local_heads);
-
-        // Capture attention context (output of attention before output projection)
-        if (snapshot_callback_ && getRank() == 0)
-        {
-            snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, layer_index_, local_output, seq_len, local_heads * head_dim_);
-        }
-
-        // Optional debug validation: re-run scalar reference primitives on already RoPE-rotated Q/K
-        // and compare with kernel path. Enabled when LLAMINAR_ATTN_PRIMITIVES_VALIDATE is set.
-        if (debugEnv().attention.validate_primitives)
-        {
-            // We intentionally perform this only on rank 0 to avoid duplicated logs.
-            if (getRank() == 0)
+            catch (const std::exception &e)
             {
-                // Primitive layout matches: sequence-major rows, heads contiguous per row.
-                // local_q/k/v layout here is [seq_len, local_heads * head_dim_].
-                // Build a temporary contiguous copy so we can treat as primitives input.
-                size_t frame_elems = seq_len * static_cast<size_t>(local_heads) * head_dim_;
-                std::vector<float> q_copy(frame_elems), k_copy(frame_elems), v_copy(frame_elems);
-                std::memcpy(q_copy.data(), local_q, frame_elems * sizeof(float));
-                std::memcpy(k_copy.data(), local_k, frame_elems * sizeof(float));
-                std::memcpy(v_copy.data(), local_v, frame_elems * sizeof(float));
+                LOG_ERROR("QKV projection contract violation: " << e.what());
+                return false;
+            }
 
-                // Fused primitive attention (always causal in kernel today)
-                std::vector<float> fused_out(frame_elems, 0.f);
-                llaminar::attn::fused_attention(q_copy.data(), k_copy.data(), v_copy.data(), fused_out.data(),
-                                                static_cast<int>(seq_len), head_dim_, local_heads, /*causal=*/true);
+            // HEALTH CHECK: Verify projections produced valid values
+            if (rank == 0)
+            {
+                TensorHealthCheck q_health("local_q");
+                q_health.check(local_q->data(), local_q->size());
+                q_health.log(rank);
 
-                // Compute simple diff metrics
-                double max_abs = 0.0, sum_sq_ref = 0.0, sum_sq_diff = 0.0;
-                for (size_t i = 0; i < frame_elems; ++i)
+                TensorHealthCheck k_health("local_k");
+                k_health.check(local_k->data(), local_k->size());
+                k_health.log(rank);
+
+                TensorHealthCheck v_health("local_v");
+                v_health.check(local_v->data(), local_v->size());
+                v_health.log(rank);
+
+                if (!q_health.is_healthy() || !k_health.is_healthy() || !v_health.is_healthy())
                 {
-                    double ref = fused_out[i];
-                    double got = local_output[i];
-                    double diff = std::fabs(ref - got);
-                    if (diff > max_abs)
-                        max_abs = diff;
-                    sum_sq_ref += ref * ref;
-                    sum_sq_diff += diff * diff;
+                    LOG_ERROR("❌ QKV projections produced NaN/Inf - matrix multiplication failed!");
+                    return false;
                 }
-                double rel_l2 = (sum_sq_ref == 0.0) ? 0.0 : std::sqrt(sum_sq_diff / sum_sq_ref);
-                if (max_abs > 1e-5 || rel_l2 > 1e-5)
+            }
+
+            // OPTIONAL: Validate against scalar reference implementation
+            if (validate_projections && rank == 0)
+            {
+                auto q_result = llaminar::attention::AttentionValidator::validateProjection(
+                    input->data(), local_wq->data(), local_q->data(),
+                    seq_len, local_head_dim, d_model, true);
+
+                if (!llaminar::attention::AttentionValidator::isWithinTolerance(q_result, 1e-4, 1e-4))
                 {
-                    LOG_WARN("MPIAttentionKernel primitives validation divergence max_abs=" << max_abs
-                                                                                            << " rel_l2=" << rel_l2
-                                                                                            << " (seq_len=" << seq_len << ", local_heads=" << local_heads << ")");
+                    LOG_WARN("Q projection divergence: max_abs=" << q_result.max_abs
+                                                                 << ", rel_l2=" << q_result.rel_l2);
                 }
                 else
                 {
-                    LOG_DEBUG("MPIAttentionKernel primitives validation OK max_abs=" << max_abs
-                                                                                     << " rel_l2=" << rel_l2);
+                    LOG_DEBUG("✓ Q projection validated against scalar reference");
                 }
             }
         }
 
-        LOG_DEBUG("Computed local attention for " << local_heads << " heads on rank " << getRank());
-    }
+        // Snapshot Q/K/V projections if callback is set
+        if (snapshot_callback_)
+        {
+            // Add instrumentation to verify values before snapshotting
+            if (rank == 0)
+            {
+                float q_min = *std::min_element(local_q->data(), local_q->data() + local_q->size());
+                float q_max = *std::max_element(local_q->data(), local_q->data() + local_q->size());
+                float q_sum = std::accumulate(local_q->data(), local_q->data() + local_q->size(), 0.0f);
+                float q_mean = q_sum / local_q->size();
 
-    void MPIAttentionKernel::applyLocalRoPE(float *local_q, float *local_k, size_t seq_len, int local_heads)
-    {
-        // Primitive applies in-place RoPE to Q/K (causal offset n_past_)
-        const auto &env = debugEnv();
-        if (getRank() == 0)
-        {
-            static int gate_count = 0;
-            if (gate_count < 8)
-            {
-                LOG_WARN("[RoPEDiagGate] internal_diff=" << env.attention.internal_diff
-                                                         << " layer_token_diff=" << env.pipeline.layer_token_diff
-                                                         << " layer_replay_compare=" << env.pipeline.layer_replay_compare
-                                                         << " seq_len=" << seq_len << " n_past=" << n_past_ << " local_heads=" << local_heads);
-                ++gate_count;
+                float k_min = *std::min_element(local_k->data(), local_k->data() + local_k->size());
+                float k_max = *std::max_element(local_k->data(), local_k->data() + local_k->size());
+                float k_sum = std::accumulate(local_k->data(), local_k->data() + local_k->size(), 0.0f);
+                float k_mean = k_sum / local_k->size();
+
+                float v_min = *std::min_element(local_v->data(), local_v->data() + local_v->size());
+                float v_max = *std::max_element(local_v->data(), local_v->data() + local_v->size());
+                float v_sum = std::accumulate(local_v->data(), local_v->data() + local_v->size(), 0.0f);
+                float v_mean = v_sum / local_v->size();
+
+                LOG_INFO("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " Q projection stats: "
+                                                   << "size=" << local_q->size() << " "
+                                                   << "min=" << q_min << " max=" << q_max << " mean=" << q_mean << " "
+                                                   << "sample[0:5]=[" << local_q->data()[0] << "," << local_q->data()[1] << ","
+                                                   << local_q->data()[2] << "," << local_q->data()[3] << "," << local_q->data()[4] << "]");
+
+                LOG_INFO("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " K projection stats: "
+                                                   << "size=" << local_k->size() << " "
+                                                   << "min=" << k_min << " max=" << k_max << " mean=" << k_mean << " "
+                                                   << "sample[0:5]=[" << local_k->data()[0] << "," << local_k->data()[1] << ","
+                                                   << local_k->data()[2] << "," << local_k->data()[3] << "," << local_k->data()[4] << "]");
+
+                LOG_INFO("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " V projection stats: "
+                                                   << "size=" << local_v->size() << " "
+                                                   << "min=" << v_min << " max=" << v_max << " mean=" << v_mean << " "
+                                                   << "sample[0:5]=[" << local_v->data()[0] << "," << local_v->data()[1] << ","
+                                                   << local_v->data()[2] << "," << local_v->data()[3] << "," << local_v->data()[4] << "]");
             }
         }
-        // We want diagnostics even if replay compare snapshot not yet set when called from replay pipeline.
-        bool diag = env.attention.internal_diff && getRank() == 0;
-        if (diag)
+        else
         {
-            static int invoke_count = 0;
-            ++invoke_count;
-            if (invoke_count <= 12)
+            if (rank == 0)
             {
-                LOG_INFO("[RoPEDiagInvoke] call=" << invoke_count << " seq_len=" << seq_len << " n_past=" << n_past_ << " local_heads=" << local_heads << " head_dim=" << head_dim_ << " layer_replay_compare=" << (env.pipeline.layer_replay_compare ? 1 : 0));
-            }
-        }
-        if (!env.pipeline.layer_replay_compare && diag)
-        {
-            // Lightweight marker to confirm gating condition; only emits once per run per rank due to static.
-            static bool warned = false;
-            if (!warned)
-            {
-                LOG_INFO("[RoPEDiag] note=replay_compare_flag_off but collecting due to internal_diff");
-                warned = true;
-            }
-        }
-        // Determine whether this invocation is incremental single-token (seq_len==1 with history)
-        bool incr = (seq_len == 1 && n_past_ > 0);
-        int head_dim = head_dim_;
-        int preview = std::min(head_dim * local_heads, 8); // first few floats across first head slice
-        // Capture BEFORE snapshot for first head last token only (the token whose rotation parity we care about)
-        std::array<float, 8> q_before{};
-        std::array<float, 8> k_before{};
-        q_before.fill(0.f);
-        k_before.fill(0.f);
-        if (diag && seq_len > 0 && preview > 0)
-        {
-            // Layout: contiguous [seq_len, local_heads*head_dim]
-            size_t row_offset = (seq_len - 1) * (size_t)local_heads * head_dim; // last token row inside local_q/k
-            const float *q_row = local_q + row_offset;
-            const float *k_row = local_k + row_offset;
-            for (int i = 0; i < preview; ++i)
-            {
-                q_before[i] = q_row[i];
-                k_before[i] = k_row[i];
+                LOG_WARN("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " snapshot_callback_ is NULL - snapshots NOT captured!");
             }
         }
 
-        llaminar::attn::apply_rope(local_q, local_k, (int)seq_len, head_dim_, local_heads, (int)n_past_, rope_freq_base_);
-
-        if (diag && seq_len > 0)
+        // ========================================================================
+        // STEP 4: Gather Q/K/V for snapshotting (BEFORE RoPE!)
+        // ========================================================================
+        // For multi-rank execution, we need to gather Q/K/V across all ranks before snapshotting
+        // This is because PyTorch reference has the full Q/K/V, not sharded versions
+        //
+        // CRITICAL: PyTorch captures Q_PROJECTION/K_PROJECTION BEFORE RoPE is applied,
+        // so we must gather and snapshot BEFORE applying RoPE to match the reference.
+        //
+        // We gather row-by-row (per token) to maintain proper layout
+        // Each rank has [seq_len, local_head_dim] in row-major order
+        // We need to concatenate the head dimension per row to get [seq_len, total_head_dim]
+        if (snapshot_callback_ && world_size > 1)
         {
-            if (preview == 0)
+            // Allocate global tensors
+            auto global_q = TensorFactory::create_simple({seq_len, n_head_ * head_dim_});
+            auto global_k = TensorFactory::create_simple({seq_len, n_head_kv_ * head_dim_});
+            auto global_v = TensorFactory::create_simple({seq_len, n_head_kv_ * head_dim_});
+
+            // Gather row-by-row to maintain proper layout
+            // For Q: gather local_head_dim elements per row from each rank
+            for (int t = 0; t < seq_len; ++t)
             {
-                LOG_INFO("[RoPEDiag] mode=" << (incr ? "INC" : "REPLAY")
-                                            << " n_past=" << n_past_ << " seq_len=" << seq_len
-                                            << " heads_local=" << local_heads << " head_dim=" << head_dim
-                                            << " note=preview_zero_unexpected");
+                const float *local_q_row = local_q->data() + t * local_head_dim;
+                float *global_q_row = global_q->data() + t * (n_head_ * head_dim_);
+
+                // Gather this row from all ranks, placing each rank's data at the correct offset
+                MPI_Allgather(local_q_row, local_head_dim, MPI_FLOAT,
+                              global_q_row, local_head_dim, MPI_FLOAT,
+                              MPI_COMM_WORLD);
+            }
+
+            // Same for K
+            for (int t = 0; t < seq_len; ++t)
+            {
+                const float *local_k_row = local_k->data() + t * local_kv_head_dim;
+                float *global_k_row = global_k->data() + t * (n_head_kv_ * head_dim_);
+
+                MPI_Allgather(local_k_row, local_kv_head_dim, MPI_FLOAT,
+                              global_k_row, local_kv_head_dim, MPI_FLOAT,
+                              MPI_COMM_WORLD);
+            }
+
+            // Same for V
+            for (int t = 0; t < seq_len; ++t)
+            {
+                const float *local_v_row = local_v->data() + t * local_kv_head_dim;
+                float *global_v_row = global_v->data() + t * (n_head_kv_ * head_dim_);
+
+                MPI_Allgather(local_v_row, local_kv_head_dim, MPI_FLOAT,
+                              global_v_row, local_kv_head_dim, MPI_FLOAT,
+                              MPI_COMM_WORLD);
+            }
+
+            // Snapshot the gathered global tensors (only rank 0 needs to snapshot)
+            // CRITICAL: These are Q/K/V BEFORE RoPE to match PyTorch's Q_PROJECTION stage
+            if (rank == 0)
+            {
+                snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, global_q->data(), seq_len, n_head_ * head_dim_);
+                snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, global_k->data(), seq_len, n_head_kv_ * head_dim_);
+                snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, global_v->data(), seq_len, n_head_kv_ * head_dim_);
+            }
+        }
+        else if (snapshot_callback_)
+        {
+            // Single rank: just snapshot the local tensors directly (also before RoPE)
+            snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, local_q->data(), seq_len, local_head_dim);
+            snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, local_k->data(), seq_len, local_kv_head_dim);
+            snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, local_v->data(), seq_len, local_kv_head_dim);
+        }
+
+        // ========================================================================
+        // STEP 5: Apply RoPE to Q and K (AFTER snapshotting but BEFORE attention!)
+        // ========================================================================
+        // PyTorch applies RoPE AFTER capturing Q_PROJECTION but BEFORE computing attention.
+        // We do the same: snapshot first (above), then apply RoPE to our local shard.
+        // This ensures attention is computed from RoPE-rotated tensors while Q_PROJECTION
+        // snapshots match PyTorch's pre-RoPE values.
+
+        if (layer_index_ == 0)
+        {
+            LOG_INFO("[RANK=" << rank << "] BEFORE RoPE (local_heads=" << local_heads << ", local_kv_heads=" << local_kv_heads << "):");
+            LOG_INFO("  local_q size=" << local_q->size() << " shape=[" << seq_len << "," << local_head_dim << "]");
+            LOG_INFO("  local_q[token=0, head=0, dim=0:10]: ["
+                     << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+                     << local_q->data()[2] << ", " << local_q->data()[3] << ", "
+                     << local_q->data()[4] << ", " << local_q->data()[5] << ", "
+                     << local_q->data()[6] << ", " << local_q->data()[7] << ", "
+                     << local_q->data()[8] << ", " << local_q->data()[9] << "]");
+            int token1_offset = local_head_dim;
+            LOG_INFO("  local_q[token=1, head=0, dim=0:10]: ["
+                     << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
+                     << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
+                     << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
+                     << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
+                     << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
+            // Also check middle and end of tensor to see if ranks differ
+            int mid = local_q->size() / 2;
+            int end = local_q->size() - 10;
+            LOG_INFO("  local_q[mid=" << mid << ":mid+5]: ["
+                                      << local_q->data()[mid] << ", " << local_q->data()[mid + 1] << ", "
+                                      << local_q->data()[mid + 2] << ", " << local_q->data()[mid + 3] << ", "
+                                      << local_q->data()[mid + 4] << "]");
+            LOG_INFO("  local_q[end-5:end]: ["
+                     << local_q->data()[end] << ", " << local_q->data()[end + 1] << ", "
+                     << local_q->data()[end + 2] << ", " << local_q->data()[end + 3] << ", "
+                     << local_q->data()[end + 4] << "]");
+            LOG_INFO("  local_k size=" << local_k->size() << " shape=[" << seq_len << "," << local_kv_head_dim << "]");
+            LOG_INFO("  local_k[token=0, head=0, dim=0:10]: ["
+                     << local_k->data()[0] << ", " << local_k->data()[1] << ", "
+                     << local_k->data()[2] << ", " << local_k->data()[3] << ", "
+                     << local_k->data()[4] << ", " << local_k->data()[5] << ", "
+                     << local_k->data()[6] << ", " << local_k->data()[7] << ", "
+                     << local_k->data()[8] << ", " << local_k->data()[9] << "]");
+        }
+
+        llaminar::attn::apply_rope(local_q->data(), local_k->data(),
+                                   seq_len, head_dim_, local_heads, local_kv_heads,
+                                   0, rope_freq_base_);
+
+        if (layer_index_ == 0)
+        {
+            LOG_INFO("[RANK=" << rank << "] AFTER RoPE:");
+            LOG_INFO("  local_q[token=0, head=0, dim=0:10]: ["
+                     << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+                     << local_q->data()[2] << ", " << local_q->data()[3] << ", "
+                     << local_q->data()[4] << ", " << local_q->data()[5] << ", "
+                     << local_q->data()[6] << ", " << local_q->data()[7] << ", "
+                     << local_q->data()[8] << ", " << local_q->data()[9] << "]");
+            // Check token 1 (t=1) which SHOULD be rotated (pos=1, non-zero angle)
+            int token1_offset = local_head_dim; // Start of second token
+            LOG_INFO("  local_q[token=1, head=0, dim=0:10]: ["
+                     << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
+                     << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
+                     << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
+                     << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
+                     << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
+            LOG_INFO("  local_k[token=0, head=0, dim=0:10]: ["
+                     << local_k->data()[0] << ", " << local_k->data()[1] << ", "
+                     << local_k->data()[2] << ", " << local_k->data()[3] << ", "
+                     << local_k->data()[4] << ", " << local_k->data()[5] << ", "
+                     << local_k->data()[6] << ", " << local_k->data()[7] << ", "
+                     << local_k->data()[8] << ", " << local_k->data()[9] << "]");
+            int k_token1_offset = local_kv_head_dim;
+            LOG_INFO("  local_k[token=1, head=0, dim=0:10]: ["
+                     << local_k->data()[k_token1_offset + 0] << ", " << local_k->data()[k_token1_offset + 1] << ", "
+                     << local_k->data()[k_token1_offset + 2] << ", " << local_k->data()[k_token1_offset + 3] << ", "
+                     << local_k->data()[k_token1_offset + 4] << ", " << local_k->data()[k_token1_offset + 5] << ", "
+                     << local_k->data()[k_token1_offset + 6] << ", " << local_k->data()[k_token1_offset + 7] << ", "
+                     << local_k->data()[k_token1_offset + 8] << ", " << local_k->data()[k_token1_offset + 9] << "]");
+        }
+
+        // CONTRACT: RoPE application
+        if (enable_validation && rank == 0)
+        {
+            TensorHealthCheck q_rope_health("Q_after_RoPE");
+            q_rope_health.check(local_q->data(), local_q->size());
+            q_rope_health.log(rank);
+
+            TensorHealthCheck k_rope_health("K_after_RoPE");
+            k_rope_health.check(local_k->data(), local_k->size());
+            k_rope_health.log(rank);
+        }
+
+        // STEP 5.5: Capture ROPE_APPLICATION snapshot (post-RoPE Q and K)
+        // Gather Q and K after RoPE application for comparison with PyTorch
+        if (snapshot_callback_)
+        {
+            // Calculate dimensions
+            const int k_v_dim = n_head_kv_ * head_dim_;
+
+            if (rank == 0 && layer_index_ == 0)
+            {
+                LOG_INFO("[ROPE_SNAPSHOT_DEBUG] Gathering ROPE_APPLICATION:");
+                LOG_INFO("  world_size=" << world_size << " local_heads=" << local_heads
+                                         << " local_kv_heads=" << local_kv_heads);
+                LOG_INFO("  n_head_=" << n_head_ << " n_head_kv_=" << n_head_kv_ << " head_dim_=" << head_dim_);
+                LOG_INFO("  local_head_dim=" << local_head_dim << " local_kv_head_dim=" << local_kv_head_dim);
+                LOG_INFO("  d_model_=" << d_model_ << " k_v_dim=" << k_v_dim);
+                LOG_INFO("  Expected global Q shape: [" << seq_len << ", " << d_model_ << "]");
+                LOG_INFO("  Expected global K shape: [" << seq_len << ", " << k_v_dim << "]");
+                LOG_INFO("  local_q shape: [" << seq_len << ", " << local_head_dim << "]");
+                LOG_INFO("  local_k shape: [" << seq_len << ", " << local_kv_head_dim << "]");
+            }
+
+            // Gather Q and K (post-RoPE) from all ranks
+            std::shared_ptr<TensorBase> global_q_rope, global_k_rope;
+
+            if (world_size > 1)
+            {
+                global_q_rope = TensorFactory::create_simple({seq_len, d_model_});
+                global_k_rope = TensorFactory::create_simple({seq_len, k_v_dim});
+
+                // DEBUG: Check local Q values before gather
+                if (rank == 0 && layer_index_ == 0)
+                {
+                    LOG_INFO("[ROPE_SNAPSHOT_DEBUG] Rank 0 local_q[t=0] first 10 values:");
+                    for (int i = 0; i < 10 && i < local_head_dim; ++i)
+                    {
+                        std::cout << local_q->data()[i] << " ";
+                    }
+                    std::cout << std::endl;
+                }
+
+                // Gather row-by-row to maintain proper layout
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    const float *local_q_row = local_q->data() + t * local_head_dim;
+                    const float *local_k_row = local_k->data() + t * local_kv_head_dim;
+                    float *global_q_row = global_q_rope->data() + t * d_model_;
+                    float *global_k_row = global_k_rope->data() + t * k_v_dim;
+
+                    MPI_Allgather(local_q_row, local_head_dim, MPI_FLOAT,
+                                  global_q_row, local_head_dim, MPI_FLOAT,
+                                  MPI_COMM_WORLD);
+
+                    MPI_Allgather(local_k_row, local_kv_head_dim, MPI_FLOAT,
+                                  global_k_row, local_kv_head_dim, MPI_FLOAT,
+                                  MPI_COMM_WORLD);
+                }
+
+                // DEBUG: Check gathered values
+                if (rank == 0 && layer_index_ == 0)
+                {
+                    LOG_INFO("[ROPE_SNAPSHOT_DEBUG] After MPI_Allgather, global_q[t=0]:");
+                    LOG_INFO("  First 10 (from rank 0): ");
+                    for (int i = 0; i < 10 && i < d_model_; ++i)
+                    {
+                        std::cout << global_q_rope->data()[i] << " ";
+                    }
+                    std::cout << std::endl;
+                    LOG_INFO("  Elements [" << local_head_dim << ".." << (local_head_dim + 10) << "] (from rank 1): ");
+                    for (int i = local_head_dim; i < local_head_dim + 10 && i < d_model_; ++i)
+                    {
+                        std::cout << global_q_rope->data()[i] << " ";
+                    }
+                    std::cout << std::endl;
+                }
             }
             else
             {
-                std::array<float, 8> q_after{};
-                std::array<float, 8> k_after{};
-                q_after.fill(0.f);
-                k_after.fill(0.f);
-                size_t row_offset = (seq_len - 1) * (size_t)local_heads * head_dim; // last token row
-                const float *q_row_after = local_q + row_offset;
-                const float *k_row_after = local_k + row_offset;
-                long double l2_q_b = 0, l2_q_a = 0, l2_k_b = 0, l2_k_a = 0, l2_q_delta = 0, l2_k_delta = 0;
-                for (int i = 0; i < preview; ++i)
+                // Single rank: use local tensors directly
+                global_q_rope = local_q;
+                global_k_rope = local_k;
+            }
+
+            // Concatenate Q and K along feature dimension: [Q | K]
+            // This matches PyTorch's ROPE_APPLICATION which includes both
+            std::vector<int> rope_shape = {seq_len, d_model_ + k_v_dim};
+            auto rope_combined = TensorFactory::create_simple(rope_shape);
+            float *dst = rope_combined->data();
+
+            for (int t = 0; t < seq_len; ++t)
+            {
+                const float *q_row = global_q_rope->data() + t * d_model_;
+                const float *k_row = global_k_rope->data() + t * k_v_dim;
+
+                // Copy Q first
+                std::memcpy(dst, q_row, d_model_ * sizeof(float));
+                dst += d_model_;
+
+                // Then K
+                std::memcpy(dst, k_row, k_v_dim * sizeof(float));
+                dst += k_v_dim;
+            }
+
+            // DEBUG: Show final concatenated values
+            if (rank == 0 && layer_index_ == 0)
+            {
+                LOG_INFO("[ROPE_SNAPSHOT_DEBUG] Final rope_combined[t=0]:");
+                LOG_INFO("  First 10 (Q): ");
+                for (int i = 0; i < 10; ++i)
                 {
-                    q_after[i] = q_row_after[i];
-                    k_after[i] = k_row_after[i];
-                    long double qb = q_before[i], qa = q_after[i];
-                    long double kb = k_before[i], ka = k_after[i];
-                    l2_q_b += qb * qb;
-                    l2_q_a += qa * qa;
-                    l2_k_b += kb * kb;
-                    l2_k_a += ka * ka;
-                    long double dq = qa - qb;
-                    long double dk = ka - kb;
-                    l2_q_delta += dq * dq;
-                    l2_k_delta += dk * dk;
+                    std::cout << rope_combined->data()[i] << " ";
                 }
-                double rel_move_q = (l2_q_b > 0) ? std::sqrt((double)l2_q_delta / (double)l2_q_b) : 0.0;
-                double rel_move_k = (l2_k_b > 0) ? std::sqrt((double)l2_k_delta / (double)l2_k_b) : 0.0;
-                int pos_last = (int)n_past_ + (int)seq_len - 1; // semantic position of this final token
-                // Recompute first two angles used (pair 0) for transparency
-                int pairs = head_dim / 2;
-                float theta0 = (pairs > 0) ? (1.f / std::pow(rope_freq_base_, (2.f * 0) / head_dim)) : 0.f;
-                float angle_pos = theta0 * pos_last;
-                float cs = std::cos(angle_pos), sn = std::sin(angle_pos);
-                std::ostringstream oss;
-                oss << "[RoPEDiag] mode=" << (incr ? "INC" : "REPLAY")
-                    << " n_past=" << n_past_ << " seq_len=" << seq_len
-                    << " pos_last=" << pos_last
-                    << " heads_local=" << local_heads
-                    << " head_dim=" << head_dim
-                    << " freq_base=" << rope_freq_base_
-                    << " theta0=" << theta0
-                    << " angle0=" << angle_pos
-                    << " cos0=" << cs << " sin0=" << sn
-                    << " q_before=";
-                for (int i = 0; i < preview; ++i)
+                std::cout << std::endl;
+                LOG_INFO("  Elements [" << d_model_ << ".." << (d_model_ + 10) << "] (K start): ");
+                for (int i = d_model_; i < d_model_ + 10; ++i)
                 {
-                    oss << q_before[i];
-                    if (i + 1 < preview)
-                        oss << ",";
+                    std::cout << rope_combined->data()[i] << " ";
                 }
-                oss << " q_after=";
-                for (int i = 0; i < preview; ++i)
-                {
-                    oss << q_after[i];
-                    if (i + 1 < preview)
-                        oss << ",";
-                }
-                oss << " rel_move_q=" << rel_move_q
-                    << " k_before=";
-                for (int i = 0; i < preview; ++i)
-                {
-                    oss << k_before[i];
-                    if (i + 1 < preview)
-                        oss << ",";
-                }
-                oss << " k_after=";
-                for (int i = 0; i < preview; ++i)
-                {
-                    oss << k_after[i];
-                    if (i + 1 < preview)
-                        oss << ",";
-                }
-                oss << " rel_move_k=" << rel_move_k;
-                LOG_INFO(oss.str());
+                std::cout << std::endl;
+                LOG_INFO("  Total rope_combined size: " << rope_combined->size()
+                                                        << " expected: " << (seq_len * (d_model_ + k_v_dim)));
+            }
+
+            // Only rank 0 needs to snapshot
+            if (rank == 0)
+            {
+                snapshot_callback_(PipelineStage::ROPE_APPLICATION, layer_index_,
+                                   rope_combined->data(), seq_len, d_model_ + k_v_dim);
             }
         }
-        LOG_DEBUG("Applied RoPE for " << local_heads << " heads on rank " << getRank());
-    }
 
-    void MPIAttentionKernel::computeLocalAttentionScores(const float *local_q, const float *local_k, float *scores,
-                                                         size_t seq_len, int local_heads)
-    {
-        // Compute Q@K^T scores first (before softmax) for debugging
-        llaminar::attn::compute_qk_scores(local_q, local_k, scores, (int)seq_len, head_dim_, local_heads, /*causal=*/true, /*apply_softmax=*/false);
-        
-        // Capture attention scores BEFORE softmax for parity testing
-        if (snapshot_callback_ && getRank() == 0)
+        // ========================================================================
+        // STEP 6: Handle GQA - replicate K/V heads if needed
+        // ========================================================================
+        std::shared_ptr<TensorBase> local_k_expanded, local_v_expanded;
+
+        if (n_head_ != n_head_kv_)
         {
-            // Scores are in [heads, seq_len, seq_len] layout
-            // For snapshot we'll capture as [seq_len * local_heads, seq_len]
-            snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, scores, seq_len * local_heads, seq_len);
+            // GQA: replicate K/V heads to match Q head count
+            local_k_expanded = TensorFactory::create_simple({seq_len, local_head_dim});
+            local_v_expanded = TensorFactory::create_simple({seq_len, local_head_dim});
+
+            llaminar::attn::expand_kv_for_gqa(
+                local_k->data(), local_v->data(),
+                local_k_expanded->data(), local_v_expanded->data(),
+                seq_len, head_dim_, local_heads, local_kv_heads);
+
+            // DEBUG: Log after GQA expansion (layer 0 only)
+            if (layer_index_ == 0)
+            {
+                LOG_INFO("[RANK=" << rank << "] After GQA expansion:");
+                LOG_INFO("  K_expanded[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
+                                                 << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
+
+                float k_exp_min = *std::min_element(local_k_expanded->data(), local_k_expanded->data() + local_k_expanded->size());
+                float k_exp_max = *std::max_element(local_k_expanded->data(), local_k_expanded->data() + local_k_expanded->size());
+                LOG_INFO("  K_expanded range: [" << k_exp_min << ", " << k_exp_max << "]");
+            }
         }
-        
-        // Now apply softmax in-place (one call per head)
+        else
+        {
+            // MHA: no replication needed
+            local_k_expanded = local_k;
+            local_v_expanded = local_v;
+        }
+
+        // ========================================================================
+        // STEP 7: Compute attention scores and apply softmax
+        // ========================================================================
+        const int scores_size = local_heads * seq_len * seq_len;
+        std::vector<float> scores(scores_size);
+
+        // IMPORTANT: For parity testing, we need to capture scores BEFORE causal masking
+        // PyTorch captures unmasked scores, then applies mask separately
+        if (snapshot_callback_)
+        {
+            // DEBUG: Log Q and K before computing scores (layer 0 only)
+            if (layer_index_ == 0)
+            {
+                LOG_INFO("[RANK=" << rank << "] Before compute_qk_scores for snapshot:");
+                LOG_INFO("  local_q size=" << (local_heads * seq_len * head_dim_)
+                                           << " shape=[" << (local_heads * seq_len) << "," << head_dim_ << "]");
+                LOG_INFO("  local_k_expanded size=" << (local_heads * seq_len * head_dim_)
+                                                    << " shape=[" << (local_heads * seq_len) << "," << head_dim_ << "]");
+                LOG_INFO("  Q[0,0:5]: " << local_q->data()[0] << " " << local_q->data()[1] << " "
+                                        << local_q->data()[2] << " " << local_q->data()[3] << " " << local_q->data()[4]);
+                LOG_INFO("  K[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
+                                        << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
+
+                // Compute what the first score should be
+                double test_dot = 0.0;
+                for (int d = 0; d < head_dim_; ++d)
+                {
+                    test_dot += local_q->data()[d] * local_k_expanded->data()[d];
+                }
+                float scale = 1.0f / std::sqrt((float)head_dim_);
+                LOG_INFO("  Expected scores[0,0] = Q[0]·K[0]/sqrt(" << head_dim_ << ") = "
+                                                                    << test_dot << " * " << scale << " = " << (test_dot * scale));
+            }
+
+            // Compute unmasked scores for snapshot
+            std::vector<float> unmasked_scores(scores_size);
+            llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
+                                              unmasked_scores.data(), seq_len, head_dim_, local_heads,
+                                              false, false); // causal=FALSE for snapshot
+
+            // DEBUG: Log computed scores (layer 0 only)
+            if (layer_index_ == 0)
+            {
+                LOG_INFO("[RANK=" << rank << "] After compute_qk_scores:");
+                LOG_INFO("  unmasked_scores[0:5]: " << unmasked_scores[0] << " " << unmasked_scores[1] << " "
+                                                    << unmasked_scores[2] << " " << unmasked_scores[3] << " " << unmasked_scores[4]);
+            }
+
+            // Gather and snapshot unmasked scores
+            if (world_size > 1)
+            {
+                auto global_scores = std::vector<float>(n_head_ * seq_len * seq_len, 0.0f);
+
+                std::vector<int> recvcounts(world_size);
+                std::vector<int> displs(world_size);
+
+                int sendcount = local_heads * seq_len * seq_len;
+                MPI_Allgather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+                int offset = 0;
+                for (int r = 0; r < world_size; ++r)
+                {
+                    displs[r] = offset;
+                    offset += recvcounts[r];
+                }
+
+                MPI_Allgatherv(unmasked_scores.data(), sendcount, MPI_FLOAT,
+                               global_scores.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
+                               MPI_COMM_WORLD);
+
+                if (rank == 0)
+                {
+                    snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, global_scores.data(),
+                                       n_head_ * seq_len, seq_len);
+                }
+            }
+            else
+            {
+                snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, unmasked_scores.data(),
+                                   local_heads * seq_len, seq_len);
+            }
+        }
+
+        // Now compute MASKED scores for actual attention (causal masking, scaling, NO softmax yet)
+        llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
+                                          scores.data(), seq_len, head_dim_, local_heads,
+                                          true, false); // causal=TRUE for actual computation
+
+        // Contract: Validate attention scores (raw QK^T)
+        if (enable_validation && rank == 0)
+        {
+            TensorHealthCheck scores_health("scores_pre_softmax");
+            scores_health.check(scores.data(), scores.size());
+            scores_health.log(rank);
+
+            // Note: -inf values are EXPECTED in causal positions
+            if (scores_health.nan_count > 0)
+            {
+                LOG_ERROR("❌ Attention scores contain NaN (unexpected)");
+                return false;
+            }
+            if (scores_health.inf_count == 0 && seq_len > 1)
+            {
+                LOG_WARN("⚠️ Expected -inf in causal mask positions but found none");
+            }
+            LOG_DEBUG("✓ Attention scores validated (inf_count=" << scores_health.inf_count << " expected for causal masking)");
+        }
+
+        // Apply softmax to each head (sequential loop - softmax_row_major parallelizes internally)
         for (int h = 0; h < local_heads; ++h)
         {
             llaminar::kernels::SoftmaxRowArgs args;
-            args.scores = scores + (std::size_t)h * seq_len * seq_len;
-            args.rows = (int)seq_len;
-            args.cols = (int)seq_len;
+            args.scores = scores.data() + static_cast<size_t>(h) * seq_len * seq_len;
+            args.rows = seq_len;
+            args.cols = seq_len;
             args.causal = true;
             args.scale = 1.0f;
             llaminar::kernels::softmax_row_major(args);
         }
-        
-        LOG_DEBUG("Computed local attention scores for " << local_heads << " heads on rank " << getRank());
-    }
 
-    void MPIAttentionKernel::applyLocalAttention(const float *scores, const float *local_v, float *local_attended_output,
-                                                 size_t seq_len, int local_heads)
-    {
-        const auto &env = debugEnv();
-        llaminar::attn::apply_scores_to_v(scores, local_v, local_attended_output, (int)seq_len, head_dim_, local_heads);
-        if (env.attention.dump_attention && getRank() == 0 && seq_len <= 4 && local_heads <= 2)
+        // Snapshot scores AFTER softmax
+        if (snapshot_callback_)
         {
-            std::cerr << "[AttnApplyDump] head0 row0:";
-            for (size_t j = 0; j < std::min(seq_len, (size_t)8); ++j)
-                std::cerr << ' ' << scores[j];
-            std::cerr << '\n';
-        }
-        LOG_DEBUG("Applied attention for " << local_heads << " heads on rank " << getRank());
-    }
+            if (world_size > 1)
+            {
+                // Gather softmax scores across ranks: [local_heads, seq_len, seq_len] -> [n_head, seq_len, seq_len]
+                auto global_softmax = std::vector<float>(n_head_ * seq_len * seq_len, 0.0f);
 
-    void MPIAttentionKernel::computeLocalOutputProjection(const std::shared_ptr<TensorBase> &local_attended_output,
-                                                          const std::shared_ptr<TensorBase> &local_wo,
-                                                          std::shared_ptr<TensorBase> &local_final_output,
-                                                          size_t seq_len, int local_heads, size_t d_model)
-    {
-        size_t local_head_dim = static_cast<size_t>(local_heads * head_dim_);
-        bool tp_sim_done = false; // if simulation path executes successfully, skip baseline path
+                std::vector<int> recvcounts(world_size);
+                std::vector<int> displs(world_size);
 
-        // ---------------------------------------------------------------------
-        // Tensor-Parallel (simulation) path (Task 2)
-        // When enabled via tp_sim.* env snapshot we synthesize an intra-process
-        // tensor parallel execution of the output projection, partitioning either
-        // rows (M dimension / sequence length) or columns (N / d_model) and
-        // reconstructing the full output. This is a correctness exploration tool
-        // that does not (yet) overlap or distribute work across MPI ranks.
-        // ---------------------------------------------------------------------
-        const auto &tpSim = debugEnv().tp_sim;
-        if (tpSim.enable && tpSim.partitions > 1)
-        {
-            PERF_SCOPED_TIMER("OutputProjection::tp_sim");
-            int parts = tpSim.partitions;
-            bool row_split = false;
-            switch (tpSim.mode)
-            {
-            case DebugEnvSnapshot::TPSimEnv::Mode::Row:
-                row_split = true;
-                break;
-            case DebugEnvSnapshot::TPSimEnv::Mode::Col:
-                row_split = false;
-                break;
-            case DebugEnvSnapshot::TPSimEnv::Mode::Auto:
-            default:
-                // Heuristic: prefer column split if d_model divisible, else row if seq_len divisible, else column fallback.
-                if (d_model % static_cast<size_t>(parts) == 0)
-                    row_split = false;
-                else if (seq_len % static_cast<size_t>(parts) == 0)
-                    row_split = true;
-                else
-                    row_split = false;
-                break;
-            }
+                int sendcount = local_heads * seq_len * seq_len;
+                MPI_Allgather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
 
-            auto matmul_fn = [&](const float *A, const float *B, float *C, std::size_t M, std::size_t N, std::size_t K) -> bool
-            {
-                return adaptive_matmul(A, B, C, (int)M, (int)N, (int)K, false);
-            };
+                int offset = 0;
+                for (int r = 0; r < world_size; ++r)
+                {
+                    displs[r] = offset;
+                    offset += recvcounts[r];
+                }
 
-            // Build executor configs for each simulated partition and run sequentially (single process simulation).
-            std::vector<TPOutputLocalResult> local_parts;
-            local_parts.reserve(parts);
-            bool failed = false;
-            for (int p = 0; p < parts; ++p)
-            {
-                TPOutputExecConfig cfg;
-                cfg.tp_size = parts;
-                cfg.tp_rank = p;
-                cfg.row_split = row_split;
-                try
+                MPI_Allgatherv(scores.data(), sendcount, MPI_FLOAT,
+                               global_softmax.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
+                               MPI_COMM_WORLD);
+
+                if (rank == 0)
                 {
-                    TPOutputProjectionExecutor exec(matmul_fn, cfg, seq_len, d_model, local_head_dim);
-                    local_parts.push_back(exec.run(local_attended_output->data(), local_wo->data()));
+                    snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, global_softmax.data(),
+                                       n_head_ * seq_len, seq_len);
                 }
-                catch (const std::exception &e)
-                {
-                    failed = true;
-                    if (getRank() == 0)
-                        LOG_ERROR("[TP-Sim] partition execution failed p=" << p << " err=" << e.what());
-                    break;
-                }
-            }
-            if (!failed)
-            {
-                // Reconstruct into final output buffer.
-                try
-                {
-                    if (row_split)
-                        TPOutputProjectionExecutor::reconstruct_rows(local_parts, local_final_output->data(), seq_len, d_model);
-                    else
-                        TPOutputProjectionExecutor::reconstruct_columns(local_parts, local_final_output->data(), seq_len, d_model);
-                    if (getRank() == 0)
-                        LOG_DEBUG("[TP-Sim] output projection reconstructed mode=" << (row_split ? "row" : "col")
-                                                                                   << " parts=" << parts
-                                                                                   << " seq_len=" << seq_len
-                                                                                   << " d_model=" << d_model
-                                                                                   << " local_head_dim=" << local_head_dim);
-                }
-                catch (const std::exception &e)
-                {
-                    failed = true;
-                    if (getRank() == 0)
-                        LOG_ERROR("[TP-Sim] reconstruction failed: " << e.what());
-                }
-            }
-            if (!failed)
-            {
-                // Optional: reference scalar validation may still run below if attention.validate_output enabled.
-                if (debugEnv().attention.validate_output && getRank() == 0)
-                    LOG_DEBUG("[TP-Sim] validation (scalar ref) will run after simulation path");
-                tp_sim_done = true; // ensure baseline logic skipped
             }
             else
             {
-                // Fallback: execute baseline path if simulation failed.
-                if (getRank() == 0)
-                    LOG_WARN("[TP-Sim] falling back to baseline single-path output projection due to prior errors");
-                // Continue into baseline logic below (no early return).
+                snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, scores.data(),
+                                   local_heads * seq_len, seq_len);
             }
-            // NOTE: We intentionally do not 'return' here so scalar validation below still applies.
-            // Baseline logic guarded further down by absence of simulation gating state.
         }
-        if (!tp_sim_done)
+
+        // Contract: Validate attention probabilities (after softmax)
+        if (enable_validation && rank == 0)
         {
-            const auto &attnEnv3 = debugEnv().attention;
-            int tp_parts = attnEnv3.tp_partitions;
-            bool tp_disable = attnEnv3.tp_disable;
-            bool auto_escalated = false;
-            if (!tp_disable && tp_parts == 1 && attnEnv3.tp_auto && d_model >= 2048 && (d_model % 2 == 0))
+            TensorHealthCheck probs_health("attention_probs");
+            probs_health.check(scores.data(), scores.size());
+            probs_health.log(rank);
+
+            if (!probs_health.is_healthy())
             {
-                tp_parts = 2;
-                auto_escalated = true;
+                LOG_ERROR("❌ Softmax produced NaN/Inf probabilities!");
+                return false;
             }
-            size_t op_elems_proxy = seq_len * d_model * local_head_dim; // approximate cost proxy
-            if (auto_escalated && op_elems_proxy < 4096ULL)
+
+            // Verify probability constraints: values in [0, 1], rows sum to ~1.0
+            bool valid_probs = true;
+            for (int h = 0; h < local_heads; ++h)
             {
-                // Revert tiny auto-escalations – explicit user tp_partitions still honored.
-                tp_parts = 1;
-                auto_escalated = false;
-            }
-            bool use_tp = (tp_parts > 1) && !tp_disable;
-            if (!use_tp)
-            {
-                PERF_SCOPED_TIMER("OutputProjection::single_gemm");
+                for (int r = 0; r < seq_len; ++r)
                 {
-                    bool is_prefill_like = seq_len >= static_cast<size_t>(debugEnv().cosma.prefill_threshold);
-                    if (is_prefill_like)
+                    float row_sum = 0.0f;
+                    const float *row = scores.data() + h * seq_len * seq_len + r * seq_len;
+                    for (int c = 0; c < seq_len; ++c)
                     {
-                        static auto prefill_backend = PrefillBackendFactory::create();
-                        PrefillOpDesc desc;
-                        desc.kind = PrefillOpKind::MatMul;
-                        desc.M = seq_len;
-                        desc.N = d_model;
-                        desc.K = local_head_dim;
-                        desc.is_prefill = true;
-                        desc.transpose_B = true;  // PyTorch nn.Linear uses x @ weight.T
-                        PrefillLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
-                        auto decision = prefill_backend->launch(desc, ctx);
-                        if (decision.status != PrefillStatus::Success)
+                        if (row[c] < 0.0f || row[c] > 1.0f)
                         {
-                            LOG_WARN("Output projection prefill fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
-                            if (!adaptiveMatMul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false, false, false, true))
-                            {
-                                LOG_ERROR("Output projection failed on rank " << getRank());
-                                return;
-                            }
+                            LOG_ERROR("Invalid probability at head=" << h << " row=" << r << " col=" << c << ": " << row[c]);
+                            valid_probs = false;
                         }
+                        row_sum += row[c];
                     }
-                    else
-                    {
-                        static auto infer_backend = InferenceBackendFactory::create();
-                        InferenceOpDesc desc;
-                        desc.kind = InferenceOpKind::MatMul;
-                        desc.M = seq_len;
-                        desc.N = d_model;
-                        desc.K = local_head_dim;
-                        desc.latency_critical = true;
-                        desc.transpose_B = true;  // PyTorch nn.Linear uses x @ weight.T
-                        InferenceLaunchContext ctx{local_attended_output->data(), local_wo->data(), local_final_output->data()};
-                        auto decision = infer_backend->launch(desc, ctx);
-                        if (decision.status != InferenceStatus::Success)
-                        {
-                            LOG_WARN("Output projection inference fallback status=" << (int)decision.status << " reason=" << decision.reason);
-                            // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
-                            if (!adaptiveMatMul(local_attended_output->data(), local_wo->data(), local_final_output->data(), seq_len, d_model, local_head_dim, false, false, false, true))
-                            {
-                                LOG_ERROR("Output projection failed on rank " << getRank());
-                                return;
-                            }
-                        }
+                    // Allow slight numerical error in sum
+                    if (std::abs(row_sum - 1.0f) > 1e-4f && r < seq_len)
+                    { // Only check non-masked rows
+                        LOG_WARN("Row sum deviation at head=" << h << " row=" << r << ": sum=" << row_sum);
                     }
                 }
             }
-            else
+
+            if (!valid_probs)
             {
-                PERF_SCOPED_TIMER("OutputProjection::tp_partition");
-                float *C = local_final_output->data();
-                const float *B = local_wo->data();
-                auto do_part = [&](int part)
-                {
-                    auto spec = compute_tp_partition(d_model, tp_parts, part, TPPartitionSpec::Axis::Col);
-                    int n_sub = (int)spec.local_dim;
-                    int col_off = (int)spec.local_offset;
-                    const float *B_sub = B + col_off;
-                    float *C_sub = C + col_off;
-                    // PyTorch nn.Linear uses x @ weight.T, so we need transpose_B=true
-                    if (!adaptiveMatMul(local_attended_output->data(), B_sub, C_sub, seq_len, n_sub, local_head_dim, false, false, false, true))
-                    {
-                        LOG_ERROR("[TP] partition projection failed part=" << part);
-                    }
-                };
-                for (int p = 0; p < tp_parts; ++p)
-                    do_part(p);
+                LOG_ERROR("❌ Probability constraints violated!");
+                return false;
             }
-            // Logging only if baseline executed
-            if (use_tp)
-                LOG_DEBUG("Computed output projection (TP col) heads=" << local_heads << " parts=" << tp_parts << " rank=" << getRank());
-            else
-                LOG_DEBUG("Computed output projection (single GEMM) heads=" << local_heads << " rank=" << getRank());
+            LOG_DEBUG("✓ Attention probabilities validated (all in [0,1], rows sum to 1.0)");
         }
 
-        // Optional scalar reference validation for output projection (pre-gather).
-        // Enabled via LLAMINAR_ATTN_OUTPUT_VALIDATE=1 (rank 0 logs divergences >1e-6).
-        if (debugEnv().attention.validate_output)
+        // ========================================================================
+        // STEP 6b: Apply attention scores to V
+        // ========================================================================
+        auto local_attended = TensorFactory::create_simple({seq_len, local_head_dim});
+
+        llaminar::attn::apply_scores_to_v(scores.data(), local_v_expanded->data(),
+                                          local_attended->data(), seq_len, head_dim_, local_heads);
+
+        // Contract: Validate attended output (scores @ V)
+        if (enable_validation && rank == 0)
         {
-            // Recompute output projection with naive scalar matmul to validate adaptive_matmul path.
-            // local_attended_output: [seq_len, local_head_dim]
-            // local_wo: [local_head_dim, d_model]
-            size_t local_head_dim_e = local_head_dim;
-            std::vector<float> ref(seq_len * d_model, 0.f);
-            const float *A = local_attended_output->data();
-            const float *B = local_wo->data();
-            for (size_t i = 0; i < seq_len; ++i)
+            StageContract attended_contract("AttendedOutput");
+            attended_contract.outputs = {
+                TensorContract("attended",
+                               ShapeSpec({seq_len, local_head_dim}),
+                               TensorLayout::RowMajor,
+                               TensorSemantic::Activation)};
+            attended_contract.validate_outputs({local_attended});
+
+            TensorHealthCheck attended_health("attended_output");
+            attended_health.check(local_attended->data(), local_attended->size());
+            attended_health.log(rank);
+
+            if (!attended_health.is_healthy())
             {
-                const float *a_row = A + i * local_head_dim_e;
-                float *c_row = ref.data() + i * d_model;
-                for (size_t k = 0; k < local_head_dim_e; ++k)
+                LOG_ERROR("❌ Attended output (scores @ V) contains NaN/Inf!");
+                return false;
+            }
+            LOG_DEBUG("✓ Attended output validated");
+        }
+
+        // Snapshot attended values
+        if (snapshot_callback_)
+        {
+            if (world_size > 1)
+            {
+                // Gather attended output across ranks
+                // Each rank has [seq_len, local_head_dim], need [seq_len, n_head * head_dim]
+                auto global_attended = TensorFactory::create_simple({seq_len, n_head_ * head_dim_});
+
+                // Gather row-by-row to maintain proper layout (same as Q/K/V)
+                for (int t = 0; t < seq_len; ++t)
                 {
-                    float aval = a_row[k];
-                    const float *b_col = B + k * d_model;
-                    for (size_t j = 0; j < d_model; ++j)
-                    {
-                        c_row[j] += aval * b_col[j];
-                    }
+                    const float *local_attended_row = local_attended->data() + t * local_head_dim;
+                    float *global_attended_row = global_attended->data() + t * (n_head_ * head_dim_);
+
+                    MPI_Allgather(local_attended_row, local_head_dim, MPI_FLOAT,
+                                  global_attended_row, local_head_dim, MPI_FLOAT,
+                                  MPI_COMM_WORLD);
+                }
+
+                if (rank == 0)
+                {
+                    snapshot_callback_(PipelineStage::ATTENTION_OUTPUT, layer_index_, global_attended->data(),
+                                       seq_len, n_head_ * head_dim_);
                 }
             }
-            double max_abs = 0.0, sum_sq_ref = 0.0, sum_sq_diff = 0.0;
-            const float *C = local_final_output->data();
-            for (size_t idx = 0; idx < ref.size(); ++idx)
+            else
             {
-                double r = ref[idx];
-                double g = C[idx];
-                double d = std::fabs(r - g);
-                if (d > max_abs)
-                    max_abs = d;
-                sum_sq_ref += r * r;
-                sum_sq_diff += d * d;
+                snapshot_callback_(PipelineStage::ATTENTION_OUTPUT, layer_index_, local_attended->data(),
+                                   seq_len, local_head_dim);
             }
-            double rel_l2 = (sum_sq_ref == 0.0) ? 0.0 : std::sqrt(sum_sq_diff / sum_sq_ref);
-            if (getRank() == 0)
+        }
+
+        if (rank == 0)
+        {
+            fprintf(stderr, "[kernel-test] rank %d local_attended[0,0:4]: %.6f, %.6f, %.6f, %.6f\n",
+                    rank, local_attended->data()[0], local_attended->data()[1],
+                    local_attended->data()[2], local_attended->data()[3]);
+            fflush(stderr);
+        }
+
+        // ========================================================================
+        // STEP 7: Output projection + MPI gather
+        // ========================================================================
+        auto local_output = TensorFactory::create_simple({seq_len, d_model});
+
+        // Output projection: local_attended @ wo^T
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    seq_len, d_model, local_head_dim,
+                    1.0f, local_attended->data(), local_head_dim,
+                    local_wo->data(), local_head_dim,
+                    0.0f, local_output->data(), d_model);
+
+        // Contract: Validate output projection
+        if (enable_validation && rank == 0)
+        {
+            StageContract output_contract("OutputProjection");
+            output_contract.outputs = {
+                TensorContract("local_output",
+                               ShapeSpec({seq_len, d_model}),
+                               TensorLayout::RowMajor,
+                               TensorSemantic::Activation)};
+            output_contract.validate_outputs({local_output});
+
+            TensorHealthCheck output_health("output_projection");
+            output_health.check(local_output->data(), local_output->size());
+            output_health.log(rank);
+
+            if (!output_health.is_healthy())
             {
-                if (max_abs > 1e-6 || rel_l2 > 1e-6)
+                LOG_ERROR("❌ Output projection contains NaN/Inf!");
+                return false;
+            }
+
+            // Optional: Deep validation against scalar reference
+            if (validate_projections)
+            {
+                auto result = llaminar::attention::AttentionValidator::validateProjection(
+                    local_attended->data(), local_wo->data(), local_output->data(),
+                    seq_len, d_model, local_head_dim,
+                    false // wo is already transposed for gemm
+                );
+
+                if (!llaminar::attention::AttentionValidator::isWithinTolerance(result, 1e-4f, 1e-4f))
                 {
-                    LOG_WARN("MPIAttentionKernel output projection validation divergence max_abs=" << max_abs
-                                                                                                   << " rel_l2=" << rel_l2
-                                                                                                   << " (seq_len=" << seq_len << ", local_heads=" << local_heads << ")");
+                    LOG_WARN("⚠️ Output projection divergence: max_abs=" << result.max_abs
+                                                                        << " rel_l2=" << result.rel_l2);
                 }
                 else
                 {
-                    LOG_DEBUG("MPIAttentionKernel output projection validation OK max_abs=" << max_abs
-                                                                                            << " rel_l2=" << rel_l2);
+                    LOG_DEBUG("✓ Output projection matches scalar reference");
                 }
             }
+
+            LOG_DEBUG("✓ Output projection validated");
         }
 
-        if (tp_sim_done && getRank() == 0)
-            LOG_DEBUG("[TP-Sim] output projection complete (validation stage passed)");
-    }
+        // Aggregate across ranks if multi-rank
+        if (world_size > 1)
+        {
+            MPI_Allreduce(MPI_IN_PLACE, local_output->data(), local_output->size(),
+                          MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+        }
 
-    std::shared_ptr<TensorBase> MPIAttentionKernel::createLocalSimpleTensor(const std::vector<size_t> &shape) const
-    {
-        std::vector<int> int_shape(shape.begin(), shape.end());
-        return TensorFactory::create_simple(int_shape);
+        if (rank == 0)
+        {
+            fprintf(stderr, "[kernel-test] rank %d final_output[0,0:4]: %.6f, %.6f, %.6f, %.6f\n",
+                    rank, local_output->data()[0], local_output->data()[1],
+                    local_output->data()[2], local_output->data()[3]);
+            fflush(stderr);
+        }
+
+        // Contract: Validate final output after MPI aggregation
+        if (enable_validation && rank == 0)
+        {
+            StageContract final_contract("FinalOutput");
+            final_contract.outputs = {
+                TensorContract("final_output",
+                               ShapeSpec({seq_len, d_model}),
+                               TensorLayout::RowMajor,
+                               TensorSemantic::Activation)};
+            final_contract.validate_outputs({local_output});
+
+            TensorHealthCheck final_health("final_output");
+            final_health.check(local_output->data(), local_output->size());
+            final_health.log(rank);
+
+            if (!final_health.is_healthy())
+            {
+                LOG_ERROR("❌ Final output after MPI aggregation contains NaN/Inf!");
+                return false;
+            }
+
+            LOG_DEBUG("✓ Final output validated - attention kernel complete");
+        }
+
+        // Copy to output tensor
+        if (outputs.empty())
+        {
+            outputs.push_back(TensorFactory::create_simple({seq_len, d_model}));
+        }
+
+        memcpy(outputs[0]->data(), local_output->data(), seq_len * d_model * sizeof(float));
+
+        return true;
     }
 
 } // namespace llaminar

@@ -30,7 +30,7 @@ static RopeResult bench_rope_once(int heads, int head_dim, int seq_len, int n_pa
         v = dist(rng);
 
     // Warmup
-    apply_rope(q.data(), k.data(), seq_len, head_dim, heads, n_past, 10000.0f);
+    apply_rope(q.data(), k.data(), seq_len, head_dim, heads, heads, n_past, 10000.0f);
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iters; ++i)
@@ -40,7 +40,7 @@ static RopeResult bench_rope_once(int heads, int head_dim, int seq_len, int n_pa
             v = dist(rng);
         for (auto &v : k)
             v = dist(rng);
-        apply_rope(q.data(), k.data(), seq_len, head_dim, heads, n_past, 10000.0f);
+        apply_rope(q.data(), k.data(), seq_len, head_dim, heads, heads, n_past, 10000.0f);
     }
     auto end = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;

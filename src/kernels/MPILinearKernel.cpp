@@ -136,7 +136,7 @@ namespace llaminar
                                              /*is_prefill*/ false,
                                              /*distributed_partition*/ true,
                                              /*transpose_A*/ false,
-                                             /*transpose_B*/ true,  // CRITICAL: Transpose weight per PyTorch/GGUF convention
+                                             /*transpose_B*/ true, // CRITICAL: Transpose weight per PyTorch/GGUF convention
                                              /*alpha*/ 1.0f,
                                              /*beta*/ 0.0f);
         auto end = std::chrono::high_resolution_clock::now();
@@ -225,10 +225,10 @@ namespace llaminar
         // output[1] should match weight[0] (out_dim)
         if (output->shape().size() != 2 ||
             output->shape()[0] != input->shape()[0] ||
-            output->shape()[1] != weight->shape()[0])  // Changed from weight->shape()[1]
+            output->shape()[1] != weight->shape()[0]) // Changed from weight->shape()[1]
         {
-            LOG_ERROR("MPILinearKernel: Output shape mismatch - expected [" << input->shape()[0] 
-                      << ", " << weight->shape()[0] << "], got [" << output->shape()[0] << ", " << output->shape()[1] << "]");
+            LOG_ERROR("MPILinearKernel: Output shape mismatch - expected [" << input->shape()[0]
+                                                                            << ", " << weight->shape()[0] << "], got [" << output->shape()[0] << ", " << output->shape()[1] << "]");
             return false;
         }
 
@@ -267,7 +267,7 @@ namespace llaminar
         // Each row has input_size elements (contiguous in memory).
         const size_t elements_to_copy = local_output_size * input_size;
         const float *src_start = global_data + output_offset * input_size;
-        
+
         // Single contiguous memcpy is optimal for row-major slicing
         std::memcpy(local_data, src_start, elements_to_copy * sizeof(float));
 

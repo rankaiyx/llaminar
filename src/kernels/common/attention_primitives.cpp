@@ -43,30 +43,115 @@ namespace llaminar::attn
     void compute_qk_scores(const float *q, const float *k, float *scores, int seq_len,
                            int head_dim, int heads, bool causal, bool apply_softmax);
 
-    void apply_rope(float *q, float *k, int seq_len, int head_dim, int heads, int n_past, float freq_base)
+    void apply_rope(float *q, float *k, int seq_len, int head_dim, int q_heads, int k_heads, int n_past, float freq_base)
     {
         // Unconditional lightweight trace (first few invocations) to verify this path executes in parity tests.
         static int rope_call_count = 0;
         if (rope_call_count < 8)
         {
-            LOG_WARN("[RoPETraceCall] idx=" << rope_call_count << " seq_len=" << seq_len << " heads=" << heads << " head_dim=" << head_dim << " n_past=" << n_past << " freq_base=" << freq_base);
+            LOG_WARN("[RoPETraceCall] idx=" << rope_call_count << " seq_len=" << seq_len << " q_heads=" << q_heads << " k_heads=" << k_heads << " head_dim=" << head_dim << " n_past=" << n_past << " freq_base=" << freq_base);
         }
         ++rope_call_count;
         const auto &env = llaminar::debugEnv().attention;
+
+        // GQA fallback: For now, use simple scalar path when q_heads != k_heads
+        // TODO: Refactor the optimized paths to properly support GQA
+        if (q_heads != k_heads)
+        {
+            LOG_WARN("[RoPE_GQA_PATH] Using GQA fallback for q_heads=" << q_heads << " k_heads=" << k_heads);
+            const int pairs = head_dim / 2;
+            std::vector<float> theta(pairs);
+            for (int p = 0; p < pairs; ++p)
+                theta[p] = 1.f / std::pow(freq_base, (2.f * p) / head_dim);
+
+            // Process Q
+            LOG_WARN("[RoPE_GQA_DEBUG] Processing Q: seq_len=" << seq_len << " q_heads=" << q_heads << " head_dim=" << head_dim);
+            for (int t = 0; t < seq_len; ++t)
+            {
+                float pos = float(n_past + t);
+                for (int h = 0; h < q_heads; ++h)
+                {
+                    float *qh = q + t * q_heads * head_dim + h * head_dim;
+                    if (t == 0 && h == 0)
+                    {
+                        LOG_WARN("[RoPE_GQA_DEBUG] Q before rotation [t=" << t << ",h=" << h << "]: "
+                                                                          << qh[0] << " " << qh[1] << " " << qh[2] << " " << qh[3] << " " << qh[4]);
+                    }
+                    for (int p = 0; p < pairs; ++p)
+                    {
+                        float angle = pos * theta[p];
+                        float cs = std::cos(angle);
+                        float sn = std::sin(angle);
+                        int i0 = 2 * p;
+                        int i1 = i0 + 1;
+                        if (i1 >= head_dim)
+                            break;
+                        float q0 = qh[i0], q1 = qh[i1];
+                        qh[i0] = q0 * cs - q1 * sn;
+                        qh[i1] = q0 * sn + q1 * cs;
+                    }
+                    if (t == 0 && h == 0)
+                    {
+                        LOG_WARN("[RoPE_GQA_DEBUG] Q after rotation [t=" << t << ",h=" << h << "]: "
+                                                                         << qh[0] << " " << qh[1] << " " << qh[2] << " " << qh[3] << " " << qh[4]);
+                    }
+                }
+            }
+
+            // Process K
+            LOG_WARN("[RoPE_GQA_DEBUG] Processing K: seq_len=" << seq_len << " k_heads=" << k_heads << " head_dim=" << head_dim);
+            for (int t = 0; t < seq_len; ++t)
+            {
+                float pos = float(n_past + t);
+                for (int h = 0; h < k_heads; ++h)
+                {
+                    float *kh = k + t * k_heads * head_dim + h * head_dim;
+                    if (t == 0 && h == 0)
+                    {
+                        LOG_WARN("[RoPE_GQA_DEBUG] K before rotation [t=" << t << ",h=" << h << "]: "
+                                                                          << kh[0] << " " << kh[1] << " " << kh[2] << " " << kh[3] << " " << kh[4]);
+                    }
+                    for (int p = 0; p < pairs; ++p)
+                    {
+                        float angle = pos * theta[p];
+                        float cs = std::cos(angle);
+                        float sn = std::sin(angle);
+                        int i0 = 2 * p;
+                        int i1 = i0 + 1;
+                        if (i1 >= head_dim)
+                            break;
+                        float k0 = kh[i0], k1 = kh[i1];
+                        kh[i0] = k0 * cs - k1 * sn;
+                        kh[i1] = k0 * sn + k1 * cs;
+                    }
+                    if (t == 0 && h == 0)
+                    {
+                        LOG_WARN("[RoPE_GQA_DEBUG] K after rotation [t=" << t << ",h=" << h << "]: "
+                                                                         << kh[0] << " " << kh[1] << " " << kh[2] << " " << kh[3] << " " << kh[4]);
+                    }
+                }
+            }
+            LOG_WARN("[RoPE_GQA_PATH] GQA fallback complete, early return");
+            return; // Early return for GQA path
+        }
+
+        // Original MHA path (q_heads == k_heads)
+        // Use 'heads' as alias for q_heads since they're equal
+        const int heads = q_heads;
         const int pairs = head_dim / 2;
         std::vector<float> theta(pairs);
         for (int p = 0; p < pairs; ++p)
             theta[p] = 1.f / std::pow(freq_base, (2.f * p) / head_dim);
 
         bool diag = llaminar::debugEnv().attention.internal_diff && llaminar::debugEnv().pipeline.layer_token_diff;
-        int preview = std::min(head_dim * heads, 8);
+        int preview = std::min(head_dim * q_heads, 8);
         std::array<float, 8> q_before{};
         std::array<float, 8> k_before{};
         q_before.fill(0.f);
         k_before.fill(0.f);
         if (diag && seq_len > 0 && preview > 0)
         {
-            size_t row_offset = (size_t)(seq_len - 1) * heads * head_dim; // last token row
+            size_t row_offset = (size_t)(seq_len - 1) * q_heads * head_dim; // last token row
             for (int i = 0; i < preview; ++i)
             {
                 q_before[i] = q[row_offset + i];
@@ -74,7 +159,7 @@ namespace llaminar::attn
             }
         }
 
-        const size_t total_elems = (size_t)heads * seq_len * head_dim;
+        const size_t total_elems = (size_t)q_heads * seq_len * head_dim;
         // Auto-tune cache: decide best path per (heads, head_dim, seq_len) once per process.
         struct Key
         {

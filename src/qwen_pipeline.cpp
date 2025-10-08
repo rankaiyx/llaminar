@@ -101,6 +101,55 @@ namespace
 
     // (parity sentinel accessors defined later after the atomic is declared)
     static std::atomic<bool> g_replay_first_exceed{false};
+
+    /**
+     * @brief Transpose a 2D tensor (swap rows and columns).
+     *
+     * This utility is used to convert GGUF projection weights from PyTorch format
+     * [out_features, in_features] to C++ matmul format [in_features, out_features].
+     *
+     * PyTorch convention: output = input @ weight.T (explicit transpose)
+     * C++ convention: output = input @ weight (no transpose, weight already correct)
+     *
+     * @param tensor Input 2D tensor to transpose
+     * @return New tensor with dimensions swapped
+     * @throws std::runtime_error if tensor is null or not 2D
+     */
+    std::shared_ptr<llaminar::TensorBase> transpose2D(
+        const std::shared_ptr<llaminar::TensorBase> &tensor)
+    {
+        if (!tensor)
+        {
+            throw std::runtime_error("transpose2D: tensor is null");
+        }
+
+        const auto &shape = tensor->shape();
+        if (shape.size() != 2)
+        {
+            throw std::runtime_error("transpose2D: expected 2D tensor, got " +
+                                     std::to_string(shape.size()) + "D");
+        }
+
+        const int rows = shape[0];
+        const int cols = shape[1];
+        const float *src = tensor->data();
+
+        // Allocate transposed storage: [rows, cols] → [cols, rows]
+        std::vector<float> transposed_data((size_t)rows * cols);
+
+        // Transpose: dst[c, r] = src[r, c]
+        for (int r = 0; r < rows; ++r)
+        {
+            for (int c = 0; c < cols; ++c)
+            {
+                transposed_data[(size_t)c * rows + r] = src[(size_t)r * cols + c];
+            }
+        }
+
+        // Create new tensor with swapped dimensions
+        return std::make_shared<llaminar::SimpleTensor>(
+            std::vector<int>{cols, rows}, transposed_data);
+    }
 }
 bool getReplayFirstExceedFlag() { return g_replay_first_exceed.load(); }
 void resetReplayFirstExceedFlag() { g_replay_first_exceed.store(false); }
@@ -299,7 +348,7 @@ namespace llaminar
                         LOG_INFO("[AttnKernelLayerSet] layer=" << layer_idx << " n_past=" << n_past_);
                     }
                 }
-                std::vector<std::shared_ptr<TensorBase>> attn_inputs = {attn_norm_out, weights.wq[layer_idx], weights.wk[layer_idx], weights.wv[layer_idx], weights.wo[layer_idx], use_kv_cache_ ? k_cache_[layer_idx] : createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim}), use_kv_cache_ ? v_cache_[layer_idx] : createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim})};
+                std::vector<std::shared_ptr<TensorBase>> attn_inputs = {attn_norm_out, weights.wq[layer_idx], weights.wk[layer_idx], weights.wv[layer_idx], weights.wo[layer_idx], weights.bq[layer_idx], weights.bk[layer_idx], weights.bv[layer_idx], use_kv_cache_ ? k_cache_[layer_idx] : createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim}), use_kv_cache_ ? v_cache_[layer_idx] : createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim})};
                 std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
                 if (!executeKernel("attention", attn_inputs, attn_outputs))
                 {
@@ -411,6 +460,12 @@ namespace llaminar
                 }
             }
         }
+        // Parity capture: FFN gate projection output
+        captureIfEnabled(PipelineStage::FFN_GATE, layer_idx, gate_out);
+
+        // Parity capture: FFN up projection output
+        captureIfEnabled(PipelineStage::FFN_UP, layer_idx, up_out);
+
         auto swiglu_out = createLocalTensor({seq_len, config_.getLayerConfig().d_ff});
         {
             std::vector<std::shared_ptr<TensorBase>> sw_in = {gate_out, up_out};
@@ -421,6 +476,8 @@ namespace llaminar
                 return false;
             }
         }
+        // Parity capture: FFN SwiGLU activation output (gate * silu(up))
+        captureIfEnabled(PipelineStage::FFN_SWIGLU, layer_idx, swiglu_out);
         {
             BackendContext bctx;
             bctx.is_prefill = is_prefill_stage_;
@@ -871,13 +928,13 @@ namespace llaminar
             {
                 // Use tied embedding directly - already in correct orientation
                 weights.lm_head = weights.token_embedding;
-                LOG_INFO("[WeightLoad] Using tied embeddings for lm_head (no transpose needed): [" 
-                        << emb_shape[0] << ", " << emb_shape[1] << "]");
+                LOG_INFO("[WeightLoad] Using tied embeddings for lm_head (no transpose needed): ["
+                         << emb_shape[0] << ", " << emb_shape[1] << "]");
             }
             else
             {
                 LOG_ERROR("[WeightLoad] Token embedding has unexpected shape for tied lm_head: ["
-                          << emb_shape[0] << "," << emb_shape[1] << "] - expected [" 
+                          << emb_shape[0] << "," << emb_shape[1] << "] - expected ["
                           << config.vocab_size << ", " << config.d_model << "]");
                 weights.lm_head = weights.token_embedding; // fallback
             }
@@ -927,11 +984,27 @@ namespace llaminar
             if (!wq || !wk || !wv || !wo)
                 throw std::runtime_error("Failed to load attention weights for layer " + std::to_string(layer));
 
+            // NOTE: ModelLoader already converts GGUF format [in,out] to PyTorch format [out,in]
+            // No additional transpose needed - weights are ready to use!
+
+            // Load Q, K, V projection biases
+            auto bq = loader.loadTensor(prefix + "attn_q.bias");
+            auto bk = loader.loadTensor(prefix + "attn_k.bias");
+            auto bv = loader.loadTensor(prefix + "attn_v.bias");
+
+            if (!bq || !bk || !bv)
+                throw std::runtime_error("Failed to load attention biases for layer " + std::to_string(layer));
+
             // Store attention weights for this layer
             weights.wq.push_back(wq);
             weights.wk.push_back(wk);
             weights.wv.push_back(wv);
             weights.wo.push_back(wo);
+
+            // Store attention biases
+            weights.bq.push_back(bq);
+            weights.bk.push_back(bk);
+            weights.bv.push_back(bv);
 
             // --- FFN Normalization ---
             // Load pre-FFN RMSNorm gamma
@@ -957,6 +1030,9 @@ namespace llaminar
             // Validate all FFN weights loaded successfully
             if (!w_gate || !w_up || !w_down)
                 throw std::runtime_error("Failed to load FFN weights for layer " + std::to_string(layer));
+
+            // NOTE: ModelLoader already converts GGUF format [in,out] to PyTorch format [out,in]
+            // No additional transpose needed - weights are ready to use!
 
             // Store FFN weights for this layer
             weights.w_gate.push_back(w_gate);
@@ -2131,7 +2207,7 @@ namespace llaminar
             }
 
             // Use the attention primitives with expanded K/V
-            llaminar::attn::apply_rope(q_buf.data(), k_expanded.data(), seq_len, head_dim, n_heads,
+            llaminar::attn::apply_rope(q_buf.data(), k_expanded.data(), seq_len, head_dim, n_heads, n_heads,
                                        n_past_, config_.getLayerConfig().rope_freq_base);
             llaminar::attn::fused_attention(q_buf.data(), k_expanded.data(), v_expanded.data(),
                                             context_concat.data(), seq_len, head_dim, n_heads,
@@ -2157,7 +2233,7 @@ namespace llaminar
             }
 
             // Apply RoPE to Q and K in-place
-            llaminar::attn::apply_rope(q_buf.data(), k_expanded.data(), seq_len, head_dim, n_heads,
+            llaminar::attn::apply_rope(q_buf.data(), k_expanded.data(), seq_len, head_dim, n_heads, n_heads,
                                        n_past_, config_.getLayerConfig().rope_freq_base);
 
             // Compute full attention: QK^T scores + softmax + apply to V

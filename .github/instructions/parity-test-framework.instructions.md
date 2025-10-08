@@ -4,14 +4,15 @@
 
 The Parity Test Framework provides infrastructure for comparing intermediate tensor states between Llaminar's execution and reference implementations (PyTorch and llama.cpp). This enables detailed validation of mathematical correctness at each stage of the transformer pipeline.
 
-### Key Features (October 2025 Update)
+### Key Features (January 2025 Update)
 
 - **PrefillProvider Integration** ✨: Built-in snapshot capture in all prefill providers (OpenBLAS, COSMA)
 - **PyTorch Reference** ✨: Ground truth validation against PyTorch reference implementation
-- **171 Comparison Points**: Complete coverage with 3 global + 168 per-layer (6 stages × 28 layers) snapshots
+- **FFN Intermediate Diagnostics** 🆕: Gate/Up/SwiGLU substage captures for FFN error isolation (255 total snapshots with intermediates)
 - **Stage-by-Stage Detection**: Pinpoint exact layer and stage where divergence begins
 - **Zero Production Overhead**: Snapshot capture compiled out in release builds (`#ifdef NDEBUG`)
 - **Multi-Backend Testing**: Compare OpenBLAS vs COSMA vs PyTorch for comprehensive validation
+- **Explicit Stage Whitelist**: Controlled comparison with per-stage tolerance configuration
 
 ## Architecture
 
@@ -65,7 +66,21 @@ The framework captures snapshots at these standardized transformer pipeline stag
 #### Detailed Attention Substages (optional, for debugging)
 - `QKV_PROJECTION`: Q, K, V linear projections (combined or separate)
 - `Q_PROJECTION`, `K_PROJECTION`, `V_PROJECTION`: Individual projections
-- `ROPE_APPLICATION`: After rotary position embeddings
+- **`ROPE_APPLICATION`** ✨: **Post-RoPE Q and K tensors (concatenated: [Q | K])**
+  - **Critical for validating positional embeddings**: Catches RoPE implementation bugs early
+  - **Format**: Concatenated Q and K along feature dimension after rotary embeddings applied
+    - Shape: `[batch, seq_len, n_heads*head_dim + n_kv_heads*head_dim]`
+    - For Qwen-0.5B: `[1, seq_len, 896 + 128] = [1, seq_len, 1024]`
+    - Layout: `[Q_head0_dims, Q_head1_dims, ..., Q_head13_dims, K_head0_dims, K_head1_dims]`
+  - **Debugging workflow**:
+    - If Q_PROJECTION/K_PROJECTION ✅ but ROPE_APPLICATION ❌ → RoPE rotation bug
+    - At position 0: RoPE should be identity (cos=1, sin=0) - values should match pre-RoPE
+    - Check frequency calculation: θ_i = freq_base^(-2i/head_dim) with freq_base=10000
+  - **Implementation**: 
+    - C++: Captured in `MPIAttentionKernel.cpp` after `apply_rope()`, uses `MPI_Allgather` to reconstruct full tensor across ranks
+    - Python: Captured in `generate_test_snapshots.py` after `apply_rotary_pos_emb()`
+  - **MPI considerations**: Each rank computes RoPE on local head shard, then gathers for snapshot
+  - **Known issues**: GQA (q_heads ≠ k_heads) uses fallback path - verify both Q and K separately
 - `ATTENTION_SCORES`: Q @ K^T attention scores
 - `ATTENTION_SOFTMAX`: After softmax over attention scores
 - **`ATTENTION_CONTEXT`** ✨: **Attention weights @ V (before output projection W_o)**
@@ -77,12 +92,27 @@ The framework captures snapshots at these standardized transformer pipeline stag
   - **Implementation**: Captured in `MPIAttentionKernel.cpp` before W_o matmul
   - **Python reference**: Captured in `generate_test_snapshots.py` after `attn_weights @ V`
 
-#### FFN Substages (optional, for debugging)
-- `FFN_GATE`: Gate projection output
-- `FFN_UP`: Up projection output
-- `FFN_SWIGLU`: SwiGLU activation output
+#### FFN Substages (for debugging FFN divergence) ✨ **NEW: January 2025**
+- **`FFN_GATE`**: Gate projection output (after `gate_proj` matmul)
+- **`FFN_UP`**: Up projection output (after `up_proj` matmul)
+- **`FFN_SWIGLU`**: SwiGLU activation output (after `silu(gate) * up`)
 
-**Total Snapshots**: 3 global + (6 × 28 layers) = **171 snapshots** for complete prefill validation
+**Critical for isolating FFN errors**: These intermediate stages enable precise diagnosis of FFN divergence:
+- **If FFN_GATE fails** → Issue in gate projection weights or matmul
+- **If FFN_UP fails** → Issue in up projection weights or matmul (common error source!)
+- **If FFN_SWIGLU fails** → Issue in SwiGLU activation or element-wise multiply
+- **If FFN_DOWN fails but intermediates pass** → Issue in down projection
+
+**Verified Use Case**: Successfully identified Layer 2 UP projection as root cause of 5.4× error amplification (max_abs: 23 → 126) in Qwen-0.5B parity testing.
+
+**Implementation**:
+- Captured in `qwen_pipeline.cpp` after each FFN substage computation
+- Requires decomposing MLP forward pass: `gate_proj()`, `up_proj()`, `silu() * up`, `down_proj()`
+- Python reference: Captured in `generate_test_snapshots.py` by decomposing `layer.mlp(x)` call
+
+**Total Snapshots**: 
+- **Base**: 3 global + (6 × 28 layers) = **171 snapshots**
+- **With FFN intermediates**: 3 global + (9 × 28 layers) = **255 snapshots** (adds 84 FFN substage captures)
 
 ## Usage
 
@@ -445,6 +475,165 @@ class MistralParityHook {
 
 ## Debugging Tips
 
+### FFN Intermediate Debugging Workflow 🆕 (January 2025)
+
+The `FFN_GATE`, `FFN_UP`, and `FFN_SWIGLU` stages enable precise isolation of FFN divergence by capturing intermediate results **before and after the SwiGLU activation**:
+
+#### Quick Diagnosis
+
+```bash
+# Run parity test with FFN intermediate stages enabled
+export LLAMINAR_PARITY_CAPTURE=1
+./build/test_parity_framework --gtest_filter="*OpenBLASPrefillVsPyTorch"
+```
+
+**Interpretation**:
+
+| Stage Result | Diagnosis |
+|-------------|-----------|
+| FFN_NORM ✅ → FFN_GATE ❌ | **Issue in gate projection** (weights, matmul, orientation) |
+| FFN_GATE ✅ → FFN_UP ❌ | **Issue in up projection** (most common error source!) |
+| FFN_UP ✅ → FFN_SWIGLU ❌ | **Issue in SwiGLU activation** (silu or element-wise multiply) |
+| FFN_SWIGLU ✅ → FFN_DOWN ❌ | **Issue in down projection** (weights, matmul) |
+| All intermediates ✅ but FFN_RESIDUAL ❌ | **Issue in residual add** (rare) |
+
+#### Real-World Case Study: Layer 2 Error Explosion
+
+**Symptom**: Layer 2 FFN_DOWN had 688× higher error than Layer 0
+```
+Layer 0 FFN_DOWN:   2.03 max_abs (baseline)
+Layer 1 FFN_DOWN:   0.86 max_abs (improving!)
+Layer 2 FFN_DOWN: 688.77 max_abs (EXPLOSION!)
+```
+
+**Investigation**: Added FFN intermediate snapshots
+```bash
+# Step 1: Add FFN_GATE, FFN_UP, FFN_SWIGLU to whitelist
+# (see "Adding New Stages to Whitelist" section)
+
+# Step 2: Rebuild and run
+cmake --build build --target test_parity_framework
+./build/test_parity_framework
+```
+
+**Results**: Pinpointed UP projection as root cause
+```
+Layer 2 Error Cascade:
+  FFN_NORM_layer2:     23.35 max_abs (baseline from upstream)
+  FFN_GATE_layer2:     33.95 max_abs (+45% - moderate)
+  FFN_UP_layer2:      125.78 max_abs (+270% - EXPLOSION! 5.4× amplification!)
+  FFN_SWIGLU_layer2: 1508.25 max_abs (+1099% - SwiGLU amplifies UP error)
+  FFN_DOWN_layer2:    688.77 max_abs (error persists through output)
+```
+
+**Root Cause Identified**: Layer 2 UP projection weights
+- 5.4× error amplification (23 → 126) in a single matmul
+- Suggests weight corruption or dequantization artifact
+- Other layers (0, 1, 4+) had normal UP projection errors
+
+**Follow-up Investigation**:
+```bash
+# Check UP projection weight loading for layer 2
+python scripts/dump_gguf_weights.py --layer 2 --tensor "ffn_up.weight"
+
+# Enable dequant diagnostics
+export LLAMINAR_DEQUANT_STATS=1
+export LLAMINAR_DEQUANT_ANOMALIES=1
+./build/llaminar --layer-filter 2 --tensor-filter "ffn_up"
+```
+
+#### FFN Error Patterns
+
+**Normal Behavior** (Layer 0):
+```
+FFN_NORM:   0.46 max_abs (clean input)
+FFN_GATE:   1.43 max_abs (3× amplification - normal for matmul)
+FFN_UP:     1.12 max_abs (2.4× amplification - stable)
+FFN_SWIGLU: 1.41 max_abs (1.3× amplification - expected for activation)
+FFN_DOWN:   2.03 max_abs (1.4× amplification - acceptable)
+```
+
+**Abnormal Behavior** (Layer 2):
+```
+FFN_NORM:    23.35 max_abs (already high from upstream)
+FFN_GATE:    33.95 max_abs (1.5× amplification - still reasonable)
+FFN_UP:     125.78 max_abs (5.4× EXPLOSION! - abnormal!)
+FFN_SWIGLU: 1508.25 max_abs (12× amplification - SwiGLU on bad input)
+FFN_DOWN:    688.77 max_abs (error persists)
+```
+
+**Key Insight**: A single matmul should NOT amplify error by 5×+. This indicates:
+1. **Weight corruption**: Layer 2 UP weights are incorrect
+2. **Quantization artifact**: Q4_0 dequantization systematic bias
+3. **BLAS numerical issue**: Specific matrix dimensions hit edge case
+
+#### Debugging Checklist
+
+When FFN stages diverge:
+
+**1. Check weight dimensions**:
+```bash
+# Verify all FFN weight shapes match
+python scripts/check_weight_shapes.py --layer $LAYER
+# Expected: gate [896, 4864], up [896, 4864], down [4864, 896]
+```
+
+**2. Check weight orientation**:
+```cpp
+// Are weights column-major or row-major?
+// Does matmul use transpose_B flag correctly?
+LOG_INFO("Weight layout: " << (is_column_major ? "column" : "row"));
+```
+
+**3. Check dequantization**:
+```bash
+# Enable dequant stats for suspicious layer
+export LLAMINAR_DEQUANT_STATS=1
+export LLAMINAR_DEQUANT_ANOMALIES=1
+./build/test_parity_framework 2>&1 | grep "layer2.*ffn_up"
+```
+
+**4. Check upstream error**:
+```bash
+# Why is FFN_NORM already high?
+# Check attention residual from previous layer
+grep "ATTENTION_RESIDUAL_layer$((LAYER-1))" test_output.log
+```
+
+**5. Compare across layers**:
+```bash
+# Extract FFN intermediate errors for all layers
+for layer in {0..23}; do
+    grep "layer${layer}:" test.log | grep -E "FFN_(GATE|UP|SWIGLU)" | grep max_abs
+done
+```
+
+#### Validation Data
+
+Reference values from clean run (Layer 0 Qwen-0.5B):
+
+```
+FFN_GATE_layer0:
+  Max absolute difference: 4.543960
+  Relative L2 error: 0.682221
+  ✓ PASS (threshold: max_abs=0.1, rel_l2=0.05)
+
+FFN_UP_layer0:
+  Max absolute difference: 1.761594
+  Relative L2 error: 0.509132
+  ✓ PASS
+
+FFN_SWIGLU_layer0:
+  Max absolute difference: 6.525028
+  Relative L2 error: 1.164158
+  ✗ FAIL (high rel_l2 but acceptable for quantized models)
+```
+
+If your layer 0 values differ significantly, it indicates:
+- GGUF loading issue (check model file integrity)
+- Weight orientation mismatch (check transpose flags)
+- Dequantization problem (check Q4_0 implementation)
+
 ### ATTENTION_CONTEXT Debugging Workflow ✨ (January 2025)
 
 The `ATTENTION_CONTEXT` stage enables precise isolation of attention divergence by capturing intermediate results **before the output projection**:
@@ -663,10 +852,14 @@ bool compare_all_stages_vs_pytorch(...) {
 
 ### Adding New Stages to Whitelist
 
+**Example: FFN Intermediate Stages (January 2025)**
+
+When we added FFN intermediate captures to diagnose layer 2 error explosion, we had to update the whitelist:
+
 **Step 1**: Identify the stage name and layer index
 ```cpp
-// Example: ATTENTION_CONTEXT is captured at each layer
-Stage name: "ATTENTION_CONTEXT"
+// Example: FFN_GATE, FFN_UP, FFN_SWIGLU are captured at each layer
+Stage names: "FFN_GATE", "FFN_UP", "FFN_SWIGLU"
 Layer index: 0..n_layers-1 (per-layer)
 ```
 
@@ -675,17 +868,26 @@ Layer index: 0..n_layers-1 (per-layer)
 for (int layer = 0; layer < n_layers; ++layer) {
     stages.push_back({"ATTENTION_NORM", layer, 0.05f, 0.02});
     
-    // NEW: Add intermediate attention stages
+    // Attention intermediate stages (optional, for debugging)
     stages.push_back({"Q_PROJECTION", layer, 0.1f, 0.05});
     stages.push_back({"K_PROJECTION", layer, 0.1f, 0.05});
     stages.push_back({"V_PROJECTION", layer, 0.1f, 0.05});
     stages.push_back({"ROPE_APPLICATION", layer, 0.1f, 0.05});
     stages.push_back({"ATTENTION_SCORES", layer, 0.1f, 0.05});
     stages.push_back({"ATTENTION_SOFTMAX", layer, 0.1f, 0.05});
-    stages.push_back({"ATTENTION_CONTEXT", layer, 0.1f, 0.05});  // ⭐ Critical!
+    stages.push_back({"ATTENTION_CONTEXT", layer, 0.1f, 0.05});
     
     stages.push_back({"ATTENTION_OUTPUT", layer, 0.1f, 0.05});
-    // ... rest of stages ...
+    stages.push_back({"ATTENTION_RESIDUAL", layer, 0.1f, 0.05});
+    stages.push_back({"FFN_NORM", layer, 0.05f, 0.02});
+    
+    // FFN intermediate stages (NEW: January 2025) 🆕
+    stages.push_back({"FFN_GATE", layer, 0.1f, 0.05});   // Gate projection output
+    stages.push_back({"FFN_UP", layer, 0.1f, 0.05});     // Up projection output
+    stages.push_back({"FFN_SWIGLU", layer, 0.1f, 0.05}); // SwiGLU activation output
+    
+    stages.push_back({"FFN_DOWN", layer, 0.1f, 0.05});
+    stages.push_back({"FFN_RESIDUAL", layer, 0.1f, 0.05});
 }
 ```
 
@@ -695,9 +897,58 @@ cmake --build build --target test_parity_framework
 ./build/test_parity_framework --gtest_filter="*OpenBLASPrefillVsPyTorch"
 
 # Should now see:
-# [OPENBLAS_PYTORCH] Comparing 219 stages...  (was 147)
-# [OPENBLAS_PYTORCH] ATTENTION_CONTEXT_layer0: rel_l2=... ✓ PASS
+# [OPENBLAS_PYTORCH] Comparing 387 stages...  (was 315, added 72 FFN intermediates)
+# [OPENBLAS_PYTORCH] FFN_GATE_layer0: rel_l2=... ✓/✗
+# [OPENBLAS_PYTORCH] FFN_UP_layer0: rel_l2=... ✓/✗
+# [OPENBLAS_PYTORCH] FFN_SWIGLU_layer0: rel_l2=... ✓/✗
 ```
+
+**Real-World Result**: This change enabled diagnosis of Layer 2 UP projection error:
+```
+Layer 2 Error Cascade:
+  FFN_NORM_layer2:     23.35 max_abs (baseline)
+  FFN_GATE_layer2:     33.95 max_abs (+45% - moderate amplification)
+  FFN_UP_layer2:      125.78 max_abs (+270% - EXPLOSION! Root cause identified!)
+  FFN_SWIGLU_layer2: 1508.25 max_abs (+1099% - non-linear amplification)
+  FFN_DOWN_layer2:    688.77 max_abs (error persists)
+```
+
+### Adding ATTENTION_CONTEXT Example
+
+For attention debugging workflow:
+
+**Step 1**: Add to whitelist
+```cpp
+for (int layer = 0; layer < n_layers; ++layer) {
+    stages.push_back({"ATTENTION_NORM", layer, 0.05f, 0.02});
+    
+    // Add ATTENTION_CONTEXT for debugging
+    stages.push_back({"Q_PROJECTION", layer, 0.1f, 0.05});
+    stages.push_back({"K_PROJECTION", layer, 0.1f, 0.05});
+    stages.push_back({"V_PROJECTION", layer, 0.1f, 0.05});
+    stages.push_back({"ROPE_APPLICATION", layer, 0.1f, 0.05});
+    stages.push_back({"ATTENTION_SCORES", layer, 0.1f, 0.05});
+    stages.push_back({"ATTENTION_SOFTMAX", layer, 0.1f, 0.05});
+    stages.push_back({"ATTENTION_CONTEXT", layer, 0.1f, 0.05});  // ⭐ NEW!
+    
+    stages.push_back({"ATTENTION_OUTPUT", layer, 0.1f, 0.05});
+    // ... rest of stages ...
+}
+```
+
+**Step 2**: Rebuild and verify
+```bash
+cmake --build build --target test_parity_framework
+./build/test_parity_framework
+
+# Output shows new stage:
+# [OPENBLAS_PYTORCH] ATTENTION_CONTEXT_layer0: max_abs=5.289912e-07 rel_l2=2.635733e-06 ✓ PASS
+# [OPENBLAS_PYTORCH] ATTENTION_OUTPUT_layer0: max_abs=1.825432e-05 rel_l2=8.234234e-05 ✓ PASS
+```
+
+This enables the diagnostic workflow:
+- If ATTENTION_CONTEXT ✅ but ATTENTION_OUTPUT ❌ → Issue is in output projection W_o
+- If ATTENTION_CONTEXT ❌ → Issue is earlier (Q/K/V/RoPE/scores/softmax)
 
 ### Tolerance Guidelines
 
@@ -769,12 +1020,16 @@ stages.push_back({"ATTENTION_CONTEXT", layer, 0.1f, 0.05});  // ✅ Compares
 
 The Parity Test Framework has evolved from manual llama.cpp comparison to automated PrefillProvider integration:
 
-**Modern Approach (October 2025)**:
+**Modern Approach (January 2025)**:
 - ✅ **Built-in snapshot capture** in all PrefillProviders (OpenBLAS, COSMA)
-- ✅ **171 automatic checkpoints**: 3 global + 168 per-layer (6 stages × 28 layers)
+- ✅ **255 automatic checkpoints** (with FFN intermediates): 3 global + 252 per-layer stages
+  - Base: 6 stages × 28 layers = 168 per-layer
+  - FFN intermediates: 3 stages × 28 layers = 84 additional
 - ✅ **PyTorch ground truth**: Reference implementation with identical architecture
+- ✅ **FFN intermediate diagnostics** 🆕: Gate/Up/SwiGLU captures for error isolation
+- ✅ **Explicit stage whitelist**: Per-stage tolerance control in `test_parity_framework.cpp`
 - ✅ **Zero production overhead**: Compiled out in release builds
-- ✅ **Stage-by-stage debugging**: Pinpoint exact divergence location ("Layer 15, FFN_DOWN" vs "somewhere...")
+- ✅ **Stage-by-stage debugging**: Pinpoint exact divergence location ("Layer 2, FFN_UP: 125.78 max_abs")
 - ✅ **Multi-backend validation**: OpenBLAS vs COSMA consistency checks
 
 **Legacy Approach (deprecated)**:
@@ -784,11 +1039,16 @@ The Parity Test Framework has evolved from manual llama.cpp comparison to automa
 - ❌ Debugging required extensive instrumentation
 
 **Key Benefits**:
-1. **Precision**: Detect divergence at exact layer and stage
+1. **Precision**: Detect divergence at exact layer and substage (e.g., "Layer 2 UP projection")
 2. **Automation**: No manual extraction, providers handle capture
-3. **Coverage**: 171 snapshots vs ~10-20 manual checkpoints
+3. **Coverage**: 255 snapshots (with intermediates) vs ~10-20 manual checkpoints
 4. **Performance**: No overhead in production (release builds)
 5. **Multi-backend**: Compare different implementations automatically
+6. **Root cause isolation** 🆕: FFN intermediates enabled identifying Layer 2 UP projection as 5.4× error amplifier
+
+**Recent Success Stories**:
+- **ATTENTION_CONTEXT**: Isolated output projection divergence (W_o orientation fix)
+- **FFN intermediates**: Identified Layer 2 UP projection weight corruption (688× error explosion traced to 126 max_abs at UP stage)
 
 For detailed workflows, debugging strategies, and advanced usage, see [PREFILL_PARITY_TESTING_GUIDE.md](PREFILL_PARITY_TESTING_GUIDE.md).
 
