@@ -31,9 +31,11 @@
 #include "attention/AttentionStageContracts.h"
 #include "attention/AttentionValidator.h"
 #include "../utils/debug_env.h"
+#include <algorithm>
 #include <cblas.h>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <mpi.h>
 
 namespace llaminar
@@ -245,8 +247,11 @@ namespace llaminar
     {
         const int rank = getRank();
         const int world_size = getSize();
-        const bool enable_validation = debugEnv().attention.validate_output;
-        const bool validate_projections = debugEnv().attention.validate_proj;
+        const auto &debug_snapshot = debugEnv();
+        const bool enable_validation = debug_snapshot.attention.validate_output;
+        const bool validate_projections = debug_snapshot.attention.validate_proj;
+        const bool trace_weight_slice = debug_snapshot.attention.trace_weight_slicing;
+        const bool trace_k_projection = debug_snapshot.attention.trace_k_projection;
 
         // ========================================================================
         // STEP 1: Validate inputs and extract parameters
@@ -471,6 +476,10 @@ namespace llaminar
         std::shared_ptr<TensorBase> local_wq, local_wk, local_wv, local_wo;
         std::shared_ptr<TensorBase> local_bq, local_bk, local_bv;
 
+        const size_t wq_base_offset = static_cast<size_t>(head_offset) * head_dim_ * d_model;
+        const size_t kv_base_offset = static_cast<size_t>(kv_head_offset) * head_dim_ * d_model;
+        bool copied_global_weights = false;
+
         if (weights_are_sharded)
         {
             // Weights are already sharded - use them directly
@@ -515,12 +524,13 @@ namespace llaminar
             local_wo = TensorFactory::create_simple({d_model, local_head_dim});
 
             // Copy weight slices (row-wise slicing for wq/wk/wv, column-wise for wo)
-            const int wq_offset = head_offset * head_dim_ * d_model;
-            const int kv_offset = kv_head_offset * head_dim_ * d_model;
+            const size_t local_q_elements = static_cast<size_t>(local_head_dim) * static_cast<size_t>(d_model);
+            const size_t local_kv_elements = static_cast<size_t>(local_kv_head_dim) * static_cast<size_t>(d_model);
 
-            memcpy(local_wq->data(), wq_global->data() + wq_offset, local_head_dim * d_model * sizeof(float));
-            memcpy(local_wk->data(), wk_global->data() + kv_offset, local_kv_head_dim * d_model * sizeof(float));
-            memcpy(local_wv->data(), wv_global->data() + kv_offset, local_kv_head_dim * d_model * sizeof(float));
+            memcpy(local_wq->data(), wq_global->data() + wq_base_offset, local_q_elements * sizeof(float));
+            memcpy(local_wk->data(), wk_global->data() + kv_base_offset, local_kv_elements * sizeof(float));
+            memcpy(local_wv->data(), wv_global->data() + kv_base_offset, local_kv_elements * sizeof(float));
+            copied_global_weights = true;
 
             // Copy output weight (column slice)
             for (int row = 0; row < d_model; ++row)
@@ -550,6 +560,114 @@ namespace llaminar
                 local_bv = TensorFactory::create_simple({local_kv_head_dim});
                 const int bv_offset = kv_head_offset * head_dim_;
                 memcpy(local_bv->data(), bv_global->data() + bv_offset, local_kv_head_dim * sizeof(float));
+            }
+        }
+
+        if (trace_weight_slice && local_wk && wk_global)
+        {
+            const size_t stride = static_cast<size_t>(d_model);
+
+            if (copied_global_weights)
+            {
+                float max_abs_diff = 0.0f;
+                const size_t elems = static_cast<size_t>(local_kv_head_dim) * stride;
+                const float *global_ptr = wk_global->data() + kv_base_offset;
+                const float *local_ptr = local_wk->data();
+                for (size_t idx = 0; idx < elems; ++idx)
+                {
+                    max_abs_diff = std::max(max_abs_diff, std::fabs(local_ptr[idx] - global_ptr[idx]));
+                }
+                LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                     << " layer=" << layer_index_
+                                                     << " kv_head_offset=" << kv_head_offset
+                                                     << " local_kv_heads=" << local_kv_heads
+                                                     << " head_dim=" << head_dim_
+                                                     << " weights_sharded=no"
+                                                     << " max_abs_copy_diff=" << max_abs_diff);
+            }
+            else
+            {
+                LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                     << " layer=" << layer_index_
+                                                     << " kv_head_offset=" << kv_head_offset
+                                                     << " local_kv_heads=" << local_kv_heads
+                                                     << " head_dim=" << head_dim_
+                                                     << " weights_sharded=" << (weights_are_sharded ? "yes" : "no"));
+            }
+
+            const bool has_extra_cols = d_model > 33;
+
+            for (int kv = 0; kv < local_kv_heads; ++kv)
+            {
+                const int global_kv_head = kv_head_offset + kv;
+                const int local_row_base = kv * head_dim_;
+                const float *local_row0 = local_wk->data() + static_cast<size_t>(local_row_base) * stride;
+
+                LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                     << " layer=" << layer_index_
+                                                     << " kv_head_global=" << global_kv_head
+                                                     << " row0_cols0-3={" << local_row0[0] << ", " << local_row0[1]
+                                                     << ", " << local_row0[2] << ", " << local_row0[3] << "}");
+                if (has_extra_cols)
+                {
+                    LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                         << " layer=" << layer_index_
+                                                         << " kv_head_global=" << global_kv_head
+                                                         << " row0_cols32-33={" << local_row0[32] << ", " << local_row0[33] << "}");
+                }
+
+                if (copied_global_weights)
+                {
+                    const size_t global_head_row_base = static_cast<size_t>(global_kv_head) * static_cast<size_t>(head_dim_);
+                    const float *global_row0 = wk_global->data() + global_head_row_base * stride;
+                    LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                         << " layer=" << layer_index_
+                                                         << " kv_head_global=" << global_kv_head
+                                                         << " GLOBAL_row0_cols0-3={" << global_row0[0] << ", " << global_row0[1]
+                                                         << ", " << global_row0[2] << ", " << global_row0[3] << "}");
+                    if (has_extra_cols)
+                    {
+                        LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                             << " layer=" << layer_index_
+                                                             << " kv_head_global=" << global_kv_head
+                                                             << " GLOBAL_row0_cols32-33={" << global_row0[32] << ", " << global_row0[33] << "}");
+                    }
+                }
+
+                if (head_dim_ > 32)
+                {
+                    const float *local_row32 = local_wk->data() + static_cast<size_t>(local_row_base + 32) * stride;
+                    LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                         << " layer=" << layer_index_
+                                                         << " kv_head_global=" << global_kv_head
+                                                         << " row32_cols0-3={" << local_row32[0] << ", " << local_row32[1]
+                                                         << ", " << local_row32[2] << ", " << local_row32[3] << "}");
+                    if (has_extra_cols)
+                    {
+                        LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                             << " layer=" << layer_index_
+                                                             << " kv_head_global=" << global_kv_head
+                                                             << " row32_cols32-33={" << local_row32[32] << ", " << local_row32[33] << "}");
+                    }
+
+                    if (copied_global_weights)
+                    {
+                        const size_t global_row32_index = static_cast<size_t>(global_kv_head) * static_cast<size_t>(head_dim_) + 32;
+                        const float *global_row32 = wk_global->data() + global_row32_index * stride;
+                        LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                             << " layer=" << layer_index_
+                                                             << " kv_head_global=" << global_kv_head
+                                                             << " GLOBAL_row32_cols0-3={" << global_row32[0] << ", " << global_row32[1]
+                                                             << ", " << global_row32[2] << ", " << global_row32[3] << "}");
+                        if (has_extra_cols)
+                        {
+                            LOG_INFO("[ATTN_WEIGHT_TRACE] rank " << rank
+                                                                 << " layer=" << layer_index_
+                                                                 << " kv_head_global=" << global_kv_head
+                                                                 << " GLOBAL_row32_cols32-33={" << global_row32[32] << ", " << global_row32[33] << "}");
+                        }
+                    }
+                }
             }
         }
 
@@ -925,36 +1043,94 @@ namespace llaminar
         // This ensures attention is computed from RoPE-rotated tensors while Q_PROJECTION
         // snapshots match PyTorch's pre-RoPE values.
 
-        if (layer_index_ == 0)
+        if (trace_k_projection && layer_index_ == 0)
         {
-            LOG_INFO("[RANK=" << rank << "] BEFORE RoPE (local_heads=" << local_heads << ", local_kv_heads=" << local_kv_heads << "):");
-            LOG_INFO("  local_q size=" << local_q->size() << " shape=[" << seq_len << "," << local_head_dim << "]");
-            LOG_INFO("  local_q[token=0, head=0, dim=0:10]: ["
+            const int log_layer = layer_index_;
+            const auto log_sample = [&](const std::string &label, const float *ptr, int cols)
+            {
+                std::ostringstream oss;
+                oss << label << "{";
+                const int preview = std::min(cols, 10);
+                for (int i = 0; i < preview; ++i)
+                {
+                    if (i > 0)
+                        oss << ", ";
+                    oss << ptr[i];
+                }
+                if (cols > 10)
+                {
+                    oss << ", ...";
+                }
+                oss << "}";
+                LOG_INFO(oss.str());
+            };
+
+            LOG_INFO("[ATTN_K_TRACE] rank=" << rank
+                                            << " layer=" << log_layer
+                                            << " local_heads=" << local_heads
+                                            << " local_kv_heads=" << local_kv_heads
+                                            << " seq_len=" << seq_len
+                                            << " head_dim=" << head_dim_);
+
+            // Token 0 preview (first local head)
+            log_sample("  local_q[token0_head0]=", local_q->data(), head_dim_);
+            log_sample("  local_k[token0_head0]=", local_k->data(), head_dim_);
+
+            if (seq_len > 1)
+            {
+                log_sample("  local_q[token1_head0]=", local_q->data() + local_head_dim, head_dim_);
+                log_sample("  local_k[token1_head0]=", local_k->data() + local_kv_head_dim, head_dim_);
+            }
+
+            if (local_q->size() >= head_dim_ * 2)
+            {
+                const int mid = static_cast<int>(local_q->size() / 2);
+                const int tail = static_cast<int>(local_q->size() - std::min(local_head_dim, head_dim_));
+                log_sample("  local_q[mid_segment]=", local_q->data() + mid, head_dim_);
+                log_sample("  local_q[tail_segment]=", local_q->data() + tail, head_dim_);
+            }
+
+            if (local_k->size() >= head_dim_ * 2)
+            {
+                const int mid = static_cast<int>(local_k->size() / 2);
+                const int tail = static_cast<int>(local_k->size() - std::min(local_kv_head_dim, head_dim_));
+                log_sample("  local_k[mid_segment]=", local_k->data() + mid, head_dim_);
+                log_sample("  local_k[tail_segment]=", local_k->data() + tail, head_dim_);
+            }
+        }
+
+        // =======================================================================
+        // ROPE PARAMETER VALIDATION AND PRE-ROPE VALUE LOGGING
+        // =======================================================================
+        if (rank == 0 && layer_index_ == 0)
+        {
+            LOG_INFO("========== ROPE_APPLICATION DEBUG STEP 1: PRE-ROPE VALIDATION ==========");
+            LOG_INFO("[ROPE_PARAMS] Parameters being passed to apply_rope():");
+            LOG_INFO("  seq_len: " << seq_len << " (expected: 5 for test prompt)");
+            LOG_INFO("  head_dim: " << head_dim_ << " (expected: 64 for Qwen-0.5B)");
+            LOG_INFO("  local_heads (q_heads param): " << local_heads << " (expected: 7 per rank for 14 total)");
+            LOG_INFO("  local_kv_heads (k_heads param): " << local_kv_heads << " (expected: 1 per rank for 2 total)");
+            LOG_INFO("  n_past: 0 (hardcoded - prefill)");
+            LOG_INFO("  rope_freq_base: " << rope_freq_base_ << " (expected: 10000)");
+
+            LOG_INFO("[ROPE_TENSORS] Tensor shapes before RoPE:");
+            LOG_INFO("  local_q size: " << local_q->size() << " shape: [" << seq_len << ", " << local_head_dim << "]");
+            LOG_INFO("  local_k size: " << local_k->size() << " shape: [" << seq_len << ", " << local_kv_head_dim << "]");
+            LOG_INFO("  local_head_dim: " << local_head_dim << " = " << local_heads << " heads * " << head_dim_ << " dims");
+            LOG_INFO("  local_kv_head_dim: " << local_kv_head_dim << " = " << local_kv_heads << " heads * " << head_dim_ << " dims");
+
+            LOG_INFO("[PRE_ROPE_Q] Token 0, head 0, first 10 dims: ["
                      << local_q->data()[0] << ", " << local_q->data()[1] << ", "
                      << local_q->data()[2] << ", " << local_q->data()[3] << ", "
                      << local_q->data()[4] << ", " << local_q->data()[5] << ", "
                      << local_q->data()[6] << ", " << local_q->data()[7] << ", "
                      << local_q->data()[8] << ", " << local_q->data()[9] << "]");
-            int token1_offset = local_head_dim;
-            LOG_INFO("  local_q[token=1, head=0, dim=0:10]: ["
-                     << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
-                     << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
-                     << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
-                     << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
-                     << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
-            // Also check middle and end of tensor to see if ranks differ
-            int mid = local_q->size() / 2;
-            int end = local_q->size() - 10;
-            LOG_INFO("  local_q[mid=" << mid << ":mid+5]: ["
-                                      << local_q->data()[mid] << ", " << local_q->data()[mid + 1] << ", "
-                                      << local_q->data()[mid + 2] << ", " << local_q->data()[mid + 3] << ", "
-                                      << local_q->data()[mid + 4] << "]");
-            LOG_INFO("  local_q[end-5:end]: ["
-                     << local_q->data()[end] << ", " << local_q->data()[end + 1] << ", "
-                     << local_q->data()[end + 2] << ", " << local_q->data()[end + 3] << ", "
-                     << local_q->data()[end + 4] << "]");
-            LOG_INFO("  local_k size=" << local_k->size() << " shape=[" << seq_len << "," << local_kv_head_dim << "]");
-            LOG_INFO("  local_k[token=0, head=0, dim=0:10]: ["
+
+            // Check position 0 values - these should be close to Q_PROJECTION outputs
+            LOG_INFO("[PRE_ROPE_Q] Token 0, head 0, dims [2,3,4] (key for comparison): "
+                     << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4]);
+
+            LOG_INFO("[PRE_ROPE_K] Token 0, head 0, first 10 dims: ["
                      << local_k->data()[0] << ", " << local_k->data()[1] << ", "
                      << local_k->data()[2] << ", " << local_k->data()[3] << ", "
                      << local_k->data()[4] << ", " << local_k->data()[5] << ", "
@@ -965,6 +1141,41 @@ namespace llaminar
         llaminar::attn::apply_rope(local_q->data(), local_k->data(),
                                    seq_len, head_dim_, local_heads, local_kv_heads,
                                    0, rope_freq_base_);
+
+        // =======================================================================
+        // POST-ROPE VALUE LOGGING
+        // =======================================================================
+        if (rank == 0 && layer_index_ == 0)
+        {
+            LOG_INFO("========== ROPE_APPLICATION DEBUG STEP 2: POST-ROPE VALUES ==========");
+            LOG_INFO("[POST_ROPE_Q] Token 0, head 0, first 10 dims: ["
+                     << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+                     << local_q->data()[2] << ", " << local_q->data()[3] << ", "
+                     << local_q->data()[4] << ", " << local_q->data()[5] << ", "
+                     << local_q->data()[6] << ", " << local_q->data()[7] << ", "
+                     << local_q->data()[8] << ", " << local_q->data()[9] << "]");
+
+            // At position 0, RoPE should be identity (angle=0, cos=1, sin=0)
+            // So post-RoPE values should match pre-RoPE values
+            LOG_INFO("[POST_ROPE_Q] Token 0 CHECK: dims [2,3,4] should match pre-RoPE: "
+                     << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4]);
+
+            LOG_INFO("[POST_ROPE_K] Token 0, head 0, first 10 dims: ["
+                     << local_k->data()[0] << ", " << local_k->data()[1] << ", "
+                     << local_k->data()[2] << ", " << local_k->data()[3] << ", "
+                     << local_k->data()[4] << ", " << local_k->data()[5] << ", "
+                     << local_k->data()[6] << ", " << local_k->data()[7] << ", "
+                     << local_k->data()[8] << ", " << local_k->data()[9] << "]");
+
+            // Check token 1 to verify rotation happened
+            int token1_offset = local_head_dim;
+            LOG_INFO("[POST_ROPE_Q] Token 1, head 0, first 10 dims (should differ from Token 0): ["
+                     << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
+                     << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
+                     << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
+                     << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
+                     << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
+        }
 
         if (layer_index_ == 0)
         {
@@ -1011,8 +1222,11 @@ namespace llaminar
         }
 
         // STEP 5.5: Capture ROPE_APPLICATION snapshot (post-RoPE Q and K)
-        // Gather Q and K after RoPE application for comparison with PyTorch
-        if (snapshot_callback_)
+        // Gather Q, K, and V after RoPE application for comparison with PyTorch
+        // IMPORTANT: We also need to gather K/V for GQA expansion later
+        std::shared_ptr<TensorBase> global_q_rope, global_k_rope, global_v_rope;
+
+        if (snapshot_callback_ || n_head_ != n_head_kv_)
         {
             // Calculate dimensions
             const int k_v_dim = n_head_kv_ * head_dim_;
@@ -1031,13 +1245,12 @@ namespace llaminar
                 LOG_INFO("  local_k shape: [" << seq_len << ", " << local_kv_head_dim << "]");
             }
 
-            // Gather Q and K (post-RoPE) from all ranks
-            std::shared_ptr<TensorBase> global_q_rope, global_k_rope;
-
+            // Gather Q, K, and V (post-RoPE) from all ranks
             if (world_size > 1)
             {
                 global_q_rope = TensorFactory::create_simple({seq_len, d_model_});
                 global_k_rope = TensorFactory::create_simple({seq_len, k_v_dim});
+                global_v_rope = TensorFactory::create_simple({seq_len, k_v_dim});
 
                 // DEBUG: Check local Q values before gather
                 if (rank == 0 && layer_index_ == 0)
@@ -1050,13 +1263,23 @@ namespace llaminar
                     std::cout << std::endl;
                 }
 
+                // DEBUG: Log local_k before gathering (layer 0 only)
+                if (layer_index_ == 0)
+                {
+                    LOG_INFO("[RANK=" << rank << "] Before gather, local_k[t=0, h=0] first 5: "
+                                      << local_k->data()[0] << ", " << local_k->data()[1] << ", "
+                                      << local_k->data()[2] << ", " << local_k->data()[3] << ", " << local_k->data()[4]);
+                }
+
                 // Gather row-by-row to maintain proper layout
                 for (int t = 0; t < seq_len; ++t)
                 {
                     const float *local_q_row = local_q->data() + t * local_head_dim;
                     const float *local_k_row = local_k->data() + t * local_kv_head_dim;
+                    const float *local_v_row = local_v->data() + t * local_kv_head_dim;
                     float *global_q_row = global_q_rope->data() + t * d_model_;
                     float *global_k_row = global_k_rope->data() + t * k_v_dim;
+                    float *global_v_row = global_v_rope->data() + t * k_v_dim;
 
                     MPI_Allgather(local_q_row, local_head_dim, MPI_FLOAT,
                                   global_q_row, local_head_dim, MPI_FLOAT,
@@ -1065,6 +1288,31 @@ namespace llaminar
                     MPI_Allgather(local_k_row, local_kv_head_dim, MPI_FLOAT,
                                   global_k_row, local_kv_head_dim, MPI_FLOAT,
                                   MPI_COMM_WORLD);
+
+                    MPI_Allgather(local_v_row, local_kv_head_dim, MPI_FLOAT,
+                                  global_v_row, local_kv_head_dim, MPI_FLOAT,
+                                  MPI_COMM_WORLD);
+                }
+
+                // DEBUG: Log global_k after gathering (layer 0, rank 0 only)
+                if (rank == 0 && layer_index_ == 0)
+                {
+                    LOG_INFO("[RANK=0] After gather, global_k_rope[t=0]:");
+                    LOG_INFO("  offset[0..4] (from rank 0): " << global_k_rope->data()[0] << ", "
+                                                              << global_k_rope->data()[1] << ", " << global_k_rope->data()[2] << ", "
+                                                              << global_k_rope->data()[3] << ", " << global_k_rope->data()[4]);
+                    LOG_INFO("  offset[64..68] (from rank 1): " << global_k_rope->data()[64] << ", "
+                                                                << global_k_rope->data()[65] << ", " << global_k_rope->data()[66] << ", "
+                                                                << global_k_rope->data()[67] << ", " << global_k_rope->data()[68]);
+
+                    // Check the failing position: token=3, kv_head=1, dim_in_head=32
+                    // global_k_rope layout: [token][kv_head_0_64_dims, kv_head_1_64_dims]
+                    // offset = token * k_v_dim + kv_head * head_dim + dim_in_head
+                    //        = 3 * 128 + 1 * 64 + 32
+                    //        = 384 + 64 + 32 = 480
+                    const int failing_offset_in_k = 3 * k_v_dim + 1 * head_dim_ + 32;
+                    LOG_INFO("  CRITICAL CHECK: global_k_rope[token=3, kv_head=1, dim=32] (offset=" << failing_offset_in_k << "): "
+                                                                                                    << global_k_rope->data()[failing_offset_in_k]);
                 }
 
                 // DEBUG: Check gathered values
@@ -1090,71 +1338,90 @@ namespace llaminar
                 // Single rank: use local tensors directly
                 global_q_rope = local_q;
                 global_k_rope = local_k;
+                global_v_rope = local_v;
             }
 
-            // Concatenate Q and K along feature dimension: [Q | K]
+            // Concatenate Q and K along feature dimension for snapshot: [Q | K]
             // This matches PyTorch's ROPE_APPLICATION which includes both
-            std::vector<int> rope_shape = {seq_len, d_model_ + k_v_dim};
-            auto rope_combined = TensorFactory::create_simple(rope_shape);
-            float *dst = rope_combined->data();
-
-            for (int t = 0; t < seq_len; ++t)
+            if (snapshot_callback_)
             {
-                const float *q_row = global_q_rope->data() + t * d_model_;
-                const float *k_row = global_k_rope->data() + t * k_v_dim;
+                std::vector<int> rope_shape = {seq_len, d_model_ + k_v_dim};
+                auto rope_combined = TensorFactory::create_simple(rope_shape);
+                float *dst = rope_combined->data();
 
-                // Copy Q first
-                std::memcpy(dst, q_row, d_model_ * sizeof(float));
-                dst += d_model_;
-
-                // Then K
-                std::memcpy(dst, k_row, k_v_dim * sizeof(float));
-                dst += k_v_dim;
-            }
-
-            // DEBUG: Show final concatenated values
-            if (rank == 0 && layer_index_ == 0)
-            {
-                LOG_INFO("[ROPE_SNAPSHOT_DEBUG] Final rope_combined[t=0]:");
-                LOG_INFO("  First 10 (Q): ");
-                for (int i = 0; i < 10; ++i)
+                for (int t = 0; t < seq_len; ++t)
                 {
-                    std::cout << rope_combined->data()[i] << " ";
-                }
-                std::cout << std::endl;
-                LOG_INFO("  Elements [" << d_model_ << ".." << (d_model_ + 10) << "] (K start): ");
-                for (int i = d_model_; i < d_model_ + 10; ++i)
-                {
-                    std::cout << rope_combined->data()[i] << " ";
-                }
-                std::cout << std::endl;
-                LOG_INFO("  Total rope_combined size: " << rope_combined->size()
-                                                        << " expected: " << (seq_len * (d_model_ + k_v_dim)));
-            }
+                    const float *q_row = global_q_rope->data() + t * d_model_;
+                    const float *k_row = global_k_rope->data() + t * k_v_dim;
 
-            // Only rank 0 needs to snapshot
-            if (rank == 0)
-            {
-                snapshot_callback_(PipelineStage::ROPE_APPLICATION, layer_index_,
-                                   rope_combined->data(), seq_len, d_model_ + k_v_dim);
+                    // Copy Q first
+                    std::memcpy(dst, q_row, d_model_ * sizeof(float));
+                    dst += d_model_;
+
+                    // Then K
+                    std::memcpy(dst, k_row, k_v_dim * sizeof(float));
+                    dst += k_v_dim;
+                }
+
+                // DEBUG: Show final concatenated values
+                if (rank == 0 && layer_index_ == 0)
+                {
+                    LOG_INFO("[ROPE_SNAPSHOT_DEBUG] Final rope_combined[t=0]:");
+                    LOG_INFO("  First 10 (Q): ");
+                    for (int i = 0; i < 10; ++i)
+                    {
+                        std::cout << rope_combined->data()[i] << " ";
+                    }
+                    std::cout << std::endl;
+                    LOG_INFO("  Elements [" << d_model_ << ".." << (d_model_ + 10) << "] (K start): ");
+                    for (int i = d_model_; i < d_model_ + 10; ++i)
+                    {
+                        std::cout << rope_combined->data()[i] << " ";
+                    }
+                    std::cout << std::endl;
+                    LOG_INFO("  Total rope_combined size: " << rope_combined->size()
+                                                            << " expected: " << (seq_len * (d_model_ + k_v_dim)));
+
+                    // CRITICAL DEBUG: Check position [3,992] which is the failing position
+                    // Token 3, position 992, which is dim 96 of K (992 - 896 = 96)
+                    const int failing_token = 3;
+                    const int failing_pos = 992;
+                    const int row_size = d_model_ + k_v_dim;
+                    const int failing_offset = failing_token * row_size + failing_pos;
+                    LOG_INFO("  CRITICAL: rope_combined[token=" << failing_token << ", pos=" << failing_pos << "] (offset=" << failing_offset << "): "
+                                                                << rope_combined->data()[failing_offset]);
+                    LOG_INFO("  This should be K[token=3, dim=96] = K[token=3, kv_head=1, dim_in_head=32]");
+                }
+
+                // Only rank 0 needs to snapshot
+                if (rank == 0)
+                {
+                    snapshot_callback_(PipelineStage::ROPE_APPLICATION, layer_index_,
+                                       rope_combined->data(), seq_len, d_model_ + k_v_dim);
+                }
             }
         }
 
         // ========================================================================
         // STEP 6: Handle GQA - replicate K/V heads if needed
         // ========================================================================
+        // IMPORTANT: For GQA, we need ALL KV heads from ALL ranks to replicate them
+        // to the query heads. The global_k_rope and global_v_rope gathered above
+        // contain all KV heads concatenated across ranks.
+
         std::shared_ptr<TensorBase> local_k_expanded, local_v_expanded;
 
         if (n_head_ != n_head_kv_)
         {
             // GQA: replicate K/V heads to match Q head count
+            // Use global K/V (gathered from all ranks) not local K/V
             local_k_expanded = TensorFactory::create_simple({seq_len, local_head_dim});
             local_v_expanded = TensorFactory::create_simple({seq_len, local_head_dim});
 
             llaminar::attn::expand_kv_for_gqa(
-                local_k->data(), local_v->data(),
+                global_k_rope->data(), global_v_rope->data(),
                 local_k_expanded->data(), local_v_expanded->data(),
-                seq_len, head_dim_, local_heads, local_kv_heads);
+                seq_len, head_dim_, local_heads, n_head_kv_);
 
             // DEBUG: Log after GQA expansion (layer 0 only)
             if (layer_index_ == 0)
@@ -1193,10 +1460,48 @@ namespace llaminar
                                            << " shape=[" << (local_heads * seq_len) << "," << head_dim_ << "]");
                 LOG_INFO("  local_k_expanded size=" << (local_heads * seq_len * head_dim_)
                                                     << " shape=[" << (local_heads * seq_len) << "," << head_dim_ << "]");
-                LOG_INFO("  Q[0,0:5]: " << local_q->data()[0] << " " << local_q->data()[1] << " "
-                                        << local_q->data()[2] << " " << local_q->data()[3] << " " << local_q->data()[4]);
+
+                // CRITICAL: Verify memory layout expectations
+                LOG_INFO("[MEMORY_LAYOUT_DEBUG] Q tensor layout check:");
+                LOG_INFO("  Expected by compute_qk_scores: Q[token, head, dim] flattened");
+                LOG_INFO("  Index formula: q[i, h, d] = q[(i * heads * head_dim) + (h * head_dim) + d]");
+                LOG_INFO("  For token i=0, head h=0: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = d");
+                LOG_INFO("  For token i=0, head h=1: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (1 * " << head_dim_ << ") + d = " << head_dim_ << " + d");
+                LOG_INFO("  For token i=1, head h=0: offset = (1 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = " << (local_heads * head_dim_) << " + d");
+
+                LOG_INFO("  Actual Q memory layout after projection:");
+                LOG_INFO("    Q[t=0, h=0, d=0:5]: "
+                         << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+                         << local_q->data()[2] << ", " << local_q->data()[3] << ", "
+                         << local_q->data()[4]);
+
+                int offset_t0_h1 = head_dim_;
+                LOG_INFO("    Q[t=0, h=1, d=0:5]: "
+                         << local_q->data()[offset_t0_h1 + 0] << ", " << local_q->data()[offset_t0_h1 + 1] << ", "
+                         << local_q->data()[offset_t0_h1 + 2] << ", " << local_q->data()[offset_t0_h1 + 3] << ", "
+                         << local_q->data()[offset_t0_h1 + 4]);
+
+                int offset_t1_h0 = local_heads * head_dim_;
+                LOG_INFO("    Q[t=1, h=0, d=0:5]: "
+                         << local_q->data()[offset_t1_h0 + 0] << ", " << local_q->data()[offset_t1_h0 + 1] << ", "
+                         << local_q->data()[offset_t1_h0 + 2] << ", " << local_q->data()[offset_t1_h0 + 3] << ", "
+                         << local_q->data()[offset_t1_h0 + 4]);
+
+                LOG_INFO("[MEMORY_LAYOUT_DEBUG] K_expanded tensor layout check:");
                 LOG_INFO("  K[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
                                         << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
+                LOG_INFO("    K[t=0, h=0, d=0:5]: "
+                         << local_k_expanded->data()[0] << ", " << local_k_expanded->data()[1] << ", "
+                         << local_k_expanded->data()[2] << ", " << local_k_expanded->data()[3] << ", "
+                         << local_k_expanded->data()[4]);
+                LOG_INFO("    K[t=0, h=1, d=0:5]: "
+                         << local_k_expanded->data()[offset_t0_h1 + 0] << ", " << local_k_expanded->data()[offset_t0_h1 + 1] << ", "
+                         << local_k_expanded->data()[offset_t0_h1 + 2] << ", " << local_k_expanded->data()[offset_t0_h1 + 3] << ", "
+                         << local_k_expanded->data()[offset_t0_h1 + 4]);
+                LOG_INFO("    K[t=1, h=0, d=0:5]: "
+                         << local_k_expanded->data()[offset_t1_h0 + 0] << ", " << local_k_expanded->data()[offset_t1_h0 + 1] << ", "
+                         << local_k_expanded->data()[offset_t1_h0 + 2] << ", " << local_k_expanded->data()[offset_t1_h0 + 3] << ", "
+                         << local_k_expanded->data()[offset_t1_h0 + 4]);
 
                 // Compute what the first score should be
                 double test_dot = 0.0;

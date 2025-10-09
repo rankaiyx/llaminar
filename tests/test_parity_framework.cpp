@@ -308,7 +308,8 @@ namespace
         int &passed,
         int &failed,
         int &missing,
-        std::string &first_divergence)
+        std::string &first_divergence,
+        const TransformerLayerConfig &layer_config)
     {
         if (rank != 0)
         {
@@ -518,6 +519,296 @@ namespace
             }
 
             auto result = SnapshotComparator::compare(pytorch_snap, llaminar_snapshot, tolerance);
+
+            // DETAILED ERROR DISTRIBUTION ANALYSIS for Q_PROJECTION
+            if (stage_name == "Q_PROJECTION" && layer_idx == 0 && rank == 0)
+            {
+                std::cout << "\n[Q_PROJ_ERROR_ANALYSIS] Detailed error distribution for " << stage_name << "_layer" << layer_idx << std::endl;
+
+                // Calculate per-element differences
+                std::vector<float> abs_diffs;
+                for (size_t i = 0; i < std::min(pytorch_snap.data.size(), llaminar_snapshot.data.size()); ++i)
+                {
+                    abs_diffs.push_back(std::abs(pytorch_snap.data[i] - llaminar_snapshot.data[i]));
+                }
+
+                // Overall statistics
+                float mean_abs = std::accumulate(abs_diffs.begin(), abs_diffs.end(), 0.0f) / abs_diffs.size();
+                float var = 0.0f;
+                for (float d : abs_diffs)
+                {
+                    var += (d - mean_abs) * (d - mean_abs);
+                }
+                float std_abs = std::sqrt(var / abs_diffs.size());
+
+                std::sort(abs_diffs.begin(), abs_diffs.end());
+                float median_abs = abs_diffs[abs_diffs.size() / 2];
+
+                std::cout << "  Overall: max=" << abs_diffs.back() << " mean=" << mean_abs
+                          << " std=" << std_abs << " median=" << median_abs << std::endl;
+
+                // Percentiles
+                std::cout << "  Percentiles: ";
+                for (int p : {50, 75, 90, 95, 99})
+                {
+                    size_t idx = (abs_diffs.size() * p) / 100;
+                    std::cout << "P" << p << "=" << abs_diffs[idx] << " ";
+                }
+                std::cout << std::endl;
+
+                // Per-head analysis (896 = 14 heads * 64 dims)
+                const int n_heads = 14;
+                const int head_dim = 64;
+                const int seq_len = pytorch_meta.seq_len;
+
+                std::cout << "  Per-head max errors (seq_len=" << seq_len << ", n_heads=" << n_heads << ", head_dim=" << head_dim << "):" << std::endl;
+                std::vector<std::pair<int, float>> head_errors;
+
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float head_max = 0.0f;
+                    for (int s = 0; s < seq_len; ++s)
+                    {
+                        for (int d = 0; d < head_dim; ++d)
+                        {
+                            size_t idx = s * (n_heads * head_dim) + h * head_dim + d;
+                            if (idx < abs_diffs.size())
+                            {
+                                head_max = std::max(head_max, std::abs(pytorch_snap.data[idx] - llaminar_snapshot.data[idx]));
+                            }
+                        }
+                    }
+                    head_errors.push_back({h, head_max});
+                }
+
+                std::sort(head_errors.begin(), head_errors.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.second > b.second; });
+
+                for (size_t i = 0; i < std::min(size_t(5), head_errors.size()); ++i)
+                {
+                    std::cout << "    Head " << head_errors[i].first << ": max_abs=" << head_errors[i].second << std::endl;
+                }
+
+                // Error histogram
+                std::cout << "  Error histogram:" << std::endl;
+                std::vector<float> bins = {0.0f, 0.001f, 0.01f, 0.05f, 0.1f, 0.15f, 0.2f, 0.5f};
+                for (size_t i = 0; i < bins.size() - 1; ++i)
+                {
+                    size_t count = 0;
+                    for (float d : abs_diffs)
+                    {
+                        if (d >= bins[i] && d < bins[i + 1])
+                            count++;
+                    }
+                    float pct = 100.0f * count / abs_diffs.size();
+                    std::cout << "    [" << bins[i] << ", " << bins[i + 1] << "): "
+                              << count << " (" << pct << "%)" << std::endl;
+                }
+                size_t count_above = 0;
+                for (float d : abs_diffs)
+                {
+                    if (d >= bins.back())
+                        count_above++;
+                }
+                std::cout << "    [" << bins.back() << ", inf): " << count_above
+                          << " (" << 100.0f * count_above / abs_diffs.size() << "%)" << std::endl;
+                std::cout << std::endl;
+            }
+
+            // DETAILED ERROR DISTRIBUTION ANALYSIS for K_PROJECTION
+            if (stage_name == "K_PROJECTION" && layer_idx == 0 && rank == 0)
+            {
+                std::cout << "\n[K_PROJ_ERROR_ANALYSIS] Detailed error distribution for " << stage_name << "_layer" << layer_idx << std::endl;
+
+                // Calculate per-element differences
+                std::vector<float> abs_diffs;
+                for (size_t i = 0; i < std::min(pytorch_snap.data.size(), llaminar_snapshot.data.size()); ++i)
+                {
+                    abs_diffs.push_back(std::abs(pytorch_snap.data[i] - llaminar_snapshot.data[i]));
+                }
+
+                // Overall statistics
+                float mean_abs = std::accumulate(abs_diffs.begin(), abs_diffs.end(), 0.0f) / abs_diffs.size();
+                float var = 0.0f;
+                for (float d : abs_diffs)
+                {
+                    var += (d - mean_abs) * (d - mean_abs);
+                }
+                float std_abs = std::sqrt(var / abs_diffs.size());
+
+                std::sort(abs_diffs.begin(), abs_diffs.end());
+                float median_abs = abs_diffs[abs_diffs.size() / 2];
+
+                std::cout << "  Overall: max=" << abs_diffs.back() << " mean=" << mean_abs
+                          << " std=" << std_abs << " median=" << median_abs << std::endl;
+
+                // Percentiles
+                std::cout << "  Percentiles: ";
+                for (int p : {50, 75, 90, 95, 99})
+                {
+                    size_t idx = (abs_diffs.size() * p) / 100;
+                    std::cout << "P" << p << "=" << abs_diffs[idx] << " ";
+                }
+                std::cout << std::endl;
+
+                const int n_kv_heads = layer_config.n_head_kv;
+                const int head_dim = layer_config.head_dim;
+                const int seq_len = pytorch_meta.seq_len;
+                const int expected_feature_dim = n_kv_heads * head_dim;
+
+                if (expected_feature_dim != pytorch_meta.feature_dim)
+                {
+                    std::cout << "  [WARN] Expected feature_dim=" << expected_feature_dim
+                              << " (" << n_kv_heads << " kv heads * " << head_dim
+                              << "), but snapshot feature_dim=" << pytorch_meta.feature_dim << std::endl;
+                    std::cout << std::endl;
+                }
+                else
+                {
+                    std::cout << "  Per-KV-head max errors (seq_len=" << seq_len << ", n_kv_heads=" << n_kv_heads << ", head_dim=" << head_dim << "):" << std::endl;
+                    std::vector<std::pair<int, float>> head_errors;
+
+                    for (int h = 0; h < n_kv_heads; ++h)
+                    {
+                        float head_max = 0.0f;
+                        for (int s = 0; s < seq_len; ++s)
+                        {
+                            for (int d = 0; d < head_dim; ++d)
+                            {
+                                size_t idx = static_cast<size_t>(s) * expected_feature_dim + static_cast<size_t>(h) * head_dim + d;
+                                if (idx < abs_diffs.size())
+                                {
+                                    head_max = std::max(head_max, std::abs(pytorch_snap.data[idx] - llaminar_snapshot.data[idx]));
+                                }
+                            }
+                        }
+                        head_errors.push_back({h, head_max});
+                    }
+
+                    std::sort(head_errors.begin(), head_errors.end(),
+                              [](const auto &a, const auto &b)
+                              { return a.second > b.second; });
+
+                    for (size_t i = 0; i < std::min(static_cast<size_t>(n_kv_heads), head_errors.size()); ++i)
+                    {
+                        std::cout << "    KV-Head " << head_errors[i].first << ": max_abs=" << head_errors[i].second << std::endl;
+                    }
+
+                    // Error histogram
+                    std::cout << "  Error histogram:" << std::endl;
+                    std::vector<float> bins = {0.0f, 0.001f, 0.01f, 0.05f, 0.1f, 0.15f, 0.2f, 0.5f};
+                    for (size_t i = 0; i < bins.size() - 1; ++i)
+                    {
+                        size_t count = 0;
+                        for (float d : abs_diffs)
+                        {
+                            if (d >= bins[i] && d < bins[i + 1])
+                                count++;
+                        }
+                        float pct = 100.0f * count / abs_diffs.size();
+                        std::cout << "    [" << bins[i] << ", " << bins[i + 1] << "): "
+                                  << count << " (" << pct << "%)" << std::endl;
+                    }
+                    size_t count_above = 0;
+                    for (float d : abs_diffs)
+                    {
+                        if (d >= bins.back())
+                            count_above++;
+                    }
+                    std::cout << "    [" << bins.back() << ", inf): " << count_above
+                              << " (" << 100.0f * count_above / abs_diffs.size() << "%)" << std::endl;
+
+                    const int world_size = [&]()
+                    {
+                        int w = 1;
+                        MPI_Comm_size(MPI_COMM_WORLD, &w);
+                        return w;
+                    }();
+
+                    std::cout << "  Per-rank K projection metrics (pre-RoPE vs PyTorch):" << std::endl;
+                    const size_t shard_stride = static_cast<size_t>(n_kv_heads) * head_dim;
+
+                    auto head_distribution = [&](int target_rank)
+                    {
+                        int base = n_kv_heads / world_size;
+                        int rem = n_kv_heads % world_size;
+                        int local = base + (target_rank < rem ? 1 : 0);
+                        int offset = target_rank * base + std::min(target_rank, rem);
+                        return std::make_pair(local, offset);
+                    };
+
+                    for (int r = 0; r < world_size; ++r)
+                    {
+                        auto [local_heads, head_offset] = head_distribution(r);
+                        if (local_heads == 0)
+                        {
+                            std::cout << "    rank " << r << ": owns 0 KV heads (skipped)" << std::endl;
+                            continue;
+                        }
+
+                        const int shard_cols = local_heads * head_dim;
+                        const size_t shard_offset = static_cast<size_t>(head_offset) * head_dim;
+
+                        double diff_sq_sum = 0.0;
+                        double ref_sq_sum = 0.0;
+                        double abs_sum = 0.0;
+                        float max_abs = 0.0f;
+
+                        for (int s = 0; s < seq_len; ++s)
+                        {
+                            const size_t row_base = static_cast<size_t>(s) * shard_stride + shard_offset;
+                            const float *ref_row = pytorch_snap.data.data() + row_base;
+                            const float *act_row = llaminar_snapshot.data.data() + row_base;
+
+                            for (int c = 0; c < shard_cols; ++c)
+                            {
+                                const float ref_val = ref_row[c];
+                                const float act_val = act_row[c];
+                                const float diff = act_val - ref_val;
+                                max_abs = std::max(max_abs, std::fabs(diff));
+                                abs_sum += std::fabs(diff);
+                                diff_sq_sum += static_cast<double>(diff) * diff;
+                                ref_sq_sum += static_cast<double>(ref_val) * ref_val;
+                            }
+                        }
+
+                        const size_t elem_count = static_cast<size_t>(seq_len) * shard_cols;
+                        const double mean_abs = elem_count ? abs_sum / static_cast<double>(elem_count) : 0.0;
+                        const double rel_l2 = ref_sq_sum > 0.0 ? std::sqrt(diff_sq_sum / ref_sq_sum) : 0.0;
+
+                        std::cout << "    rank " << r
+                                  << ": head_offset=" << head_offset
+                                  << " local_kv_heads=" << local_heads
+                                  << " cols=" << shard_cols
+                                  << " max_abs=" << max_abs
+                                  << " mean_abs=" << mean_abs
+                                  << " rel_l2=" << rel_l2 << std::endl;
+
+                        const auto print_sample = [&](const char *label, const float *ptr)
+                        {
+                            std::cout << "       " << label << " [0:" << std::min(head_dim, 6) << "] = [";
+                            const int preview = std::min(head_dim, 6);
+                            for (int i = 0; i < preview; ++i)
+                            {
+                                if (i > 0)
+                                    std::cout << ", ";
+                                std::cout << ptr[i];
+                            }
+                            if (head_dim > preview)
+                                std::cout << ", ...";
+                            std::cout << "]" << std::endl;
+                        };
+
+                        const float *ref_sample = pytorch_snap.data.data() + shard_offset;
+                        const float *act_sample = llaminar_snapshot.data.data() + shard_offset;
+                        print_sample("PyTorch token0", ref_sample);
+                        print_sample("Llaminar token0", act_sample);
+                    }
+
+                    std::cout << std::endl;
+                }
+            }
 
             // Log result
             std::cout << "[" << test_name << "] " << stage_name;
@@ -813,7 +1104,8 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
         passed,
         failed,
         missing,
-        first_divergence);
+        first_divergence,
+        model_cfg.getLayerConfig());
 
     if (rank == 0)
     {
@@ -994,7 +1286,8 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
         passed,
         failed,
         missing,
-        first_divergence);
+        first_divergence,
+        model_cfg.getLayerConfig());
 
     if (rank == 0)
     {

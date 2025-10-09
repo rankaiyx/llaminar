@@ -951,6 +951,24 @@ if(GTEST_FOUND)
     add_test(NAME AttentionPrimitivesTest COMMAND $<TARGET_FILE:test_attention_primitives>)
     set_tests_properties(AttentionPrimitivesTest PROPERTIES TIMEOUT 5)
 
+    # K tensor gathering and RoPE GQA correctness tests
+    add_executable(test_k_gathering_and_rope_gqa tests/test_k_gathering_and_rope_gqa.cpp)
+    target_link_libraries(test_k_gathering_and_rope_gqa llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_k_gathering_and_rope_gqa GTest::gtest GTest::gtest_main pthread)
+    else()
+        target_include_directories(test_k_gathering_and_rope_gqa PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_k_gathering_and_rope_gqa ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
+    endif()
+    # Single-rank tests (RoPE GQA logic)
+    add_test(NAME KGatheringAndRopeGQA_SingleRank
+             COMMAND $<TARGET_FILE:test_k_gathering_and_rope_gqa> --gtest_filter=*RopeUsesCorrectKVHeadIndices*:*RopeKIndependentOfQHeadCount*)
+    set_tests_properties(KGatheringAndRopeGQA_SingleRank PROPERTIES TIMEOUT 10 LABELS "attention;rope;gqa")
+    # Multi-rank tests (K gathering order)
+    add_test(NAME KGatheringAndRopeGQA_MultiRank
+             COMMAND ${MPIEXEC_EXECUTABLE} -np 2 $<TARGET_FILE:test_k_gathering_and_rope_gqa> --gtest_filter=*AllgatherProducesSequentialHeadOrder*:*MultiRankKGatheringAfterRope*)
+    set_tests_properties(KGatheringAndRopeGQA_MultiRank PROPERTIES TIMEOUT 15 LABELS "attention;rope;gqa;mpi" RUN_SERIAL TRUE)
+
     # Golden oracle tests for attention primitives (PyTorch reference)
     add_executable(test_attention_golden tests/test_attention_golden.cpp)
     target_link_libraries(test_attention_golden llaminar_core)

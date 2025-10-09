@@ -59,78 +59,61 @@ namespace llaminar::attn
         if (q_heads != k_heads)
         {
             LOG_WARN("[RoPE_GQA_PATH] Using GQA fallback for q_heads=" << q_heads << " k_heads=" << k_heads);
-            const int pairs = head_dim / 2;
-            std::vector<float> theta(pairs);
-            for (int p = 0; p < pairs; ++p)
-                theta[p] = 1.f / std::pow(freq_base, (2.f * p) / head_dim);
-
-            // Process Q
-            LOG_WARN("[RoPE_GQA_DEBUG] Processing Q: seq_len=" << seq_len << " q_heads=" << q_heads << " head_dim=" << head_dim);
-            for (int t = 0; t < seq_len; ++t)
+            const int half_dim = head_dim / 2;
+            if (half_dim == 0)
             {
-                float pos = float(n_past + t);
-                for (int h = 0; h < q_heads; ++h)
-                {
-                    float *qh = q + t * q_heads * head_dim + h * head_dim;
-                    if (t == 0 && h == 0)
-                    {
-                        LOG_WARN("[RoPE_GQA_DEBUG] Q before rotation [t=" << t << ",h=" << h << "]: "
-                                                                          << qh[0] << " " << qh[1] << " " << qh[2] << " " << qh[3] << " " << qh[4]);
-                    }
-                    for (int p = 0; p < pairs; ++p)
-                    {
-                        float angle = pos * theta[p];
-                        float cs = std::cos(angle);
-                        float sn = std::sin(angle);
-                        int i0 = 2 * p;
-                        int i1 = i0 + 1;
-                        if (i1 >= head_dim)
-                            break;
-                        float q0 = qh[i0], q1 = qh[i1];
-                        qh[i0] = q0 * cs - q1 * sn;
-                        qh[i1] = q0 * sn + q1 * cs;
-                    }
-                    if (t == 0 && h == 0)
-                    {
-                        LOG_WARN("[RoPE_GQA_DEBUG] Q after rotation [t=" << t << ",h=" << h << "]: "
-                                                                         << qh[0] << " " << qh[1] << " " << qh[2] << " " << qh[3] << " " << qh[4]);
-                    }
-                }
+                LOG_WARN("[RoPE_GQA_PATH] head_dim < 2, skipping rotation.");
+                return;
+            }
+            if (half_dim * 2 != head_dim)
+            {
+                LOG_ERROR("[RoPE_GQA_PATH] head_dim=" << head_dim << " is not even; contiguous-half RoPE rotation requires even head_dim");
             }
 
-            // Process K
-            LOG_WARN("[RoPE_GQA_DEBUG] Processing K: seq_len=" << seq_len << " k_heads=" << k_heads << " head_dim=" << head_dim);
-            for (int t = 0; t < seq_len; ++t)
+            std::vector<float> inv_freq(half_dim);
+            for (int i = 0; i < half_dim; ++i)
             {
-                float pos = float(n_past + t);
-                for (int h = 0; h < k_heads; ++h)
+                inv_freq[i] = 1.f / std::pow(freq_base, (2.f * i) / head_dim);
+            }
+
+            auto apply_half_layout_rope = [&](float *base, int heads, const char *label)
+            {
+                LOG_WARN("[RoPE_GQA_DEBUG] Processing " << label << ": seq_len=" << seq_len << " heads=" << heads << " head_dim=" << head_dim);
+                for (int t = 0; t < seq_len; ++t)
                 {
-                    float *kh = k + t * k_heads * head_dim + h * head_dim;
-                    if (t == 0 && h == 0)
+                    float pos = float(n_past + t);
+                    for (int h = 0; h < heads; ++h)
                     {
-                        LOG_WARN("[RoPE_GQA_DEBUG] K before rotation [t=" << t << ",h=" << h << "]: "
-                                                                          << kh[0] << " " << kh[1] << " " << kh[2] << " " << kh[3] << " " << kh[4]);
-                    }
-                    for (int p = 0; p < pairs; ++p)
-                    {
-                        float angle = pos * theta[p];
-                        float cs = std::cos(angle);
-                        float sn = std::sin(angle);
-                        int i0 = 2 * p;
-                        int i1 = i0 + 1;
-                        if (i1 >= head_dim)
-                            break;
-                        float k0 = kh[i0], k1 = kh[i1];
-                        kh[i0] = k0 * cs - k1 * sn;
-                        kh[i1] = k0 * sn + k1 * cs;
-                    }
-                    if (t == 0 && h == 0)
-                    {
-                        LOG_WARN("[RoPE_GQA_DEBUG] K after rotation [t=" << t << ",h=" << h << "]: "
-                                                                         << kh[0] << " " << kh[1] << " " << kh[2] << " " << kh[3] << " " << kh[4]);
+                        float *row = base + ((size_t)t * heads + h) * head_dim;
+                        if (t == 0 && h == 0)
+                        {
+                            LOG_WARN("[RoPE_GQA_DEBUG] " << label << " before rotation [t=" << t << ",h=" << h << ": "
+                                                         << row[0] << " " << row[1] << " " << row[2] << " " << row[3] << " " << row[4]);
+                        }
+                        for (int i = 0; i < half_dim; ++i)
+                        {
+                            float angle = pos * inv_freq[i];
+                            float cs = std::cos(angle);
+                            float sn = std::sin(angle);
+                            int upper = i + half_dim;
+                            if (upper >= head_dim)
+                                break;
+                            float lo = row[i];
+                            float hi = row[upper];
+                            row[i] = lo * cs - hi * sn;
+                            row[upper] = lo * sn + hi * cs;
+                        }
+                        if (t == 0 && h == 0)
+                        {
+                            LOG_WARN("[RoPE_GQA_DEBUG] " << label << " after rotation [t=" << t << ",h=" << h << ": "
+                                                         << row[0] << " " << row[1] << " " << row[2] << " " << row[3] << " " << row[4]);
+                        }
                     }
                 }
-            }
+            };
+
+            apply_half_layout_rope(q, q_heads, "Q");
+            apply_half_layout_rope(k, k_heads, "K");
             LOG_WARN("[RoPE_GQA_PATH] GQA fallback complete, early return");
             return; // Early return for GQA path
         }
@@ -1281,6 +1264,35 @@ namespace llaminar::attn
         const int kv_head_dim = n_kv_heads * head_dim;
         const int total_head_dim = n_heads * head_dim;
 
+        // DEBUG: Log GQA expansion parameters (only for first call to avoid spam)
+        static bool first_call = true;
+        if (first_call)
+        {
+            LOG_INFO("[GQA_EXPANSION_DEBUG] Parameters:");
+            LOG_INFO("  seq_len: " << seq_len << ", head_dim: " << head_dim);
+            LOG_INFO("  n_heads: " << n_heads << ", n_kv_heads: " << n_kv_heads);
+            LOG_INFO("  kv_head_dim: " << kv_head_dim << " (n_kv_heads * head_dim)");
+            LOG_INFO("  total_head_dim: " << total_head_dim << " (n_heads * head_dim)");
+            LOG_INFO("  Mapping: Q_heads[0-" << (n_heads - 1) << "] -> KV_heads[0-" << (n_kv_heads - 1) << "]");
+            for (int h = 0; h < n_heads; ++h)
+            {
+                LOG_INFO("    Q_head[" << h << "] -> KV_head[" << (h % n_kv_heads) << "]");
+            }
+
+            // Show input K values (token 0, first few values of each KV head)
+            LOG_INFO("  Input K (compact) token 0:");
+            for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+            {
+                LOG_INFO("    KV_head[" << kv_h << "] first 5 vals: "
+                                        << k_compact[kv_h * head_dim + 0] << ", "
+                                        << k_compact[kv_h * head_dim + 1] << ", "
+                                        << k_compact[kv_h * head_dim + 2] << ", "
+                                        << k_compact[kv_h * head_dim + 3] << ", "
+                                        << k_compact[kv_h * head_dim + 4]);
+            }
+            first_call = false;
+        }
+
         // Parallelize over sequence tokens (outer loop)
         // This gives good work distribution for long sequences
 #pragma omp parallel for schedule(static)
@@ -1304,6 +1316,23 @@ namespace llaminar::attn
                 std::memcpy(k_dst, k_src, head_dim * sizeof(float));
                 std::memcpy(v_dst, v_src, head_dim * sizeof(float));
             }
+        }
+
+        // DEBUG: Show output K_expanded values (token 0, first few Q heads)
+        static bool logged_output = false;
+        if (!logged_output)
+        {
+            LOG_INFO("[GQA_EXPANSION_DEBUG] Output K_expanded token 0:");
+            for (int h = 0; h < std::min(4, n_heads); ++h)
+            {
+                LOG_INFO("  Q_head[" << h << "] (from KV_head[" << (h % n_kv_heads) << "]) first 5: "
+                                     << k_expanded[h * head_dim + 0] << ", "
+                                     << k_expanded[h * head_dim + 1] << ", "
+                                     << k_expanded[h * head_dim + 2] << ", "
+                                     << k_expanded[h * head_dim + 3] << ", "
+                                     << k_expanded[h * head_dim + 4]);
+            }
+            logged_output = true;
         }
     }
 
