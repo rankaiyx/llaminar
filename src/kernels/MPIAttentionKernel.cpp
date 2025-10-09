@@ -143,6 +143,21 @@ namespace llaminar
         {
             throw std::invalid_argument("MPIAttentionKernel: n_head_kv cannot exceed n_head");
         }
+
+        // Check for excess MPI ranks (more ranks than heads to distribute)
+        const int world_size = getSize();
+        if (world_size > n_head_)
+        {
+            LOG_WARN("MPIAttentionKernel: More ranks (" << world_size
+                                                        << ") than Q heads (" << n_head_ << "). "
+                                                        << (world_size - n_head_) << " rank(s) will have no work (local_heads=0).");
+        }
+        if (world_size > n_head_kv_)
+        {
+            LOG_WARN("MPIAttentionKernel: More ranks (" << world_size
+                                                        << ") than KV heads (" << n_head_kv_ << "). "
+                                                        << (world_size - n_head_kv_) << " rank(s) will have no KV work (local_kv_heads=0).");
+        }
     }
 
     // ============================================================================
@@ -282,6 +297,35 @@ namespace llaminar
         auto [local_kv_heads, kv_head_offset] = getKVHeadDistribution();
         const int local_head_dim = local_heads * head_dim_;
         const int local_kv_head_dim = local_kv_heads * head_dim_;
+
+        // ========================================================================
+        // EARLY EXIT: Rank has no work to do (more ranks than heads)
+        // ========================================================================
+        if (local_heads == 0)
+        {
+            if (rank == 0)
+            {
+                LOG_INFO("Rank " << rank << " has no Q heads to process (local_heads=0). "
+                                 << "Creating zero-filled output and participating in collectives only.");
+            }
+
+            // Create zero-filled output tensor for this rank
+            // Output shape should match expected partial output: [seq_len, 0] effectively
+            // But we still need to participate in MPI collectives, so create minimal tensor
+            auto zero_output = TensorFactory::create_simple({seq_len, 0});
+            outputs[0] = zero_output;
+
+            // Note: This rank will still participate in MPI_Allgather/Allreduce operations
+            // with sendcount=0, which is valid and necessary for collective completion
+            return true;
+        }
+
+        if (local_kv_heads == 0)
+        {
+            LOG_WARN("Rank " << rank << " has no KV heads (local_kv_heads=0). "
+                             << "This may indicate misconfiguration (more ranks than KV heads).");
+            // Continue execution - Q heads can still be processed using gathered KV
+        }
 
         // VALIDATION: Bias tensor sizes must match projection output dimensions
         // Bias is broadcast across batch/sequence dimension, so should have size = output_features
@@ -1418,10 +1462,15 @@ namespace llaminar
             local_k_expanded = TensorFactory::create_simple({seq_len, local_head_dim});
             local_v_expanded = TensorFactory::create_simple({seq_len, local_head_dim});
 
+            // CRITICAL FIX: Pass head_offset and total Q heads so GQA expansion uses correct mapping
+            // For Qwen: 14 Q heads, 2 KV heads → group_size=7
+            //   Q heads [0-6] (rank 0) → KV head 0
+            //   Q heads [7-13] (rank 1) → KV head 1
+            // Formula: kv_head = (local_h + head_offset) / (total_q_heads / n_kv_heads)
             llaminar::attn::expand_kv_for_gqa(
                 global_k_rope->data(), global_v_rope->data(),
                 local_k_expanded->data(), local_v_expanded->data(),
-                seq_len, head_dim_, local_heads, n_head_kv_);
+                seq_len, head_dim_, local_heads, n_head_kv_, head_offset, n_head_);
 
             // DEBUG: Log after GQA expansion (layer 0 only)
             if (layer_index_ == 0)

@@ -1505,6 +1505,10 @@ void ModelLoader::extractModelMetadata()
     model_.head_count = model_.getMetadata<uint32_t>("qwen2.attention.head_count", 0);
     model_.head_count_kv = model_.getMetadata<uint32_t>("qwen2.attention.head_count_kv", 0);
 
+    // CRITICAL: Load RoPE frequency base from model (defaults to 10000.0 for backward compatibility)
+    // Qwen2.5 uses 1000000.0, while older models typically use 10000.0
+    model_.rope_freq_base = model_.getMetadata<float>("qwen2.rope.freq_base", 10000.0f);
+
     if (model_.hasMetadata("tokenizer.ggml.tokens"))
     {
         model_.token_list = model_.metadata.at("tokenizer.ggml.tokens").asStringArray();
@@ -1581,7 +1585,8 @@ TransformerLayerConfig ModelLoader::createLayerConfig() const
     cfg.vocab_size = static_cast<int>(model_.token_list.size());
     cfg.max_seq_len = static_cast<int>(model_.context_length);
     cfg.n_layers = static_cast<int>(model_.block_count);
-    cfg.eps = 1e-5f; // default RMSNorm epsilon; TODO: pull from metadata if present
+    cfg.eps = 1e-5f;                            // default RMSNorm epsilon; TODO: pull from metadata if present
+    cfg.rope_freq_base = model_.rope_freq_base; // RoPE frequency base from GGUF metadata
     return cfg;
 }
 

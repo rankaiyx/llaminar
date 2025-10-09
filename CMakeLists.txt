@@ -124,6 +124,8 @@ set(GGML_CUDA OFF CACHE BOOL "Disable GGML CUDA backend" FORCE)
 set(GGML_METAL OFF CACHE BOOL "Disable GGML Metal backend" FORCE)
 set(GGML_SYCL OFF CACHE BOOL "Disable GGML SYCL backend" FORCE)
 set(GGML_RPC OFF CACHE BOOL "Disable GGML RPC backend" FORCE)
+# Use -march=native to avoid illegal instruction errors on varying CPU architectures
+set(GGML_NATIVE ON CACHE BOOL "Enable native CPU optimizations for GGML" FORCE)
 add_subdirectory(llama.cpp)
 
 

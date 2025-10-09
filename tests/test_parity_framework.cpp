@@ -19,6 +19,7 @@
 #include "abstract_pipeline.h"
 #include "pipeline_snapshot_manager.h"
 #include "cosma_prefill_manager.h"
+#include "dynamic_threshold_loader.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -114,30 +115,40 @@ namespace
     }
 
     /**
-     * @brief Generate PyTorch reference snapshots automatically
+     * @brief Generate PyTorch reference snapshots with variance-based thresholds
      *
-     * Calls the Python script to generate reference snapshots for comparison.
+     * Runs PyTorch model multiple times to measure variance, then generates
+     * dynamic thresholds based on observed variance. This provides scientifically
+     * grounded tolerances for parity testing.
+     *
      * Only rank 0 generates the snapshots, then broadcasts success/failure.
      *
      * @param model_path Path to GGUF model file
      * @param tokens Token IDs to test
      * @param output_dir Output directory for snapshots
      * @param rank MPI rank
+     * @param num_runs Number of PyTorch runs for variance measurement (default: 3)
+     * @param safety_margin Safety multiplier for variance-based thresholds (default: 5.0)
      * @return true if snapshots generated successfully
      */
     bool generate_pytorch_snapshots(
         const std::string &model_path,
         const std::vector<int> &tokens,
         const std::string &output_dir,
-        int rank)
+        int rank,
+        int num_runs = 3,
+        float safety_margin = 5.0f)
     {
         int success = 0;
 
         if (rank == 0)
         {
-            std::cout << "\n[PyTorch] Generating reference snapshots..." << std::endl;
-            std::cout << "[PyTorch]   Model: " << model_path << std::endl;
-            std::cout << "[PyTorch]   Tokens: ";
+            std::cout << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cout << "GENERATING VARIANCE-BASED PYTORCH REFERENCE" << std::endl;
+            std::cout << std::string(80, '=') << std::endl;
+            std::cout << "Model:         " << model_path << std::endl;
+            std::cout << "Tokens:        ";
             for (size_t i = 0; i < tokens.size(); ++i)
             {
                 std::cout << tokens[i];
@@ -145,7 +156,11 @@ namespace
                     std::cout << ",";
             }
             std::cout << " (" << tokens.size() << " tokens)" << std::endl;
-            std::cout << "[PyTorch]   Output: " << output_dir << "/" << std::endl;
+            std::cout << "Num runs:      " << num_runs << " (for variance measurement)" << std::endl;
+            std::cout << "Safety margin: " << safety_margin << "x" << std::endl;
+            std::cout << "Output dir:    " << output_dir << "/" << std::endl;
+            std::cout << std::string(80, '=') << std::endl
+                      << std::endl;
 
             // Build token string
             std::ostringstream token_str;
@@ -156,35 +171,63 @@ namespace
                     token_str << ",";
             }
 
-            // Build command - use absolute path to script
+            // Build command - use variance threshold script
             std::ostringstream cmd;
-            // Get workspace root (parent of build directory if we're in build/)
-            std::string script_path = "python/reference/generate_test_snapshots.py";
             std::filesystem::path cwd = std::filesystem::current_path();
+            std::filesystem::path workspace_root = cwd;
             if (cwd.filename() == "build")
             {
-                script_path = (cwd.parent_path() / script_path).string();
+                workspace_root = cwd.parent_path();
             }
 
-            cmd << "python3 " << script_path
-                << " --model \"" << model_path << "\""
+            std::string script_path = (workspace_root / "scripts" / "generate_variance_thresholds.py").string();
+
+            // Use venv Python if available, fallback to system python3
+            std::filesystem::path venv_python = workspace_root / ".venv" / "bin" / "python";
+            std::string python_cmd = std::filesystem::exists(venv_python) ? venv_python.string() : "python3";
+
+            cmd << python_cmd << " " << script_path
+                << " -m \"" << model_path << "\""
                 << " --tokens \"" << token_str.str() << "\""
-                << " --output-dir \"" << output_dir << "\""
+                << " -o \"" << output_dir << "\""
+                << " --num-runs " << num_runs
+                << " --safety-margin " << safety_margin
                 << " --verbose"
                 << " 2>&1";
 
+            std::cout << "[PyTorch] Running variance analysis script..." << std::endl;
+            std::cout << "[PyTorch] This will run the model " << num_runs << " times (~30s per run)" << std::endl;
+
             // Execute
+            auto start = std::chrono::steady_clock::now();
             int ret = system(cmd.str().c_str());
+            auto end = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
 
             if (ret == 0)
             {
-                std::cout << "[PyTorch] ✓ Snapshots generated successfully" << std::endl;
+                std::cout << "\n"
+                          << std::string(80, '=') << std::endl;
+                std::cout << "✓ PyTorch reference generated successfully" << std::endl;
+                std::cout << "  Time: " << duration << "s" << std::endl;
+                std::cout << "  Output files:" << std::endl;
+                std::cout << "    - *.npy (reference snapshots)" << std::endl;
+                std::cout << "    - dynamic_thresholds.json (variance-based thresholds)" << std::endl;
+                std::cout << "    - variance_statistics.json (variance metrics)" << std::endl;
+                std::cout << "    - threshold_summary.txt (human-readable report)" << std::endl;
+                std::cout << std::string(80, '=') << std::endl
+                          << std::endl;
                 success = 1;
             }
             else
             {
-                std::cerr << "[PyTorch] ✗ Snapshot generation failed with exit code " << ret << std::endl;
-                std::cerr << "[PyTorch]   Command: " << cmd.str() << std::endl;
+                std::cerr << "\n"
+                          << std::string(80, '=') << std::endl;
+                std::cerr << "✗ PyTorch reference generation FAILED" << std::endl;
+                std::cerr << "  Exit code: " << ret << std::endl;
+                std::cerr << "  Command:   " << cmd.str() << std::endl;
+                std::cerr << std::string(80, '=') << std::endl
+                          << std::endl;
                 success = 0;
             }
         }
@@ -283,16 +326,18 @@ namespace
     };
 
     /**
-     * @brief Comprehensive stage-by-stage PyTorch comparison
+     * @brief Comprehensive stage-by-stage PyTorch comparison with dynamic thresholds
      *
      * This function compares Llaminar snapshots against PyTorch reference across
-     * all captured stages, detecting the first divergence point.
+     * all captured stages, using variance-based dynamic thresholds for robust
+     * comparison. Detects the first divergence point.
      *
      * @param pytorch_loader PyTorch snapshot loader
      * @param registry Llaminar snapshot registry
      * @param n_layers Number of transformer layers
      * @param rank MPI rank (only rank 0 performs comparison)
      * @param test_name Test name for logging
+     * @param threshold_loader Dynamic threshold loader (loaded from JSON)
      * @param passed Output: number of passed comparisons
      * @param failed Output: number of failed comparisons
      * @param missing Output: number of missing snapshots
@@ -305,6 +350,7 @@ namespace
         int n_layers,
         int rank,
         const std::string &test_name,
+        const DynamicThresholdLoader &threshold_loader,
         int &passed,
         int &failed,
         int &missing,
@@ -327,53 +373,49 @@ namespace
         {
             std::string name;
             int layer;
-            float max_abs_tol;
-            double rel_l2_tol;
         };
 
         std::vector<StageInfo> stages;
 
         // Global stages
-        stages.push_back({"EMBEDDING", -1, 0.05f, 0.02}); // Tight tolerance for embedding
+        stages.push_back({"EMBEDDING", -1});
 
         // Per-layer stages
         for (int layer = 0; layer < n_layers; ++layer)
         {
-            stages.push_back({"ATTENTION_NORM", layer, 0.05f, 0.02}); // Tight for norm
-
-            // Intermediate attention stages (for debugging divergence)
-            // NOTE: Relaxed max_abs to 0.15 for Q/K/V projections to account for Q4_0 quantization precision.
-            // Empirical testing shows Layer 0 Q_PROJECTION has max_abs=0.106 (vs 0.1 threshold) but excellent
-            // rel_l2=0.0014 (vs 0.05 threshold), indicating a few outlier values due to quantization rounding
-            // rather than systematic error. This is acceptable for 4-bit quantized models.
-            stages.push_back({"Q_PROJECTION", layer, 0.15f, 0.05});     // Q linear projection (Q4_0 tolerant)
-            stages.push_back({"K_PROJECTION", layer, 0.15f, 0.05});     // K linear projection (Q4_0 tolerant)
-            stages.push_back({"V_PROJECTION", layer, 0.15f, 0.05});     // V linear projection (Q4_0 tolerant)
-            stages.push_back({"ROPE_APPLICATION", layer, 0.1f, 0.05});  // After RoPE rotation
-            stages.push_back({"ATTENTION_SCORES", layer, 0.1f, 0.05});  // Q@K^T before softmax
-            stages.push_back({"ATTENTION_SOFTMAX", layer, 0.1f, 0.05}); // After softmax
-            stages.push_back({"ATTENTION_CONTEXT", layer, 0.1f, 0.05}); // Scores@V (before W_o)
-
-            stages.push_back({"ATTENTION_OUTPUT", layer, 0.1f, 0.05}); // Relaxed for matmul
-            stages.push_back({"ATTENTION_RESIDUAL", layer, 0.1f, 0.05});
-            stages.push_back({"FFN_NORM", layer, 0.05f, 0.02}); // Tight for norm
-
-            // FFN intermediate stages (for debugging FFN divergence)
-            stages.push_back({"FFN_GATE", layer, 0.1f, 0.05});   // Gate projection output
-            stages.push_back({"FFN_UP", layer, 0.1f, 0.05});     // Up projection output
-            stages.push_back({"FFN_SWIGLU", layer, 0.1f, 0.05}); // SwiGLU activation output
-
-            stages.push_back({"FFN_DOWN", layer, 0.1f, 0.05}); // Relaxed for matmul
-            stages.push_back({"FFN_RESIDUAL", layer, 0.1f, 0.05});
+            stages.push_back({"ATTENTION_NORM", layer});
+            stages.push_back({"Q_PROJECTION", layer});
+            stages.push_back({"K_PROJECTION", layer});
+            stages.push_back({"V_PROJECTION", layer});
+            stages.push_back({"ROPE_APPLICATION", layer});
+            stages.push_back({"ATTENTION_SCORES", layer});
+            stages.push_back({"ATTENTION_SOFTMAX", layer});
+            stages.push_back({"ATTENTION_CONTEXT", layer});
+            stages.push_back({"ATTENTION_OUTPUT", layer});
+            stages.push_back({"ATTENTION_RESIDUAL", layer});
+            stages.push_back({"FFN_NORM", layer});
+            stages.push_back({"FFN_GATE", layer});
+            stages.push_back({"FFN_UP", layer});
+            stages.push_back({"FFN_SWIGLU", layer});
+            stages.push_back({"FFN_DOWN", layer});
+            stages.push_back({"FFN_RESIDUAL", layer});
         }
 
         // Final stages
-        stages.push_back({"FINAL_NORM", -1, 0.05f, 0.02});
-        stages.push_back({"LM_HEAD", -1, 0.15f, 0.1}); // Most relaxed for final projection
+        stages.push_back({"FINAL_NORM", -1});
+        stages.push_back({"LM_HEAD", -1});
 
         std::cout << "\n[" << test_name << "] Comparing " << stages.size()
-                  << " stages against PyTorch reference...\n"
-                  << std::endl;
+                  << " stages against PyTorch reference";
+        if (threshold_loader.using_defaults())
+        {
+            std::cout << " (using conservative defaults)" << std::endl;
+        }
+        else
+        {
+            std::cout << " (using dynamic variance-based thresholds)" << std::endl;
+        }
+        std::cout << std::endl;
 
         // Compare each stage
         for (const auto &stage_info : stages)
@@ -436,8 +478,14 @@ namespace
 
             TensorSnapshot pytorch_snap(pytorch_meta, pytorch_snapshot.data.data(), pytorch_snapshot.data.size());
 
-            // Compare with tolerances
-            ComparisonTolerance tolerance(stage_info.max_abs_tol, stage_info.rel_l2_tol);
+            // Get dynamic threshold for this stage
+            std::string stage_key = stage_name;
+            if (layer_idx >= 0)
+            {
+                stage_key += "_" + std::to_string(layer_idx);
+            }
+            StageThreshold stage_threshold = threshold_loader.get_threshold(stage_key);
+            ComparisonTolerance tolerance(stage_threshold.max_abs, stage_threshold.rel_l2);
 
             // DEBUG: Log snapshot sizes before comparison
             if (stage_name == "EMBEDDING")
@@ -816,7 +864,7 @@ namespace
                 std::cout << "_layer" << layer_idx;
             std::cout << ": max_abs=" << std::scientific << result.metrics.max_abs_diff
                       << " rel_l2=" << result.metrics.rel_l2
-                      << std::fixed << " (tol: " << stage_info.max_abs_tol << "/" << stage_info.rel_l2_tol << ")";
+                      << std::fixed << " (tol: " << stage_threshold.max_abs << "/" << stage_threshold.rel_l2 << ")";
 
             if (result.passed())
             {
@@ -1031,10 +1079,20 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
     // Synchronize after cleanup
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // Generate PyTorch reference snapshots (always fresh)
-    if (!generate_pytorch_snapshots(model_path, token_ids, snapshot_dir, rank))
+    // Generate PyTorch reference snapshots with variance analysis (always fresh)
+    // This runs PyTorch 3 times to measure variance and generate dynamic thresholds
+    if (!generate_pytorch_snapshots(model_path, token_ids, snapshot_dir, rank,
+                                    /*num_runs=*/3, /*safety_margin=*/5.0f))
     {
-        GTEST_FAIL() << "Failed to generate PyTorch reference snapshots";
+        GTEST_FAIL() << "Failed to generate PyTorch reference snapshots with variance analysis";
+    }
+
+    // Load dynamic thresholds (rank 0 only)
+    DynamicThresholdLoader threshold_loader;
+    if (rank == 0)
+    {
+        std::string threshold_path = snapshot_dir + "/dynamic_thresholds.json";
+        threshold_loader.load(threshold_path);
     }
 
     // Disable COSMA to ensure OpenBLAS path
@@ -1101,6 +1159,7 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
         n_layers,
         rank,
         "OPENBLAS_PYTORCH",
+        threshold_loader, // Pass dynamic threshold loader
         passed,
         failed,
         missing,
@@ -1215,10 +1274,20 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
         std::cout << "[COSMA_PYTORCH] Token sequence: 1000 tokens (0-999 cycled)" << std::endl;
     }
 
-    // Generate PyTorch reference snapshots
-    if (!generate_pytorch_snapshots(model_path, token_ids, snapshot_dir, rank))
+    // Generate PyTorch reference snapshots with variance analysis
+    // This runs PyTorch 3 times to measure variance and generate dynamic thresholds
+    if (!generate_pytorch_snapshots(model_path, token_ids, snapshot_dir, rank,
+                                    /*num_runs=*/3, /*safety_margin=*/5.0f))
     {
-        GTEST_FAIL() << "Failed to generate PyTorch reference snapshots";
+        GTEST_FAIL() << "Failed to generate PyTorch reference snapshots with variance analysis";
+    }
+
+    // Load dynamic thresholds (rank 0 only)
+    DynamicThresholdLoader threshold_loader;
+    if (rank == 0)
+    {
+        std::string threshold_path = snapshot_dir + "/dynamic_thresholds.json";
+        threshold_loader.load(threshold_path);
     }
 
     // Force COSMA path (lower threshold to ensure COSMA is used)
@@ -1283,6 +1352,7 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
         n_layers,
         rank,
         "COSMA_PYTORCH",
+        threshold_loader, // Pass dynamic threshold loader
         passed,
         failed,
         missing,

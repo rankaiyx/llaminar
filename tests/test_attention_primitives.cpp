@@ -346,3 +346,624 @@ TEST(AttentionPrimitives, RoPELocalHeadSharding)
     }
     EXPECT_TRUE(some_values_changed) << "Position 1 should have rotated values";
 }
+
+// ============================================================================
+// GQA Head Mapping Tests (Global vs Local Index)
+// ============================================================================
+
+/**
+ * @brief Test GQA head mapping with distributed heads across ranks
+ *
+ * This test validates that expand_kv_for_gqa correctly maps Q heads to KV heads
+ * when heads are distributed across MPI ranks. The critical bug this prevents:
+ * using local head indices instead of global head indices for GQA group mapping.
+ *
+ * Scenario: Qwen2.5-0.5B configuration
+ * - 14 Q heads total (7 per rank on 2 ranks)
+ * - 2 KV heads total
+ * - Group size = 14 / 2 = 7
+ * - Correct mapping: Q heads [0-6] → KV head 0, Q heads [7-13] → KV head 1
+ */
+TEST(AttentionPrimitives, GQAHeadMappingDistributedRanks)
+{
+    const int total_q_heads = 14;
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int seq_len = 4;
+    const int num_ranks = 2;
+    const int heads_per_rank = total_q_heads / num_ranks; // 7
+
+    // Create reference K/V tensors (compact format: [seq, kv_heads, head_dim])
+    std::vector<float> k_compact(seq_len * n_kv_heads * head_dim);
+    std::vector<float> v_compact(seq_len * n_kv_heads * head_dim);
+
+    // Fill with distinct values for each KV head
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                int idx = t * n_kv_heads * head_dim + kv_h * head_dim + d;
+                // KV head 0: values around 100, KV head 1: values around 200
+                k_compact[idx] = 100.0f * (kv_h + 1) + d;
+                v_compact[idx] = 100.0f * (kv_h + 1) + d + 0.5f;
+            }
+        }
+    }
+
+    // Simulate expansion on each rank
+    for (int rank = 0; rank < num_ranks; ++rank)
+    {
+        int head_offset = rank * heads_per_rank; // Rank 0: offset=0, Rank 1: offset=7
+
+        std::vector<float> k_expanded(seq_len * heads_per_rank * head_dim);
+        std::vector<float> v_expanded(seq_len * heads_per_rank * head_dim);
+
+        // Call the expansion function with global context
+        expand_kv_for_gqa(
+            k_compact.data(), v_compact.data(),
+            k_expanded.data(), v_expanded.data(),
+            seq_len, head_dim,
+            heads_per_rank, // local_heads (7)
+            n_kv_heads,     // n_kv_heads (2)
+            head_offset,    // head_offset (0 or 7)
+            total_q_heads   // total_q_heads (14)
+        );
+
+        // Verify the mapping for each local head
+        for (int local_h = 0; local_h < heads_per_rank; ++local_h)
+        {
+            int global_h = head_offset + local_h;
+            int expected_kv_head = global_h / (total_q_heads / n_kv_heads); // global_h / 7
+
+            // Check a sample token
+            for (int d = 0; d < head_dim; ++d)
+            {
+                int expanded_idx = 0 * heads_per_rank * head_dim + local_h * head_dim + d;
+                int compact_idx = 0 * n_kv_heads * head_dim + expected_kv_head * head_dim + d;
+
+                EXPECT_FLOAT_EQ(k_expanded[expanded_idx], k_compact[compact_idx])
+                    << "Rank " << rank << ", local_h=" << local_h
+                    << " (global_h=" << global_h << ") should map to KV head "
+                    << expected_kv_head << ", dim=" << d;
+
+                EXPECT_FLOAT_EQ(v_expanded[expanded_idx], v_compact[compact_idx])
+                    << "V mismatch on Rank " << rank << ", local_h=" << local_h;
+            }
+        }
+
+        // Specific assertions for this test scenario
+        if (rank == 0)
+        {
+            // Rank 0 processes global heads 0-6, all should map to KV head 0
+            for (int local_h = 0; local_h < heads_per_rank; ++local_h)
+            {
+                int idx = 0 * heads_per_rank * head_dim + local_h * head_dim + 0;
+                EXPECT_FLOAT_EQ(k_expanded[idx], 100.0f)
+                    << "Rank 0, local_h=" << local_h << " should use KV head 0";
+            }
+        }
+        else if (rank == 1)
+        {
+            // Rank 1 processes global heads 7-13, all should map to KV head 1
+            for (int local_h = 0; local_h < heads_per_rank; ++local_h)
+            {
+                int idx = 0 * heads_per_rank * head_dim + local_h * head_dim + 0;
+                EXPECT_FLOAT_EQ(k_expanded[idx], 200.0f)
+                    << "Rank 1, local_h=" << local_h << " should use KV head 1";
+            }
+        }
+    }
+}
+
+/**
+ * @brief Test GQA with various configuration scenarios
+ *
+ * Tests different Q-to-KV head ratios to ensure the formula works correctly
+ * for various model architectures.
+ */
+TEST(AttentionPrimitives, GQAHeadMappingVariousConfigs)
+{
+    const int head_dim = 64;
+    const int seq_len = 2;
+
+    struct TestCase
+    {
+        int total_q_heads;
+        int n_kv_heads;
+        int num_ranks;
+        std::string description;
+    };
+
+    std::vector<TestCase> test_cases = {
+        {32, 8, 2, "LLaMA2-7B: 32 Q heads, 8 KV heads, 2 ranks"},
+        {32, 8, 4, "LLaMA2-7B: 32 Q heads, 8 KV heads, 4 ranks"},
+        {40, 8, 2, "LLaMA3-8B: 40 Q heads, 8 KV heads, 2 ranks"},
+        {8, 2, 2, "Small model: 8 Q heads, 2 KV heads, 2 ranks"},
+        {16, 1, 2, "Extreme GQA: 16 Q heads, 1 KV head, 2 ranks"},
+    };
+
+    for (const auto &tc : test_cases)
+    {
+        SCOPED_TRACE(tc.description);
+
+        int heads_per_rank = tc.total_q_heads / tc.num_ranks;
+        ASSERT_EQ(tc.total_q_heads % tc.num_ranks, 0) << "Heads must divide evenly across ranks";
+
+        // Create compact K with distinct values per KV head
+        std::vector<float> k_compact(seq_len * tc.n_kv_heads * head_dim);
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int kv_h = 0; kv_h < tc.n_kv_heads; ++kv_h)
+            {
+                for (int d = 0; d < head_dim; ++d)
+                {
+                    int idx = t * tc.n_kv_heads * head_dim + kv_h * head_dim + d;
+                    k_compact[idx] = static_cast<float>(kv_h * 1000 + d);
+                }
+            }
+        }
+
+        std::vector<float> v_compact = k_compact; // V same as K for simplicity
+
+        // Test each rank
+        for (int rank = 0; rank < tc.num_ranks; ++rank)
+        {
+            int head_offset = rank * heads_per_rank;
+
+            std::vector<float> k_expanded(seq_len * heads_per_rank * head_dim);
+            std::vector<float> v_expanded(seq_len * heads_per_rank * head_dim);
+
+            expand_kv_for_gqa(
+                k_compact.data(), v_compact.data(),
+                k_expanded.data(), v_expanded.data(),
+                seq_len, head_dim, heads_per_rank, tc.n_kv_heads,
+                head_offset, tc.total_q_heads);
+
+            // Verify mapping for each head on this rank
+            for (int local_h = 0; local_h < heads_per_rank; ++local_h)
+            {
+                int global_h = head_offset + local_h;
+                int group_size = tc.total_q_heads / tc.n_kv_heads;
+                int expected_kv_head = global_h / group_size;
+
+                // Check first element of this head
+                int expanded_idx = 0 * heads_per_rank * head_dim + local_h * head_dim + 0;
+                float expected_value = static_cast<float>(expected_kv_head * 1000);
+
+                EXPECT_FLOAT_EQ(k_expanded[expanded_idx], expected_value)
+                    << "Rank " << rank << ", global_h=" << global_h
+                    << " should map to KV head " << expected_kv_head;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Test that head_offset=0 gives correct results (single rank case)
+ *
+ * When head_offset=0 (default), the function should work correctly for
+ * single-rank execution or when processing all heads on one rank.
+ */
+TEST(AttentionPrimitives, GQAHeadMappingSingleRank)
+{
+    const int total_q_heads = 14;
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int seq_len = 2;
+
+    // Create compact K/V
+    std::vector<float> k_compact(seq_len * n_kv_heads * head_dim);
+    std::vector<float> v_compact(seq_len * n_kv_heads * head_dim);
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                int idx = t * n_kv_heads * head_dim + kv_h * head_dim + d;
+                k_compact[idx] = static_cast<float>(kv_h * 100 + d);
+                v_compact[idx] = static_cast<float>(kv_h * 100 + d + 50);
+            }
+        }
+    }
+
+    // Expand all heads on single rank (head_offset=0)
+    std::vector<float> k_expanded(seq_len * total_q_heads * head_dim);
+    std::vector<float> v_expanded(seq_len * total_q_heads * head_dim);
+
+    expand_kv_for_gqa(
+        k_compact.data(), v_compact.data(),
+        k_expanded.data(), v_expanded.data(),
+        seq_len, head_dim, total_q_heads, n_kv_heads,
+        0, // head_offset = 0 (single rank)
+        total_q_heads);
+
+    // Verify mapping: heads 0-6 → KV 0, heads 7-13 → KV 1
+    for (int h = 0; h < total_q_heads; ++h)
+    {
+        int expected_kv_head = h / 7;
+
+        for (int d = 0; d < head_dim; ++d)
+        {
+            int expanded_idx = 0 * total_q_heads * head_dim + h * head_dim + d;
+            int compact_idx = 0 * n_kv_heads * head_dim + expected_kv_head * head_dim + d;
+
+            EXPECT_FLOAT_EQ(k_expanded[expanded_idx], k_compact[compact_idx])
+                << "Q head " << h << " should map to KV head " << expected_kv_head
+                << " at dim " << d;
+        }
+    }
+}
+
+/**
+ * @brief Regression test for the bug where local indices were used
+ *
+ * This test explicitly checks the failure scenario: using local head indices
+ * instead of global head indices. It verifies that Rank 1 does NOT incorrectly
+ * alternate between KV heads when it should consistently use KV head 1.
+ */
+TEST(AttentionPrimitives, GQAHeadMappingRegressionLocalVsGlobal)
+{
+    const int total_q_heads = 14;
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int seq_len = 1;
+    const int heads_per_rank = 7;
+
+    // Create compact K with very distinct values
+    std::vector<float> k_compact(seq_len * n_kv_heads * head_dim);
+    for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+    {
+        for (int d = 0; d < head_dim; ++d)
+        {
+            int idx = kv_h * head_dim + d;
+            k_compact[idx] = static_cast<float>((kv_h + 1) * 1000); // KV0=1000, KV1=2000
+        }
+    }
+
+    std::vector<float> v_compact = k_compact;
+
+    // Test Rank 1 (global heads 7-13)
+    const int rank1_offset = 7;
+    std::vector<float> k_expanded(seq_len * heads_per_rank * head_dim);
+    std::vector<float> v_expanded(seq_len * heads_per_rank * head_dim);
+
+    expand_kv_for_gqa(
+        k_compact.data(), v_compact.data(),
+        k_expanded.data(), v_expanded.data(),
+        seq_len, head_dim, heads_per_rank, n_kv_heads,
+        rank1_offset, total_q_heads);
+
+    // ALL local heads on Rank 1 should map to KV head 1 (value 2000)
+    // The bug would cause alternating pattern: local_h % 2
+    for (int local_h = 0; local_h < heads_per_rank; ++local_h)
+    {
+        int global_h = rank1_offset + local_h;
+        int idx = local_h * head_dim + 0; // First element of this head
+
+        // Correct behavior: all map to KV head 1
+        EXPECT_FLOAT_EQ(k_expanded[idx], 2000.0f)
+            << "Rank 1, local_h=" << local_h << " (global_h=" << global_h
+            << ") should map to KV head 1, not alternating based on local index";
+
+        // The BUG would have caused:
+        // local_h=0 → 1000 (KV head 0)  ✗
+        // local_h=1 → 2000 (KV head 1)  ✓ (accidentally correct)
+        // local_h=2 → 1000 (KV head 0)  ✗
+        // etc.
+
+        // Verify this does NOT happen
+        if (local_h % 2 == 0)
+        {
+            // Even local indices should NOT map to KV head 0
+            EXPECT_NE(k_expanded[idx], 1000.0f)
+                << "Bug detected: local_h=" << local_h
+                << " incorrectly using local index modulo instead of global index";
+        }
+    }
+}
+
+/**
+ * @brief Test MHA scenario (no GQA)
+ *
+ * When n_heads == n_kv_heads (Multi-Head Attention, not Grouped-Query),
+ * the expansion should be identity mapping: each Q head maps to its
+ * corresponding KV head.
+ */
+TEST(AttentionPrimitives, GQAHeadMappingMHAIdentity)
+{
+    const int n_heads = 8;
+    const int n_kv_heads = 8; // Same as n_heads → MHA
+    const int head_dim = 64;
+    const int seq_len = 2;
+
+    std::vector<float> k_compact(seq_len * n_kv_heads * head_dim);
+    std::vector<float> v_compact(seq_len * n_kv_heads * head_dim);
+
+    // Fill with unique values per head
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                int idx = t * n_kv_heads * head_dim + h * head_dim + d;
+                k_compact[idx] = static_cast<float>(h * 100 + d);
+                v_compact[idx] = static_cast<float>(h * 100 + d + 10);
+            }
+        }
+    }
+
+    std::vector<float> k_expanded(seq_len * n_heads * head_dim);
+    std::vector<float> v_expanded(seq_len * n_heads * head_dim);
+
+    expand_kv_for_gqa(
+        k_compact.data(), v_compact.data(),
+        k_expanded.data(), v_expanded.data(),
+        seq_len, head_dim, n_heads, n_kv_heads,
+        0, n_heads);
+
+    // Verify identity mapping: expanded should equal compact
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                int idx = t * n_heads * head_dim + h * head_dim + d;
+                EXPECT_FLOAT_EQ(k_expanded[idx], k_compact[idx])
+                    << "MHA should be identity: h=" << h << " d=" << d;
+                EXPECT_FLOAT_EQ(v_expanded[idx], v_compact[idx])
+                    << "MHA should be identity: h=" << h << " d=" << d;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Edge Case Tests: More Ranks Than Heads
+// ============================================================================
+
+/**
+ * @brief Test GQA head mapping when some ranks have no heads (excess ranks)
+ *
+ * This test validates the behavior when we have more MPI ranks than heads to
+ * distribute. Some ranks will get local_heads=0, which should be handled gracefully.
+ *
+ * Scenario: 8 Q heads, 2 KV heads, 10 ranks
+ * - Ranks 0-7: get 1 head each
+ * - Ranks 8-9: get 0 heads (no work)
+ */
+TEST(AttentionPrimitives, GQAHeadMappingExcessRanks)
+{
+    const int total_q_heads = 8;
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int seq_len = 2;
+    const int num_ranks = 10; // More ranks than Q heads!
+
+    // Create compact K/V
+    std::vector<float> k_compact(seq_len * n_kv_heads * head_dim);
+    std::vector<float> v_compact(seq_len * n_kv_heads * head_dim);
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                int idx = t * n_kv_heads * head_dim + kv_h * head_dim + d;
+                k_compact[idx] = static_cast<float>((kv_h + 1) * 100 + d);
+                v_compact[idx] = static_cast<float>((kv_h + 1) * 100 + d + 50);
+            }
+        }
+    }
+
+    // Simulate each rank
+    for (int rank = 0; rank < num_ranks; ++rank)
+    {
+        // Distribute heads: 8 heads / 10 ranks = 0 heads per rank, 8 remainder
+        int heads_per_rank = total_q_heads / num_ranks; // 0
+        int remainder = total_q_heads % num_ranks;      // 8
+        int local_heads = heads_per_rank + (rank < remainder ? 1 : 0);
+        int head_offset = rank * heads_per_rank + std::min(rank, remainder);
+
+        if (rank < 8)
+        {
+            // Ranks 0-7: should get 1 head each
+            EXPECT_EQ(local_heads, 1) << "Rank " << rank << " should have 1 head";
+            EXPECT_EQ(head_offset, rank) << "Rank " << rank << " head_offset should be " << rank;
+        }
+        else
+        {
+            // Ranks 8-9: should get 0 heads
+            EXPECT_EQ(local_heads, 0) << "Rank " << rank << " should have 0 heads (excess rank)";
+            EXPECT_EQ(head_offset, 8) << "Rank " << rank << " head_offset should be 8";
+        }
+
+        // Only process if this rank has heads
+        if (local_heads > 0)
+        {
+            std::vector<float> k_expanded(seq_len * local_heads * head_dim);
+            std::vector<float> v_expanded(seq_len * local_heads * head_dim);
+
+            expand_kv_for_gqa(
+                k_compact.data(), v_compact.data(),
+                k_expanded.data(), v_expanded.data(),
+                seq_len, head_dim, local_heads, n_kv_heads,
+                head_offset, total_q_heads);
+
+            // Verify the mapping
+            int global_h = head_offset;                  // For this rank's single head
+            int group_size = total_q_heads / n_kv_heads; // 8 / 2 = 4
+            int expected_kv_head = global_h / group_size;
+
+            // Check first element
+            int idx = 0;
+            float expected_value = static_cast<float>((expected_kv_head + 1) * 100);
+            EXPECT_FLOAT_EQ(k_expanded[idx], expected_value)
+                << "Rank " << rank << " global_h=" << global_h
+                << " should map to KV head " << expected_kv_head;
+        }
+    }
+}
+
+/**
+ * @brief Test handling of uneven head distribution
+ *
+ * Validates that heads are distributed as evenly as possible when they don't
+ * divide evenly across ranks.
+ *
+ * Example: 14 heads across 3 ranks → 5, 5, 4 distribution
+ */
+TEST(AttentionPrimitives, GQAHeadMappingUnevenDistribution)
+{
+    const int total_q_heads = 14;
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int seq_len = 2;
+    const int num_ranks = 3;
+
+    std::vector<float> k_compact(seq_len * n_kv_heads * head_dim);
+    std::vector<float> v_compact(seq_len * n_kv_heads * head_dim);
+
+    // Fill with distinct values
+    for (int t = 0; t < seq_len; ++t)
+    {
+        for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                int idx = t * n_kv_heads * head_dim + kv_h * head_dim + d;
+                k_compact[idx] = static_cast<float>(kv_h * 1000 + d);
+                v_compact[idx] = static_cast<float>(kv_h * 1000 + d + 500);
+            }
+        }
+    }
+
+    int expected_distribution[] = {5, 5, 4}; // 14 / 3 = 4 remainder 2
+    int expected_offsets[] = {0, 5, 10};
+
+    for (int rank = 0; rank < num_ranks; ++rank)
+    {
+        int heads_per_rank = total_q_heads / num_ranks; // 4
+        int remainder = total_q_heads % num_ranks;      // 2
+        int local_heads = heads_per_rank + (rank < remainder ? 1 : 0);
+        int head_offset = rank * heads_per_rank + std::min(rank, remainder);
+
+        EXPECT_EQ(local_heads, expected_distribution[rank])
+            << "Rank " << rank << " should have " << expected_distribution[rank] << " heads";
+        EXPECT_EQ(head_offset, expected_offsets[rank])
+            << "Rank " << rank << " should start at offset " << expected_offsets[rank];
+
+        std::vector<float> k_expanded(seq_len * local_heads * head_dim);
+        std::vector<float> v_expanded(seq_len * local_heads * head_dim);
+
+        expand_kv_for_gqa(
+            k_compact.data(), v_compact.data(),
+            k_expanded.data(), v_expanded.data(),
+            seq_len, head_dim, local_heads, n_kv_heads,
+            head_offset, total_q_heads);
+
+        // Verify each local head maps to correct KV head
+        int group_size = total_q_heads / n_kv_heads; // 7
+        for (int local_h = 0; local_h < local_heads; ++local_h)
+        {
+            int global_h = head_offset + local_h;
+            int expected_kv_head = global_h / group_size;
+
+            int idx = 0 * local_heads * head_dim + local_h * head_dim + 0;
+            float expected_value = static_cast<float>(expected_kv_head * 1000);
+
+            EXPECT_FLOAT_EQ(k_expanded[idx], expected_value)
+                << "Rank " << rank << " local_h=" << local_h
+                << " (global_h=" << global_h << ") should map to KV head " << expected_kv_head;
+        }
+    }
+}
+
+/**
+ * @brief Test extreme edge case: 1 head, multiple ranks
+ *
+ * Only rank 0 gets the single head, all other ranks have no work.
+ */
+TEST(AttentionPrimitives, GQAHeadMappingOneHeadManyRanks)
+{
+    const int total_q_heads = 1;
+    const int n_kv_heads = 1;
+    const int head_dim = 64;
+    const int seq_len = 2;
+    const int num_ranks = 4;
+
+    std::vector<float> k_compact(seq_len * n_kv_heads * head_dim, 42.0f);
+    std::vector<float> v_compact(seq_len * n_kv_heads * head_dim, 84.0f);
+
+    for (int rank = 0; rank < num_ranks; ++rank)
+    {
+        int heads_per_rank = total_q_heads / num_ranks; // 0
+        int remainder = total_q_heads % num_ranks;      // 1
+        int local_heads = heads_per_rank + (rank < remainder ? 1 : 0);
+
+        if (rank == 0)
+        {
+            EXPECT_EQ(local_heads, 1) << "Rank 0 should get the only head";
+
+            std::vector<float> k_expanded(seq_len * local_heads * head_dim);
+            std::vector<float> v_expanded(seq_len * local_heads * head_dim);
+
+            expand_kv_for_gqa(
+                k_compact.data(), v_compact.data(),
+                k_expanded.data(), v_expanded.data(),
+                seq_len, head_dim, local_heads, n_kv_heads,
+                0, total_q_heads);
+
+            // Should be identity mapping (1 Q head → 1 KV head)
+            EXPECT_FLOAT_EQ(k_expanded[0], 42.0f);
+            EXPECT_FLOAT_EQ(v_expanded[0], 84.0f);
+        }
+        else
+        {
+            EXPECT_EQ(local_heads, 0) << "Rank " << rank << " should have 0 heads";
+            // No expansion needed, rank has no work
+        }
+    }
+}
+
+/**
+ * @brief Test that zero local heads produces empty output (not crash)
+ *
+ * Validates that calling expand_kv_for_gqa with n_heads=0 is safe.
+ */
+TEST(AttentionPrimitives, GQAHeadMappingZeroLocalHeads)
+{
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int seq_len = 2;
+
+    std::vector<float> k_compact(seq_len * n_kv_heads * head_dim, 1.0f);
+    std::vector<float> v_compact(seq_len * n_kv_heads * head_dim, 2.0f);
+
+    // Create empty output buffers (size 0)
+    std::vector<float> k_expanded; // Empty
+    std::vector<float> v_expanded; // Empty
+
+    // This should not crash with n_heads=0
+    EXPECT_NO_THROW({
+        expand_kv_for_gqa(
+            k_compact.data(), v_compact.data(),
+            k_expanded.data(), v_expanded.data(),
+            seq_len, head_dim,
+            0, // n_heads = 0 (no local heads)
+            n_kv_heads,
+            0, // head_offset
+            8  // total_q_heads (arbitrary)
+        );
+    });
+
+    // No data should have been written (empty vectors)
+    EXPECT_EQ(k_expanded.size(), 0);
+    EXPECT_EQ(v_expanded.size(), 0);
+}
