@@ -113,12 +113,14 @@ namespace llaminar
                     int32_t next_token = sampleToken(logits);
 
                     // Debug: Print first few logits and the sampled token
-                    std::cout << "Logits[0-9]: ";
+                    std::ostringstream oss;
+                    oss << "Logits[0-9]: ";
                     for (size_t i = 0; i < std::min(logits.size(), size_t(10)); ++i)
                     {
-                        std::cout << logits[i] << " ";
+                        oss << logits[i] << " ";
                     }
-                    std::cout << "... Sampled token: " << next_token << std::endl;
+                    oss << "... Sampled token: " << next_token;
+                    LOG_DEBUG(oss.str());
 
                     if (next_token < 0)
                     {
@@ -277,27 +279,27 @@ namespace llaminar
 
             // Debug: Show initial logit range
             auto min_max = std::minmax_element(processed_logits.begin(), processed_logits.end());
-            std::cout << "Initial logits range: [" << *min_max.first << ", " << *min_max.second << "]" << std::endl;
+            LOG_DEBUG("Initial logits range: [" << *min_max.first << ", " << *min_max.second << "]");
 
             // Apply temperature scaling
             if (temperature_ != 1.0f)
             {
                 applyTemperature(processed_logits, temperature_);
-                std::cout << "Applied temperature " << temperature_ << std::endl;
+                LOG_DEBUG("Applied temperature " << temperature_);
             }
 
             // Apply top-k filtering
             if (top_k_ > 0 && top_k_ < static_cast<int32_t>(processed_logits.size()))
             {
                 applyTopK(processed_logits, top_k_);
-                std::cout << "Applied top-k " << top_k_ << std::endl;
+                LOG_DEBUG("Applied top-k " << top_k_);
             }
 
             // Apply top-p filtering
             if (top_p_ < 1.0f)
             {
                 applyTopP(processed_logits, top_p_);
-                std::cout << "Applied top-p " << top_p_ << std::endl;
+                LOG_DEBUG("Applied top-p " << top_p_);
             }
 
             // Convert to probabilities and sample
@@ -311,12 +313,13 @@ namespace llaminar
             }
             std::sort(top_probs.begin(), top_probs.end(), std::greater<>());
 
-            std::cout << "Top probabilities: ";
+            std::ostringstream oss;
+            oss << "Top probabilities: ";
             for (const auto &p : top_probs)
             {
-                std::cout << "tok" << p.second << "=" << p.first << " ";
+                oss << "tok" << p.second << "=" << p.first << " ";
             }
-            std::cout << std::endl;
+            LOG_DEBUG(oss.str());
 
             return sampleFromProbs(probs);
         }
@@ -497,14 +500,14 @@ namespace llaminar
             float random_value = dis(gen);
             float cumulative = 0.0f;
 
-            std::cout << "Random value: " << random_value << ", sampling..." << std::endl;
+            LOG_DEBUG("Random value: " << random_value << ", sampling...");
 
             for (size_t i = 0; i < probs.size(); ++i)
             {
                 cumulative += probs[i];
                 if (random_value <= cumulative)
                 {
-                    std::cout << "Selected token " << i << " at cumulative " << cumulative << std::endl;
+                    LOG_DEBUG("Selected token " << i << " at cumulative " << cumulative);
                     return static_cast<int32_t>(i);
                 }
             }

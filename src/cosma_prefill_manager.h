@@ -340,6 +340,11 @@ namespace llaminar
 
     private:
         CosmaPrefillManager();
+        
+        // MPI context initialization (lazy)
+        void ensure_mpi_context();
+        bool mpi_context_initialized_ = false;
+        
         int world_size_ = 1;
         int rank_ = 0;
         int threshold_ = 4096;                                   // default; overridden by env

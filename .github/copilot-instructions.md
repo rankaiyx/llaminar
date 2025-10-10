@@ -89,17 +89,17 @@ Always use the canonical launch script for optimal performance:
 
 ```bash
 # Canonical way to run Llaminar
-./run-llaminar.sh [arguments]
+./run_llaminar.sh [arguments]
 
 # Examples
-./run-llaminar.sh -v --print-topology
-./run-llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
+./run_llaminar.sh -v --print-topology
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
 ```
 
 ### Canonical Environment Variables
 
 ```bash
-# OpenMP Settings (automatically set by run-llaminar.sh)
+# OpenMP Settings (automatically set by run_llaminar.sh)
 export OMP_NUM_THREADS=<cores_per_socket>  # Auto-detected physical cores per socket
 export OMP_PLACES=sockets          # Place threads on sockets
 export OMP_PROC_BIND=close         # Bind threads close together
@@ -108,7 +108,7 @@ export OMP_DYNAMIC=false           # Disable dynamic adjustment
 export KMP_AFFINITY=granularity=fine,compact,1,0
 export KMP_BLOCKTIME=0             # Reduce blocking time
 
-# MPI Settings (automatically set by run-llaminar.sh)
+# MPI Settings (automatically set by run_llaminar.sh)
 export OMPI_MCA_mpi_leave_pinned=1
 export OMPI_MCA_btl_vader_single_copy_mechanism=none
 export OMPI_MCA_btl_openib_allow_ib=1
@@ -597,7 +597,7 @@ Use these to control verbosity, backend selection, and validation when working o
 | `LLAMINAR_COSMA_MAX_RESIDENT_MB` | Soft memory budget for COSMA working set; fallback if exceeded. | 2048 | Memory safety / preflight |
 | `LLAMINAR_COSMA_VALIDATE_TILE` | If >0, performs small tile OpenBLAS vs COSMA correctness spot-check (relative L2). | 0 (off) | Debug validation |
 | `LLAMINAR_COSMA_LOG_LEVEL` | Verbosity for COSMA prefill instrumentation (`trace`..`error`). | info | Prefill diagnostics |
-| `OMP_NUM_THREADS` / `OMP_PLACES` / `OMP_PROC_BIND` | Governs OpenMP thread placement & counts (run script sets). | Auto-set by `run-llaminar.sh` | Threading performance |
+| `OMP_NUM_THREADS` / `OMP_PLACES` / `OMP_PROC_BIND` | Governs OpenMP thread placement & counts (run script sets). | Auto-set by `run_llaminar.sh` | Threading performance |
 | `KMP_AFFINITY` / `KMP_BLOCKTIME` | Fine tuning for Intel OpenMP runtime responsiveness. | Script default | Latency tuning |
 
 ### Usage Patterns

@@ -56,7 +56,7 @@ Parity / Validation Strategy:
 Fast Sanity Checklist Before Benchmarking:
 ```
 grep -R "MPI_Allreduce" src | grep -v stats   # no accidental full activation reductions
-./run-llaminar.sh -v --print-topology         # verify shard summaries (future)
+./run_llaminar.sh -v --print-topology         # verify shard summaries (future)
 ```
 
 Refer also to: `llaminar-architecture.instructions.md` (Backend Abstraction Layer section) for deeper rationale.
@@ -678,7 +678,7 @@ bool ShardedAttention::execute(const DistTensor& x, DistTensor& out) {
 mpirun -np 4 --oversubscribe ./build/test_attention_shard_parity -v
 
 # Print topology after refactor
-./run-llaminar.sh -v --print-topology | grep SHARD
+./run_llaminar.sh -v --print-topology | grep SHARD
 
 # Sanity check: ensure no large Allreduce calls remain
 grep -R "MPI_Allreduce" -n src | grep -v stats || true

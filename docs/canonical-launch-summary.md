@@ -2,12 +2,12 @@
 
 ## Files Created/Updated
 
-### 1. **run-llaminar.sh** (New Canonical Script)
+### 1. **run_llaminar.sh** (New Canonical Script)
 - **Purpose**: Single canonical way to run Llaminar with optimal MPI/OpenMP settings
 - **Auto-Detection**: Automatically detects system topology using same logic as C++ `detectCPUTopology()`
 - **Dynamic Configuration**: Calculates cores per socket from `/proc/cpuinfo` parsing
 - **Environment**: Sets all optimal environment variables for MPI and OpenMP
-- **Usage**: `./run-llaminar.sh [llaminar arguments]`
+- **Usage**: `./run_llaminar.sh [llaminar arguments]`
 
 ### 2. **Updated Documentation**
 
@@ -71,15 +71,15 @@ mpirun -np ${SOCKETS} \
 
 ```bash
 # System topology and benchmarking
-./run-llaminar.sh -v --print-topology
-./run-llaminar.sh -vv --matrix-size 2048
+./run_llaminar.sh -v --print-topology
+./run_llaminar.sh -vv --matrix-size 2048
 
 # Model inference
-./run-llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
-./run-llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -vv --profile
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -vv --profile
 
 # Interactive usage
-./run-llaminar.sh --help
+./run_llaminar.sh --help
 ```
 
 This canonical approach ensures that all Llaminar deployments achieve optimal performance with the empirically-validated MPI and OpenMP configurations from our extensive testing work.

@@ -3423,7 +3423,7 @@ Llaminar includes a canonical launch script with empirically-optimized settings:
 
 ```bash
 # Always use the canonical launcher
-./run-llaminar.sh [arguments]
+./run_llaminar.sh [arguments]
 
 # The script automatically configures:
 # - OpenMP: Auto-detected cores per socket, socket placement, close binding
@@ -3463,22 +3463,22 @@ OMPI_MCA_btl_openib_allow_ib=1                  # InfiniBand support
 ### Basic Execution
 ```bash
 # Topology detection and system info
-./run-llaminar.sh -v --print-topology
+./run_llaminar.sh -v --print-topology
 
 # Performance benchmarking
-./run-llaminar.sh -vv --matrix-size 2048
+./run_llaminar.sh -vv --matrix-size 2048
 
 # GPU detection and profiling
-./run-llaminar.sh --detect-gpus --profile --trace
+./run_llaminar.sh --detect-gpus --profile --trace
 ```
 
 ### Model Inference
 ```bash
 # Load and run inference with Qwen 2.5 model
-./run-llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v
 
 # Verbose inference with profiling
-./run-llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -vv --profile
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -vv --profile
 ```
 
 ### Advanced Usage (Manual MPI)

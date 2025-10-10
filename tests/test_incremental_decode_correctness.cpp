@@ -48,17 +48,26 @@ namespace
         for (int l = 0; l < cfg.n_layers; ++l)
         {
             W.attn_norm_weight.push_back(make_vec(cfg.d_model));
-            W.wq.push_back(make_matrix(cfg.d_model, cfg.n_head * cfg.head_dim));
-            W.wk.push_back(make_matrix(cfg.d_model, cfg.n_head_kv * cfg.head_dim));
-            W.wv.push_back(make_matrix(cfg.d_model, cfg.n_head_kv * cfg.head_dim));
-            W.wo.push_back(make_matrix(cfg.n_head * cfg.head_dim, cfg.d_model));
+            // GGUF format: Q/K/V projections are [out_features, in_features] = [n_head*head_dim, d_model]
+            W.wq.push_back(make_matrix(cfg.n_head * cfg.head_dim, cfg.d_model));
+            W.wk.push_back(make_matrix(cfg.n_head_kv * cfg.head_dim, cfg.d_model));
+            W.wv.push_back(make_matrix(cfg.n_head_kv * cfg.head_dim, cfg.d_model));
+            // wo remains [n_head*head_dim, d_model] (output projection is different format)
+            W.wo.push_back(make_matrix(cfg.d_model, cfg.n_head * cfg.head_dim));
+            // Qwen models DO use attention biases (range can be large: [-79, +47])
+            // Create small dummy biases for testing
+            W.bq.push_back(make_vec(cfg.n_head * cfg.head_dim));
+            W.bk.push_back(make_vec(cfg.n_head_kv * cfg.head_dim));
+            W.bv.push_back(make_vec(cfg.n_head_kv * cfg.head_dim));
             W.ffn_norm_weight.push_back(make_vec(cfg.d_model));
-            W.w_gate.push_back(make_matrix(cfg.d_model, cfg.d_ff));
-            W.w_up.push_back(make_matrix(cfg.d_model, cfg.d_ff));
-            W.w_down.push_back(make_matrix(cfg.d_ff, cfg.d_model));
+            // GGUF format: FFN projections are [out_features, in_features]
+            W.w_gate.push_back(make_matrix(cfg.d_ff, cfg.d_model));
+            W.w_up.push_back(make_matrix(cfg.d_ff, cfg.d_model));
+            W.w_down.push_back(make_matrix(cfg.d_model, cfg.d_ff));
         }
         W.output_norm_weight = make_vec(cfg.d_model);
-        W.lm_head = make_matrix(cfg.d_model, cfg.vocab_size);
+        // GGUF format: lm_head is [vocab_size, d_model]
+        W.lm_head = make_matrix(cfg.vocab_size, cfg.d_model);
         return W;
     }
 

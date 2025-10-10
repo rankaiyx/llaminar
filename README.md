@@ -29,7 +29,7 @@ The following environment variables enable additional logging, validation, and i
 | `LLAMINAR_COSMA_MAX_RESIDENT_MB` | Soft cap on resident COSMA working set in MiB. | Integer; default: `2048` | Prefill manager may fallback if estimate exceeds budget. |
 | `LLAMINAR_COSMA_VALIDATE_TILE` | Enable small tile correctness spot-check (relative L2) vs OpenBLAS. | Integer (tile size) or `0` to disable; default: `0` | Debug / validation only. |
 | `LLAMINAR_COSMA_LOG_LEVEL` | Verbosity for COSMA prefill instrumentation. | `trace|debug|info|warn|error`; default: `info` | Independent of global logging level. |
-| `OMP_NUM_THREADS` / `OMP_*` | Controls OpenMP threading behavior. | See `run-llaminar.sh` | Script sets optimal defaults (NUMA-aware binding). |
+| `OMP_NUM_THREADS` / `OMP_*` | Controls OpenMP threading behavior. | See `run_llaminar.sh` | Script sets optimal defaults (NUMA-aware binding). |
 | `KMP_AFFINITY` / `KMP_BLOCKTIME` | Fine-grain thread affinity & spin-wait tuning. | See script defaults | Only relevant for Intel OpenMP runtime. |
 | `LLAMINAR_EMBED_TRACE` | Enable detailed per-rank embedding buffer diagnostics (min/max, NaN/Inf counts, token & value preview). | Any non-empty (not `0`) enables; default: disabled | Produces TRACE logs labelled `MPIEmbeddingKernel[local_pre_gather|global_post_gather]`. Combine with `LLAMINAR_EMBED_TRACE_TOKENS` / `LLAMINAR_EMBED_TRACE_DIMS`. |
 | `LLAMINAR_EMBED_TRACE_TOKENS` | Limit number of tokens shown in embedding diagnostics. | Positive integer; default: `2` | Ignored unless `LLAMINAR_EMBED_TRACE` enabled. |
@@ -64,15 +64,15 @@ export LLAMINAR_EMBED_FAIL_FAST=1
 ### Running (Canonical Method)
 ```bash
 # Always use the canonical launcher for optimal performance
-./run-llaminar.sh [arguments]
+./run_llaminar.sh [arguments]
 
 
 # Examples:
-./run-llaminar.sh -v --print-topology                    # System info
-./run-llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v  # Model inference
+./run_llaminar.sh -v --print-topology                    # System info
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf -v  # Model inference
 ```
 
-The `run-llaminar.sh` script automatically configures optimal MPI and OpenMP settings:
+The `run_llaminar.sh` script automatically configures optimal MPI and OpenMP settings:
 - **OpenMP**: 28 threads per socket, socket placement, close binding
 - **MPI**: 1 process per socket with memory pinning and NUMA awareness
 - **Threading**: Adaptive backend selection (single/multi/distributed)
@@ -467,4 +467,4 @@ High-performance, distributed LLM inference engine.
 
 ## Build
 
-See `./run-llaminar.sh -h` for runtime options or consult the development guidelines in `.github/copilot-instructions.md`.
+See `./run_llaminar.sh -h` for runtime options or consult the development guidelines in `.github/copilot-instructions.md`.

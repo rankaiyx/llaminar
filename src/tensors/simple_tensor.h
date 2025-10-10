@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tensor_base.h"
+#include "../logger.h"
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
@@ -56,8 +57,8 @@ namespace llaminar
                 {
                     if (data_[i] != 0.0f)
                     {
-                        std::cerr << "[SimpleTensor-CTOR-" << tensor_count
-                                  << "] ⚠️ NON-ZERO at index " << i << ": " << data_[i] << std::endl;
+                        LOG_DEBUG("[SimpleTensor-CTOR-" << tensor_count
+                                                        << "] ⚠️ NON-ZERO at index " << i << ": " << data_[i]);
                         has_nonzero = true;
                         break;
                     }
@@ -65,19 +66,19 @@ namespace llaminar
 
                 if (!has_nonzero)
                 {
-                    std::cerr << "[SimpleTensor-CTOR-" << tensor_count << "] shape=" << shape_str
-                              << " size=" << total_size
-                              << " data_ptr=" << (void *)data_.data()
-                              << " first_val=" << (total_size > 0 ? data_[0] : 0.0f)
-                              << " last_val=" << (total_size > 0 ? data_[total_size - 1] : 0.0f)
-                              << " all_zeros=YES" << std::endl;
+                    LOG_DEBUG("[SimpleTensor-CTOR-" << tensor_count << "] shape=" << shape_str
+                                                    << " size=" << total_size
+                                                    << " data_ptr=" << (void *)data_.data()
+                                                    << " first_val=" << (total_size > 0 ? data_[0] : 0.0f)
+                                                    << " last_val=" << (total_size > 0 ? data_[total_size - 1] : 0.0f)
+                                                    << " all_zeros=YES");
                 }
                 else
                 {
-                    std::cerr << "[SimpleTensor-CTOR-" << tensor_count << "] shape=" << shape_str
-                              << " size=" << total_size
-                              << " data_ptr=" << (void *)data_.data()
-                              << " CORRUPTED!" << std::endl;
+                    LOG_DEBUG("[SimpleTensor-CTOR-" << tensor_count << "] shape=" << shape_str
+                                                    << " size=" << total_size
+                                                    << " data_ptr=" << (void *)data_.data()
+                                                    << " CORRUPTED!");
                 }
             }
         }

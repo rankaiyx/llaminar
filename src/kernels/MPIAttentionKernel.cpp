@@ -366,11 +366,10 @@ namespace llaminar
         // DEBUG: Confirm execution
         if (rank == 0)
         {
-            std::cerr << "[EXECUTE] MPIAttentionKernel::execute() called"
+            LOG_DEBUG("[EXECUTE] MPIAttentionKernel::execute() called"
                       << " layer=" << layer_index_
                       << " cosma_mgr=" << (void *)cosma_mgr_
-                      << " snapshot_cb=" << (snapshot_callback_ ? "SET" : "NULL")
-                      << std::endl;
+                      << " snapshot_cb=" << (snapshot_callback_ ? "SET" : "NULL"));
         }
 
         const auto &debug_snapshot = debugEnv();
@@ -605,17 +604,17 @@ namespace llaminar
                 float wq_sum = std::accumulate(wq_global->data(), wq_global->data() + wq_global->size(), 0.0f);
                 float wq_mean = wq_sum / wq_global->size();
 
-                LOG_INFO("[INPUT_DEBUG] Layer " << layer_index_ << " Input stats: "
-                                                << "size=" << input->size() << " shape=[" << seq_len << "," << d_model << "] "
-                                                << "min=" << input_min << " max=" << input_max << " mean=" << input_mean << " "
-                                                << "sample[0:5]=[" << input->data()[0] << "," << input->data()[1] << ","
-                                                << input->data()[2] << "," << input->data()[3] << "," << input->data()[4] << "]");
+                LOG_DEBUG("[INPUT_DEBUG] Layer " << layer_index_ << " Input stats: "
+                                                 << "size=" << input->size() << " shape=[" << seq_len << "," << d_model << "] "
+                                                 << "min=" << input_min << " max=" << input_max << " mean=" << input_mean << " "
+                                                 << "sample[0:5]=[" << input->data()[0] << "," << input->data()[1] << ","
+                                                 << input->data()[2] << "," << input->data()[3] << "," << input->data()[4] << "]");
 
-                LOG_INFO("[INPUT_DEBUG] Layer " << layer_index_ << " WQ stats: "
-                                                << "size=" << wq_global->size() << " shape=[" << expected_wq_rows << "," << d_model << "] "
-                                                << "min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean << " "
-                                                << "sample[0:5]=[" << wq_global->data()[0] << "," << wq_global->data()[1] << ","
-                                                << wq_global->data()[2] << "," << wq_global->data()[3] << "," << wq_global->data()[4] << "]");
+                LOG_DEBUG("[INPUT_DEBUG] Layer " << layer_index_ << " WQ stats: "
+                                                 << "size=" << wq_global->size() << " shape=[" << expected_wq_rows << "," << d_model << "] "
+                                                 << "min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean << " "
+                                                 << "sample[0:5]=[" << wq_global->data()[0] << "," << wq_global->data()[1] << ","
+                                                 << wq_global->data()[2] << "," << wq_global->data()[3] << "," << wq_global->data()[4] << "]");
             }
         }
 
@@ -972,23 +971,23 @@ namespace llaminar
                 float v_sum = std::accumulate(local_v->data(), local_v->data() + local_v->size(), 0.0f);
                 float v_mean = v_sum / local_v->size();
 
-                LOG_INFO("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " Q projection stats: "
-                                                   << "size=" << local_q->size() << " "
-                                                   << "min=" << q_min << " max=" << q_max << " mean=" << q_mean << " "
-                                                   << "sample[0:5]=[" << local_q->data()[0] << "," << local_q->data()[1] << ","
-                                                   << local_q->data()[2] << "," << local_q->data()[3] << "," << local_q->data()[4] << "]");
+                LOG_DEBUG("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " Q projection stats: "
+                                                    << "size=" << local_q->size() << " "
+                                                    << "min=" << q_min << " max=" << q_max << " mean=" << q_mean << " "
+                                                    << "sample[0:5]=[" << local_q->data()[0] << "," << local_q->data()[1] << ","
+                                                    << local_q->data()[2] << "," << local_q->data()[3] << "," << local_q->data()[4] << "]");
 
-                LOG_INFO("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " K projection stats: "
-                                                   << "size=" << local_k->size() << " "
-                                                   << "min=" << k_min << " max=" << k_max << " mean=" << k_mean << " "
-                                                   << "sample[0:5]=[" << local_k->data()[0] << "," << local_k->data()[1] << ","
-                                                   << local_k->data()[2] << "," << local_k->data()[3] << "," << local_k->data()[4] << "]");
+                LOG_DEBUG("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " K projection stats: "
+                                                    << "size=" << local_k->size() << " "
+                                                    << "min=" << k_min << " max=" << k_max << " mean=" << k_mean << " "
+                                                    << "sample[0:5]=[" << local_k->data()[0] << "," << local_k->data()[1] << ","
+                                                    << local_k->data()[2] << "," << local_k->data()[3] << "," << local_k->data()[4] << "]");
 
-                LOG_INFO("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " V projection stats: "
-                                                   << "size=" << local_v->size() << " "
-                                                   << "min=" << v_min << " max=" << v_max << " mean=" << v_mean << " "
-                                                   << "sample[0:5]=[" << local_v->data()[0] << "," << local_v->data()[1] << ","
-                                                   << local_v->data()[2] << "," << local_v->data()[3] << "," << local_v->data()[4] << "]");
+                LOG_DEBUG("[SNAPSHOT_DEBUG] Layer " << layer_index_ << " V projection stats: "
+                                                    << "size=" << local_v->size() << " "
+                                                    << "min=" << v_min << " max=" << v_max << " mean=" << v_mean << " "
+                                                    << "sample[0:5]=[" << local_v->data()[0] << "," << local_v->data()[1] << ","
+                                                    << local_v->data()[2] << "," << local_v->data()[3] << "," << local_v->data()[4] << "]");
             }
         }
         else
@@ -1012,8 +1011,8 @@ namespace llaminar
         // Each rank has [seq_len, local_head_dim] in row-major order
         // We need to concatenate the head dimension per row to get [seq_len, total_head_dim]
 
-        std::cerr << "[MPIAttentionKernel] Layer " << layer_index_ << ": snapshot_callback_="
-                  << (snapshot_callback_ ? "SET" : "NULL") << ", world_size=" << world_size << std::endl;
+        LOG_DEBUG("[MPIAttentionKernel] Layer " << layer_index_ << ": snapshot_callback_="
+                                                << (snapshot_callback_ ? "SET" : "NULL") << ", world_size=" << world_size);
 
         if (snapshot_callback_ && world_size > 1)
         {
@@ -1143,8 +1142,8 @@ namespace llaminar
         // =======================================================================
         if (rank == 0 && layer_index_ == 0)
         {
-            LOG_INFO("========== ROPE_APPLICATION DEBUG STEP 1: PRE-ROPE VALIDATION ==========");
-            LOG_INFO("[ROPE_PARAMS] Parameters being passed to apply_rope():");
+            LOG_DEBUG("========== ROPE_APPLICATION DEBUG STEP 1: PRE-ROPE VALIDATION ==========");
+            LOG_DEBUG("[ROPE_PARAMS] Parameters being passed to apply_rope():");
             LOG_INFO("  seq_len: " << seq_len << " (expected: 5 for test prompt)");
             LOG_INFO("  head_dim: " << head_dim_ << " (expected: 64 for Qwen-0.5B)");
             LOG_INFO("  local_heads (q_heads param): " << local_heads << " (expected: 7 per rank for 14 total)");
@@ -1152,29 +1151,29 @@ namespace llaminar
             LOG_INFO("  n_past: 0 (hardcoded - prefill)");
             LOG_INFO("  rope_freq_base: " << rope_freq_base_ << " (expected: 10000)");
 
-            LOG_INFO("[ROPE_TENSORS] Tensor shapes before RoPE:");
+            LOG_DEBUG("[ROPE_TENSORS] Tensor shapes before RoPE:");
             LOG_INFO("  local_q size: " << local_q->size() << " shape: [" << seq_len << ", " << local_head_dim << "]");
             LOG_INFO("  local_k size: " << local_k->size() << " shape: [" << seq_len << ", " << local_kv_head_dim << "]");
             LOG_INFO("  local_head_dim: " << local_head_dim << " = " << local_heads << " heads * " << head_dim_ << " dims");
             LOG_INFO("  local_kv_head_dim: " << local_kv_head_dim << " = " << local_kv_heads << " heads * " << head_dim_ << " dims");
 
-            LOG_INFO("[PRE_ROPE_Q] Token 0, head 0, first 10 dims: ["
-                     << local_q->data()[0] << ", " << local_q->data()[1] << ", "
-                     << local_q->data()[2] << ", " << local_q->data()[3] << ", "
-                     << local_q->data()[4] << ", " << local_q->data()[5] << ", "
-                     << local_q->data()[6] << ", " << local_q->data()[7] << ", "
-                     << local_q->data()[8] << ", " << local_q->data()[9] << "]");
+            LOG_DEBUG("[PRE_ROPE_Q] Token 0, head 0, first 10 dims: ["
+                      << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+                      << local_q->data()[2] << ", " << local_q->data()[3] << ", "
+                      << local_q->data()[4] << ", " << local_q->data()[5] << ", "
+                      << local_q->data()[6] << ", " << local_q->data()[7] << ", "
+                      << local_q->data()[8] << ", " << local_q->data()[9] << "]");
 
             // Check position 0 values - these should be close to Q_PROJECTION outputs
-            LOG_INFO("[PRE_ROPE_Q] Token 0, head 0, dims [2,3,4] (key for comparison): "
-                     << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4]);
+            LOG_DEBUG("[PRE_ROPE_Q] Token 0, head 0, dims [2,3,4] (key for comparison): "
+                      << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4]);
 
-            LOG_INFO("[PRE_ROPE_K] Token 0, head 0, first 10 dims: ["
-                     << local_k->data()[0] << ", " << local_k->data()[1] << ", "
-                     << local_k->data()[2] << ", " << local_k->data()[3] << ", "
-                     << local_k->data()[4] << ", " << local_k->data()[5] << ", "
-                     << local_k->data()[6] << ", " << local_k->data()[7] << ", "
-                     << local_k->data()[8] << ", " << local_k->data()[9] << "]");
+            LOG_DEBUG("[PRE_ROPE_K] Token 0, head 0, first 10 dims: ["
+                      << local_k->data()[0] << ", " << local_k->data()[1] << ", "
+                      << local_k->data()[2] << ", " << local_k->data()[3] << ", "
+                      << local_k->data()[4] << ", " << local_k->data()[5] << ", "
+                      << local_k->data()[6] << ", " << local_k->data()[7] << ", "
+                      << local_k->data()[8] << ", " << local_k->data()[9] << "]");
         }
 
         llaminar::attn::apply_rope(local_q->data(), local_k->data(),
@@ -1186,39 +1185,39 @@ namespace llaminar
         // =======================================================================
         if (rank == 0 && layer_index_ == 0)
         {
-            LOG_INFO("========== ROPE_APPLICATION DEBUG STEP 2: POST-ROPE VALUES ==========");
-            LOG_INFO("[POST_ROPE_Q] Token 0, head 0, first 10 dims: ["
-                     << local_q->data()[0] << ", " << local_q->data()[1] << ", "
-                     << local_q->data()[2] << ", " << local_q->data()[3] << ", "
-                     << local_q->data()[4] << ", " << local_q->data()[5] << ", "
-                     << local_q->data()[6] << ", " << local_q->data()[7] << ", "
-                     << local_q->data()[8] << ", " << local_q->data()[9] << "]");
+            LOG_DEBUG("========== ROPE_APPLICATION DEBUG STEP 2: POST-ROPE VALUES ==========");
+            LOG_DEBUG("[POST_ROPE_Q] Token 0, head 0, first 10 dims: ["
+                      << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+                      << local_q->data()[2] << ", " << local_q->data()[3] << ", "
+                      << local_q->data()[4] << ", " << local_q->data()[5] << ", "
+                      << local_q->data()[6] << ", " << local_q->data()[7] << ", "
+                      << local_q->data()[8] << ", " << local_q->data()[9] << "]");
 
             // At position 0, RoPE should be identity (angle=0, cos=1, sin=0)
             // So post-RoPE values should match pre-RoPE values
-            LOG_INFO("[POST_ROPE_Q] Token 0 CHECK: dims [2,3,4] should match pre-RoPE: "
-                     << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4]);
+            LOG_DEBUG("[POST_ROPE_Q] Token 0 CHECK: dims [2,3,4] should match pre-RoPE: "
+                      << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4]);
 
-            LOG_INFO("[POST_ROPE_K] Token 0, head 0, first 10 dims: ["
-                     << local_k->data()[0] << ", " << local_k->data()[1] << ", "
-                     << local_k->data()[2] << ", " << local_k->data()[3] << ", "
-                     << local_k->data()[4] << ", " << local_k->data()[5] << ", "
-                     << local_k->data()[6] << ", " << local_k->data()[7] << ", "
-                     << local_k->data()[8] << ", " << local_k->data()[9] << "]");
+            LOG_DEBUG("[POST_ROPE_K] Token 0, head 0, first 10 dims: ["
+                      << local_k->data()[0] << ", " << local_k->data()[1] << ", "
+                      << local_k->data()[2] << ", " << local_k->data()[3] << ", "
+                      << local_k->data()[4] << ", " << local_k->data()[5] << ", "
+                      << local_k->data()[6] << ", " << local_k->data()[7] << ", "
+                      << local_k->data()[8] << ", " << local_k->data()[9] << "]");
 
             // Check token 1 to verify rotation happened
             int token1_offset = local_head_dim;
-            LOG_INFO("[POST_ROPE_Q] Token 1, head 0, first 10 dims (should differ from Token 0): ["
-                     << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
-                     << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
-                     << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
-                     << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
-                     << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
+            LOG_DEBUG("[POST_ROPE_Q] Token 1, head 0, first 10 dims (should differ from Token 0): ["
+                      << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
+                      << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
+                      << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
+                      << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
+                      << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
         }
 
         if (layer_index_ == 0)
         {
-            LOG_INFO("[RANK=" << rank << "] AFTER RoPE:");
+            LOG_DEBUG("[RANK=" << rank << "] AFTER RoPE:");
             LOG_INFO("  local_q[token=0, head=0, dim=0:10]: ["
                      << local_q->data()[0] << ", " << local_q->data()[1] << ", "
                      << local_q->data()[2] << ", " << local_q->data()[3] << ", "
@@ -1272,7 +1271,7 @@ namespace llaminar
 
             if (rank == 0 && layer_index_ == 0)
             {
-                LOG_INFO("[ROPE_SNAPSHOT_DEBUG] Gathering ROPE_APPLICATION:");
+                LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] Gathering ROPE_APPLICATION:");
                 LOG_INFO("  world_size=" << world_size << " local_heads=" << local_heads
                                          << " local_kv_heads=" << local_kv_heads);
                 LOG_INFO("  n_head_=" << n_head_ << " n_head_kv_=" << n_head_kv_ << " head_dim_=" << head_dim_);
@@ -1294,12 +1293,13 @@ namespace llaminar
                 // DEBUG: Check local Q values before gather
                 if (rank == 0 && layer_index_ == 0)
                 {
-                    LOG_INFO("[ROPE_SNAPSHOT_DEBUG] Rank 0 local_q[t=0] first 10 values:");
+                    std::ostringstream oss;
+                    oss << "[ROPE_SNAPSHOT_DEBUG] Rank 0 local_q[t=0] first 10 values: ";
                     for (int i = 0; i < 10 && i < local_head_dim; ++i)
                     {
-                        std::cout << local_q->data()[i] << " ";
+                        oss << local_q->data()[i] << " ";
                     }
-                    std::cout << std::endl;
+                    LOG_DEBUG(oss.str());
                 }
 
                 // DEBUG: Log local_k before gathering (layer 0 only)
@@ -1357,19 +1357,21 @@ namespace llaminar
                 // DEBUG: Check gathered values
                 if (rank == 0 && layer_index_ == 0)
                 {
-                    LOG_INFO("[ROPE_SNAPSHOT_DEBUG] After MPI_Allgather, global_q[t=0]:");
-                    LOG_INFO("  First 10 (from rank 0): ");
+                    LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] After MPI_Allgather, global_q[t=0]:");
+                    std::ostringstream oss1;
+                    oss1 << "  First 10 (from rank 0): ";
                     for (int i = 0; i < 10 && i < d_model_; ++i)
                     {
-                        std::cout << global_q_rope->data()[i] << " ";
+                        oss1 << global_q_rope->data()[i] << " ";
                     }
-                    std::cout << std::endl;
-                    LOG_INFO("  Elements [" << local_head_dim << ".." << (local_head_dim + 10) << "] (from rank 1): ");
+                    LOG_DEBUG(oss1.str());
+                    std::ostringstream oss2;
+                    oss2 << "  Elements [" << local_head_dim << ".." << (local_head_dim + 10) << "] (from rank 1): ";
                     for (int i = local_head_dim; i < local_head_dim + 10 && i < d_model_; ++i)
                     {
-                        std::cout << global_q_rope->data()[i] << " ";
+                        oss2 << global_q_rope->data()[i] << " ";
                     }
-                    std::cout << std::endl;
+                    LOG_DEBUG(oss2.str());
                 }
             }
             else
@@ -1405,31 +1407,37 @@ namespace llaminar
                 // DEBUG: Show final concatenated values
                 if (rank == 0 && layer_index_ == 0)
                 {
-                    LOG_INFO("[ROPE_SNAPSHOT_DEBUG] Final rope_combined[t=0]:");
-                    LOG_INFO("  First 10 (Q): ");
+                    LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] Final rope_combined[t=0]:");
+                    std::ostringstream oss1;
+                    oss1 << "  First 10 (Q): ";
                     for (int i = 0; i < 10; ++i)
                     {
-                        std::cout << rope_combined->data()[i] << " ";
+                        oss1 << rope_combined->data()[i] << " ";
                     }
-                    std::cout << std::endl;
-                    LOG_INFO("  Elements [" << d_model_ << ".." << (d_model_ + 10) << "] (K start): ");
+                    LOG_DEBUG(oss1.str());
+                    std::ostringstream oss2;
+                    oss2 << "  Elements [" << d_model_ << ".." << (d_model_ + 10) << "] (K start): ";
                     for (int i = d_model_; i < d_model_ + 10; ++i)
                     {
-                        std::cout << rope_combined->data()[i] << " ";
+                        oss2 << rope_combined->data()[i] << " ";
                     }
-                    std::cout << std::endl;
-                    LOG_INFO("  Total rope_combined size: " << rope_combined->size()
-                                                            << " expected: " << (seq_len * (d_model_ + k_v_dim)));
+                    LOG_DEBUG(oss2.str());
+                    LOG_DEBUG("  Total rope_combined size: " << rope_combined->size()
+                                                             << " expected: " << (seq_len * (d_model_ + k_v_dim)));
 
                     // CRITICAL DEBUG: Check position [3,992] which is the failing position
                     // Token 3, position 992, which is dim 96 of K (992 - 896 = 96)
-                    const int failing_token = 3;
-                    const int failing_pos = 992;
-                    const int row_size = d_model_ + k_v_dim;
-                    const int failing_offset = failing_token * row_size + failing_pos;
-                    LOG_INFO("  CRITICAL: rope_combined[token=" << failing_token << ", pos=" << failing_pos << "] (offset=" << failing_offset << "): "
-                                                                << rope_combined->data()[failing_offset]);
-                    LOG_INFO("  This should be K[token=3, dim=96] = K[token=3, kv_head=1, dim_in_head=32]");
+                    // NOTE: Only valid for production Qwen-0.5B dimensions (d_model=896, seq_len>=4)
+                    if (d_model_ >= 896 && seq_len >= 4)
+                    {
+                        const int failing_token = 3;
+                        const int failing_pos = 992;
+                        const int row_size = d_model_ + k_v_dim;
+                        const int failing_offset = failing_token * row_size + failing_pos;
+                        LOG_INFO("  CRITICAL: rope_combined[token=" << failing_token << ", pos=" << failing_pos << "] (offset=" << failing_offset << "): "
+                                                                    << rope_combined->data()[failing_offset]);
+                        LOG_INFO("  This should be K[token=3, dim=96] = K[token=3, kv_head=1, dim_in_head=32]");
+                    }
                 }
 
                 // Only rank 0 needs to snapshot
@@ -1470,7 +1478,7 @@ namespace llaminar
             // DEBUG: Log after GQA expansion (layer 0 only)
             if (layer_index_ == 0)
             {
-                LOG_INFO("[RANK=" << rank << "] After GQA expansion:");
+                LOG_DEBUG("[RANK=" << rank << "] After GQA expansion:");
                 LOG_INFO("  K_expanded[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
                                                  << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
 
@@ -1506,14 +1514,14 @@ namespace llaminar
                                                     << " shape=[" << (local_heads * seq_len) << "," << head_dim_ << "]");
 
                 // CRITICAL: Verify memory layout expectations
-                LOG_INFO("[MEMORY_LAYOUT_DEBUG] Q tensor layout check:");
+                LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] Q tensor layout check:");
                 LOG_INFO("  Expected by compute_qk_scores: Q[token, head, dim] flattened");
                 LOG_INFO("  Index formula: q[i, h, d] = q[(i * heads * head_dim) + (h * head_dim) + d]");
                 LOG_INFO("  For token i=0, head h=0: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = d");
                 LOG_INFO("  For token i=0, head h=1: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (1 * " << head_dim_ << ") + d = " << head_dim_ << " + d");
                 LOG_INFO("  For token i=1, head h=0: offset = (1 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = " << (local_heads * head_dim_) << " + d");
 
-                LOG_INFO("  Actual Q memory layout after projection:");
+                LOG_DEBUG("  Actual Q memory layout after projection:");
                 LOG_INFO("    Q[t=0, h=0, d=0:5]: "
                          << local_q->data()[0] << ", " << local_q->data()[1] << ", "
                          << local_q->data()[2] << ", " << local_q->data()[3] << ", "
@@ -1531,7 +1539,7 @@ namespace llaminar
                          << local_q->data()[offset_t1_h0 + 2] << ", " << local_q->data()[offset_t1_h0 + 3] << ", "
                          << local_q->data()[offset_t1_h0 + 4]);
 
-                LOG_INFO("[MEMORY_LAYOUT_DEBUG] K_expanded tensor layout check:");
+                LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] K_expanded tensor layout check:");
                 LOG_INFO("  K[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
                                         << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
                 LOG_INFO("    K[t=0, h=0, d=0:5]: "
@@ -1794,10 +1802,9 @@ namespace llaminar
 
         if (rank == 0)
         {
-            fprintf(stderr, "[kernel-test] rank %d local_attended[0,0:4]: %.6f, %.6f, %.6f, %.6f\n",
-                    rank, local_attended->data()[0], local_attended->data()[1],
-                    local_attended->data()[2], local_attended->data()[3]);
-            fflush(stderr);
+            LOG_DEBUG("[kernel-test] rank " << rank << " local_attended[0,0:4]: "
+                                            << local_attended->data()[0] << ", " << local_attended->data()[1] << ", "
+                                            << local_attended->data()[2] << ", " << local_attended->data()[3]);
         }
 
         // ========================================================================
@@ -1872,10 +1879,9 @@ namespace llaminar
 
         if (rank == 0)
         {
-            fprintf(stderr, "[kernel-test] rank %d final_output[0,0:4]: %.6f, %.6f, %.6f, %.6f\n",
-                    rank, local_output->data()[0], local_output->data()[1],
-                    local_output->data()[2], local_output->data()[3]);
-            fflush(stderr);
+            LOG_DEBUG("[kernel-test] rank " << rank << " final_output[0,0:4]: "
+                                            << local_output->data()[0] << ", " << local_output->data()[1] << ", "
+                                            << local_output->data()[2] << ", " << local_output->data()[3]);
         }
 
         // Contract: Validate final output after MPI aggregation

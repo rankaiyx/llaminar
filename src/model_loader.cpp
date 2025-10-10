@@ -1075,7 +1075,7 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
     // DEBUG: Log info->dimensions before any processing
     if (tensor_name.find("attn_k") != std::string::npos && info->dimensions.size() >= 2)
     {
-        LOG_ERROR("[DIMS_DEBUG] tensor='" << tensor_name << "' info->dimensions=[" << info->dimensions[0] << ", " << info->dimensions[1] << "] dims=[" << dims[0] << ", " << dims[1] << "]");
+        LOG_DEBUG("[DIMS_DEBUG] tensor='" << tensor_name << "' info->dimensions=[" << info->dimensions[0] << ", " << info->dimensions[1] << "] dims=[" << dims[0] << ", " << dims[1] << "]");
     }
 
     // If we sliced, adjust the last dimension to match data length
@@ -1656,8 +1656,8 @@ std::vector<float> ModelLoader::dequantizeTensor(const GGUFTensorInfo &tensor_in
             std::cerr << "[ENUM MAP NOTE] Unsupported id: Q8_1=9 (Q4_1 & Q5_1 restored)" << std::endl;
         }
     }
-    std::cerr << "[DEQ ENTRY] tensor='" << tensor_name << "' enum=" << static_cast<int>(tensor_info.type)
-              << " bytes=" << quantized_data.size() << std::endl;
+    LOG_DEBUG("[DEQ ENTRY] tensor='" << tensor_name << "' enum=" << static_cast<int>(tensor_info.type)
+              << " bytes=" << quantized_data.size());
     LOG_TRACE("dequantizeTensor: Enter name='" << tensor_name << "' type=" << static_cast<int>(tensor_info.type)
                                                << " quantized_bytes=" << quantized_data.size());
     const IDequantizer *dq = selectDequantizer(tensor_info.type);

@@ -305,9 +305,9 @@ namespace llaminar
             auto dec = selectAttentionBackend(bctx);
             if (getRank() == 0)
             {
-                std::cerr << "[BACKEND_DECISION_PREFILL] layer=" << layer_idx
+                LOG_DEBUG("[BACKEND_DECISION_PREFILL] layer=" << layer_idx
                           << " use_cosma=" << dec.use_cosma()
-                          << " seq_len=" << seq_len << std::endl;
+                          << " seq_len=" << seq_len);
             }
             if (dec.use_cosma())
             {

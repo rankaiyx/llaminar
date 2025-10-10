@@ -237,14 +237,9 @@ namespace llaminar
     }
 
     CosmaPrefillManager::CosmaPrefillManager()
+        : world_size_(1), rank_(0), threshold_(4096), max_resident_mb_(2048),
+          fast_path_threshold_ops_(64LL * 64LL * 64LL), log_level_(2)
     {
-        // Initialize MPI context
-        if (mpi_is_initialized())
-        {
-            MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
-        }
-
         // Read centralized environment configuration
         const auto &env = debugEnv();
 
@@ -254,27 +249,49 @@ namespace llaminar
         // Memory budget (MB)
         max_resident_mb_ = env.cosma.max_resident_mb;
 
-        // Fast path threshold (bypass COSMA for very small ops)
-        fast_path_threshold_ops_ = 64LL * 64LL * 64LL; // 262,144 operations
-
-        // Log level (simplified)
-        log_level_ = 2; // INFO
-
-        if (rank_ == 0 && threshold_ > 0)
-        {
-            LOG_INFO("[CosmaPrefillManager] Initialized: world_size=" << world_size_
-                                                                      << ", threshold=" << threshold_
-                                                                      << ", max_resident_mb=" << max_resident_mb_);
-        }
+        // Note: MPI context is initialized lazily on first use, not in constructor
+        // This avoids calling MPI functions before MPI_Init() when singleton is created
     }
 
     CosmaPrefillManager::~CosmaPrefillManager()
     {
         // Automatic cleanup via RAII - no manual memory management needed
-        if (rank_ == 0)
+        if (mpi_context_initialized_ && rank_ == 0)
         {
             LOG_DEBUG("[CosmaPrefillManager] Destroyed");
         }
+    }
+
+    /**
+     * @brief Ensure MPI context is initialized (lazy initialization)
+     * 
+     * @note Called on first use to avoid calling MPI functions before MPI_Init()
+     */
+    void CosmaPrefillManager::ensure_mpi_context()
+    {
+        if (mpi_context_initialized_)
+        {
+            return;
+        }
+
+        if (mpi_is_initialized())
+        {
+            MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
+            
+            if (rank_ == 0)
+            {
+                const auto &env = debugEnv();
+                if (threshold_ > 0)
+                {
+                    LOG_INFO("[CosmaPrefillManager] Initialized: world_size=" << world_size_
+                                                                              << ", threshold=" << threshold_
+                                                                              << ", max_resident_mb=" << max_resident_mb_);
+                }
+            }
+        }
+
+        mpi_context_initialized_ = true;
     }
 
     // ========================================================================
@@ -291,6 +308,9 @@ namespace llaminar
      */
     bool CosmaPrefillManager::enabled_for(int seq_len) const
     {
+        // Ensure MPI context is initialized before accessing world_size_/rank_
+        const_cast<CosmaPrefillManager*>(this)->ensure_mpi_context();
+        
         const auto &env = debugEnv();
 
         // Explicit disable via environment
@@ -466,6 +486,9 @@ namespace llaminar
         int m,
         int k)
     {
+        // Ensure MPI context is initialized
+        ensure_mpi_context();
+        
         if (!row_major || m <= 0 || k <= 0)
         {
             LOG_ERROR("[convert_activation_in] Invalid inputs: m=" << m << ", k=" << k);
@@ -509,6 +532,9 @@ namespace llaminar
      */
     CosmaWeightHandle CosmaPrefillManager::load_weight(const WeightDescriptor &desc)
     {
+        // Ensure MPI context is initialized
+        ensure_mpi_context();
+        
         if (!desc.base_ptr || desc.rows <= 0 || desc.cols <= 0)
         {
             LOG_ERROR("[load_weight] Invalid descriptor: "
@@ -634,6 +660,9 @@ namespace llaminar
         float alpha,
         float beta)
     {
+        // Ensure MPI context is initialized
+        ensure_mpi_context();
+        
         if (!A.mat || !W.view.mat)
         {
             LOG_ERROR("[matmul] Invalid input matrices");

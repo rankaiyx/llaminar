@@ -239,6 +239,146 @@ namespace
     }
 
     /**
+     * @brief Generate PyTorch decode snapshots with variance-based thresholds
+     *
+     * Generates snapshots for incremental decode steps by:
+     * 1. Running prefill with the given tokens
+     * 2. Running N decode steps
+     * 3. Capturing all intermediate stages for each decode step
+     * 4. Measuring variance across multiple runs
+     * 5. Generating dynamic thresholds
+     *
+     * Output directory structure:
+     *   {output_dir}/decode_step_0/*.npy
+     *   {output_dir}/decode_step_1/*.npy
+     *   ...
+     *   {output_dir}/dynamic_thresholds.json
+     *
+     * @param model_path Path to GGUF model file
+     * @param prefill_tokens Token IDs for prefill phase
+     * @param num_decode_steps Number of decode steps to generate
+     * @param output_dir Base output directory for decode snapshots
+     * @param rank MPI rank
+     * @param num_runs Number of PyTorch runs for variance measurement (default: 3)
+     * @param safety_margin Safety multiplier for variance-based thresholds (default: 5.0)
+     * @return true if snapshots generated successfully
+     */
+    bool generate_pytorch_decode_snapshots(
+        const std::string &model_path,
+        const std::vector<int> &prefill_tokens,
+        int num_decode_steps,
+        const std::string &output_dir,
+        int rank,
+        int num_runs = 3,
+        float safety_margin = 5.0f)
+    {
+        int success = 0;
+
+        if (rank == 0)
+        {
+            std::cout << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cout << "GENERATING PYTORCH DECODE REFERENCE" << std::endl;
+            std::cout << std::string(80, '=') << std::endl;
+            std::cout << "Model:         " << model_path << std::endl;
+            std::cout << "Prefill tokens: ";
+            for (size_t i = 0; i < prefill_tokens.size(); ++i)
+            {
+                std::cout << prefill_tokens[i];
+                if (i < prefill_tokens.size() - 1)
+                    std::cout << ",";
+            }
+            std::cout << " (" << prefill_tokens.size() << " tokens)" << std::endl;
+            std::cout << "Decode steps:  " << num_decode_steps << std::endl;
+            std::cout << "Num runs:      " << num_runs << " (for variance measurement)" << std::endl;
+            std::cout << "Safety margin: " << safety_margin << "x" << std::endl;
+            std::cout << "Output dir:    " << output_dir << "/" << std::endl;
+            std::cout << std::string(80, '=') << std::endl
+                      << std::endl;
+
+            // Build token string
+            std::ostringstream token_str;
+            for (size_t i = 0; i < prefill_tokens.size(); ++i)
+            {
+                token_str << prefill_tokens[i];
+                if (i < prefill_tokens.size() - 1)
+                    token_str << ",";
+            }
+
+            // Build command - use variance threshold script with --mode decode
+            std::ostringstream cmd;
+            std::filesystem::path cwd = std::filesystem::current_path();
+            std::filesystem::path workspace_root = cwd;
+            if (cwd.filename() == "build")
+            {
+                workspace_root = cwd.parent_path();
+            }
+
+            std::string script_path = (workspace_root / "scripts" / "generate_variance_thresholds.py").string();
+
+            // Use venv Python if available, fallback to system python3
+            std::filesystem::path venv_python = workspace_root / ".venv" / "bin" / "python";
+            std::string python_cmd = std::filesystem::exists(venv_python) ? venv_python.string() : "python3";
+
+            cmd << python_cmd << " " << script_path
+                << " -m \"" << model_path << "\""
+                << " --tokens \"" << token_str.str() << "\""
+                << " -o \"" << output_dir << "\""
+                << " --mode decode"
+                << " --num-decode-steps " << num_decode_steps
+                << " --num-runs " << num_runs
+                << " --safety-margin " << safety_margin
+                << " --verbose"
+                << " 2>&1";
+
+            std::cout << "[PyTorch] Running decode variance analysis..." << std::endl;
+            std::cout << "[PyTorch] This will run prefill + " << num_decode_steps
+                      << " decode steps " << num_runs << " times" << std::endl;
+
+            // Execute
+            auto start = std::chrono::steady_clock::now();
+            int ret = system(cmd.str().c_str());
+            auto end = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
+
+            if (ret == 0)
+            {
+                std::cout << "\n"
+                          << std::string(80, '=') << std::endl;
+                std::cout << "✓ PyTorch decode reference generated successfully" << std::endl;
+                std::cout << "  Time: " << duration << "s" << std::endl;
+                std::cout << "  Output structure:" << std::endl;
+                for (int step = 0; step < num_decode_steps; ++step)
+                {
+                    std::cout << "    - decode_step_" << step << "/*.npy" << std::endl;
+                }
+                std::cout << "    - dynamic_thresholds.json" << std::endl;
+                std::cout << "    - variance_statistics.json" << std::endl;
+                std::cout << "    - threshold_summary.txt" << std::endl;
+                std::cout << std::string(80, '=') << std::endl
+                          << std::endl;
+                success = 1;
+            }
+            else
+            {
+                std::cerr << "\n"
+                          << std::string(80, '=') << std::endl;
+                std::cerr << "✗ PyTorch decode reference generation FAILED" << std::endl;
+                std::cerr << "  Exit code: " << ret << std::endl;
+                std::cerr << "  Command:   " << cmd.str() << std::endl;
+                std::cerr << std::string(80, '=') << std::endl
+                          << std::endl;
+                success = 0;
+            }
+        }
+
+        // Broadcast result to all ranks
+        MPI_Bcast(&success, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        return success == 1;
+    }
+
+    /**
      * @brief RAII guard for llama.cpp context
      */
     struct LlamaContextGuard
@@ -1658,6 +1798,299 @@ TEST(ParityFramework, CosmaModeValidation)
     {
         std::cout << "\n[COSMA_MODE_TEST] All COSMA modes tested successfully" << std::endl;
     }
+}
+
+/**
+ * @brief Test incremental decode against PyTorch ground truth with comprehensive snapshots
+ *
+ * This test validates that Llaminar's incremental decode implementation produces
+ * correct intermediate activations and logits at each decode step by comparing
+ * against PyTorch layer-by-layer snapshots.
+ *
+ * Test Strategy:
+ * 1. Generate PyTorch reference snapshots (automatic, fresh on each run):
+ *    - Runs PyTorch model with prefill + N decode steps
+ *    - Captures all intermediate stages for each decode step
+ *    - Measures variance across multiple runs
+ *    - Generates dynamic variance-based thresholds
+ *    - Output: pytorch_snapshots_mapped/decode_step_{0..N-1}/*.npy
+ *
+ * 2. Run Llaminar with same configuration:
+ *    a. Prefill with tokens [1,2,3,4,5]
+ *    b. Decode N steps (default 3), capturing all stages
+ *
+ * 3. For each decode step, compare against PyTorch snapshots:
+ *    - Embedding output
+ *    - Each transformer layer (6 stages × 24 layers):
+ *      * ATTENTION_NORM, ATTENTION_OUTPUT, ATTENTION_RESIDUAL
+ *      * FFN_NORM, FFN_DOWN, FFN_RESIDUAL
+ *    - Final norm
+ *    - LM head logits
+ *
+ * Validation provides ~145 snapshot comparisons per decode step, catching bugs
+ * at the exact pipeline stage where they occur.
+ *
+ * Prerequisites:
+ * - Model: models/Gemini-Distill-Qwen2.5-0.5B-ead-fp32.gguf (FP32 for precision)
+ * - Python environment: .venv/bin/python with PyTorch and transformers
+ *
+ * Usage:
+ *   ctest -R ParityFrameworkTest  # Runs automatically with MPI via CTest
+ *   # Or manually:
+ *   mpirun -np 2 ./build/test_parity_framework \
+ *     --gtest_filter="*IncrementalDecodeVsPyTorch*"
+ */
+TEST(ParityFramework, IncrementalDecodeVsPyTorch)
+{
+    int world_size = 1;
+    int rank = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    // Find model file
+    std::string model_path;
+    int model_not_found = 0;
+
+    if (rank == 0)
+    {
+        model_path = find_test_model();
+        model_not_found = model_path.empty() ? 1 : 0;
+    }
+
+    MPI_Bcast(&model_not_found, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (model_not_found)
+    {
+        GTEST_SKIP() << "No test model found - cannot run decode parity test";
+    }
+
+    broadcast_string(model_path, 0, MPI_COMM_WORLD);
+
+    // Test configuration
+    const int num_decode_steps = 3; // Test 3 decode steps for comprehensive validation
+    std::vector<int> prefill_tokens = {1, 2, 3, 4, 5};
+    std::string snapshot_base_dir = "pytorch_snapshots_mapped";
+
+    if (rank == 0)
+    {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "Incremental Decode vs PyTorch Test" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "[DECODE_PARITY] Model: " << model_path << std::endl;
+        std::cout << "[DECODE_PARITY] Prefill tokens: ";
+        for (size_t i = 0; i < prefill_tokens.size(); ++i)
+        {
+            std::cout << prefill_tokens[i];
+            if (i < prefill_tokens.size() - 1)
+                std::cout << ",";
+        }
+        std::cout << std::endl;
+        std::cout << "[DECODE_PARITY] Decode steps to validate: " << num_decode_steps << std::endl;
+    }
+
+    // Generate PyTorch decode reference snapshots (always fresh)
+    if (!generate_pytorch_decode_snapshots(model_path, prefill_tokens, num_decode_steps,
+                                           snapshot_base_dir, rank))
+    {
+        GTEST_FAIL() << "Failed to generate PyTorch decode reference snapshots";
+    }
+
+    std::string decode_snapshot_base = snapshot_base_dir + "/decode_step_";
+
+    // Disable COSMA for simpler validation
+    setenv("ADAPTIVE_DISABLE_COSMA", "1", 1);
+    CosmaPrefillManager &manager = CosmaPrefillManager::instance();
+    manager.set_force_cosma(false);
+
+    // Enable snapshot capture for Llaminar
+    setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
+    LlaminarSnapshotHook::set_enabled(true);
+    SnapshotRegistry &registry = SnapshotRegistry::instance();
+    registry.clear();
+
+    // Register Qwen pipeline
+    registerQwenPipeline();
+
+    // Load model
+    ModelLoader loader;
+    ASSERT_TRUE(loader.loadModel(model_path)) << "Failed to load GGUF model: " << model_path;
+    TransformerLayerConfig base_config = loader.createLayerConfig();
+    ModelConfig model_cfg(base_config, "qwen");
+    int n_layers = base_config.n_layers;
+
+    // Create pipeline
+    auto pipeline = PipelineFactory::instance().create(model_cfg);
+    ASSERT_NE(pipeline, nullptr) << "Failed to create Qwen pipeline";
+
+    auto weights = pipeline->loadWeights(model_path);
+    ASSERT_NE(weights, nullptr) << "Failed to load weights";
+
+    if (rank == 0)
+    {
+        std::cout << "\n[DECODE_PARITY] Step 1: Running Llaminar prefill..." << std::endl;
+        std::cout << "[DECODE_PARITY] Prefill tokens: ";
+        for (size_t i = 0; i < prefill_tokens.size(); ++i)
+        {
+            std::cout << prefill_tokens[i];
+            if (i < prefill_tokens.size() - 1)
+                std::cout << ",";
+        }
+        std::cout << std::endl;
+    }
+
+    // Run prefill
+    StageContext prefill_ctx;
+    prefill_ctx.stage = InferenceStage::Prefill;
+    prefill_ctx.seq_len = static_cast<int>(prefill_tokens.size());
+
+    ASSERT_TRUE(pipeline->prefill(prefill_tokens, *weights, prefill_ctx)) << "Prefill failed";
+
+    // Get prefill logits
+    std::shared_ptr<TensorBase> prefill_logits_tensor;
+    ASSERT_TRUE(pipeline->logits(prefill_logits_tensor)) << "Failed to get prefill logits";
+    ASSERT_NE(prefill_logits_tensor, nullptr) << "Prefill logits tensor is null";
+
+    if (rank == 0)
+    {
+        std::cout << "[DECODE_PARITY] ✓ Prefill complete" << std::endl;
+    }
+
+    // Load dynamic thresholds for comparison tolerances (if available)
+    DynamicThresholdLoader threshold_loader;
+    std::string threshold_path = snapshot_base_dir + "/dynamic_thresholds.json";
+    threshold_loader.load(threshold_path); // Will use defaults if file doesn't exist
+
+    // ========== PHASE 2: Decode Loop with Stage-by-Stage Validation ==========
+    int passed_steps = 0;
+    int failed_steps = 0;
+    std::vector<int> generated_tokens;
+
+    // Sample first token from prefill logits (greedy)
+    // Need to get logits from LAST position only (shape: [seq_len, vocab_size])
+    auto prefill_shape = prefill_logits_tensor->shape();
+    ASSERT_EQ(prefill_shape.size(), 2) << "Expected 2D logits tensor";
+    int prefill_seq_len = prefill_shape[0];
+    int vocab_size = prefill_shape[1];
+
+    // Get pointer to last row (last token's logits)
+    const float *last_row_logits = prefill_logits_tensor->data() + (prefill_seq_len - 1) * vocab_size;
+    int next_token = std::distance(last_row_logits, std::max_element(last_row_logits, last_row_logits + vocab_size));
+    generated_tokens.push_back(next_token);
+
+    for (int step = 0; step < num_decode_steps; ++step)
+    {
+        if (rank == 0)
+        {
+            std::cout << "\n[DECODE_STEP_" << step << "] ==================" << std::endl;
+            std::cout << "[DECODE_STEP_" << step << "] Token: " << next_token << std::endl;
+        }
+
+        // Clear previous step's snapshots
+        registry.clear();
+
+        // Run decode step
+        StageContext decode_ctx;
+        decode_ctx.stage = InferenceStage::Decode;
+        decode_ctx.seq_len = 1; // Single token decode
+
+        ASSERT_TRUE(pipeline->decode({next_token}, *weights, decode_ctx)) << "Decode step " << step << " failed";
+
+        // Get decode logits
+        std::shared_ptr<TensorBase> decode_logits_tensor;
+        ASSERT_TRUE(pipeline->logits(decode_logits_tensor)) << "Failed to get decode logits at step " << step;
+        ASSERT_NE(decode_logits_tensor, nullptr) << "Decode logits tensor is null at step " << step;
+
+        // Load PyTorch snapshots for this decode step
+        std::string snapshot_dir = decode_snapshot_base + std::to_string(step);
+        PyTorchSnapshotLoader pytorch_loader(snapshot_dir);
+
+        if (rank == 0)
+        {
+            std::cout << "[DECODE_STEP_" << step << "] Loading PyTorch snapshots from: " << snapshot_dir << std::endl;
+        }
+
+        // Compare all stages for this decode step
+        int step_passed = 0;
+        int step_failed = 0;
+        int step_missing = 0;
+        std::string first_divergence;
+
+        bool step_ok = compare_all_stages_vs_pytorch(
+            pytorch_loader,
+            registry,
+            n_layers,
+            rank,
+            "DECODE_STEP_" + std::to_string(step),
+            threshold_loader,
+            step_passed,
+            step_failed,
+            step_missing,
+            first_divergence,
+            model_cfg.getLayerConfig());
+
+        if (rank == 0)
+        {
+            std::cout << "[DECODE_STEP_" << step << "] Summary: "
+                      << step_passed << " passed, "
+                      << step_failed << " failed, "
+                      << step_missing << " missing" << std::endl;
+        }
+
+        if (step_failed > 0)
+        {
+            failed_steps++;
+        }
+        else
+        {
+            passed_steps++;
+        }
+
+        // Sample next token for next iteration (greedy)
+        if (step < num_decode_steps - 1)
+        {
+            // Get logits from LAST position only (shape: [current_seq_len, vocab_size])
+            auto decode_shape = decode_logits_tensor->shape();
+            ASSERT_EQ(decode_shape.size(), 2) << "Expected 2D decode logits tensor at step " << step;
+            int decode_seq_len = decode_shape[0];
+            int decode_vocab = decode_shape[1];
+
+            // Get pointer to last row (last token's logits)
+            const float *last_decode_logits = decode_logits_tensor->data() + (decode_seq_len - 1) * decode_vocab;
+            next_token = std::distance(last_decode_logits, std::max_element(last_decode_logits, last_decode_logits + decode_vocab));
+            generated_tokens.push_back(next_token);
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    // ========== PHASE 3: Summary ==========
+    if (rank == 0)
+    {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "Incremental Decode Parity Test Summary" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "Decode steps passed: " << passed_steps << "/" << num_decode_steps << std::endl;
+        std::cout << "Decode steps failed: " << failed_steps << "/" << num_decode_steps << std::endl;
+        std::cout << "\nGenerated token sequence: ";
+        for (size_t i = 0; i < generated_tokens.size(); ++i)
+        {
+            std::cout << generated_tokens[i];
+            if (i < generated_tokens.size() - 1)
+                std::cout << " → ";
+        }
+        std::cout << std::endl;
+    }
+
+    ASSERT_EQ(failed_steps, 0)
+        << "Decode parity test failed: " << failed_steps << " decode steps out of " << num_decode_steps
+        << " had stage mismatches with PyTorch ground truth";
+
+    if (rank == 0)
+    {
+        std::cout << "\n[DECODE_PARITY] ✓ All decode steps match PyTorch ground truth!" << std::endl;
+    }
+
+    // Clean up
+    unsetenv("ADAPTIVE_DISABLE_COSMA");
 }
 
 int main(int argc, char **argv)

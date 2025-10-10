@@ -320,12 +320,24 @@ def main():
     parser.add_argument(
         "--tokens",
         required=True,
-        help="Comma-separated token IDs (e.g., '1,2,3,4,5')"
+        help="Comma-separated token IDs for prefill (e.g., '1,2,3,4,5')"
     )
     parser.add_argument(
         "-o", "--output-dir",
         required=True,
         help="Output directory for snapshots and thresholds"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["prefill", "decode"],
+        default="prefill",
+        help="Generation mode: 'prefill' (default) or 'decode'"
+    )
+    parser.add_argument(
+        "--num-decode-steps",
+        type=int,
+        default=3,
+        help="Number of decode steps to generate (only used with --mode decode, default: 3)"
     )
     parser.add_argument(
         "--num-runs",
@@ -357,36 +369,51 @@ def main():
     tokens = [int(t.strip()) for t in args.tokens.split(',')]
     output_dir = Path(args.output_dir)
     
+    if args.mode == "decode":
+        generate_decode_snapshots(
+            args.model, tokens, args.num_decode_steps, output_dir,
+            args.num_runs, args.safety_margin, args.min_rel_l2, args.verbose
+        )
+    else:
+        generate_prefill_snapshots(
+            args.model, tokens, output_dir,
+            args.num_runs, args.safety_margin, args.min_rel_l2, args.verbose
+        )
+
+
+def generate_prefill_snapshots(model_path, tokens, output_dir, num_runs, safety_margin, min_rel_l2, verbose):
+    """Generate prefill mode snapshots (original behavior)"""
+    
     print(f"=" * 80)
-    print(f"GENERATING VARIANCE-BASED THRESHOLDS")
+    print(f"GENERATING VARIANCE-BASED THRESHOLDS (PREFILL MODE)")
     print(f"=" * 80)
-    print(f"Model:         {args.model}")
+    print(f"Model:         {model_path}")
     print(f"Tokens:        {tokens}")
-    print(f"Num runs:      {args.num_runs}")
-    print(f"Safety margin: {args.safety_margin}")
+    print(f"Num runs:      {num_runs}")
+    print(f"Safety margin: {safety_margin}")
     print(f"Output dir:    {output_dir}")
     print(f"=" * 80)
     print()
     
     # Run PyTorch multiple times
     runs = []
-    for i in range(args.num_runs):
-        print(f"Run {i+1}/{args.num_runs}...")
-        snapshots = run_pytorch_inference(args.model, tokens, verbose=args.verbose)
+    for i in range(num_runs):
+        print(f"Run {i+1}/{num_runs}...")
+        snapshots = run_pytorch_inference(model_path, tokens, verbose=verbose)
         runs.append(snapshots)
         print(f"  Captured {len(snapshots)} snapshots")
     
     print()
     print(f"Computing variance statistics across {len(runs)} runs...")
-    mean_snapshots, variance_stats = compute_variance_statistics(runs, verbose=args.verbose)
+    mean_snapshots, variance_stats = compute_variance_statistics(runs, verbose=verbose)
     
     print()
-    print(f"Computing dynamic thresholds (safety_margin={args.safety_margin})...")
+    print(f"Computing dynamic thresholds (safety_margin={safety_margin})...")
     thresholds = compute_dynamic_thresholds(
         variance_stats,
-        safety_margin=args.safety_margin,
-        min_rel_l2=args.min_rel_l2,
-        verbose=args.verbose
+        safety_margin=safety_margin,
+        min_rel_l2=min_rel_l2,
+        verbose=verbose
     )
     
     print()
@@ -396,17 +423,17 @@ def main():
         variance_stats,
         thresholds,
         output_dir,
-        verbose=args.verbose
+        verbose=verbose
     )
     
     print()
     print("=" * 80)
-    print("SUMMARY")
+    print("SUMMARY (PREFILL MODE)")
     print("=" * 80)
     print(f"Generated {len(mean_snapshots)} reference snapshots")
     print(f"Generated {len(thresholds)} dynamic thresholds")
-    print(f"Variance measured across {args.num_runs} runs")
-    print(f"Safety margin: {args.safety_margin}x")
+    print(f"Variance measured across {num_runs} runs")
+    print(f"Safety margin: {safety_margin}x")
     print()
     print("Output files:")
     print(f"  - {len(mean_snapshots)} .npy snapshot files")
@@ -416,5 +443,133 @@ def main():
     print("=" * 80)
 
 
+def generate_decode_snapshots(model_path, prefill_tokens, num_decode_steps, output_dir, 
+                              num_runs, safety_margin, min_rel_l2, verbose):
+    """
+    Generate decode mode snapshots with variance measurement.
+    
+    Creates one subdirectory per decode step:
+        output_dir/decode_step_0/*.npy
+        output_dir/decode_step_1/*.npy
+        ...
+        output_dir/dynamic_thresholds.json (aggregated thresholds)
+    """
+    from reference.generate_decode_snapshots import generate_decode_reference
+    
+    print(f"=" * 80)
+    print(f"GENERATING VARIANCE-BASED THRESHOLDS (DECODE MODE)")
+    print(f"=" * 80)
+    print(f"Model:          {model_path}")
+    print(f"Prefill tokens: {prefill_tokens}")
+    print(f"Decode steps:   {num_decode_steps}")
+    print(f"Num runs:       {num_runs}")
+    print(f"Safety margin:  {safety_margin}")
+    print(f"Output dir:     {output_dir}")
+    print(f"=" * 80)
+    print()
+    
+    # For decode, we need to run prefill + N decode steps for each variance run
+    # Collect snapshots per decode step across runs
+    decode_step_runs = [[] for _ in range(num_decode_steps)]  # List of runs per step
+    
+    for run_idx in range(num_runs):
+        print(f"\n{'='*60}")
+        print(f"Variance Run {run_idx+1}/{num_runs}")
+        print(f"{'='*60}")
+        
+        # Generate decode snapshots for this run
+        # This returns a dict: {step_idx: {stage_name: tensor}}
+        step_snapshots = generate_decode_reference(
+            model_path, 
+            prefill_tokens, 
+            num_decode_steps,
+            verbose=verbose
+        )
+        
+        # Organize by decode step
+        for step_idx in range(num_decode_steps):
+            if step_idx in step_snapshots:
+                decode_step_runs[step_idx].append(step_snapshots[step_idx])
+                if verbose:
+                    print(f"  Step {step_idx}: captured {len(step_snapshots[step_idx])} snapshots")
+    
+    # Now compute variance and save for each decode step
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    all_thresholds = {}  # Aggregated thresholds across all steps
+    
+    for step_idx in range(num_decode_steps):
+        print(f"\n{'='*60}")
+        print(f"Processing Decode Step {step_idx}")
+        print(f"{'='*60}")
+        
+        runs = decode_step_runs[step_idx]
+        if not runs:
+            print(f"  WARNING: No snapshots for step {step_idx}")
+            continue
+            
+        # Compute variance for this step
+        print(f"  Computing variance across {len(runs)} runs...")
+        mean_snapshots, variance_stats = compute_variance_statistics(runs, verbose=verbose)
+        
+        # Compute dynamic thresholds
+        print(f"  Computing dynamic thresholds...")
+        thresholds = compute_dynamic_thresholds(
+            variance_stats,
+            safety_margin=safety_margin,
+            min_rel_l2=min_rel_l2,
+            verbose=verbose
+        )
+        
+        # Save snapshots for this step
+        step_dir = output_dir / f"decode_step_{step_idx}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"  Saving to {step_dir}...")
+        save_snapshots_and_thresholds(
+            mean_snapshots,
+            variance_stats,
+            thresholds,
+            step_dir,
+            verbose=verbose
+        )
+        
+        # Aggregate thresholds (use max across steps for safety)
+        for stage_name, threshold in thresholds.items():
+            if stage_name not in all_thresholds:
+                all_thresholds[stage_name] = threshold
+            else:
+                # Take the maximum threshold for robustness
+                all_thresholds[stage_name] = {
+                    'max_abs': max(all_thresholds[stage_name]['max_abs'], threshold['max_abs']),
+                    'rel_l2': max(all_thresholds[stage_name]['rel_l2'], threshold['rel_l2'])
+                }
+        
+        print(f"  ✓ Decode step {step_idx} complete")
+    
+    # Save aggregated thresholds to base output dir
+    aggregated_threshold_path = output_dir / "dynamic_thresholds.json"
+    with open(aggregated_threshold_path, 'w') as f:
+        json.dump(all_thresholds, f, indent=2)
+    print(f"\n✓ Saved aggregated thresholds to {aggregated_threshold_path}")
+    
+    print()
+    print("=" * 80)
+    print("SUMMARY (DECODE MODE)")
+    print("=" * 80)
+    print(f"Generated snapshots for {num_decode_steps} decode steps")
+    print(f"Variance measured across {num_runs} runs per step")
+    print(f"Safety margin: {safety_margin}x")
+    print()
+    print("Output structure:")
+    for step_idx in range(num_decode_steps):
+        print(f"  - decode_step_{step_idx}/*.npy")
+    print(f"  - dynamic_thresholds.json (aggregated)")
+    print("=" * 80)
+
+
 if __name__ == "__main__":
+    main()
+
     main()

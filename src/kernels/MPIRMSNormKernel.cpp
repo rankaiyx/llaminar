@@ -118,11 +118,11 @@ namespace llaminar
         const bool validate_reference = debugEnv().rmsnorm.validate_ref;
         if (validate_reference)
         {
-            LOG_INFO("[MPIRMSNormKernel] reference validation enabled");
+            LOG_DEBUG("[MPIRMSNormKernel] reference validation enabled");
         }
 
         // Additional epsilon logging
-        LOG_INFO("[MPIRMSNormKernel] Using epsilon=" << epsilon_);
+        LOG_DEBUG("[MPIRMSNormKernel] Using epsilon=" << epsilon_);
 
         // Extract dimensions
         size_t global_seq_len = static_cast<size_t>(global_input->shape()[0]);
@@ -567,9 +567,9 @@ namespace llaminar
 
         if (getRank() == 0)
         {
-            LOG_INFO("[MPIRMSNormKernel] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
+            LOG_DEBUG("[MPIRMSNormKernel] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
                                                                << " rms_first_row=" << rms_global << " mode=T5");
-            LOG_INFO("[MPIRMSNormKernel] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
+            LOG_DEBUG("[MPIRMSNormKernel] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
         }
 
         // Post-norm local stats to detect zeroing (parallel)
@@ -594,7 +594,7 @@ namespace llaminar
         double out_global_mean = (global_seq_len * hidden_size) ? (out_global_sum / (double)(global_seq_len * hidden_size)) : 0.0;
         if (getRank() == 0)
         {
-            LOG_INFO("[MPIRMSNormKernel] Post-Norm stats: min=" << out_global_min << " max=" << out_global_max << " mean=" << out_global_mean << " mode=T5");
+            LOG_DEBUG("[MPIRMSNormKernel] Post-Norm stats: min=" << out_global_min << " max=" << out_global_max << " mean=" << out_global_mean << " mode=T5");
         }
 
         LOG_DEBUG("Computed distributed RMS normalization: rms_metric=" << rms_global

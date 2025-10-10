@@ -1,5 +1,5 @@
 #!/bin/bash
-# run-llaminar.sh - Canonical script to run Llaminar with optimal MPI/OpenMP settings
+# run_llaminar.sh - Canonical script to run Llaminar with optimal MPI/OpenMP settings
 #
 # This wrapper establishes a consistent performance baseline:
 #   * One MPI rank per socket by default (unless --mpi-procs / LLAMINAR_MPI_PROCS override)
@@ -17,13 +17,13 @@
 #   --dry-run                  Print computed configuration then exit without running mpirun
 #
 # All other arguments are forwarded to the llaminar executable.
-# Example: ./run-llaminar.sh --mpi-procs=4 --force-threads=16 -m models/qwen... -v
+# Example: ./run_llaminar.sh --mpi-procs=4 --force-threads=16 -m models/qwen... -v
 
 set -euo pipefail
 
 print_help() {
     cat <<'EOF'
-Usage: ./run-llaminar.sh [script-options] [--] [llaminar-args]
+Usage: ./run_llaminar.sh [script-options] [--] [llaminar-args]
 
 Script Options:
     --help                     Show this help text and exit.
@@ -43,9 +43,9 @@ Environment Variables (selected):
     LLAMINAR_SEQ_LEN_HINT          Sequence length hint for decode scaling.
 
 Examples:
-    ./run-llaminar.sh -m models/model.gguf -v
-    ./run-llaminar.sh --mpi-procs=4 --force-threads=12 -m models/model.gguf
-    ./run-llaminar.sh --dry-run --openblas-policy=single -m models/model.gguf
+    ./run_llaminar.sh -m models/model.gguf -v
+    ./run_llaminar.sh --mpi-procs=4 --force-threads=12 -m models/model.gguf
+    ./run_llaminar.sh --dry-run --openblas-policy=single -m models/model.gguf
 
 Notes:
     * Unknown --script-switch triggers this help with non-zero exit.
@@ -75,7 +75,7 @@ while (( "$#" )); do
         --)
             shift; BIN_ARGS+=("$@" ); break ;;
         --*)
-            echo "[run-llaminar] Error: unknown option '$1'" >&2
+            echo "[run_llaminar] Error: unknown option '$1'" >&2
             print_help >&2
             exit 1 ;;
         *)
@@ -146,13 +146,13 @@ NUMA_NODES=$(lscpu | grep 'NUMA node(s):' | awk '{print $3}')
 # We allow a lightweight policy to prevent oversubscription during decode while
 # still giving larger prefill GEMMs thread parallelism.
 # Policies (env: LLAMINAR_OPENBLAS_POLICY):
-#   single     -> Always use 1 thread (good for latency-sensitive decode)
-#   match_omp  -> Match OMP_NUM_THREADS exactly
-#   hybrid(*)  -> If many cores, use half (min 4); if small core count (<=8) use all
-#                 Additionally, if LLAMINAR_SEQ_LEN_HINT < 1024, force 1 thread
+#   single        -> Always use 1 thread (good for latency-sensitive decode)
+#   match_omp(*)  -> Match OMP_NUM_THREADS exactly
+#   hybrid        -> If many cores, use half (min 4); if small core count (<=8) use all
+#                    Additionally, if LLAMINAR_SEQ_LEN_HINT < 1024, force 1 thread
 # (*) default
 if [ -z "${OPENBLAS_NUM_THREADS}" ]; then
-    POLICY=${LLAMINAR_OPENBLAS_POLICY:-hybrid}
+    POLICY=${LLAMINAR_OPENBLAS_POLICY:-match_omp}
     case "$POLICY" in
         single)
             OPENBLAS_NUM_THREADS=1 ;;
@@ -173,7 +173,7 @@ if [ -z "${OPENBLAS_NUM_THREADS}" ]; then
             fi
             ;;
         *)
-            echo "[run-llaminar] Warning: Unknown LLAMINAR_OPENBLAS_POLICY='$POLICY' (fallback=hybrid)" >&2
+            echo "[run_llaminar] Warning: Unknown LLAMINAR_OPENBLAS_POLICY='$POLICY' (fallback=hybrid)" >&2
             if [ $OMP_NUM_THREADS -le 8 ]; then
                 OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS
             else
@@ -230,7 +230,7 @@ EFFECTIVE_OPENBLAS_THREADS=$OPENBLAS_NUM_THREADS
 # Optional MPI process override (default: one process per socket)
 MPI_PROCS=${LLAMINAR_MPI_PROCS:-$SOCKETS}
 if ! [[ $MPI_PROCS =~ ^[0-9]+$ ]] || [ $MPI_PROCS -lt 1 ]; then
-    echo "[run-llaminar] Invalid MPI proc count '$MPI_PROCS' -> falling back to $SOCKETS" >&2
+    echo "[run_llaminar] Invalid MPI proc count '$MPI_PROCS' -> falling back to $SOCKETS" >&2
     MPI_PROCS=$SOCKETS
 fi
 
@@ -269,7 +269,7 @@ echo "TP: partitions=${LLAMINAR_ATTN_TP_PARTITIONS:-unset} disabled=${LLAMINAR_A
 echo ""
 
 if [ $DRY_RUN -eq 1 ]; then
-    echo "[run-llaminar] Dry run requested; exiting before launch." >&2
+    echo "[run_llaminar] Dry run requested; exiting before launch." >&2
     exit 0
 fi
 
