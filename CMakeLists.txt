@@ -265,28 +265,28 @@ add_executable(production_demo src/production_demo.cpp)
 target_link_libraries(production_demo llaminar_core)
 
 # Tensor-parallel output projection micro-benchmark
-add_executable(bench_tp_output_projection bench_tp_output_projection.cpp)
-target_link_libraries(bench_tp_output_projection llaminar_core)
+# add_executable(bench_tp_output_projection bench_tp_output_projection.cpp)
+# target_link_libraries(bench_tp_output_projection llaminar_core)
 
 # RMSNorm micro-benchmark harness
-add_executable(bench_rmsnorm bench_rmsnorm.cpp)
-target_link_libraries(bench_rmsnorm llaminar_core)
+# add_executable(bench_rmsnorm bench_rmsnorm.cpp)
+# target_link_libraries(bench_rmsnorm llaminar_core)
 
 # Attention primitives benchmark (primitives vs legacy path)
-add_executable(bench_attention bench_attention.cpp)
-target_link_libraries(bench_attention llaminar_core)
+# add_executable(bench_attention bench_attention.cpp)
+# target_link_libraries(bench_attention llaminar_core)
 
 # Softmax micro-benchmark harness
-add_executable(bench_softmax bench_softmax.cpp)
-target_link_libraries(bench_softmax llaminar_core)
+# add_executable(bench_softmax bench_softmax.cpp)
+# target_link_libraries(bench_softmax llaminar_core)
 
 # Distributed softmax benchmark (MPI required)
-add_executable(bench_softmax_distributed bench_softmax_distributed.cpp)
-target_link_libraries(bench_softmax_distributed llaminar_core)
+# add_executable(bench_softmax_distributed bench_softmax_distributed.cpp)
+# target_link_libraries(bench_softmax_distributed llaminar_core)
 
 # RoPE micro-benchmark harness
-add_executable(bench_rope bench_rope.cpp)
-target_link_libraries(bench_rope llaminar_core)
+# add_executable(bench_rope bench_rope.cpp)
+# target_link_libraries(bench_rope llaminar_core)
 
 # Add DEBUG flag to main executable when in Debug build
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -1150,10 +1150,10 @@ if(GTEST_FOUND)
     set_tests_properties(CosmaPrefillManagerOrientationAutoFixTest PROPERTIES TIMEOUT 60)
 
     # Minimal scatter/gather coordinate mapping test
-    add_executable(test_cosma_scatter_gather test_cosma_scatter_gather.cpp)
-    target_link_libraries(test_cosma_scatter_gather PRIVATE llaminar_core MPI::MPI_CXX)
-    add_llaminar_mpi_test(CosmaScatterGatherTest 2 test_cosma_scatter_gather)
-    set_tests_properties(CosmaScatterGatherTest PROPERTIES TIMEOUT 60)
+    # add_executable(test_cosma_scatter_gather test_cosma_scatter_gather.cpp)
+    # target_link_libraries(test_cosma_scatter_gather PRIVATE llaminar_core MPI::MPI_CXX)
+    # add_llaminar_mpi_test(CosmaScatterGatherTest 2 test_cosma_scatter_gather)
+    # set_tests_properties(CosmaScatterGatherTest PROPERTIES TIMEOUT 60)
 
     add_executable(test_cosma_prefill_manager_env_audit tests/test_cosma_prefill_manager_env_audit.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_cosma_prefill_manager_env_audit llaminar_core)

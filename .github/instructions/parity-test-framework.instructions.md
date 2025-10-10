@@ -1039,6 +1039,96 @@ When a comparison fails:
 - Compiled out completely in release builds (`#ifdef NDEBUG`)
 - Use stage filtering to reduce capture overhead during development
 
+**Tied Embeddings / LM Head Weight Sharing** 🔥 **CRITICAL BUG FIX: October 2025**
+
+**Problem**: PyTorch reference was using random weights for LM head, causing massive divergence (20+ absolute error, 148× tolerance exceedance)
+
+**Root Cause**:
+- Many GGUF models (including Gemini-Distill-Qwen2.5-0.5B-ead-fp32.gguf) use **tied embeddings** (weight sharing)
+- The embedding matrix `token_embd.weight` is reused for both:
+  1. **Input embedding**: Maps token IDs → hidden states
+  2. **Output projection (LM head)**: Maps final hidden states → vocabulary logits
+- GGUF files **do NOT include a separate `output.weight` / `lm_head.weight`** tensor when using tied weights
+- PyTorch's `Qwen2ForCausalLM` expects `lm_head.weight` as a distinct parameter
+
+**Bug Symptoms**:
+- All 386/387 stages pass perfectly (< 1e-4 error)
+- Only `LM_HEAD` stage fails with massive error:
+  - Expected: max_abs ≤ 0.15, rel_l2 ≤ 0.1
+  - Actual: max_abs = 22.3, rel_l2 = 1.36 (138× over tolerance!)
+- Manual computation shows Llaminar is correct; PyTorch reference is wrong
+- Error pattern shows completely different logit distributions (not just scaling/offset)
+
+**Detection Method**:
+```python
+# Check if PyTorch is using random weights
+python3 << 'EOF'
+import numpy as np
+import torch
+from transformers import Qwen2ForCausalLM, Qwen2Config
+
+# Load GGUF via reference loader
+from reference.loaders.gguf_loader import GGUFLoader
+loader = GGUFLoader("models/your-model.gguf")
+config_dict, state_dict = loader.load()
+
+# Create model and load weights
+model = Qwen2ForCausalLM(Qwen2Config(**config_dict))
+missing_keys, _ = model.load_state_dict(state_dict, strict=False)
+
+# BUG: If lm_head.weight is missing, it keeps random initialization!
+if 'lm_head.weight' in missing_keys:
+    print("⚠️  BUG DETECTED: lm_head.weight missing, using random weights!")
+    print("    Tied embeddings not properly configured.")
+    
+    # Verify: Check if lm_head and embeddings are tied
+    tied = (model.lm_head.weight.data_ptr() == 
+            model.model.embed_tokens.weight.data_ptr())
+    print(f"    Weights tied: {tied}")  # Should be True, will be False!
+EOF
+```
+
+**Fix Applied** (in `python/reference/qwen.py`):
+```python
+# After loading state dict from GGUF
+missing_keys, unexpected_keys = self.hf_model.load_state_dict(state_dict, strict=False)
+
+if missing_keys:
+    warnings.warn(f"Missing keys when loading GGUF: {missing_keys}")
+
+# ✅ FIX: Handle tied embeddings explicitly
+if 'lm_head.weight' in missing_keys:
+    print("Tying lm_head.weight to model.embed_tokens.weight (weight sharing)")
+    self.hf_model.lm_head.weight = self.hf_model.model.embed_tokens.weight
+```
+
+**Verification**:
+```bash
+# After fix, all stages should pass:
+./build/test_parity_framework --gtest_filter="*OpenBLASPrefillVsPyTorch"
+
+# Expected output:
+# [OPENBLAS_PYTORCH] LM_HEAD: max_abs=1.341e-04 rel_l2=5.500e-06 (tol: 0.150/0.100) ✓ PASS
+# [OPENBLAS_PYTORCH] Summary:
+#   ✓ Passed:  387/387  (100%)
+#   ✗ Failed:  0/387
+#   ? Missing: 0/387
+```
+
+**Other Models Affected**:
+- Any GGUF model where `config.tie_word_embeddings = true`
+- LLaMA models often use tied embeddings
+- Gemini-distilled variants
+- Check GGUF metadata: Look for `tie_word_embeddings` or missing `output.weight` tensor
+
+**Why This Bug Was Subtle**:
+1. PyTorch silently accepts missing keys with `strict=False`
+2. Random initialization produced plausible-looking logits (range [-15, 17])
+3. All other stages passed perfectly, suggesting Llaminar was at fault
+4. Only manual recomputation revealed PyTorch reference was using wrong weights
+
+**Lesson Learned**: Always verify PyTorch reference is using GGUF weights correctly, especially for tied/shared parameters!
+
 ## ⚠️ CRITICAL: Comparison Stage Whitelist
 
 ### Overview

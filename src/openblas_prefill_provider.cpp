@@ -250,6 +250,42 @@ namespace llaminar
 
         int vocab_size = layer_cfg.vocab_size;
         auto logits = createLocalTensor({seq_len, vocab_size});
+
+        // DEBUG: Log input/weight statistics before LM head
+        if (mpiContext().rank == 0)
+        {
+            const float *norm_data = final_norm_out->data();
+            const float *weight_data = qwen_weights->lm_head->data();
+            auto weight_shape = qwen_weights->lm_head->shape();
+
+            // Compute statistics on final_norm_out
+            float norm_min = norm_data[0], norm_max = norm_data[0], norm_sum = 0.0f;
+            size_t norm_size = seq_len * d_model;
+            for (size_t i = 0; i < norm_size; ++i)
+            {
+                norm_min = std::min(norm_min, norm_data[i]);
+                norm_max = std::max(norm_max, norm_data[i]);
+                norm_sum += norm_data[i];
+            }
+            float norm_mean = norm_sum / norm_size;
+
+            // Compute statistics on lm_head weights
+            float weight_min = weight_data[0], weight_max = weight_data[0], weight_sum = 0.0f;
+            size_t weight_size = weight_shape[0] * weight_shape[1];
+            for (size_t i = 0; i < weight_size; ++i)
+            {
+                weight_min = std::min(weight_min, weight_data[i]);
+                weight_max = std::max(weight_max, weight_data[i]);
+                weight_sum += weight_data[i];
+            }
+            float weight_mean = weight_sum / weight_size;
+
+            LOG_INFO("[LM_HEAD_DEBUG] Input (final_norm_out): shape=[" << seq_len << "," << d_model
+                                                                       << "] range=[" << norm_min << "," << norm_max << "] mean=" << norm_mean);
+            LOG_INFO("[LM_HEAD_DEBUG] Weight (lm_head): shape=[" << weight_shape[0] << "," << weight_shape[1]
+                                                                 << "] range=[" << weight_min << "," << weight_max << "] mean=" << weight_mean);
+        }
+
         {
             std::vector<std::shared_ptr<TensorBase>> lm_inputs = {
                 final_norm_out,
@@ -261,6 +297,32 @@ namespace llaminar
                 LOG_ERROR("OpenBLASPrefillProvider: LM head failed");
                 return false;
             }
+        }
+
+        // DEBUG: Log output statistics after LM head
+        if (mpiContext().rank == 0)
+        {
+            const float *logits_data = logits->data();
+            size_t logits_size = seq_len * vocab_size;
+
+            float logits_min = logits_data[0], logits_max = logits_data[0], logits_sum = 0.0f;
+            for (size_t i = 0; i < logits_size; ++i)
+            {
+                logits_min = std::min(logits_min, logits_data[i]);
+                logits_max = std::max(logits_max, logits_data[i]);
+                logits_sum += logits_data[i];
+            }
+            float logits_mean = logits_sum / logits_size;
+
+            LOG_INFO("[LM_HEAD_DEBUG] Output (logits): shape=[" << seq_len << "," << vocab_size
+                                                                << "] range=[" << logits_min << "," << logits_max << "] mean=" << logits_mean);
+
+            // Show first 10 logits
+            LOG_INFO("[LM_HEAD_DEBUG] First 10 logits: "
+                     << logits_data[0] << " " << logits_data[1] << " " << logits_data[2] << " "
+                     << logits_data[3] << " " << logits_data[4] << " " << logits_data[5] << " "
+                     << logits_data[6] << " " << logits_data[7] << " " << logits_data[8] << " "
+                     << logits_data[9]);
         }
 
         auto t_lm_end = std::chrono::high_resolution_clock::now();
@@ -464,6 +526,10 @@ namespace llaminar
             }
         }
 
+        // Capture FFN gate projection snapshot
+        captureSnapshot(PipelineStage::FFN_GATE, layer_idx, gate_out->data(), seq_len, d_ff);
+        incrementSnapshotCounter(metrics);
+
         {
             std::vector<std::shared_ptr<TensorBase>> up_inputs = {
                 ffn_norm_out,
@@ -477,6 +543,10 @@ namespace llaminar
             }
         }
 
+        // Capture FFN up projection snapshot
+        captureSnapshot(PipelineStage::FFN_UP, layer_idx, up_out->data(), seq_len, d_ff);
+        incrementSnapshotCounter(metrics);
+
         // SwiGLU activation
         auto swiglu_out = createLocalTensor({seq_len, d_ff});
         {
@@ -489,6 +559,10 @@ namespace llaminar
                 return false;
             }
         }
+
+        // Capture FFN SwiGLU activation snapshot
+        captureSnapshot(PipelineStage::FFN_SWIGLU, layer_idx, swiglu_out->data(), seq_len, d_ff);
+        incrementSnapshotCounter(metrics);
 
         // Down projection
         {
