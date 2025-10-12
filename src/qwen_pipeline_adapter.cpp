@@ -28,10 +28,29 @@ namespace llaminar
 
         // CRITICAL: Validate all weights against canonical GGUF format contracts
         // This ensures kernels can trust the weight dimensions/orientations without runtime detection
+        // NOW supports MPI-aware validation (checks sliced dimensions when mpi_size > 1)
+        int mpi_rank = 0, mpi_size = 1;
+#ifdef LLAMINAR_HAVE_MPI
+        int mpi_initialized = 0;
+        MPI_Initialized(&mpi_initialized);
+        if (mpi_initialized)
+        {
+            MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+            MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+        }
+#endif
+
         try
         {
-            weights->validate(cfg_.getLayerConfig());
-            LOG_INFO("✓ All weights validated against canonical GGUF format");
+            weights->validate_with_mpi(cfg_.getLayerConfig(), mpi_rank, mpi_size);
+            if (mpi_size > 1)
+            {
+                LOG_INFO("✓ All weights validated with MPI slicing (rank " << mpi_rank << "/" << mpi_size << ")");
+            }
+            else
+            {
+                LOG_INFO("✓ All weights validated against canonical GGUF format");
+            }
         }
         catch (const std::exception &e)
         {
@@ -48,7 +67,7 @@ namespace llaminar
         ctx.stage = InferenceStage::Prefill;
         ctx.seq_len = (int)tokens.size();
         current_tokens_ = tokens; // retain for decode continuation
-        
+
         if (!legacy_)
         {
             LOG_ERROR("QwenPipelineAdapter: legacy pipeline is null");

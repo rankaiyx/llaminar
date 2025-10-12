@@ -180,6 +180,7 @@ namespace llaminar
     s.pipeline.incr_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_TRACE"));
     s.pipeline.incr_cache_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_CACHE_TRACE"));
     s.pipeline.incr_hidden_trace = flag(std::getenv("LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE"));
+    s.pipeline.debug_decode_embed = flag(std::getenv("LLAMINAR_DEBUG_DECODE_EMBED"));
     // KV cache
     s.kv_cache.dynamic_init = flag(std::getenv("LLAMINAR_KV_DYNAMIC_INIT"));
     if(const char* gfac = std::getenv("LLAMINAR_KV_GROWTH_FACTOR")) { int v=std::atoi(gfac); if(v>=1 && v<=16) s.kv_cache.growth_factor = v; }
@@ -359,6 +360,13 @@ namespace llaminar
     if(const char* eps = std::getenv("LLAMINAR_RMS_EPS_OVERRIDE")) if(*eps){ try { s.rms_fused.eps_override = std::stod(eps); s.rms_fused.eps_override_active=true; } catch(...){} }
     // Embedding warnings
     s.embedding_warn.transpose_warn = flag(std::getenv("LLAMINAR_EMBEDDING_TRANSPOSE_WARN"));
+    
+    // Parity testing controls
+    s.parity.save_per_token = flag(std::getenv("LLAMINAR_PARITY_SAVE_PER_TOKEN"));
+    if (const char* od = std::getenv("LLAMINAR_PARITY_OUTPUT_DIR")) {
+        if (*od) s.parity.output_dir = od;
+    }
+    
     // Test harness
     s.test_harness.skip_mpi_in_single_test = flag(std::getenv("LLAMINAR_SKIP_MPI_IN_SINGLE_TEST"));
 
@@ -855,6 +863,12 @@ namespace llaminar
         if (s.embedding_warn.transpose_warn)
         {
             lines.push_back("[DebugEnv] embedding_warn: transpose_warn=on");
+        }
+        if (s.parity.save_per_token)
+        {
+            std::ostringstream oss;
+            oss << "[DebugEnv] parity: save_per_token=on output_dir=" << s.parity.output_dir;
+            lines.push_back(oss.str());
         }
         if (s.test_harness.skip_mpi_in_single_test)
         {

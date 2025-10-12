@@ -117,6 +117,8 @@ namespace llaminar
          * - Output projection
          *
          * Captures intermediate snapshots via callback mechanism.
+         *
+         * If cache_provider is non-null, populates K/V cache for this layer.
          */
         bool executeAttentionBlock(
             int layer_idx,
@@ -124,7 +126,8 @@ namespace llaminar
             const QwenPipeline::ModelWeights &weights,
             std::shared_ptr<TensorBase> &attn_norm_out,
             std::shared_ptr<TensorBase> &attn_out,
-            PrefillMetrics &metrics) override;
+            PrefillMetrics &metrics,
+            KVCacheProvider *cache_provider) override;
 
     private:
         /**

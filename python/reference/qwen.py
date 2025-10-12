@@ -138,6 +138,8 @@ class QwenReferenceModel(AbstractReferenceModel):
         
         # Create model from config
         print(f"Creating Qwen2 model from config...")
+        # Use eager attention to enable attention weight capture
+        self.hf_config._attn_implementation = 'eager'
         self.hf_model = Qwen2ForCausalLM(self.hf_config)
         
         # Load state dict

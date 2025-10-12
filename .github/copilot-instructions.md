@@ -144,11 +144,11 @@ ctest --test-dir build --output-on-failure --parallel \
 
 # Unit Tests (2m30s)
 ctest --test-dir build --output-on-failure --parallel \
-  -E "(Integration|ParityFramework|Incremental|Qwen|Prefill|.*Stress.*)"
+  -E "(Integration|ParityFrameworkTest|Incremental|Qwen|Prefill|.*Stress.*)"
 
-# Parity Integration (24.5s)
+# Parity Integration (180s) (Long running, verbose test suite - use `tee` and grep details from the logfile)
 ctest --test-dir build --output-on-failure --verbose \
-  -R "(ParityFramework|AbstractPipelineParity)"
+  -R "(ParityFrameworkTest|AbstractPipelineParity)" 2>&1 | tee test_output.log | tail -50
 
 # Integration Tests (3m0s)
 ctest --test-dir build --output-on-failure --verbose \
@@ -729,10 +729,8 @@ All COSMA-associated tests have an external 60s CTest timeout. Internally, watch
 3. Reconstruction tracing: `LLAMINAR_COSMA_DEBUG_RECON=1 LLAMINAR_COSMA_TEST_TRACE=1`.
 4. Orientation suspicion: enable `LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE` plus replicated compare for before/after diff.
 
-### Stability Guards Summary
-- COSMA buffer double allocation now guarded (early return on subsequent call).
-- Fast path skips COSMA buffer allocation entirely for small ops.
-- MPI collectives wrapped with safety guards for single-rank scenarios.
-- Watchdog threads ensure actionable stack traces rather than silent hangs.
-
 Disable heavy validation & trace logging prior to performance measurement to ensure representative timing.
+
+# Writing Documentation and Changelogs
+
+When we write documentation and changelogs at the end of our work runs, we place them in the `changelog/` folder in the workspace to avoid cluttering up the rest of the repo. We also use the `date` command to get the current date before naming changelog files.

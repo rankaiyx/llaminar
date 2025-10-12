@@ -164,6 +164,85 @@ namespace llaminar
             const std::string &error_message() const { return error_message_; }
 
             /**
+             * @brief Write a .npy file (for saving Llaminar snapshots)
+             *
+             * This writes the NumPy .npy format directly. Useful for exporting
+             * Llaminar snapshots to compare with PyTorch.
+             *
+             * @param filepath Path to output .npy file
+             * @param data Float data to write
+             * @param shape Array dimensions
+             * @return true if successful
+             */
+            static bool write_npy(const std::string &filepath,
+                                  const std::vector<float> &data,
+                                  const std::vector<size_t> &shape)
+            {
+                // Validate dimensions match data size
+                size_t total = 1;
+                for (size_t dim : shape)
+                {
+                    total *= dim;
+                }
+                if (total != data.size())
+                {
+                    return false;
+                }
+
+                std::ofstream file(filepath, std::ios::binary);
+                if (!file)
+                {
+                    return false;
+                }
+
+                // Write .npy header
+                // Format: magic "\x93NUMPY" + version (1.0) + header_len (2 bytes) + dict + data
+
+                // Magic bytes
+                file.write("\x93NUMPY", 6);
+
+                // Version 1.0 (most compatible)
+                file.write("\x01\x00", 2);
+
+                // Build header dictionary
+                // Example: "{'descr': '<f4', 'fortran_order': False, 'shape': (1, 10, 512), }          \n"
+                std::ostringstream header_stream;
+                header_stream << "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+                for (size_t i = 0; i < shape.size(); ++i)
+                {
+                    if (i > 0)
+                        header_stream << ", ";
+                    header_stream << shape[i];
+                }
+                if (shape.size() == 1)
+                {
+                    header_stream << ","; // Trailing comma for 1D arrays
+                }
+                header_stream << "), }";
+
+                std::string header = header_stream.str();
+
+                // Pad header to multiple of 64 bytes for alignment (NumPy standard)
+                // Header must end with '\n' and be padded with spaces
+                size_t header_with_newline = header.size() + 1;                 // +1 for '\n'
+                size_t padding = (64 - ((10 + header_with_newline) % 64)) % 64; // 10 = magic(6) + version(2) + len(2)
+                header.append(padding, ' ');
+                header += '\n';
+
+                // Write header length (little-endian uint16)
+                uint16_t header_len = static_cast<uint16_t>(header.size());
+                file.write(reinterpret_cast<const char *>(&header_len), 2);
+
+                // Write header
+                file.write(header.c_str(), header.size());
+
+                // Write data (float32, little-endian)
+                file.write(reinterpret_cast<const char *>(data.data()), data.size() * sizeof(float));
+
+                return file.good();
+            }
+
+            /**
              * @brief Load a single .npy file (helper for extracted archives)
              *
              * This parses the NumPy .npy format directly. Use this when .npz has been

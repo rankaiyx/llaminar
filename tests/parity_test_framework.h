@@ -129,6 +129,22 @@ namespace llaminar
 
             std::vector<std::string> list_keys() const;
 
+            /**
+             * @brief Save all snapshots to a directory as individual .npy files
+             * @param output_dir Directory to save snapshots (will be created if it doesn't exist)
+             * @return true if successful, false on error
+             *
+             * This saves all registered snapshots to {output_dir}/{stage_name}.npy files.
+             * Used for generating Llaminar snapshots to compare with PyTorch.
+             *
+             * Example: If output_dir="llaminar_snapshots/token_0", saves:
+             *   - EMBEDDING.npy
+             *   - ATTENTION_NORM_layer0.npy
+             *   - Q_PROJECTION_layer0.npy
+             *   - etc.
+             */
+            bool saveToDirectory(const std::string &output_dir) const;
+
             // Convenience methods for common key patterns
             std::string make_key(const std::string &source, PipelineStage stage, int layer = -1) const;
             std::string make_key(const std::string &source, const std::string &stage_name, int layer = -1) const;
@@ -214,6 +230,57 @@ namespace llaminar
 
         private:
             static bool enabled_;
+        };
+
+        /**
+         * @brief Helper for per-token snapshot saving during incremental decode
+         *
+         * This utility enables capturing and saving snapshots for each token
+         * during incremental decode, matching the PyTorch incremental snapshot format.
+         *
+         * Usage:
+         *   IncrementalSnapshotHelper helper("llaminar_incremental_snapshots");
+         *   for (int i = 0; i < num_tokens; ++i) {
+         *       helper.beforeToken(i);
+         *       pipeline->incrementalDecodeToken(token_ids[i], ...);
+         *       helper.afterToken(i);
+         *   }
+         */
+        class IncrementalSnapshotHelper
+        {
+        public:
+            /**
+             * @brief Constructor
+             * @param output_base_dir Base directory for snapshot output (e.g., "llaminar_incremental_snapshots")
+             */
+            explicit IncrementalSnapshotHelper(const std::string &output_base_dir);
+
+            /**
+             * @brief Prepare for capturing a token
+             * @param token_index Token index (0-based)
+             *
+             * Clears the snapshot registry and enables capture.
+             */
+            void beforeToken(int token_index);
+
+            /**
+             * @brief Finalize token capture and save snapshots
+             * @param token_index Token index (0-based)
+             *
+             * Saves all captured snapshots to {output_base_dir}/token_{token_index}/
+             * and clears the registry for the next token.
+             *
+             * @return true if successful, false on error
+             */
+            bool afterToken(int token_index);
+
+            /**
+             * @brief Get the output directory for a specific token
+             */
+            std::string getTokenDir(int token_index) const;
+
+        private:
+            std::string output_base_dir_;
         };
 
         /**

@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "python"))
 
 from reference import PipelineStage
 from reference.generate_test_snapshots import PipelineStageCapture
+from reference.generate_incremental_decode_snapshots import save_model_weights
 
 
 def stage_key_to_str(key):
@@ -426,6 +427,15 @@ def generate_prefill_snapshots(model_path, tokens, output_dir, num_runs, safety_
         verbose=verbose
     )
     
+    # Save model weights for verification (embedding + layer projections)
+    print()
+    print(f"Saving model weights for verification...")
+    save_model_weights(
+        model_path,
+        output_dir,
+        verbose=verbose
+    )
+    
     print()
     print("=" * 80)
     print("SUMMARY (PREFILL MODE)")
@@ -440,6 +450,7 @@ def generate_prefill_snapshots(model_path, tokens, output_dir, num_runs, safety_
     print(f"  - variance_statistics.json (variance metrics)")
     print(f"  - dynamic_thresholds.json (for C++ tests)")
     print(f"  - threshold_summary.txt (human-readable)")
+    print(f"  - weights/ (embedding + layer projection weights)")
     print("=" * 80)
 
 

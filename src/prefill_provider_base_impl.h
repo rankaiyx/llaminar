@@ -97,6 +97,7 @@ namespace llaminar
          * @param output Output tensor (final hidden states or logits)
          * @param ctx Stage context (sequence length, KV cache state)
          * @param metrics Output metrics (timing, FLOPs)
+         * @param cache_provider Optional KV cache provider
          *
          * @return true if execution succeeded, false on error
          */
@@ -105,7 +106,8 @@ namespace llaminar
             const IModelWeights &weights,
             std::shared_ptr<TensorBase> &output,
             StageContext &ctx,
-            PrefillMetrics &metrics) override;
+            PrefillMetrics &metrics,
+            KVCacheProvider *cache_provider = nullptr) override;
 
     protected:
         // ========================================================================
@@ -177,6 +179,7 @@ namespace llaminar
          * @param attn_norm_out Output: Normalized input [seq_len, d_model]
          * @param attn_out Output: Final attention output [seq_len, d_model]
          * @param metrics Metrics to update (timing)
+         * @param cache_provider Optional KV cache provider to populate during execution
          *
          * @return true if successful, false on error
          *
@@ -185,6 +188,7 @@ namespace llaminar
          * - COSMA: Uses CosmaPrefillManager (fused RMSNorm+QKV) + attention primitives
          *
          * CRITICAL: Must populate attn_norm_out for snapshot capture consistency!
+         * CRITICAL: If cache_provider is non-null, MUST populate with K/V cache for this layer!
          */
         virtual bool executeAttentionBlock(
             int layer_idx,
@@ -192,7 +196,8 @@ namespace llaminar
             const QwenPipeline::ModelWeights &weights,
             std::shared_ptr<TensorBase> &attn_norm_out,
             std::shared_ptr<TensorBase> &attn_out,
-            PrefillMetrics &metrics) = 0;
+            PrefillMetrics &metrics,
+            KVCacheProvider *cache_provider) = 0;
 
         // ========================================================================
         // Shared implementation methods (used by execute())
@@ -222,7 +227,8 @@ namespace llaminar
             std::shared_ptr<TensorBase> &input,
             const QwenPipeline::ModelWeights &weights,
             std::shared_ptr<TensorBase> &output,
-            PrefillMetrics &metrics);
+            PrefillMetrics &metrics,
+            KVCacheProvider *cache_provider);
 
         /**
          * @brief Execute FFN block (shared implementation)

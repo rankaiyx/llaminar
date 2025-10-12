@@ -99,6 +99,7 @@ namespace llaminar
         bool incr_trace = false;                 // LLAMINAR_PIPELINE_INCR_TRACE (basic incremental decode trace: n_past, pos, seq_len)
         bool incr_cache_trace = false;           // LLAMINAR_PIPELINE_INCR_CACHE_TRACE (log K/V slice stats around incremental writes)
         bool incr_hidden_trace = false;          // LLAMINAR_PIPELINE_INCR_HIDDEN_TRACE (dump final hidden row prior to LM head)
+        bool debug_decode_embed = false;         // LLAMINAR_DEBUG_DECODE_EMBED (log embedding details during incremental decode)
     };
 
     // KV cache policy (dynamic capacity management for incremental decode)
@@ -342,6 +343,13 @@ namespace llaminar
         bool transpose_warn = false;
     };
 
+    // Parity testing controls for incremental decode validation
+    struct ParityEnv
+    {
+        bool save_per_token = false;                               // LLAMINAR_PARITY_SAVE_PER_TOKEN (enable per-token snapshot saving during decode)
+        std::string output_dir = "llaminar_incremental_snapshots"; // LLAMINAR_PARITY_OUTPUT_DIR (directory for snapshots)
+    };
+
     // Test / harness controls
     struct TestHarnessEnv
     {
@@ -467,6 +475,7 @@ namespace llaminar
         FFNShardTraceEnv ffn_shard_trace;
         RMSFusedEnv rms_fused;
         EmbeddingWarnEnv embedding_warn;
+        ParityEnv parity; // parity testing controls for incremental decode
         TestHarnessEnv test_harness;
         LoggingEnv logging;
         DistributionEnvConfig distribution; // new group for high-level mode selection

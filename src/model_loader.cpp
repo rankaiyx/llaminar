@@ -1089,14 +1089,53 @@ std::shared_ptr<llaminar::TensorBase> ModelLoader::loadTensor(const std::string 
         }
     }
 
-    // DIMENSION FIX: After reversing GGUF dimensions in parseTensorInfo,
-    // dimensions are now in standard row-major order: [vocab_size, d_model] for embeddings
-    // NO TRANSPOSE NEEDED - dimensions are already correct!
-    LOG_INFO("[TRANSPOSE_CHECK] tensor_name='" << tensor_name << "' n_dims=" << info->dimensions.size());
-    if (tensor_name == "token_embd.weight" || tensor_name == "output.weight")
+    // GGUF METADATA vs DATA LAYOUT - THE TRUTH:
+    // ==========================================
+    // GGUF metadata dimensions are BACKWARDS from actual data layout!
+    //
+    // Example: token_embd.weight
+    //   - GGUF metadata claims: [896, 151669] = [d_model, vocab_size]
+    //   - Actual data in file:  [151669, 896] = [vocab_size, d_model] in row-major
+    //   - Proof: first 3 values match PyTorch embedding[0][:3], not embedding[:3][0]
+    //
+    // In parseTensorInfo(), we SWAPPED the metadata dimensions to match reality:
+    //   - Read GGUF metadata: [896, 151669]
+    //   - Swap to truth: [151669, 896]
+    //
+    // CRITICAL INSIGHT: After dimension swap, metadata matches data layout!
+    //   - Metadata now says: [151669, 896]
+    //   - Data is stored as: [151669, 896] in row-major
+    //   - Therefore: NO DATA TRANSPOSE NEEDED!
+    //
+    // The previous code was doing an unnecessary transpose, which CORRUPTED the data
+    // by transposing already-correct data, causing embedding[0][1] to land at embedding[1][0].
+    //
+    // SOLUTION: Do NOT transpose data when dimensions were swapped - they're already aligned!
+    //
+    LOG_TRACE("[DIMENSION_CHECK] tensor_name='" << tensor_name << "' n_dims=" << info->dimensions.size());
+
+    if (info->dimensions.size() == 2 && info->gguf_dimensions.size() == 2)
     {
-        LOG_INFO("[TRANSPOSE_SKIP] Embedding tensor '" << tensor_name << "' dimensions already correct: ["
-                                                       << info->dimensions[0] << "x" << info->dimensions[1] << "]");
+        // Check if dimensions were swapped (GGUF != Llaminar dimensions)
+        bool dims_were_swapped = (info->gguf_dimensions[0] == info->dimensions[1] &&
+                                  info->gguf_dimensions[1] == info->dimensions[0]);
+
+        LOG_DEBUG("[DIMENSION_DEBUG] " << tensor_name
+                                       << " gguf_metadata=[" << info->gguf_dimensions[0] << "," << info->gguf_dimensions[1] << "]"
+                                       << " corrected_dims=[" << info->dimensions[0] << "," << info->dimensions[1] << "]"
+                                       << " swapped=" << dims_were_swapped
+                                       << " first_3_values=[" << data_f32[0] << "," << data_f32[1] << "," << data_f32[2] << "]");
+
+        // When dims were swapped, the corrected metadata now matches the actual data layout
+        // No transpose needed! Data is already in the right layout.
+        if (dims_were_swapped)
+        {
+            LOG_DEBUG("[DIMENSION_FIX] " << tensor_name
+                                         << ": GGUF metadata was backwards, we corrected it to match actual data layout"
+                                         << " [" << info->gguf_dimensions[0] << "," << info->gguf_dimensions[1] << "]"
+                                         << " → [" << info->dimensions[0] << "," << info->dimensions[1] << "]"
+                                         << " - data already matches, no transpose needed");
+        }
     }
 
     auto simple = std::make_shared<llaminar::SimpleTensor>(dims, data_f32);
@@ -1358,18 +1397,29 @@ bool ModelLoader::parseTensorInfo()
 
         // Read dimensions
         //
-        // GGUF DIMENSION STORAGE CONVENTION:
-        // ==================================
-        // GGUF stores tensor dimensions in llama.cpp's convention (TRANSPOSED from our needs):
-        //   - GGUF stores: [in_features, out_features] for weight matrices
-        //   - GGUF stores: [d_model, vocab_size] for embeddings
-        //   - llama.cpp's ggml_mul_mat implicitly transposes, so this works for them
+        // GGUF DIMENSION METADATA vs DATA LAYOUT - CRITICAL QUIRK:
+        // =========================================================
+        // GGUF has a dimension metadata/data layout mismatch!
         //
-        // Llaminar uses PyTorch/NumPy convention (row-major, explicit transposes):
-        //   - We need: [out_features, in_features] for weight matrices
-        //   - We need: [vocab_size, d_model] for embeddings
+        // For embeddings (token_embd.weight):
+        //   - GGUF metadata claims: [d_model, vocab_size] = [896, 151669]
+        //   - Actual data is stored: [vocab_size, d_model] row-major
+        //   - Verified: first 3 values match PyTorch embedding[0][:3], NOT embedding[:3][0]
         //
-        // SOLUTION: Reverse dimensions for all 2D tensors after reading from GGUF
+        // For weight matrices:
+        //   - GGUF metadata claims: [in_features, out_features]
+        //   - Actual data is stored: [out_features, in_features] row-major
+        //
+        // This quirk exists because llama.cpp's ggml_mul_mat implicitly transposes,
+        // so they can use the "wrong" metadata with the "correct" data layout.
+        //
+        // Llaminar uses PyTorch convention (explicit transposes), so we need:
+        //   - Embeddings: [vocab_size, d_model]
+        //   - Weights: [out_features, in_features]
+        //
+        // SOLUTION:
+        //   1. Swap the metadata dimensions (below) to match actual data layout
+        //   2. Transpose the data (in loadTensor()) to match PyTorch if needed
         //
         // See docs/WEIGHT_MATRIX_CONVENTIONS.md for full explanation.
         //
@@ -1380,11 +1430,35 @@ bool ModelLoader::parseTensorInfo()
                 return false;
         }
 
-        // CRITICAL: Reverse dimensions for 2D tensors to convert from GGUF/llama.cpp convention
-        // to Llaminar/PyTorch convention
+        // Save original GGUF dimensions BEFORE any swapping (for offset calculation later)
+        tensor.gguf_dimensions = tensor.dimensions;
+
+        // CRITICAL: Dimension swap for ALL 2D tensors from GGUF
+        // ======================================================
+        // GGUF metadata dimensions are BACKWARDS from actual data layout!
+        //
+        // GGUF metadata claims:      Actual data stored as:    Llaminar needs:
+        // - Embeddings: [d, vocab]   [vocab, d] row-major  →   [vocab, d]  (already correct!)
+        // - Weights: [in, out]       [out, in] row-major   →   [out, in]   (already correct!)
+        //
+        // However, we still need to SWAP the metadata to match the actual data:
+        // - Read GGUF metadata: [896, 151669] (claims d×vocab)
+        // - Swap to get truth: [151669, 896] (actual vocab×d in file)
+        //
+        // Then in loadTensor(), we check if dims were swapped and transpose THE DATA
+        // to match whatever layout we need (currently we transpose to undo the layout).
+        //
+        // IMPORTANT: We swap the dimension METADATA here to correct GGUF's backwards metadata.
+        // The actual DATA transpose happens in loadTensor() based on whether metadata was swapped.
+        //
+        // See docs/WEIGHT_MATRIX_CONVENTIONS.md for detailed explanation.
+        //
         if (n_dims == 2)
         {
             std::swap(tensor.dimensions[0], tensor.dimensions[1]);
+            LOG_TRACE("Swapped dimensions for " << tensor.name
+                                                << ": GGUF=" << tensor.gguf_dimensions[0] << "x" << tensor.gguf_dimensions[1]
+                                                << " → Llaminar=" << tensor.dimensions[0] << "x" << tensor.dimensions[1]);
         }
 
         // Debug: Log dimensions for key tensors to verify correct loading
@@ -1657,7 +1731,7 @@ std::vector<float> ModelLoader::dequantizeTensor(const GGUFTensorInfo &tensor_in
         }
     }
     LOG_DEBUG("[DEQ ENTRY] tensor='" << tensor_name << "' enum=" << static_cast<int>(tensor_info.type)
-              << " bytes=" << quantized_data.size());
+                                     << " bytes=" << quantized_data.size());
     LOG_TRACE("dequantizeTensor: Enter name='" << tensor_name << "' type=" << static_cast<int>(tensor_info.type)
                                                << " quantized_bytes=" << quantized_data.size());
     const IDequantizer *dq = selectDequantizer(tensor_info.type);
@@ -2186,16 +2260,37 @@ bool ModelLoader::loadTensorRowShard(const std::string &tensor_name,
         return false;
     if (info->dimensions.size() != 2)
         return false;
-    size_t rows = info->dimensions[0];
-    size_t cols = info->dimensions[1];
+
+    // Use CORRECTED dimensions (after metadata swap) for offset calculation
+    // The actual data in memory matches the corrected dimensions:
+    // - GGUF metadata may say [896, 151669] (backwards)
+    // - Corrected dimensions = [151669, 896] (matches actual data layout)
+    // - Actual data is stored row-major in [151669, 896] layout
+    size_t rows = info->dimensions[0]; // Corrected first dimension
+    size_t cols = info->dimensions[1]; // Corrected second dimension
+
     if (static_cast<size_t>(row_offset + row_count) > rows)
         return false;
     const CachedFullTensor *full = getOrCacheFullQuantTensor(tensor_name, *info);
     if (!full)
         return false;
+
+    // Calculate offset using CORRECTED dimensions: each row has 'cols' elements
     const float *src = full->data.data() + static_cast<size_t>(row_offset) * cols;
     std::memcpy(dest, src, sizeof(float) * static_cast<size_t>(row_count) * cols);
     return true;
+}
+
+bool ModelLoader::loadTensorColumnShard(const std::string &tensor_name,
+                                        int col_offset,
+                                        int col_count,
+                                        float *dest)
+{
+    // Wrapper around loadTensorColumnShards for single shard convenience
+    std::vector<int> offsets = {col_offset};
+    std::vector<int> counts = {col_count};
+    std::vector<float *> dests = {dest};
+    return loadTensorColumnShards(tensor_name, offsets, counts, dests);
 }
 
 // ---- Simplified K-family dequants now directly call upstream ggml row functions ----

@@ -118,5 +118,6 @@
     "chat.tools.global.autoApprove": true,
     "chat.tools.terminal.autoApprove": {
         "/.*/": true
-    }
+    },
+    "chat.todoListTool.enabled": true
 }

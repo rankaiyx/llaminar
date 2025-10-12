@@ -32,6 +32,7 @@
 #include "transformer_config.h"
 #include "tensors/tensor_base.h"
 #include "mpi_context.h"
+#include "kv_cache_provider.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -127,6 +128,7 @@ namespace llaminar
          * @param output Output tensor for final hidden states or logits
          * @param ctx Stage context (sequence length, KV cache state, etc.)
          * @param metrics Output metrics for timing and FLOP counting
+         * @param cache_provider Optional KV cache provider for populating cache during execution
          *
          * @return true if execution succeeded, false on error
          *
@@ -137,6 +139,13 @@ namespace llaminar
          * 4. Computes LM head output (if needed)
          * 5. Captures snapshots at each stage (if enabled)
          * 6. Populates metrics with timing and FLOP counts
+         * 7. Populates KV cache via cache_provider (if provided)
+         *
+         * Cache Population:
+         * - If cache_provider is non-null, implementations MUST populate it during layer execution
+         * - Call cache_provider->setKCache(layer_idx, k_cache) after each attention layer
+         * - Call cache_provider->setVCache(layer_idx, v_cache) after each attention layer
+         * - Pipeline will retrieve cache after execute() completes for use in decode path
          *
          * Implementations should call captureSnapshot() at standardized stages
          * to enable parity testing against reference implementations.
@@ -146,7 +155,8 @@ namespace llaminar
             const IModelWeights &weights,
             std::shared_ptr<TensorBase> &output,
             StageContext &ctx,
-            PrefillMetrics &metrics) = 0;
+            PrefillMetrics &metrics,
+            KVCacheProvider *cache_provider = nullptr) = 0;
 
         /**
          * @brief Get provider name for logging and metrics

@@ -55,26 +55,52 @@ namespace llaminar
          */
         void validate(const TransformerLayerConfig &cfg) const
         {
+            validate_with_mpi(cfg, 0, 1);
+        }
+
+        /**
+         * @brief Validate all weights with MPI context (slicing-aware).
+         *
+         * @param cfg Model configuration
+         * @param mpi_rank Current MPI rank
+         * @param mpi_size Total MPI world size
+         * @throws std::runtime_error if any weight violates its contract
+         */
+        void validate_with_mpi(const TransformerLayerConfig &cfg, int mpi_rank, int mpi_size) const
+        {
             auto contracts = getQwenWeightContracts();
 
             // Validate global weights
-            contracts.validate_global(inner.token_embedding, inner.output_norm_weight,
-                                      inner.lm_head, cfg);
+            contracts.validate_global_with_mpi(inner.token_embedding, inner.output_norm_weight,
+                                               inner.lm_head, cfg, mpi_rank, mpi_size);
 
             // Validate each layer
-            for (int layer = 0; layer < layer_count(); ++layer)
+            int n_layers = layer_count();
+            LOG_INFO("[WeightContract] Validating " << n_layers << " layers (rank "
+                                                    << mpi_rank << "/" << mpi_size << ")");
+
+            for (int layer = 0; layer < n_layers; ++layer)
             {
-                contracts.validate_layer(layer,
-                                         inner.attn_norm_weight[layer],
-                                         inner.wq[layer],
-                                         inner.wk[layer],
-                                         inner.wv[layer],
-                                         inner.wo[layer],
-                                         inner.ffn_norm_weight[layer],
-                                         inner.w_gate[layer],
-                                         inner.w_up[layer],
-                                         inner.w_down[layer],
-                                         cfg);
+                contracts.validate_layer_with_mpi(layer,
+                                                  inner.attn_norm_weight[layer],
+                                                  inner.wq[layer],
+                                                  inner.wk[layer],
+                                                  inner.wv[layer],
+                                                  inner.wo[layer],
+                                                  inner.ffn_norm_weight[layer],
+                                                  inner.w_gate[layer],
+                                                  inner.w_up[layer],
+                                                  inner.w_down[layer],
+                                                  cfg,
+                                                  mpi_rank,
+                                                  mpi_size);
+
+                // Log progress every 5 layers
+                if ((layer + 1) % 5 == 0 || layer == n_layers - 1)
+                {
+                    LOG_INFO("[WeightContract] ✓ Validated layers 0-" << layer << " (" << (layer + 1)
+                                                                      << "/" << n_layers << ")");
+                }
             }
         }
     };

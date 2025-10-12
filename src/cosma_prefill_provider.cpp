@@ -185,7 +185,8 @@ namespace llaminar
         const QwenPipeline::ModelWeights &weights,
         std::shared_ptr<TensorBase> &attn_norm_out,
         std::shared_ptr<TensorBase> &attn_out,
-        PrefillMetrics &metrics)
+        PrefillMetrics &metrics,
+        KVCacheProvider *cache_provider)
     {
         PERF_SCOPED_TIMER("COSMAPrefillProvider::executeAttentionBlock");
 
@@ -250,12 +251,25 @@ namespace llaminar
             weights.bv[layer_idx],
             k_cache,
             v_cache};
-        std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
+        std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out, nullptr, nullptr};
 
         if (!executeKernel("attention", attn_inputs, attn_outputs))
         {
             LOG_ERROR("COSMAPrefillProvider: Layer " << layer_idx << " attention failed");
             return false;
+        }
+
+        // Populate cache provider if given
+        if (cache_provider && attn_outputs.size() >= 3)
+        {
+            if (attn_outputs[1])
+            {
+                cache_provider->setKCache(layer_idx, attn_outputs[1]);
+            }
+            if (attn_outputs[2])
+            {
+                cache_provider->setVCache(layer_idx, attn_outputs[2]);
+            }
         }
 
         auto attn_end = std::chrono::high_resolution_clock::now();

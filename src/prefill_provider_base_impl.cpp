@@ -26,7 +26,8 @@ namespace llaminar
         const IModelWeights &weights,
         std::shared_ptr<TensorBase> &output,
         StageContext &ctx,
-        PrefillMetrics &metrics)
+        PrefillMetrics &metrics,
+        KVCacheProvider *cache_provider)
     {
         PERF_SCOPED_TIMER("PrefillProviderBaseImpl::execute");
 
@@ -77,7 +78,7 @@ namespace llaminar
 
         for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
         {
-            if (!executeTransformerLayer(layer_idx, layer_input, *qwen_weights, layer_output, metrics))
+            if (!executeTransformerLayer(layer_idx, layer_input, *qwen_weights, layer_output, metrics, cache_provider))
             {
                 LOG_ERROR("PrefillProviderBaseImpl: Layer " << layer_idx << " failed");
                 return false;
@@ -168,7 +169,8 @@ namespace llaminar
         std::shared_ptr<TensorBase> &input,
         const QwenPipeline::ModelWeights &weights,
         std::shared_ptr<TensorBase> &output,
-        PrefillMetrics &metrics)
+        PrefillMetrics &metrics,
+        KVCacheProvider *cache_provider)
     {
         PERF_SCOPED_TIMER("PrefillProviderBaseImpl::executeTransformerLayer");
 
@@ -182,7 +184,7 @@ namespace llaminar
         auto residual_tmp = createLocalTensor({seq_len, d_model});
 
         // === Attention Block (delegated to backend) ===
-        if (!executeAttentionBlock(layer_idx, input, weights, attn_norm_out, attn_out, metrics))
+        if (!executeAttentionBlock(layer_idx, input, weights, attn_norm_out, attn_out, metrics, cache_provider))
         {
             LOG_ERROR("PrefillProviderBaseImpl: Layer " << layer_idx << " attention failed");
             return false;

@@ -62,18 +62,24 @@ class PipelineStageCapture:
             if self.verbose:
                 print("✓ Model loaded")
     
-    def capture_stages(self, token_ids: List[int]) -> Dict[str, np.ndarray]:
+    def capture_stages(self, token_ids: List[int], past_key_values=None) -> Dict[str, np.ndarray]:
         """
         Run forward pass and capture all pipeline stages.
         
         Args:
             token_ids: Input token IDs
+            past_key_values: Optional KV cache from previous tokens (for incremental decode)
             
         Returns:
             Dictionary mapping stage names to numpy arrays
+            If past_key_values was provided, also returns updated cache in self.past_key_values
         """
         self.load_model()
         self.captures = {}
+        
+        # For incremental decode with KV cache, we use the simpler forward path
+        if past_key_values is not None:
+            return self._capture_stages_incremental(token_ids, past_key_values)
         
         # Use the model's forward method which handles all the complexity
         token_tensor = torch.tensor([token_ids])
@@ -84,7 +90,12 @@ class PipelineStageCapture:
             # EMBEDDING stage
             if hasattr(hf_model, 'model') and hasattr(hf_model.model, 'embed_tokens'):
                 hidden_states = hf_model.model.embed_tokens(token_tensor)
-                self.captures['EMBEDDING'] = hidden_states.detach().cpu().numpy()
+                # For single-token incremental decode, squeeze sequence dimension to match Llaminar format
+                embedding_output = hidden_states.detach().cpu().numpy()
+                if embedding_output.shape[1] == 1:
+                    # (1, 1, 896) -> (1, 896) for incremental decode
+                    embedding_output = embedding_output.squeeze(1)
+                self.captures['EMBEDDING'] = embedding_output
             else:
                 raise RuntimeError("Cannot find embedding layer")
             
@@ -306,6 +317,27 @@ class PipelineStageCapture:
                 self.captures['LM_HEAD'] = logits.detach().cpu().numpy()
             else:
                 raise RuntimeError("Cannot find lm_head")
+            
+            # Also generate KV cache for incremental decode continuation
+            # Run a quick forward pass with use_cache=True and output_attentions=True
+            outputs = hf_model(
+                input_ids=token_tensor,
+                use_cache=True,
+                output_attentions=True,
+                return_dict=True
+            )
+            self.past_key_values = outputs.past_key_values
+            
+            # Capture attention weights (softmax outputs) if available
+            if hasattr(outputs, 'attentions') and outputs.attentions:
+                for layer_idx, attn_weights in enumerate(outputs.attentions):
+                    # attn_weights shape: (batch, num_heads, seq_len, seq_len)
+                    # This is the attention softmax output
+                    # Squeeze batch dimension if present: (1, H, S, S) -> (H, S, S) for prefill
+                    attn_np = attn_weights.detach().cpu().numpy()
+                    if attn_np.shape[0] == 1:
+                        attn_np = attn_np.squeeze(0)  # Remove batch dimension
+                    self.captures[f'ATTENTION_SOFTMAX_layer{layer_idx}'] = attn_np
         
         if self.verbose:
             print(f"\n✓ Captured {len(self.captures)} pipeline stages:")
@@ -313,7 +345,121 @@ class PipelineStageCapture:
                 shape = self.captures[name].shape
                 print(f"  - {name}: {shape}")
         
-        return self.captures
+        # Return a COPY to avoid reference issues when self.captures is cleared on next call
+        return self.captures.copy()
+    
+    def _capture_stages_incremental(self, token_ids: List[int], past_key_values) -> Dict[str, np.ndarray]:
+        """
+        Capture stages for incremental decode with KV cache using forward hooks.
+        
+        We use PyTorch hooks to intercept intermediate activations during
+        the model's optimized forward pass with KV cache.
+        
+        Args:
+            token_ids: Single token ID (list with one element)
+            past_key_values: KV cache from previous tokens
+            
+        Returns:
+            Dictionary with all captured stages
+            
+        Side effects:
+            Sets self.past_key_values to the updated KV cache for next token
+        """
+        token_tensor = torch.tensor([token_ids])
+        hf_model = self.model.hf_model
+        
+        # Storage for hook captures
+        hook_captures = {}
+        hooks = []
+        
+        def make_hook(name):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    # For modules that return tuples, capture first element
+                    hook_captures[name] = output[0].detach().cpu().numpy()
+                else:
+                    hook_captures[name] = output.detach().cpu().numpy()
+            return hook
+        
+        try:
+            # Register hooks for all key modules
+            # Embedding
+            if hasattr(hf_model.model, 'embed_tokens'):
+                hooks.append(hf_model.model.embed_tokens.register_forward_hook(
+                    make_hook('EMBEDDING')))
+            
+            # Per-layer hooks
+            if hasattr(hf_model.model, 'layers'):
+                for i, layer in enumerate(hf_model.model.layers):
+                    # Attention norm
+                    if hasattr(layer, 'input_layernorm'):
+                        hooks.append(layer.input_layernorm.register_forward_hook(
+                            make_hook(f'ATTENTION_NORM_layer{i}')))
+                    
+                    # Q, K, V projections
+                    if hasattr(layer, 'self_attn'):
+                        attn = layer.self_attn
+                        if hasattr(attn, 'q_proj'):
+                            hooks.append(attn.q_proj.register_forward_hook(
+                                make_hook(f'Q_PROJECTION_layer{i}')))
+                        if hasattr(attn, 'k_proj'):
+                            hooks.append(attn.k_proj.register_forward_hook(
+                                make_hook(f'K_PROJECTION_layer{i}')))
+                        if hasattr(attn, 'v_proj'):
+                            hooks.append(attn.v_proj.register_forward_hook(
+                                make_hook(f'V_PROJECTION_layer{i}')))
+                        if hasattr(attn, 'o_proj'):
+                            hooks.append(attn.o_proj.register_forward_hook(
+                                make_hook(f'ATTENTION_OUTPUT_layer{i}')))
+                    
+                    # FFN/MLP norm and output (use FFN naming to match Llaminar)
+                    if hasattr(layer, 'post_attention_layernorm'):
+                        hooks.append(layer.post_attention_layernorm.register_forward_hook(
+                            make_hook(f'FFN_NORM_layer{i}')))
+                    if hasattr(layer, 'mlp'):
+                        hooks.append(layer.mlp.register_forward_hook(
+                            make_hook(f'FFN_DOWN_layer{i}')))
+            
+            # Final norm
+            if hasattr(hf_model.model, 'norm'):
+                hooks.append(hf_model.model.norm.register_forward_hook(
+                    make_hook('FINAL_NORM')))
+            
+            # Run forward with KV cache
+            with torch.no_grad():
+                outputs = hf_model(
+                    input_ids=token_tensor,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_attentions=True,
+                    return_dict=True
+                )
+            
+            # Capture final outputs
+            hook_captures['LM_HEAD'] = outputs.logits.detach().cpu().numpy()
+            
+            # Capture attention weights (softmax outputs) if available
+            if hasattr(outputs, 'attentions') and outputs.attentions:
+                for layer_idx, attn_weights in enumerate(outputs.attentions):
+                    # attn_weights shape: (batch, num_heads, seq_len_q, seq_len_k)
+                    # For incremental decode: (1, num_heads, 1, cache_len+1)
+                    # Squeeze to (num_heads, cache_len+1) to match Llaminar format
+                    attn_np = attn_weights.detach().cpu().numpy()
+                    if attn_np.shape[0] == 1 and attn_np.shape[2] == 1:
+                        attn_np = attn_np.squeeze(0).squeeze(1)  # (1, H, 1, K) -> (H, K)
+                    hook_captures[f'ATTENTION_SOFTMAX_layer{layer_idx}'] = attn_np
+            
+            # Store updated KV cache for next token
+            self.past_key_values = outputs.past_key_values
+            
+        finally:
+            # Clean up hooks
+            for hook in hooks:
+                hook.remove()
+        
+        self.captures = hook_captures
+        # Return a COPY to avoid reference issues when self.captures is cleared on next call
+        return self.captures.copy()
     
     def save_snapshots(self, output_dir: str):
         """

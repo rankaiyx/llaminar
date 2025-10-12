@@ -7,6 +7,7 @@
 #include "parity_test_framework.h"
 #include "npz_loader.h"
 #include "logger.h"
+#include <mpi.h>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -68,6 +69,68 @@ namespace llaminar
                 keys.push_back(pair.first);
             }
             return keys;
+        }
+
+        bool SnapshotRegistry::saveToDirectory(const std::string &output_dir) const
+        {
+            // Create output directory if it doesn't exist
+            std::string mkdir_cmd = "mkdir -p \"" + output_dir + "\"";
+            int ret = std::system(mkdir_cmd.c_str());
+            if (ret != 0)
+            {
+                LOG_ERROR("Failed to create directory: " << output_dir);
+                return false;
+            }
+
+            LOG_INFO("Saving " << snapshots_.size() << " snapshots to: " << output_dir);
+
+            // Save each snapshot as a .npy file
+            size_t saved_count = 0;
+            for (const auto &pair : snapshots_)
+            {
+                const std::string &key = pair.first;
+                const TensorSnapshot &snapshot = pair.second;
+
+                // Convert key to filename
+                // Llaminar keys are like "llaminar_EMBEDDING" or "llaminar_layer_0_ATTENTION_OUTPUT"
+                // We want to save as "EMBEDDING.npy" or "ATTENTION_OUTPUT_layer0.npy"
+
+                std::string filename;
+                const auto &meta = snapshot.metadata;
+
+                // Use the standardized stage name from metadata
+                if (meta.layer_index >= 0)
+                {
+                    // Layer-specific stage: ATTENTION_OUTPUT_layer0.npy
+                    filename = meta.stage_name + "_layer" + std::to_string(meta.layer_index) + ".npy";
+                }
+                else
+                {
+                    // Global stage: EMBEDDING.npy, FINAL_NORM.npy, LM_HEAD.npy
+                    filename = meta.stage_name + ".npy";
+                }
+
+                std::string filepath = output_dir + "/" + filename;
+
+                // Build shape vector from metadata
+                std::vector<size_t> shape;
+                shape.push_back(static_cast<size_t>(meta.seq_len));
+                shape.push_back(static_cast<size_t>(meta.feature_dim));
+
+                // Write .npy file using the writer we just added
+                bool success = NpzLoader::write_npy(filepath, snapshot.data, shape);
+
+                if (!success)
+                {
+                    LOG_ERROR("Failed to write snapshot: " << filepath);
+                    return false;
+                }
+
+                saved_count++;
+            }
+
+            LOG_INFO("Successfully saved " << saved_count << " snapshots");
+            return true;
         }
 
         std::string SnapshotRegistry::make_key(const std::string &source, PipelineStage stage, int layer) const
@@ -292,6 +355,76 @@ namespace llaminar
         bool LlaminarSnapshotHook::is_enabled()
         {
             return enabled_;
+        }
+
+        // ==================== IncrementalSnapshotHelper Implementation ====================
+
+        IncrementalSnapshotHelper::IncrementalSnapshotHelper(const std::string &output_base_dir)
+            : output_base_dir_(output_base_dir)
+        {
+            // Ensure output directory exists
+            std::string mkdir_cmd = "mkdir -p \"" + output_base_dir_ + "\"";
+            if (std::system(mkdir_cmd.c_str()) != 0)
+            {
+                LOG_WARN("Failed to create base output directory: " << output_base_dir_);
+            }
+        }
+
+        void IncrementalSnapshotHelper::beforeToken(int token_index)
+        {
+            // Clear any previous snapshots
+            SnapshotRegistry::instance().clear();
+
+            // Ensure LlaminarSnapshotHook is enabled
+            if (!LlaminarSnapshotHook::is_enabled())
+            {
+                LlaminarSnapshotHook::set_enabled(true);
+            }
+
+            LOG_DEBUG("IncrementalSnapshotHelper: Ready to capture token_" << token_index);
+        }
+
+        bool IncrementalSnapshotHelper::afterToken(int token_index)
+        {
+            // CRITICAL: Only save snapshots from rank 0 to avoid MPI ranks overwriting each other!
+            // Each rank captures its own local intermediate values (due to sharding), but we want
+            // to compare rank 0's values against PyTorch (which runs single-process).
+            int rank = 0;
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+            if (rank == 0)
+            {
+                std::string token_dir = getTokenDir(token_index);
+
+                LOG_INFO("IncrementalSnapshotHelper: Saving snapshots for token_" << token_index
+                                                                                  << " to: " << token_dir);
+
+                // Save all captured snapshots
+                bool success = SnapshotRegistry::instance().saveToDirectory(token_dir);
+
+                if (!success)
+                {
+                    LOG_ERROR("IncrementalSnapshotHelper: Failed to save snapshots to: " << token_dir);
+                    return false;
+                }
+
+                size_t count = SnapshotRegistry::instance().list_keys().size();
+                LOG_INFO("IncrementalSnapshotHelper: Successfully saved " << count << " snapshots");
+            }
+            else
+            {
+                LOG_DEBUG("IncrementalSnapshotHelper: Rank " << rank << " skipping save (only rank 0 saves)");
+            }
+
+            // Clear registry on ALL ranks for next token
+            SnapshotRegistry::instance().clear();
+
+            return true;
+        }
+
+        std::string IncrementalSnapshotHelper::getTokenDir(int token_index) const
+        {
+            return output_base_dir_ + "/token_" + std::to_string(token_index);
         }
 
         // ==================== PyTorch Snapshot Loader ====================

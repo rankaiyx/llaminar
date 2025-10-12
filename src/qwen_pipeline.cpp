@@ -57,7 +57,10 @@
 #include "qwen_pipeline_adapter.h" // For QwenModelWeights
 #include "prefill_diagnostics.h"   // For baseline comparison and FFN tracing
 #include "prefill_provider.h"      // For PrefillProviderFactory
+#include "kv_cache_provider.h"     // For SimpleKVCacheProvider
 #include "model_loader.h"
+#include "weight_contracts.h" // For contract-driven weight loading
+#include "bias_contracts.h"   // For bias dimension validation
 #include "kernels/MPISwiGLUKernel.h"
 #include "kernels/MPIRoPEKernel.h"
 #include "kernels/MPIResidualKernel.h"
@@ -365,15 +368,71 @@ namespace llaminar
                 // Update KV cache with kernel outputs
                 if (use_kv_cache_ && attn_outputs.size() >= 3)
                 {
+                    if (getRank() == 0 && layer_idx == 0)
+                    {
+                        LOG_INFO("[CACHE_UPDATE_CONDITION] use_kv_cache=" << use_kv_cache_
+                                                                          << " attn_outputs.size()=" << attn_outputs.size()
+                                                                          << " attn_outputs[1]=" << (void *)attn_outputs[1].get()
+                                                                          << " attn_outputs[2]=" << (void *)attn_outputs[2].get()
+                                                                          << " bool(attn_outputs[1])=" << (bool)(attn_outputs[1])
+                                                                          << " bool(attn_outputs[2])=" << (bool)(attn_outputs[2]));
+                    }
+
                     if (attn_outputs[1] && attn_outputs[2])
                     {
+                        if (getRank() == 0 && layer_idx == 0)
+                        {
+                            LOG_INFO("[CACHE_UPDATE_DEBUG] BEFORE update:");
+                            LOG_INFO("  k_cache_[0] pointer: " << (void *)k_cache_[layer_idx].get());
+                            if (k_cache_[layer_idx])
+                            {
+                                LOG_INFO("  k_cache_[0] shape: [" << k_cache_[layer_idx]->shape()[0] << ", " << k_cache_[layer_idx]->shape()[1] << "]");
+                                LOG_INFO("  k_cache_[0] first 10: "
+                                         << k_cache_[layer_idx]->data()[0] << " " << k_cache_[layer_idx]->data()[1] << " "
+                                         << k_cache_[layer_idx]->data()[2] << " " << k_cache_[layer_idx]->data()[3] << " "
+                                         << k_cache_[layer_idx]->data()[4] << " " << k_cache_[layer_idx]->data()[5] << " "
+                                         << k_cache_[layer_idx]->data()[6] << " " << k_cache_[layer_idx]->data()[7] << " "
+                                         << k_cache_[layer_idx]->data()[8] << " " << k_cache_[layer_idx]->data()[9]);
+                            }
+                            LOG_INFO("  attn_outputs[1] pointer: " << (void *)attn_outputs[1].get());
+                            LOG_INFO("  attn_outputs[1] shape: [" << attn_outputs[1]->shape()[0] << ", " << attn_outputs[1]->shape()[1] << "]");
+                            LOG_INFO("  attn_outputs[1] first 10: "
+                                     << attn_outputs[1]->data()[0] << " " << attn_outputs[1]->data()[1] << " "
+                                     << attn_outputs[1]->data()[2] << " " << attn_outputs[1]->data()[3] << " "
+                                     << attn_outputs[1]->data()[4] << " " << attn_outputs[1]->data()[5] << " "
+                                     << attn_outputs[1]->data()[6] << " " << attn_outputs[1]->data()[7] << " "
+                                     << attn_outputs[1]->data()[8] << " " << attn_outputs[1]->data()[9]);
+                        }
+
                         k_cache_[layer_idx] = attn_outputs[1];
                         v_cache_[layer_idx] = attn_outputs[2];
+
+                        if (getRank() == 0 && layer_idx == 0)
+                        {
+                            LOG_INFO("[CACHE_UPDATE_DEBUG] AFTER update:");
+                            LOG_INFO("  k_cache_[0] pointer: " << (void *)k_cache_[layer_idx].get());
+                            LOG_INFO("  k_cache_[0] shape: [" << k_cache_[layer_idx]->shape()[0] << ", " << k_cache_[layer_idx]->shape()[1] << "]");
+                            LOG_INFO("  k_cache_[0] first 10: "
+                                     << k_cache_[layer_idx]->data()[0] << " " << k_cache_[layer_idx]->data()[1] << " "
+                                     << k_cache_[layer_idx]->data()[2] << " " << k_cache_[layer_idx]->data()[3] << " "
+                                     << k_cache_[layer_idx]->data()[4] << " " << k_cache_[layer_idx]->data()[5] << " "
+                                     << k_cache_[layer_idx]->data()[6] << " " << k_cache_[layer_idx]->data()[7] << " "
+                                     << k_cache_[layer_idx]->data()[8] << " " << k_cache_[layer_idx]->data()[9]);
+                        }
+
                         if (debugEnv().pipeline.layer_token_diff_verbose && getRank() == 0)
                         {
                             LOG_DEBUG("[CacheUpdate] layer=" << layer_idx
                                                              << " k_cache_seq_len=" << k_cache_[layer_idx]->shape()[0]
                                                              << " v_cache_seq_len=" << v_cache_[layer_idx]->shape()[0]);
+                        }
+                    }
+                    else
+                    {
+                        if (getRank() == 0 && layer_idx == 0)
+                        {
+                            LOG_WARN("[CACHE_UPDATE_SKIPPED] Condition FALSE! attn_outputs[1]=" << (bool)(attn_outputs[1])
+                                                                                                << " attn_outputs[2]=" << (bool)(attn_outputs[2]));
                         }
                     }
                 }
@@ -855,6 +914,29 @@ namespace llaminar
             LOG_INFO("[WeightLoad] token_embd.weight shape=" << emb_shape[0] << "x" << emb_shape[1]);
         }
 
+        // Log first few embedding values to verify consistency across ranks
+        {
+            int mpi_rank = 0;
+#ifdef LLAMINAR_HAVE_MPI
+            MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+#endif
+            const float *emb_ptr = weights.token_embedding->data();
+            LOG_INFO("[WeightLoad] rank=" << mpi_rank
+                                          << " token_embd first 10 values: ["
+                                          << emb_ptr[0] << ", " << emb_ptr[1] << ", " << emb_ptr[2] << ", "
+                                          << emb_ptr[3] << ", " << emb_ptr[4] << ", " << emb_ptr[5] << ", "
+                                          << emb_ptr[6] << ", " << emb_ptr[7] << ", " << emb_ptr[8] << ", "
+                                          << emb_ptr[9] << "]");
+            // Also log some values from token 1 embedding (offset 896)
+            const float *token1_emb = emb_ptr + 896;
+            LOG_INFO("[WeightLoad] rank=" << mpi_rank
+                                          << " token_embd[1] first 10 values: ["
+                                          << token1_emb[0] << ", " << token1_emb[1] << ", " << token1_emb[2] << ", "
+                                          << token1_emb[3] << ", " << token1_emb[4] << ", " << token1_emb[5] << ", "
+                                          << token1_emb[6] << ", " << token1_emb[7] << ", " << token1_emb[8] << ", "
+                                          << token1_emb[9] << "]");
+        }
+
         // Lightweight anomaly detection on sample of embedding values
         {
             const float *ptr = weights.token_embedding->data();
@@ -978,16 +1060,47 @@ namespace llaminar
         weights.w_down.reserve(config.n_layers);
 
         LOG_INFO("[WeightLoad] per-layer loading start layers=" << config.n_layers);
+
+        // Get MPI context for weight slicing
+        int mpi_rank = 0, mpi_size = 1;
+#ifdef LLAMINAR_HAVE_MPI
+        int mpi_initialized = 0;
+        MPI_Initialized(&mpi_initialized);
+        if (mpi_initialized)
+        {
+            MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+            MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+        }
+#endif
+
+        // Get Qwen weight contracts for contract-driven loading
+        auto contracts = llaminar::getQwenWeightContracts();
+
+        // Weight indices in contracts.layer_weights
+        const int IDX_ATTN_NORM = 0;
+        const int IDX_Q = 1;
+        const int IDX_K = 2;
+        const int IDX_V = 3;
+        const int IDX_O = 4;
+        const int IDX_FFN_NORM = 5;
+        const int IDX_W_GATE = 6;
+        const int IDX_W_UP = 7;
+        const int IDX_W_DOWN = 8;
+
+        if (mpi_rank == 0)
+        {
+            LOG_INFO("[WeightLoad] Using contract-driven loading with MPI world_size=" << mpi_size);
+        }
+
         for (int layer = 0; layer < config.n_layers; ++layer)
         {
             // Construct tensor name prefix for this layer
             std::string prefix = "blk." + std::to_string(layer) + ".";
 
             // --- Attention Normalization ---
-            // Load pre-attention RMSNorm gamma
-            auto attn_norm = loader.loadTensor(prefix + "attn_norm.weight");
-            if (!attn_norm)
-                throw std::runtime_error("Failed to load " + prefix + "attn_norm.weight");
+            // Contract-driven loading handles everything automatically
+            auto attn_norm = contracts.layer_weights[IDX_ATTN_NORM].load(
+                loader, config, mpi_rank, mpi_size, layer);
 
             // Debug override: force unit gamma if requested
             if (debugEnv().output_norm.force_unit_all)
@@ -999,26 +1112,116 @@ namespace llaminar
             weights.attn_norm_weight.push_back(attn_norm);
 
             // --- Attention Projection Matrices ---
-            // Load Q, K, V, and output projection weights
-            auto wq = loader.loadTensor(prefix + "attn_q.weight");      // Query projection
-            auto wk = loader.loadTensor(prefix + "attn_k.weight");      // Key projection
-            auto wv = loader.loadTensor(prefix + "attn_v.weight");      // Value projection
-            auto wo = loader.loadTensor(prefix + "attn_output.weight"); // Output projection
+            // Contract-driven loading automatically handles:
+            // - GGUF vs PyTorch dimension conventions
+            // - Row/column slicing based on MPI context
+            // - Data transposition when needed
+            // - Shape validation
 
-            // Validate all attention weights loaded successfully
-            if (!wq || !wk || !wv || !wo)
-                throw std::runtime_error("Failed to load attention weights for layer " + std::to_string(layer));
+            auto wq = contracts.layer_weights[IDX_Q].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto wk = contracts.layer_weights[IDX_K].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto wv = contracts.layer_weights[IDX_V].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto wo = contracts.layer_weights[IDX_O].load(
+                loader, config, mpi_rank, mpi_size, layer);
 
-            // NOTE: ModelLoader already converts GGUF format [in,out] to PyTorch format [out,in]
-            // No additional transpose needed - weights are ready to use!
+            // Load Q, K, V projection biases as REPLICATED, then slice them for this rank
+            // Biases are 1D vectors aligned with the row dimension of their respective weights
+            auto bq_full = loader.loadTensor(prefix + "attn_q.bias");
+            auto bk_full = loader.loadTensor(prefix + "attn_k.bias");
+            auto bv_full = loader.loadTensor(prefix + "attn_v.bias");
 
-            // Load Q, K, V projection biases
-            auto bq = loader.loadTensor(prefix + "attn_q.bias");
-            auto bk = loader.loadTensor(prefix + "attn_k.bias");
-            auto bv = loader.loadTensor(prefix + "attn_v.bias");
-
-            if (!bq || !bk || !bv)
+            if (!bq_full || !bk_full || !bv_full)
                 throw std::runtime_error("Failed to load attention biases for layer " + std::to_string(layer));
+
+            // Calculate head distribution for this rank (same logic as MPIAttentionKernel)
+            auto calc_head_distribution = [](int total_heads, int rank, int world_size) -> std::pair<int, int>
+            {
+                int heads_per_rank = total_heads / world_size;
+                int remainder = total_heads % world_size;
+                int local_heads = heads_per_rank + (rank < remainder ? 1 : 0);
+                int head_offset = rank * heads_per_rank + std::min(rank, remainder);
+                return {local_heads, head_offset};
+            };
+
+            auto [local_q_heads, q_head_offset] = calc_head_distribution(config.n_head, mpi_rank, mpi_size);
+            auto [local_kv_heads, kv_head_offset] = calc_head_distribution(config.n_head_kv, mpi_rank, mpi_size);
+
+            const int head_dim = config.d_model / config.n_head;
+            const int local_q_dim = local_q_heads * head_dim;
+            const int local_kv_dim = local_kv_heads * head_dim;
+
+            // Create bias contracts for validation
+            const int full_q_dim = config.n_head * head_dim;
+            const int full_kv_dim = config.n_head_kv * head_dim;
+
+            BiasContract bq_contract("blk." + std::to_string(layer) + ".attn_q.bias",
+                                     "Q projection bias (head-sliced)",
+                                     full_q_dim, local_q_dim, mpi_rank, mpi_size);
+            BiasContract bk_contract("blk." + std::to_string(layer) + ".attn_k.bias",
+                                     "K projection bias (head-sliced)",
+                                     full_kv_dim, local_kv_dim, mpi_rank, mpi_size);
+            BiasContract bv_contract("blk." + std::to_string(layer) + ".attn_v.bias",
+                                     "V projection bias (head-sliced)",
+                                     full_kv_dim, local_kv_dim, mpi_rank, mpi_size);
+
+            // Validate full bias dimensions BEFORE slicing
+            if (!bq_contract.validate_full(bq_full, layer, prefix + "attn_q.bias") ||
+                !bk_contract.validate_full(bk_full, layer, prefix + "attn_k.bias") ||
+                !bv_contract.validate_full(bv_full, layer, prefix + "attn_v.bias"))
+            {
+                throw std::runtime_error("Bias dimension validation failed at layer " + std::to_string(layer));
+            }
+
+            // Pre-slice biases to match local head dimensions
+            // This happens ONCE at load time, not every forward pass
+            std::shared_ptr<TensorBase> bq, bk, bv;
+
+            if (mpi_size > 1)
+            {
+                // Multi-rank: slice biases
+                const int bq_offset = q_head_offset * head_dim;
+                const int bk_offset = kv_head_offset * head_dim;
+                const int bv_offset = kv_head_offset * head_dim;
+
+                bq = TensorFactory::create_simple({local_q_dim});
+                bk = TensorFactory::create_simple({local_kv_dim});
+                bv = TensorFactory::create_simple({local_kv_dim});
+
+                memcpy(bq->data(), bq_full->data() + bq_offset, local_q_dim * sizeof(float));
+                memcpy(bk->data(), bk_full->data() + bk_offset, local_kv_dim * sizeof(float));
+                memcpy(bv->data(), bv_full->data() + bv_offset, local_kv_dim * sizeof(float));
+
+                if (layer == 0)
+                {
+                    LOG_INFO("[BIAS_SLICE] Layer " << layer << " Rank " << mpi_rank);
+                    LOG_INFO("  Q bias: full[" << bq_full->size() << "] -> local[" << bq->size()
+                                               << "] offset=" << bq_offset);
+                    LOG_INFO("  K bias: full[" << bk_full->size() << "] -> local[" << bk->size()
+                                               << "] offset=" << bk_offset);
+                    LOG_INFO("  V bias: full[" << bv_full->size() << "] -> local[" << bv->size()
+                                               << "] offset=" << bv_offset);
+                    LOG_INFO("  bq first 3: [" << bq->data()[0] << ", " << bq->data()[1] << ", "
+                                               << bq->data()[2] << "]");
+                }
+            }
+            else
+            {
+                // Single rank: use full biases
+                bq = bq_full;
+                bk = bk_full;
+                bv = bv_full;
+            }
+
+            // Validate sliced bias dimensions AFTER slicing
+            if (!bq_contract.validate(bq, layer, prefix + "attn_q.bias") ||
+                !bk_contract.validate(bk, layer, prefix + "attn_k.bias") ||
+                !bv_contract.validate(bv, layer, prefix + "attn_v.bias"))
+            {
+                throw std::runtime_error("Sliced bias dimension validation failed at layer " + std::to_string(layer));
+            }
 
             // Store attention weights for this layer
             weights.wq.push_back(wq);
@@ -1026,16 +1229,15 @@ namespace llaminar
             weights.wv.push_back(wv);
             weights.wo.push_back(wo);
 
-            // Store attention biases
+            // Store PRE-SLICED attention biases
             weights.bq.push_back(bq);
             weights.bk.push_back(bk);
             weights.bv.push_back(bv);
 
             // --- FFN Normalization ---
-            // Load pre-FFN RMSNorm gamma
-            auto ffn_norm = loader.loadTensor(prefix + "ffn_norm.weight");
-            if (!ffn_norm)
-                throw std::runtime_error("Failed to load " + prefix + "ffn_norm.weight");
+            // Contract-driven loading
+            auto ffn_norm = contracts.layer_weights[IDX_FFN_NORM].load(
+                loader, config, mpi_rank, mpi_size, layer);
 
             // Debug override: force unit gamma if requested
             if (debugEnv().output_norm.force_unit_all)
@@ -1047,17 +1249,13 @@ namespace llaminar
             weights.ffn_norm_weight.push_back(ffn_norm);
 
             // --- FFN Projection Matrices (SwiGLU) ---
-            // Load gate, up, and down projection weights for SwiGLU activation
-            auto w_gate = loader.loadTensor(prefix + "ffn_gate.weight"); // Gate projection
-            auto w_up = loader.loadTensor(prefix + "ffn_up.weight");     // Up projection
-            auto w_down = loader.loadTensor(prefix + "ffn_down.weight"); // Down projection
-
-            // Validate all FFN weights loaded successfully
-            if (!w_gate || !w_up || !w_down)
-                throw std::runtime_error("Failed to load FFN weights for layer " + std::to_string(layer));
-
-            // NOTE: ModelLoader already converts GGUF format [in,out] to PyTorch format [out,in]
-            // No additional transpose needed - weights are ready to use!
+            // Contract-driven loading automatically handles GGUF->PyTorch conversion and transposition
+            auto w_gate = contracts.layer_weights[IDX_W_GATE].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto w_up = contracts.layer_weights[IDX_W_UP].load(
+                loader, config, mpi_rank, mpi_size, layer);
+            auto w_down = contracts.layer_weights[IDX_W_DOWN].load(
+                loader, config, mpi_rank, mpi_size, layer);
 
             // Store FFN weights for this layer
             weights.w_gate.push_back(w_gate);
@@ -1313,14 +1511,39 @@ namespace llaminar
             return;
         if (seq_len <= 0)
             seq_len = 1;
+
+        int rank = getRank();
+        if (rank == 0)
+        {
+            LOG_INFO("[CACHE_INIT_DEBUG] initializeKVCache called with seq_len=" << seq_len
+                                                                                 << " current_capacity=" << kv_cache_state_.capacity_tokens
+                                                                                 << " current_used=" << kv_cache_state_.used_tokens);
+        }
+
         k_cache_.resize(config_.getLayerConfig().n_layers);
         v_cache_.resize(config_.getLayerConfig().n_layers);
         for (int l = 0; l < config_.getLayerConfig().n_layers; ++l)
         {
+            bool recreated_k = false;
+            bool recreated_v = false;
+
             if (!k_cache_[l] || k_cache_[l]->shape()[0] < seq_len)
+            {
                 k_cache_[l] = createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim});
+                recreated_k = true;
+            }
             if (!v_cache_[l] || v_cache_[l]->shape()[0] < seq_len)
+            {
                 v_cache_[l] = createLocalTensor({seq_len, config_.getLayerConfig().n_head_kv * config_.getLayerConfig().head_dim});
+                recreated_v = true;
+            }
+
+            if (rank == 0 && l == 0 && (recreated_k || recreated_v))
+            {
+                LOG_WARN("[CACHE_INIT_DEBUG] Layer 0: Recreated cache tensors! This will WIPE existing cache data!");
+                LOG_WARN("  k_cache recreated: " << (recreated_k ? "YES" : "no"));
+                LOG_WARN("  v_cache recreated: " << (recreated_v ? "YES" : "no"));
+            }
         }
         kv_cache_state_.capacity_tokens = seq_len;
         kv_cache_state_.used_tokens = 0;
@@ -1708,15 +1931,50 @@ namespace llaminar
             return false;
         }
 
-        // Execute prefill via provider
+        // Create cache provider if KV cache enabled
+        SimpleKVCacheProvider cache_provider;
+        const int n_layers = config_.getLayerConfig().n_layers;
+        if (use_kv_cache_)
+        {
+            const int kv_head_dim = (config_.getLayerConfig().n_head_kv / mpi_ctx_.size) *
+                                    config_.getLayerConfig().head_dim;
+            cache_provider.reserve(n_layers, tokens.size(), kv_head_dim);
+        }
+
+        // Execute prefill via provider (with cache capture if enabled)
         std::shared_ptr<TensorBase> output;
         PrefillMetrics metrics;
-        bool success = provider->execute(tokens, weights_iface, output, ctx, metrics);
+        bool success = provider->execute(tokens, weights_iface, output, ctx, metrics,
+                                         use_kv_cache_ ? &cache_provider : nullptr);
 
         if (!success)
         {
             LOG_ERROR("prefill: Provider execution failed");
             return false;
+        }
+
+        // Transfer cache from provider to pipeline storage
+        if (use_kv_cache_)
+        {
+            const auto &k_caches = cache_provider.getKCache();
+            const auto &v_caches = cache_provider.getVCache();
+
+            // Initialize cache vectors if needed
+            if (k_cache_.empty())
+            {
+                k_cache_.resize(n_layers);
+                v_cache_.resize(n_layers);
+            }
+
+            // Copy cache references (shared_ptr assignment, zero-copy)
+            for (int i = 0; i < n_layers; ++i)
+            {
+                if (cache_provider.hasCache(i))
+                {
+                    k_cache_[i] = k_caches[i];
+                    v_cache_[i] = v_caches[i];
+                }
+            }
         }
 
         // Log metrics
@@ -1866,6 +2124,17 @@ namespace llaminar
         auto current = embedSingleToken(token_id, weights.token_embedding);
         if (!current)
             return false;
+
+        // Conditional debug logging for embedding details (parity debugging)
+        if (env.pipeline.debug_decode_embed && getRank() == 0)
+        {
+            LOG_INFO("[DECODE_EMBED_DEBUG] token_id=" << token_id
+                                                      << " embedding_shape=[1," << current->shape()[1] << "]"
+                                                      << " first_10=[" << current->data()[0] << "," << current->data()[1] << "," << current->data()[2]
+                                                      << "," << current->data()[3] << "," << current->data()[4] << "," << current->data()[5]
+                                                      << "," << current->data()[6] << "," << current->data()[7] << "," << current->data()[8]
+                                                      << "," << current->data()[9] << "]");
+        }
 
         // Capture embedding snapshot for parity testing
         captureIfEnabled(PipelineStage::EMBEDDING, -1, current);
@@ -2223,12 +2492,29 @@ namespace llaminar
             weights.bv[layer_idx],
             k_cache,
             v_cache};
-        std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out};
+        std::vector<std::shared_ptr<TensorBase>> attn_outputs = {attn_out, nullptr, nullptr};
 
         if (!executeKernel("attention", attn_inputs, attn_outputs))
         {
             LOG_ERROR("Layer " << layer_idx << " attention failed");
             return false;
+        }
+
+        // Update KV cache with kernel outputs (same as OpenBLAS path!)
+        if (use_kv_cache_ && attn_outputs.size() >= 3)
+        {
+            if (attn_outputs[1] && attn_outputs[2])
+            {
+                k_cache_[layer_idx] = attn_outputs[1];
+                v_cache_[layer_idx] = attn_outputs[2];
+
+                if (getRank() == 0 && debugEnv().pipeline.layer_token_diff_verbose)
+                {
+                    LOG_DEBUG("[CacheUpdate] COSMA path: layer=" << layer_idx
+                                                                 << " k_cache_seq_len=" << k_cache_[layer_idx]->shape()[0]
+                                                                 << " v_cache_seq_len=" << v_cache_[layer_idx]->shape()[0]);
+                }
+            }
         }
 
         auto attention_end = std::chrono::high_resolution_clock::now();

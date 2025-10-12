@@ -27,8 +27,37 @@ The Parity Test Framework provides infrastructure for comparing intermediate ten
 
 See [`docs/DYNAMIC_VARIANCE_THRESHOLDS.md`](../../docs/DYNAMIC_VARIANCE_THRESHOLDS.md) for complete details.
 
+### 🆕 Major Update: True Incremental Decode Parity (October 2025)
+
+**Revolutionary enhancement**: Token-by-token validation with **dual-level validation**!
+
+**What's new**:
+- ✅ **True incremental decode comparison**: Both PyTorch and Llaminar use KV cache (apples-to-apples)
+- ✅ **Token sequence validation**: Quick functional check - do outputs match?
+- ✅ **Stage-by-stage validation**: Detailed numerical precision monitoring
+- ✅ **IncrementalSnapshotHelper**: Automatic per-token snapshot management
+
+**Why it matters**:
+1. **Functional validation**: Token sequences tell you if outputs are identical
+2. **Precision monitoring**: Stage comparison shows numerical drift
+3. **Better debugging**: Distinguish critical bugs from precision issues
+4. **Clear priorities**: Token divergence = urgent, stage drift = monitor
+
+**Example**:
+```
+✓ Token sequences MATCH → Systems generate identical output
+✓ All 513 stages passed → Perfect numerical precision
+→ Complete parity validated!
+```
+
+See section "True Incremental Decode Parity Testing" below for complete details.
+
 ### Key Features
 
+- **🆕 Weight and Embedding Verification** (October 2025): Comprehensive verification of model weights including embedding table with verbose logging and automatic snapshot generation
+- **🆕 True Incremental Decode Parity** (October 2025): Token-by-token validation with dual-level validation (token sequence + stage comparison)
+- **🆕 Token Sequence Comparison**: Quick functional validation - do both systems generate the same output?
+- **🆕 IncrementalSnapshotHelper**: Per-token snapshot management with automatic capture and saving
 - **Dynamic Variance-Based Thresholds** 🔥: Automatic threshold generation from PyTorch variance (replaces fixed thresholds)
 - **PrefillProvider Integration** ✨: Built-in snapshot capture in all prefill providers (OpenBLAS, COSMA)
 - **PyTorch Reference** ✨: Ground truth validation against PyTorch reference implementation
@@ -137,6 +166,308 @@ The framework captures snapshots at these standardized transformer pipeline stag
 **Total Snapshots**: 
 - **Base**: 3 global + (6 × 28 layers) = **171 snapshots**
 - **With FFN intermediates**: 3 global + (9 × 28 layers) = **255 snapshots** (adds 84 FFN substage captures)
+
+## Weight and Embedding Verification ✨ *NEW: October 2025*
+
+**Critical Addition**: Before validating activation stages, the parity test framework now verifies that model weights are loaded correctly. This isolates bugs to either **weight loading** or **computational path** execution.
+
+### Why Weight Verification Matters
+
+**Problem**: When activation stages fail with large errors, it's unclear whether the bug is:
+1. **Weight loading bug**: Incorrect weight values loaded into Llaminar
+2. **Computational bug**: Correct weights but incorrect operations
+
+**Solution**: Comprehensive weight verification **before** activation comparison:
+
+```
+[EMBEDDING_VERIFY] Verifying embedding table...
+  Max absolute diff: 0
+  Relative L2: 0
+✓ Embedding table verified successfully!
+
+[WeightVerifier] Verifying 96 layer weight matrices (4 per layer × 24 layers)...
+  [Layer 0] Q: max_diff=0.000000, rel_l2=0.000000
+  [Layer 0] K: max_diff=0.000000, rel_l2=0.000000
+  [Layer 0] V: max_diff=0.000000, rel_l2=0.000000
+  [Layer 0] O: max_diff=0.000000, rel_l2=0.000000
+  ... (all 24 layers)
+✓ All layer weights verified (96 matrices)
+  max_diff=0.000000, rel_l2=0.000000
+
+→ CONCLUSION: Bug is NOT in weight loading!
+→ Bug IS in computational path (embedding lookup, RMSNorm, attention, etc.)
+```
+
+### Components
+
+#### 1. Embedding Table Verification
+
+**What it does**: Compares Llaminar's `token_embedding` tensor with PyTorch's embedding table.
+
+**Automatic workflow**:
+1. Test calls `generate_pytorch_incremental_snapshots()` Python function
+2. Python script extracts `hf_model.model.embed_tokens.weight` (shape: [vocab_size, d_model])
+3. Saves as `pytorch_snapshots_mapped/weights/token_embd.weight.npy`
+4. Test loads both Llaminar and PyTorch embeddings
+5. Compares element-wise with tolerances
+
+**Example output** (from test):
+```cpp
+[EMBEDDING_VERIFY] Verifying embedding table...
+[EMBEDDING_VERIFY] PyTorch embedding shape: (151669, 896)
+[EMBEDDING_VERIFY] Llaminar embedding shape: (151669, 896)
+[EMBEDDING_VERIFY] Comparison (first 5 tokens, first 5 dims):
+
+PyTorch  embedding[0,:5]: [-0.00982666, 0.04077148, 0.00964355, 0.00066376, -0.02709961]
+Llaminar embedding[0,:5]: [-0.00982666, 0.04077148, 0.00964355, 0.00066376, -0.02709961]
+Max diff token 0: 0.000000
+
+PyTorch  embedding[1,:5]: [-0.0145874, -0.00109863, -0.0177002, -0.00198364, 0.00445557]
+Llaminar embedding[1,:5]: [-0.0145874, -0.00109863, -0.0177002, -0.00198364, 0.00445557]
+Max diff token 1: 0.000000
+
+...
+
+✓ Embedding table verified successfully!
+  Max absolute diff: 0
+  Relative L2: 0
+```
+
+**Tolerances**:
+- **max_abs**: 1e-5 (10 µV tolerance for FP32)
+- **rel_l2**: 1e-4 (0.01% relative error)
+
+**Implementation** (in `test_parity_framework.cpp`):
+```cpp
+// Embedding verification (lines 2566-2648)
+std::string embedding_path = "pytorch_snapshots_mapped/weights/token_embd.weight.npy";
+if (std::filesystem::exists(embedding_path)) {
+    NpyArray pytorch_emb;
+    NpzLoader::load_npy(embedding_path, pytorch_emb);
+    
+    const auto &llaminar_emb_tensor = raw_weights.token_embedding;
+    auto *simple_emb = dynamic_cast<SimpleTensor *>(llaminar_emb_tensor.get());
+    const std::vector<float> &llaminar_emb = simple_emb->get_data();
+    
+    // Element-wise comparison with detailed logging
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < pytorch_emb.data.size(); ++i) {
+        float diff = std::abs(pytorch_emb.data[i] - llaminar_emb[i]);
+        max_diff = std::max(max_diff, diff);
+    }
+    
+    // Compute rel_l2
+    float pytorch_norm = computeL2Norm(pytorch_emb.data);
+    float diff_norm = computeL2Norm(diffs);
+    float rel_l2 = diff_norm / pytorch_norm;
+    
+    // Validate
+    if (max_diff > 1e-5f || rel_l2 > 1e-4f) {
+        LOG_ERROR("Embedding verification FAILED!");
+        return 1;
+    }
+}
+```
+
+#### 2. Layer Weight Verification (Verbose Mode)
+
+**What it does**: Verifies all transformer layer weights (Q, K, V, O projections for each layer).
+
+**How to enable**:
+```cpp
+// In test_parity_framework.cpp (line 2650)
+bool weights_verified = verifyModelWeights(
+    raw_weights, mpi_ctx, base_config,
+    "pytorch_snapshots_mapped/weights",
+    /*verbose=*/true  // Enable detailed per-layer logging
+);
+```
+
+**Example output** (verbose mode):
+```
+[WeightVerifier] Verifying 96 layer weight matrices (4 per layer × 24 layers)...
+
+[WeightVerifier] [Layer 0]
+  Q_proj: max_diff=0.000000, rel_l2=0.000000 (shape: [896, 896])
+  K_proj: max_diff=0.000000, rel_l2=0.000000 (shape: [896, 128])
+  V_proj: max_diff=0.000000, rel_l2=0.000000 (shape: [896, 128])
+  O_proj: max_diff=0.000000, rel_l2=0.000000 (shape: [896, 896])
+
+[WeightVerifier] [Layer 1]
+  Q_proj: max_diff=0.000000, rel_l2=0.000000 (shape: [896, 896])
+  K_proj: max_diff=0.000000, rel_l2=0.000000 (shape: [896, 128])
+  V_proj: max_diff=0.000000, rel_l2=0.000000 (shape: [896, 128])
+  O_proj: max_diff=0.000000, rel_l2=0.000000 (shape: [896, 896])
+
+... (all 24 layers)
+
+[WeightVerifier] ✓ All layer weights verified (96 matrices)
+  max_diff=0.000000, rel_l2=0.000000
+```
+
+**Weight verification includes**:
+- **Q projection** (`attn.q_proj.weight`): Query projection matrix
+- **K projection** (`attn.k_proj.weight`): Key projection matrix
+- **V projection** (`attn.v_proj.weight`): Value projection matrix
+- **O projection** (`attn.o_proj.weight`): Output projection matrix
+
+**Automatic snapshot generation**:
+The Python script `generate_incremental_decode_snapshots.py` automatically saves all layer weights:
+
+```python
+def save_model_weights(model_path, output_dir, verbose=False):
+    """Extract and save all layer weights from HuggingFace model"""
+    hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32)
+    weights_dir = Path(output_dir) / "weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save embedding table
+    embedding_weight = hf_model.model.embed_tokens.weight.detach().cpu().numpy()
+    np.save(weights_dir / "token_embd.weight.npy", embedding_weight)
+    
+    # Save all layer weights
+    for layer_idx, layer in enumerate(hf_model.model.layers):
+        # Q, K, V, O projections
+        np.save(weights_dir / f"attn.q_proj.weight.layer{layer_idx}.npy",
+                layer.self_attn.q_proj.weight.detach().cpu().numpy())
+        # ... K, V, O ...
+```
+
+### Integration with Test Workflow
+
+**Fully automatic** - no manual steps required:
+
+```cpp
+// In test_parity_framework.cpp
+TEST(ParityFrameworkTest, IncrementalDecodeParity) {
+    // 1. Generate PyTorch snapshots (includes weights!)
+    std::string snapshot_dir = generate_pytorch_incremental_snapshots(
+        model_path, hf_checkpoint, tokens, num_layers, num_runs, safety_margin
+    );
+    
+    // 2. Verify embedding table
+    verify_embedding_table(raw_weights, snapshot_dir);
+    
+    // 3. Verify layer weights (verbose mode)
+    bool weights_verified = verifyModelWeights(
+        raw_weights, mpi_ctx, base_config,
+        snapshot_dir + "/weights",
+        /*verbose=*/true
+    );
+    
+    if (!weights_verified) {
+        LOG_ERROR("Weight verification failed - bug in weight loading!");
+        return 1;
+    }
+    
+    // 4. Now safe to compare activation stages
+    // If stages fail, we know it's a computational bug, not weight loading
+    compareActivationStages(llaminar_output, pytorch_snapshots);
+}
+```
+
+### Real-World Case Study: Isolating Root Cause
+
+**Symptom**: First activation stage `ATTENTION_NORM_layer0.npy` failed with massive error:
+```
+Stage: token_0/ATTENTION_NORM_layer0.npy
+Status: ✗ FAIL
+Max Abs Diff: 1.967e+00  (huge!)
+Rel L2: 1.352e-01  (13.5% error!)
+```
+
+**Investigation**: Is this a weight bug or computational bug?
+
+**Step 1**: Enable weight verification
+```cpp
+verify_embedding_table(raw_weights, snapshot_dir);  // NEW
+verifyModelWeights(raw_weights, ..., /*verbose=*/true);  // NEW
+```
+
+**Step 2**: Run test with weight verification
+```bash
+mpirun -np 2 ./build/test_parity_framework --gtest_filter="*IncrementalDecodeParity"
+```
+
+**Results**:
+```
+[EMBEDDING_VERIFY] ✓ Embedding table verified successfully!
+  Max absolute diff: 0
+  Relative L2: 0
+
+[WeightVerifier] ✓ All layer weights verified (96 matrices)
+  max_diff=0.000000, rel_l2=0.000000
+
+[ACTIVATION_COMPARE] ✗ ATTENTION_NORM_layer0 FAILED
+  Max abs diff: 1.967
+  Rel L2: 0.135
+```
+
+**Conclusion**: 
+- ✅ **All weights perfect** (max_diff=0) → Weight loading is correct
+- ❌ **First activation fails** → Bug is in **computational path**
+- 🎯 **Root cause isolated**: Bug is in embedding lookup or first RMSNorm operation, NOT in weight loading
+
+**Next debug steps** (now highly focused):
+1. Add logging to `MPIEmbeddingKernel::execute()` to show token IDs and retrieved vectors
+2. Add logging to first `MPIRMSNormKernel::execute()` to show input/output
+3. Compare with PyTorch embedding output before RMSNorm
+4. Identify exact divergence point
+
+### Usage Examples
+
+#### Enable Verbose Weight Verification
+
+```cpp
+// In your parity test
+bool weights_verified = verifyModelWeights(
+    raw_weights,
+    mpi_ctx,
+    base_config,
+    "pytorch_snapshots_mapped/weights",
+    /*verbose=*/true  // Show per-layer results
+);
+
+if (!weights_verified) {
+    LOG_ERROR("Weight verification failed!");
+    return 1;
+}
+```
+
+#### Manual Embedding Verification
+
+```cpp
+// Verify embedding table manually
+std::string embedding_path = snapshot_dir + "/weights/token_embd.weight.npy";
+NpyArray pytorch_emb;
+NpzLoader::load_npy(embedding_path, pytorch_emb);
+
+const auto &llaminar_emb = raw_weights.token_embedding;
+auto *simple_emb = dynamic_cast<SimpleTensor *>(llaminar_emb.get());
+
+// Compare shapes
+assert(pytorch_emb.shape[0] == config.vocab_size);
+assert(pytorch_emb.shape[1] == config.d_model);
+assert(simple_emb->shape()[0] == config.vocab_size);
+
+// Compare values
+float max_diff = 0.0f;
+for (size_t i = 0; i < pytorch_emb.data.size(); ++i) {
+    max_diff = std::max(max_diff, std::abs(pytorch_emb.data[i] - simple_emb->get_data()[i]));
+}
+
+std::cout << "Embedding verification: max_diff=" << max_diff << std::endl;
+```
+
+### Summary
+
+**Weight verification provides**:
+1. **Root cause isolation**: Distinguish weight loading bugs from computational bugs
+2. **Confidence**: Know that weights are loaded correctly before debugging activations
+3. **Debugging efficiency**: Focus debugging efforts on the actual bug location
+4. **Automatic workflow**: Fully integrated, no manual snapshot generation needed
+
+**Key insight**: Perfect weight match (max_diff=0) + activation divergence = **bug is in computation, not data loading**
 
 ## Usage
 
@@ -316,7 +647,7 @@ cat parity_data/threshold_summary.txt
 ### PrefillProvider Parity Test Example (Updated)
 
 ```cpp
-TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
+TEST(ParityFrameworkTest, OpenBLASPrefillVsPyTorch)
 {
     // 1. Setup environment
     setenv("PYTORCH_SNAPSHOT_DIR", "pytorch_snapshots/", 1);
@@ -1407,7 +1738,7 @@ The parity framework now supports **incremental decode validation**, enabling ve
 
 ### Test Architecture
 
-**Test**: `ParityFramework.IncrementalDecodeVsPyTorch` (in `test_parity_framework.cpp`)
+**Test**: `ParityFrameworkTest.IncrementalDecodeVsPyTorch` (in `test_parity_framework.cpp`)
 
 **Workflow**:
 ```
@@ -1482,7 +1813,7 @@ EXPECT_EQ(attn_scores_snap.feature_dim, 7);    // 7 (cache length)
 ### Example Test Code
 
 ```cpp
-TEST(ParityFramework, IncrementalDecodeVsPyTorch)
+TEST(ParityFrameworkTest, IncrementalDecodeVsPyTorch)
 {
     // 1. Generate PyTorch reference with variance analysis
     std::string pytorch_dir = "pytorch_snapshots_decode/";
@@ -1619,6 +1950,334 @@ Decode 3: ATTENTION_OUTPUT_layer0: max_abs=1e-2 ❌
 
 ---
 
+## 🆕 True Incremental Decode Parity Testing (October 2025)
+
+**Revolutionary Enhancement**: Token-by-token incremental decode validation with **dual-level validation**!
+
+### Overview
+
+The new `TrueIncrementalDecodeVsPyTorch` test provides apples-to-apples comparison between Llaminar and PyTorch for incremental decode, using the **same execution path** (KV cache) for both systems.
+
+**Key Innovation**: **Dual-Level Validation**
+1. **Token Sequence Comparison** (Functional) - Do both systems generate the same output?
+2. **Stage-by-Stage Comparison** (Numerical) - How precise are intermediate computations?
+
+### Why This Matters
+
+**Problem with Old Test** (`IncrementalDecodeVsPyTorch`):
+- PyTorch: Full replay of entire sequence each step
+- Llaminar: True incremental decode with KV cache
+- Comparison: Different execution paths → Not apples-to-apples
+
+**New Test** (`TrueIncrementalDecodeVsPyTorch`):
+- PyTorch: True incremental decode with KV cache
+- Llaminar: True incremental decode with KV cache  
+- Comparison: **Same execution path** → Apples-to-apples ✓
+
+### Dual-Level Validation Strategy
+
+#### Level 1: Token Sequence Validation (Functional)
+**Question**: Do both systems generate the same output?
+
+```
+✓ Token sequences MATCH → Systems are functionally equivalent
+✗ Tokens diverge at position 2 → Critical functional bug
+```
+
+**Benefits**:
+- Quick pass/fail check
+- User-visible correctness
+- Early divergence detection
+
+#### Level 2: Stage-by-Stage Validation (Numerical)
+**Question**: How precise are intermediate computations?
+
+```
+✓ All stages within thresholds → High numerical precision
+✗ Some stages differ → Numerical drift (may or may not affect output)
+```
+
+**Benefits**:
+- Detailed debugging information
+- Precision monitoring
+- Catches regressions in intermediate stages
+
+### How It Works
+
+#### Phase 1: Generate PyTorch Reference Snapshots
+```bash
+python python/reference/generate_incremental_decode_snapshots.py \
+    -m models/qwen2.5-0.5b-instruct-fp16.gguf \
+    --tokens "1,2,3,4,5,6,7,8" \
+    -o pytorch_incremental_snapshots \
+    -v
+```
+
+**Output Structure**:
+```
+pytorch_incremental_snapshots/
+├── sampled_tokens.json          ← Token sequence for validation
+├── token_0/                      ← Prefill phase (387 stages)
+│   ├── EMBEDDING.npy
+│   ├── ATTENTION_OUTPUT_layer0.npy
+│   └── ... (387 .npy files)
+├── token_1/                      ← Incremental decode (171 stages)
+│   └── ... (171 .npy files with KV cache)
+├── token_2/
+└── token_N/
+```
+
+**Key File**: `sampled_tokens.json`
+```json
+{
+  "sampled_tokens": [1234, 5678, 9012],
+  "num_tokens": 3,
+  "description": "Greedy-sampled tokens from PyTorch (argmax of logits)"
+}
+```
+
+#### Phase 2: Run Llaminar with IncrementalSnapshotHelper
+
+```cpp
+#include "incremental_snapshot_helper.h"
+
+// Enable snapshot capture
+setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
+
+// Create helper
+IncrementalSnapshotHelper snapshot_helper("llaminar_incremental_snapshots");
+
+// Prefill
+pipeline->prefill(prefill_tokens, weights, ctx);
+
+// Incremental decode with per-token snapshots
+for (int token_idx = 0; token_idx < num_decode_tokens; ++token_idx) {
+    // 1. Prepare for capture
+    snapshot_helper.beforeToken(token_idx);
+    
+    // 2. Run decode (captures 171 stages automatically)
+    pipeline->decode({next_token}, weights, ctx);
+    
+    // 3. Save to llaminar_incremental_snapshots/token_i/
+    snapshot_helper.afterToken(token_idx);
+    
+    // 4. Sample next token (greedy)
+    next_token = greedy_sample(logits);
+}
+```
+
+#### Phase 3: Compare Token Sequences
+```cpp
+// Load PyTorch sampled tokens
+std::vector<int> pytorch_tokens;
+load_sampled_tokens_json("pytorch_incremental_snapshots/sampled_tokens.json", 
+                        pytorch_tokens);
+
+// Compare with Llaminar's sampled tokens
+bool tokens_match = (pytorch_tokens == llaminar_tokens);
+
+if (tokens_match) {
+    std::cout << "✓ Token sequences MATCH" << std::endl;
+    std::cout << "  → Both systems generate identical output" << std::endl;
+} else {
+    std::cerr << "✗ DIVERGENCE at position " << i << std::endl;
+}
+```
+
+#### Phase 4: Compare Pipeline Stages (If Tokens Match)
+```cpp
+for (int token_idx = 0; token_idx < num_decode_tokens; ++token_idx) {
+    // Compare all .npy files for this token
+    for (const auto& stage_file : token_directory) {
+        auto pytorch_tensor = load_npy(pytorch_token_dir + "/" + stage_file);
+        auto llaminar_tensor = load_npy(llaminar_token_dir + "/" + stage_file);
+        
+        auto result = compare_tensors(pytorch_tensor, llaminar_tensor);
+        // Uses max_abs_diff < 1e-3 and rel_l2 < 1e-4
+    }
+}
+```
+
+### Running the Test
+
+```bash
+# Via CTest
+ctest --test-dir build -R TrueIncrementalDecodeVsPyTorch --output-on-failure --verbose
+
+# Via GTest filter
+./build/test_parity_framework --gtest_filter="*TrueIncrementalDecodeVsPyTorch*"
+
+# With MPI (2 ranks)
+mpirun -np 2 ./build/test_parity_framework \
+    --gtest_filter="*TrueIncrementalDecodeVsPyTorch*"
+```
+
+### Test Output Example
+
+```
+========================================
+True Incremental Decode vs PyTorch Test
+========================================
+[TRUE_INCR] Model: models/qwen2.5-0.5b-instruct-fp16.gguf
+[TRUE_INCR] Prefill tokens: 1,2,3,4,5
+[TRUE_INCR] Decode tokens: 3
+
+[Generating PyTorch snapshots...]
+✓ PyTorch incremental snapshots generated successfully
+  Output structure:
+    - sampled_tokens.json (greedy-sampled sequence)
+    - token_0/ (387 stages - prefill)
+    - token_1/ (171 stages - incremental)
+    - token_2/ (171 stages - incremental)
+
+[TRUE_INCR] Step 3a: Comparing token sequences...
+
+[TOKEN SEQUENCE VALIDATION]
+  PyTorch tokens:  [1234 → 5678 → 9012]
+  Llaminar tokens: [1234 → 5678 → 9012]
+  ✓ All 3 tokens match!
+    → Both systems generate identical output sequence
+
+[TRUE_INCR] Step 3b: Comparing snapshots token-by-token...
+[TRUE_INCR] Comparing token_0...
+[TRUE_INCR]   ✓ EMBEDDING.npy (max_abs=0.0001, rel_l2=0.00005)
+[TRUE_INCR]   ✓ ATTENTION_OUTPUT_layer0.npy (max_abs=0.0002, rel_l2=0.00008)
+...
+[TRUE_INCR] ✓ token_0 passed (171 stages)
+
+========================================
+True Incremental Decode Parity Summary
+========================================
+
+[TOKEN SEQUENCE VALIDATION]
+  ✓ Token sequences MATCH
+    Both systems generate identical output
+
+[STAGE-LEVEL VALIDATION]
+  Tokens passed:   3/3
+  Tokens failed:   0/3
+  Stages compared: 513 (171 × 3)
+  Stages passed:   513
+  Stages failed:   0
+
+[OUTPUT SEQUENCE]
+  Generated tokens: 1234 → 5678 → 9012
+
+[TRUE_INCR] ✓✓ COMPLETE PARITY VALIDATED ✓✓
+  • Token sequences match (functional equivalence)
+  • All pipeline stages match (numerical precision)
+```
+
+### Bug Classification Examples
+
+#### Perfect Parity
+```
+✓ Token sequences MATCH
+✓ All 513 stages passed
+→ Complete parity validated
+```
+
+#### Precision Drift (Non-Critical)
+```
+✓ Token sequences MATCH  
+✗ 5/513 stages have high error (but below sampling threshold)
+→ Functional output correct, investigate precision drift
+```
+
+#### Functional Divergence (Critical)
+```
+✗ Token sequences DIVERGE at position 2
+✗ 342 stages failed after divergence
+→ CRITICAL BUG: outputs differ
+```
+
+### IncrementalSnapshotHelper API
+
+```cpp
+namespace llaminar::parity {
+
+class IncrementalSnapshotHelper {
+public:
+    /**
+     * @brief Create helper for per-token snapshot management
+     * @param output_base_dir Base directory (e.g., "llaminar_incremental_snapshots")
+     */
+    explicit IncrementalSnapshotHelper(const std::string& output_base_dir);
+    
+    /**
+     * @brief Prepare for capturing token at index
+     * Clears snapshot registry and enables capture
+     */
+    void beforeToken(int token_index);
+    
+    /**
+     * @brief Save captured snapshots for token
+     * Saves to output_base_dir/token_N/ directory
+     */
+    bool afterToken(int token_index);
+    
+    /**
+     * @brief Get directory path for specific token
+     */
+    std::string getTokenDir(int token_index) const;
+};
+
+} // namespace llaminar::parity
+```
+
+### Environment Variables
+
+**Incremental Decode Specific**:
+- `LLAMINAR_PARITY_SAVE_PER_TOKEN=1`: Enable per-token snapshot saving
+- `LLAMINAR_PARITY_OUTPUT_DIR=<path>`: Override output directory
+- `LLAMINAR_PARITY_CAPTURE=1`: Enable snapshot capture (required)
+
+### Benefits
+
+1. ✅ **True Apples-to-Apples**: Both systems use KV cache, same execution path
+2. ✅ **Quick Functional Check**: Token comparison gives instant pass/fail
+3. ✅ **Detailed Debugging**: Stage comparison pinpoints precision issues
+4. ✅ **Bug Classification**: Distinguish functional bugs from precision drift
+5. ✅ **Better Priorities**: Token divergence = urgent, stage drift = monitor
+6. ✅ **Regression Safety**: Changes that don't affect output won't fail test
+
+### When to Use Each Test
+
+**Use `TrueIncrementalDecodeVsPyTorch`** (Recommended):
+- Validating incremental decode correctness
+- Quick functional validation (token sequences)
+- Detailed numerical validation (stages)
+- Debugging divergence issues
+- Testing KV cache correctness
+
+**Use `IncrementalDecodeVsPyTorch`** (Legacy):
+- Full pipeline stress testing
+- Long sequence validation
+- Performance benchmarking
+- Complementary validation
+
+### Implementation Files
+
+**Python**:
+- `python/reference/generate_incremental_decode_snapshots.py`: Snapshot generator with token tracking
+- `python/reference/generate_test_snapshots.py`: Base capture infrastructure
+
+**C++**:
+- `tests/test_parity_framework.cpp`: `TEST(ParityFrameworkTest, TrueIncrementalDecodeVsPyTorch)`
+- `src/parity_test_framework.h`: `IncrementalSnapshotHelper` class
+- `src/parity_test_framework.cpp`: Implementation
+- `src/npz_loader.h`: `.npy` file I/O utilities
+
+### Future Enhancements
+
+Potential improvements:
+1. **Probabilistic Sampling**: Support temperature/top-k/top-p comparison
+2. **Perplexity Metrics**: Compare next-token probabilities (not just argmax)
+3. **Token Diversity**: Track when different tokens would be valid (tied logits)
+4. **KL Divergence**: Compare full logit distributions for better validation
+
+---
+
 ## Legacy Documentation (Historical Reference)
 
 The following sections describe the old llama.cpp-based approach. They are preserved for historical context but are no longer recommended.
@@ -1643,14 +2302,26 @@ Potential improvements to the framework:
 ## References
 
 ### Core Documentation
-- `docs/DYNAMIC_VARIANCE_THRESHOLDS.md`: **Comprehensive guide to variance-based thresholds** 🔥 **NEW**
-- `DYNAMIC_THRESHOLD_IMPLEMENTATION_SUMMARY.md`: Technical implementation summary
-- `DYNAMIC_THRESHOLDS_QUICK_REF.md`: Quick reference for dynamic thresholds
-- `tests/test_parity_framework.cpp`: Complete usage examples with dynamic thresholds
-- `tests/parity_test_framework.h`: API documentation
-- `tests/dynamic_threshold_loader.h`: Threshold loading utility
-- `scripts/generate_variance_thresholds.py`: Variance analysis and threshold generation
-- `test_variance_thresholds.sh`: Quick validation script
+- **Incremental Decode Parity** 🆕:
+  - `TRUE_INCREMENTAL_DECODE_TEST_COMPLETE.md`: Complete implementation guide
+  - `changelog/token_sequence_comparison_enhancement.md`: Token comparison feature details
+  - `changelog/token_comparison_implementation_summary.md`: Quick reference
+- **Dynamic Thresholds** 🔥:
+  - `docs/DYNAMIC_VARIANCE_THRESHOLDS.md`: Comprehensive guide to variance-based thresholds
+  - `DYNAMIC_THRESHOLD_IMPLEMENTATION_SUMMARY.md`: Technical implementation summary
+  - `DYNAMIC_THRESHOLDS_QUICK_REF.md`: Quick reference for dynamic thresholds
+- **Test Framework**:
+  - `tests/test_parity_framework.cpp`: Complete usage examples with all features
+  - `tests/parity_test_framework.h`: API documentation
+  - `src/incremental_snapshot_helper.{h,cpp}`: Per-token snapshot management
+  - `tests/dynamic_threshold_loader.h`: Threshold loading utility
+- **Python Reference**:
+  - `python/reference/generate_incremental_decode_snapshots.py`: True incremental decode with token tracking
+  - `python/reference/generate_test_snapshots.py`: Base snapshot capture
+  - `scripts/generate_variance_thresholds.py`: Variance analysis and threshold generation
+- **Utilities**:
+  - `test_variance_thresholds.sh`: Quick validation script
+  - `src/npz_loader.h`: NPY/NPZ file I/O utilities
 
 ### Legacy Documentation
 - `tests/test_prefill_attention_golden.cpp`: Existing end-to-end parity test

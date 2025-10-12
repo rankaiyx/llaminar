@@ -14,6 +14,8 @@
 #include "qwen_pipeline_adapter.h"
 #include "qwen_pipeline.h"
 #include "model_loader.h"
+#include "model_weights_provider.h"
+#include "weight_verifier.h"
 #include "logger.h"
 #include "test_timeout_guard.h"
 #include "abstract_pipeline.h"
@@ -28,6 +30,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -111,6 +114,85 @@ namespace
         if (length > 0)
         {
             MPI_Bcast(value.data(), length, MPI_CHAR, root, comm);
+        }
+    }
+
+    /**
+     * @brief Verify loaded weights against PyTorch reference snapshots
+     * @param weights Loaded Qwen model weights
+     * @param mpi_ctx MPI context for slicing metadata
+     * @param config Transformer layer configuration
+     * @param snapshot_dir Directory containing PyTorch weight .npy files
+     * @param verbose Enable detailed logging
+     * @return true if all weights match within tolerance
+     */
+    bool verifyModelWeights(
+        const QwenPipeline::ModelWeights &weights,
+        const MPIContext &mpi_ctx,
+        const TransformerLayerConfig &config,
+        const std::string &snapshot_dir = "pytorch_snapshots_mapped/weights",
+        bool verbose = false)
+    {
+        int rank = mpi_ctx.rank;
+
+        // Check if snapshot directory exists
+        if (!std::filesystem::exists(snapshot_dir))
+        {
+            if (rank == 0)
+            {
+                LOG_WARN("[WeightVerification] Snapshot directory not found: " << snapshot_dir);
+                LOG_WARN("[WeightVerification] Skipping weight verification");
+            }
+            return true; // Skip verification if snapshots not available
+        }
+
+        if (rank == 0)
+        {
+            std::cout << "\n========================================" << std::endl;
+            std::cout << "Weight Verification vs PyTorch" << std::endl;
+            std::cout << "========================================" << std::endl;
+            std::cout << "[WEIGHT_VERIFY] Snapshot dir: " << snapshot_dir << std::endl;
+            std::cout << "[WEIGHT_VERIFY] Layers: " << config.n_layers << std::endl;
+        }
+
+        try
+        {
+            // Create weights provider
+            auto weights_copy = std::make_unique<QwenPipeline::ModelWeights>(weights);
+            QwenModelWeightsProvider provider(std::move(weights_copy), mpi_ctx, config);
+
+            // Create verifier with standard tolerances
+            WeightVerifier verifier(&provider, snapshot_dir, 1e-5f, 1e-4f);
+            verifier.setVerbose(verbose);
+
+            // Verify all weights
+            auto result = verifier.verifyAllWeights();
+
+            if (rank == 0)
+            {
+                if (result.passed)
+                {
+                    std::cout << "[WEIGHT_VERIFY] ✓ All weights verified successfully!" << std::endl;
+                    std::cout << "[WEIGHT_VERIFY] " << result.details << std::endl;
+                }
+                else
+                {
+                    std::cout << "[WEIGHT_VERIFY] ✗ Weight verification FAILED!" << std::endl;
+                    std::cout << "[WEIGHT_VERIFY] " << result.toString() << std::endl;
+                }
+                std::cout << "========================================\n"
+                          << std::endl;
+            }
+
+            return result.passed;
+        }
+        catch (const std::exception &e)
+        {
+            if (rank == 0)
+            {
+                LOG_ERROR("[WeightVerification] Exception: " << e.what());
+            }
+            return false;
         }
     }
 
@@ -1252,9 +1334,10 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
     PyTorchSnapshotLoader pytorch_loader(snapshot_dir);
 
     // Enable snapshot capture for Llaminar
-    // CRITICAL: Must set BOTH the environment variable AND the hook
+    // CRITICAL: Must set BOTH the environment variable AND explicitly enable the managers
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
     LlaminarSnapshotHook::set_enabled(true);
+    PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
     SnapshotRegistry &registry = SnapshotRegistry::instance();
     registry.clear();
 
@@ -1277,6 +1360,154 @@ TEST(ParityFramework, OpenBLASPrefillVsPyTorch)
     // Load weights using new API
     auto weights = pipeline->loadWeights(model_path);
     ASSERT_NE(weights, nullptr) << "Failed to load weights";
+
+    // ========== WEIGHT AND EMBEDDING VERIFICATION ==========
+    if (rank == 0)
+    {
+        std::cout << "\n"
+                  << std::string(80, '=') << std::endl;
+        std::cout << "WEIGHT VERIFICATION" << std::endl;
+        std::cout << std::string(80, '=') << std::endl;
+    }
+
+    MPIContext mpi_ctx = MPIContext::capture();
+
+    // Extract raw weights from IModelWeights interface
+    auto *qwen_weights_iface = dynamic_cast<QwenModelWeights *>(weights.get());
+    ASSERT_NE(qwen_weights_iface, nullptr) << "Failed to cast to QwenModelWeights";
+
+    const QwenPipeline::ModelWeights &raw_weights = qwen_weights_iface->inner;
+
+    // Verify embedding table
+    if (rank == 0)
+    {
+        std::cout << "\n[EMBEDDING_VERIFY] Verifying embedding table..." << std::endl;
+
+        std::string embedding_path = snapshot_dir + "/weights/token_embd.weight.npy";
+        if (std::filesystem::exists(embedding_path))
+        {
+            NpyArray pytorch_emb;
+            NpzLoader::load_npy(embedding_path, pytorch_emb);
+
+            std::cout << "[EMBEDDING_VERIFY] PyTorch embedding shape: ("
+                      << pytorch_emb.shape[0] << ", " << pytorch_emb.shape[1] << ")" << std::endl;
+
+            const auto &llaminar_emb_tensor = raw_weights.token_embedding;
+            auto *simple_emb = dynamic_cast<SimpleTensor *>(llaminar_emb_tensor.get());
+            ASSERT_NE(simple_emb, nullptr) << "Failed to cast embedding to SimpleTensor";
+
+            const std::vector<float> &llaminar_emb = simple_emb->get_data();
+
+            std::cout << "[EMBEDDING_VERIFY] Llaminar embedding shape: ("
+                      << simple_emb->shape()[0] << ", " << simple_emb->shape()[1] << ")" << std::endl;
+
+            // Compare shapes
+            ASSERT_EQ(pytorch_emb.shape[0], simple_emb->shape()[0])
+                << "Embedding vocab size mismatch";
+            ASSERT_EQ(pytorch_emb.shape[1], simple_emb->shape()[1])
+                << "Embedding dimension mismatch";
+
+            // Compare first 5 tokens for detailed diagnostics
+            std::cout << "[EMBEDDING_VERIFY] Comparison (first 5 tokens, first 5 dims):\n"
+                      << std::endl;
+            for (int tok = 0; tok < 5 && tok < static_cast<int>(pytorch_emb.shape[0]); ++tok)
+            {
+                std::cout << "PyTorch  embedding[" << tok << ",:5]: [";
+                for (int d = 0; d < 5; ++d)
+                {
+                    std::cout << pytorch_emb.data[tok * pytorch_emb.shape[1] + d];
+                    if (d < 4)
+                        std::cout << ", ";
+                }
+                std::cout << "]" << std::endl;
+
+                std::cout << "Llaminar embedding[" << tok << ",:5]: [";
+                for (int d = 0; d < 5; ++d)
+                {
+                    std::cout << llaminar_emb[tok * pytorch_emb.shape[1] + d];
+                    if (d < 4)
+                        std::cout << ", ";
+                }
+                std::cout << "]" << std::endl;
+
+                // Compute max diff for this token
+                float max_diff = 0.0f;
+                for (size_t d = 0; d < pytorch_emb.shape[1]; ++d)
+                {
+                    float diff = std::abs(pytorch_emb.data[tok * pytorch_emb.shape[1] + d] -
+                                          llaminar_emb[tok * pytorch_emb.shape[1] + d]);
+                    max_diff = std::max(max_diff, diff);
+                }
+                std::cout << "Max diff token " << tok << ": " << max_diff << std::endl;
+                std::cout << std::endl;
+            }
+
+            // Full comparison with tolerances
+            float max_abs_diff = 0.0f;
+            for (size_t i = 0; i < pytorch_emb.data.size(); ++i)
+            {
+                float diff = std::abs(pytorch_emb.data[i] - llaminar_emb[i]);
+                max_abs_diff = std::max(max_abs_diff, diff);
+            }
+
+            // Compute rel_l2
+            double pytorch_norm_sq = 0.0;
+            double diff_norm_sq = 0.0;
+            for (size_t i = 0; i < pytorch_emb.data.size(); ++i)
+            {
+                pytorch_norm_sq += pytorch_emb.data[i] * pytorch_emb.data[i];
+                float diff = pytorch_emb.data[i] - llaminar_emb[i];
+                diff_norm_sq += diff * diff;
+            }
+            float rel_l2 = std::sqrt(diff_norm_sq / pytorch_norm_sq);
+
+            std::cout << "\n✓ Embedding table verified successfully!" << std::endl;
+            std::cout << "  Max absolute diff: " << max_abs_diff << std::endl;
+            std::cout << "  Relative L2: " << rel_l2 << std::endl;
+
+            // Assert tolerances
+            ASSERT_LT(max_abs_diff, 1e-5f)
+                << "Embedding max absolute difference exceeds tolerance";
+            ASSERT_LT(rel_l2, 1e-4f)
+                << "Embedding relative L2 exceeds tolerance";
+        }
+        else
+        {
+            std::cout << "  ⚠ PyTorch embedding snapshot not found: " << embedding_path << std::endl;
+            std::cout << "  Skipping embedding verification" << std::endl;
+        }
+    }
+
+    // Verify layer weights (verbose mode)
+    bool weights_verified = verifyModelWeights(
+        raw_weights, mpi_ctx, base_config,
+        snapshot_dir + "/weights",
+        /*verbose=*/true // Enable detailed per-layer logging
+    );
+
+    if (rank == 0)
+    {
+        if (weights_verified)
+        {
+            std::cout << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cout << "✓ WEIGHT VERIFICATION PASSED" << std::endl;
+            std::cout << std::string(80, '=') << std::endl;
+            std::cout << "All weights match PyTorch reference (including embeddings)" << std::endl;
+            std::cout << std::string(80, '=') << std::endl
+                      << std::endl;
+        }
+        else
+        {
+            std::cout << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cout << "✗ WEIGHT VERIFICATION FAILED" << std::endl;
+            std::cout << std::string(80, '=') << std::endl;
+        }
+    }
+
+    ASSERT_TRUE(weights_verified) << "Weight verification failed - weights do not match PyTorch";
+    // ========== END WEIGHT VERIFICATION ==========
 
     if (rank == 0)
     {
@@ -1443,9 +1674,10 @@ TEST(ParityFramework, COSMAPrefillVsPyTorch)
     PyTorchSnapshotLoader pytorch_loader(snapshot_dir);
 
     // Enable snapshot capture for Llaminar
-    // CRITICAL: Must set BOTH the environment variable AND the hook
+    // CRITICAL: Must set BOTH the environment variable AND explicitly enable the managers
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
     LlaminarSnapshotHook::set_enabled(true);
+    PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
     SnapshotRegistry &registry = SnapshotRegistry::instance();
     registry.clear();
 
@@ -1851,6 +2083,210 @@ TEST(ParityFramework, CosmaModeValidation)
  *   mpirun -np 2 ./build/test_parity_framework \
  *     --gtest_filter="*IncrementalDecodeVsPyTorch*"
  */
+
+/**
+ * @brief Load sampled tokens from PyTorch's sampled_tokens.json file
+ *
+ * Simple JSON parser to extract the "sampled_tokens" array from:
+ * {
+ *   "sampled_tokens": [1234, 5678, 9012],
+ *   "num_tokens": 3,
+ *   "description": "..."
+ * }
+ *
+ * @param json_path Path to sampled_tokens.json
+ * @param tokens Output vector to store token IDs
+ * @return true if successfully loaded, false otherwise
+ */
+bool load_sampled_tokens_json(const std::string &json_path, std::vector<int> &tokens)
+{
+    std::ifstream file(json_path);
+    if (!file.is_open())
+    {
+        std::cerr << "Failed to open: " << json_path << std::endl;
+        return false;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    file.close();
+
+    // Simple JSON parsing for "sampled_tokens": [...]
+    auto tokens_pos = content.find("\"sampled_tokens\"");
+    if (tokens_pos == std::string::npos)
+    {
+        std::cerr << "No 'sampled_tokens' field in JSON" << std::endl;
+        return false;
+    }
+
+    auto array_start = content.find('[', tokens_pos);
+    auto array_end = content.find(']', array_start);
+    if (array_start == std::string::npos || array_end == std::string::npos)
+    {
+        std::cerr << "Malformed JSON array" << std::endl;
+        return false;
+    }
+
+    std::string array_content = content.substr(array_start + 1, array_end - array_start - 1);
+
+    // Parse comma-separated integers
+    tokens.clear();
+    std::istringstream iss(array_content);
+    std::string token_str;
+    while (std::getline(iss, token_str, ','))
+    {
+        // Remove whitespace
+        token_str.erase(0, token_str.find_first_not_of(" \t\n\r"));
+        token_str.erase(token_str.find_last_not_of(" \t\n\r") + 1);
+
+        if (!token_str.empty())
+        {
+            try
+            {
+                tokens.push_back(std::stoi(token_str));
+            }
+            catch (...)
+            {
+                std::cerr << "Failed to parse token: " << token_str << std::endl;
+                return false;
+            }
+        }
+    }
+
+    return !tokens.empty();
+}
+
+/**
+ * @brief Generate PyTorch incremental decode snapshots using the new per-token format
+ *
+ * This generates snapshots where each token has its own directory with 171 stages.
+ * Uses the generate_incremental_decode_snapshots.py script from python/reference/.
+ *
+ * @param model_path Path to GGUF model file
+ * @param prefill_tokens Initial tokens for prefill phase
+ * @param num_decode_tokens Number of additional tokens to generate
+ * @param output_dir Base directory for output (will create token_0/, token_1/, etc.)
+ * @param rank MPI rank (only rank 0 generates snapshots)
+ * @return true if successful, false otherwise
+ */
+bool generate_pytorch_incremental_snapshots(
+    const std::string &model_path,
+    const std::vector<int> &prefill_tokens,
+    int num_decode_tokens,
+    const std::string &output_dir,
+    int rank)
+{
+    int success = 0;
+
+    if (rank == 0)
+    {
+        std::cout << "\n"
+                  << std::string(80, '=') << std::endl;
+        std::cout << "GENERATING PYTORCH INCREMENTAL DECODE SNAPSHOTS" << std::endl;
+        std::cout << std::string(80, '=') << std::endl;
+        std::cout << "Model:           " << model_path << std::endl;
+        std::cout << "Prefill tokens:  ";
+        for (size_t i = 0; i < prefill_tokens.size(); ++i)
+        {
+            std::cout << prefill_tokens[i];
+            if (i < prefill_tokens.size() - 1)
+                std::cout << ",";
+        }
+        std::cout << " (" << prefill_tokens.size() << " tokens)" << std::endl;
+        std::cout << "Decode tokens:   " << num_decode_tokens << std::endl;
+        std::cout << "Output dir:      " << output_dir << "/" << std::endl;
+        std::cout << "Output format:   token_0/, token_1/, ..., token_N/" << std::endl;
+        std::cout << std::string(80, '=') << std::endl
+                  << std::endl;
+
+        // Build token string (prefill + decode tokens)
+        // For decode tokens, we use simple sequential IDs (prefill_last + 1, +2, +3, ...)
+        // Build prefill token string
+        std::ostringstream prefill_str;
+        for (size_t i = 0; i < prefill_tokens.size(); ++i)
+        {
+            prefill_str << prefill_tokens[i];
+            if (i < prefill_tokens.size() - 1)
+                prefill_str << ",";
+        }
+
+        // Build command
+        std::ostringstream cmd;
+        std::filesystem::path cwd = std::filesystem::current_path();
+        std::filesystem::path workspace_root = cwd;
+        if (cwd.filename() == "build")
+        {
+            workspace_root = cwd.parent_path();
+        }
+
+        std::string script_path = (workspace_root / "python" / "reference" / "generate_incremental_decode_snapshots.py").string();
+
+        // Use venv Python if available, fallback to system python3
+        std::filesystem::path venv_python = workspace_root / ".venv" / "bin" / "python";
+        std::string python_cmd = std::filesystem::exists(venv_python) ? venv_python.string() : "python3";
+
+        cmd << python_cmd << " " << script_path
+            << " --model \"" << model_path << "\""
+            << " --prefill-tokens " << prefill_str.str()
+            << " --num-decode-tokens " << num_decode_tokens
+            << " --output-dir \"" << output_dir << "\""
+            << " 2>&1";
+
+        std::cout << "[PyTorch] Generating incremental decode snapshots (prefill+decode mode)..." << std::endl;
+        std::cout << "[PyTorch] Prefill tokens: [" << prefill_str.str() << "]" << std::endl;
+        std::cout << "[PyTorch] Decode tokens: " << num_decode_tokens << std::endl;
+        std::cout << "[PyTorch] This will generate " << num_decode_tokens
+                  << " token directories (decode only)" << std::endl;
+
+        // Execute
+        auto start = std::chrono::steady_clock::now();
+        int ret = system(cmd.str().c_str());
+        auto end = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
+
+        if (ret == 0)
+        {
+            std::cout << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cout << "✓ PyTorch incremental snapshots generated successfully" << std::endl;
+            std::cout << "  Time: " << duration << "s" << std::endl;
+            std::cout << "  Output structure:" << std::endl;
+            for (int i = 0; i < static_cast<int>(prefill_tokens.size()) + num_decode_tokens; ++i)
+            {
+                std::cout << "    - token_" << i << "/";
+                if (i == 0)
+                {
+                    std::cout << " (387 stages - prefill with no KV cache)";
+                }
+                else
+                {
+                    std::cout << " (171 stages - incremental with KV cache)";
+                }
+                std::cout << std::endl;
+            }
+            std::cout << std::string(80, '=') << std::endl
+                      << std::endl;
+            success = 1;
+        }
+        else
+        {
+            std::cerr << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cerr << "✗ PyTorch incremental snapshot generation FAILED" << std::endl;
+            std::cerr << "  Exit code: " << ret << std::endl;
+            std::cerr << "  Command:   " << cmd.str() << std::endl;
+            std::cerr << std::string(80, '=') << std::endl
+                      << std::endl;
+            success = 0;
+        }
+    }
+
+    // Broadcast result to all ranks
+    MPI_Bcast(&success, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    return success == 1;
+}
+
 TEST(ParityFramework, IncrementalDecodeVsPyTorch)
 {
     int world_size = 1;
@@ -1896,7 +2332,14 @@ TEST(ParityFramework, IncrementalDecodeVsPyTorch)
         }
         std::cout << std::endl;
         std::cout << "[DECODE_PARITY] Decode steps to validate: " << num_decode_steps << std::endl;
+
+        // Clean up old snapshots to ensure fresh generation
+        std::string cleanup_cmd = "rm -rf " + snapshot_base_dir;
+        system(cleanup_cmd.c_str());
     }
+
+    // Synchronize after cleanup
+    MPI_Barrier(MPI_COMM_WORLD);
 
     // Generate PyTorch decode reference snapshots (always fresh)
     if (!generate_pytorch_decode_snapshots(model_path, prefill_tokens, num_decode_steps,
@@ -1915,6 +2358,7 @@ TEST(ParityFramework, IncrementalDecodeVsPyTorch)
     // Enable snapshot capture for Llaminar
     setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
     LlaminarSnapshotHook::set_enabled(true);
+    PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
     SnapshotRegistry &registry = SnapshotRegistry::instance();
     registry.clear();
 
@@ -1986,6 +2430,29 @@ TEST(ParityFramework, IncrementalDecodeVsPyTorch)
     const float *last_row_logits = prefill_logits_tensor->data() + (prefill_seq_len - 1) * vocab_size;
     int next_token = std::distance(last_row_logits, std::max_element(last_row_logits, last_row_logits + vocab_size));
     generated_tokens.push_back(next_token);
+
+    if (rank == 0)
+    {
+        float max_logit = *std::max_element(last_row_logits, last_row_logits + vocab_size);
+        std::cout << "[DECODE_PARITY] Sampled token from prefill: " << next_token
+                  << " (logit=" << max_logit << ")" << std::endl;
+
+        // Show top 5 for debugging
+        std::vector<std::pair<int, float>> token_logits;
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            token_logits.push_back({i, last_row_logits[i]});
+        }
+        std::partial_sort(token_logits.begin(), token_logits.begin() + 5, token_logits.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.second > b.second; });
+        std::cout << "[DECODE_PARITY] Top 5 tokens: ";
+        for (int i = 0; i < 5; ++i)
+        {
+            std::cout << token_logits[i].first << "(" << token_logits[i].second << ") ";
+        }
+        std::cout << std::endl;
+    }
 
     for (int step = 0; step < num_decode_steps; ++step)
     {
@@ -2099,6 +2566,872 @@ TEST(ParityFramework, IncrementalDecodeVsPyTorch)
     {
         std::cout << "\n[DECODE_PARITY] ✓ All decode steps match PyTorch ground truth!" << std::endl;
     }
+
+    // Clean up
+    unsetenv("ADAPTIVE_DISABLE_COSMA");
+}
+
+/**
+ * @test ParityFramework.TrueIncrementalDecodeVsPyTorch
+ * @brief True per-token incremental decode parity test using IncrementalSnapshotHelper
+ *
+ * This test validates Llaminar's incremental decode against PyTorch by comparing
+ * each token's pipeline stages individually. Unlike IncrementalDecodeVsPyTorch
+ * which uses full replay, this test compares true incremental execution:
+ *
+ * Flow:
+ * 1. Generate PyTorch snapshots (token_0/, token_1/, ..., token_N/)
+ *    - Each token directory contains 171 stages (EMBEDDING through LM_HEAD)
+ *    - token_0 uses prefill path (387 stages)
+ *    - token_1+ use incremental decode with KV cache (171 stages)
+ *
+ * 2. Run Llaminar incremental decode with IncrementalSnapshotHelper:
+ *    - Prefill with initial tokens
+ *    - For each decode token:
+ *      * helper.beforeToken(i) - prepare capture
+ *      * pipeline->incrementalDecodeToken(...) - execute
+ *      * helper.afterToken(i) - save to llaminar_token_i/
+ *
+ * 3. Compare snapshots token-by-token:
+ *    - Load PyTorch token_i/ snapshots
+ *    - Load Llaminar token_i/ snapshots
+ *    - Compare all 171 stages per token
+ *
+ * This provides true apples-to-apples comparison: both systems use KV cache,
+ * both process one token at a time, no replay artifacts.
+ *
+ * Prerequisites:
+ * - Model: models/Gemini-Distill-Qwen2.5-0.5B-ead-fp32.gguf (FP32 for precision)
+ * - Python environment: .venv/bin/python with PyTorch and transformers
+ *
+ * Usage:
+ *   ctest -R TrueIncrementalDecodeVsPyTorch
+ *   # Or manually:
+ *   mpirun -np 2 ./build/test_parity_framework \
+ *     --gtest_filter="*TrueIncrementalDecodeVsPyTorch*"
+ */
+TEST(ParityFramework, TrueIncrementalDecodeVsPyTorch)
+{
+    int world_size = 1;
+    int rank = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    // Find model file
+    std::string model_path;
+    int model_not_found = 0;
+
+    if (rank == 0)
+    {
+        model_path = find_test_model();
+        model_not_found = model_path.empty() ? 1 : 0;
+    }
+
+    MPI_Bcast(&model_not_found, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (model_not_found)
+    {
+        GTEST_SKIP() << "No test model found - cannot run true incremental decode parity test";
+    }
+
+    broadcast_string(model_path, 0, MPI_COMM_WORLD);
+
+    // Test configuration
+    const int num_decode_tokens = 3;                   // Generate 3 additional tokens after prefill
+    std::vector<int> prefill_tokens = {1, 2, 3, 4, 5}; // 5-token prefill
+    std::string pytorch_output_dir = "pytorch_incremental_snapshots";
+    std::string llaminar_output_dir = "llaminar_incremental_snapshots";
+
+    if (rank == 0)
+    {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "True Incremental Decode vs PyTorch Test" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "[TRUE_INCR] Model: " << model_path << std::endl;
+        std::cout << "[TRUE_INCR] Prefill tokens: ";
+        for (size_t i = 0; i < prefill_tokens.size(); ++i)
+        {
+            std::cout << prefill_tokens[i];
+            if (i < prefill_tokens.size() - 1)
+                std::cout << ",";
+        }
+        std::cout << std::endl;
+        std::cout << "[TRUE_INCR] Decode tokens: " << num_decode_tokens << std::endl;
+        std::cout << "[TRUE_INCR] Total tokens to validate: " << (prefill_tokens.size() + num_decode_tokens) << std::endl;
+
+        // Clean up old snapshots
+        std::string cleanup_cmd1 = "rm -rf " + pytorch_output_dir;
+        std::string cleanup_cmd2 = "rm -rf " + llaminar_output_dir;
+        system(cleanup_cmd1.c_str());
+        system(cleanup_cmd2.c_str());
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // ========== PHASE 1: Generate PyTorch Reference Snapshots ==========
+    if (!generate_pytorch_incremental_snapshots(model_path, prefill_tokens, num_decode_tokens,
+                                                pytorch_output_dir, rank))
+    {
+        GTEST_FAIL() << "Failed to generate PyTorch incremental snapshots";
+    }
+
+    // ========== PHASE 2: Setup Llaminar Pipeline ==========
+    // Disable COSMA for simpler validation
+    setenv("ADAPTIVE_DISABLE_COSMA", "1", 1);
+    CosmaPrefillManager &manager = CosmaPrefillManager::instance();
+    manager.set_force_cosma(false);
+
+    // Enable snapshot capture
+    setenv("LLAMINAR_PARITY_CAPTURE", "1", 1);
+    LlaminarSnapshotHook::set_enabled(true);
+    PipelineSnapshotManager::instance().setEnabled(true); // Explicitly enable snapshot manager
+
+    // Register Qwen pipeline
+    registerQwenPipeline();
+
+    // Load model
+    ModelLoader loader;
+    ASSERT_TRUE(loader.loadModel(model_path)) << "Failed to load GGUF model: " << model_path;
+    TransformerLayerConfig base_config = loader.createLayerConfig();
+    ModelConfig model_cfg(base_config, "qwen");
+
+    // Create pipeline
+    auto pipeline = PipelineFactory::instance().create(model_cfg);
+    ASSERT_NE(pipeline, nullptr) << "Failed to create Qwen pipeline";
+
+    auto weights = pipeline->loadWeights(model_path);
+    ASSERT_NE(weights, nullptr) << "Failed to load weights";
+
+    // ========== WEIGHT VERIFICATION ==========
+    // Verify that loaded weights match PyTorch reference snapshots exactly
+    if (rank == 0)
+    {
+        std::cout << "\n[TRUE_INCR] Verifying loaded weights vs PyTorch..." << std::endl;
+    }
+
+    MPIContext mpi_ctx = MPIContext::capture();
+
+    // Extract raw weights from IModelWeights interface
+    auto *qwen_weights_iface = dynamic_cast<QwenModelWeights *>(weights.get());
+    ASSERT_NE(qwen_weights_iface, nullptr) << "Failed to cast to QwenModelWeights";
+
+    const QwenPipeline::ModelWeights &raw_weights = qwen_weights_iface->inner;
+
+    // ========== EMBEDDING WEIGHT VERIFICATION ==========
+    // Verify embedding table before layer weights
+    if (rank == 0)
+    {
+        std::cout << "\n[EMBEDDING_VERIFY] Verifying embedding table..." << std::endl;
+
+        std::string embedding_path = "pytorch_snapshots_mapped/weights/token_embd.weight.npy";
+        if (std::filesystem::exists(embedding_path))
+        {
+            // Load PyTorch embedding snapshot
+            NpyArray pytorch_emb;
+            if (!NpzLoader::load_npy(embedding_path, pytorch_emb))
+            {
+                std::cerr << "[EMBEDDING_VERIFY] ✗ Failed to load PyTorch embedding: " << embedding_path << std::endl;
+                GTEST_FAIL() << "Could not load PyTorch embedding snapshot";
+            }
+
+            std::cout << "[EMBEDDING_VERIFY] PyTorch embedding shape: ";
+            for (size_t d : pytorch_emb.shape)
+                std::cout << d << " ";
+            std::cout << std::endl;
+
+            // Get Llaminar embedding table
+            const auto &llaminar_emb_tensor = raw_weights.token_embedding;
+            if (!llaminar_emb_tensor)
+            {
+                std::cerr << "[EMBEDDING_VERIFY] ✗ Llaminar embedding tensor is null!" << std::endl;
+                GTEST_FAIL() << "Llaminar embedding tensor not loaded";
+            }
+
+            // Convert to SimpleTensor to access data
+            auto *simple_emb = dynamic_cast<SimpleTensor *>(llaminar_emb_tensor.get());
+            if (!simple_emb)
+            {
+                std::cerr << "[EMBEDDING_VERIFY] ✗ Llaminar embedding is not SimpleTensor!" << std::endl;
+                GTEST_FAIL() << "Unexpected embedding tensor type";
+            }
+
+            const std::vector<float> &llaminar_emb = simple_emb->get_data();
+            size_t llaminar_vocab = llaminar_emb.size() / 896; // vocab_size * d_model
+
+            std::cout << "[EMBEDDING_VERIFY] Llaminar embedding shape: " << llaminar_vocab << " x 896" << std::endl;
+
+            // Verify shapes match
+            if (pytorch_emb.shape.size() != 2 ||
+                pytorch_emb.shape[0] != llaminar_vocab ||
+                pytorch_emb.shape[1] != 896)
+            {
+                std::cerr << "[EMBEDDING_VERIFY] ✗ Shape mismatch!" << std::endl;
+                GTEST_FAIL() << "Embedding shape mismatch";
+            }
+
+            // Compare first few token embeddings
+            std::cout << "[EMBEDDING_VERIFY] Comparing sample token embeddings (tokens 0-4)..." << std::endl;
+            float max_diff = 0.0f;
+            float sum_sq_diff = 0.0f;
+            size_t total_elements = 0;
+
+            for (size_t token_id = 0; token_id < std::min(size_t(5), llaminar_vocab); ++token_id)
+            {
+                float token_max_diff = 0.0f;
+                for (size_t dim = 0; dim < 896; ++dim)
+                {
+                    size_t idx = token_id * 896 + dim;
+                    float pytorch_val = pytorch_emb.data[idx];
+                    float llaminar_val = llaminar_emb[idx];
+                    float diff = std::abs(pytorch_val - llaminar_val);
+
+                    max_diff = std::max(max_diff, diff);
+                    token_max_diff = std::max(token_max_diff, diff);
+                    sum_sq_diff += diff * diff;
+                    total_elements++;
+                }
+
+                std::cout << "[EMBEDDING_VERIFY]   Token " << token_id
+                          << ": max_diff=" << token_max_diff
+                          << " | PyTorch[0:3]=[" << pytorch_emb.data[token_id * 896]
+                          << ", " << pytorch_emb.data[token_id * 896 + 1]
+                          << ", " << pytorch_emb.data[token_id * 896 + 2]
+                          << "] | Llaminar[0:3]=[" << llaminar_emb[token_id * 896]
+                          << ", " << llaminar_emb[token_id * 896 + 1]
+                          << ", " << llaminar_emb[token_id * 896 + 2]
+                          << "]" << std::endl;
+            }
+
+            float rel_l2 = std::sqrt(sum_sq_diff / total_elements);
+
+            std::cout << "[EMBEDDING_VERIFY] Sample statistics:" << std::endl;
+            std::cout << "[EMBEDDING_VERIFY]   Max absolute diff: " << max_diff << std::endl;
+            std::cout << "[EMBEDDING_VERIFY]   Relative L2: " << rel_l2 << std::endl;
+
+            const float embedding_abs_tol = 1e-5f;
+            const float embedding_rel_tol = 1e-4f;
+
+            if (max_diff > embedding_abs_tol || rel_l2 > embedding_rel_tol)
+            {
+                std::cerr << "[EMBEDDING_VERIFY] ✗ FAILED! Embeddings do not match!" << std::endl;
+                std::cerr << "[EMBEDDING_VERIFY]   Max diff: " << max_diff << " (threshold: " << embedding_abs_tol << ")" << std::endl;
+                std::cerr << "[EMBEDDING_VERIFY]   Rel L2: " << rel_l2 << " (threshold: " << embedding_rel_tol << ")" << std::endl;
+                GTEST_FAIL() << "Embedding table verification failed";
+            }
+
+            std::cout << "[EMBEDDING_VERIFY] ✓ Embedding table verified successfully!" << std::endl;
+        }
+        else
+        {
+            std::cout << "[EMBEDDING_VERIFY] ⚠ PyTorch embedding snapshot not found, skipping verification" << std::endl;
+        }
+
+        std::cout << std::endl;
+    }
+    // ========== END EMBEDDING VERIFICATION ==========
+
+    // Verify weights match PyTorch snapshots (VERBOSE for full embedding verification)
+    bool weights_verified = verifyModelWeights(
+        raw_weights,
+        mpi_ctx,
+        base_config,
+        "pytorch_snapshots_mapped/weights",
+        /*verbose=*/true // ENABLE: Show detailed per-weight diagnostics including embeddings
+    );
+
+    if (!weights_verified)
+    {
+        if (rank == 0)
+        {
+            std::cerr << "\n"
+                      << std::string(80, '=') << std::endl;
+            std::cerr << "✗ WEIGHT VERIFICATION FAILED" << std::endl;
+            std::cerr << std::string(80, '=') << std::endl;
+            std::cerr << "Loaded weights do not match PyTorch reference snapshots!" << std::endl;
+            std::cerr << "This means the GGUF model weights loaded by Llaminar differ" << std::endl;
+            std::cerr << "from the weights loaded by PyTorch's GGUF loader." << std::endl;
+            std::cerr << std::string(80, '=') << std::endl;
+        }
+        GTEST_FAIL() << "Weight verification failed - cannot proceed with parity testing";
+    }
+
+    if (rank == 0)
+    {
+        std::cout << "\n"
+                  << std::string(80, '=') << std::endl;
+        std::cout << "✓ WEIGHT VERIFICATION PASSED" << std::endl;
+        std::cout << std::string(80, '=') << std::endl;
+        std::cout << "All weights match PyTorch reference (including embeddings)" << std::endl;
+        std::cout << std::string(80, '=') << std::endl
+                  << std::endl;
+    }
+    // ========== END WEIGHT VERIFICATION ==========
+
+    if (rank == 0)
+    {
+        std::cout << "\n[TRUE_INCR] Step 1: Running Llaminar prefill..." << std::endl;
+    }
+
+    // ========== PHASE 3: Prefill ==========
+    StageContext prefill_ctx;
+    prefill_ctx.stage = InferenceStage::Prefill;
+    prefill_ctx.seq_len = static_cast<int>(prefill_tokens.size());
+
+    ASSERT_TRUE(pipeline->prefill(prefill_tokens, *weights, prefill_ctx)) << "Prefill failed";
+
+    std::shared_ptr<TensorBase> prefill_logits_tensor;
+    ASSERT_TRUE(pipeline->logits(prefill_logits_tensor)) << "Failed to get prefill logits";
+    ASSERT_NE(prefill_logits_tensor, nullptr) << "Prefill logits tensor is null";
+
+    if (rank == 0)
+    {
+        std::cout << "[TRUE_INCR] ✓ Prefill complete" << std::endl;
+    }
+
+    // ========== PHASE 4: Incremental Decode with Per-Token Snapshot Saving ==========
+    IncrementalSnapshotHelper snapshot_helper(llaminar_output_dir);
+
+    // Sample first token from prefill logits (greedy sampling)
+    auto prefill_shape = prefill_logits_tensor->shape();
+    ASSERT_EQ(prefill_shape.size(), 2) << "Expected 2D logits tensor";
+    int prefill_seq_len = prefill_shape[0];
+    int vocab_size = prefill_shape[1];
+
+    if (rank == 0)
+    {
+        std::cout << "[TRUE_INCR] Prefill logits shape: [" << prefill_seq_len << ", " << vocab_size << "]" << std::endl;
+        std::cout << "[TRUE_INCR] Sampling from position: " << (prefill_seq_len - 1) << " (last token)" << std::endl;
+    }
+
+    const float *last_row_logits = prefill_logits_tensor->data() + (prefill_seq_len - 1) * vocab_size;
+    int next_token = std::distance(last_row_logits, std::max_element(last_row_logits, last_row_logits + vocab_size));
+
+    // Debug: show top 5 tokens and save logits for analysis
+    if (rank == 0)
+    {
+        std::vector<std::pair<float, int>> logit_pairs;
+        for (int i = 0; i < vocab_size; ++i)
+        {
+            logit_pairs.push_back({last_row_logits[i], i});
+        }
+        std::partial_sort(logit_pairs.begin(), logit_pairs.begin() + 5, logit_pairs.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.first > b.first; });
+        std::cout << "[TRUE_INCR] Top 5 tokens: [";
+        for (int i = 0; i < 5; ++i)
+        {
+            std::cout << logit_pairs[i].second;
+            if (i < 4)
+                std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
+
+        // Save full prefill logits for debugging
+        std::string prefill_logits_file = llaminar_output_dir + "/prefill_logits.npy";
+        NpyArray prefill_logits_array;
+        prefill_logits_array.shape = {static_cast<size_t>(vocab_size)}; // Save as 1D
+        prefill_logits_array.data.assign(last_row_logits, last_row_logits + vocab_size);
+        if (NpzLoader::write_npy(prefill_logits_file, prefill_logits_array.data, prefill_logits_array.shape))
+        {
+            std::cout << "[TRUE_INCR] Saved prefill logits to: " << prefill_logits_file << std::endl;
+        }
+    }
+
+    std::vector<int> generated_tokens;
+    generated_tokens.push_back(next_token);
+
+    if (rank == 0)
+    {
+        std::cout << "\n[TRUE_INCR] Step 2: Running incremental decode with snapshot capture..." << std::endl;
+        std::cout << "[TRUE_INCR] First token from prefill: " << next_token << std::endl;
+    }
+
+    // Decode loop with per-token snapshot capture
+    for (int token_idx = 0; token_idx < num_decode_tokens; ++token_idx)
+    {
+        if (rank == 0)
+        {
+            std::cout << "\n[TRUE_INCR] Decoding token_" << token_idx << " (token=" << next_token << ")..." << std::endl;
+        }
+
+        // Prepare for snapshot capture
+        snapshot_helper.beforeToken(token_idx);
+
+        // Run decode step
+        StageContext decode_ctx;
+        decode_ctx.stage = InferenceStage::Decode;
+        decode_ctx.seq_len = 1;
+
+        ASSERT_TRUE(pipeline->decode({next_token}, *weights, decode_ctx))
+            << "Decode step " << token_idx << " failed";
+
+        // Get decode logits
+        std::shared_ptr<TensorBase> decode_logits_tensor;
+        ASSERT_TRUE(pipeline->logits(decode_logits_tensor))
+            << "Failed to get decode logits at token " << token_idx;
+        ASSERT_NE(decode_logits_tensor, nullptr)
+            << "Decode logits tensor is null at token " << token_idx;
+
+        // Save snapshots for this token
+        ASSERT_TRUE(snapshot_helper.afterToken(token_idx))
+            << "Failed to save snapshots for token_" << token_idx;
+
+        if (rank == 0)
+        {
+            std::cout << "[TRUE_INCR] ✓ Saved snapshots to: " << snapshot_helper.getTokenDir(token_idx) << std::endl;
+        }
+
+        // Sample next token for next iteration (if not last)
+        if (token_idx < num_decode_tokens - 1)
+        {
+            auto decode_shape = decode_logits_tensor->shape();
+            ASSERT_EQ(decode_shape.size(), 2) << "Expected 2D decode logits tensor";
+            int decode_seq_len = decode_shape[0];
+            int decode_vocab = decode_shape[1];
+
+            const float *last_decode_logits = decode_logits_tensor->data() + (decode_seq_len - 1) * decode_vocab;
+            next_token = std::distance(last_decode_logits, std::max_element(last_decode_logits, last_decode_logits + decode_vocab));
+            generated_tokens.push_back(next_token);
+
+            if (rank == 0)
+            {
+                std::cout << "[TRUE_INCR] Next token: " << next_token << std::endl;
+            }
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    // ========== PHASE 4.5: Compare Token Sequences ==========
+    if (rank == 0)
+    {
+        std::cout << "\n[TRUE_INCR] Step 3a: Comparing token sequences..." << std::endl;
+    }
+
+    bool tokens_match = false;
+    std::vector<int> pytorch_tokens;
+
+    if (rank == 0)
+    {
+        // Load PyTorch sampled tokens
+        std::string pytorch_tokens_file = pytorch_output_dir + "/sampled_tokens.json";
+        if (load_sampled_tokens_json(pytorch_tokens_file, pytorch_tokens))
+        {
+            std::cout << "\n[TRUE_INCR] Token Sequence Comparison:" << std::endl;
+            std::cout << "  PyTorch tokens:  [";
+            for (size_t i = 0; i < pytorch_tokens.size(); ++i)
+            {
+                std::cout << pytorch_tokens[i];
+                if (i < pytorch_tokens.size() - 1)
+                    std::cout << " → ";
+            }
+            std::cout << "]" << std::endl;
+
+            std::cout << "  Llaminar tokens: [";
+            for (size_t i = 0; i < generated_tokens.size(); ++i)
+            {
+                std::cout << generated_tokens[i];
+                if (i < generated_tokens.size() - 1)
+                    std::cout << " → ";
+            }
+            std::cout << "]" << std::endl;
+
+            // Compare sequences
+            if (pytorch_tokens.size() != generated_tokens.size())
+            {
+                std::cerr << "  ✗ MISMATCH: Different sequence lengths!" << std::endl;
+                std::cerr << "    PyTorch:  " << pytorch_tokens.size() << " tokens" << std::endl;
+                std::cerr << "    Llaminar: " << generated_tokens.size() << " tokens" << std::endl;
+                tokens_match = false;
+            }
+            else
+            {
+                tokens_match = true;
+                for (size_t i = 0; i < pytorch_tokens.size(); ++i)
+                {
+                    if (pytorch_tokens[i] != generated_tokens[i])
+                    {
+                        std::cerr << "  ✗ DIVERGENCE at position " << i << ":" << std::endl;
+                        std::cerr << "    PyTorch:  " << pytorch_tokens[i] << std::endl;
+                        std::cerr << "    Llaminar: " << generated_tokens[i] << std::endl;
+                        tokens_match = false;
+                        break;
+                    }
+                }
+
+                if (tokens_match)
+                {
+                    std::cout << "  ✓ All " << generated_tokens.size() << " tokens match!" << std::endl;
+                    std::cout << "    → Both systems generate identical output sequence" << std::endl;
+                }
+            }
+        }
+        else
+        {
+            std::cerr << "  ⚠ Warning: Could not load PyTorch tokens for comparison" << std::endl;
+            std::cerr << "    File: " << pytorch_tokens_file << std::endl;
+        }
+    }
+
+    // Broadcast token match result to all ranks
+    int tokens_match_int = tokens_match ? 1 : 0;
+    MPI_Bcast(&tokens_match_int, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    tokens_match = (tokens_match_int == 1);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // ========== PHASE 5: Compare Snapshots Token-by-Token with Fail-Fast ==========
+    if (rank == 0)
+    {
+        std::cout << "\n"
+                  << std::string(80, '=') << std::endl;
+        std::cout << "SNAPSHOT COMPARISON (Fail-Fast Mode)" << std::endl;
+        std::cout << std::string(80, '=') << std::endl;
+    }
+
+    // Results tracking structure
+    struct StageResult
+    {
+        std::string name;
+        bool passed;
+        float max_abs;
+        float rel_l2;
+        std::string pytorch_shape;
+        std::string llaminar_shape;
+        std::string error_msg;
+    };
+    std::vector<StageResult> all_results;
+
+    int total_tokens_passed = 0;
+    int total_tokens_failed = 0;
+    int total_stages_compared = 0;
+    int total_stages_passed = 0;
+    int total_stages_failed = 0;
+    bool fail_fast_triggered = false;
+
+    // Note: We only compare decode tokens (not prefill token_0) since that's what we captured
+    for (int token_idx = 0; token_idx < num_decode_tokens && !fail_fast_triggered; ++token_idx)
+    {
+        if (rank == 0)
+        {
+            std::cout << "\n[Token " << token_idx << "] Comparing snapshots..." << std::endl;
+        }
+
+        // Load PyTorch snapshots for this token
+        std::string pytorch_token_dir = pytorch_output_dir + "/token_" + std::to_string(token_idx);
+
+        // Load Llaminar snapshots for this token
+        std::string llaminar_token_dir = llaminar_output_dir + "/token_" + std::to_string(token_idx);
+
+        // Compare all .npy files in the directories
+        namespace fs = std::filesystem;
+        if (!fs::exists(pytorch_token_dir) || !fs::exists(llaminar_token_dir))
+        {
+            if (rank == 0)
+            {
+                std::cerr << "[Token " << token_idx << "] ✗ FATAL: Missing snapshot directory" << std::endl;
+                std::cerr << "  PyTorch dir exists: " << fs::exists(pytorch_token_dir) << std::endl;
+                std::cerr << "  Llaminar dir exists: " << fs::exists(llaminar_token_dir) << std::endl;
+            }
+            total_tokens_failed++;
+            fail_fast_triggered = true;
+            break;
+        }
+
+        int token_stages_passed = 0;
+        int token_stages_failed = 0;
+
+        // Collect all stage names for ordered processing
+        std::vector<std::string> stage_names;
+        for (const auto &entry : fs::directory_iterator(pytorch_token_dir))
+        {
+            if (entry.path().extension() == ".npy")
+            {
+                stage_names.push_back(entry.path().filename().string());
+            }
+        }
+        std::sort(stage_names.begin(), stage_names.end());
+
+        // Iterate through stages in order
+        for (const auto &filename : stage_names)
+        {
+            std::string pytorch_file = pytorch_token_dir + "/" + filename;
+            std::string llaminar_file = llaminar_token_dir + "/" + filename;
+
+            StageResult result;
+            result.name = "token_" + std::to_string(token_idx) + "/" + filename;
+            result.passed = false;
+
+            if (!fs::exists(llaminar_file))
+            {
+                result.error_msg = "Missing Llaminar snapshot";
+                all_results.push_back(result);
+                token_stages_failed++;
+                fail_fast_triggered = true;
+                if (rank == 0)
+                {
+                    std::cerr << "  ✗ " << filename << ": " << result.error_msg << std::endl;
+                }
+                break; // FAIL FAST
+            }
+
+            // Load both snapshots
+            NpyArray pytorch_array;
+            NpyArray llaminar_array;
+
+            if (!NpzLoader::load_npy(pytorch_file, pytorch_array) ||
+                !NpzLoader::load_npy(llaminar_file, llaminar_array))
+            {
+                result.error_msg = "Failed to load snapshot files";
+                all_results.push_back(result);
+                token_stages_failed++;
+                fail_fast_triggered = true;
+                if (rank == 0)
+                {
+                    std::cerr << "  ✗ " << filename << ": " << result.error_msg << std::endl;
+                }
+                break; // FAIL FAST
+            }
+
+            // Helper to format shape for printing
+            auto format_shape = [](const std::vector<size_t> &shape) -> std::string
+            {
+                std::ostringstream oss;
+                for (size_t i = 0; i < shape.size(); ++i)
+                {
+                    oss << shape[i];
+                    if (i < shape.size() - 1)
+                        oss << "x";
+                }
+                return oss.str();
+            };
+
+            // Helper to squeeze leading singleton dimensions (batch and sequence dims)
+            auto squeeze_shape = [](const std::vector<size_t> &shape) -> std::vector<size_t>
+            {
+                std::vector<size_t> squeezed;
+                bool found_non_one = false;
+                for (auto dim : shape)
+                {
+                    if (dim != 1 || found_non_one)
+                    {
+                        squeezed.push_back(dim);
+                        found_non_one = true;
+                    }
+                }
+                // If all dimensions were 1, keep at least one
+                if (squeezed.empty())
+                    squeezed.push_back(1);
+                return squeezed;
+            };
+
+            // Squeeze shapes for comparison (PyTorch may have extra batch/seq dims)
+            auto pytorch_squeezed = squeeze_shape(pytorch_array.shape);
+            auto llaminar_squeezed = squeeze_shape(llaminar_array.shape);
+
+            result.pytorch_shape = format_shape(pytorch_array.shape);
+            result.llaminar_shape = format_shape(llaminar_array.shape);
+
+            // Compare shapes after squeezing
+            if (pytorch_squeezed != llaminar_squeezed)
+            {
+                result.error_msg = "Shape mismatch: PyTorch=" + format_shape(pytorch_array.shape) +
+                                   " (squeezed: " + format_shape(pytorch_squeezed) + ")" +
+                                   " vs Llaminar=" + format_shape(llaminar_array.shape) +
+                                   " (squeezed: " + format_shape(llaminar_squeezed) + ")";
+                all_results.push_back(result);
+                token_stages_failed++;
+                fail_fast_triggered = true;
+                if (rank == 0)
+                {
+                    std::cerr << "  ✗ " << filename << ": " << result.error_msg << std::endl;
+                }
+                break; // FAIL FAST on shape mismatch
+            }
+
+            // Compare values (use simple metrics for now)
+            float max_abs_diff = 0.0f;
+            float sum_squared_diff = 0.0f;
+            size_t count = pytorch_array.data.size();
+
+            for (size_t i = 0; i < count; ++i)
+            {
+                float diff = std::abs(pytorch_array.data[i] - llaminar_array.data[i]);
+                max_abs_diff = std::max(max_abs_diff, diff);
+                sum_squared_diff += diff * diff;
+            }
+
+            float rel_l2 = std::sqrt(sum_squared_diff / count);
+
+            // Store results for table
+            result.max_abs = max_abs_diff;
+            result.rel_l2 = rel_l2;
+
+            // Use generous thresholds for now (can tighten later)
+            const float max_abs_threshold = 1e-3f;
+            const float rel_l2_threshold = 1e-4f;
+
+            result.passed = (max_abs_diff < max_abs_threshold) && (rel_l2 < rel_l2_threshold);
+            all_results.push_back(result);
+            total_stages_compared++;
+
+            if (result.passed)
+            {
+                token_stages_passed++;
+                total_stages_passed++;
+                if (rank == 0)
+                {
+                    std::cout << "  ✓ " << filename
+                              << " (max_abs=" << max_abs_diff
+                              << ", rel_l2=" << rel_l2 << ")" << std::endl;
+                }
+            }
+            else
+            {
+                token_stages_failed++;
+                total_stages_failed++;
+                fail_fast_triggered = true;
+                if (rank == 0)
+                {
+                    std::cerr << "  ✗ " << filename
+                              << " FAILED (max_abs=" << max_abs_diff << " > " << max_abs_threshold
+                              << ", rel_l2=" << rel_l2 << " > " << rel_l2_threshold << ")" << std::endl;
+                }
+                break; // FAIL FAST on value mismatch
+            }
+        } // End stages loop
+
+        total_stages_passed += token_stages_passed;
+        total_stages_failed += token_stages_failed;
+
+        if (token_stages_failed == 0)
+        {
+            total_tokens_passed++;
+            if (rank == 0)
+            {
+                std::cout << "[Token " << token_idx << "] ✓ PASSED (all "
+                          << token_stages_passed << " stages)" << std::endl;
+            }
+        }
+        else
+        {
+            total_tokens_failed++;
+            if (rank == 0)
+            {
+                std::cerr << "[Token " << token_idx << "] ✗ FAILED ("
+                          << token_stages_failed << " stage(s) failed)" << std::endl;
+            }
+        }
+
+        if (fail_fast_triggered)
+        {
+            if (rank == 0)
+            {
+                std::cerr << "\n⚠ FAIL-FAST TRIGGERED - Stopping at first failure" << std::endl;
+            }
+            break;
+        }
+    } // End tokens loop
+
+    // ========== PHASE 6: Results Table and Summary ==========
+    if (rank == 0)
+    {
+        std::cout << "\n"
+                  << std::string(120, '=') << std::endl;
+        std::cout << "PARITY TEST RESULTS TABLE" << std::endl;
+        std::cout << std::string(120, '=') << std::endl;
+
+        // Table header
+        std::cout << std::left
+                  << std::setw(50) << "Stage"
+                  << std::setw(10) << "Status"
+                  << std::setw(15) << "Max Abs Diff"
+                  << std::setw(15) << "Rel L2"
+                  << std::setw(30) << "Notes"
+                  << std::endl;
+        std::cout << std::string(120, '-') << std::endl;
+
+        // Print all results
+        for (const auto &result : all_results)
+        {
+            std::string status_str = result.passed ? "✓ PASS" : "✗ FAIL";
+            std::string notes = result.error_msg.empty() ? "" : result.error_msg;
+
+            std::cout << std::left
+                      << std::setw(50) << result.name
+                      << std::setw(10) << status_str;
+
+            if (!result.error_msg.empty())
+            {
+                // Shape or loading error - no metrics
+                std::cout << std::setw(15) << "N/A"
+                          << std::setw(15) << "N/A"
+                          << std::setw(30) << notes.substr(0, 30);
+            }
+            else
+            {
+                // Value comparison
+                std::cout << std::setw(15) << std::scientific << std::setprecision(3) << result.max_abs
+                          << std::setw(15) << std::scientific << std::setprecision(3) << result.rel_l2
+                          << std::setw(30) << "";
+            }
+            std::cout << std::endl;
+        }
+
+        std::cout << std::string(120, '=') << std::endl;
+
+        // Summary Statistics
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "SUMMARY" << std::endl;
+        std::cout << "========================================" << std::endl;
+        // Summary Statistics
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "SUMMARY" << std::endl;
+        std::cout << "========================================" << std::endl;
+
+        // Token sequence validation
+        std::cout << "\n[TOKEN SEQUENCE VALIDATION]" << std::endl;
+        if (tokens_match)
+        {
+            std::cout << "  ✓ Token sequences MATCH" << std::endl;
+            std::cout << "    Both systems generate identical output" << std::endl;
+        }
+        else
+        {
+            std::cout << "  ✗ Token sequences DIVERGE" << std::endl;
+            std::cout << "    Functional output differs between systems" << std::endl;
+        }
+
+        // Stage-level validation
+        std::cout << "\n[STAGE-LEVEL VALIDATION]" << std::endl;
+        std::cout << "  Tokens passed:      " << total_tokens_passed << "/" << num_decode_tokens << std::endl;
+        std::cout << "  Tokens failed:      " << total_tokens_failed << "/" << num_decode_tokens << std::endl;
+        std::cout << "  Stages compared:    " << total_stages_compared << std::endl;
+        std::cout << "  Stages passed:      " << total_stages_passed << std::endl;
+        std::cout << "  Stages failed:      " << total_stages_failed << std::endl;
+
+        if (fail_fast_triggered)
+        {
+            std::cout << "\n  ⚠ Fail-fast triggered - stopped at first failure" << std::endl;
+            std::cout << "  ⚠ Not all stages were tested" << std::endl;
+        }
+
+        std::cout << "\n[OUTPUT SEQUENCE]" << std::endl;
+        std::cout << "  Generated tokens: ";
+        for (size_t i = 0; i < generated_tokens.size(); ++i)
+        {
+            std::cout << generated_tokens[i];
+            if (i < generated_tokens.size() - 1)
+                std::cout << " → ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "\n========================================" << std::endl;
+    }
+
+    // Final test assertion
+    EXPECT_GT(total_stages_passed, 0) << "No stages passed - complete parity failure";
+    EXPECT_EQ(total_stages_failed, 0) << "Stage-level parity check failed - see detailed results above";
+    EXPECT_TRUE(tokens_match) << "Token sequences diverge between PyTorch and Llaminar";
 
     // Clean up
     unsetenv("ADAPTIVE_DISABLE_COSMA");

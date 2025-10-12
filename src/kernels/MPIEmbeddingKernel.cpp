@@ -403,6 +403,23 @@ namespace llaminar
             return false;
         }
 
+        // ========================================================================
+        // TENSOR DIMENSIONALITY REFERENCE
+        // ========================================================================
+        // Extract inputs with explicit dimensions:
+        //   token_ids_tensor:    [seq_len]                           - Input token IDs (int32)
+        //   embedding_table:     [vocab_size, embedding_dim] OR      - Full embedding table, OR
+        //                        [embedding_dim, vocab_size] if transposed, OR
+        //                        [local_vocab_size, embedding_dim]   - Sharded per-rank portion
+        //
+        // Outputs:
+        //   output:              [seq_len, embedding_dim]            - Embedded token vectors
+        //
+        // Internal buffers:
+        //   local_output:        [seq_len, embedding_dim]            - Per-rank partial embeddings
+        //                                                              (zeros for non-owned tokens if sharded)
+        // ========================================================================
+
         auto token_ids_tensor = inputs[0];
         auto embedding_table = inputs[1];
         auto output = outputs[0];
@@ -446,6 +463,18 @@ namespace llaminar
 
         // Gather embeddings (Allreduce for sharded, copy for full table mode)
         gatherEmbeddings(local_output, output, seq_len, embedding_dim_, full_table_mode);
+
+        // Log embedding output values to verify consistency across ranks
+        if (seq_len > 0)
+        {
+            const float *out_ptr = output->data();
+            LOG_INFO("[EmbedOutput] rank=" << rank_ << " token[0]=" << token_ids[0]
+                                           << " emb_out[0:10]: ["
+                                           << out_ptr[0] << ", " << out_ptr[1] << ", " << out_ptr[2] << ", "
+                                           << out_ptr[3] << ", " << out_ptr[4] << ", " << out_ptr[5] << ", "
+                                           << out_ptr[6] << ", " << out_ptr[7] << ", " << out_ptr[8] << ", "
+                                           << out_ptr[9] << "]");
+        }
 
         if (debug_enabled)
         {

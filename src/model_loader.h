@@ -303,11 +303,12 @@ struct GGUFValue
  */
 struct GGUFTensorInfo
 {
-    std::string name;                 ///< Tensor name (e.g., "blk.0.attn_q.weight")
-    std::vector<uint64_t> dimensions; ///< Shape (e.g., [896, 896] for Q weight)
-    GGUFTensorType type;              ///< Quantization format
-    uint64_t offset;                  ///< Byte offset in file to tensor data
-    size_t size_bytes;                ///< Total bytes for this tensor
+    std::string name;                      ///< Tensor name (e.g., "blk.0.attn_q.weight")
+    std::vector<uint64_t> dimensions;      ///< Shape after dimension swap (e.g., [896, 896] for Q weight)
+    std::vector<uint64_t> gguf_dimensions; ///< Original GGUF dimensions BEFORE swap (for offset calculation)
+    GGUFTensorType type;                   ///< Quantization format
+    uint64_t offset;                       ///< Byte offset in file to tensor data
+    size_t size_bytes;                     ///< Total bytes for this tensor
 
     /**
      * @brief Check if tensor is quantized (vs full precision)
@@ -722,6 +723,25 @@ public:
                             int row_offset,
                             int row_count,
                             float *dest);
+
+    /**
+     * @brief Stream load a contiguous column shard from a 2D tensor (single shard version)
+     * @param tensor_name Tensor name
+     * @param col_offset Starting column index
+     * @param col_count Number of columns to load
+     * @param dest Output buffer (must be pre-allocated: rows × col_count)
+     * @return true if successful, false if unsupported
+     *
+     * @details Extracts [:, col_offset : col_offset+col_count] slice
+     *   - Output layout: row-major, reduced column count
+     *   - Use for attention head distribution (Q/K/V)
+     *
+     * @note Wrapper around loadTensorColumnShards() for single-shard convenience
+     */
+    bool loadTensorColumnShard(const std::string &tensor_name,
+                               int col_offset,
+                               int col_count,
+                               float *dest);
 
     /**
      * @brief Print model metadata summary to stdout

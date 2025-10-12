@@ -171,6 +171,8 @@ set(LLAMINAR_CORE_SOURCES
     src/tensors/cosma_tensor.cpp
     src/tensors/tensor_factory.cpp
     src/model_loader.cpp
+    src/model_weights_provider.cpp
+    src/mpi_slicing_helper.cpp
     src/repacker.cpp
     src/socket_aware_inference.cpp
     # Backend abstraction (prefill / inference future GPU integration)
@@ -299,6 +301,17 @@ endif()
 # Enable testing
 enable_testing()
 
+# Helper function to add tests with DEBUG log level by default
+# This ensures all CTest runs include DEBUG level logs for better diagnostics
+# Usage: add_test_with_debug_logging(TestName COMMAND test_executable [args...])
+function(add_test_with_debug_logging TEST_NAME)
+    # Forward all arguments to add_test, inserting NAME before TEST_NAME
+    add_test(NAME ${TEST_NAME} ${ARGN})
+    set_tests_properties(${TEST_NAME} PROPERTIES
+        ENVIRONMENT "LLAMINAR_LOG_LEVEL=DEBUG"
+    )
+endfunction()
+
 # Weight role classification unit test (non-MPI)
 if(GTEST_FOUND)
     add_executable(test_weight_role_classification
@@ -312,7 +325,7 @@ if(GTEST_FOUND)
         GTest::gtest
         GTest::gtest_main
     )
-    add_test(NAME WeightRoleClassification COMMAND test_weight_role_classification)
+    add_test_with_debug_logging(WeightRoleClassification COMMAND test_weight_role_classification)
 endif()
 
 # RMSNorm core parity regression test
@@ -327,7 +340,7 @@ if(GTEST_FOUND)
             GTest::gtest
             GTest::gtest_main
     )
-    add_test(NAME RMSNormCoreCorrectness COMMAND test_rmsnorm_core_correctness)
+    add_test_with_debug_logging(RMSNormCoreCorrectness COMMAND test_rmsnorm_core_correctness)
 
     add_executable(test_softmax_core_correctness
         tests/test_softmax_core_correctness.cpp
@@ -338,7 +351,7 @@ if(GTEST_FOUND)
             GTest::gtest
             GTest::gtest_main
     )
-    add_test(NAME SoftmaxCoreCorrectness COMMAND test_softmax_core_correctness)
+    add_test_with_debug_logging(SoftmaxCoreCorrectness COMMAND test_softmax_core_correctness)
 endif()
 
 
@@ -382,7 +395,9 @@ function(add_llaminar_mpi_test TEST_NAME NUM_PROCS TARGET_NAME)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 
-    set_tests_properties(${TEST_NAME} PROPERTIES ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1")
+    set_tests_properties(${TEST_NAME} PROPERTIES 
+        ENVIRONMENT "OMPI_MCA_rmaps_base_oversubscribe=1;LLAMINAR_LOG_LEVEL=DEBUG"
+    )
 endfunction()
 
 # Weight slice parity validation test (requires MPI, launched with 2 ranks)
@@ -404,27 +419,35 @@ endif()
 # Test sources and executables
 add_executable(test_basic tests/test_basic.cpp)
 target_link_libraries(test_basic llaminar_core GTest::gtest GTest::gtest_main)
-add_test(NAME BasicTest COMMAND test_basic)
+add_test_with_debug_logging(BasicTest COMMAND test_basic)
 
 add_executable(test_pipeline_factory tests/test_pipeline_factory.cpp)
 target_link_libraries(test_pipeline_factory llaminar_core GTest::gtest GTest::gtest_main)
-add_test(NAME PipelineFactoryTest COMMAND test_pipeline_factory)
+add_test_with_debug_logging(PipelineFactoryTest COMMAND test_pipeline_factory)
 
 add_executable(test_weight_contracts tests/test_weight_contracts.cpp)
 target_link_libraries(test_weight_contracts llaminar_core GTest::gtest GTest::gtest_main)
-add_test(NAME WeightContractsTest COMMAND test_weight_contracts)
+add_test_with_debug_logging(WeightContractsTest COMMAND test_weight_contracts)
 
 add_executable(test_weight_validation_integration tests/test_weight_validation_integration.cpp)
 target_link_libraries(test_weight_validation_integration llaminar_core GTest::gtest GTest::gtest_main)
-add_test(NAME WeightValidationIntegration COMMAND test_weight_validation_integration)
+add_test_with_debug_logging(WeightValidationIntegration COMMAND test_weight_validation_integration)
 
 add_executable(test_large_matmul_plan tests/test_large_matmul_plan.cpp)
 target_link_libraries(test_large_matmul_plan llaminar_core GTest::gtest GTest::gtest_main)
-add_test(NAME LargeMatmulPlanTest COMMAND test_large_matmul_plan)
+add_test_with_debug_logging(LargeMatmulPlanTest COMMAND test_large_matmul_plan)
 
 add_executable(test_numa tests/test_numa.cpp)
 target_link_libraries(test_numa llaminar_core)
-add_test(NAME NumaTest COMMAND test_numa)
+add_test_with_debug_logging(NumaTest COMMAND test_numa)
+
+add_executable(test_contract_loading tests/test_contract_loading.cpp)
+target_link_libraries(test_contract_loading llaminar_core)
+add_test_with_debug_logging(ContractLoadingTest COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS} ./test_contract_loading ${MPIEXEC_POSTFLAGS})
+
+add_executable(test_bias_contracts tests/test_bias_contracts.cpp)
+target_link_libraries(test_bias_contracts llaminar_core GTest::gtest)
+add_test_with_debug_logging(BiasContractTest COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS} ./test_bias_contracts ${MPIEXEC_POSTFLAGS})
 
 add_executable(test_cosma tests/test_cosma.cpp)
 target_link_libraries(test_cosma llaminar_core)
@@ -1181,9 +1204,19 @@ if(GTEST_FOUND)
 add_executable(test_parity_framework 
     tests/test_parity_framework.cpp 
     tests/parity_test_framework.cpp 
+    tests/weight_verifier.cpp
     $<TARGET_OBJECTS:test_logging_bootstrap>)
 target_link_libraries(test_parity_framework PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
 add_llaminar_mpi_test(ParityFrameworkTest 2 test_parity_framework)
+
+# Incremental snapshot helper test - verifies .npy writer and per-token snapshot saving
+add_executable(test_incremental_snapshot_helper
+    tests/test_incremental_snapshot_helper.cpp
+    tests/parity_test_framework.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_incremental_snapshot_helper PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
+add_test(NAME IncrementalSnapshotHelper COMMAND test_incremental_snapshot_helper)
+set_tests_properties(IncrementalSnapshotHelper PROPERTIES TIMEOUT 30 LABELS "unit;parity;snapshot")
 
 # Weight passthrough test - verifies dequantized weights reach attention kernel intact
 add_executable(test_weight_passthrough

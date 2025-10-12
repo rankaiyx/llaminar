@@ -13,21 +13,40 @@
 
 #include "tensors/tensor_base.h"
 #include "transformer_config.h"
+#include "logger.h"
 #include <string>
 #include <vector>
 #include <stdexcept>
 #include <sstream>
 
+// Forward declaration to avoid circular dependency
+class ModelLoader;
+
 namespace llaminar
 {
     /**
-     * @brief Describes expected shape for a model weight tensor.
+     * @brief MPI slicing strategy for weight distribution across ranks.
+     */
+    enum class WeightSliceType
+    {
+        REPLICATED, ///< Full weight on every rank (no slicing)
+        ROW_SLICED, ///< Row-wise slicing (first dimension sliced by heads)
+        COL_SLICED  ///< Column-wise slicing (second dimension sliced by heads)
+    };
+
+    /**
+     * @brief Describes expected shape for a model weight tensor with MPI slicing support.
      *
      * Dimensions can be symbolic (e.g., "d_model", "n_head*head_dim") or literal integers.
      * The contract is evaluated against actual ModelConfig values at validation time.
      *
      * CRITICAL: dim_expressions specify GGUF format (what's in the file).
      * If requires_transpose=true, loader MUST transpose before use.
+     *
+     * MPI SLICING: When mpi_size > 1, weights may be sliced across ranks:
+     * - REPLICATED: Full weight on every rank (embedding, norms, etc.)
+     * - ROW_SLICED: First dimension sliced (Q/K/V by attention heads)
+     * - COL_SLICED: Second dimension sliced (O by attention heads)
      */
     struct WeightShapeContract
     {
@@ -36,11 +55,30 @@ namespace llaminar
         std::string description;                  ///< Human-readable description
         bool requires_transpose;                  ///< If true, tensor must be transposed after loading
 
+        // MPI slicing metadata
+        WeightSliceType slice_type;  ///< How this weight is distributed across MPI ranks
+        std::string slice_parameter; ///< Config parameter to slice by ("n_head", "n_head_kv", "d_ff")
+
+        // GGUF storage format metadata (NEW - for contract-driven loading)
+        std::vector<std::string> gguf_dim_expressions; ///< Dimensions as stored in GGUF file (before transpose)
+        bool needs_transpose_data;                     ///< Whether to transpose actual data during loading
+        std::string name_pattern;                      ///< Pattern with {layer} placeholder (e.g., "blk.{layer}.attn_q.weight")
+        std::string role_description;                  ///< Role description for logging
+
         WeightShapeContract(const std::string &name,
                             const std::vector<std::string> &dims,
                             const std::string &desc = "",
-                            bool transpose = false)
-            : weight_name(name), dim_expressions(dims), description(desc), requires_transpose(transpose) {}
+                            bool transpose = false,
+                            WeightSliceType slice = WeightSliceType::REPLICATED,
+                            const std::string &slice_param = "",
+                            const std::vector<std::string> &gguf_dims = {},
+                            bool transpose_data = false)
+            : weight_name(name), dim_expressions(dims), description(desc),
+              requires_transpose(transpose), slice_type(slice), slice_parameter(slice_param),
+              gguf_dim_expressions(gguf_dims.empty() ? dims : gguf_dims),
+              needs_transpose_data(transpose_data),
+              name_pattern(name),
+              role_description(desc) {}
 
         /**
          * @brief Evaluate dimension expressions against model config.
@@ -73,28 +111,94 @@ namespace llaminar
                       const TransformerLayerConfig &cfg,
                       int layer_index = -1) const
         {
+            // Default to single-rank validation (MPI size = 1)
+            validate_with_mpi(tensor, cfg, 0, 1, layer_index);
+        }
+
+        /**
+         * @brief Validate tensor with MPI context (slicing-aware).
+         *
+         * @param tensor The loaded weight tensor
+         * @param cfg Model configuration
+         * @param mpi_rank Current MPI rank
+         * @param mpi_size Total MPI world size
+         * @param layer_index Optional layer index for per-layer weights
+         * @throws std::runtime_error if validation fails
+         */
+        void validate_with_mpi(const std::shared_ptr<TensorBase> &tensor,
+                               const TransformerLayerConfig &cfg,
+                               int mpi_rank,
+                               int mpi_size,
+                               int layer_index = -1) const
+        {
             if (!tensor)
             {
                 throw std::runtime_error("Weight contract validation failed: " + weight_name + " is null");
             }
 
-            auto expected = evaluate(cfg);
+            std::vector<int> expected;
+
+            if (mpi_size == 1)
+            {
+                // Single rank: validate full dimensions
+                expected = evaluate(cfg);
+            }
+            else
+            {
+                // Multi-rank: validate sliced dimensions
+                expected = evaluate_sliced(cfg, mpi_rank, mpi_size);
+            }
+
             auto actual = tensor->shape();
 
             if (expected.size() != actual.size())
             {
-                throw std::runtime_error(format_error(expected, actual, layer_index,
-                                                      "Rank mismatch"));
+                throw std::runtime_error(format_error_mpi(expected, actual, mpi_rank, mpi_size, layer_index,
+                                                          "Rank mismatch"));
             }
 
             for (size_t i = 0; i < expected.size(); ++i)
             {
                 if (expected[i] != actual[i])
                 {
-                    throw std::runtime_error(format_error(expected, actual, layer_index,
-                                                          "Dimension " + std::to_string(i) + " mismatch"));
+                    throw std::runtime_error(format_error_mpi(expected, actual, mpi_rank, mpi_size, layer_index,
+                                                              "Dimension " + std::to_string(i) + " mismatch"));
                 }
             }
+
+            // Log successful validation with details
+            std::stringstream log_msg;
+            log_msg << "[WeightContract] ✓ " << weight_name;
+            if (layer_index >= 0)
+            {
+                log_msg << " (layer " << layer_index << ")";
+            }
+            log_msg << ": shape=[";
+            for (size_t i = 0; i < actual.size(); ++i)
+            {
+                if (i > 0)
+                    log_msg << ", ";
+                log_msg << actual[i];
+            }
+            log_msg << "]";
+            if (mpi_size > 1)
+            {
+                log_msg << " (rank " << mpi_rank << "/" << mpi_size;
+                if (slice_type != WeightSliceType::REPLICATED)
+                {
+                    log_msg << ", sliced ";
+                    if (slice_type == WeightSliceType::ROW_SLICED)
+                    {
+                        log_msg << "rows";
+                    }
+                    else if (slice_type == WeightSliceType::COL_SLICED)
+                    {
+                        log_msg << "cols";
+                    }
+                }
+                log_msg << ")";
+            }
+            LOG_DEBUG(log_msg.str());
         }
 
         /**
@@ -156,7 +260,108 @@ namespace llaminar
             }
         }
 
+        /**
+         * @brief Load tensor with automatic MPI slicing based on this contract.
+         *
+         * This is the PRIMARY METHOD for loading weights in an MPI context.
+         * Delegates to mpi_slicing::load_with_contract() for actual loading.
+         *
+         * @param loader ModelLoader instance for accessing GGUF file
+         * @param cfg Transformer layer configuration
+         * @param mpi_rank Current MPI rank
+         * @param mpi_size Total number of MPI ranks
+         * @param layer_index Layer index for layer-specific tensors (-1 for global)
+         * @return Correctly-sliced tensor in expected PyTorch layout
+         *
+         * @note This method is declared here but implemented in mpi_slicing_helper.cpp
+         *       to avoid circular dependencies.
+         */
+        std::shared_ptr<TensorBase> load(ModelLoader &loader,
+                                         const TransformerLayerConfig &cfg,
+                                         int mpi_rank,
+                                         int mpi_size,
+                                         int layer_index = -1) const;
+
     private:
+        /**
+         * @brief Evaluate dimension expressions for sliced weights.
+         *
+         * @param cfg Model configuration
+         * @param mpi_rank Current MPI rank
+         * @param mpi_size Total MPI world size
+         * @return Expected shape for this rank's slice
+         */
+        std::vector<int> evaluate_sliced(const TransformerLayerConfig &cfg,
+                                         int mpi_rank,
+                                         int mpi_size) const
+        {
+            if (slice_type == WeightSliceType::REPLICATED)
+            {
+                // Replicated weights: full dimensions on every rank
+                return evaluate(cfg);
+            }
+
+            // Get full dimensions first
+            auto full_shape = evaluate(cfg);
+
+            // Get the parameter value to slice by
+            int slice_param_value = get_slice_parameter_value(slice_parameter, cfg);
+
+            // Calculate local slice size
+            if (slice_param_value % mpi_size != 0)
+            {
+                std::ostringstream oss;
+                oss << "Weight '" << weight_name << "' cannot be evenly sliced: "
+                    << slice_parameter << "=" << slice_param_value
+                    << " is not divisible by mpi_size=" << mpi_size;
+                throw std::runtime_error(oss.str());
+            }
+
+            int local_count = slice_param_value / mpi_size;
+
+            // Apply slicing to appropriate dimension
+            if (slice_type == WeightSliceType::ROW_SLICED)
+            {
+                // Row slicing: first dimension is sliced
+                // e.g., Q: [n_head*head_dim, d_model] → [local_heads*head_dim, d_model]
+                // The first dimension expression is "n_head*head_dim" or "n_head_kv*head_dim"
+                // We need to replace the parameter value with the local count
+                full_shape[0] = local_count * cfg.head_dim;
+            }
+            else if (slice_type == WeightSliceType::COL_SLICED)
+            {
+                // Column slicing: second dimension is sliced
+                // e.g., O: [d_model, n_head*head_dim] → [d_model, local_heads*head_dim]
+                full_shape[1] = local_count * cfg.head_dim;
+            }
+
+            return full_shape;
+        }
+
+        /**
+         * @brief Get the value of a slice parameter from config.
+         *
+         * @param param_name Parameter name (e.g., "n_head", "n_head_kv", "d_ff")
+         * @param cfg Model configuration
+         * @return Parameter value
+         */
+        int get_slice_parameter_value(const std::string &param_name, const TransformerLayerConfig &cfg) const
+        {
+            if (param_name.empty())
+            {
+                return 1; // Replicated weights have no slice parameter
+            }
+
+            if (param_name == "n_head")
+                return cfg.n_head;
+            if (param_name == "n_head_kv")
+                return cfg.n_head_kv;
+            if (param_name == "d_ff")
+                return cfg.d_ff;
+
+            throw std::runtime_error("Unknown slice parameter: " + param_name);
+        }
+
         /**
          * @brief Evaluate a single dimension expression.
          *
@@ -225,17 +430,51 @@ namespace llaminar
                                  int layer_index,
                                  const std::string &reason) const
         {
+            return format_error_mpi(expected, actual, 0, 1, layer_index, reason);
+        }
+
+        std::string format_error_mpi(const std::vector<int> &expected,
+                                     const std::vector<int> &actual,
+                                     int mpi_rank,
+                                     int mpi_size,
+                                     int layer_index,
+                                     const std::string &reason) const
+        {
             std::ostringstream oss;
             oss << "Weight contract validation failed for '" << weight_name << "'";
             if (layer_index >= 0)
             {
                 oss << " (layer " << layer_index << ")";
             }
+            if (mpi_size > 1)
+            {
+                oss << " on rank " << mpi_rank << "/" << mpi_size;
+            }
             oss << ":\n";
             if (!description.empty())
             {
                 oss << "  Description: " << description << "\n";
             }
+
+            // Explain slicing context
+            if (mpi_size > 1)
+            {
+                oss << "  MPI Slicing: ";
+                if (slice_type == WeightSliceType::REPLICATED)
+                {
+                    oss << "REPLICATED (full weight on every rank)";
+                }
+                else if (slice_type == WeightSliceType::ROW_SLICED)
+                {
+                    oss << "ROW_SLICED by " << slice_parameter;
+                }
+                else if (slice_type == WeightSliceType::COL_SLICED)
+                {
+                    oss << "COL_SLICED by " << slice_parameter;
+                }
+                oss << "\n";
+            }
+
             oss << "  Reason: " << reason << "\n";
             oss << "  Expected shape: [";
             for (size_t i = 0; i < expected.size(); ++i)
@@ -244,15 +483,25 @@ namespace llaminar
                     oss << ", ";
                 oss << expected[i];
             }
-            oss << "] (from [";
-            for (size_t i = 0; i < dim_expressions.size(); ++i)
+            oss << "]";
+
+            if (mpi_size > 1)
             {
-                if (i > 0)
-                    oss << ", ";
-                oss << dim_expressions[i];
+                oss << " (sliced for rank " << mpi_rank << ")";
             }
-            oss << "])\n";
-            oss << "  Actual shape:   [";
+            else
+            {
+                oss << " (from [";
+                for (size_t i = 0; i < dim_expressions.size(); ++i)
+                {
+                    if (i > 0)
+                        oss << ", ";
+                    oss << dim_expressions[i];
+                }
+                oss << "])";
+            }
+
+            oss << "\n  Actual shape:   [";
             for (size_t i = 0; i < actual.size(); ++i)
             {
                 if (i > 0)
@@ -297,6 +546,23 @@ namespace llaminar
                              const std::shared_ptr<TensorBase> &lm_head,
                              const TransformerLayerConfig &cfg) const
         {
+            validate_global_with_mpi(token_embedding, output_norm, lm_head, cfg, 0, 1);
+        }
+
+        /**
+         * @brief Validate all global weights with MPI context.
+         */
+        void validate_global_with_mpi(const std::shared_ptr<TensorBase> &token_embedding,
+                                      const std::shared_ptr<TensorBase> &output_norm,
+                                      const std::shared_ptr<TensorBase> &lm_head,
+                                      const TransformerLayerConfig &cfg,
+                                      int mpi_rank,
+                                      int mpi_size) const
+        {
+            LOG_INFO("[WeightContract] Validating " << global_weights.size() << " global weights (rank "
+                                                    << mpi_rank << "/" << mpi_size << ")");
+
+            int validated_count = 0;
             for (const auto &contract : global_weights)
             {
                 std::shared_ptr<TensorBase> tensor;
@@ -316,9 +582,12 @@ namespace llaminar
 
                 if (tensor)
                 {
-                    contract.validate(tensor, cfg);
+                    contract.validate_with_mpi(tensor, cfg, mpi_rank, mpi_size);
+                    validated_count++;
                 }
             }
+
+            LOG_INFO("[WeightContract] ✓ Global weights validated: " << validated_count << "/" << global_weights.size());
         }
 
         /**
@@ -335,6 +604,27 @@ namespace llaminar
                             const std::shared_ptr<TensorBase> &w_up,
                             const std::shared_ptr<TensorBase> &w_down,
                             const TransformerLayerConfig &cfg) const
+        {
+            validate_layer_with_mpi(layer_idx, attn_norm, wq, wk, wv, wo, ffn_norm,
+                                    w_gate, w_up, w_down, cfg, 0, 1);
+        }
+
+        /**
+         * @brief Validate per-layer weights with MPI context.
+         */
+        void validate_layer_with_mpi(int layer_idx,
+                                     const std::shared_ptr<TensorBase> &attn_norm,
+                                     const std::shared_ptr<TensorBase> &wq,
+                                     const std::shared_ptr<TensorBase> &wk,
+                                     const std::shared_ptr<TensorBase> &wv,
+                                     const std::shared_ptr<TensorBase> &wo,
+                                     const std::shared_ptr<TensorBase> &ffn_norm,
+                                     const std::shared_ptr<TensorBase> &w_gate,
+                                     const std::shared_ptr<TensorBase> &w_up,
+                                     const std::shared_ptr<TensorBase> &w_down,
+                                     const TransformerLayerConfig &cfg,
+                                     int mpi_rank,
+                                     int mpi_size) const
         {
             for (const auto &contract : layer_weights)
             {
@@ -383,14 +673,35 @@ namespace llaminar
 
                 if (tensor)
                 {
-                    contract.validate(tensor, cfg, layer_idx);
+                    contract.validate_with_mpi(tensor, cfg, mpi_rank, mpi_size, layer_idx);
                 }
             }
         }
     };
 
     /**
-     * @brief Qwen/Qwen2 model weight contracts.
+     * @brief Qwen/Qwen2 model weight contracts with MPI slicing support.
+     *
+     * CRITICAL: ModelLoader Automatic Dimension AND Data Transpose
+     * =============================================================
+     * The ModelLoader performs TWO operations for all 2D tensors:
+     *
+     * 1. **Dimension swap during parseTensorInfo()** (line ~1403):
+     *    - Swaps metadata from GGUF [in, out] → Llaminar [out, in]
+     *
+     * 2. **Data transpose during loadTensor()** (line ~1090):
+     *    - Transposes actual data to match swapped metadata
+     *    - Result: Metadata and data are ALWAYS consistent
+     *
+     * Example for any weight matrix:
+     *   - GGUF file stores: [896, 4864] (in × out layout)
+     *   - ModelLoader returns: shape=[4864, 896], data layout=[4864, 896] ✓
+     *   - Metadata and data are NOW CONSISTENT!
+     *
+     * Implication for weight contracts:
+     *   - needs_transpose_data should be FALSE for all weights
+     *   - ModelLoader has already done the necessary transpose
+     *   - Contract system just validates shapes, no additional transpose needed
      *
      * CRITICAL: ALL KERNELS USE GGUF FORMAT DIRECTLY
      *
@@ -404,57 +715,113 @@ namespace llaminar
      * 2. Avoids expensive O(n²) transpose operations during model loading
      * 3. Maintains consistency with GGUF storage format
      *
+     * MPI SLICING STRATEGY (mpi_size > 1):
+     * - Q weights: ROW_SLICED by n_head (each rank gets local_heads × head_dim rows)
+     * - K/V weights: ROW_SLICED by n_head_kv (GQA: fewer KV heads)
+     * - O weights: COL_SLICED by n_head (each rank gets local_heads × head_dim columns)
+     * - FFN weights: COL_SLICED by d_ff (gate/up) or ROW_SLICED (down)
+     * - Embeddings/Norms: REPLICATED (full copy on every rank)
+     *
      * Weight dimensions in GGUF format (requires_transpose=false for all):
-     * - Q/K/V: [n_head*head_dim, d_model]
-     * - O proj: [d_model, n_head*head_dim]
-     * - FFN gate/up: [d_ff, d_model]
-     * - FFN down: [d_model, d_ff]
+     * - Q/K/V: [n_head*head_dim, d_model] → [local_heads*head_dim, d_model] when sliced
+     * - O proj: [d_model, n_head*head_dim] → [d_model, local_heads*head_dim] when sliced
+     * - FFN gate/up: [d_ff, d_model] → [local_d_ff, d_model] when sliced
+     * - FFN down: [d_model, d_ff] → [d_model, local_d_ff] when sliced
      */
     inline ModelWeightContracts getQwenWeightContracts()
     {
+        using ST = WeightSliceType;
         ModelWeightContracts contracts;
 
-        // Global weights
+        // Global weights (all replicated - full copy on every rank)
+        // Token embedding and lm_head are stored as [vocab_size, d_model] in both GGUF and PyTorch
+        // (No transpose needed for embeddings!)
         contracts.global_weights = {
             WeightShapeContract("token_embedding", {"vocab_size", "d_model"},
                                 "Token embedding lookup table",
-                                false), // No transpose (lookup table)
+                                false, ST::REPLICATED, "",
+                                {"vocab_size", "d_model"}, false),
             WeightShapeContract("output_norm", {"d_model"},
                                 "Final RMS norm before lm_head",
-                                false), // No transpose (1D)
+                                false, ST::REPLICATED, "",
+                                {"d_model"}, false),
             WeightShapeContract("lm_head", {"vocab_size", "d_model"},
                                 "Output projection to vocabulary (GGUF: [vocab, d_model])",
-                                false)}; // No transpose
+                                false, ST::REPLICATED, "",
+                                {"vocab_size", "d_model"}, false)};
 
-        // Per-layer weights - ALL use GGUF format directly (no transposes!)
+        // Per-layer weights with MPI slicing metadata
         contracts.layer_weights = {
-            WeightShapeContract("attn_norm", {"d_model"},
+            WeightShapeContract("blk.{layer}.attn_norm.weight", {"d_model"},
                                 "Attention input RMS norm",
-                                false), // No transpose (1D)
-            WeightShapeContract("attn_q.weight", {"n_head*head_dim", "d_model"},
-                                "Query projection (GGUF: [out,in], kernel uses GEMM transpose_B)",
-                                false), // NO TRANSPOSE
-            WeightShapeContract("attn_k.weight", {"n_head_kv*head_dim", "d_model"},
-                                "Key projection (GGUF: [out,in], kernel uses GEMM transpose_B)",
-                                false), // NO TRANSPOSE
-            WeightShapeContract("attn_v.weight", {"n_head_kv*head_dim", "d_model"},
-                                "Value projection (GGUF: [out,in], kernel uses GEMM transpose_B)",
-                                false), // NO TRANSPOSE
-            WeightShapeContract("attn_output.weight", {"d_model", "n_head*head_dim"},
-                                "Output projection (GGUF: [out,in], kernel uses GEMM transpose_B)",
-                                false), // NO TRANSPOSE
-            WeightShapeContract("ffn_norm", {"d_model"},
+                                false, ST::REPLICATED, "",
+                                {"d_model"}, false),
+
+            // Attention Q/K/V: Row-sliced by attention heads
+            // CRITICAL FIX: needs_transpose_data = FALSE after ModelLoader dimension correction!
+            // ====================================================================================
+            // GGUF metadata dimensions are backwards from actual data layout, but ModelLoader
+            // now corrects this by swapping metadata to match reality. The data layout in memory
+            // already matches PyTorch convention, so NO transpose is needed!
+            //
+            // PyTorch Linear: weight is [out_features, in_features], forward does input @ weight.T
+            // GGUF after ModelLoader: dimensions corrected to match PyTorch [out_features, in_features]
+            // Data layout matches - ready to use directly!
+            //
+            // Q/K/V weights: [n_head*head_dim, d_model] - row-sliced by heads for MPI distribution
+            // O weight: [d_model, n_head*head_dim] - column-sliced by heads for MPI distribution
+            WeightShapeContract("blk.{layer}.attn_q.weight", {"n_head*head_dim", "d_model"},
+                                "Query projection (row-sliced by Q heads in MPI mode)",
+                                false, ST::ROW_SLICED, "n_head",
+                                {"d_model", "n_head*head_dim"}, false),
+            WeightShapeContract("blk.{layer}.attn_k.weight", {"n_head_kv*head_dim", "d_model"},
+                                "Key projection (row-sliced by KV heads in MPI mode, GQA)",
+                                false, ST::ROW_SLICED, "n_head_kv",
+                                {"d_model", "n_head_kv*head_dim"}, false),
+            WeightShapeContract("blk.{layer}.attn_v.weight", {"n_head_kv*head_dim", "d_model"},
+                                "Value projection (row-sliced by KV heads in MPI mode, GQA)",
+                                false, ST::ROW_SLICED, "n_head_kv",
+                                {"d_model", "n_head_kv*head_dim"}, false),
+
+            // Attention O: Column-sliced by Q heads (matches partial head outputs)
+            WeightShapeContract("blk.{layer}.attn_output.weight", {"d_model", "n_head*head_dim"},
+                                "Output projection (column-sliced by Q heads in MPI mode)",
+                                false, ST::COL_SLICED, "n_head",
+                                {"n_head*head_dim", "d_model"}, false),
+
+            // NOTE: Attention biases (attn_q.bias, attn_k.bias, attn_v.bias) are NOT in contracts
+            // They are loaded and pre-sliced manually in QwenPipeline to avoid complexity in the
+            // contract system (biases are 1D, stored REPLICATED, but consumed as sliced).
+            // This is architecturally cleaner than adding 1D slicing support to contracts.
+
+            WeightShapeContract("blk.{layer}.ffn_norm.weight", {"d_model"},
                                 "FFN input RMS norm",
-                                false), // No transpose (1D)
-            WeightShapeContract("w_gate", {"d_ff", "d_model"},
-                                "FFN gate projection (GGUF: [out,in], kernel uses GEMM transpose_B)",
-                                false), // NO TRANSPOSE
-            WeightShapeContract("w_up", {"d_ff", "d_model"},
-                                "FFN up projection (GGUF: [out,in], kernel uses GEMM transpose_B)",
-                                false), // NO TRANSPOSE
-            WeightShapeContract("w_down", {"d_model", "d_ff"},
-                                "FFN down projection (GGUF: [out,in], kernel uses GEMM transpose_B)",
-                                false)}; // NO TRANSPOSE
+                                false, ST::REPLICATED, "",
+                                {"d_model"}, false),
+
+            // FFN weights: Currently NOT sliced (TODO: implement FFN slicing in future)
+            //
+            // CRITICAL: needs_transpose_data = FALSE for REPLICATED weights!
+            // ================================================================
+            // Replicated (non-sliced) weights are loaded via ModelLoader.loadTensor()
+            // which automatically transposes the data to match swapped dimensions.
+            //
+            // Sliced weights (Q/K/V/O above) have needs_transpose_data = TRUE because
+            // they're loaded via loadTensorRowShard/ColumnShard which bypasses ModelLoader's
+            // automatic transpose, so mpi_slicing_helper must transpose them instead.
+            //
+            WeightShapeContract("blk.{layer}.ffn_gate.weight", {"d_ff", "d_model"},
+                                "FFN gate projection (currently replicated, slicing TODO)",
+                                false, ST::REPLICATED, "",
+                                {"d_model", "d_ff"}, false),
+            WeightShapeContract("blk.{layer}.ffn_up.weight", {"d_ff", "d_model"},
+                                "FFN up projection (currently replicated, slicing TODO)",
+                                false, ST::REPLICATED, "",
+                                {"d_model", "d_ff"}, false),
+            WeightShapeContract("blk.{layer}.ffn_down.weight", {"d_model", "d_ff"},
+                                "FFN down projection (currently replicated, slicing TODO)",
+                                false, ST::REPLICATED, "",
+                                {"d_ff", "d_model"}, false)};
 
         return contracts;
     }

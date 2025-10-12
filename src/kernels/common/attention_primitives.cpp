@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <array>
+#include <atomic>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -74,7 +75,7 @@ namespace llaminar::attn
      */
     static void apply_rope_to_head(float *head_ptr, int position,
                                    const std::vector<float> &inv_freq,
-                                   int head_dim)
+                                   int head_dim, bool debug = false, int head_idx = 0)
     {
         const int half_dim = head_dim / 2;
 
@@ -93,9 +94,24 @@ namespace llaminar::attn
             const float x_first = head_ptr[idx_first];
             const float x_second = head_ptr[idx_second];
 
+            // DEBUG: Log first few rotations for position 0 (use printf to bypass logging/OpenMP issues)
+            if (debug && position == 0 && head_idx == 0 && i < 5)
+            {
+                printf("[RoPE_DEBUG] pos=0 head=0 dim_pair=%d inv_freq=%.10f angle=%.10f cos=%.10f sin=%.10f before=[%.6f,%.6f]\n",
+                       i, inv_freq[i], angle, cos_angle, sin_angle, x_first, x_second);
+                fflush(stdout);
+            }
+
             // Apply rotation (rotate_half pattern)
             head_ptr[idx_first] = x_first * cos_angle - x_second * sin_angle;
             head_ptr[idx_second] = x_first * sin_angle + x_second * cos_angle;
+
+            // DEBUG: Log after rotation
+            if (debug && position == 0 && head_idx == 0 && i < 5)
+            {
+                printf("[RoPE_DEBUG]   after=[%.6f,%.6f]\n", head_ptr[idx_first], head_ptr[idx_second]);
+                fflush(stdout);
+            }
         }
     }
 
@@ -113,13 +129,23 @@ namespace llaminar::attn
      */
     static void apply_rope_to_tensor(float *tensor, int seq_len, int num_heads,
                                      int head_dim, int n_past,
-                                     const std::vector<float> &inv_freq)
+                                     const std::vector<float> &inv_freq, bool debug = false)
     {
+        printf("[ROPE_TENSOR] seq_len=%d num_heads=%d head_dim=%d n_past=%d debug=%d\n",
+               seq_len, num_heads, head_dim, n_past, (int)debug);
+        fflush(stdout);
+
         const auto &env = llaminar::debugEnv().attention;
+
+        // Disable OpenMP if debug mode to ensure printf output appears
+        bool use_parallel = !env.prim_force_scalar && !debug;
+
+        printf("[ROPE_TENSOR] About to enter loop, use_parallel=%d\n", (int)use_parallel);
+        fflush(stdout);
 
 // Parallelize over (token, head) pairs
 // Each iteration is independent, making this perfectly parallelizable
-#pragma omp parallel for collapse(2) if (!env.prim_force_scalar)
+#pragma omp parallel for collapse(2) if (use_parallel)
         for (int t = 0; t < seq_len; ++t)
         {
             for (int h = 0; h < num_heads; ++h)
@@ -130,10 +156,21 @@ namespace llaminar::attn
                 // Pointer to this specific head: tensor[t, h, :]
                 float *head_ptr = tensor + (size_t)t * num_heads * head_dim + (size_t)h * head_dim;
 
-                // Apply rotation
-                apply_rope_to_head(head_ptr, position, inv_freq, head_dim);
+                // Apply rotation - pass debug for first token, first head only
+                bool debug_this = debug && (t == 0) && (h == 0);
+
+                if (t == 0 && h == 0)
+                {
+                    printf("[ROPE_TENSOR] Processing t=0 h=0, debug_this=%d\n", (int)debug_this);
+                    fflush(stdout);
+                }
+
+                apply_rope_to_head(head_ptr, position, inv_freq, head_dim, debug_this, h);
             }
         }
+
+        printf("[ROPE_TENSOR] Loop complete\n");
+        fflush(stdout);
     }
 
     // ============================================================================
@@ -163,6 +200,9 @@ namespace llaminar::attn
     void apply_rope(float *q, float *k, int seq_len, int head_dim,
                     int q_heads, int k_heads, int n_past, float freq_base)
     {
+        fprintf(stderr, "[ROPE_ENTRY] seq_len=%d q_heads=%d k_heads=%d\n", seq_len, q_heads, k_heads);
+        fflush(stderr);
+
         const auto &env = llaminar::debugEnv().attention;
 
         // Validation
@@ -181,6 +221,8 @@ namespace llaminar::attn
 
         // Diagnostic trace (limited to first few calls)
         static int call_count = 0;
+        bool enable_debug = (call_count == 0); // Debug first call
+
         if (call_count < 3)
         {
             LOG_INFO("[RoPE] call=" << call_count
@@ -196,11 +238,25 @@ namespace llaminar::attn
         // Compute inverse frequencies (same for Q and K)
         const std::vector<float> inv_freq = compute_inv_freq(head_dim, freq_base);
 
+        // Log first few inverse frequencies for debugging (before OpenMP region to guarantee output)
+        if (enable_debug)
+        {
+            printf("[RoPE_DEBUG] First 5 inv_freq values:\n");
+            for (int i = 0; i < std::min(5, (int)inv_freq.size()); ++i)
+            {
+                float exponent = (2.0f * i) / head_dim;
+                printf("[RoPE_DEBUG]   inv_freq[%d] = %.10f (from 1e6^%.5f = %.5f)\n",
+                       i, inv_freq[i], exponent, std::pow(freq_base, exponent));
+            }
+            printf("[RoPE_DEBUG] PyTorch expects inv_freq[0]=1.0, inv_freq[1]≈0.9886\n");
+            fflush(stdout);
+        }
+
         // Apply RoPE to Q tensor
-        apply_rope_to_tensor(q, seq_len, q_heads, head_dim, n_past, inv_freq);
+        apply_rope_to_tensor(q, seq_len, q_heads, head_dim, n_past, inv_freq, enable_debug);
 
         // Apply RoPE to K tensor (may have different number of heads for GQA)
-        apply_rope_to_tensor(k, seq_len, k_heads, head_dim, n_past, inv_freq);
+        apply_rope_to_tensor(k, seq_len, k_heads, head_dim, n_past, inv_freq, enable_debug);
 
         // Optional diagnostics
         if (env.internal_diff && llaminar::debugEnv().pipeline.layer_token_diff && seq_len > 0)
@@ -263,6 +319,16 @@ namespace llaminar::attn
         const auto &env = llaminar::debugEnv().attention;
         const float scale = 1.0f / std::sqrt((float)head_dim);
 
+        // DEBUG: Log parameters for first call
+        static bool first_call = true;
+        if (first_call && causal)
+        {
+            LOG_INFO("[compute_qk_scores DEBUG] First causal call:");
+            LOG_INFO("  q_seq_len=" << q_seq_len << ", k_seq_len=" << k_seq_len
+                                    << ", head_dim=" << head_dim << ", heads=" << heads);
+            first_call = false;
+        }
+
 // Parallelize over (head, query_position) pairs
 #pragma omp parallel for collapse(2) if (!env.prim_force_scalar)
         for (int h = 0; h < heads; ++h)
@@ -272,18 +338,44 @@ namespace llaminar::attn
                 float *score_row = scores + (size_t)h * q_seq_len * k_seq_len + (size_t)i * k_seq_len;
                 const float *qi = q + (size_t)i * heads * head_dim + (size_t)h * head_dim;
 
+                // Calculate absolute query position for causal masking
+                // For prefill: k_seq_len == q_seq_len, so abs_q_pos = i (identity)
+                // For decode: k_seq_len = n_past + q_seq_len, query starts at n_past
+                int abs_q_pos = (k_seq_len - q_seq_len) + i;
+
                 // Compute dot product with each key position
                 for (int j = 0; j < k_seq_len; ++j)
                 {
                     // Apply causal mask: can't attend to future tokens
-                    if (causal && j > i)
+                    // Compare key position j with absolute query position
+                    if (causal && j > abs_q_pos)
                     {
+                        // DEBUG: Log first few masks
+                        if (h == 0 && i == 0 && j <= 7)
+                        {
+                            LOG_INFO("[CAUSAL_MASK] h=" << h << ", i=" << i << ", abs_q_pos=" << abs_q_pos
+                                                        << ", j=" << j << " -> MASKED (j > abs_q_pos)");
+                        }
                         score_row[j] = -std::numeric_limits<float>::infinity();
                         continue;
                     }
 
                     // Compute Q[i] @ K[j]^T
                     const float *kj = k + (size_t)j * heads * head_dim + (size_t)h * head_dim;
+
+                    // DEBUG: Log Q and K vectors for first decode token
+                    if (h == 0 && i == 0 && j <= 5 && k_seq_len == 6 && q_seq_len == 1)
+                    {
+                        LOG_INFO("[Q_VECTOR] h=" << h << ", i=" << i << ", first 10 dims: "
+                                                 << qi[0] << " " << qi[1] << " " << qi[2] << " " << qi[3] << " "
+                                                 << qi[4] << " " << qi[5] << " " << qi[6] << " " << qi[7] << " "
+                                                 << qi[8] << " " << qi[9]);
+                        LOG_INFO("[K_VECTOR] h=" << h << ", j=" << j << ", first 10 dims: "
+                                                 << kj[0] << " " << kj[1] << " " << kj[2] << " " << kj[3] << " "
+                                                 << kj[4] << " " << kj[5] << " " << kj[6] << " " << kj[7] << " "
+                                                 << kj[8] << " " << kj[9]);
+                    }
+
                     float dot = 0.0f;
 
                     for (int d = 0; d < head_dim; ++d)
@@ -292,6 +384,13 @@ namespace llaminar::attn
                     }
 
                     score_row[j] = dot * scale;
+
+                    // DEBUG: Log first few scores
+                    if (h == 0 && i == 0 && j <= 7)
+                    {
+                        LOG_INFO("[SCORE_COMPUTE] h=" << h << ", i=" << i << ", abs_q_pos=" << abs_q_pos
+                                                      << ", j=" << j << " -> score=" << score_row[j]);
+                    }
                 }
             }
         }
