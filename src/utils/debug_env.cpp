@@ -200,6 +200,7 @@ namespace llaminar
     if(const char* gt = std::getenv("LLAMINAR_ATTN_GATHER_THRESHOLD")) { s.attention.gather_threshold = std::atoi(gt); }
     s.attention.force_scalar = flag(std::getenv("LLAMINAR_ATTN_FORCE_SCALAR"));
     s.attention.validate_proj = flag(std::getenv("LLAMINAR_ATTN_VALIDATE_PROJ"));
+    s.attention.verbose = flag(std::getenv("LLAMINAR_ATTN_VERBOSE"));
     s.attention.micro_trace = flag(std::getenv("LLAMINAR_ATTN_MICRO_TRACE"));
     s.attention.trace_weight_slicing = flag(std::getenv("LLAMINAR_ATTN_TRACE_WEIGHT_SLICE"));
     s.attention.trace_k_projection = flag(std::getenv("LLAMINAR_ATTN_TRACE_K_PROJECTION"));

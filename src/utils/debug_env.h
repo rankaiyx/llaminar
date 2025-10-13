@@ -131,6 +131,7 @@ namespace llaminar
         int gather_threshold = -1;         // LLAMINAR_ATTN_GATHER_THRESHOLD
         bool force_scalar = false;         // LLAMINAR_ATTN_FORCE_SCALAR
         bool validate_proj = false;        // LLAMINAR_ATTN_VALIDATE_PROJ
+        bool verbose = false;              // LLAMINAR_ATTN_VERBOSE (enable detailed debug logging in attention kernels)
         bool micro_trace = false;          // LLAMINAR_ATTN_MICRO_TRACE
         bool trace_weight_slicing = false; // LLAMINAR_ATTN_TRACE_WEIGHT_SLICE (log weight partitioning per rank)
         bool trace_k_projection = false;   // LLAMINAR_ATTN_TRACE_K_PROJECTION (dump local K projection stats before RoPE)

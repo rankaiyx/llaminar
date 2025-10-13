@@ -146,11 +146,11 @@ ctest --test-dir build --output-on-failure --parallel \
 ctest --test-dir build --output-on-failure --parallel \
   -E "(Integration|ParityFrameworkTest|Incremental|Qwen|Prefill|.*Stress.*)"
 
-# Parity Integration (180s) (Long running, verbose test suite - use `tee` and grep details from the logfile)
+# Parity Integration (220s) (Long running, verbose test suite - use `tee` and grep details from the logfile)
 ctest --test-dir build --output-on-failure --verbose \
   -R "(ParityFrameworkTest|AbstractPipelineParity)" 2>&1 | tee test_output.log | tail -150
 
-# Parity Integration (180s) with a GTEST filter to target only PyTorch parity tests in the suite:
+# Parity Integration (220s) with a GTEST filter to target only PyTorch parity tests in the suite:
 GTEST_FILTER="ParityFramework.COSMAPrefillVsPyTorch:ParityFramework.OpenBLASPrefillVsPyTorch:ParityFramework.TrueIncrementalDecodeVsPyTorch" ctest --test-dir build --output-on-failure --verbose -R "ParityFrameworkTest" 2>&1 | tee test_output.log | tail -150
 
 # Integration Tests (3m0s)
@@ -190,6 +190,11 @@ bash -lc 'set -m; mpirun -np 2 gdb -q --batch -ex "handle SIGUSR1 pass nostop no
 **Removed Historical Tests:**
 - ❌ `test_graph.cpp`: Generic compute graph (architecture removed)
 - ❌ `LinearKernelTest`: Legacy non-MPI kernel (retired after MPI migration)
+
+
+## Checking Files for Compile Errors / Problems
+
+It is possible to use the `problems` tool against a particular filename in order to get a list of problems (compile errors) in the file. Do this after editing a file but before building, as the feedback loop is faster.
 
 ## Debugging with GDB
 
@@ -552,7 +557,6 @@ TEST_CASE("MyNewKernel basic functionality") {
 }
 ```
 
-### Documentation Standards
 ### Centralized Environment Access (debugEnv)
 
 All new or refactored code on hot paths (kernels, matmul selection, attention assembly, tensor partition loops) MUST avoid direct `std::getenv` calls. Instead:
@@ -583,9 +587,12 @@ if (env.attention.micro_trace && rank == 0) { ... }
 
 Do NOT add another ad-hoc snapshot facility; extend the existing one. If grouping is unclear, prefer adding a new subgroup struct within `debug_env.h` rather than mixing unrelated flags.
 
-## Doxygen
+
+## Documentation Standards
+### Doxygen
 
 All files and functions should be documented with the Doxygen format for readability and easy understanding of their purpose. For @author, use David Sanftenberg.
+
 
 ## Debug / Instrumentation Environment Variables
 

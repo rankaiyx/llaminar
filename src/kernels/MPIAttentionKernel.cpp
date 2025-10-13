@@ -14,7 +14,7 @@
  *
  * Architecture: 7 sequential steps
  * 1. Extract inputs & validate count
- * 2. Distribute weights (single-rank: use directly, multi-rank: slice by heads)
+ * 2. Distribute weights (single-rank: use directly, multi-rank: sliced by heads)
  * 3. Compute Q/K/V projections with optional bias
  * 4. Apply RoPE to Q and K
  * 5. Expand K/V for GQA if needed
@@ -260,10 +260,10 @@ namespace llaminar
         const int world_size = getSize();
 
         // DEBUG: Trace bias status at function entry
-        if (layer_index_ == 0 && operation_label)
+        if (debugEnv().attention.verbose && layer_index_ == 0 && operation_label)
         {
             LOG_DEBUG("[MATMUL_BIAS] Layer " << layer_index_ << " Rank " << rank
-                                            << " Operation: " << operation_label);
+                                             << " Operation: " << operation_label);
             if (bias)
             {
                 LOG_DEBUG("[MATMUL_BIAS] BIAS PRESENT - will apply bias after matmul");
@@ -394,7 +394,7 @@ namespace llaminar
         const int world_size = getSize();
 
         // DEBUG: Confirm execution
-        if (rank == 0)
+        if (debugEnv().attention.verbose && rank == 0)
         {
             LOG_DEBUG("[EXECUTE] MPIAttentionKernel::execute() called"
                       << " layer=" << layer_index_
@@ -459,18 +459,18 @@ namespace llaminar
         const int d_model = static_cast<int>(input->shape()[1]);
 
         // DEBUG: Trace bias flow from input extraction
-        if (layer_index_ == 0)
+        if (debugEnv().attention.verbose && layer_index_ == 0)
         {
             LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                          << " bq_global=" << (bq_global ? "PRESENT" : "null")
-                                          << " size=" << (bq_global ? bq_global->size() : 0)
-                                          << " first_val=" << (bq_global && bq_global->size() > 0 ? bq_global->data()[0] : 0.0f));
+                                           << " bq_global=" << (bq_global ? "PRESENT" : "null")
+                                           << " size=" << (bq_global ? bq_global->size() : 0)
+                                           << " first_val=" << (bq_global && bq_global->size() > 0 ? bq_global->data()[0] : 0.0f));
             LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                          << " bk_global=" << (bk_global ? "PRESENT" : "null")
-                                          << " size=" << (bk_global ? bk_global->size() : 0));
+                                           << " bk_global=" << (bk_global ? "PRESENT" : "null")
+                                           << " size=" << (bk_global ? bk_global->size() : 0));
             LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                          << " bv_global=" << (bv_global ? "PRESENT" : "null")
-                                          << " size=" << (bv_global ? bv_global->size() : 0));
+                                           << " bv_global=" << (bv_global ? "PRESENT" : "null")
+                                           << " size=" << (bv_global ? bv_global->size() : 0));
         }
 
         // Determine mode based on n_past (authoritative signal)
@@ -502,7 +502,7 @@ namespace llaminar
                                                                      << " < n_past=" << n_past_);
                 return false;
             }
-            if (rank == 0)
+            if (debugEnv().attention.verbose && rank == 0)
             {
                 LOG_DEBUG("[KV_CACHE] Decode mode: n_past=" << n_past_
                                                             << ", cache_len=" << cache_seq_len
@@ -511,7 +511,7 @@ namespace llaminar
         }
         else
         {
-            if (rank == 0)
+            if (debugEnv().attention.verbose && rank == 0)
             {
                 LOG_DEBUG("[KV_CACHE] Prefill mode: seq_len=" << seq_len
                                                               << ", will initialize cache");
@@ -529,10 +529,10 @@ namespace llaminar
         // ========================================================================
         if (local_heads == 0)
         {
-            if (rank == 0)
+            if (debugEnv().attention.verbose && rank == 0)
             {
                 LOG_DEBUG("Rank " << rank << " has no Q heads to process (local_heads=0). "
-                                 << "Creating zero-filled output and participating in collectives only.");
+                                  << "Creating zero-filled output and participating in collectives only.");
             }
 
             // Create zero-filled output tensor for this rank
@@ -640,12 +640,12 @@ namespace llaminar
             return false;
         }
 
-        if (rank == 0)
+        if (debugEnv().attention.verbose && rank == 0)
         {
             LOG_DEBUG("Attention layer " << layer_index_ << ": seq_len=" << seq_len
-                                        << ", d_model=" << d_model << ", local_heads=" << local_heads
-                                        << "/" << n_head_ << ", local_kv_heads=" << local_kv_heads << "/" << n_head_kv_
-                                        << ", weights_sharded=" << (weights_are_sharded ? "yes" : "no"));
+                                         << ", d_model=" << d_model << ", local_heads=" << local_heads
+                                         << "/" << n_head_ << ", local_kv_heads=" << local_kv_heads << "/" << n_head_kv_
+                                         << ", weights_sharded=" << (weights_are_sharded ? "yes" : "no"));
         }
 
         // CONTRACT: Input validation (handle both sharded and full weights)
@@ -667,7 +667,7 @@ namespace llaminar
             try
             {
                 input_contract.validate_inputs({input, wq_global, wk_global, wv_global, wo_global});
-                if (rank == 0)
+                if (debugEnv().attention.verbose && rank == 0)
                     LOG_DEBUG("✓ Input shape contracts validated (sharded=" << weights_are_sharded << ")");
             }
             catch (const std::exception &e)
@@ -765,31 +765,31 @@ namespace llaminar
             local_bv = (bv_global && bv_global->size() > 1) ? bv_global : nullptr;
 
             // DEBUG: Verify bias assignment (sharded path)
-            if (layer_index_ == 0)
+            if (debugEnv().attention.verbose && layer_index_ == 0)
             {
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " SHARDED PATH: weights_are_sharded=true");
+                                               << " SHARDED PATH: weights_are_sharded=true");
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
-                                              << " size=" << (local_bq ? local_bq->size() : 0));
+                                               << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
+                                               << " size=" << (local_bq ? local_bq->size() : 0));
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " local_bk=" << (local_bk ? "PRESENT" : "nullptr")
-                                              << " size=" << (local_bk ? local_bk->size() : 0));
+                                               << " local_bk=" << (local_bk ? "PRESENT" : "nullptr")
+                                               << " size=" << (local_bk ? local_bk->size() : 0));
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " local_bv=" << (local_bv ? "PRESENT" : "nullptr")
-                                              << " size=" << (local_bv ? local_bv->size() : 0));
+                                               << " local_bv=" << (local_bv ? "PRESENT" : "nullptr")
+                                               << " size=" << (local_bv ? local_bv->size() : 0));
             }
 
             // DEBUG: Verify pointer assignment
-            if (layer_index_ == 0)
+            if (debugEnv().attention.verbose && layer_index_ == 0)
             {
                 LOG_DEBUG("[PTR_DEBUG] Layer " << layer_index_ << " Rank " << rank << " weight pointer assignment:");
                 LOG_DEBUG("  wq_global ptr: " << (void *)wq_global->data() << " first 5: ["
-                                             << wq_global->data()[0] << ", " << wq_global->data()[1] << ", " << wq_global->data()[2] << ", "
-                                             << wq_global->data()[3] << ", " << wq_global->data()[4] << "]");
+                                              << wq_global->data()[0] << ", " << wq_global->data()[1] << ", " << wq_global->data()[2] << ", "
+                                              << wq_global->data()[3] << ", " << wq_global->data()[4] << "]");
                 LOG_DEBUG("  local_wq ptr: " << (void *)local_wq->data() << " first 5: ["
-                                            << local_wq->data()[0] << ", " << local_wq->data()[1] << ", " << local_wq->data()[2] << ", "
-                                            << local_wq->data()[3] << ", " << local_wq->data()[4] << "]");
+                                             << local_wq->data()[0] << ", " << local_wq->data()[1] << ", " << local_wq->data()[2] << ", "
+                                             << local_wq->data()[3] << ", " << local_wq->data()[4] << "]");
                 if (wq_global->data() != local_wq->data())
                 {
                     LOG_ERROR("  ❌ POINTER MISMATCH! wq_global and local_wq point to different memory!");
@@ -801,7 +801,7 @@ namespace llaminar
             }
 
             // DEBUG: Verify wq_global content for both ranks
-            if (layer_index_ == 0)
+            if (debugEnv().attention.verbose && layer_index_ == 0)
             {
                 LOG_DEBUG("[WQ_VERIFY] Layer " << layer_index_ << " Rank " << rank << " wq_global stats:");
                 float wq_min = *std::min_element(wq_global->data(), wq_global->data() + wq_global->size());
@@ -810,13 +810,13 @@ namespace llaminar
                 float wq_mean = wq_sum / wq_global->size();
                 LOG_DEBUG("  wq_global: size=" << wq_global->size() << " min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean);
                 LOG_DEBUG("  wq_global[0:10]: [" << wq_global->data()[0] << ", " << wq_global->data()[1] << ", "
-                                                << wq_global->data()[2] << ", " << wq_global->data()[3] << ", " << wq_global->data()[4] << ", "
-                                                << wq_global->data()[5] << ", " << wq_global->data()[6] << ", " << wq_global->data()[7] << ", "
-                                                << wq_global->data()[8] << ", " << wq_global->data()[9] << "]");
+                                                 << wq_global->data()[2] << ", " << wq_global->data()[3] << ", " << wq_global->data()[4] << ", "
+                                                 << wq_global->data()[5] << ", " << wq_global->data()[6] << ", " << wq_global->data()[7] << ", "
+                                                 << wq_global->data()[8] << ", " << wq_global->data()[9] << "]");
                 LOG_DEBUG("  wq_global[400000:400010]: [" << wq_global->data()[400000] << ", " << wq_global->data()[400001] << ", "
-                                                         << wq_global->data()[400002] << ", " << wq_global->data()[400003] << ", " << wq_global->data()[400004] << ", "
-                                                         << wq_global->data()[400005] << ", " << wq_global->data()[400006] << ", " << wq_global->data()[400007] << ", "
-                                                         << wq_global->data()[400008] << ", " << wq_global->data()[400009] << "]");
+                                                          << wq_global->data()[400002] << ", " << wq_global->data()[400003] << ", " << wq_global->data()[400004] << ", "
+                                                          << wq_global->data()[400005] << ", " << wq_global->data()[400006] << ", " << wq_global->data()[400007] << ", "
+                                                          << wq_global->data()[400008] << ", " << wq_global->data()[400009] << "]");
 
                 // Ensure rank ordering before saving files
                 MPI_Barrier(MPI_COMM_WORLD);
@@ -832,7 +832,7 @@ namespace llaminar
                 MPI_Barrier(MPI_COMM_WORLD);
             }
 
-            if (rank == 0)
+            if (debugEnv().attention.verbose && rank == 0)
             {
                 LOG_DEBUG("Using pre-sharded weights directly (local_head_dim=" << local_head_dim << ")");
                 fprintf(stderr, "[kernel-test] rank %d local_wo shape: [%d, %d]\n",
@@ -856,13 +856,13 @@ namespace llaminar
             local_bv = (bv_global && bv_global->size() > 1) ? bv_global : nullptr;
 
             // DEBUG: Verify bias assignment (single-rank path)
-            if (layer_index_ == 0)
+            if (debugEnv().attention.verbose && layer_index_ == 0)
             {
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " SINGLE-RANK PATH: weights_are_sharded=false, world_size=1");
+                                               << " SINGLE-RANK PATH: weights_are_sharded=false, world_size=1");
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
-                                              << " size=" << (local_bq ? local_bq->size() : 0));
+                                               << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
+                                               << " size=" << (local_bq ? local_bq->size() : 0));
             }
         }
         else
@@ -897,20 +897,20 @@ namespace llaminar
             local_bv = (bv_global && bv_global->size() > 1) ? bv_global : nullptr;
 
             // DEBUG: Verify bias assignment (multi-rank global weights path)
-            if (layer_index_ == 0)
+            if (debugEnv().attention.verbose && layer_index_ == 0)
             {
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " MULTI-RANK PATH: weights_are_sharded=false, world_size>1");
+                                               << " MULTI-RANK PATH: weights_are_sharded=false, world_size>1");
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
-                                              << " size=" << (local_bq ? local_bq->size() : 0)
-                                              << " first_val=" << (local_bq && local_bq->size() > 0 ? local_bq->data()[0] : 0.0f));
+                                               << " local_bq=" << (local_bq ? "PRESENT" : "nullptr")
+                                               << " size=" << (local_bq ? local_bq->size() : 0)
+                                               << " first_val=" << (local_bq && local_bq->size() > 0 ? local_bq->data()[0] : 0.0f));
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " local_bk=" << (local_bk ? "PRESENT" : "nullptr")
-                                              << " size=" << (local_bk ? local_bk->size() : 0));
+                                               << " local_bk=" << (local_bk ? "PRESENT" : "nullptr")
+                                               << " size=" << (local_bk ? local_bk->size() : 0));
                 LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                              << " local_bv=" << (local_bv ? "PRESENT" : "nullptr")
-                                              << " size=" << (local_bv ? local_bv->size() : 0));
+                                               << " local_bv=" << (local_bv ? "PRESENT" : "nullptr")
+                                               << " size=" << (local_bv ? local_bv->size() : 0));
             }
         }
 
@@ -929,21 +929,21 @@ namespace llaminar
                     max_abs_diff = std::max(max_abs_diff, std::fabs(local_ptr[idx] - global_ptr[idx]));
                 }
                 LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                     << " layer=" << layer_index_
-                                                     << " kv_head_offset=" << kv_head_offset
-                                                     << " local_kv_heads=" << local_kv_heads
-                                                     << " head_dim=" << head_dim_
-                                                     << " weights_sharded=no"
-                                                     << " max_abs_copy_diff=" << max_abs_diff);
+                                                      << " layer=" << layer_index_
+                                                      << " kv_head_offset=" << kv_head_offset
+                                                      << " local_kv_heads=" << local_kv_heads
+                                                      << " head_dim=" << head_dim_
+                                                      << " weights_sharded=no"
+                                                      << " max_abs_copy_diff=" << max_abs_diff);
             }
             else
             {
                 LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                     << " layer=" << layer_index_
-                                                     << " kv_head_offset=" << kv_head_offset
-                                                     << " local_kv_heads=" << local_kv_heads
-                                                     << " head_dim=" << head_dim_
-                                                     << " weights_sharded=" << (weights_are_sharded ? "yes" : "no"));
+                                                      << " layer=" << layer_index_
+                                                      << " kv_head_offset=" << kv_head_offset
+                                                      << " local_kv_heads=" << local_kv_heads
+                                                      << " head_dim=" << head_dim_
+                                                      << " weights_sharded=" << (weights_are_sharded ? "yes" : "no"));
             }
 
             const bool has_extra_cols = d_model > 33;
@@ -955,16 +955,16 @@ namespace llaminar
                 const float *local_row0 = local_wk->data() + static_cast<size_t>(local_row_base) * stride;
 
                 LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                     << " layer=" << layer_index_
-                                                     << " kv_head_global=" << global_kv_head
-                                                     << " row0_cols0-3={" << local_row0[0] << ", " << local_row0[1]
-                                                     << ", " << local_row0[2] << ", " << local_row0[3] << "}");
+                                                      << " layer=" << layer_index_
+                                                      << " kv_head_global=" << global_kv_head
+                                                      << " row0_cols0-3={" << local_row0[0] << ", " << local_row0[1]
+                                                      << ", " << local_row0[2] << ", " << local_row0[3] << "}");
                 if (has_extra_cols)
                 {
                     LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                         << " layer=" << layer_index_
-                                                         << " kv_head_global=" << global_kv_head
-                                                         << " row0_cols32-33={" << local_row0[32] << ", " << local_row0[33] << "}");
+                                                          << " layer=" << layer_index_
+                                                          << " kv_head_global=" << global_kv_head
+                                                          << " row0_cols32-33={" << local_row0[32] << ", " << local_row0[33] << "}");
                 }
 
                 if (copied_global_weights)
@@ -972,16 +972,16 @@ namespace llaminar
                     const size_t global_head_row_base = static_cast<size_t>(global_kv_head) * static_cast<size_t>(head_dim_);
                     const float *global_row0 = wk_global->data() + global_head_row_base * stride;
                     LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                         << " layer=" << layer_index_
-                                                         << " kv_head_global=" << global_kv_head
-                                                         << " GLOBAL_row0_cols0-3={" << global_row0[0] << ", " << global_row0[1]
-                                                         << ", " << global_row0[2] << ", " << global_row0[3] << "}");
+                                                          << " layer=" << layer_index_
+                                                          << " kv_head_global=" << global_kv_head
+                                                          << " GLOBAL_row0_cols0-3={" << global_row0[0] << ", " << global_row0[1]
+                                                          << ", " << global_row0[2] << ", " << global_row0[3] << "}");
                     if (has_extra_cols)
                     {
                         LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                             << " layer=" << layer_index_
-                                                             << " kv_head_global=" << global_kv_head
-                                                             << " GLOBAL_row0_cols32-33={" << global_row0[32] << ", " << global_row0[33] << "}");
+                                                              << " layer=" << layer_index_
+                                                              << " kv_head_global=" << global_kv_head
+                                                              << " GLOBAL_row0_cols32-33={" << global_row0[32] << ", " << global_row0[33] << "}");
                     }
                 }
 
@@ -989,16 +989,16 @@ namespace llaminar
                 {
                     const float *local_row32 = local_wk->data() + static_cast<size_t>(local_row_base + 32) * stride;
                     LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                         << " layer=" << layer_index_
-                                                         << " kv_head_global=" << global_kv_head
-                                                         << " row32_cols0-3={" << local_row32[0] << ", " << local_row32[1]
-                                                         << ", " << local_row32[2] << ", " << local_row32[3] << "}");
+                                                          << " layer=" << layer_index_
+                                                          << " kv_head_global=" << global_kv_head
+                                                          << " row32_cols0-3={" << local_row32[0] << ", " << local_row32[1]
+                                                          << ", " << local_row32[2] << ", " << local_row32[3] << "}");
                     if (has_extra_cols)
                     {
                         LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                             << " layer=" << layer_index_
-                                                             << " kv_head_global=" << global_kv_head
-                                                             << " row32_cols32-33={" << local_row32[32] << ", " << local_row32[33] << "}");
+                                                              << " layer=" << layer_index_
+                                                              << " kv_head_global=" << global_kv_head
+                                                              << " row32_cols32-33={" << local_row32[32] << ", " << local_row32[33] << "}");
                     }
 
                     if (copied_global_weights)
@@ -1006,16 +1006,16 @@ namespace llaminar
                         const size_t global_row32_index = static_cast<size_t>(global_kv_head) * static_cast<size_t>(head_dim_) + 32;
                         const float *global_row32 = wk_global->data() + global_row32_index * stride;
                         LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                             << " layer=" << layer_index_
-                                                             << " kv_head_global=" << global_kv_head
-                                                             << " GLOBAL_row32_cols0-3={" << global_row32[0] << ", " << global_row32[1]
-                                                             << ", " << global_row32[2] << ", " << global_row32[3] << "}");
+                                                              << " layer=" << layer_index_
+                                                              << " kv_head_global=" << global_kv_head
+                                                              << " GLOBAL_row32_cols0-3={" << global_row32[0] << ", " << global_row32[1]
+                                                              << ", " << global_row32[2] << ", " << global_row32[3] << "}");
                         if (has_extra_cols)
                         {
                             LOG_DEBUG("[ATTN_WEIGHT_TRACE] rank " << rank
-                                                                 << " layer=" << layer_index_
-                                                                 << " kv_head_global=" << global_kv_head
-                                                                 << " GLOBAL_row32_cols32-33={" << global_row32[32] << ", " << global_row32[33] << "}");
+                                                                  << " layer=" << layer_index_
+                                                                  << " kv_head_global=" << global_kv_head
+                                                                  << " GLOBAL_row32_cols32-33={" << global_row32[32] << ", " << global_row32[33] << "}");
                         }
                     }
                 }
@@ -1030,7 +1030,7 @@ namespace llaminar
         auto local_v = TensorFactory::create_simple({seq_len, local_kv_head_dim});
 
         // DEBUG: Log input and weight stats before Q projection
-        if (layer_index_ == 0)
+        if (debugEnv().attention.verbose && layer_index_ == 0)
         {
             LOG_DEBUG("[Q_PROJ_DEBUG] Layer " << layer_index_ << " Rank " << rank << " BEFORE Q projection:");
             LOG_DEBUG("  input shape: [" << seq_len << ", " << d_model << "]");
@@ -1044,7 +1044,7 @@ namespace llaminar
             float input_mean = input_sum / input->size();
             LOG_DEBUG("  input stats: min=" << input_min << " max=" << input_max << " mean=" << input_mean);
             LOG_DEBUG("  input[0, 0:5]: [" << input->data()[0] << ", " << input->data()[1] << ", "
-                                          << input->data()[2] << ", " << input->data()[3] << ", " << input->data()[4] << "]");
+                                           << input->data()[2] << ", " << input->data()[3] << ", " << input->data()[4] << "]");
 
             // Weight stats
             float wq_min = *std::min_element(local_wq->data(), local_wq->data() + local_wq->size());
@@ -1053,11 +1053,11 @@ namespace llaminar
             float wq_mean = wq_sum / local_wq->size();
             LOG_DEBUG("  local_wq stats: min=" << wq_min << " max=" << wq_max << " mean=" << wq_mean);
             LOG_DEBUG("  local_wq[0:5]: [" << local_wq->data()[0] << ", " << local_wq->data()[1] << ", "
-                                          << local_wq->data()[2] << ", " << local_wq->data()[3] << ", " << local_wq->data()[4] << "]");
+                                           << local_wq->data()[2] << ", " << local_wq->data()[3] << ", " << local_wq->data()[4] << "]");
         }
 
         // Q projection: [seq_len, d_model] @ [d_model, local_head_dim] = [seq_len, local_head_dim]
-        if (layer_index_ == 0)
+        if (debugEnv().attention.verbose && layer_index_ == 0)
         {
             LOG_DEBUG("[MATMUL_DEBUG] Layer " << layer_index_ << " Rank " << rank << " Q projection matmul parameters:");
             LOG_DEBUG("  M=" << seq_len << " N=" << local_head_dim << " K=" << d_model);
@@ -1070,17 +1070,17 @@ namespace llaminar
         }
 
         // DEBUG: Verify local_bq status before Q projection
-        if (layer_index_ == 0)
+        if (debugEnv().attention.verbose && layer_index_ == 0)
         {
             LOG_DEBUG("[BIAS_FLOW] Layer " << layer_index_ << " Rank " << rank
-                                          << " BEFORE Q_projection call:");
+                                           << " BEFORE Q_projection call:");
             LOG_DEBUG("[BIAS_FLOW] local_bq=" << (local_bq ? "PRESENT" : "nullptr")
-                                             << " size=" << (local_bq ? local_bq->size() : 0)
-                                             << " will_pass=" << (local_bq ? "local_bq->data()" : "nullptr"));
+                                              << " size=" << (local_bq ? local_bq->size() : 0)
+                                              << " will_pass=" << (local_bq ? "local_bq->data()" : "nullptr"));
             if (local_bq && local_bq->size() > 0)
             {
                 LOG_DEBUG("[BIAS_FLOW] local_bq[0:3]: [" << local_bq->data()[0] << ", "
-                                                        << local_bq->data()[1] << ", " << local_bq->data()[2] << "]");
+                                                         << local_bq->data()[1] << ", " << local_bq->data()[2] << "]");
             }
         }
 
@@ -1089,7 +1089,7 @@ namespace llaminar
                          seq_len, local_head_dim, d_model, "Q_projection");
 
         // DEBUG: Log Q projection output
-        if (layer_index_ == 0)
+        if (debugEnv().attention.verbose && layer_index_ == 0)
         {
             LOG_DEBUG("[Q_PROJ_DEBUG] Layer " << layer_index_ << " Rank " << rank << " AFTER Q projection:");
             float q_min = *std::min_element(local_q->data(), local_q->data() + local_q->size());
@@ -1098,9 +1098,9 @@ namespace llaminar
             float q_mean = q_sum / local_q->size();
             LOG_DEBUG("  local_q stats: min=" << q_min << " max=" << q_max << " mean=" << q_mean);
             LOG_DEBUG("  local_q[0, 0:10]: [" << local_q->data()[0] << ", " << local_q->data()[1] << ", "
-                                             << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4] << ", "
-                                             << local_q->data()[5] << ", " << local_q->data()[6] << ", " << local_q->data()[7] << ", "
-                                             << local_q->data()[8] << ", " << local_q->data()[9] << "]");
+                                              << local_q->data()[2] << ", " << local_q->data()[3] << ", " << local_q->data()[4] << ", "
+                                              << local_q->data()[5] << ", " << local_q->data()[6] << ", " << local_q->data()[7] << ", "
+                                              << local_q->data()[8] << ", " << local_q->data()[9] << "]");
         }
 
         // K projection: [seq_len, d_model] @ [d_model, local_kv_head_dim] = [seq_len, local_kv_head_dim]
@@ -1166,7 +1166,7 @@ namespace llaminar
                         std::cerr << "[CHECK-AFTER-CONTRACT] Q clean after contract validation" << std::endl;
                     }
                 }
-                if (rank == 0)
+                if (debugEnv().attention.verbose && rank == 0)
                     LOG_DEBUG("✓ QKV projection shape contracts validated");
             }
             catch (const std::exception &e)
@@ -1288,17 +1288,17 @@ namespace llaminar
             auto global_v = TensorFactory::create_simple({seq_len, n_head_kv_ * head_dim_});
 
             // DEBUG: Log local Q before gather
-            if (layer_index_ == 0)
+            if (debugEnv().attention.verbose && layer_index_ == 0)
             {
                 LOG_DEBUG("[Q_GATHER_DEBUG] Layer " << layer_index_ << " Rank " << rank << " BEFORE gather:");
                 LOG_DEBUG("  local_q shape: [" << seq_len << ", " << local_head_dim << "]");
                 LOG_DEBUG("  local_head_dim: " << local_head_dim << " (= " << local_heads << " heads * " << head_dim_ << " dims)");
                 LOG_DEBUG("  Expected rank " << rank << " heads: [" << (rank * local_heads) << ", " << ((rank + 1) * local_heads) << ")");
                 LOG_DEBUG("  local_q[t=0, first 10]: ["
-                         << local_q->data()[0] << ", " << local_q->data()[1] << ", " << local_q->data()[2] << ", "
-                         << local_q->data()[3] << ", " << local_q->data()[4] << ", " << local_q->data()[5] << ", "
-                         << local_q->data()[6] << ", " << local_q->data()[7] << ", " << local_q->data()[8] << ", "
-                         << local_q->data()[9] << "]");
+                          << local_q->data()[0] << ", " << local_q->data()[1] << ", " << local_q->data()[2] << ", "
+                          << local_q->data()[3] << ", " << local_q->data()[4] << ", " << local_q->data()[5] << ", "
+                          << local_q->data()[6] << ", " << local_q->data()[7] << ", " << local_q->data()[8] << ", "
+                          << local_q->data()[9] << "]");
 
                 // Check head boundaries (first value of each head)
                 for (int h = 0; h < local_heads && h < 3; ++h)
@@ -1306,84 +1306,108 @@ namespace llaminar
                     int global_head_idx = rank * local_heads + h;
                     int offset = h * head_dim_;
                     LOG_DEBUG("  Head " << global_head_idx << " (local head " << h << ") first 5 dims: ["
-                                       << local_q->data()[offset] << ", " << local_q->data()[offset + 1] << ", "
-                                       << local_q->data()[offset + 2] << ", " << local_q->data()[offset + 3] << ", "
-                                       << local_q->data()[offset + 4] << "]");
+                                        << local_q->data()[offset] << ", " << local_q->data()[offset + 1] << ", "
+                                        << local_q->data()[offset + 2] << ", " << local_q->data()[offset + 3] << ", "
+                                        << local_q->data()[offset + 4] << "]");
                 }
             }
 
-            // Gather row-by-row to maintain proper layout
-            // For Q: gather local_head_dim elements per row from each rank
-            for (int t = 0; t < seq_len; ++t)
+            // OPTIMIZATION: Only gather Q/K/V projections when snapshot callback is registered
+            // These gathers exist ONLY for snapshot validation (Q_PROJECTION, K_PROJECTION, V_PROJECTION stages)
+            // In production inference (no snapshots), skip entirely to avoid expensive MPI overhead
+            if (snapshot_callback_)
             {
-                const float *local_q_row = local_q->data() + t * local_head_dim;
-                float *global_q_row = global_q->data() + t * (n_head_ * head_dim_);
+                // PHASE 2A OPTIMIZATION: Bulk gather + transpose
+                // MPI_Allgather in bulk is faster than seq_len separate calls, but produces different layout:
+                //   Bulk: [rank0_all_tokens | rank1_all_tokens | ...] (rank-major)
+                //   Need: [token0: rank0_heads, rank1_heads | token1: rank0_heads, rank1_heads | ...] (row-interleaved)
+                // Solution: Gather into temporary buffer, then rearrange
 
-                // Gather this row from all ranks, placing each rank's data at the correct offset
-                MPI_Allgather(local_q_row, local_head_dim, MPI_FLOAT,
-                              global_q_row, local_head_dim, MPI_FLOAT,
+                // Temporary buffer for rank-major layout
+                auto temp_q = TensorFactory::create_simple({seq_len * n_head_ * head_dim_});
+
+                // Bulk gather: faster than seq_len MPI calls
+                MPI_Allgather(local_q->data(), seq_len * local_head_dim, MPI_FLOAT,
+                              temp_q->data(), seq_len * local_head_dim, MPI_FLOAT,
                               MPI_COMM_WORLD);
-            }
 
-            // DEBUG: Log global Q after gather
-            if (layer_index_ == 0)
-            {
-                LOG_DEBUG("[Q_GATHER_DEBUG] Layer " << layer_index_ << " Rank " << rank << " AFTER gather:");
-                LOG_DEBUG("  global_q shape: [" << seq_len << ", " << (n_head_ * head_dim_) << "]");
-                LOG_DEBUG("  global_q[t=0, first 10]: ["
-                         << global_q->data()[0] << ", " << global_q->data()[1] << ", " << global_q->data()[2] << ", "
-                         << global_q->data()[3] << ", " << global_q->data()[4] << ", " << global_q->data()[5] << ", "
-                         << global_q->data()[6] << ", " << global_q->data()[7] << ", " << global_q->data()[8] << ", "
-                         << global_q->data()[9] << "]");
-
-                // Check each head's contribution in global tensor
-                for (int h = 0; h < n_head_ && h < 10; ++h)
+                // Rearrange from rank-major to row-interleaved
+                // temp_q layout: [rank0: t0,t1,t2,... | rank1: t0,t1,t2,... | ...]
+                // global_q layout: [t0: r0,r1,... | t1: r0,r1,... | ...]
+                for (int t = 0; t < seq_len; ++t)
                 {
-                    int offset = h * head_dim_;
-                    int source_rank = h / local_heads;
-                    LOG_DEBUG("  Global head " << h << " (from rank " << source_rank << ") first 5 dims: ["
-                                              << global_q->data()[offset] << ", " << global_q->data()[offset + 1] << ", "
-                                              << global_q->data()[offset + 2] << ", " << global_q->data()[offset + 3] << ", "
-                                              << global_q->data()[offset + 4] << "]");
+                    for (int r = 0; r < world_size; ++r)
+                    {
+                        const float *src = temp_q->data() + r * (seq_len * local_head_dim) + t * local_head_dim;
+                        float *dst = global_q->data() + t * (n_head_ * head_dim_) + r * local_head_dim;
+                        std::memcpy(dst, src, local_head_dim * sizeof(float));
+                    }
                 }
 
-                // Critical check: verify heads 7 and 8 (boundary between ranks)
-                LOG_DEBUG("  CRITICAL CHECK - Head boundary (rank 0 last head vs rank 1 first head):");
-                int h7_offset = 7 * head_dim_;
-                int h8_offset = 8 * head_dim_;
-                LOG_DEBUG("    Head 7 (rank 0): [" << global_q->data()[h7_offset] << ", " << global_q->data()[h7_offset + 1] << ", " << global_q->data()[h7_offset + 2] << "]");
-                LOG_DEBUG("    Head 8 (rank 1): [" << global_q->data()[h8_offset] << ", " << global_q->data()[h8_offset + 1] << ", " << global_q->data()[h8_offset + 2] << "]");
-            }
+                // DEBUG: Log global Q after gather
+                if (debugEnv().attention.verbose && layer_index_ == 0)
+                {
+                    LOG_DEBUG("[Q_GATHER_DEBUG] Layer " << layer_index_ << " Rank " << rank << " AFTER gather:");
+                    LOG_DEBUG("  global_q shape: [" << seq_len << ", " << (n_head_ * head_dim_) << "]");
+                    LOG_DEBUG("  global_q[t=0, first 10]: ["
+                              << global_q->data()[0] << ", " << global_q->data()[1] << ", " << global_q->data()[2] << ", "
+                              << global_q->data()[3] << ", " << global_q->data()[4] << ", " << global_q->data()[5] << ", "
+                              << global_q->data()[6] << ", " << global_q->data()[7] << ", " << global_q->data()[8] << ", "
+                              << global_q->data()[9] << "]");
 
-            // Same for K
-            for (int t = 0; t < seq_len; ++t)
-            {
-                const float *local_k_row = local_k->data() + t * local_kv_head_dim;
-                float *global_k_row = global_k->data() + t * (n_head_kv_ * head_dim_);
+                    // Check each head's contribution in global tensor
+                    for (int h = 0; h < n_head_ && h < 10; ++h)
+                    {
+                        int offset = h * head_dim_;
+                        int source_rank = h / local_heads;
+                        LOG_DEBUG("  Global head " << h << " (from rank " << source_rank << ") first 5 dims: ["
+                                                   << global_q->data()[offset] << ", " << global_q->data()[offset + 1] << ", "
+                                                   << global_q->data()[offset + 2] << ", " << global_q->data()[offset + 3] << ", "
+                                                   << global_q->data()[offset + 4] << "]");
+                    }
 
-                MPI_Allgather(local_k_row, local_kv_head_dim, MPI_FLOAT,
-                              global_k_row, local_kv_head_dim, MPI_FLOAT,
+                    // Critical check: verify heads 7 and 8 (boundary between ranks)
+                    LOG_DEBUG("  CRITICAL CHECK - Head boundary (rank 0 last head vs rank 1 first head):");
+                    int h7_offset = 7 * head_dim_;
+                    int h8_offset = 8 * head_dim_;
+                    LOG_DEBUG("    Head 7 (rank 0): [" << global_q->data()[h7_offset] << ", " << global_q->data()[h7_offset + 1] << ", " << global_q->data()[h7_offset + 2] << "]");
+                    LOG_DEBUG("    Head 8 (rank 1): [" << global_q->data()[h8_offset] << ", " << global_q->data()[h8_offset + 1] << ", " << global_q->data()[h8_offset + 2] << "]");
+                }
+
+                // PHASE 2A: Bulk gather K and V (same pattern as Q)
+                auto temp_k = TensorFactory::create_simple({seq_len * n_head_kv_ * head_dim_});
+                auto temp_v = TensorFactory::create_simple({seq_len * n_head_kv_ * head_dim_});
+
+                MPI_Allgather(local_k->data(), seq_len * local_kv_head_dim, MPI_FLOAT,
+                              temp_k->data(), seq_len * local_kv_head_dim, MPI_FLOAT,
                               MPI_COMM_WORLD);
-            }
 
-            // Same for V
-            for (int t = 0; t < seq_len; ++t)
-            {
-                const float *local_v_row = local_v->data() + t * local_kv_head_dim;
-                float *global_v_row = global_v->data() + t * (n_head_kv_ * head_dim_);
-
-                MPI_Allgather(local_v_row, local_kv_head_dim, MPI_FLOAT,
-                              global_v_row, local_kv_head_dim, MPI_FLOAT,
+                MPI_Allgather(local_v->data(), seq_len * local_kv_head_dim, MPI_FLOAT,
+                              temp_v->data(), seq_len * local_kv_head_dim, MPI_FLOAT,
                               MPI_COMM_WORLD);
-            }
 
-            // Snapshot the gathered global tensors (only rank 0 needs to snapshot)
-            // CRITICAL: These are Q/K/V BEFORE RoPE to match PyTorch's Q_PROJECTION stage
-            if (rank == 0)
-            {
-                snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, global_q->data(), seq_len, n_head_ * head_dim_);
-                snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, global_k->data(), seq_len, n_head_kv_ * head_dim_);
-                snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, global_v->data(), seq_len, n_head_kv_ * head_dim_);
+                // Rearrange K and V from rank-major to row-interleaved
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    for (int r = 0; r < world_size; ++r)
+                    {
+                        const float *src_k = temp_k->data() + r * (seq_len * local_kv_head_dim) + t * local_kv_head_dim;
+                        const float *src_v = temp_v->data() + r * (seq_len * local_kv_head_dim) + t * local_kv_head_dim;
+                        float *dst_k = global_k->data() + t * (n_head_kv_ * head_dim_) + r * local_kv_head_dim;
+                        float *dst_v = global_v->data() + t * (n_head_kv_ * head_dim_) + r * local_kv_head_dim;
+                        std::memcpy(dst_k, src_k, local_kv_head_dim * sizeof(float));
+                        std::memcpy(dst_v, src_v, local_kv_head_dim * sizeof(float));
+                    }
+                }
+
+                // Snapshot the gathered global tensors (only rank 0 needs to snapshot)
+                // CRITICAL: These are Q/K/V BEFORE RoPE to match PyTorch's Q_PROJECTION stage
+                if (rank == 0)
+                {
+                    snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, global_q->data(), seq_len, n_head_ * head_dim_);
+                    snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, global_k->data(), seq_len, n_head_kv_ * head_dim_);
+                    snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, global_v->data(), seq_len, n_head_kv_ * head_dim_);
+                }
             }
         }
         else if (snapshot_callback_)
@@ -1425,11 +1449,11 @@ namespace llaminar
             };
 
             LOG_DEBUG("[ATTN_K_TRACE] rank=" << rank
-                                            << " layer=" << log_layer
-                                            << " local_heads=" << local_heads
-                                            << " local_kv_heads=" << local_kv_heads
-                                            << " seq_len=" << seq_len
-                                            << " head_dim=" << head_dim_);
+                                             << " layer=" << log_layer
+                                             << " local_heads=" << local_heads
+                                             << " local_kv_heads=" << local_kv_heads
+                                             << " seq_len=" << seq_len
+                                             << " head_dim=" << head_dim_);
 
             // Token 0 preview (first local head)
             log_sample("  local_q[token0_head0]=", local_q->data(), head_dim_);
@@ -1461,7 +1485,7 @@ namespace llaminar
         // =======================================================================
         // ROPE PARAMETER VALIDATION AND PRE-ROPE VALUE LOGGING
         // =======================================================================
-        if (rank == 0 && layer_index_ == 0)
+        if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
         {
             LOG_DEBUG("========== ROPE_APPLICATION DEBUG STEP 1: PRE-ROPE VALIDATION ==========");
             LOG_DEBUG("[ROPE_PARAMS] Parameters being passed to apply_rope():");
@@ -1504,7 +1528,7 @@ namespace llaminar
         // =======================================================================
         // POST-ROPE VALUE LOGGING
         // =======================================================================
-        if (rank == 0 && layer_index_ == 0)
+        if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
         {
             LOG_DEBUG("========== ROPE_APPLICATION DEBUG STEP 2: POST-ROPE VALUES ==========");
             LOG_DEBUG("[POST_ROPE_Q] Token 0, head 0, first 10 dims: ["
@@ -1536,36 +1560,36 @@ namespace llaminar
                       << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
         }
 
-        if (layer_index_ == 0)
+        if (debugEnv().attention.verbose && layer_index_ == 0)
         {
             LOG_DEBUG("[RANK=" << rank << "] AFTER RoPE:");
             LOG_DEBUG("  local_q[token=0, head=0, dim=0:10]: ["
-                     << local_q->data()[0] << ", " << local_q->data()[1] << ", "
-                     << local_q->data()[2] << ", " << local_q->data()[3] << ", "
-                     << local_q->data()[4] << ", " << local_q->data()[5] << ", "
-                     << local_q->data()[6] << ", " << local_q->data()[7] << ", "
-                     << local_q->data()[8] << ", " << local_q->data()[9] << "]");
+                      << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+                      << local_q->data()[2] << ", " << local_q->data()[3] << ", "
+                      << local_q->data()[4] << ", " << local_q->data()[5] << ", "
+                      << local_q->data()[6] << ", " << local_q->data()[7] << ", "
+                      << local_q->data()[8] << ", " << local_q->data()[9] << "]");
             // Check token 1 (t=1) which SHOULD be rotated (pos=1, non-zero angle)
             int token1_offset = local_head_dim; // Start of second token
             LOG_DEBUG("  local_q[token=1, head=0, dim=0:10]: ["
-                     << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
-                     << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
-                     << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
-                     << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
-                     << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
+                      << local_q->data()[token1_offset + 0] << ", " << local_q->data()[token1_offset + 1] << ", "
+                      << local_q->data()[token1_offset + 2] << ", " << local_q->data()[token1_offset + 3] << ", "
+                      << local_q->data()[token1_offset + 4] << ", " << local_q->data()[token1_offset + 5] << ", "
+                      << local_q->data()[token1_offset + 6] << ", " << local_q->data()[token1_offset + 7] << ", "
+                      << local_q->data()[token1_offset + 8] << ", " << local_q->data()[token1_offset + 9] << "]");
             LOG_DEBUG("  local_k[token=0, head=0, dim=0:10]: ["
-                     << local_k->data()[0] << ", " << local_k->data()[1] << ", "
-                     << local_k->data()[2] << ", " << local_k->data()[3] << ", "
-                     << local_k->data()[4] << ", " << local_k->data()[5] << ", "
-                     << local_k->data()[6] << ", " << local_k->data()[7] << ", "
-                     << local_k->data()[8] << ", " << local_k->data()[9] << "]");
+                      << local_k->data()[0] << ", " << local_k->data()[1] << ", "
+                      << local_k->data()[2] << ", " << local_k->data()[3] << ", "
+                      << local_k->data()[4] << ", " << local_k->data()[5] << ", "
+                      << local_k->data()[6] << ", " << local_k->data()[7] << ", "
+                      << local_k->data()[8] << ", " << local_k->data()[9] << "]");
             int k_token1_offset = local_kv_head_dim;
             LOG_DEBUG("  local_k[token=1, head=0, dim=0:10]: ["
-                     << local_k->data()[k_token1_offset + 0] << ", " << local_k->data()[k_token1_offset + 1] << ", "
-                     << local_k->data()[k_token1_offset + 2] << ", " << local_k->data()[k_token1_offset + 3] << ", "
-                     << local_k->data()[k_token1_offset + 4] << ", " << local_k->data()[k_token1_offset + 5] << ", "
-                     << local_k->data()[k_token1_offset + 6] << ", " << local_k->data()[k_token1_offset + 7] << ", "
-                     << local_k->data()[k_token1_offset + 8] << ", " << local_k->data()[k_token1_offset + 9] << "]");
+                      << local_k->data()[k_token1_offset + 0] << ", " << local_k->data()[k_token1_offset + 1] << ", "
+                      << local_k->data()[k_token1_offset + 2] << ", " << local_k->data()[k_token1_offset + 3] << ", "
+                      << local_k->data()[k_token1_offset + 4] << ", " << local_k->data()[k_token1_offset + 5] << ", "
+                      << local_k->data()[k_token1_offset + 6] << ", " << local_k->data()[k_token1_offset + 7] << ", "
+                      << local_k->data()[k_token1_offset + 8] << ", " << local_k->data()[k_token1_offset + 9] << "]");
         }
 
         // CONTRACT: RoPE application
@@ -1594,14 +1618,14 @@ namespace llaminar
             attn_seq_len = cache_seq_len + seq_len; // n_past + 1
 
             // DEBUG: Check input cache
-            if (rank == 0 && layer_index_ == 0)
+            if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
             {
                 LOG_DEBUG("[CACHE_DEBUG] Input K cache (first 10 of first row): "
-                         << k_cache_in->data()[0] << " " << k_cache_in->data()[1] << " "
-                         << k_cache_in->data()[2] << " " << k_cache_in->data()[3] << " "
-                         << k_cache_in->data()[4] << " " << k_cache_in->data()[5] << " "
-                         << k_cache_in->data()[6] << " " << k_cache_in->data()[7] << " "
-                         << k_cache_in->data()[8] << " " << k_cache_in->data()[9]);
+                          << k_cache_in->data()[0] << " " << k_cache_in->data()[1] << " "
+                          << k_cache_in->data()[2] << " " << k_cache_in->data()[3] << " "
+                          << k_cache_in->data()[4] << " " << k_cache_in->data()[5] << " "
+                          << k_cache_in->data()[6] << " " << k_cache_in->data()[7] << " "
+                          << k_cache_in->data()[8] << " " << k_cache_in->data()[9]);
                 LOG_DEBUG("  Cache shape: [" << k_cache_in->shape()[0] << ", " << k_cache_in->shape()[1] << "]");
             }
 
@@ -1622,7 +1646,7 @@ namespace llaminar
                         local_v->data(),
                         seq_len * local_kv_head_dim * sizeof(float));
 
-            if (rank == 0 && layer_index_ == 0)
+            if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
             {
                 LOG_DEBUG("[KV_CACHE] Decode: appended " << seq_len << " new tokens to cache");
                 LOG_DEBUG("  Old cache size: " << cache_seq_len << ", New cache size: " << attn_seq_len);
@@ -1633,11 +1657,11 @@ namespace llaminar
                 {
                     int offset = t * local_kv_head_dim;
                     LOG_DEBUG("  Row " << t << ": "
-                                      << local_k_cache->data()[offset + 0] << " " << local_k_cache->data()[offset + 1] << " "
-                                      << local_k_cache->data()[offset + 2] << " " << local_k_cache->data()[offset + 3] << " "
-                                      << local_k_cache->data()[offset + 4] << " " << local_k_cache->data()[offset + 5] << " "
-                                      << local_k_cache->data()[offset + 6] << " " << local_k_cache->data()[offset + 7] << " "
-                                      << local_k_cache->data()[offset + 8] << " " << local_k_cache->data()[offset + 9]);
+                                       << local_k_cache->data()[offset + 0] << " " << local_k_cache->data()[offset + 1] << " "
+                                       << local_k_cache->data()[offset + 2] << " " << local_k_cache->data()[offset + 3] << " "
+                                       << local_k_cache->data()[offset + 4] << " " << local_k_cache->data()[offset + 5] << " "
+                                       << local_k_cache->data()[offset + 6] << " " << local_k_cache->data()[offset + 7] << " "
+                                       << local_k_cache->data()[offset + 8] << " " << local_k_cache->data()[offset + 9]);
                 }
             }
         }
@@ -1648,7 +1672,7 @@ namespace llaminar
             local_k_cache = local_k; // Share the tensor (no copy needed)
             local_v_cache = local_v;
 
-            if (rank == 0 && layer_index_ == 0)
+            if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
             {
                 LOG_DEBUG("[KV_CACHE] Prefill: initialized cache with " << seq_len << " tokens");
                 LOG_DEBUG("  Cache shape: [" << attn_seq_len << ", " << local_kv_head_dim << "]");
@@ -1658,11 +1682,11 @@ namespace llaminar
                 {
                     int offset = t * local_kv_head_dim;
                     LOG_DEBUG("  Row " << t << ": "
-                                      << local_k_cache->data()[offset + 0] << " " << local_k_cache->data()[offset + 1] << " "
-                                      << local_k_cache->data()[offset + 2] << " " << local_k_cache->data()[offset + 3] << " "
-                                      << local_k_cache->data()[offset + 4] << " " << local_k_cache->data()[offset + 5] << " "
-                                      << local_k_cache->data()[offset + 6] << " " << local_k_cache->data()[offset + 7] << " "
-                                      << local_k_cache->data()[offset + 8] << " " << local_k_cache->data()[offset + 9]);
+                                       << local_k_cache->data()[offset + 0] << " " << local_k_cache->data()[offset + 1] << " "
+                                       << local_k_cache->data()[offset + 2] << " " << local_k_cache->data()[offset + 3] << " "
+                                       << local_k_cache->data()[offset + 4] << " " << local_k_cache->data()[offset + 5] << " "
+                                       << local_k_cache->data()[offset + 6] << " " << local_k_cache->data()[offset + 7] << " "
+                                       << local_k_cache->data()[offset + 8] << " " << local_k_cache->data()[offset + 9]);
                 }
             }
         }
@@ -1677,11 +1701,11 @@ namespace llaminar
             // Calculate dimensions
             const int k_v_dim = n_head_kv_ * head_dim_;
 
-            if (rank == 0 && layer_index_ == 0)
+            if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
             {
                 LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] Gathering ROPE_APPLICATION:");
                 LOG_DEBUG("  world_size=" << world_size << " local_heads=" << local_heads
-                                         << " local_kv_heads=" << local_kv_heads);
+                                          << " local_kv_heads=" << local_kv_heads);
                 LOG_DEBUG("  n_head_=" << n_head_ << " n_head_kv_=" << n_head_kv_ << " head_dim_=" << head_dim_);
                 LOG_DEBUG("  local_head_dim=" << local_head_dim << " local_kv_head_dim=" << local_kv_head_dim);
                 LOG_DEBUG("  d_model_=" << d_model_ << " k_v_dim=" << k_v_dim);
@@ -1691,873 +1715,962 @@ namespace llaminar
                 LOG_DEBUG("  local_k shape: [" << seq_len << ", " << local_kv_head_dim << "]");
             }
 
-            // Gather Q, K, and V (post-RoPE) from all ranks
-            if (world_size > 1)
-            {
-                global_q_rope = TensorFactory::create_simple({seq_len, d_model_});
-                global_k_rope = TensorFactory::create_simple({seq_len, k_v_dim});
-                global_v_rope = TensorFactory::create_simple({seq_len, k_v_dim});
-
-                // DEBUG: Check local Q values before gather
-                if (rank == 0 && layer_index_ == 0)
-                {
-                    std::ostringstream oss;
-                    oss << "[ROPE_SNAPSHOT_DEBUG] Rank 0 local_q[t=0] first 10 values: ";
-                    for (int i = 0; i < 10 && i < local_head_dim; ++i)
-                    {
-                        oss << local_q->data()[i] << " ";
-                    }
-                    LOG_DEBUG(oss.str());
-                }
-
-                // DEBUG: Log local_k before gathering (layer 0 only)
-                if (layer_index_ == 0)
-                {
-                    LOG_DEBUG("[RANK=" << rank << "] Before gather, local_k[t=0, h=0] first 5: "
-                                      << local_k->data()[0] << ", " << local_k->data()[1] << ", "
-                                      << local_k->data()[2] << ", " << local_k->data()[3] << ", " << local_k->data()[4]);
-                }
-
-                // Gather row-by-row to maintain proper layout
-                for (int t = 0; t < seq_len; ++t)
-                {
-                    const float *local_q_row = local_q->data() + t * local_head_dim;
-                    const float *local_k_row = local_k->data() + t * local_kv_head_dim;
-                    const float *local_v_row = local_v->data() + t * local_kv_head_dim;
-                    float *global_q_row = global_q_rope->data() + t * d_model_;
-                    float *global_k_row = global_k_rope->data() + t * k_v_dim;
-                    float *global_v_row = global_v_rope->data() + t * k_v_dim;
-
-                    MPI_Allgather(local_q_row, local_head_dim, MPI_FLOAT,
-                                  global_q_row, local_head_dim, MPI_FLOAT,
-                                  MPI_COMM_WORLD);
-
-                    MPI_Allgather(local_k_row, local_kv_head_dim, MPI_FLOAT,
-                                  global_k_row, local_kv_head_dim, MPI_FLOAT,
-                                  MPI_COMM_WORLD);
-
-                    MPI_Allgather(local_v_row, local_kv_head_dim, MPI_FLOAT,
-                                  global_v_row, local_kv_head_dim, MPI_FLOAT,
-                                  MPI_COMM_WORLD);
-                }
-
-                // DEBUG: Log global_k after gathering (layer 0, rank 0 only)
-                if (rank == 0 && layer_index_ == 0)
-                {
-                    LOG_DEBUG("[RANK=0] After gather, global_k_rope[t=0]:");
-                    LOG_DEBUG("  offset[0..4] (from rank 0): " << global_k_rope->data()[0] << ", "
-                                                              << global_k_rope->data()[1] << ", " << global_k_rope->data()[2] << ", "
-                                                              << global_k_rope->data()[3] << ", " << global_k_rope->data()[4]);
-                    LOG_DEBUG("  offset[64..68] (from rank 1): " << global_k_rope->data()[64] << ", "
-                                                                << global_k_rope->data()[65] << ", " << global_k_rope->data()[66] << ", "
-                                                                << global_k_rope->data()[67] << ", " << global_k_rope->data()[68]);
-
-                    // Check the failing position: token=3, kv_head=1, dim_in_head=32
-                    // global_k_rope layout: [token][kv_head_0_64_dims, kv_head_1_64_dims]
-                    // offset = token * k_v_dim + kv_head * head_dim + dim_in_head
-                    //        = 3 * 128 + 1 * 64 + 32
-                    //        = 384 + 64 + 32 = 480
-                    const int failing_offset_in_k = 3 * k_v_dim + 1 * head_dim_ + 32;
-                    LOG_DEBUG("  CRITICAL CHECK: global_k_rope[token=3, kv_head=1, dim=32] (offset=" << failing_offset_in_k << "): "
-                                                                                                    << global_k_rope->data()[failing_offset_in_k]);
-                }
-
-                // DEBUG: Check gathered values
-                if (rank == 0 && layer_index_ == 0)
-                {
-                    LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] After MPI_Allgather, global_q[t=0]:");
-                    std::ostringstream oss1;
-                    oss1 << "  First 10 (from rank 0): ";
-                    for (int i = 0; i < 10 && i < d_model_; ++i)
-                    {
-                        oss1 << global_q_rope->data()[i] << " ";
-                    }
-                    LOG_DEBUG(oss1.str());
-                    std::ostringstream oss2;
-                    oss2 << "  Elements [" << local_head_dim << ".." << (local_head_dim + 10) << "] (from rank 1): ";
-                    for (int i = local_head_dim; i < local_head_dim + 10 && i < d_model_; ++i)
-                    {
-                        oss2 << global_q_rope->data()[i] << " ";
-                    }
-                    LOG_DEBUG(oss2.str());
-                }
-            }
-            else
-            {
-                // Single rank: use local tensors directly
-                global_q_rope = local_q;
-                global_k_rope = local_k;
-                global_v_rope = local_v;
-            }
-
-            // Concatenate Q and K along feature dimension for snapshot: [Q | K]
-            // This matches PyTorch's ROPE_APPLICATION which includes both
+            // OPTIMIZATION: Only gather post-RoPE Q/K/V when snapshot callback is registered
+            // This gather exists ONLY for snapshot validation (ROPE_APPLICATION stage)
+            // In production inference (no snapshots), skip entirely to avoid expensive MPI overhead
             if (snapshot_callback_)
             {
-                std::vector<int> rope_shape = {seq_len, d_model_ + k_v_dim};
-                auto rope_combined = TensorFactory::create_simple(rope_shape);
-                float *dst = rope_combined->data();
-
-                for (int t = 0; t < seq_len; ++t)
+                // Gather Q, K, and V (post-RoPE) from all ranks
+                if (world_size > 1)
                 {
-                    const float *q_row = global_q_rope->data() + t * d_model_;
-                    const float *k_row = global_k_rope->data() + t * k_v_dim;
+                    global_q_rope = TensorFactory::create_simple({seq_len, d_model_});
+                    global_k_rope = TensorFactory::create_simple({seq_len, k_v_dim});
+                    global_v_rope = TensorFactory::create_simple({seq_len, k_v_dim});
 
-                    // Copy Q first
-                    std::memcpy(dst, q_row, d_model_ * sizeof(float));
-                    dst += d_model_;
-
-                    // Then K
-                    std::memcpy(dst, k_row, k_v_dim * sizeof(float));
-                    dst += k_v_dim;
-                }
-
-                // DEBUG: Show final concatenated values
-                if (rank == 0 && layer_index_ == 0)
-                {
-                    LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] Final rope_combined[t=0]:");
-                    std::ostringstream oss1;
-                    oss1 << "  First 10 (Q): ";
-                    for (int i = 0; i < 10; ++i)
+                    // DEBUG: Check local Q values before gather
+                    if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
                     {
-                        oss1 << rope_combined->data()[i] << " ";
-                    }
-                    LOG_DEBUG(oss1.str());
-                    std::ostringstream oss2;
-                    oss2 << "  Elements [" << d_model_ << ".." << (d_model_ + 10) << "] (K start): ";
-                    for (int i = d_model_; i < d_model_ + 10; ++i)
-                    {
-                        oss2 << rope_combined->data()[i] << " ";
-                    }
-                    LOG_DEBUG(oss2.str());
-                    LOG_DEBUG("  Total rope_combined size: " << rope_combined->size()
-                                                             << " expected: " << (seq_len * (d_model_ + k_v_dim)));
-
-                    // CRITICAL DEBUG: Check position [3,992] which is the failing position
-                    // Token 3, position 992, which is dim 96 of K (992 - 896 = 96)
-                    // NOTE: Only valid for production Qwen-0.5B dimensions (d_model=896, seq_len>=4)
-                    if (d_model_ >= 896 && seq_len >= 4)
-                    {
-                        const int failing_token = 3;
-                        const int failing_pos = 992;
-                        const int row_size = d_model_ + k_v_dim;
-                        const int failing_offset = failing_token * row_size + failing_pos;
-                        LOG_DEBUG("  CRITICAL: rope_combined[token=" << failing_token << ", pos=" << failing_pos << "] (offset=" << failing_offset << "): "
-                                                                    << rope_combined->data()[failing_offset]);
-                        LOG_DEBUG("  This should be K[token=3, dim=96] = K[token=3, kv_head=1, dim_in_head=32]");
-                    }
-                }
-
-                // Only rank 0 needs to snapshot
-                if (rank == 0)
-                {
-                    snapshot_callback_(PipelineStage::ROPE_APPLICATION, layer_index_,
-                                       rope_combined->data(), seq_len, d_model_ + k_v_dim);
-                }
-            }
-        }
-
-        // ========================================================================
-        // STEP 6: Handle GQA - replicate K/V heads if needed
-        // ========================================================================
-        // IMPORTANT: For GQA, we need ALL KV heads from ALL ranks to replicate them
-        // to the query heads. The global_k_rope and global_v_rope gathered above
-        // contain all KV heads concatenated across ranks.
-        // NOW USING KV CACHE INSTEAD OF JUST CURRENT K/V!
-
-        std::shared_ptr<TensorBase> local_k_expanded, local_v_expanded;
-
-        if (n_head_ != n_head_kv_)
-        {
-            // GQA: replicate K/V heads from CACHE to match Q head count
-            // Use cache (which contains all past tokens + current token)
-            local_k_expanded = TensorFactory::create_simple({attn_seq_len, local_head_dim});
-            local_v_expanded = TensorFactory::create_simple({attn_seq_len, local_head_dim});
-
-            // First gather the full cache from all ranks if needed
-            std::shared_ptr<TensorBase> global_k_cache, global_v_cache;
-
-            if (world_size > 1)
-            {
-                // Need to gather full cache from all ranks for GQA expansion
-                const int k_v_dim = n_head_kv_ * head_dim_;
-                global_k_cache = TensorFactory::create_simple({attn_seq_len, k_v_dim});
-                global_v_cache = TensorFactory::create_simple({attn_seq_len, k_v_dim});
-
-                // Gather KV cache from all ranks, then transpose to correct layout
-                // CRITICAL: MPI_Allgatherv produces rank-major layout:
-                //   [Rank0: t=0..T, kv_head=0] [Rank1: t=0..T, kv_head=1] ...
-                // But expand_kv_for_gqa expects time-major layout:
-                //   [t=0: kv_head=0, kv_head=1] [t=1: kv_head=0, kv_head=1] ...
-                // We must transpose after gathering!
-
-                std::vector<int> recvcounts_k(world_size);
-                std::vector<int> displs_k(world_size);
-                int sendcount_k = attn_seq_len * local_kv_head_dim;
-
-                MPI_Allgather(&sendcount_k, 1, MPI_INT, recvcounts_k.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-                int offset_k = 0;
-                for (int r = 0; r < world_size; ++r)
-                {
-                    displs_k[r] = offset_k;
-                    offset_k += recvcounts_k[r];
-                }
-
-                // Gather into temporary buffers (rank-major layout)
-                std::vector<float> temp_k(attn_seq_len * k_v_dim);
-                std::vector<float> temp_v(attn_seq_len * k_v_dim);
-
-                MPI_Allgatherv(local_k_cache->data(), sendcount_k, MPI_FLOAT,
-                               temp_k.data(), recvcounts_k.data(), displs_k.data(),
-                               MPI_FLOAT, MPI_COMM_WORLD);
-                MPI_Allgatherv(local_v_cache->data(), sendcount_k, MPI_FLOAT,
-                               temp_v.data(), recvcounts_k.data(), displs_k.data(),
-                               MPI_FLOAT, MPI_COMM_WORLD);
-
-                // Transpose from rank-major to time-major layout
-                // Source (temp): [Rank0: t=0..T, head_dim] [Rank1: t=0..T, head_dim] ...
-                // Dest (global): [t=0: Rank0_head_dim, Rank1_head_dim] [t=1: ...] ...
-                std::vector<int> kv_heads_per_rank(world_size);
-                for (int r = 0; r < world_size; ++r)
-                {
-                    auto [local_kv, kv_offset] = getKVHeadDistribution(r);
-                    kv_heads_per_rank[r] = local_kv;
-                }
-
-                int src_offset = 0;
-                for (int r = 0; r < world_size; ++r)
-                {
-                    const int rank_kv_heads = kv_heads_per_rank[r];
-                    const int rank_kv_dim = rank_kv_heads * head_dim_;
-                    auto [_, kv_offset] = getKVHeadDistribution(r);
-
-                    for (int t = 0; t < attn_seq_len; ++t)
-                    {
-                        // Source: temp[src_offset + t * rank_kv_dim : src_offset + (t+1) * rank_kv_dim]
-                        // Dest: global[t * k_v_dim + kv_offset * head_dim_ : ...]
-                        const float *src_k = temp_k.data() + src_offset + t * rank_kv_dim;
-                        const float *src_v = temp_v.data() + src_offset + t * rank_kv_dim;
-
-                        float *dst_k = global_k_cache->data() + t * k_v_dim + kv_offset * head_dim_;
-                        float *dst_v = global_v_cache->data() + t * k_v_dim + kv_offset * head_dim_;
-
-                        std::memcpy(dst_k, src_k, rank_kv_dim * sizeof(float));
-                        std::memcpy(dst_v, src_v, rank_kv_dim * sizeof(float));
-                    }
-
-                    src_offset += attn_seq_len * rank_kv_dim;
-                }
-
-                // DEBUG: Log gathered cache layout (layer 0 only)
-                if (layer_index_ == 0)
-                {
-                    LOG_DEBUG("[RANK=" << rank << "] After transpose to time-major:");
-                    LOG_DEBUG("  global_k_cache shape: [" << attn_seq_len << ", " << k_v_dim << "]");
-                    LOG_DEBUG("  global_k_cache[t=0, kv_head=0:1, d=0:5]:");
-                    LOG_DEBUG("    KV head 0: " << global_k_cache->data()[0] << " " << global_k_cache->data()[1] << " "
-                                               << global_k_cache->data()[2] << " " << global_k_cache->data()[3] << " " << global_k_cache->data()[4]);
-                    LOG_DEBUG("    KV head 1: " << global_k_cache->data()[head_dim_] << " " << global_k_cache->data()[head_dim_ + 1] << " "
-                                               << global_k_cache->data()[head_dim_ + 2] << " " << global_k_cache->data()[head_dim_ + 3] << " "
-                                               << global_k_cache->data()[head_dim_ + 4]);
-                }
-            }
-            else
-            {
-                global_k_cache = local_k_cache;
-                global_v_cache = local_v_cache;
-            }
-
-            // CRITICAL FIX: Pass head_offset and total Q heads so GQA expansion uses correct mapping
-            // For Qwen: 14 Q heads, 2 KV heads → group_size=7
-            //   Q heads [0-6] (rank 0) → KV head 0
-            //   Q heads [7-13] (rank 1) → KV head 1
-            // Formula: kv_head = (local_h + head_offset) / (total_q_heads / n_kv_heads)
-            llaminar::attn::expand_kv_for_gqa(
-                global_k_cache->data(), global_v_cache->data(),
-                local_k_expanded->data(), local_v_expanded->data(),
-                attn_seq_len, head_dim_, local_heads, n_head_kv_, head_offset, n_head_); // Use cache length!
-
-            // DEBUG: Log after GQA expansion (layer 0 only)
-            if (layer_index_ == 0)
-            {
-                LOG_DEBUG("[RANK=" << rank << "] After GQA expansion (using cache):");
-                LOG_DEBUG("  attn_seq_len=" << attn_seq_len << " (n_past + seq_len)");
-                LOG_DEBUG("  K_expanded shape: [" << attn_seq_len << ", " << local_head_dim << "]");
-                LOG_DEBUG("  K_expanded[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
-                                                 << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
-
-                float k_exp_min = *std::min_element(local_k_expanded->data(), local_k_expanded->data() + local_k_expanded->size());
-                float k_exp_max = *std::max_element(local_k_expanded->data(), local_k_expanded->data() + local_k_expanded->size());
-                LOG_DEBUG("  K_expanded range: [" << k_exp_min << ", " << k_exp_max << "]");
-            }
-        }
-        else
-        {
-            // MHA: no replication needed, use cache directly
-            local_k_expanded = local_k_cache;
-            local_v_expanded = local_v_cache;
-        }
-
-        // ========================================================================
-        // STEP 7: Compute attention scores and apply softmax
-        // ========================================================================
-        // CRITICAL: Now using full cache length for K dimension!
-        const int scores_size = local_heads * seq_len * attn_seq_len;
-        std::vector<float> scores(scores_size);
-
-        // IMPORTANT: For parity testing, we need to capture scores BEFORE causal masking
-        // PyTorch captures unmasked scores, then applies mask separately
-        if (snapshot_callback_)
-        {
-            // DEBUG: Log Q and K before computing scores (layer 0 only)
-            if (layer_index_ == 0)
-            {
-                LOG_DEBUG("[RANK=" << rank << "] Before compute_qk_scores for snapshot:");
-                LOG_DEBUG("  local_q size=" << (local_heads * seq_len * head_dim_)
-                                           << " shape=[" << seq_len << ", " << (local_heads * head_dim_) << "]");
-                LOG_DEBUG("  local_k_expanded size=" << (local_heads * attn_seq_len * head_dim_)
-                                                    << " shape=[" << attn_seq_len << ", " << (local_heads * head_dim_) << "]");
-                LOG_DEBUG("  scores shape will be: [" << local_heads << ", " << seq_len << ", " << attn_seq_len << "]");
-                LOG_DEBUG("  scores total elements: " << scores_size);
-
-                // CRITICAL: Verify memory layout expectations
-                LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] Q tensor layout check:");
-                LOG_DEBUG("  Expected by compute_qk_scores: Q[token, head, dim] flattened");
-                LOG_DEBUG("  Index formula: q[i, h, d] = q[(i * heads * head_dim) + (h * head_dim) + d]");
-                LOG_DEBUG("  For token i=0, head h=0: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = d");
-                LOG_DEBUG("  For token i=0, head h=1: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (1 * " << head_dim_ << ") + d = " << head_dim_ << " + d");
-                LOG_DEBUG("  For token i=1, head h=0: offset = (1 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = " << (local_heads * head_dim_) << " + d");
-
-                LOG_DEBUG("  Actual Q memory layout after projection:");
-                LOG_DEBUG("    Q[t=0, h=0, d=0:5]: "
-                         << local_q->data()[0] << ", " << local_q->data()[1] << ", "
-                         << local_q->data()[2] << ", " << local_q->data()[3] << ", "
-                         << local_q->data()[4]);
-
-                int offset_t0_h1 = head_dim_;
-                LOG_DEBUG("    Q[t=0, h=1, d=0:5]: "
-                         << local_q->data()[offset_t0_h1 + 0] << ", " << local_q->data()[offset_t0_h1 + 1] << ", "
-                         << local_q->data()[offset_t0_h1 + 2] << ", " << local_q->data()[offset_t0_h1 + 3] << ", "
-                         << local_q->data()[offset_t0_h1 + 4]);
-
-                int offset_t1_h0 = local_heads * head_dim_;
-                LOG_DEBUG("    Q[t=1, h=0, d=0:5]: "
-                         << local_q->data()[offset_t1_h0 + 0] << ", " << local_q->data()[offset_t1_h0 + 1] << ", "
-                         << local_q->data()[offset_t1_h0 + 2] << ", " << local_q->data()[offset_t1_h0 + 3] << ", "
-                         << local_q->data()[offset_t1_h0 + 4]);
-
-                LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] K_expanded tensor layout check:");
-                LOG_DEBUG("  K[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
-                                        << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
-                LOG_DEBUG("    K[t=0, h=0, d=0:5]: "
-                         << local_k_expanded->data()[0] << ", " << local_k_expanded->data()[1] << ", "
-                         << local_k_expanded->data()[2] << ", " << local_k_expanded->data()[3] << ", "
-                         << local_k_expanded->data()[4]);
-                LOG_DEBUG("    K[t=0, h=1, d=0:5]: "
-                         << local_k_expanded->data()[offset_t0_h1 + 0] << ", " << local_k_expanded->data()[offset_t0_h1 + 1] << ", "
-                         << local_k_expanded->data()[offset_t0_h1 + 2] << ", " << local_k_expanded->data()[offset_t0_h1 + 3] << ", "
-                         << local_k_expanded->data()[offset_t0_h1 + 4]);
-                LOG_DEBUG("    K[t=1, h=0, d=0:5]: "
-                         << local_k_expanded->data()[offset_t1_h0 + 0] << ", " << local_k_expanded->data()[offset_t1_h0 + 1] << ", "
-                         << local_k_expanded->data()[offset_t1_h0 + 2] << ", " << local_k_expanded->data()[offset_t1_h0 + 3] << ", "
-                         << local_k_expanded->data()[offset_t1_h0 + 4]);
-
-                // Compute what the first score should be
-                double test_dot = 0.0;
-                for (int d = 0; d < head_dim_; ++d)
-                {
-                    test_dot += local_q->data()[d] * local_k_expanded->data()[d];
-                }
-                float scale = 1.0f / std::sqrt((float)head_dim_);
-                LOG_DEBUG("  Expected scores[0,0] = Q[0]·K[0]/sqrt(" << head_dim_ << ") = "
-                                                                    << test_dot << " * " << scale << " = " << (test_dot * scale));
-            }
-
-            // Compute unmasked scores for snapshot
-            std::vector<float> unmasked_scores(scores_size);
-            llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
-                                              unmasked_scores.data(),
-                                              seq_len, attn_seq_len, // q_seq_len, k_seq_len
-                                              head_dim_, local_heads,
-                                              false, false); // causal=FALSE for snapshot
-
-            // DEBUG: Log computed scores (layer 0 only)
-            if (layer_index_ == 0)
-            {
-                LOG_DEBUG("[RANK=" << rank << "] After compute_qk_scores:");
-                LOG_DEBUG("  unmasked_scores[0:5]: " << unmasked_scores[0] << " " << unmasked_scores[1] << " "
-                                                    << unmasked_scores[2] << " " << unmasked_scores[3] << " " << unmasked_scores[4]);
-            }
-
-            // Gather and snapshot unmasked scores
-            if (world_size > 1)
-            {
-                auto global_scores = std::vector<float>(n_head_ * seq_len * attn_seq_len, 0.0f);
-
-                std::vector<int> recvcounts(world_size);
-                std::vector<int> displs(world_size);
-
-                int sendcount = local_heads * seq_len * attn_seq_len;
-                MPI_Allgather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-                int offset = 0;
-                for (int r = 0; r < world_size; ++r)
-                {
-                    displs[r] = offset;
-                    offset += recvcounts[r];
-                }
-
-                MPI_Allgatherv(unmasked_scores.data(), sendcount, MPI_FLOAT,
-                               global_scores.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
-                               MPI_COMM_WORLD);
-
-                // DEBUG: Log gathered scores structure (layer 0 only)
-                if (layer_index_ == 0 && rank == 0)
-                {
-                    LOG_DEBUG("[GATHERED_SCORES_DEBUG] After MPI_Allgatherv:");
-                    LOG_DEBUG("  global_scores size: " << global_scores.size() << " (expected " << (n_head_ * seq_len * attn_seq_len) << ")");
-                    LOG_DEBUG("  Will snapshot as [" << (n_head_ * seq_len) << " x " << attn_seq_len << "]");
-                    LOG_DEBUG("  Rank 0 contributed: " << recvcounts[0] << " elements (heads 0-" << (local_heads - 1) << ")");
-                    LOG_DEBUG("  Rank 1 contributed: " << recvcounts[1] << " elements (heads " << local_heads << "-" << (n_head_ - 1) << ")");
-                    LOG_DEBUG("  Rank 0 offset: " << displs[0]);
-                    LOG_DEBUG("  Rank 1 offset: " << displs[1]);
-                    LOG_DEBUG("  First 10 elements: ");
-                    for (int i = 0; i < std::min(10, (int)global_scores.size()); ++i)
-                    {
-                        LOG_DEBUG("    global_scores[" << i << "] = " << global_scores[i]);
-                    }
-
-                    // Interpret as 2D: [n_head * seq_len, attn_seq_len]
-                    // Row 0 = head 0, token 0 (first attn_seq_len elements)
-                    LOG_DEBUG("  Row 0 (head 0, token 0): " << global_scores[0] << " " << global_scores[1] << " "
-                                                           << global_scores[2] << " " << global_scores[3] << " " << global_scores[4]);
-                    // Row 1 = head 0, token 1
-                    LOG_DEBUG("  Row 1 (head 0, token 1): " << global_scores[5] << " " << global_scores[6] << " "
-                                                           << global_scores[7] << " " << global_scores[8] << " " << global_scores[9]);
-
-                    // Also show what we EXPECT PyTorch to have:
-                    LOG_DEBUG("  Expected PyTorch row 0 should match our row 0");
-                    LOG_DEBUG("  Expected PyTorch row 1 should match our row 1");
-                }
-
-                if (rank == 0)
-                {
-                    snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, global_scores.data(),
-                                       n_head_ * seq_len, attn_seq_len); // rows, cols
-                }
-            }
-            else
-            {
-                snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, unmasked_scores.data(),
-                                   local_heads * seq_len, attn_seq_len); // rows, cols
-            }
-        } // Now compute MASKED scores for actual attention (causal masking, scaling, NO softmax yet)
-        llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
-                                          scores.data(), seq_len, attn_seq_len,
-                                          head_dim_, local_heads,
-                                          true, false); // causal=TRUE for actual computation
-
-        // DEBUG: Log masked scores for layer 0
-        if (layer_index_ == 0 && rank == 0)
-        {
-            LOG_DEBUG("[MASKED_SCORES_DEBUG] Layer 0, AFTER compute_qk_scores with causal=TRUE:");
-            LOG_DEBUG("  Head 0, scores[0:6]: " << scores[0] << " " << scores[1] << " "
-                                               << scores[2] << " " << scores[3] << " " << scores[4] << " " << scores[5]);
-        }
-
-        // Contract: Validate attention scores (raw QK^T)
-        if (enable_validation && rank == 0)
-        {
-            TensorHealthCheck scores_health("scores_pre_softmax");
-            scores_health.check(scores.data(), scores.size());
-            scores_health.log(rank);
-
-            // Note: -inf values are EXPECTED in causal positions
-            if (scores_health.nan_count > 0)
-            {
-                LOG_ERROR("❌ Attention scores contain NaN (unexpected)");
-                return false;
-            }
-            if (scores_health.inf_count == 0 && seq_len > 1)
-            {
-                LOG_WARN("⚠️ Expected -inf in causal mask positions but found none");
-            }
-            LOG_DEBUG("✓ Attention scores validated (inf_count=" << scores_health.inf_count << " expected for causal masking)");
-        }
-
-        // Apply softmax to each head (sequential loop - softmax_row_major parallelizes internally)
-        // CRITICAL FIX: In incremental decode (seq_len=1), disable causal masking because
-        // the query token is attending to the full cache which only contains PAST tokens.
-        // Causal masking with rows=1 would incorrectly mask based on relative position (row 0 -> mask all c > 0).
-        const bool use_causal_mask = (seq_len > 1); // Only use causal mask in prefill/batch mode
-
-        for (int h = 0; h < local_heads; ++h)
-        {
-            llaminar::kernels::SoftmaxRowArgs args;
-            args.scores = scores.data() + static_cast<size_t>(h) * seq_len * attn_seq_len;
-            args.rows = seq_len;
-            args.cols = attn_seq_len;
-            args.causal = use_causal_mask; // FIX: Disable for incremental decode
-            args.scale = 1.0f;
-
-            // DEBUG: Log scores before softmax for layer 0, head 0
-            if (layer_index_ == 0 && h == 0 && rank == 0)
-            {
-                LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, BEFORE softmax:");
-                LOG_DEBUG("  seq_len=" << seq_len << " attn_seq_len=" << attn_seq_len << " use_causal=" << use_causal_mask);
-                LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
-                                           << args.scores[2] << " " << args.scores[3] << " "
-                                           << args.scores[4] << " " << args.scores[5]);
-            }
-
-            llaminar::kernels::softmax_row_major(args);
-
-            // DEBUG: Log scores after softmax for layer 0, head 0
-            if (layer_index_ == 0 && h == 0 && rank == 0)
-            {
-                LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, AFTER softmax:");
-                LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
-                                           << args.scores[2] << " " << args.scores[3] << " "
-                                           << args.scores[4] << " " << args.scores[5]);
-                float sum = 0.0f;
-                for (int i = 0; i < attn_seq_len; ++i)
-                    sum += args.scores[i];
-                LOG_DEBUG("  Sum (should be ~1.0): " << sum);
-            }
-        }
-
-        // Snapshot scores AFTER softmax
-        if (snapshot_callback_)
-        {
-            if (world_size > 1)
-            {
-                // Gather softmax scores across ranks: [local_heads, seq_len, attn_seq_len] -> [n_head, seq_len, attn_seq_len]
-                auto global_softmax = std::vector<float>(n_head_ * seq_len * attn_seq_len, 0.0f);
-
-                std::vector<int> recvcounts(world_size);
-                std::vector<int> displs(world_size);
-
-                int sendcount = local_heads * seq_len * attn_seq_len;
-                MPI_Allgather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-                int offset = 0;
-                for (int r = 0; r < world_size; ++r)
-                {
-                    displs[r] = offset;
-                    offset += recvcounts[r];
-                }
-
-                MPI_Allgatherv(scores.data(), sendcount, MPI_FLOAT,
-                               global_softmax.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
-                               MPI_COMM_WORLD);
-
-                if (rank == 0)
-                {
-                    snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, global_softmax.data(),
-                                       n_head_ * seq_len, attn_seq_len);
-                }
-            }
-            else
-            {
-                snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, scores.data(),
-                                   local_heads * seq_len, attn_seq_len);
-            }
-        }
-
-        // Contract: Validate attention probabilities (after softmax)
-        if (enable_validation && rank == 0)
-        {
-            TensorHealthCheck probs_health("attention_probs");
-            probs_health.check(scores.data(), scores.size());
-            probs_health.log(rank);
-
-            if (!probs_health.is_healthy())
-            {
-                LOG_ERROR("❌ Softmax produced NaN/Inf probabilities!");
-                return false;
-            }
-
-            // Verify probability constraints: values in [0, 1], rows sum to ~1.0
-            bool valid_probs = true;
-            for (int h = 0; h < local_heads; ++h)
-            {
-                for (int r = 0; r < seq_len; ++r)
-                {
-                    float row_sum = 0.0f;
-                    const float *row = scores.data() + h * seq_len * attn_seq_len + r * attn_seq_len;
-                    for (int c = 0; c < attn_seq_len; ++c)
-                    {
-                        if (row[c] < 0.0f || row[c] > 1.0f)
+                        std::ostringstream oss;
+                        oss << "[ROPE_SNAPSHOT_DEBUG] Rank 0 local_q[t=0] first 10 values: ";
+                        for (int i = 0; i < 10 && i < local_head_dim; ++i)
                         {
-                            LOG_ERROR("Invalid probability at head=" << h << " row=" << r << " col=" << c << ": " << row[c]);
-                            valid_probs = false;
+                            oss << local_q->data()[i] << " ";
                         }
-                        row_sum += row[c];
+                        LOG_DEBUG(oss.str());
                     }
-                    // Allow slight numerical error in sum
-                    if (std::abs(row_sum - 1.0f) > 1e-4f && r < seq_len)
-                    { // Only check non-masked rows
-                        LOG_WARN("Row sum deviation at head=" << h << " row=" << r << ": sum=" << row_sum);
+
+                    // DEBUG: Log local_k before gathering (layer 0 only)
+                    if (debugEnv().attention.verbose && layer_index_ == 0)
+                    {
+                        LOG_DEBUG("[RANK=" << rank << "] Before gather, local_k[t=0, h=0] first 5: "
+                                           << local_k->data()[0] << ", " << local_k->data()[1] << ", "
+                                           << local_k->data()[2] << ", " << local_k->data()[3] << ", " << local_k->data()[4]);
                     }
-                }
-            }
 
-            if (!valid_probs)
-            {
-                LOG_ERROR("❌ Probability constraints violated!");
-                return false;
-            }
-            LOG_DEBUG("✓ Attention probabilities validated (all in [0,1], rows sum to 1.0)");
-        }
+                    // PHASE 2A OPTIMIZATION: Bulk gather post-RoPE Q/K/V + transpose
+                    // Bulk gather is faster than seq_len MPI calls, but produces rank-major layout
+                    // Rearrange to row-interleaved layout after gathering
+                    auto temp_q_rope = TensorFactory::create_simple({seq_len * d_model_});
+                    auto temp_k_rope = TensorFactory::create_simple({seq_len * k_v_dim});
+                    auto temp_v_rope = TensorFactory::create_simple({seq_len * k_v_dim});
 
-        // ========================================================================
-        // STEP 6b: Apply attention scores to V
-        // ========================================================================
-        auto local_attended = TensorFactory::create_simple({seq_len, local_head_dim});
-
-        llaminar::attn::apply_scores_to_v(scores.data(), local_v_expanded->data(),
-                                          local_attended->data(), seq_len, attn_seq_len,
-                                          head_dim_, local_heads);
-
-        // Contract: Validate attended output (scores @ V)
-        if (enable_validation && rank == 0)
-        {
-            StageContract attended_contract("AttendedOutput");
-            attended_contract.outputs = {
-                TensorContract("attended",
-                               ShapeSpec({seq_len, local_head_dim}),
-                               TensorLayout::RowMajor,
-                               TensorSemantic::Activation)};
-            attended_contract.validate_outputs({local_attended});
-
-            TensorHealthCheck attended_health("attended_output");
-            attended_health.check(local_attended->data(), local_attended->size());
-            attended_health.log(rank);
-
-            if (!attended_health.is_healthy())
-            {
-                LOG_ERROR("❌ Attended output (scores @ V) contains NaN/Inf!");
-                return false;
-            }
-            LOG_DEBUG("✓ Attended output validated");
-        }
-
-        // Snapshot attended values (ATTENTION_CONTEXT: scores @ V before output projection)
-        if (snapshot_callback_)
-        {
-            if (world_size > 1)
-            {
-                // Gather attended output across ranks
-                // Each rank has [seq_len, local_head_dim], need [seq_len, n_head * head_dim]
-                auto global_attended = TensorFactory::create_simple({seq_len, n_head_ * head_dim_});
-
-                // Gather row-by-row to maintain proper layout (same as Q/K/V)
-                for (int t = 0; t < seq_len; ++t)
-                {
-                    const float *local_attended_row = local_attended->data() + t * local_head_dim;
-                    float *global_attended_row = global_attended->data() + t * (n_head_ * head_dim_);
-
-                    MPI_Allgather(local_attended_row, local_head_dim, MPI_FLOAT,
-                                  global_attended_row, local_head_dim, MPI_FLOAT,
+                    MPI_Allgather(local_q->data(), seq_len * local_head_dim, MPI_FLOAT,
+                                  temp_q_rope->data(), seq_len * local_head_dim, MPI_FLOAT,
                                   MPI_COMM_WORLD);
-                }
 
-                if (rank == 0)
-                {
-                    snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, layer_index_, global_attended->data(),
-                                       seq_len, n_head_ * head_dim_);
-                }
-            }
-            else
-            {
-                snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, layer_index_, local_attended->data(),
-                                   seq_len, local_head_dim);
-            }
-        }
+                    MPI_Allgather(local_k->data(), seq_len * local_kv_head_dim, MPI_FLOAT,
+                                  temp_k_rope->data(), seq_len * local_kv_head_dim, MPI_FLOAT,
+                                  MPI_COMM_WORLD);
 
-        if (rank == 0)
-        {
-            LOG_DEBUG("[kernel-test] rank " << rank << " local_attended[0,0:4]: "
-                                            << local_attended->data()[0] << ", " << local_attended->data()[1] << ", "
-                                            << local_attended->data()[2] << ", " << local_attended->data()[3]);
-        }
+                    MPI_Allgather(local_v->data(), seq_len * local_kv_head_dim, MPI_FLOAT,
+                                  temp_v_rope->data(), seq_len * local_kv_head_dim, MPI_FLOAT,
+                                  MPI_COMM_WORLD);
 
-        // ========================================================================
-        // STEP 7: Output projection + MPI gather
-        // ========================================================================
-        auto local_output = TensorFactory::create_simple({seq_len, d_model});
+                    // Rearrange from rank-major to row-interleaved
+                    for (int t = 0; t < seq_len; ++t)
+                    {
+                        for (int r = 0; r < world_size; ++r)
+                        {
+                            const float *src_q = temp_q_rope->data() + r * (seq_len * local_head_dim) + t * local_head_dim;
+                            const float *src_k = temp_k_rope->data() + r * (seq_len * local_kv_head_dim) + t * local_kv_head_dim;
+                            const float *src_v = temp_v_rope->data() + r * (seq_len * local_kv_head_dim) + t * local_kv_head_dim;
+                            float *dst_q = global_q_rope->data() + t * d_model_ + r * local_head_dim;
+                            float *dst_k = global_k_rope->data() + t * k_v_dim + r * local_kv_head_dim;
+                            float *dst_v = global_v_rope->data() + t * k_v_dim + r * local_kv_head_dim;
+                            std::memcpy(dst_q, src_q, local_head_dim * sizeof(float));
+                            std::memcpy(dst_k, src_k, local_kv_head_dim * sizeof(float));
+                            std::memcpy(dst_v, src_v, local_kv_head_dim * sizeof(float));
+                        }
+                    }
 
-        // Output projection: local_attended @ wo^T
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    seq_len, d_model, local_head_dim,
-                    1.0f, local_attended->data(), local_head_dim,
-                    local_wo->data(), local_head_dim,
-                    0.0f, local_output->data(), d_model);
+                    // DEBUG: Log global_k after gathering (layer 0, rank 0 only)
+                    if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
+                    {
+                        LOG_DEBUG("[RANK=0] After gather, global_k_rope[t=0]:");
+                        LOG_DEBUG("  offset[0..4] (from rank 0): " << global_k_rope->data()[0] << ", "
+                                                                   << global_k_rope->data()[1] << ", " << global_k_rope->data()[2] << ", "
+                                                                   << global_k_rope->data()[3] << ", " << global_k_rope->data()[4]);
+                        LOG_DEBUG("  offset[64..68] (from rank 1): " << global_k_rope->data()[64] << ", "
+                                                                     << global_k_rope->data()[65] << ", " << global_k_rope->data()[66] << ", "
+                                                                     << global_k_rope->data()[67] << ", " << global_k_rope->data()[68]);
 
-        // Contract: Validate output projection
-        if (enable_validation && rank == 0)
-        {
-            StageContract output_contract("OutputProjection");
-            output_contract.outputs = {
-                TensorContract("local_output",
-                               ShapeSpec({seq_len, d_model}),
-                               TensorLayout::RowMajor,
-                               TensorSemantic::Activation)};
-            output_contract.validate_outputs({local_output});
+                        // Check the failing position: token=3, kv_head=1, dim_in_head=32
+                        // global_k_rope layout: [token][kv_head_0_64_dims, kv_head_1_64_dims]
+                        // offset = token * k_v_dim + kv_head * head_dim + dim_in_head
+                        //        = 3 * 128 + 1 * 64 + 32
+                        //        = 384 + 64 + 32 = 480
+                        const int failing_offset_in_k = 3 * k_v_dim + 1 * head_dim_ + 32;
+                        LOG_DEBUG("  CRITICAL CHECK: global_k_rope[token=3, kv_head=1, dim=32] (offset=" << failing_offset_in_k << "): "
+                                                                                                         << global_k_rope->data()[failing_offset_in_k]);
+                    }
 
-            TensorHealthCheck output_health("output_projection");
-            output_health.check(local_output->data(), local_output->size());
-            output_health.log(rank);
-
-            if (!output_health.is_healthy())
-            {
-                LOG_ERROR("❌ Output projection contains NaN/Inf!");
-                return false;
-            }
-
-            // Optional: Deep validation against scalar reference
-            if (validate_projections)
-            {
-                auto result = llaminar::attention::AttentionValidator::validateProjection(
-                    local_attended->data(), local_wo->data(), local_output->data(),
-                    seq_len, d_model, local_head_dim,
-                    false // wo is already transposed for gemm
-                );
-
-                if (!llaminar::attention::AttentionValidator::isWithinTolerance(result, 1e-4f, 1e-4f))
-                {
-                    LOG_WARN("⚠️ Output projection divergence: max_abs=" << result.max_abs
-                                                                        << " rel_l2=" << result.rel_l2);
+                    // DEBUG: Check gathered values
+                    if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
+                    {
+                        LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] After MPI_Allgather, global_q[t=0]:");
+                        std::ostringstream oss1;
+                        oss1 << "  First 10 (from rank 0): ";
+                        for (int i = 0; i < 10 && i < d_model_; ++i)
+                        {
+                            oss1 << global_q_rope->data()[i] << " ";
+                        }
+                        LOG_DEBUG(oss1.str());
+                        std::ostringstream oss2;
+                        oss2 << "  Elements [" << local_head_dim << ".." << (local_head_dim + 10) << "] (from rank 1): ";
+                        for (int i = local_head_dim; i < local_head_dim + 10 && i < d_model_; ++i)
+                        {
+                            oss2 << global_q_rope->data()[i] << " ";
+                        }
+                        LOG_DEBUG(oss2.str());
+                    }
                 }
                 else
                 {
-                    LOG_DEBUG("✓ Output projection matches scalar reference");
+                    // Single rank: use local tensors directly
+                    global_q_rope = local_q;
+                    global_k_rope = local_k;
+                    global_v_rope = local_v;
+                }
+
+                // Concatenate Q and K along feature dimension for snapshot: [Q | K]
+                // This matches PyTorch's ROPE_APPLICATION which includes both
+                if (snapshot_callback_)
+                {
+                    std::vector<int> rope_shape = {seq_len, d_model_ + k_v_dim};
+                    auto rope_combined = TensorFactory::create_simple(rope_shape);
+                    float *dst = rope_combined->data();
+
+                    for (int t = 0; t < seq_len; ++t)
+                    {
+                        const float *q_row = global_q_rope->data() + t * d_model_;
+                        const float *k_row = global_k_rope->data() + t * k_v_dim;
+
+                        // Copy Q first
+                        std::memcpy(dst, q_row, d_model_ * sizeof(float));
+                        dst += d_model_;
+
+                        // Then K
+                        std::memcpy(dst, k_row, k_v_dim * sizeof(float));
+                        dst += k_v_dim;
+                    }
+
+                    // DEBUG: Show final concatenated values
+                    if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
+                    {
+                        LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] Final rope_combined[t=0]:");
+                        std::ostringstream oss1;
+                        oss1 << "  First 10 (Q): ";
+                        for (int i = 0; i < 10; ++i)
+                        {
+                            oss1 << rope_combined->data()[i] << " ";
+                        }
+                        LOG_DEBUG(oss1.str());
+                        std::ostringstream oss2;
+                        oss2 << "  Elements [" << d_model_ << ".." << (d_model_ + 10) << "] (K start): ";
+                        for (int i = d_model_; i < d_model_ + 10; ++i)
+                        {
+                            oss2 << rope_combined->data()[i] << " ";
+                        }
+                        LOG_DEBUG(oss2.str());
+                        LOG_DEBUG("  Total rope_combined size: " << rope_combined->size()
+                                                                 << " expected: " << (seq_len * (d_model_ + k_v_dim)));
+
+                        // CRITICAL DEBUG: Check position [3,992] which is the failing position
+                        // Token 3, position 992, which is dim 96 of K (992 - 896 = 96)
+                        // NOTE: Only valid for production Qwen-0.5B dimensions (d_model=896, seq_len>=4)
+                        if (d_model_ >= 896 && seq_len >= 4)
+                        {
+                            const int failing_token = 3;
+                            const int failing_pos = 992;
+                            const int row_size = d_model_ + k_v_dim;
+                            const int failing_offset = failing_token * row_size + failing_pos;
+                            LOG_DEBUG("  CRITICAL: rope_combined[token=" << failing_token << ", pos=" << failing_pos << "] (offset=" << failing_offset << "): "
+                                                                         << rope_combined->data()[failing_offset]);
+                            LOG_DEBUG("  This should be K[token=3, dim=96] = K[token=3, kv_head=1, dim_in_head=32]");
+                        }
+                    }
+
+                    // Only rank 0 needs to snapshot
+                    if (rank == 0)
+                    {
+                        snapshot_callback_(PipelineStage::ROPE_APPLICATION, layer_index_,
+                                           rope_combined->data(), seq_len, d_model_ + k_v_dim);
+                    }
+                }
+            } // End snapshot_callback_ guard
+
+            // ========================================================================
+            // STEP 6: Handle GQA - replicate K/V heads if needed
+            // ========================================================================
+            // IMPORTANT: For GQA, we need ALL KV heads from ALL ranks to replicate them
+            // to the query heads. The global_k_rope and global_v_rope gathered above
+            // contain all KV heads concatenated across ranks.
+            // NOW USING KV CACHE INSTEAD OF JUST CURRENT K/V!
+
+            std::shared_ptr<TensorBase> local_k_expanded, local_v_expanded;
+
+            if (n_head_ != n_head_kv_)
+            {
+                // GQA: replicate K/V heads from CACHE to match Q head count
+                // Use cache (which contains all past tokens + current token)
+                local_k_expanded = TensorFactory::create_simple({attn_seq_len, local_head_dim});
+                local_v_expanded = TensorFactory::create_simple({attn_seq_len, local_head_dim});
+
+                // First gather the full cache from all ranks if needed
+                std::shared_ptr<TensorBase> global_k_cache, global_v_cache;
+
+                if (world_size > 1)
+                {
+                    // PHASE 3+4+5 OPTIMIZATIONS: Fused KV cache gathering with count caching and zero-copy
+                    // Phase 3: Pack K+V into single buffer, gather once (2 allgatherv → 1)
+                    // Phase 4: Cache count metadata to skip MPI_Allgather on repeated calls
+                    // Phase 5: Use MPI derived datatype for zero-copy pack (eliminate memcpy)
+
+                    const int k_v_dim = n_head_kv_ * head_dim_;
+                    int sendcount_kv = 2 * attn_seq_len * local_kv_head_dim;
+
+                    // PHASE 4: Check if we can reuse cached metadata
+                    // For decode, attn_seq_len grows by 1 each step, making counts predictable
+                    // For prefill, attn_seq_len varies, so we must regather
+                    bool can_use_cached_metadata = kv_cache_metadata_initialized_ &&
+                                                   (attn_seq_len == last_attn_seq_len_ + 1); // Decode pattern
+
+                    std::vector<int> recvcounts_kv;
+                    std::vector<int> displs_kv;
+
+                    if (can_use_cached_metadata)
+                    {
+                        // PHASE 4: Reuse cached metadata (skip MPI_Allgather!)
+                        // Update cached counts for predictable growth
+                        recvcounts_kv = cached_recvcounts_kv_;
+                        displs_kv = cached_displs_kv_;
+
+// Decode growth: each rank's count increases by 2*local_kv_head_dim (one token K+V)
+#pragma omp parallel for if (world_size > 4) schedule(static)
+                        for (int r = 0; r < world_size; ++r)
+                        {
+                            recvcounts_kv[r] += 2 * local_kv_head_dim;
+                        }
+
+                        // Recalculate displacements based on updated counts
+                        int offset_kv = 0;
+                        for (int r = 0; r < world_size; ++r)
+                        {
+                            displs_kv[r] = offset_kv;
+                            offset_kv += recvcounts_kv[r];
+                        }
+
+                        // Update cache for next iteration
+                        cached_recvcounts_kv_ = recvcounts_kv;
+                        cached_displs_kv_ = displs_kv;
+                        last_attn_seq_len_ = attn_seq_len;
+
+                        if (debugEnv().attention.verbose && layer_index_ == 0)
+                        {
+                            LOG_DEBUG("[PHASE 4] Rank " << rank << ": Reused cached KV metadata (skipped MPI_Allgather)");
+                        }
+                    }
+                    else
+                    {
+                        // First call or non-predictable growth (prefill): gather counts
+                        recvcounts_kv.resize(world_size);
+                        displs_kv.resize(world_size);
+
+                        MPI_Allgather(&sendcount_kv, 1, MPI_INT, recvcounts_kv.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+                        int offset_kv = 0;
+                        for (int r = 0; r < world_size; ++r)
+                        {
+                            displs_kv[r] = offset_kv;
+                            offset_kv += recvcounts_kv[r];
+                        }
+
+                        // Initialize cache for future decode steps
+                        cached_recvcounts_kv_ = recvcounts_kv;
+                        cached_displs_kv_ = displs_kv;
+                        last_attn_seq_len_ = attn_seq_len;
+                        kv_cache_metadata_initialized_ = true;
+
+                        if (debugEnv().attention.verbose && layer_index_ == 0)
+                        {
+                            LOG_DEBUG("[PHASE 4] Rank " << rank << ": Initialized KV metadata cache");
+                        }
+                    }
+
+                    // Calculate total receive buffer size
+                    int total_kv_size = displs_kv[world_size - 1] + recvcounts_kv[world_size - 1];
+                    auto fused_kv_buffer = TensorFactory::create_simple({total_kv_size});
+
+                    // PHASE 5: Create MPI derived datatype for zero-copy K+V interleaving
+                    // This eliminates the pack memcpy by telling MPI how to gather directly from separate buffers
+                    MPI_Datatype kv_type;
+                    int blocklengths[2] = {attn_seq_len * local_kv_head_dim, attn_seq_len * local_kv_head_dim};
+                    MPI_Aint displacements[2];
+                    MPI_Get_address(local_k_cache->data(), &displacements[0]);
+                    MPI_Get_address(local_v_cache->data(), &displacements[1]);
+
+                    // Convert absolute addresses to relative offsets
+                    displacements[1] -= displacements[0];
+                    displacements[0] = 0;
+
+                    MPI_Datatype types[2] = {MPI_FLOAT, MPI_FLOAT};
+                    MPI_Type_create_struct(2, blocklengths, displacements, types, &kv_type);
+                    MPI_Type_commit(&kv_type);
+
+                    // PHASE 3+5: Single fused MPI_Allgatherv using derived datatype (zero-copy!)
+                    // Note: We send using the derived type (which reads from separate K/V buffers)
+                    // but receive into contiguous buffer (MPI handles the interleaving)
+                    MPI_Allgatherv(local_k_cache->data(), 1, kv_type,
+                                   fused_kv_buffer->data(), recvcounts_kv.data(), displs_kv.data(),
+                                   MPI_FLOAT, MPI_COMM_WORLD);
+
+                    // Clean up derived datatype
+                    MPI_Type_free(&kv_type);
+
+                    // Allocate buffers for unpacked K and V caches
+                    const int k_cache_size = total_kv_size / 2;
+                    global_k_cache = TensorFactory::create_simple({k_cache_size / head_dim_, head_dim_});
+                    global_v_cache = TensorFactory::create_simple({k_cache_size / head_dim_, head_dim_});
+
+                    // Unpack fused buffer into separate K and V tensors
+                    // Note: Cannot parallelize this loop easily because offsets depend on previous iterations
+                    // The memcpy operations are already optimized and offsets must be computed sequentially
+                    int k_offset = 0;
+                    int v_offset = 0;
+                    for (int r = 0; r < world_size; ++r)
+                    {
+                        const int rank_kv_size = recvcounts_kv[r];
+                        const int rank_k_size = rank_kv_size / 2;
+                        const int rank_v_size = rank_kv_size / 2;
+
+                        std::memcpy(global_k_cache->data() + k_offset,
+                                    fused_kv_buffer->data() + displs_kv[r],
+                                    rank_k_size * sizeof(float));
+
+                        std::memcpy(global_v_cache->data() + v_offset,
+                                    fused_kv_buffer->data() + displs_kv[r] + rank_k_size,
+                                    rank_v_size * sizeof(float));
+
+                        k_offset += rank_k_size;
+                        v_offset += rank_v_size;
+                    }
+
+                    if (debugEnv().attention.verbose && layer_index_ == 0)
+                    {
+                        LOG_DEBUG("[RANK=" << rank << "] After Phase 3+4+5 KV gather:");
+                        LOG_DEBUG("  Phase 3: Fused K+V gathering (2 allgatherv → 1)");
+                        LOG_DEBUG("  Phase 4: " << (can_use_cached_metadata ? "Cached metadata (skipped count gather)" : "Initialized metadata cache"));
+                        LOG_DEBUG("  Phase 5: Zero-copy MPI datatype (eliminated pack memcpy)");
+                        LOG_DEBUG("  global_k_cache size: " << global_k_cache->size());
+                        LOG_DEBUG("  global_v_cache size: " << global_v_cache->size());
+                    }
+                }
+                else
+                {
+                    global_k_cache = local_k_cache;
+                    global_v_cache = local_v_cache;
+                }
+
+                // CRITICAL FIX: Pass head_offset and total Q heads so GQA expansion uses correct mapping
+                // For Qwen: 14 Q heads, 2 KV heads → group_size=7
+                //   Q heads [0-6] (rank 0) → KV head 0
+                //   Q heads [7-13] (rank 1) → KV head 1
+                // Formula: kv_head = (local_h + head_offset) / (total_q_heads / n_kv_heads)
+                //
+                // OPTIMIZATION: Use gathered_rank_major=true for multi-rank to avoid transpose!
+                auto [local_kv, kv_offset] = getKVHeadDistribution();
+                llaminar::attn::expand_kv_for_gqa(
+                    global_k_cache->data(), global_v_cache->data(),
+                    local_k_expanded->data(), local_v_expanded->data(),
+                    attn_seq_len, head_dim_, local_heads, n_head_kv_, head_offset, n_head_,
+                    world_size > 1, // gathered_rank_major = true for multi-rank
+                    kv_offset);     // kv_head_offset_for_rank
+
+                // DEBUG: Log after GQA expansion (layer 0 only)
+                if (debugEnv().attention.verbose && layer_index_ == 0)
+                {
+                    LOG_DEBUG("[RANK=" << rank << "] After GQA expansion (using cache):");
+                    LOG_DEBUG("  attn_seq_len=" << attn_seq_len << " (n_past + seq_len)");
+                    LOG_DEBUG("  K_expanded shape: [" << attn_seq_len << ", " << local_head_dim << "]");
+                    LOG_DEBUG("  K_expanded[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
+                                                      << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
+
+                    float k_exp_min = *std::min_element(local_k_expanded->data(), local_k_expanded->data() + local_k_expanded->size());
+                    float k_exp_max = *std::max_element(local_k_expanded->data(), local_k_expanded->data() + local_k_expanded->size());
+                    LOG_DEBUG("  K_expanded range: [" << k_exp_min << ", " << k_exp_max << "]");
+                }
+            }
+            else
+            {
+                // MHA: no replication needed, use cache directly
+                local_k_expanded = local_k_cache;
+                local_v_expanded = local_v_cache;
+            }
+
+            // ========================================================================
+            // STEP 7: Compute attention scores and apply softmax
+            // ========================================================================
+            // CRITICAL: Now using full cache length for K dimension!
+            const int scores_size = local_heads * seq_len * attn_seq_len;
+            std::vector<float> scores(scores_size);
+
+            // IMPORTANT: For parity testing, we need to capture scores BEFORE causal masking
+            // PyTorch captures unmasked scores, then applies mask separately
+            if (snapshot_callback_)
+            {
+                // DEBUG: Log Q and K before computing scores (layer 0 only)
+                if (debugEnv().attention.verbose && layer_index_ == 0)
+                {
+                    LOG_DEBUG("[RANK=" << rank << "] Before compute_qk_scores for snapshot:");
+                    LOG_DEBUG("  local_q size=" << (local_heads * seq_len * head_dim_)
+                                                << " shape=[" << seq_len << ", " << (local_heads * head_dim_) << "]");
+                    LOG_DEBUG("  local_k_expanded size=" << (local_heads * attn_seq_len * head_dim_)
+                                                         << " shape=[" << attn_seq_len << ", " << (local_heads * head_dim_) << "]");
+                    LOG_DEBUG("  scores shape will be: [" << local_heads << ", " << seq_len << ", " << attn_seq_len << "]");
+                    LOG_DEBUG("  scores total elements: " << scores_size);
+
+                    // CRITICAL: Verify memory layout expectations
+                    LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] Q tensor layout check:");
+                    LOG_DEBUG("  Expected by compute_qk_scores: Q[token, head, dim] flattened");
+                    LOG_DEBUG("  Index formula: q[i, h, d] = q[(i * heads * head_dim) + (h * head_dim) + d]");
+                    LOG_DEBUG("  For token i=0, head h=0: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = d");
+                    LOG_DEBUG("  For token i=0, head h=1: offset = (0 * " << local_heads << " * " << head_dim_ << ") + (1 * " << head_dim_ << ") + d = " << head_dim_ << " + d");
+                    LOG_DEBUG("  For token i=1, head h=0: offset = (1 * " << local_heads << " * " << head_dim_ << ") + (0 * " << head_dim_ << ") + d = " << (local_heads * head_dim_) << " + d");
+
+                    LOG_DEBUG("  Actual Q memory layout after projection:");
+                    LOG_DEBUG("    Q[t=0, h=0, d=0:5]: "
+                              << local_q->data()[0] << ", " << local_q->data()[1] << ", "
+                              << local_q->data()[2] << ", " << local_q->data()[3] << ", "
+                              << local_q->data()[4]);
+
+                    int offset_t0_h1 = head_dim_;
+                    LOG_DEBUG("    Q[t=0, h=1, d=0:5]: "
+                              << local_q->data()[offset_t0_h1 + 0] << ", " << local_q->data()[offset_t0_h1 + 1] << ", "
+                              << local_q->data()[offset_t0_h1 + 2] << ", " << local_q->data()[offset_t0_h1 + 3] << ", "
+                              << local_q->data()[offset_t0_h1 + 4]);
+
+                    int offset_t1_h0 = local_heads * head_dim_;
+                    LOG_DEBUG("    Q[t=1, h=0, d=0:5]: "
+                              << local_q->data()[offset_t1_h0 + 0] << ", " << local_q->data()[offset_t1_h0 + 1] << ", "
+                              << local_q->data()[offset_t1_h0 + 2] << ", " << local_q->data()[offset_t1_h0 + 3] << ", "
+                              << local_q->data()[offset_t1_h0 + 4]);
+
+                    LOG_DEBUG("[MEMORY_LAYOUT_DEBUG] K_expanded tensor layout check:");
+                    LOG_DEBUG("  K[0,0:5]: " << local_k_expanded->data()[0] << " " << local_k_expanded->data()[1] << " "
+                                             << local_k_expanded->data()[2] << " " << local_k_expanded->data()[3] << " " << local_k_expanded->data()[4]);
+                    LOG_DEBUG("    K[t=0, h=0, d=0:5]: "
+                              << local_k_expanded->data()[0] << ", " << local_k_expanded->data()[1] << ", "
+                              << local_k_expanded->data()[2] << ", " << local_k_expanded->data()[3] << ", "
+                              << local_k_expanded->data()[4]);
+                    LOG_DEBUG("    K[t=0, h=1, d=0:5]: "
+                              << local_k_expanded->data()[offset_t0_h1 + 0] << ", " << local_k_expanded->data()[offset_t0_h1 + 1] << ", "
+                              << local_k_expanded->data()[offset_t0_h1 + 2] << ", " << local_k_expanded->data()[offset_t0_h1 + 3] << ", "
+                              << local_k_expanded->data()[offset_t0_h1 + 4]);
+                    LOG_DEBUG("    K[t=1, h=0, d=0:5]: "
+                              << local_k_expanded->data()[offset_t1_h0 + 0] << ", " << local_k_expanded->data()[offset_t1_h0 + 1] << ", "
+                              << local_k_expanded->data()[offset_t1_h0 + 2] << ", " << local_k_expanded->data()[offset_t1_h0 + 3] << ", "
+                              << local_k_expanded->data()[offset_t1_h0 + 4]);
+
+                    // Compute what the first score should be
+                    double test_dot = 0.0;
+                    for (int d = 0; d < head_dim_; ++d)
+                    {
+                        test_dot += local_q->data()[d] * local_k_expanded->data()[d];
+                    }
+                    float scale = 1.0f / std::sqrt((float)head_dim_);
+                    LOG_DEBUG("  Expected scores[0,0] = Q[0]·K[0]/sqrt(" << head_dim_ << ") = "
+                                                                         << test_dot << " * " << scale << " = " << (test_dot * scale));
+                }
+
+                // Compute unmasked scores for snapshot
+                std::vector<float> unmasked_scores(scores_size);
+                llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
+                                                  unmasked_scores.data(),
+                                                  seq_len, attn_seq_len, // q_seq_len, k_seq_len
+                                                  head_dim_, local_heads,
+                                                  false, false); // causal=FALSE for snapshot
+
+                // DEBUG: Log computed scores (layer 0 only)
+                if (debugEnv().attention.verbose && layer_index_ == 0)
+                {
+                    LOG_DEBUG("[RANK=" << rank << "] After compute_qk_scores:");
+                    LOG_DEBUG("  unmasked_scores[0:5]: " << unmasked_scores[0] << " " << unmasked_scores[1] << " "
+                                                         << unmasked_scores[2] << " " << unmasked_scores[3] << " " << unmasked_scores[4]);
+                }
+
+                // Gather and snapshot unmasked scores
+                if (world_size > 1)
+                {
+                    auto global_scores = std::vector<float>(n_head_ * seq_len * attn_seq_len, 0.0f);
+
+                    std::vector<int> recvcounts(world_size);
+                    std::vector<int> displs(world_size);
+
+                    int sendcount = local_heads * seq_len * attn_seq_len;
+                    MPI_Allgather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+                    int offset = 0;
+                    for (int r = 0; r < world_size; ++r)
+                    {
+                        displs[r] = offset;
+                        offset += recvcounts[r];
+                    }
+
+                    MPI_Allgatherv(unmasked_scores.data(), sendcount, MPI_FLOAT,
+                                   global_scores.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
+                                   MPI_COMM_WORLD);
+
+                    // DEBUG: Log gathered scores structure (layer 0 only)
+                    if (debugEnv().attention.verbose && layer_index_ == 0 && rank == 0)
+                    {
+                        LOG_DEBUG("[GATHERED_SCORES_DEBUG] After MPI_Allgatherv:");
+                        LOG_DEBUG("  global_scores size: " << global_scores.size() << " (expected " << (n_head_ * seq_len * attn_seq_len) << ")");
+                        LOG_DEBUG("  Will snapshot as [" << (n_head_ * seq_len) << " x " << attn_seq_len << "]");
+                        LOG_DEBUG("  Rank 0 contributed: " << recvcounts[0] << " elements (heads 0-" << (local_heads - 1) << ")");
+                        LOG_DEBUG("  Rank 1 contributed: " << recvcounts[1] << " elements (heads " << local_heads << "-" << (n_head_ - 1) << ")");
+                        LOG_DEBUG("  Rank 0 offset: " << displs[0]);
+                        LOG_DEBUG("  Rank 1 offset: " << displs[1]);
+                        LOG_DEBUG("  First 10 elements: ");
+                        for (int i = 0; i < std::min(10, (int)global_scores.size()); ++i)
+                        {
+                            LOG_DEBUG("    global_scores[" << i << "] = " << global_scores[i]);
+                        }
+
+                        // Interpret as 2D: [n_head * seq_len, attn_seq_len]
+                        // Row 0 = head 0, token 0 (first attn_seq_len elements)
+                        LOG_DEBUG("  Row 0 (head 0, token 0): " << global_scores[0] << " " << global_scores[1] << " "
+                                                                << global_scores[2] << " " << global_scores[3] << " " << global_scores[4]);
+                        // Row 1 = head 0, token 1
+                        LOG_DEBUG("  Row 1 (head 0, token 1): " << global_scores[5] << " " << global_scores[6] << " "
+                                                                << global_scores[7] << " " << global_scores[8] << " " << global_scores[9]);
+
+                        // Also show what we EXPECT PyTorch to have:
+                        LOG_DEBUG("  Expected PyTorch row 0 should match our row 0");
+                        LOG_DEBUG("  Expected PyTorch row 1 should match our row 1");
+                    }
+
+                    if (rank == 0)
+                    {
+                        snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, global_scores.data(),
+                                           n_head_ * seq_len, attn_seq_len); // rows, cols
+                    }
+                }
+                else
+                {
+                    snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, unmasked_scores.data(),
+                                       local_heads * seq_len, attn_seq_len); // rows, cols
                 }
             }
 
-            LOG_DEBUG("✓ Output projection validated");
-        }
+            // Now compute MASKED scores for actual attention (causal masking, scaling, NO softmax)
+            llaminar::attn::compute_qk_scores(local_q->data(), local_k_expanded->data(),
+                                              scores.data(), seq_len, attn_seq_len,
+                                              head_dim_, local_heads,
+                                              true, // causal=TRUE for actual computation
+                                              false // no softmax yet
+            );
 
-        // Aggregate across ranks if multi-rank
-        if (world_size > 1)
-        {
-            MPI_Allreduce(MPI_IN_PLACE, local_output->data(), local_output->size(),
-                          MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-        }
-
-        // Snapshot final attention output (after output projection and MPI reduction)
-        if (snapshot_callback_ && rank == 0)
-        {
-            snapshot_callback_(PipelineStage::ATTENTION_OUTPUT, layer_index_, local_output->data(),
-                               seq_len, d_model);
-        }
-
-        if (rank == 0)
-        {
-            LOG_DEBUG("[kernel-test] rank " << rank << " final_output[0,0:4]: "
-                                            << local_output->data()[0] << ", " << local_output->data()[1] << ", "
-                                            << local_output->data()[2] << ", " << local_output->data()[3]);
-        }
-
-        // Contract: Validate final output after MPI aggregation
-        if (enable_validation && rank == 0)
-        {
-            StageContract final_contract("FinalOutput");
-            final_contract.outputs = {
-                TensorContract("final_output",
-                               ShapeSpec({seq_len, d_model}),
-                               TensorLayout::RowMajor,
-                               TensorSemantic::Activation)};
-            final_contract.validate_outputs({local_output});
-
-            TensorHealthCheck final_health("final_output");
-            final_health.check(local_output->data(), local_output->size());
-            final_health.log(rank);
-
-            if (!final_health.is_healthy())
+            // DEBUG: Log masked scores for layer 0
+            if (debugEnv().attention.verbose && layer_index_ == 0 && rank == 0)
             {
-                LOG_ERROR("❌ Final output after MPI aggregation contains NaN/Inf!");
-                return false;
+                LOG_DEBUG("[MASKED_SCORES_DEBUG] Layer 0, AFTER compute_qk_scores with causal=TRUE:");
+                LOG_DEBUG("  Head 0, scores[0:6]: " << scores[0] << " " << scores[1] << " "
+                                                    << scores[2] << " " << scores[3] << " " << scores[4] << " " << scores[5]);
             }
 
-            LOG_DEBUG("✓ Final output validated - attention kernel complete");
-        }
-
-        // Copy to output tensor
-        if (outputs.empty())
-        {
-            outputs.push_back(TensorFactory::create_simple({seq_len, d_model}));
-            outputs.push_back(TensorFactory::create_simple(local_k_cache->shape()));
-            outputs.push_back(TensorFactory::create_simple(local_v_cache->shape()));
-        }
-        else if (outputs.size() == 1)
-        {
-            // Legacy: only attention output was expected, add cache outputs
-            outputs.push_back(TensorFactory::create_simple(local_k_cache->shape()));
-            outputs.push_back(TensorFactory::create_simple(local_v_cache->shape()));
-        }
-        else if (outputs.size() >= 3)
-        {
-            // Ensure cache output tensors are created if nullptr
-            if (!outputs[1])
+            // Contract: Validate attention scores (raw QK^T)
+            if (enable_validation && rank == 0)
             {
-                outputs[1] = TensorFactory::create_simple(local_k_cache->shape());
+                TensorHealthCheck scores_health("scores_pre_softmax");
+                scores_health.check(scores.data(), scores.size());
+                scores_health.log(rank);
+
+                // Note: -inf values are EXPECTED in causal positions
+                if (scores_health.nan_count > 0)
+                {
+                    LOG_ERROR("❌ Attention scores contain NaN (unexpected)");
+                    return false;
+                }
+                if (scores_health.inf_count == 0 && seq_len > 1)
+                {
+                    LOG_WARN("⚠️ Expected -inf in causal mask positions but found none");
+                }
+                LOG_DEBUG("✓ Attention scores validated (inf_count=" << scores_health.inf_count << " expected for causal masking)");
             }
-            if (!outputs[2])
+
+            // Apply softmax to each head (sequential loop - softmax_row_major parallelizes internally)
+            // CRITICAL FIX: In incremental decode (seq_len=1), disable causal masking because
+            // the query token is attending to the full cache which only contains PAST tokens.
+            // Causal masking with rows=1 would incorrectly mask based on relative position (row 0 -> mask all c > 0).
+            const bool use_causal_mask = (seq_len > 1); // Only use causal mask in prefill/batch mode
+
+#pragma omp parallel for if (local_heads > 1) schedule(static)
+            for (int h = 0; h < local_heads; ++h)
             {
-                outputs[2] = TensorFactory::create_simple(local_v_cache->shape());
+                llaminar::kernels::SoftmaxRowArgs args;
+                args.scores = scores.data() + static_cast<size_t>(h) * seq_len * attn_seq_len;
+                args.rows = seq_len;
+                args.cols = attn_seq_len;
+                args.causal = use_causal_mask; // FIX: Disable for incremental decode
+                args.scale = 1.0f;
+
+                // DEBUG: Log scores before softmax for layer 0, head 0
+                if (debugEnv().attention.verbose && layer_index_ == 0 && h == 0 && rank == 0)
+                {
+                    LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, BEFORE softmax:");
+                    LOG_DEBUG("  seq_len=" << seq_len << " attn_seq_len=" << attn_seq_len << " use_causal=" << use_causal_mask);
+                    LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
+                                                << args.scores[2] << " " << args.scores[3] << " "
+                                                << args.scores[4] << " " << args.scores[5]);
+                }
+
+                llaminar::kernels::softmax_row_major(args);
+
+                // DEBUG: Log scores after softmax for layer 0, head 0
+                if (debugEnv().attention.verbose && layer_index_ == 0 && h == 0 && rank == 0)
+                {
+                    LOG_DEBUG("[SOFTMAX_DEBUG] Layer 0, Head 0, AFTER softmax:");
+                    LOG_DEBUG("  scores[0:6]: " << args.scores[0] << " " << args.scores[1] << " "
+                                                << args.scores[2] << " " << args.scores[3] << " "
+                                                << args.scores[4] << " " << args.scores[5]);
+                    float sum = 0.0f;
+                    for (int i = 0; i < attn_seq_len; ++i)
+                        sum += args.scores[i];
+                    LOG_DEBUG("  Sum (should be ~1.0): " << sum);
+                }
             }
+
+            // Snapshot scores AFTER softmax
+            if (snapshot_callback_)
+            {
+                if (world_size > 1)
+                {
+                    // Gather softmax scores across ranks: [local_heads, seq_len, attn_seq_len] -> [n_head, seq_len, attn_seq_len]
+                    auto global_softmax = std::vector<float>(n_head_ * seq_len * attn_seq_len, 0.0f);
+
+                    std::vector<int> recvcounts(world_size);
+                    std::vector<int> displs(world_size);
+
+                    int sendcount = local_heads * seq_len * attn_seq_len;
+                    MPI_Allgather(&sendcount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+                    int offset = 0;
+                    for (int r = 0; r < world_size; ++r)
+                    {
+                        displs[r] = offset;
+                        offset += recvcounts[r];
+                    }
+
+                    MPI_Allgatherv(scores.data(), sendcount, MPI_FLOAT,
+                                   global_softmax.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
+                                   MPI_COMM_WORLD);
+
+                    if (rank == 0)
+                    {
+                        snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, global_softmax.data(),
+                                           n_head_ * seq_len, attn_seq_len);
+                    }
+                }
+                else
+                {
+                    snapshot_callback_(PipelineStage::ATTENTION_SOFTMAX, layer_index_, scores.data(),
+                                       local_heads * seq_len, attn_seq_len);
+                }
+            }
+
+            // Contract: Validate attention probabilities (after softmax)
+            if (enable_validation && rank == 0)
+            {
+                TensorHealthCheck probs_health("attention_probs");
+                probs_health.check(scores.data(), scores.size());
+                probs_health.log(rank);
+
+                if (!probs_health.is_healthy())
+                {
+                    LOG_ERROR("❌ Softmax produced NaN/Inf probabilities!");
+                    return false;
+                }
+
+                // Verify probability constraints: values in [0, 1], rows sum to ~1.0
+                bool valid_probs = true;
+                for (int h = 0; h < local_heads; ++h)
+                {
+                    for (int r = 0; r < seq_len; ++r)
+                    {
+                        float row_sum = 0.0f;
+                        const float *row = scores.data() + h * seq_len * attn_seq_len + r * attn_seq_len;
+                        for (int c = 0; c < attn_seq_len; ++c)
+                        {
+                            if (row[c] < 0.0f || row[c] > 1.0f)
+                            {
+                                LOG_ERROR("Invalid probability at head=" << h << " row=" << r << " col=" << c << ": " << row[c]);
+                                valid_probs = false;
+                            }
+                            row_sum += row[c];
+                        }
+                        // Allow slight numerical error in sum
+                        if (std::abs(row_sum - 1.0f) > 1e-4f && r < seq_len)
+                        { // Only check non-masked rows
+                            LOG_WARN("Row sum deviation at head=" << h << " row=" << r << ": sum=" << row_sum);
+                        }
+                    }
+                }
+
+                if (!valid_probs)
+                {
+                    LOG_ERROR("❌ Probability constraints violated!");
+                    return false;
+                }
+                LOG_DEBUG("✓ Attention probabilities validated (all in [0,1], rows sum to 1.0)");
+            }
+
+            // ========================================================================
+            // STEP 6b: Apply attention scores to V
+            // ========================================================================
+            auto local_attended = TensorFactory::create_simple({seq_len, local_head_dim});
+
+            llaminar::attn::apply_scores_to_v(scores.data(), local_v_expanded->data(),
+                                              local_attended->data(), seq_len, attn_seq_len,
+                                              head_dim_, local_heads);
+
+            // Contract: Validate attended output (scores @ V)
+            if (enable_validation && rank == 0)
+            {
+                StageContract attended_contract("AttendedOutput");
+                attended_contract.outputs = {
+                    TensorContract("attended",
+                                   ShapeSpec({seq_len, local_head_dim}),
+                                   TensorLayout::RowMajor,
+                                   TensorSemantic::Activation)};
+                attended_contract.validate_outputs({local_attended});
+
+                TensorHealthCheck attended_health("attended_output");
+                attended_health.check(local_attended->data(), local_attended->size());
+                attended_health.log(rank);
+
+                if (!attended_health.is_healthy())
+                {
+                    LOG_ERROR("❌ Attended output (scores @ V) contains NaN/Inf!");
+                    return false;
+                }
+                LOG_DEBUG("✓ Attended output validated");
+            }
+
+            // Snapshot attended values (ATTENTION_CONTEXT: scores @ V before output projection)
+            if (snapshot_callback_)
+            {
+                if (world_size > 1)
+                {
+                    // Gather attended output across ranks
+                    // Each rank has [seq_len, local_head_dim], need [seq_len, n_head * head_dim]
+                    auto global_attended = TensorFactory::create_simple({seq_len, n_head_ * head_dim_});
+
+                    // Gather row-by-row to maintain proper layout (same as Q/K/V)
+                    for (int t = 0; t < seq_len; ++t)
+                    {
+                        const float *local_attended_row = local_attended->data() + t * local_head_dim;
+                        float *global_attended_row = global_attended->data() + t * (n_head_ * head_dim_);
+
+                        MPI_Allgather(local_attended_row, local_head_dim, MPI_FLOAT,
+                                      global_attended_row, local_head_dim, MPI_FLOAT,
+                                      MPI_COMM_WORLD);
+                    }
+
+                    if (rank == 0)
+                    {
+                        snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, layer_index_, global_attended->data(),
+                                           seq_len, n_head_ * head_dim_);
+                    }
+                }
+                else
+                {
+                    snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, layer_index_, local_attended->data(),
+                                       seq_len, local_head_dim);
+                }
+            }
+
+            if (debugEnv().attention.verbose && rank == 0)
+            {
+                LOG_DEBUG("[kernel-test] rank " << rank << " local_attended[0,0:4]: "
+                                                << local_attended->data()[0] << ", " << local_attended->data()[1] << ", "
+                                                << local_attended->data()[2] << ", " << local_attended->data()[3]);
+            }
+
+            // ========================================================================
+            // STEP 7: Output projection + MPI gather
+            // ========================================================================
+            auto local_output = TensorFactory::create_simple({seq_len, d_model});
+
+            // Output projection: local_attended @ wo^T
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        seq_len, d_model, local_head_dim,
+                        1.0f, local_attended->data(), local_head_dim,
+                        local_wo->data(), local_head_dim,
+                        0.0f, local_output->data(), d_model);
+
+            // Contract: Validate output projection
+            if (enable_validation && rank == 0)
+            {
+                StageContract output_contract("OutputProjection");
+                output_contract.outputs = {
+                    TensorContract("local_output",
+                                   ShapeSpec({seq_len, d_model}),
+                                   TensorLayout::RowMajor,
+                                   TensorSemantic::Activation)};
+                output_contract.validate_outputs({local_output});
+
+                TensorHealthCheck output_health("output_projection");
+                output_health.check(local_output->data(), local_output->size());
+                output_health.log(rank);
+
+                if (!output_health.is_healthy())
+                {
+                    LOG_ERROR("❌ Output projection contains NaN/Inf!");
+                    return false;
+                }
+
+                // Optional: Deep validation against scalar reference
+                if (validate_projections)
+                {
+                    auto result = llaminar::attention::AttentionValidator::validateProjection(
+                        local_attended->data(), local_wo->data(), local_output->data(),
+                        seq_len, d_model, local_head_dim,
+                        false // wo is already transposed for gemm
+                    );
+
+                    if (!llaminar::attention::AttentionValidator::isWithinTolerance(result, 1e-4f, 1e-4f))
+                    {
+                        LOG_WARN("⚠️ Output projection divergence: max_abs=" << result.max_abs
+                                                                            << " rel_l2=" << result.rel_l2);
+                    }
+                    else
+                    {
+                        LOG_DEBUG("✓ Output projection matches scalar reference");
+                    }
+                }
+
+                LOG_DEBUG("✓ Output projection validated");
+            }
+
+            // Aggregate across ranks if multi-rank
+            if (world_size > 1)
+            {
+                MPI_Allreduce(MPI_IN_PLACE, local_output->data(), local_output->size(),
+                              MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+            }
+
+            // Snapshot final attention output (after output projection and MPI reduction)
+            if (snapshot_callback_ && rank == 0)
+            {
+                snapshot_callback_(PipelineStage::ATTENTION_OUTPUT, layer_index_, local_output->data(),
+                                   seq_len, d_model);
+            }
+
+            if (debugEnv().attention.verbose && rank == 0)
+            {
+                LOG_DEBUG("[kernel-test] rank " << rank << " final_output[0,0:4]: "
+                                                << local_output->data()[0] << ", " << local_output->data()[1] << ", "
+                                                << local_output->data()[2] << ", " << local_output->data()[3]);
+            }
+
+            // Contract: Validate final output after MPI aggregation
+            if (enable_validation && rank == 0)
+            {
+                StageContract final_contract("FinalOutput");
+                final_contract.outputs = {
+                    TensorContract("final_output",
+                                   ShapeSpec({seq_len, d_model}),
+                                   TensorLayout::RowMajor,
+                                   TensorSemantic::Activation)};
+                final_contract.validate_outputs({local_output});
+
+                TensorHealthCheck final_health("final_output");
+                final_health.check(local_output->data(), local_output->size());
+                final_health.log(rank);
+
+                if (!final_health.is_healthy())
+                {
+                    LOG_ERROR("❌ Final output after MPI aggregation contains NaN/Inf!");
+                    return false;
+                }
+
+                LOG_DEBUG("✓ Final output validated - attention kernel complete");
+            }
+
+            // Copy to output tensor
+            if (outputs.empty())
+            {
+                outputs.push_back(TensorFactory::create_simple({seq_len, d_model}));
+                outputs.push_back(TensorFactory::create_simple(local_k_cache->shape()));
+                outputs.push_back(TensorFactory::create_simple(local_v_cache->shape()));
+            }
+            else if (outputs.size() == 1)
+            {
+                // Legacy: only attention output was expected, add cache outputs
+                outputs.push_back(TensorFactory::create_simple(local_k_cache->shape()));
+                outputs.push_back(TensorFactory::create_simple(local_v_cache->shape()));
+            }
+            else if (outputs.size() >= 3)
+            {
+                // Ensure cache output tensors are created if nullptr
+                if (!outputs[1])
+                {
+                    outputs[1] = TensorFactory::create_simple(local_k_cache->shape());
+                }
+                if (!outputs[2])
+                {
+                    outputs[2] = TensorFactory::create_simple(local_v_cache->shape());
+                }
+            }
+
+            // outputs[0] = attention output
+            memcpy(outputs[0]->data(), local_output->data(), seq_len * d_model * sizeof(float));
+
+            if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
+            {
+                LOG_DEBUG("[CACHE_RETURN_DEBUG] Before copying to outputs:");
+                LOG_DEBUG("  local_k_cache shape: [" << local_k_cache->shape()[0] << ", " << local_k_cache->shape()[1] << "]");
+                LOG_DEBUG("  local_k_cache first 10: "
+                          << local_k_cache->data()[0] << " " << local_k_cache->data()[1] << " "
+                          << local_k_cache->data()[2] << " " << local_k_cache->data()[3] << " "
+                          << local_k_cache->data()[4] << " " << local_k_cache->data()[5] << " "
+                          << local_k_cache->data()[6] << " " << local_k_cache->data()[7] << " "
+                          << local_k_cache->data()[8] << " " << local_k_cache->data()[9]);
+                LOG_DEBUG("  outputs[1] shape: [" << outputs[1]->shape()[0] << ", " << outputs[1]->shape()[1] << "]");
+                LOG_DEBUG("  outputs[1] before copy: "
+                          << outputs[1]->data()[0] << " " << outputs[1]->data()[1] << " "
+                          << outputs[1]->data()[2] << " " << outputs[1]->data()[3] << " "
+                          << outputs[1]->data()[4] << " " << outputs[1]->data()[5] << " "
+                          << outputs[1]->data()[6] << " " << outputs[1]->data()[7] << " "
+                          << outputs[1]->data()[8] << " " << outputs[1]->data()[9]);
+            }
+
+            // outputs[1] = updated K cache (local portion for this rank's KV heads)
+            memcpy(outputs[1]->data(), local_k_cache->data(), local_k_cache->size() * sizeof(float));
+
+            // outputs[2] = updated V cache (local portion for this rank's KV heads)
+            memcpy(outputs[2]->data(), local_v_cache->data(), local_v_cache->size() * sizeof(float));
+
+            if (debugEnv().attention.verbose && rank == 0 && layer_index_ == 0)
+            {
+                LOG_DEBUG("[CACHE_RETURN_DEBUG] After copying to outputs:");
+                LOG_DEBUG("  outputs[1] after copy: "
+                          << outputs[1]->data()[0] << " " << outputs[1]->data()[1] << " "
+                          << outputs[1]->data()[2] << " " << outputs[1]->data()[3] << " "
+                          << outputs[1]->data()[4] << " " << outputs[1]->data()[5] << " "
+                          << outputs[1]->data()[6] << " " << outputs[1]->data()[7] << " "
+                          << outputs[1]->data()[8] << " " << outputs[1]->data()[9]);
+            }
+
+            if (rank == 0 && debugEnv().attention.micro_trace)
+            {
+                LOG_DEBUG("[KVCacheReturn] layer=" << layer_index_
+                                                   << " k_cache_shape=[" << local_k_cache->shape()[0] << "," << local_k_cache->shape()[1] << "]"
+                                                   << " v_cache_shape=[" << local_v_cache->shape()[0] << "," << local_v_cache->shape()[1] << "]"
+                                                   << " attn_seq_len=" << attn_seq_len);
+            }
+
+            return true;
         }
-
-        // outputs[0] = attention output
-        memcpy(outputs[0]->data(), local_output->data(), seq_len * d_model * sizeof(float));
-
-        if (rank == 0 && layer_index_ == 0)
-        {
-            LOG_DEBUG("[CACHE_RETURN_DEBUG] Before copying to outputs:");
-            LOG_DEBUG("  local_k_cache shape: [" << local_k_cache->shape()[0] << ", " << local_k_cache->shape()[1] << "]");
-            LOG_DEBUG("  local_k_cache first 10: "
-                     << local_k_cache->data()[0] << " " << local_k_cache->data()[1] << " "
-                     << local_k_cache->data()[2] << " " << local_k_cache->data()[3] << " "
-                     << local_k_cache->data()[4] << " " << local_k_cache->data()[5] << " "
-                     << local_k_cache->data()[6] << " " << local_k_cache->data()[7] << " "
-                     << local_k_cache->data()[8] << " " << local_k_cache->data()[9]);
-            LOG_DEBUG("  outputs[1] shape: [" << outputs[1]->shape()[0] << ", " << outputs[1]->shape()[1] << "]");
-            LOG_DEBUG("  outputs[1] before copy: "
-                     << outputs[1]->data()[0] << " " << outputs[1]->data()[1] << " "
-                     << outputs[1]->data()[2] << " " << outputs[1]->data()[3] << " "
-                     << outputs[1]->data()[4] << " " << outputs[1]->data()[5] << " "
-                     << outputs[1]->data()[6] << " " << outputs[1]->data()[7] << " "
-                     << outputs[1]->data()[8] << " " << outputs[1]->data()[9]);
-        }
-
-        // outputs[1] = updated K cache (local portion for this rank's KV heads)
-        memcpy(outputs[1]->data(), local_k_cache->data(), local_k_cache->size() * sizeof(float));
-
-        // outputs[2] = updated V cache (local portion for this rank's KV heads)
-        memcpy(outputs[2]->data(), local_v_cache->data(), local_v_cache->size() * sizeof(float));
-
-        if (rank == 0 && layer_index_ == 0)
-        {
-            LOG_DEBUG("[CACHE_RETURN_DEBUG] After copying to outputs:");
-            LOG_DEBUG("  outputs[1] after copy: "
-                     << outputs[1]->data()[0] << " " << outputs[1]->data()[1] << " "
-                     << outputs[1]->data()[2] << " " << outputs[1]->data()[3] << " "
-                     << outputs[1]->data()[4] << " " << outputs[1]->data()[5] << " "
-                     << outputs[1]->data()[6] << " " << outputs[1]->data()[7] << " "
-                     << outputs[1]->data()[8] << " " << outputs[1]->data()[9]);
-        }
-
-        if (rank == 0 && debugEnv().attention.micro_trace)
-        {
-            LOG_DEBUG("[KVCacheReturn] layer=" << layer_index_
-                                               << " k_cache_shape=[" << local_k_cache->shape()[0] << "," << local_k_cache->shape()[1] << "]"
-                                               << " v_cache_shape=[" << local_v_cache->shape()[0] << "," << local_v_cache->shape()[1] << "]"
-                                               << " attn_seq_len=" << attn_seq_len);
-        }
-
-        return true;
     }
-
 } // namespace llaminar

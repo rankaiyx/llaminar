@@ -592,7 +592,8 @@ namespace llaminar::attn
     void expand_kv_for_gqa(const float *k_compact, const float *v_compact,
                            float *k_expanded, float *v_expanded,
                            int seq_len, int head_dim, int n_heads, int n_kv_heads,
-                           int head_offset, int total_q_heads)
+                           int head_offset, int total_q_heads,
+                           bool gathered_rank_major, int kv_head_offset_for_rank)
     {
         // Each KV head serves a group of consecutive Q heads
         // For Qwen: 14 Q heads, 2 KV heads → group_size = 14/2 = 7
@@ -604,6 +605,15 @@ namespace llaminar::attn
         //   global_h = local_h + head_offset
         //   total_q_heads = global count of Q heads
         //   group_size = total_q_heads / n_kv_heads
+        //
+        // LAYOUT HANDLING:
+        // - gathered_rank_major=false (default): Time-major layout
+        //   [t=0: kv_head=0..n_kv_heads] [t=1: kv_head=0..n_kv_heads] ...
+        //   Source index: t * n_kv_heads * head_dim + kv_head * head_dim
+        //
+        // - gathered_rank_major=true: Rank-major layout from MPI_Allgatherv (NO TRANSPOSE!)
+        //   [Rank0: t=0..T, local_kv_heads] [Rank1: t=0..T, local_kv_heads] ...
+        //   Need to compute which rank owns the target kv_head, then index into that rank's block
 
         // Infer total_q_heads if not provided
         if (total_q_heads < 0)
@@ -614,22 +624,79 @@ namespace llaminar::attn
 
         const int group_size = total_q_heads / n_kv_heads;
 
-#pragma omp parallel for schedule(static)
-        for (int t = 0; t < seq_len; ++t)
+        if (!gathered_rank_major)
         {
-            for (int h = 0; h < n_heads; ++h)
+            // FAST PATH: Time-major layout (single-rank or already transposed)
+#pragma omp parallel for schedule(static)
+            for (int t = 0; t < seq_len; ++t)
             {
-                const int global_h = h + head_offset;
-                const int kv_head = global_h / group_size;
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const int global_h = h + head_offset;
+                    const int kv_head = global_h / group_size;
 
-                const float *k_src = k_compact + (size_t)t * n_kv_heads * head_dim + (size_t)kv_head * head_dim;
-                const float *v_src = v_compact + (size_t)t * n_kv_heads * head_dim + (size_t)kv_head * head_dim;
+                    const float *k_src = k_compact + (size_t)t * n_kv_heads * head_dim + (size_t)kv_head * head_dim;
+                    const float *v_src = v_compact + (size_t)t * n_kv_heads * head_dim + (size_t)kv_head * head_dim;
 
-                float *k_dst = k_expanded + (size_t)t * n_heads * head_dim + (size_t)h * head_dim;
-                float *v_dst = v_expanded + (size_t)t * n_heads * head_dim + (size_t)h * head_dim;
+                    float *k_dst = k_expanded + (size_t)t * n_heads * head_dim + (size_t)h * head_dim;
+                    float *v_dst = v_expanded + (size_t)t * n_heads * head_dim + (size_t)h * head_dim;
 
-                std::memcpy(k_dst, k_src, head_dim * sizeof(float));
-                std::memcpy(v_dst, v_src, head_dim * sizeof(float));
+                    std::memcpy(k_dst, k_src, head_dim * sizeof(float));
+                    std::memcpy(v_dst, v_src, head_dim * sizeof(float));
+                }
+            }
+        }
+        else
+        {
+            // RANK-MAJOR LAYOUT: Direct indexing without transpose
+            // Gathered data layout: [Rank0: seq_len * local_kv_dim] [Rank1: seq_len * local_kv_dim] ...
+            // We need to know which rank owns each KV head and index accordingly
+            //
+            // For this rank's Q heads, determine which KV head each needs (via group_size),
+            // then find that KV head in the gathered buffer.
+            //
+            // Assumption: KV heads are evenly distributed across ranks in order
+            // E.g., 2 KV heads, 2 ranks: Rank0 has KV head 0, Rank1 has KV head 1
+            //
+            // Since we gathered with MPI_Allgatherv, the buffer structure is:
+            //   [Rank0: t=0..T, kv_head=kv_head_offset_for_rank..kv_head_offset_for_rank+local_kv_heads-1]
+            //   [Rank1: t=0..T, kv_head=...]
+            //   ...
+            //
+            // Strategy: For each needed kv_head, compute which rank block it's in and the offset within that block
+
+#pragma omp parallel for schedule(static)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const int global_h = h + head_offset;
+                    const int kv_head = global_h / group_size; // Global KV head index [0..n_kv_heads-1]
+
+                    // Find source in rank-major layout
+                    // Assume uniform distribution: each rank gets roughly n_kv_heads / world_size KV heads
+                    // For simplicity with current architecture, assume each rank gets exactly 1 KV head (world_size == n_kv_heads)
+                    // This is the case for our 2-rank, 2-KV-head scenario.
+                    //
+                    // General formula: rank_owning_kv = kv_head (when world_size == n_kv_heads)
+                    // local_kv_index_in_rank = 0 (when each rank has 1 KV head)
+                    //
+                    // For gathered buffer with uniform 1 KV head per rank:
+                    //   Rank r contributes seq_len * 1 * head_dim floats at offset r * seq_len * head_dim
+                    //   Within rank r's block: timestep t is at offset t * head_dim
+                    //
+                    // Source index = kv_head * seq_len * head_dim + t * head_dim
+
+                    const size_t src_offset = (size_t)kv_head * seq_len * head_dim + (size_t)t * head_dim;
+                    const float *k_src = k_compact + src_offset;
+                    const float *v_src = v_compact + src_offset;
+
+                    float *k_dst = k_expanded + (size_t)t * n_heads * head_dim + (size_t)h * head_dim;
+                    float *v_dst = v_expanded + (size_t)t * n_heads * head_dim + (size_t)h * head_dim;
+
+                    std::memcpy(k_dst, k_src, head_dim * sizeof(float));
+                    std::memcpy(v_dst, v_src, head_dim * sizeof(float));
+                }
             }
         }
     }

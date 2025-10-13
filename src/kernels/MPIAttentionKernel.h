@@ -362,6 +362,18 @@ namespace llaminar
         StageContract contract_output_projection_; ///< Stage 5: Output projection
 
         // ========================================================================
+        // PHASE 4 & 5 MPI OPTIMIZATIONS: Cached metadata and zero-copy datatypes
+        // ========================================================================
+        // Phase 4: Cache count gather results for predictable decode growth
+        // Phase 5: Use MPI derived datatypes to eliminate pack/unpack memcpy
+
+        bool kv_cache_metadata_initialized_ = false;           ///< Whether cached metadata is valid
+        int last_attn_seq_len_ = -1;                           ///< Last seen attn_seq_len for cache invalidation
+        std::vector<int> cached_recvcounts_kv_;                ///< Cached receive counts from last gather
+        std::vector<int> cached_displs_kv_;                    ///< Cached displacements from last gather
+        MPI_Datatype kv_interleaved_type_ = MPI_DATATYPE_NULL; ///< Phase 5: Derived type for K+V interleaving
+
+        // ========================================================================
         // COSMA BACKEND SUPPORT (Optional)
         // ========================================================================
         CosmaPrefillManager *cosma_mgr_ = nullptr; ///< Optional COSMA backend for distributed matmul

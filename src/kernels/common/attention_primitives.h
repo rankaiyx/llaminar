@@ -53,8 +53,10 @@ namespace llaminar::attn
      * Maps n_kv_heads to n_heads by replicating each KV head group.
      * Parallelized with OpenMP over sequence positions for optimal performance.
      *
-     * @param k_compact Input K tensor [seq_len, n_kv_heads * head_dim] row-major
-     * @param v_compact Input V tensor [seq_len, n_kv_heads * head_dim] row-major
+     * @param k_compact Input K tensor - layout depends on gathered_rank_major:
+     *                  - If false (default): [seq_len, n_kv_heads * head_dim] time-major
+     *                  - If true: [rank0: seq_len * kv_heads, rank1: seq_len * kv_heads, ...] rank-major
+     * @param v_compact Input V tensor (same layout as k_compact)
      * @param k_expanded Output K tensor [seq_len, n_heads * head_dim] row-major
      * @param v_expanded Output V tensor [seq_len, n_heads * head_dim] row-major
      * @param seq_len Sequence length
@@ -63,6 +65,8 @@ namespace llaminar::attn
      * @param n_kv_heads Number of key/value heads (GLOBAL count, always)
      * @param head_offset Global head offset for this rank (0 for single-rank)
      * @param total_q_heads Total number of Q heads across ALL ranks (GLOBAL count)
+     * @param gathered_rank_major If true, input is in rank-major layout from MPI_Allgatherv (no transpose needed)
+     * @param kv_head_offset_for_rank KV head offset for this rank (used only when gathered_rank_major=true)
      */
     void expand_kv_for_gqa(
         const float *k_compact,
@@ -74,7 +78,9 @@ namespace llaminar::attn
         int n_heads,
         int n_kv_heads,
         int head_offset = 0,
-        int total_q_heads = -1);
+        int total_q_heads = -1,
+        bool gathered_rank_major = false,
+        int kv_head_offset_for_rank = 0);
 
     /**
      * @brief Expand KV for Multi-Head Attention (MHA)
