@@ -2054,6 +2054,35 @@ namespace llaminar
                                global_scores.data(), recvcounts.data(), displs.data(), MPI_FLOAT,
                                MPI_COMM_WORLD);
 
+                // DEBUG: Log gathered scores structure (layer 0 only)
+                if (layer_index_ == 0 && rank == 0)
+                {
+                    LOG_INFO("[GATHERED_SCORES_DEBUG] After MPI_Allgatherv:");
+                    LOG_INFO("  global_scores size: " << global_scores.size() << " (expected " << (n_head_ * seq_len * attn_seq_len) << ")");
+                    LOG_INFO("  Will snapshot as [" << (n_head_ * seq_len) << " x " << attn_seq_len << "]");
+                    LOG_INFO("  Rank 0 contributed: " << recvcounts[0] << " elements (heads 0-" << (local_heads - 1) << ")");
+                    LOG_INFO("  Rank 1 contributed: " << recvcounts[1] << " elements (heads " << local_heads << "-" << (n_head_ - 1) << ")");
+                    LOG_INFO("  Rank 0 offset: " << displs[0]);
+                    LOG_INFO("  Rank 1 offset: " << displs[1]);
+                    LOG_INFO("  First 10 elements: ");
+                    for (int i = 0; i < std::min(10, (int)global_scores.size()); ++i)
+                    {
+                        LOG_INFO("    global_scores[" << i << "] = " << global_scores[i]);
+                    }
+
+                    // Interpret as 2D: [n_head * seq_len, attn_seq_len]
+                    // Row 0 = head 0, token 0 (first attn_seq_len elements)
+                    LOG_INFO("  Row 0 (head 0, token 0): " << global_scores[0] << " " << global_scores[1] << " "
+                                                           << global_scores[2] << " " << global_scores[3] << " " << global_scores[4]);
+                    // Row 1 = head 0, token 1
+                    LOG_INFO("  Row 1 (head 0, token 1): " << global_scores[5] << " " << global_scores[6] << " "
+                                                           << global_scores[7] << " " << global_scores[8] << " " << global_scores[9]);
+
+                    // Also show what we EXPECT PyTorch to have:
+                    LOG_INFO("  Expected PyTorch row 0 should match our row 0");
+                    LOG_INFO("  Expected PyTorch row 1 should match our row 1");
+                }
+
                 if (rank == 0)
                 {
                     snapshot_callback_(PipelineStage::ATTENTION_SCORES, layer_index_, global_scores.data(),
