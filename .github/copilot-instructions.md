@@ -148,7 +148,10 @@ ctest --test-dir build --output-on-failure --parallel \
 
 # Parity Integration (180s) (Long running, verbose test suite - use `tee` and grep details from the logfile)
 ctest --test-dir build --output-on-failure --verbose \
-  -R "(ParityFrameworkTest|AbstractPipelineParity)" 2>&1 | tee test_output.log | tail -50
+  -R "(ParityFrameworkTest|AbstractPipelineParity)" 2>&1 | tee test_output.log | tail -150
+
+# Parity Integration (180s) with a GTEST filter to target only PyTorch parity tests in the suite:
+GTEST_FILTER="ParityFramework.COSMAPrefillVsPyTorch:ParityFramework.OpenBLASPrefillVsPyTorch:ParityFramework.TrueIncrementalDecodeVsPyTorch" ctest --test-dir build --output-on-failure --verbose -R "ParityFrameworkTest" 2>&1 | tee test_output.log | tail -150
 
 # Integration Tests (3m0s)
 ctest --test-dir build --output-on-failure --verbose \

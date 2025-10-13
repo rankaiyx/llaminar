@@ -1884,6 +1884,13 @@ namespace llaminar
                 global_k_cache = TensorFactory::create_simple({attn_seq_len, k_v_dim});
                 global_v_cache = TensorFactory::create_simple({attn_seq_len, k_v_dim});
 
+                // Gather KV cache from all ranks, then transpose to correct layout
+                // CRITICAL: MPI_Allgatherv produces rank-major layout:
+                //   [Rank0: t=0..T, kv_head=0] [Rank1: t=0..T, kv_head=1] ...
+                // But expand_kv_for_gqa expects time-major layout:
+                //   [t=0: kv_head=0, kv_head=1] [t=1: kv_head=0, kv_head=1] ...
+                // We must transpose after gathering!
+
                 std::vector<int> recvcounts_k(world_size);
                 std::vector<int> displs_k(world_size);
                 int sendcount_k = attn_seq_len * local_kv_head_dim;
@@ -1897,12 +1904,63 @@ namespace llaminar
                     offset_k += recvcounts_k[r];
                 }
 
+                // Gather into temporary buffers (rank-major layout)
+                std::vector<float> temp_k(attn_seq_len * k_v_dim);
+                std::vector<float> temp_v(attn_seq_len * k_v_dim);
+
                 MPI_Allgatherv(local_k_cache->data(), sendcount_k, MPI_FLOAT,
-                               global_k_cache->data(), recvcounts_k.data(), displs_k.data(),
+                               temp_k.data(), recvcounts_k.data(), displs_k.data(),
                                MPI_FLOAT, MPI_COMM_WORLD);
                 MPI_Allgatherv(local_v_cache->data(), sendcount_k, MPI_FLOAT,
-                               global_v_cache->data(), recvcounts_k.data(), displs_k.data(),
+                               temp_v.data(), recvcounts_k.data(), displs_k.data(),
                                MPI_FLOAT, MPI_COMM_WORLD);
+
+                // Transpose from rank-major to time-major layout
+                // Source (temp): [Rank0: t=0..T, head_dim] [Rank1: t=0..T, head_dim] ...
+                // Dest (global): [t=0: Rank0_head_dim, Rank1_head_dim] [t=1: ...] ...
+                std::vector<int> kv_heads_per_rank(world_size);
+                for (int r = 0; r < world_size; ++r)
+                {
+                    auto [local_kv, kv_offset] = getKVHeadDistribution(r);
+                    kv_heads_per_rank[r] = local_kv;
+                }
+
+                int src_offset = 0;
+                for (int r = 0; r < world_size; ++r)
+                {
+                    const int rank_kv_heads = kv_heads_per_rank[r];
+                    const int rank_kv_dim = rank_kv_heads * head_dim_;
+                    auto [_, kv_offset] = getKVHeadDistribution(r);
+
+                    for (int t = 0; t < attn_seq_len; ++t)
+                    {
+                        // Source: temp[src_offset + t * rank_kv_dim : src_offset + (t+1) * rank_kv_dim]
+                        // Dest: global[t * k_v_dim + kv_offset * head_dim_ : ...]
+                        const float *src_k = temp_k.data() + src_offset + t * rank_kv_dim;
+                        const float *src_v = temp_v.data() + src_offset + t * rank_kv_dim;
+
+                        float *dst_k = global_k_cache->data() + t * k_v_dim + kv_offset * head_dim_;
+                        float *dst_v = global_v_cache->data() + t * k_v_dim + kv_offset * head_dim_;
+
+                        std::memcpy(dst_k, src_k, rank_kv_dim * sizeof(float));
+                        std::memcpy(dst_v, src_v, rank_kv_dim * sizeof(float));
+                    }
+
+                    src_offset += attn_seq_len * rank_kv_dim;
+                }
+
+                // DEBUG: Log gathered cache layout (layer 0 only)
+                if (layer_index_ == 0)
+                {
+                    LOG_DEBUG("[RANK=" << rank << "] After transpose to time-major:");
+                    LOG_INFO("  global_k_cache shape: [" << attn_seq_len << ", " << k_v_dim << "]");
+                    LOG_INFO("  global_k_cache[t=0, kv_head=0:1, d=0:5]:");
+                    LOG_INFO("    KV head 0: " << global_k_cache->data()[0] << " " << global_k_cache->data()[1] << " "
+                                               << global_k_cache->data()[2] << " " << global_k_cache->data()[3] << " " << global_k_cache->data()[4]);
+                    LOG_INFO("    KV head 1: " << global_k_cache->data()[head_dim_] << " " << global_k_cache->data()[head_dim_ + 1] << " "
+                                               << global_k_cache->data()[head_dim_ + 2] << " " << global_k_cache->data()[head_dim_ + 3] << " "
+                                               << global_k_cache->data()[head_dim_ + 4]);
+                }
             }
             else
             {
