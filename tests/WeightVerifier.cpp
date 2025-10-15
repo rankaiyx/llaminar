@@ -5,7 +5,7 @@
  */
 
 #include "WeightVerifier.h"
-#include "logger.h"
+#include "Logger.h"
 #include <cmath>
 #include <sstream>
 #include <iomanip>

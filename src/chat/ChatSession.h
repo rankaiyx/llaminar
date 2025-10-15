@@ -2,7 +2,7 @@
 
 #include "ChatMessage.h"
 #include "TokenizerInterface.h"
-#include "../argument_parser.h"
+#include "../ArgumentParser.h"
 #include <vector>
 #include <memory>
 #include <string>

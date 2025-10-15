@@ -11,7 +11,7 @@
  */
 
 #include "ModelIntegrationTestBase.h"
-#include "logger.h"
+#include "Logger.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <iostream>

@@ -30,7 +30,7 @@
 #include "AbstractPipeline.h"
 #include "PipelineStages.h"
 #include "TransformerConfig.h"
-#include "tensors/tensor_base.h"
+#include "tensors/TensorBase.h"
 #include "MpiContext.h"
 #include "KvCacheProvider.h"
 #include <memory>

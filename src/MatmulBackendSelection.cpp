@@ -50,7 +50,7 @@ namespace llaminar
         // === 2. Distributed Partition Safety ===
 
         // Never use COSMA when caller has already partitioned data across ranks
-        // (e.g., MPILinearKernel splits output features). COSMA expects full global
+        // (e.g., MPILinearOperator splits output features). COSMA expects full global
         // matrices and would produce incorrect results on partial data.
         if (distributed_partition)
         {

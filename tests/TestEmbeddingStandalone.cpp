@@ -18,12 +18,12 @@
 #include <vector>
 #include <cmath>
 #include "ModelLoader.h"
-#include "tensors/tensor_factory.h"
+#include "tensors/TensorFactory.h"
 #include "ParityTestFramework.h"
 #include "AbstractPipeline.h"
 #include "QwenPipelineAdapter.h"
 #include "PipelineSnapshotManager.h"
-#include "logger.h"
+#include "Logger.h"
 
 namespace llaminar
 {

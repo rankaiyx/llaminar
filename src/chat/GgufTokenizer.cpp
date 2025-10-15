@@ -1,5 +1,5 @@
 #include "GgufTokenizer.h"
-#include "../logger.h"
+#include "../Logger.h"
 #include <sstream>
 #include <algorithm>
 #include <regex>

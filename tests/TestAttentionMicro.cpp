@@ -1,8 +1,8 @@
 #include "TestTensorUtils.h"
 #include "TestReferenceImpls.h"
 #include "TestTimeoutGuard.h"
-#include "kernels/MPIAttentionKernel.h"
-#include "tensors/tensor_factory.h"
+#include "operators/MPIAttentionOperator.h"
+#include "tensors/TensorFactory.h"
 #include "TestMpiUtils.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -59,7 +59,7 @@ struct TinyConfig
 // use (and compare against) the very first head slice [0, head_dim).
 // NOTE: Previous version incorrectly assumed a packed [seq, head_dim] layout and used
 //       head_dim as the row stride. That produced erroneous rows when seq>1 and n_head>1,
-//       explaining the large rel_l2 / max_abs divergences for seq > 1. The kernel output
+//       explaining the large rel_l2 / max_abs divergences for seq > 1. The operator output
 //       was correct; the reference was striding incorrectly. Fixed by adding d_model
 //       parameter and using it as the row stride.
 static void reference_single_head_causal(const float *input, int seq, int head_dim, int d_model, std::vector<float> &out)
@@ -394,7 +394,7 @@ TEST_F(AttentionMicroTestFixture, ScalarParityAndMasking)
         int n_head = (world > 1) ? world : 1; // distribute one head per rank
         int n_kv = n_head;
         int d_model = n_head * cfg.head_dim;
-        MPIAttentionKernel kernel(n_head, n_kv, cfg.head_dim);
+        MPIAttentionOperator kernel(n_head, n_kv, cfg.head_dim);
         auto input = make_simple({cfg.seq, d_model});
         auto wq = make_simple({d_model, d_model});
         auto wk = make_simple({d_model, d_model});
@@ -531,7 +531,7 @@ TEST_F(AttentionMicroTestFixture, MultiHeadIdentityParity)
     int n_head = 4;
     int head_dim = 8;
     int d_model = n_head * head_dim;
-    MPIAttentionKernel kernel(n_head, n_head, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head, head_dim);
     auto input = make_simple({seq, d_model});
     auto wq = make_simple({d_model, d_model});
     auto wk = make_simple({d_model, d_model});
@@ -575,7 +575,7 @@ TEST_F(AttentionMicroTestFixture, MultiHeadScaledWeightsParity)
     int n_head = 3;
     int head_dim = 8;
     int d_model = n_head * head_dim;
-    MPIAttentionKernel kernel(n_head, n_head, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head, head_dim);
     auto input = make_simple({seq, d_model});
     auto wq = make_simple({d_model, d_model});
     auto wk = make_simple({d_model, d_model});
@@ -632,7 +632,7 @@ TEST_F(AttentionMicroTestFixture, GroupedKVHeadsParity)
     int n_head_kv = 2; // grouped KV heads
     int head_dim = 8;
     int d_model = n_head * head_dim;
-    MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
     auto input = make_simple({seq, d_model});
     auto wq = make_simple({d_model, d_model});
     auto wk = make_simple({d_model, n_head_kv * head_dim});
@@ -699,8 +699,8 @@ TEST_F(AttentionMicroTestFixture, GatherPreProjectionMultiRankParity)
     int head_dim = 8;
     int d_model = n_head * head_dim;
     // Construct weights (identity) & input deterministic.
-    MPIAttentionKernel kernel(n_head, n_head, head_dim);
-    kernel.setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPreProjection);
+    MPIAttentionOperator kernel(n_head, n_head, head_dim);
+    kernel.setOutputMode(MPIAttentionOperator::AttentionOutputMode::GatherHeadsPreProjection);
     auto input = make_simple({seq, d_model});
     auto wq = make_simple({d_model, d_model});
     auto wk = make_simple({d_model, d_model});
@@ -754,8 +754,8 @@ TEST_F(AttentionMicroTestFixture, TPColumnPartitionWOParity)
     int d_model = n_head * head_dim;
     auto make_kernel = [&](bool tp)
     {
-        auto k = std::make_unique<MPIAttentionKernel>(n_head, n_head, head_dim);
-        k->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection); // local projection path
+        auto k = std::make_unique<MPIAttentionOperator>(n_head, n_head, head_dim);
+        k->setOutputMode(MPIAttentionOperator::AttentionOutputMode::GatherHeadsPostProjection); // local projection path
         if (tp)
         {
             setenv("LLAMINAR_ATTN_TP_PARTITIONS", "3", 1);

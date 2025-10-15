@@ -170,12 +170,12 @@
  * See:
  *   - .github/instructions/llaminar-architecture.instructions.md (Section 9)
  *   - docs/WEIGHT_MATRIX_CONVENTIONS.md
- *   - src/kernels/MPIAttentionKernel.cpp (bias application example)
+ *   - src/operators/MPIAttentionOperator.cpp (bias application example)
  * ============================================================================
  */
 
-#include "common.h"
-#include "tensors/tensor_base.h"
+#include "SystemTopology.h"
+#include "tensors/TensorBase.h"
 #include "TransformerConfig.h"
 #include <string>
 #include <vector>

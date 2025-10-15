@@ -19,20 +19,20 @@
  * - Constructor + initializeKernels(): ~100 lines
  * - executeEmbedding(): ~20 lines (manual memcpy, no kernel)
  * - executeLinearProjection(): ~10 lines (delegates to adaptiveMatMul)
- * - executeAttentionBlock(): ~50 lines (uses MPIAttentionKernel with COSMA backend)
+ * - executeAttentionBlock(): ~50 lines (uses MPIAttentionOperator with COSMA backend)
  */
 
 #include "CosmaPrefillProvider.h"
 #include "QwenPipelineAdapter.h"
-#include "kernels/MPIRMSNormKernel.h"
-#include "kernels/MPIAttentionKernel.h"
-#include "kernels/MPISwiGLUKernel.h"
-#include "kernels/MPIResidualKernel.h"
-#include "kernels/common/attention_primitives.h"
-#include "tensors/tensor_factory.h"
+#include "operators/MPIRMSNormOperator.h"
+#include "operators/MPIAttentionOperator.h"
+#include "operators/MPISwiGLUOperator.h"
+#include "operators/MPIResidualOperator.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "tensors/TensorFactory.h"
 #include "AdaptiveMatmul.h"
 #include "BackendSelector.h"
-#include "logger.h"
+#include "Logger.h"
 #include "PerformanceTimer.h"
 #include <chrono>
 #include <cstring>
@@ -51,16 +51,16 @@ namespace llaminar
     {
         const auto &layer_cfg = config().getLayerConfig();
 
-        // Attention kernel (used for snapshot callback mechanism)
+        // Attention operator (used for snapshot callback mechanism)
         {
-            auto attention_kernel = std::make_unique<MPIAttentionKernel>(
+            auto attention_kernel = std::make_unique<MPIAttentionOperator>(
                 layer_cfg.n_head,
                 layer_cfg.n_head_kv,
                 layer_cfg.head_dim,
                 layer_cfg.rope_freq_base);
 
             // Configure output mode
-            attention_kernel->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
+            attention_kernel->setOutputMode(MPIAttentionOperator::AttentionOutputMode::GatherHeadsPostProjection);
 
             // Wire up snapshot callback for intermediate stages
             attention_kernel->setSnapshotCallback(
@@ -77,8 +77,8 @@ namespace llaminar
 
         // SwiGLU activation kernel
         {
-            auto swiglu_kernel = std::make_unique<MPISwiGLUKernel>(
-                MPISwiGLUKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto swiglu_kernel = std::make_unique<MPISwiGLUOperator>(
+                MPISwiGLUOperator::DistributionStrategy::SEQUENCE_WISE);
             if (!registerKernel("swiglu", std::move(swiglu_kernel)))
             {
                 throw std::runtime_error("COSMAPrefillProvider: Failed to register swiglu kernel");
@@ -87,18 +87,18 @@ namespace llaminar
 
         // Residual connection kernel
         {
-            auto residual_kernel = std::make_unique<MPIResidualKernel>(
-                MPIResidualKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto residual_kernel = std::make_unique<MPIResidualOperator>(
+                MPIResidualOperator::DistributionStrategy::SEQUENCE_WISE);
             if (!registerKernel("residual", std::move(residual_kernel)))
             {
                 throw std::runtime_error("COSMAPrefillProvider: Failed to register residual kernel");
             }
         }
 
-        // RMSNorm kernel (fallback if COSMA fused path fails)
+        // RMSNorm operator (fallback if COSMA fused path fails)
         {
-            auto rmsnorm_kernel = std::make_unique<MPIRMSNormKernel>(
-                MPIRMSNormKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto rmsnorm_kernel = std::make_unique<MPIRMSNormOperator>(
+                MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
             rmsnorm_kernel->setEpsilon(layer_cfg.eps);
             if (!registerKernel("rmsnorm", std::move(rmsnorm_kernel)))
             {
@@ -222,12 +222,12 @@ namespace llaminar
         auto norm_end = std::chrono::high_resolution_clock::now();
         timing.norm_ms = std::chrono::duration_cast<std::chrono::microseconds>(norm_end - norm_start).count() / 1000.0;
 
-        // --- Stage 2: Attention via MPIAttentionKernel with COSMA backend ---
+        // --- Stage 2: Attention via MPIAttentionOperator with COSMA backend ---
         auto attn_start = std::chrono::high_resolution_clock::now();
 
         // Configure attention kernel to use COSMA
         CosmaPrefillManager &manager = CosmaPrefillManager::instance();
-        auto attention_kernel = dynamic_cast<MPIAttentionKernel *>(getKernel("attention"));
+        auto attention_kernel = dynamic_cast<MPIAttentionOperator *>(getKernel("attention"));
         if (attention_kernel)
         {
             attention_kernel->setSequencePosition(0); // Prefill always starts at position 0

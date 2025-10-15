@@ -16,7 +16,7 @@
 #pragma once
 
 #include "TpPartition.h"
-#include "../logger.h" // for LOG_DEBUG
+#include "../Logger.h" // for LOG_DEBUG
 #include <chrono>
 #include <functional>
 #include <vector>

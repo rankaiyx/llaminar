@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../mpi_kernel_base.h"
+#include "../MpiKernelBase.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -16,11 +16,11 @@ namespace llaminar
      * - Token lookups use MPI_Allgather for distributed access
      * - Embedding table is sharded across ranks to reduce memory usage
      */
-    class MPIEmbeddingKernel : public MPIKernelBase
+    class MPIEmbeddingOperator : public MPIKernelBase
     {
     public:
-        MPIEmbeddingKernel(size_t vocab_size, size_t embedding_dim);
-        ~MPIEmbeddingKernel() = default;
+        MPIEmbeddingOperator(size_t vocab_size, size_t embedding_dim);
+        ~MPIEmbeddingOperator() = default;
 
         // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,

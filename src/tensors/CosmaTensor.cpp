@@ -1,5 +1,5 @@
 #include "CosmaTensor.h"
-#include "logger.h"
+#include "Logger.h"
 #include <mpi.h>
 
 namespace llaminar {

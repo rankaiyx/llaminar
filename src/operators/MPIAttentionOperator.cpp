@@ -1,9 +1,9 @@
 /**
- * @file MPIAttentionKernel.cpp
+ * @file MPIAttentionOperator.cpp
  * @brief Implementation of MPI-enabled multi-head attention with modular 8-stage pipeline
  * @author David Sanftenberg
  *
- * This file implements the MPIAttentionKernel class, which performs distributed multi-head
+ * This file implements the MPIAttentionOperator class, which performs distributed multi-head
  * attention computation across MPI ranks with a clean, testable architecture.
  *
  * Phase 8 Refactoring (Complete):
@@ -53,7 +53,7 @@
  * - All backends respect matrix orientation contracts (no silent transpositions)
  *
  * Output Contract (Fully Replicated):
- * The kernel returns a FULLY REPLICATED attention output across all ranks. MPI
+ * The operator returns a FULLY REPLICATED attention output across all ranks. MPI
  * communication occurs internally, including MPI_Allgather for Q/K/V/cache/scores and
  * MPI_Allreduce (MPI_SUM) for the final output projection. The output tensor is identical
  * on all processes, requiring no additional caller-side MPI operations for basic inference.
@@ -72,21 +72,21 @@
  * - Scalability: Linear scaling with MPI ranks via head-wise parallelism
  * - Threading: OpenBLAS auto-detects thread count (respects OMP_NUM_THREADS environment)
  *
- * @see MPIAttentionKernel.h for detailed class documentation
+ * @see MPIAttentionOperator.h for detailed class documentation
  * @see AttentionStageContracts.h for stage validation contracts
  * @see CosmaPrefillManager for COSMA backend integration
  */
 
-#include "MPIAttentionKernel.h"
-#include "../logger.h"
-#include "../tensors/tensor_factory.h"
-#include "../matmul_backend_selection.h"
-#include "../cosma_prefill_manager.h"
-#include "common/attention_primitives.h"
-#include "common/softmax_core.h"
+#include "MPIAttentionOperator.h"
+#include "../Logger.h"
+#include "../tensors/TensorFactory.h"
+#include "../MatmulBackendSelection.h"
+#include "../CosmaPrefillManager.h"
+#include "common/AttentionPrimitives.h"
+#include "common/SoftmaxCore.h"
 #include "attention/AttentionStageContracts.h"
 #include "attention/AttentionValidator.h"
-#include "../utils/debug_env.h"
+#include "../utils/DebugEnv.h"
 #include <algorithm>
 #include <cblas.h>
 #include <cmath>
@@ -182,7 +182,7 @@ namespace llaminar
     // ============================================================================
     // Constructor
     // ============================================================================
-    MPIAttentionKernel::MPIAttentionKernel(int n_head, int n_head_kv, int head_dim,
+    MPIAttentionOperator::MPIAttentionOperator(int n_head, int n_head_kv, int head_dim,
                                            float rope_freq_base, DistributionStrategy strategy)
         : n_head_(n_head),
           n_head_kv_(n_head_kv),
@@ -194,24 +194,24 @@ namespace llaminar
     {
         if (head_dim_ <= 0 || n_head_ <= 0 || n_head_kv_ <= 0)
         {
-            throw std::invalid_argument("MPIAttentionKernel: invalid constructor parameters");
+            throw std::invalid_argument("MPIAttentionOperator: invalid constructor parameters");
         }
         if (n_head_kv_ > n_head_)
         {
-            throw std::invalid_argument("MPIAttentionKernel: n_head_kv cannot exceed n_head");
+            throw std::invalid_argument("MPIAttentionOperator: n_head_kv cannot exceed n_head");
         }
 
         // Check for excess MPI ranks (more ranks than heads to distribute)
         const int world_size = getSize();
         if (world_size > n_head_)
         {
-            LOG_WARN("MPIAttentionKernel: More ranks (" << world_size
+            LOG_WARN("MPIAttentionOperator: More ranks (" << world_size
                                                         << ") than Q heads (" << n_head_ << "). "
                                                         << (world_size - n_head_) << " rank(s) will have no work (local_heads=0).");
         }
         if (world_size > n_head_kv_)
         {
-            LOG_WARN("MPIAttentionKernel: More ranks (" << world_size
+            LOG_WARN("MPIAttentionOperator: More ranks (" << world_size
                                                         << ") than KV heads (" << n_head_kv_ << "). "
                                                         << (world_size - n_head_kv_) << " rank(s) will have no KV work (local_kv_heads=0).");
         }
@@ -220,12 +220,12 @@ namespace llaminar
     // ============================================================================
     // Helper: Head distribution methods
     // ============================================================================
-    std::pair<int, int> MPIAttentionKernel::getHeadDistribution() const
+    std::pair<int, int> MPIAttentionOperator::getHeadDistribution() const
     {
         return getHeadDistribution(getRank());
     }
 
-    std::pair<int, int> MPIAttentionKernel::getHeadDistribution(int rank) const
+    std::pair<int, int> MPIAttentionOperator::getHeadDistribution(int rank) const
     {
         int heads_per_rank = n_head_ / getSize();
         int remainder = n_head_ % getSize();
@@ -236,12 +236,12 @@ namespace llaminar
         return {local_heads, head_offset};
     }
 
-    std::pair<int, int> MPIAttentionKernel::getKVHeadDistribution() const
+    std::pair<int, int> MPIAttentionOperator::getKVHeadDistribution() const
     {
         return getKVHeadDistribution(getRank());
     }
 
-    std::pair<int, int> MPIAttentionKernel::getKVHeadDistribution(int rank) const
+    std::pair<int, int> MPIAttentionOperator::getKVHeadDistribution(int rank) const
     {
         int heads_per_rank = n_head_kv_ / getSize();
         int remainder = n_head_kv_ % getSize();
@@ -255,26 +255,26 @@ namespace llaminar
     // ============================================================================
     // Validation
     // ============================================================================
-    bool MPIAttentionKernel::validate(
+    bool MPIAttentionOperator::validate(
         const std::vector<std::shared_ptr<TensorBase>> &inputs,
         const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         if (inputs.size() != 10)
         {
-            LOG_ERROR("MPIAttentionKernel: Expected 10 inputs, got " << inputs.size());
+            LOG_ERROR("MPIAttentionOperator: Expected 10 inputs, got " << inputs.size());
             return false;
         }
 
         if (outputs.size() != 1)
         {
-            LOG_ERROR("MPIAttentionKernel: Expected 1 output, got " << outputs.size());
+            LOG_ERROR("MPIAttentionOperator: Expected 1 output, got " << outputs.size());
             return false;
         }
 
         auto input = inputs[0];
         if (input->shape().size() != 2)
         {
-            LOG_ERROR("MPIAttentionKernel: Input must be 2D [seq_len, d_model], got shape size "
+            LOG_ERROR("MPIAttentionOperator: Input must be 2D [seq_len, d_model], got shape size "
                       << input->shape().size());
             return false;
         }
@@ -306,7 +306,7 @@ namespace llaminar
      *       - CosmaPrefillManager availability (cosma_mgr_ != nullptr)
      *       - MatMulBackendSelector decision logic
      */
-    void MPIAttentionKernel::matmul_with_bias(
+    void MPIAttentionOperator::matmul_with_bias(
         const float *input, const float *weight, float *output,
         const float *bias, int M, int N, int K,
         const char *operation_label)
@@ -358,7 +358,7 @@ namespace llaminar
             CosmaView input_view = cosma_mgr_->convert_activation_in(input, M, K);
             if (!input_view.mat && !input_view.host_owned)
             {
-                LOG_ERROR("[MPIAttentionKernel] Failed to convert input for COSMA");
+                LOG_ERROR("[MPIAttentionOperator] Failed to convert input for COSMA");
                 // Fall back to OpenBLAS
                 goto openblas_fallback;
             }
@@ -367,7 +367,7 @@ namespace llaminar
             auto weight_handle = cosma_mgr_->load_weight(weight_desc);
             if (!weight_handle.view.mat)
             {
-                LOG_ERROR("[MPIAttentionKernel] Failed to load weight for COSMA");
+                LOG_ERROR("[MPIAttentionOperator] Failed to load weight for COSMA");
                 goto openblas_fallback;
             }
 
@@ -375,7 +375,7 @@ namespace llaminar
             CosmaView result_view = cosma_mgr_->matmul(input_view, weight_handle, M, K, N, true);
             if (!result_view.mat && !result_view.host_owned)
             {
-                LOG_ERROR("[MPIAttentionKernel] COSMA matmul failed");
+                LOG_ERROR("[MPIAttentionOperator] COSMA matmul failed");
                 goto openblas_fallback;
             }
 
@@ -440,7 +440,7 @@ namespace llaminar
     // ============================================================================
     // HELPER METHOD: INPUT VALIDATION AND SETUP (STEP 1)
     // ============================================================================
-    InputSetupResult MPIAttentionKernel::validateAndSetupInputs(
+    InputSetupResult MPIAttentionOperator::validateAndSetupInputs(
         const std::vector<std::shared_ptr<TensorBase>> &inputs,
         std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
@@ -456,7 +456,7 @@ namespace llaminar
         // ========================================================================
         if (inputs.size() < 10)
         {
-            LOG_ERROR("MPIAttentionKernel: Expected 10 inputs (input, wq, wk, wv, wo, bq, bk, bv, k_cache, v_cache), got " << inputs.size());
+            LOG_ERROR("MPIAttentionOperator: Expected 10 inputs (input, wq, wk, wv, wo, bq, bk, bv, k_cache, v_cache), got " << inputs.size());
             throw std::runtime_error("Insufficient input count");
         }
 
@@ -741,7 +741,7 @@ namespace llaminar
     // ============================================================================
     // STEP 2: DISTRIBUTE WEIGHTS BY HEAD DIMENSION
     // ============================================================================
-    WeightSlices MPIAttentionKernel::distributeWeightsByHead(const InputSetupResult &setup)
+    WeightSlices MPIAttentionOperator::distributeWeightsByHead(const InputSetupResult &setup)
     {
         WeightSlices result;
 
@@ -1047,7 +1047,7 @@ namespace llaminar
         return result;
     }
 
-    QKVProjectionResult MPIAttentionKernel::computeQKVProjections(
+    QKVProjectionResult MPIAttentionOperator::computeQKVProjections(
         const InputSetupResult &setup,
         const WeightSlices &weights)
     {
@@ -1316,7 +1316,7 @@ namespace llaminar
         return result;
     }
 
-    GatherResult MPIAttentionKernel::gatherAndSnapshotPreRoPE(
+    GatherResult MPIAttentionOperator::gatherAndSnapshotPreRoPE(
         const InputSetupResult &setup,
         const QKVProjectionResult &projections)
     {
@@ -1335,7 +1335,7 @@ namespace llaminar
 
         GatherResult result;
 
-        LOG_DEBUG("[MPIAttentionKernel] Layer " << layer_index_ << ": snapshot_callback_="
+        LOG_DEBUG("[MPIAttentionOperator] Layer " << layer_index_ << ": snapshot_callback_="
                                                 << (snapshot_callback_ ? "SET" : "NULL") << ", world_size=" << world_size);
 
         if (snapshot_callback_ && world_size > 1)
@@ -1482,7 +1482,7 @@ namespace llaminar
         return result;
     }
 
-    RoPEResult MPIAttentionKernel::applyRotaryPositionEmbeddings(
+    RoPEResult MPIAttentionOperator::applyRotaryPositionEmbeddings(
         const InputSetupResult &setup,
         const QKVProjectionResult &projections,
         const std::shared_ptr<TensorBase> &k_cache_in,
@@ -1911,7 +1911,7 @@ namespace llaminar
         return result;
     }
 
-    GQAExpansionResult MPIAttentionKernel::handleGQAExpansion(
+    GQAExpansionResult MPIAttentionOperator::handleGQAExpansion(
         const InputSetupResult &setup,
         const RoPEResult &rope_result)
     {
@@ -2133,7 +2133,7 @@ namespace llaminar
         return result;
     }
 
-    AttentionScoresResult MPIAttentionKernel::computeAttentionScores(
+    AttentionScoresResult MPIAttentionOperator::computeAttentionScores(
         const InputSetupResult &setup,
         const RoPEResult &rope_result,
         const GQAExpansionResult &gqa_result)
@@ -2543,7 +2543,7 @@ namespace llaminar
         return result;
     }
 
-    OutputProjectionResult MPIAttentionKernel::projectAndGatherOutput(
+    OutputProjectionResult MPIAttentionOperator::projectAndGatherOutput(
         const InputSetupResult &setup,
         const WeightSlices &weights,
         const AttentionScoresResult &attention_result)
@@ -2633,7 +2633,7 @@ namespace llaminar
     // ============================================================================
     // MAIN EXECUTE FUNCTION
     // ============================================================================
-    bool MPIAttentionKernel::execute(
+    bool MPIAttentionOperator::execute(
         const std::vector<std::shared_ptr<TensorBase>> &inputs,
         std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
@@ -2641,7 +2641,7 @@ namespace llaminar
         const int rank = getRank();
         if (debugEnv().attention.verbose && rank == 0)
         {
-            LOG_DEBUG("[EXECUTE] MPIAttentionKernel::execute() called"
+            LOG_DEBUG("[EXECUTE] MPIAttentionOperator::execute() called"
                       << " layer=" << layer_index_
                       << " cosma_mgr=" << (void *)cosma_mgr_
                       << " snapshot_cb=" << (snapshot_callback_ ? "SET" : "NULL"));

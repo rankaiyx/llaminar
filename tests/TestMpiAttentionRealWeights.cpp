@@ -1,6 +1,6 @@
 /**
  * @file TestMpiAttentionRealWeights.cpp
- * @brief Test MPIAttentionKernel with real GGUF model weights
+ * @brief Test MPIAttentionOperator with real GGUF model weights
  * @author David Sanftenberg
  *
  * This test loads actual model weights from GGUF files to test attention
@@ -10,10 +10,10 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <filesystem>
-#include "kernels/MPIAttentionKernel.h"
+#include "operators/MPIAttentionOperator.h"
 #include "ModelLoader.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 
 using namespace llaminar;
 
@@ -180,7 +180,7 @@ TEST_F(MPIAttentionRealWeightsTest, BasicExecutionWithRealWeights)
     v_cache->zero();
 
     // Create kernel
-    MPIAttentionKernel kernel(weights.n_head, weights.n_head_kv, weights.head_dim);
+    MPIAttentionOperator kernel(weights.n_head, weights.n_head_kv, weights.head_dim);
 
     // Prepare inputs
     std::vector<std::shared_ptr<TensorBase>> inputs = {
@@ -259,7 +259,7 @@ TEST_F(MPIAttentionRealWeightsTest, DeterministicOutput)
     k_cache->zero();
     v_cache->zero();
 
-    MPIAttentionKernel kernel(weights.n_head, weights.n_head_kv, weights.head_dim);
+    MPIAttentionOperator kernel(weights.n_head, weights.n_head_kv, weights.head_dim);
 
     std::vector<std::shared_ptr<TensorBase>> inputs = {
         input,

@@ -6,7 +6,7 @@
 
 #include "ParityTestFramework.h"
 #include "NpzLoader.h"
-#include "logger.h"
+#include "Logger.h"
 #include <mpi.h>
 #include <iostream>
 #include <sstream>
@@ -777,7 +777,7 @@ namespace llaminar
 
         // ==================== Utility Functions ====================
         // Note: stage_to_string() and string_to_stage() are now provided by
-        // the core pipeline_stages.h header (inline functions in llaminar namespace).
+        // the core PipelineStages.h header (inline functions in llaminar namespace).
         // We removed the duplicate implementations from this file.
 
     } // namespace parity

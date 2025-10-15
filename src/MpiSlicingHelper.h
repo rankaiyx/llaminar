@@ -20,8 +20,8 @@
 
 #include "ModelLoader.h"
 #include "WeightContracts.h"
-#include "tensors/tensor_base.h"
-#include "tensors/tensor_factory.h"
+#include "tensors/TensorBase.h"
+#include "tensors/TensorFactory.h"
 #include <memory>
 #include <string>
 #include <vector>

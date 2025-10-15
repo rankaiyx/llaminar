@@ -5,7 +5,7 @@
 #include <unordered_map>
 #include <vector>
 #include <memory>
-#include "logger.h"
+#include "Logger.h"
 
 namespace llaminar
 {

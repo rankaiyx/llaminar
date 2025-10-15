@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include "TestTimeoutGuard.h"
-#include "../src/kernels/MPIRMSNormKernel.h"
-#include "../src/tensors/tensor_factory.h"
+#include "../src/operators/MPIRMSNormOperator.h"
+#include "../src/tensors/TensorFactory.h"
 #include <memory>
 #include <chrono>
 #include <cmath>
@@ -10,7 +10,7 @@
 
 using namespace llaminar;
 
-class MPIRMSNormKernelTest : public ::testing::Test
+class MPIRMSNormOperatorTest : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -23,7 +23,7 @@ protected:
             throw std::runtime_error("MPI should be initialized before running tests");
         }
 
-        mpi_kernel = std::make_unique<MPIRMSNormKernel>();
+        mpi_kernel = std::make_unique<MPIRMSNormOperator>();
 
         // Set the same epsilon for both kernels
         float epsilon = 1e-6f;
@@ -83,12 +83,12 @@ protected:
         }
     }
 
-    std::unique_ptr<MPIRMSNormKernel> mpi_kernel;
+    std::unique_ptr<MPIRMSNormOperator> mpi_kernel;
     // Legacy non-MPI RMSNormKernel removed.
     std::mt19937 generator;
 };
 
-TEST_F(MPIRMSNormKernelTest, BasicFunctionality)
+TEST_F(MPIRMSNormOperatorTest, BasicFunctionality)
 {
     // Test basic RMS normalization with simple data
     const size_t seq_len = 4;
@@ -124,7 +124,7 @@ TEST_F(MPIRMSNormKernelTest, BasicFunctionality)
     EXPECT_TRUE(has_nonzero);
 }
 
-TEST_F(MPIRMSNormKernelTest, ValidationTests)
+TEST_F(MPIRMSNormOperatorTest, ValidationTests)
 {
     // Test input validation
     auto input = createTensor({2, 4});
@@ -161,7 +161,7 @@ TEST_F(MPIRMSNormKernelTest, ValidationTests)
     }
 }
 
-TEST_F(MPIRMSNormKernelTest, DifferentSequenceLengths)
+TEST_F(MPIRMSNormOperatorTest, DifferentSequenceLengths)
 {
     // Test with various sequence lengths to ensure distribution works correctly
     std::vector<size_t> test_seq_lens = {1, 3, 7, 16, 32};
@@ -201,7 +201,7 @@ TEST_F(MPIRMSNormKernelTest, DifferentSequenceLengths)
     }
 }
 
-TEST_F(MPIRMSNormKernelTest, EpsilonConfiguration)
+TEST_F(MPIRMSNormOperatorTest, EpsilonConfiguration)
 {
     // Test that epsilon configuration works correctly
     const size_t seq_len = 4;

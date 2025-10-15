@@ -24,10 +24,10 @@
 #include <omp.h>
 #endif
 
-#include "utils/debug_env.h"
-#include "kernels/common/attention_primitives.h"
-#include "kernels/common/softmax_core.h"
-#include "logger.h"
+#include "utils/DebugEnv.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "operators/common/SoftmaxCore.h"
+#include "Logger.h"
 
 namespace llaminar::attn
 {

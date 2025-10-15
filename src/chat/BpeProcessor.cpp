@@ -1,5 +1,5 @@
 #include "BpeProcessor.h"
-#include "../logger.h"
+#include "../Logger.h"
 #include <regex>
 #include <algorithm>
 #include <sstream>

@@ -3,8 +3,8 @@
 
 #include "InferenceBackend.h"
 #include "PrefillBackend.h" // reuse DeviceKind enum include
-#include "../adaptive_matmul.h"
-#include "../logger.h"
+#include "../AdaptiveMatmul.h"
+#include "../Logger.h"
 
 namespace llaminar
 {

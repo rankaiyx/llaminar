@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ChatMessage.h"
-#include "../model_loader.h"
+#include "../ModelLoader.h"
 #include <string>
 #include <vector>
 #include <memory>

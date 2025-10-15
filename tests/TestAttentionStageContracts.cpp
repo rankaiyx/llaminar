@@ -1,13 +1,13 @@
 /**
  * @file TestAttentionStageContracts.cpp
- * @brief Smoke tests for MPIAttentionKernel stage contract validation infrastructure
+ * @brief Smoke tests for MPIAttentionOperator stage contract validation infrastructure
  * @author David Sanftenberg
  *
  * This test suite validates the stage contract infrastructure without requiring full kernel execution.
  *
  * **What are Stage Contracts?**
  * Stage contracts define explicit PRE/POST conditions between the 5 internal pipeline stages
- * of MPIAttentionKernel to prevent dimension and transpose bugs:
+ * of MPIAttentionOperator to prevent dimension and transpose bugs:
  *   1. Q/K/V Projections
  *   2. RoPE Application
  *   3. GQA Replication (if applicable)
@@ -35,13 +35,13 @@
 #include <mpi.h>
 #include <memory>
 #include <vector>
-#include "../src/kernels/MPIAttentionKernel.h"
-#include "../src/tensors/simple_tensor.h"
-#include "../src/tensors/tensor_factory.h"
-#include "../src/logger.h"
+#include "../src/operators/MPIAttentionOperator.h"
+#include "../src/tensors/SimpleTensor.h"
+#include "../src/tensors/TensorFactory.h"
+#include "../src/Logger.h"
 
 using namespace llaminar;
-using DistributionStrategy = MPIAttentionKernel::DistributionStrategy;
+using DistributionStrategy = MPIAttentionOperator::DistributionStrategy;
 
 class AttentionStageContractsTest : public ::testing::Test
 {
@@ -72,18 +72,18 @@ protected:
             seq_len = seq_len_;
 
         auto input = TensorFactory::create_simple({seq_len, d_model_});
-        // Weights are TRANSPOSED in MPIAttentionKernel: [out_features, in_features]
+        // Weights are TRANSPOSED in MPIAttentionOperator: [out_features, in_features]
         auto wq = TensorFactory::create_simple({n_head_ * head_dim_, d_model_});
         auto wk = TensorFactory::create_simple({n_head_kv_ * head_dim_, d_model_});
         auto wv = TensorFactory::create_simple({n_head_kv_ * head_dim_, d_model_});
         auto wo = TensorFactory::create_simple({d_model_, n_head_ * head_dim_});
 
-        // Bias tensors (required by MPIAttentionKernel)
+        // Bias tensors (required by MPIAttentionOperator)
         auto bq = TensorFactory::create_simple({n_head_ * head_dim_});
         auto bk = TensorFactory::create_simple({n_head_kv_ * head_dim_});
         auto bv = TensorFactory::create_simple({n_head_kv_ * head_dim_});
 
-        // Create KV cache tensors (required by MPIAttentionKernel)
+        // Create KV cache tensors (required by MPIAttentionOperator)
         int max_seq = 512;
         auto k_cache = TensorFactory::create_simple({max_seq, n_head_kv_ * head_dim_});
         auto v_cache = TensorFactory::create_simple({max_seq, n_head_kv_ * head_dim_});
@@ -130,7 +130,7 @@ TEST_F(AttentionStageContractsTest, BasicExecution)
 {
     // Test 1: Verify contracts accept valid input dimensions
     {
-        MPIAttentionKernel kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
+        MPIAttentionOperator kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
                                   DistributionStrategy::HEAD_WISE);
 
         auto inputs = createValidInputs();
@@ -144,7 +144,7 @@ TEST_F(AttentionStageContractsTest, BasicExecution)
 
     // Test 2: Verify contracts would reject wrong input count
     {
-        MPIAttentionKernel kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
+        MPIAttentionOperator kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
                                   DistributionStrategy::HEAD_WISE);
 
         auto inputs = createValidInputs();
@@ -177,7 +177,7 @@ TEST_F(AttentionStageContractsTest, MultiRankExecution)
 {
     // Test: Verify contracts catch MPI configuration issues
     {
-        MPIAttentionKernel kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
+        MPIAttentionOperator kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
                                   DistributionStrategy::HEAD_WISE);
 
         auto inputs = createValidInputs();
@@ -235,7 +235,7 @@ TEST_F(AttentionStageContractsTest, PrefillExecution)
  */
 TEST_F(AttentionStageContractsTest, DISABLED_DecodeExecution)
 {
-    MPIAttentionKernel kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
+    MPIAttentionOperator kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
                               DistributionStrategy::HEAD_WISE);
 
     // First do a small prefill to populate KV cache
@@ -282,7 +282,7 @@ TEST_F(AttentionStageContractsTest, DISABLED_DecodeExecution)
  */
 TEST_F(AttentionStageContractsTest, InvalidInputShape)
 {
-    MPIAttentionKernel kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
+    MPIAttentionOperator kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
                               DistributionStrategy::HEAD_WISE);
 
     // Create input with wrong d_model dimension
@@ -333,7 +333,7 @@ TEST_F(AttentionStageContractsTest, InvalidInputShape)
  */
 TEST_F(AttentionStageContractsTest, InvalidWeightShape)
 {
-    MPIAttentionKernel kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
+    MPIAttentionOperator kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
                               DistributionStrategy::HEAD_WISE);
 
     auto input = TensorFactory::create_simple({seq_len_, d_model_});
@@ -405,7 +405,7 @@ TEST_F(AttentionStageContractsTest, ContractMessagesVisible)
     }
 
     // Test: Verify contract validation rejects bad configuration
-    MPIAttentionKernel kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
+    MPIAttentionOperator kernel(n_head_, n_head_kv_, head_dim_, rope_theta_,
                               DistributionStrategy::HEAD_WISE);
 
     auto inputs = createValidInputs();

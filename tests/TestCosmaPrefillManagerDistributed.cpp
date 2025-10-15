@@ -6,8 +6,8 @@
 // SAME strategy (m,n,k) to avoid mismatched block-cyclic layouts that would
 // otherwise produce incorrect results.
 
-#include "../src/cosma_prefill_manager.h"
-#include "../src/logger.h"
+#include "../src/CosmaPrefillManager.h"
+#include "../src/Logger.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <cblas.h>

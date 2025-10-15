@@ -1,5 +1,5 @@
 /**
- * @file MPIRMSNormKernel.cpp
+ * @file MPIRMSNormOperator.cpp
  * @brief Root Mean Square Layer Normalization (RMSNorm) applied row-wise to activation matrix.
  *
  * @section Contract
@@ -27,12 +27,12 @@
  * @todo Investigate epsilon tuning for quantized activations path.
  * @author David Sanftenberg
  */
-#include "MPIRMSNormKernel.h"
-#include "../logger.h"
-#include "../debug_utils.h"
-#include "../utils/debug_env.h"
-#include "common/rmsnorm_core.h" // centralized RMSNorm primitives
-#include "common/rmsnorm_t5.h"   // T5-style RMSNorm matching HuggingFace
+#include "MPIRMSNormOperator.h"
+#include "../Logger.h"
+#include "../DebugUtils.h"
+#include "../utils/DebugEnv.h"
+#include "common/RmsnormCore.h" // centralized RMSNorm primitives
+#include "common/RmsnormT5.h"   // T5-style RMSNorm matching HuggingFace
 #include <cmath>
 #include <chrono>
 #include <algorithm>
@@ -44,7 +44,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <mpi.h>
-#include "../utils/perf_counters.h"
+#include "../utils/PerfCounters.h"
 
 namespace llaminar
 {
@@ -75,18 +75,18 @@ namespace llaminar
         }
     }
 
-    MPIRMSNormKernel::MPIRMSNormKernel(DistributionStrategy strategy)
+    MPIRMSNormOperator::MPIRMSNormOperator(DistributionStrategy strategy)
         : strategy_(strategy), epsilon_(1e-6f)
     {
-        LOG_DEBUG("MPIRMSNormKernel initialized with epsilon=" << epsilon_ << " on rank " << getRank());
+        LOG_DEBUG("MPIRMSNormOperator initialized with epsilon=" << epsilon_ << " on rank " << getRank());
     }
 
-    bool MPIRMSNormKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPIRMSNormOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                    std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         if (!validate(inputs, outputs))
         {
-            LOG_ERROR("MPIRMSNormKernel validation failed on rank " << getRank());
+            LOG_ERROR("MPIRMSNormOperator validation failed on rank " << getRank());
             return false;
         }
 
@@ -107,22 +107,22 @@ namespace llaminar
 
         // Log detailed tensor information (basic always; extended only if verbose)
         if (debugEnv().rmsnorm.verbose)
-            TensorLogger::logNormalizationOperation(global_input, weight, global_output, "MPIRMSNormKernel");
+            TensorLogger::logNormalizationOperation(global_input, weight, global_output, "MPIRMSNormOperator");
 
         std::vector<int> trace_rows;
         if (!debugEnv().rmsnorm.trace_rows_spec.empty())
         {
             trace_rows = parseRowSpecification(debugEnv().rmsnorm.trace_rows_spec.c_str(), static_cast<size_t>(global_input->shape()[0]));
-            LOG_INFO("[MPIRMSNormKernel] trace_rows request='" << debugEnv().rmsnorm.trace_rows_spec << "' parsed_count=" << trace_rows.size());
+            LOG_INFO("[MPIRMSNormOperator] trace_rows request='" << debugEnv().rmsnorm.trace_rows_spec << "' parsed_count=" << trace_rows.size());
         }
         const bool validate_reference = debugEnv().rmsnorm.validate_ref;
         if (validate_reference)
         {
-            LOG_DEBUG("[MPIRMSNormKernel] reference validation enabled");
+            LOG_DEBUG("[MPIRMSNormOperator] reference validation enabled");
         }
 
         // Additional epsilon logging
-        LOG_DEBUG("[MPIRMSNormKernel] Using epsilon=" << epsilon_);
+        LOG_DEBUG("[MPIRMSNormOperator] Using epsilon=" << epsilon_);
 
         // Extract dimensions
         size_t global_seq_len = static_cast<size_t>(global_input->shape()[0]);
@@ -184,7 +184,7 @@ namespace llaminar
             gamma_ptr = unit_gamma.data();
             if (getRank() == 0)
             {
-                LOG_WARN("[MPIRMSNormKernel] FORCING UNIT GAMMA (debug override) hidden_size=" << global_hidden_dim_reported);
+                LOG_WARN("[MPIRMSNormOperator] FORCING UNIT GAMMA (debug override) hidden_size=" << global_hidden_dim_reported);
             }
         }
         if (dump_gamma && getRank() == 0)
@@ -202,7 +202,7 @@ namespace llaminar
             }
             double g_mean = static_cast<double>(g_sum / static_cast<long double>(global_hidden_dim_reported));
             std::ostringstream goss;
-            goss << "[MPIRMSNormKernel][GammaDump] size=" << global_hidden_dim_reported
+            goss << "[MPIRMSNormOperator][GammaDump] size=" << global_hidden_dim_reported
                  << " min=" << g_min << " max=" << g_max << " mean=" << g_mean << " first32=";
             size_t dump_n = std::min<size_t>(32, global_hidden_dim_reported);
             for (size_t i = 0; i < dump_n; ++i)
@@ -235,11 +235,11 @@ namespace llaminar
             uint64_t cs = checksum(weight->data(), hidden_size);
             if (have_last && cs != last_checksum)
             {
-                LOG_WARN("[MPIRMSNormKernel][GammaChecksum] CHANGED checksum_old=0x" << std::hex << last_checksum << " checksum_new=0x" << cs << std::dec << " (gamma modified between invocations?)");
+                LOG_WARN("[MPIRMSNormOperator][GammaChecksum] CHANGED checksum_old=0x" << std::hex << last_checksum << " checksum_new=0x" << cs << std::dec << " (gamma modified between invocations?)");
             }
             else if (!have_last)
             {
-                LOG_INFO("[MPIRMSNormKernel][GammaChecksum] initial checksum=0x" << std::hex << cs << std::dec);
+                LOG_INFO("[MPIRMSNormOperator][GammaChecksum] initial checksum=0x" << std::hex << cs << std::dec);
                 have_last = true;
             }
             last_checksum = cs;
@@ -273,7 +273,7 @@ namespace llaminar
                 inv_scale[r] = (float)inv;
                 if (r == 0 && getRank() == 0 && debugEnv().rmsnorm.validate_ref)
                 {
-                    LOG_INFO("[MPIRMSNormKernel][Diag] r=0 global_row_sumsq=" << global_row_sumsq[r]
+                    LOG_INFO("[MPIRMSNormOperator][Diag] r=0 global_row_sumsq=" << global_row_sumsq[r]
                                                                               << " denom=" << denom << " inv=" << inv);
                 }
             }
@@ -319,7 +319,7 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(global_output, "RMSNorm output after computation");
 
         // Log output tensor statistics
-        TensorLogger::logTensorStats(global_output, "RMSNorm final_output", "MPIRMSNormKernel_COMPLETE");
+        TensorLogger::logTensorStats(global_output, "RMSNorm final_output", "MPIRMSNormOperator_COMPLETE");
 
         if (!trace_rows.empty())
         {
@@ -337,23 +337,23 @@ namespace llaminar
 
         if (debugEnv().rmsnorm.verbose)
         {
-            LOG_DEBUG("[MPIRMSNormKernel][verbose] rank=" << getRank() << " exec_us=" << duration.count());
+            LOG_DEBUG("[MPIRMSNormOperator][verbose] rank=" << getRank() << " exec_us=" << duration.count());
         }
         else
         {
-            LOG_TRACE("MPIRMSNormKernel done rank=" << getRank());
+            LOG_TRACE("MPIRMSNormOperator done rank=" << getRank());
         }
 
         return true;
     }
 
-    bool MPIRMSNormKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPIRMSNormOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                     const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Basic validation
         if (inputs.size() != 2 || outputs.size() != 1)
         {
-            LOG_ERROR("MPIRMSNormKernel: Expected 2 inputs and 1 output, got "
+            LOG_ERROR("MPIRMSNormOperator: Expected 2 inputs and 1 output, got "
                       << inputs.size() << " inputs and " << outputs.size() << " outputs");
             return false;
         }
@@ -364,14 +364,14 @@ namespace llaminar
 
         if (!input || !weight || !output)
         {
-            LOG_ERROR("MPIRMSNormKernel: Null tensor provided");
+            LOG_ERROR("MPIRMSNormOperator: Null tensor provided");
             return false;
         }
 
         // Check input is 2D [seq_len, hidden_size]
         if (input->shape().size() != 2)
         {
-            LOG_ERROR("MPIRMSNormKernel: Input must be 2D [seq_len, hidden_size], got "
+            LOG_ERROR("MPIRMSNormOperator: Input must be 2D [seq_len, hidden_size], got "
                       << input->shape().size() << "D");
             return false;
         }
@@ -379,7 +379,7 @@ namespace llaminar
         // Check weight is 1D [hidden_size]
         if (weight->shape().size() != 1)
         {
-            LOG_ERROR("MPIRMSNormKernel: Weight must be 1D [hidden_size], got "
+            LOG_ERROR("MPIRMSNormOperator: Weight must be 1D [hidden_size], got "
                       << weight->shape().size() << "D");
             return false;
         }
@@ -387,7 +387,7 @@ namespace llaminar
         // Check output is 2D [seq_len, hidden_size]
         if (output->shape().size() != 2)
         {
-            LOG_ERROR("MPIRMSNormKernel: Output must be 2D [seq_len, hidden_size], got "
+            LOG_ERROR("MPIRMSNormOperator: Output must be 2D [seq_len, hidden_size], got "
                       << output->shape().size() << "D");
             return false;
         }
@@ -405,14 +405,14 @@ namespace llaminar
                     if ((size_t)spec.local_dim == (size_t)input->shape()[1] && (size_t)spec.global_dim == (size_t)weight->shape()[0])
                     {
                         allow_replicated_weight = true;
-                        LOG_DEBUG("MPIRMSNormKernel: Accepting replicated weight (global_hidden=" << spec.global_dim
+                        LOG_DEBUG("MPIRMSNormOperator: Accepting replicated weight (global_hidden=" << spec.global_dim
                                                                                                   << ") with local feature slice dim=" << spec.local_dim << " on rank " << getRank());
                     }
                 }
             }
             if (!allow_replicated_weight)
             {
-                LOG_ERROR("MPIRMSNormKernel: Dimension mismatch between input hidden_size ("
+                LOG_ERROR("MPIRMSNormOperator: Dimension mismatch between input hidden_size ("
                           << input->shape()[1] << ") and weight (" << weight->shape()[0] << ")");
                 return false;
             }
@@ -421,14 +421,14 @@ namespace llaminar
         // Check input and output have same shape
         if (input->shape()[0] != output->shape()[0] || input->shape()[1] != output->shape()[1])
         {
-            LOG_ERROR("MPIRMSNormKernel: Input and output shape mismatch");
+            LOG_ERROR("MPIRMSNormOperator: Input and output shape mismatch");
             return false;
         }
 
         return true;
     }
 
-    void MPIRMSNormKernel::distributeInput(const std::shared_ptr<TensorBase> &global_input,
+    void MPIRMSNormOperator::distributeInput(const std::shared_ptr<TensorBase> &global_input,
                                            std::shared_ptr<TensorBase> &local_input,
                                            size_t global_seq_len, size_t hidden_size)
     {
@@ -450,7 +450,7 @@ namespace llaminar
                                                     << "], offset " << seq_offset << " on rank " << getRank());
     }
 
-    void MPIRMSNormKernel::gatherOutput(const std::shared_ptr<TensorBase> &local_output,
+    void MPIRMSNormOperator::gatherOutput(const std::shared_ptr<TensorBase> &local_output,
                                         std::shared_ptr<TensorBase> &global_output,
                                         size_t global_seq_len, size_t hidden_size)
     {
@@ -477,7 +477,7 @@ namespace llaminar
         LOG_DEBUG("Gathered output: [" << global_seq_len << ", " << hidden_size << "] on rank " << getRank());
     }
 
-    void MPIRMSNormKernel::computeDistributedRMSNorm(const float *local_input, const float *weight,
+    void MPIRMSNormOperator::computeDistributedRMSNorm(const float *local_input, const float *weight,
                                                      float *local_output, size_t local_seq_len,
                                                      size_t hidden_size, size_t global_seq_len)
     {
@@ -567,9 +567,9 @@ namespace llaminar
 
         if (getRank() == 0)
         {
-            LOG_DEBUG("[MPIRMSNormKernel] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
+            LOG_DEBUG("[MPIRMSNormOperator] Pre-Norm stats: min=" << global_min << " max=" << global_max << " mean=" << global_mean
                                                                << " rms_first_row=" << rms_global << " mode=T5");
-            LOG_DEBUG("[MPIRMSNormKernel] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
+            LOG_DEBUG("[MPIRMSNormOperator] Weight stats: min=" << w_min_global << " max=" << w_max_global << " mean=" << w_mean_global);
         }
 
         // Post-norm local stats to detect zeroing (parallel)
@@ -594,7 +594,7 @@ namespace llaminar
         double out_global_mean = (global_seq_len * hidden_size) ? (out_global_sum / (double)(global_seq_len * hidden_size)) : 0.0;
         if (getRank() == 0)
         {
-            LOG_DEBUG("[MPIRMSNormKernel] Post-Norm stats: min=" << out_global_min << " max=" << out_global_max << " mean=" << out_global_mean << " mode=T5");
+            LOG_DEBUG("[MPIRMSNormOperator] Post-Norm stats: min=" << out_global_min << " max=" << out_global_max << " mean=" << out_global_mean << " mode=T5");
         }
 
         LOG_DEBUG("Computed distributed RMS normalization: rms_metric=" << rms_global
@@ -602,7 +602,7 @@ namespace llaminar
                                                                         << " mode=T5");
     }
 
-    std::shared_ptr<TensorBase> MPIRMSNormKernel::createLocalTensor(const std::vector<size_t> &shape)
+    std::shared_ptr<TensorBase> MPIRMSNormOperator::createLocalTensor(const std::vector<size_t> &shape)
     {
         // Convert size_t vector to int vector for TensorFactory
         std::vector<int> int_shape(shape.begin(), shape.end());
@@ -611,7 +611,7 @@ namespace llaminar
     }
 
 #ifdef LLAMINAR_ENABLE_RMSNORM_REFERENCE
-    void MPIRMSNormKernel::runReferenceValidation(const std::shared_ptr<TensorBase> &global_input,
+    void MPIRMSNormOperator::runReferenceValidation(const std::shared_ptr<TensorBase> &global_input,
                                                   const std::shared_ptr<TensorBase> &weight,
                                                   const std::shared_ptr<TensorBase> &global_output,
                                                   const std::vector<int> &trace_rows)
@@ -620,7 +620,7 @@ namespace llaminar
         size_t hidden_size = static_cast<size_t>(global_input->shape()[1]);
         if (seq_len == 0 || hidden_size == 0)
         {
-            LOG_WARN("[MPIRMSNormKernel][validate] Skipping reference check due to empty dimensions");
+            LOG_WARN("[MPIRMSNormOperator][validate] Skipping reference check due to empty dimensions");
             return;
         }
 
@@ -693,7 +693,7 @@ namespace llaminar
         size_t worst_row = hidden_size ? worst_index / hidden_size : 0;
         size_t worst_col = hidden_size ? worst_index % hidden_size : 0;
 
-        LOG_INFO("[MPIRMSNormKernel][validate] reference diff max_abs=" << max_abs
+        LOG_INFO("[MPIRMSNormOperator][validate] reference diff max_abs=" << max_abs
                                                                         << " rel_l2=" << rel_l2
                                                                         << " worst_row=" << worst_row
                                                                         << " worst_col=" << worst_col
@@ -732,7 +732,7 @@ namespace llaminar
             actual_preview << "]";
             ref_preview << "]";
             diff_preview << "]";
-            LOG_INFO("[MPIRMSNormKernel][validate] worst_row_preview actual=" << actual_preview.str()
+            LOG_INFO("[MPIRMSNormOperator][validate] worst_row_preview actual=" << actual_preview.str()
                                                                               << " ref=" << ref_preview.str()
                                                                               << " diff=" << diff_preview.str());
         }

@@ -19,9 +19,9 @@
  * - Error handling patterns
  *
  * Backend-Specific Logic (delegated to derived classes):
- * - executeLinearProjection(): MPILinearKernel vs adaptiveMatMul
- * - executeAttentionBlock(): MPIAttentionKernel vs COSMA fused path
- * - executeEmbedding(): MPIEmbeddingKernel vs manual memcpy
+ * - executeLinearProjection(): MPILinearOperator vs adaptiveMatMul
+ * - executeAttentionBlock(): MPIAttentionOperator vs COSMA fused path
+ * - executeEmbedding(): MPIEmbeddingOperator vs manual memcpy
  *
  * Benefits:
  * - DRY principle: Single source of truth for execution flow
@@ -45,7 +45,7 @@
 #include "PrefillProvider.h"
 #include "QwenPipeline.h"
 #include "PipelineBase.h"
-#include "logger.h"
+#include "Logger.h"
 #include "PerformanceTimer.h"
 #include <memory>
 #include <vector>
@@ -125,7 +125,7 @@ namespace llaminar
          * @return true if successful, false on error
          *
          * Implementations:
-         * - OpenBLAS: Uses MPIEmbeddingKernel
+         * - OpenBLAS: Uses MPIEmbeddingOperator
          * - COSMA: Manual memcpy loop (simple lookup, no matmul needed)
          */
         virtual bool executeEmbedding(
@@ -149,7 +149,7 @@ namespace llaminar
          * @return true if successful, false on error
          *
          * Implementations:
-         * - OpenBLAS: Uses MPILinearKernel (wraps cblas_sgemm)
+         * - OpenBLAS: Uses MPILinearOperator (wraps cblas_sgemm)
          * - COSMA: Uses adaptiveMatMul (may route to COSMA for large ops)
          *
          * Note: Weight is assumed to be stored as [n, k] and needs transpose flag.
@@ -184,7 +184,7 @@ namespace llaminar
          * @return true if successful, false on error
          *
          * Implementations:
-         * - OpenBLAS: Uses MPIAttentionKernel (all-in-one kernel)
+         * - OpenBLAS: Uses MPIAttentionOperator (all-in-one kernel)
          * - COSMA: Uses CosmaPrefillManager (fused RMSNorm+QKV) + attention primitives
          *
          * CRITICAL: Must populate attn_norm_out for snapshot capture consistency!

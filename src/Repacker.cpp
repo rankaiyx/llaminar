@@ -1,6 +1,6 @@
-#include "repacker.h"
-#include "tensors/tensor_base.h"
-#include "tensors/tensor_factory.h"
+#include "Repacker.h"
+#include "tensors/TensorBase.h"
+#include "tensors/TensorFactory.h"
 #include "QuantDequant.h" // For proper Q4_0/Q8_0 dequantization matching llama.cpp
 #include <iostream>
 #include <algorithm>
@@ -264,7 +264,7 @@ std::vector<double> TensorRepacker::dequantizeQ4_0(const uint8_t *data, size_t n
     const size_t block_bytes = 18; // 2 (scale) + 16 (quantized data)
     const size_t num_blocks = (n_elements + block_size - 1) / block_size;
 
-    // Use the quant_dequant.h implementation which matches llama.cpp exactly
+    // Use the QuantDequant.h implementation which matches llama.cpp exactly
     for (size_t block = 0; block < num_blocks; ++block)
     {
         const size_t block_offset = block * block_bytes;
@@ -273,7 +273,7 @@ std::vector<double> TensorRepacker::dequantizeQ4_0(const uint8_t *data, size_t n
         // Temporary float buffer for dequant_block_q4_0
         float block_result[32];
 
-        // Use the correct implementation from quant_dequant.h
+        // Use the correct implementation from QuantDequant.h
         llaminar::dequant_block_q4_0(data + block_offset, block_result, elements_in_block);
 
         // Convert float to double for result

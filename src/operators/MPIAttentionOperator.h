@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../mpi_kernel_base.h"
-#include "../pipeline_stages.h"
+#include "../MpiKernelBase.h"
+#include "../PipelineStages.h"
 #include "attention/AttentionStageContracts.h"
 #include <string>
 #include <vector>
@@ -181,7 +181,7 @@ namespace llaminar
      * @brief MPI-enabled multi-head attention kernel with modular 8-stage pipeline architecture
      * @author David Sanftenberg
      *
-     * This kernel implements distributed multi-head attention using a clean, testable 8-stage pipeline.
+     * This operator implements distributed multi-head attention using a clean, testable 8-stage pipeline.
      * Each stage is implemented as a separate private method with well-defined inputs/outputs via
      * structured result types, enabling independent testing and validation.
      *
@@ -215,11 +215,11 @@ namespace llaminar
      * - All backends respect proper matrix orientation contracts (no silent transpositions)
      *
      * @note Output Contract (Fully Replicated):
-     * The kernel returns a FULLY REPLICATED attention output across all ranks. The output tensor
+     * The operator returns a FULLY REPLICATED attention output across all ranks. The output tensor
      * is identical on all processes after MPI_Allreduce (MPI_SUM) in the projectAndGatherOutput stage.
      *
      * Internal MPI Communication:
-     * The kernel performs EXTENSIVE MPI collectives internally:
+     * The operator performs EXTENSIVE MPI collectives internally:
      * - MPI_Allgather: Q/K/V for PyTorch parity snapshots (optional, debug only)
      * - MPI_Allgatherv: K/V cache gathering for attention computation (required)
      * - MPI_Allgatherv: Attention scores gathering across ranks (required)
@@ -265,7 +265,7 @@ namespace llaminar
      * @see AttentionStageContracts for stage validation contracts
      * @see CosmaPrefillManager for distributed COSMA integration
      */
-    class MPIAttentionKernel : public MPIKernelBase
+    class MPIAttentionOperator : public MPIKernelBase
     {
     public:
         // Output assembly / distribution mode (scaffolding for hybrid head + TP design)
@@ -302,11 +302,11 @@ namespace llaminar
          * @param rope_freq_base Base frequency for rotary embeddings
          * @param strategy Distribution strategy to use
          */
-        MPIAttentionKernel(int n_head, int n_head_kv, int head_dim,
+        MPIAttentionOperator(int n_head, int n_head_kv, int head_dim,
                            float rope_freq_base = 10000.0f,
                            DistributionStrategy strategy = DistributionStrategy::HEAD_WISE);
 
-        ~MPIAttentionKernel() = default;
+        ~MPIAttentionOperator() = default;
 
         // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,

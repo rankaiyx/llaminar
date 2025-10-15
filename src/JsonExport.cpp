@@ -5,7 +5,7 @@
  */
 
 #include "JsonExport.h"
-#include "logger.h"
+#include "Logger.h"
 #include <iomanip>
 
 namespace llaminar

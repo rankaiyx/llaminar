@@ -16,8 +16,8 @@
 #include <string>
 #include <memory>
 #include <sstream>
-#include "logger.h"
-#include "tensors/tensor_base.h"
+#include "Logger.h"
+#include "tensors/TensorBase.h"
 
 namespace llaminar
 {

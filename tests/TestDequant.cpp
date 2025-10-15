@@ -1,5 +1,5 @@
 #include "ModelLoader.h"
-#include "logger.h"
+#include "Logger.h"
 #include <gtest/gtest.h>
 #include <numeric>
 #include <cstring>

@@ -1,5 +1,5 @@
 #include "ChatSession.h"
-#include "../logger.h"
+#include "../Logger.h"
 #include <algorithm>
 #include <sstream>
 #include <numeric>

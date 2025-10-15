@@ -1,6 +1,6 @@
 // Canonical header for Qwen-specific pipeline implementation (renamed from distributed_transformer_pipeline.h).
 // NOTE: During deprecation window, distributed_transformer_pipeline.h is a shim that includes this file.
-// New code must include qwen_pipeline.h directly.
+// New code must include QwenPipeline.h directly.
 #pragma once
 
 #include "PipelineBase.h"
@@ -10,15 +10,15 @@
 
 // Forward declarations
 class ModelLoader;
-#include "kernels/MPILinearKernel.h"
-#include "kernels/MPIRMSNormKernel.h"
-#include "kernels/MPIAttentionKernel.h"
-#include "kernels/MPISwiGLUKernel.h"
-#include "kernels/MPIRoPEKernel.h"
-#include "kernels/MPIResidualKernel.h"
+#include "operators/MPILinearOperator.h"
+#include "operators/MPIRMSNormOperator.h"
+#include "operators/MPIAttentionOperator.h"
+#include "operators/MPISwiGLUOperator.h"
+#include "operators/MPIRoPEOperator.h"
+#include "operators/MPIResidualOperator.h"
 #include "TransformerConfig.h"
 #include "ModelLoader.h"
-#include "logger.h"
+#include "Logger.h"
 #include <memory>
 #include <vector>
 #include <mpi.h>
@@ -331,7 +331,7 @@ namespace llaminar
         static std::vector<LayerTokenDiffRow> last_layer_token_rows_;
     };
 
-    // DEPRECATED: Use qwen_pipeline_adapter.h version instead
+    // DEPRECATED: Use QwenPipelineAdapter.h version instead
     // void registerQwenPipeline();
 
     // --- Inline migration shims (temporary until link-order cleanup) ---

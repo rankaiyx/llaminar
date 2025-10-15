@@ -4,11 +4,11 @@
 #include <numeric>
 #include <cmath>
 #include <cstring>
-#include "utils/debug_env.h"
-#include "kernels/MPIAttentionKernel.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
-#include "tensors/tp_partition.h"
+#include "utils/DebugEnv.h"
+#include "operators/MPIAttentionOperator.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
+#include "tensors/TpPartition.h"
 
 using namespace llaminar;
 

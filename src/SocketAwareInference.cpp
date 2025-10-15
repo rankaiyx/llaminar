@@ -1,6 +1,6 @@
 #include "SocketAwareInference.h"
-#include "logger.h"
-#include "tensors/tensor_base.h"
+#include "Logger.h"
+#include "tensors/TensorBase.h"
 #include <numa.h>
 #include <sched.h>
 #include <unistd.h>

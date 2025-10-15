@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common.h"
+#include "SystemTopology.h"
 #include "LogLevel.h"
 #include <string>
 

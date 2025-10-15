@@ -1,8 +1,8 @@
 #include "TestTensorUtils.h"
 #include "TestReferenceImpls.h"
 #include "TestTimeoutGuard.h"
-#include "kernels/MPILinearKernel.h"
-#include "tensors/tensor_factory.h"
+#include "operators/MPILinearOperator.h"
+#include "tensors/TensorFactory.h"
 #include "TestMpiUtils.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -72,7 +72,7 @@ TEST_F(LinearOrientationTestFixture, ParitySmallShapes)
     std::vector<Case> cases = {
         {1, 4, 4}, {2, 3, 5}, {3, 7, 2}, {4, 8, 6}, {5, 5, 5}};
 
-    MPILinearKernel kernel;
+    MPILinearOperator kernel;
 
     const double max_abs_tol = 1e-6;
     const double rel_l2_tol = 1e-6;
@@ -117,7 +117,7 @@ TEST_F(LinearOrientationTestFixture, ParitySmallShapes)
 TEST_F(LinearOrientationTestFixture, RandomizedBatched)
 {
     testutils::PRNG rng(1234);
-    MPILinearKernel kernel;
+    MPILinearOperator kernel;
 
     // Random shape palette (kept small for unit test runtime)
     for (int iter = 0; iter < 10; ++iter)

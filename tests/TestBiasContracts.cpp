@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 #include "BiasContracts.h"
-#include "tensors/tensor_factory.h"
+#include "tensors/TensorFactory.h"
 #include <mpi.h>
 
 using namespace llaminar;

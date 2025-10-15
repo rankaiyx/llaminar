@@ -3,8 +3,8 @@
 // to determine if the warning about transposed layout corresponds to llama.cpp's representation.
 
 #include "ModelLoader.h"
-#include "logger.h"
-#include "tensors/tensor_base.h"
+#include "Logger.h"
+#include "tensors/TensorBase.h"
 
 #include <gtest/gtest.h>
 

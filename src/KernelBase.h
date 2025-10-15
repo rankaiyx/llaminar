@@ -3,7 +3,7 @@
 #include <vector>
 #include <memory>
 #include <string>
-#include "tensors/tensor_base.h"
+#include "tensors/TensorBase.h"
 
 namespace llaminar
 {

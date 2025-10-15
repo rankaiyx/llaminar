@@ -7,7 +7,7 @@
 #include "ModelLoader.h"
 #include "WeightContracts.h"
 #include "TransformerConfig.h"
-#include "logger.h"
+#include "Logger.h"
 #include <mpi.h>
 #include <iostream>
 #include <memory>

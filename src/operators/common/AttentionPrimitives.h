@@ -1,6 +1,6 @@
 /**
  * @file AttentionPrimitives.h
- * @brief Low-level scalar attention building blocks (layout-compatible with MPIAttentionKernel).
+ * @brief Low-level scalar attention building blocks (layout-compatible with MPIAttentionOperator).
  *
  * Layout Assumptions:
  *  Q, K, V, and output are stored row-major over sequence. Each row packs all heads
@@ -13,10 +13,10 @@
  *
  * Numerical Notes:
  *  - Softmax uses standard max-subtraction for stability.
- *  - RoPE matches current MPIAttentionKernel (n_past added externally if needed).
+ *  - RoPE matches current MPIAttentionOperator (n_past added externally if needed).
  *  - All loops are simple scalar reference style prioritizing clarity over speed.
  *
- * These primitives allow refactoring MPIAttentionKernel into orchestrating distribution,
+ * These primitives allow refactoring MPIAttentionOperator into orchestrating distribution,
  *  projections, and gather while delegating math to easily testable, deterministic blocks.
  */
 #pragma once

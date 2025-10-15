@@ -4,8 +4,8 @@
 #include <cstdlib>
 #include <cmath>     // for std::sqrt, std::abs
 #include <algorithm> // for std::max
-#include "kernels/common/attention_primitives.h"
-#include "utils/debug_env.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar::attn;
 

@@ -13,11 +13,11 @@
 
 #include "QwenPipeline.h" // Provides QwenPipeline definition
 #include "AdaptiveMatmul.h"
-#include "logger.h"
+#include "Logger.h"
 #include <memory>
 #include <chrono>
 #include <cmath>
-#include "utils/perf_counters.h"
+#include "utils/PerfCounters.h"
 
 namespace llaminar
 {

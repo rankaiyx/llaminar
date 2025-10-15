@@ -22,10 +22,10 @@
 #include <iostream>
 #include <iomanip>
 
-#include "tensors/tensor_base.h"
-#include "tensors/simple_tensor.h"
-#include "kernels/common/attention_primitives.h"
-#include "logger.h"
+#include "tensors/TensorBase.h"
+#include "tensors/SimpleTensor.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "Logger.h"
 
 using namespace llaminar;
 

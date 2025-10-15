@@ -6,7 +6,7 @@
 #include "AdaptiveMatmul.h"
 #include "AdaptiveTransformerPipeline.h"
 #include "TransformerConfig.h"
-#include "logger.h"
+#include "Logger.h"
 #include <mpi.h>
 #include <iostream>
 #include <vector>

@@ -37,14 +37,14 @@ namespace llaminar
     /**
      * @brief OpenBLAS-based prefill provider (refactored version)
      *
-     * This provider uses MPILinearKernel for all matrix multiplications,
+     * This provider uses MPILinearOperator for all matrix multiplications,
      * which wraps OpenBLAS GEMM operations. It inherits all execution
      * scaffolding from PrefillProviderBaseImpl.
      *
      * Backend-Specific Features:
-     * - MPIEmbeddingKernel for token embedding lookup
-     * - MPILinearKernel for all linear projections (gate, up, down, LM head)
-     * - MPIAttentionKernel for complete attention block
+     * - MPIEmbeddingOperator for token embedding lookup
+     * - MPILinearOperator for all linear projections (gate, up, down, LM head)
+     * - MPIAttentionOperator for complete attention block
      * - KV cache management (for incremental decode)
      *
      * Shared Features (from base class):
@@ -86,7 +86,7 @@ namespace llaminar
         // ========================================================================
 
         /**
-         * @brief Execute token embedding using MPIEmbeddingKernel
+         * @brief Execute token embedding using MPIEmbeddingOperator
          */
         bool executeEmbedding(
             const std::vector<int> &tokens,
@@ -95,7 +95,7 @@ namespace llaminar
             int vocab_size) override;
 
         /**
-         * @brief Execute linear projection using MPILinearKernel (OpenBLAS GEMM)
+         * @brief Execute linear projection using MPILinearOperator (OpenBLAS GEMM)
          */
         bool executeLinearProjection(
             std::shared_ptr<TensorBase> input,
@@ -106,9 +106,9 @@ namespace llaminar
             const std::string &operation_name) override;
 
         /**
-         * @brief Execute attention block using MPIAttentionKernel
+         * @brief Execute attention block using MPIAttentionOperator
          *
-         * This kernel handles:
+         * This operator handles:
          * - RMSNorm (populates attn_norm_out)
          * - Q/K/V projections
          * - RoPE
@@ -134,12 +134,12 @@ namespace llaminar
          * @brief Initialize OpenBLAS-specific kernels
          *
          * Registers:
-         * - embedding: MPIEmbeddingKernel
-         * - rmsnorm: MPIRMSNormKernel
-         * - attention: MPIAttentionKernel (with GatherHeadsPostProjection mode)
-         * - linear: MPILinearKernel
-         * - swiglu: MPISwiGLUKernel
-         * - residual: MPIResidualKernel
+         * - embedding: MPIEmbeddingOperator
+         * - rmsnorm: MPIRMSNormOperator
+         * - attention: MPIAttentionOperator (with GatherHeadsPostProjection mode)
+         * - linear: MPILinearOperator
+         * - swiglu: MPISwiGLUOperator
+         * - residual: MPIResidualOperator
          */
         void initializeKernels();
 

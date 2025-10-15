@@ -1,6 +1,6 @@
 /**
  * @file TestAttentionOutputModeValidation.cpp
- * @brief Unit test to validate MPIAttentionKernel output mode configuration
+ * @brief Unit test to validate MPIAttentionOperator output mode configuration
  *
  * This test ensures that the critical output mode configuration is correctly set
  * for multi-rank execution. It catches the bug where LocalHeads mode (default)
@@ -11,9 +11,9 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
-#include "kernels/MPIAttentionKernel.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "operators/MPIAttentionOperator.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 
 using namespace llaminar;
 
@@ -50,7 +50,7 @@ TEST_F(AttentionOutputModeTest, LocalHeadsModeWithReplicatedWeightsThrows)
     const int seq_len = 5;
 
     // Create attention kernel with DEFAULT LocalHeads mode (this should fail!)
-    auto attention_kernel = std::make_unique<MPIAttentionKernel>(
+    auto attention_kernel = std::make_unique<MPIAttentionOperator>(
         n_head, n_head_kv, head_dim);
 
     // DO NOT call setOutputMode() - use the dangerous default
@@ -111,14 +111,14 @@ TEST_F(AttentionOutputModeTest, GatherHeadsPostProjectionModeDoesNotThrow)
     const int head_dim = 64;
 
     // Create attention kernel and EXPLICITLY set the correct mode
-    auto attention_kernel = std::make_unique<MPIAttentionKernel>(
+    auto attention_kernel = std::make_unique<MPIAttentionOperator>(
         n_head, n_head_kv, head_dim);
 
     // FIX: Set GatherHeadsPostProjection mode for row-partitioned weights
-    attention_kernel->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
+    attention_kernel->setOutputMode(MPIAttentionOperator::AttentionOutputMode::GatherHeadsPostProjection);
 
     // Verify the mode was set correctly
-    EXPECT_EQ(attention_kernel->outputMode(), MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
+    EXPECT_EQ(attention_kernel->outputMode(), MPIAttentionOperator::AttentionOutputMode::GatherHeadsPostProjection);
 
     if (rank_ == 0)
     {
@@ -149,7 +149,7 @@ TEST_F(AttentionOutputModeTest, SingleRankDoesNotTriggerAssertion)
     const int seq_len = 5;
 
     // Create attention kernel with default LocalHeads mode
-    auto attention_kernel = std::make_unique<MPIAttentionKernel>(
+    auto attention_kernel = std::make_unique<MPIAttentionOperator>(
         n_head, n_head_kv, head_dim);
 
     // Create non-sharded tensors

@@ -9,8 +9,8 @@
 
 #include "PrefillDiagnostics.h"
 #include "DebugUtils.h"
-#include "utils/debug_env.h"
-#include "logger.h"
+#include "utils/DebugEnv.h"
+#include "Logger.h"
 #include <algorithm>
 #include <cmath>
 #include <sstream>

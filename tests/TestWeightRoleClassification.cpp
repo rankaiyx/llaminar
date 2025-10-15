@@ -1,6 +1,6 @@
 // Basic tests for weight role classification (Phase 0)
 #include <gtest/gtest.h>
-#include "weights/weight_roles.h"
+#include "weights/WeightRoles.h"
 
 using namespace llaminar;
 

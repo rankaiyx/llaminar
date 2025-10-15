@@ -11,7 +11,7 @@
 #include "RmsnormT5.h"
 #include <cmath>
 #include <algorithm>
-#include "../../logger.h"
+#include "../../Logger.h"
 
 #ifdef _OPENMP
 #include <omp.h>

@@ -3,8 +3,8 @@
 #include <unordered_map>
 #include <mutex>
 #include <vector>
-#include "utils/debug_env.h" // for WeightRole enum
-#include "logger.h"
+#include "utils/DebugEnv.h" // for WeightRole enum
+#include "Logger.h"
 
 namespace llaminar
 {

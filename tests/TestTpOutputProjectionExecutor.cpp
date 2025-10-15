@@ -1,8 +1,8 @@
 // @file TestTpOutputProjectionExecutor.cpp
-#include "../src/tensors/tp_output_projection_executor.h"
-#include "../src/backends/inference_backend.h"
-#include "../src/backends/prefill_backend.h"
-#include "../src/adaptive_matmul.h"
+#include "../src/tensors/TpOutputProjectionExecutor.h"
+#include "../src/backends/InferenceBackend.h"
+#include "../src/backends/PrefillBackend.h"
+#include "../src/AdaptiveMatmul.h"
 #include <random>
 #include <cmath>
 #include <iostream>

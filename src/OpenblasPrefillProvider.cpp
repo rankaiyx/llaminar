@@ -25,14 +25,14 @@
 
 #include "OpenblasPrefillProvider.h"
 #include "QwenPipelineAdapter.h"
-#include "kernels/MPILinearKernel.h"
-#include "kernels/MPIRMSNormKernel.h"
-#include "kernels/MPIAttentionKernel.h"
-#include "kernels/MPIEmbeddingKernel.h"
-#include "kernels/MPISwiGLUKernel.h"
-#include "kernels/MPIResidualKernel.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "operators/MPILinearOperator.h"
+#include "operators/MPIRMSNormOperator.h"
+#include "operators/MPIAttentionOperator.h"
+#include "operators/MPIEmbeddingOperator.h"
+#include "operators/MPISwiGLUOperator.h"
+#include "operators/MPIResidualOperator.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 #include "PerformanceTimer.h"
 #include <chrono>
 #include <cstring>
@@ -57,19 +57,19 @@ namespace llaminar
 
         // Embedding kernel
         {
-            auto embedding_kernel = std::make_unique<MPIEmbeddingKernel>(
+            auto embedding_kernel = std::make_unique<MPIEmbeddingOperator>(
                 layer_cfg.vocab_size,
                 layer_cfg.d_model);
             if (!registerKernel("embedding", std::move(embedding_kernel)))
             {
-                throw std::runtime_error("OpenBLASPrefillProvider: Failed to register embedding kernel");
+                throw std::runtime_error("OpenBLASPrefillProvider: Failed to register embedding operator");
             }
         }
 
-        // RMSNorm kernel (sequence-wise distribution)
+        // RMSNorm operator (sequence-wise distribution)
         {
-            auto rmsnorm_kernel = std::make_unique<MPIRMSNormKernel>(
-                MPIRMSNormKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto rmsnorm_kernel = std::make_unique<MPIRMSNormOperator>(
+                MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
             rmsnorm_kernel->setEpsilon(layer_cfg.eps);
             if (!registerKernel("rmsnorm", std::move(rmsnorm_kernel)))
             {
@@ -77,14 +77,14 @@ namespace llaminar
             }
         }
 
-        // Attention kernel (handles Q/K/V/O projections internally)
+        // Attention operator (handles Q/K/V/O projections internally)
         {
-            auto attention_kernel = std::make_unique<MPIAttentionKernel>(
+            auto attention_kernel = std::make_unique<MPIAttentionOperator>(
                 layer_cfg.n_head, layer_cfg.n_head_kv,
                 layer_cfg.head_dim, layer_cfg.rope_freq_base);
 
             // CRITICAL: Must use GatherHeadsPostProjection mode for multi-rank execution
-            attention_kernel->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
+            attention_kernel->setOutputMode(MPIAttentionOperator::AttentionOutputMode::GatherHeadsPostProjection);
 
             if (!registerKernel("attention", std::move(attention_kernel)))
             {
@@ -94,7 +94,7 @@ namespace llaminar
 
         // Linear kernel (for FFN projections)
         {
-            auto linear_kernel = std::make_unique<MPILinearKernel>();
+            auto linear_kernel = std::make_unique<MPILinearOperator>();
             if (!registerKernel("linear", std::move(linear_kernel)))
             {
                 throw std::runtime_error("OpenBLASPrefillProvider: Failed to register linear kernel");
@@ -103,8 +103,8 @@ namespace llaminar
 
         // SwiGLU activation kernel
         {
-            auto swiglu_kernel = std::make_unique<MPISwiGLUKernel>(
-                MPISwiGLUKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto swiglu_kernel = std::make_unique<MPISwiGLUOperator>(
+                MPISwiGLUOperator::DistributionStrategy::SEQUENCE_WISE);
             if (!registerKernel("swiglu", std::move(swiglu_kernel)))
             {
                 throw std::runtime_error("OpenBLASPrefillProvider: Failed to register swiglu kernel");
@@ -113,8 +113,8 @@ namespace llaminar
 
         // Residual connection kernel
         {
-            auto residual_kernel = std::make_unique<MPIResidualKernel>(
-                MPIResidualKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto residual_kernel = std::make_unique<MPIResidualOperator>(
+                MPIResidualOperator::DistributionStrategy::SEQUENCE_WISE);
             if (!registerKernel("residual", std::move(residual_kernel)))
             {
                 throw std::runtime_error("OpenBLASPrefillProvider: Failed to register residual kernel");
@@ -146,11 +146,11 @@ namespace llaminar
         std::shared_ptr<TensorBase> &output,
         int vocab_size)
     {
-        // Use MPIEmbeddingKernel
+        // Use MPIEmbeddingOperator
         std::vector<std::shared_ptr<TensorBase>> embed_inputs = {embedding_weight};
         std::vector<std::shared_ptr<TensorBase>> embed_outputs = {output};
 
-        // Create temporary 1D token tensor for embedding kernel
+        // Create temporary 1D token tensor for embedding operator
         auto token_tensor = createLocalTensor({static_cast<int>(tokens.size())});
         float *token_data = token_tensor->data();
         for (size_t i = 0; i < tokens.size(); ++i)
@@ -170,7 +170,7 @@ namespace llaminar
         bool is_prefill,
         const std::string &operation_name)
     {
-        // Use MPILinearKernel (wraps OpenBLAS GEMM)
+        // Use MPILinearOperator (wraps OpenBLAS GEMM)
         std::vector<std::shared_ptr<TensorBase>> linear_inputs = {input, weight};
         std::vector<std::shared_ptr<TensorBase>> linear_outputs = {output};
 
@@ -217,7 +217,7 @@ namespace llaminar
         }
 
         // Configure attention kernel
-        auto attention_kernel = dynamic_cast<MPIAttentionKernel *>(getKernel("attention"));
+        auto attention_kernel = dynamic_cast<MPIAttentionOperator *>(getKernel("attention"));
         if (attention_kernel)
         {
             attention_kernel->setSequencePosition(n_past_);

@@ -8,7 +8,7 @@
 #include <random>
 #include <cmath>
 #include <cstring>
-#include "kernels/common/softmax_core.h"
+#include "operators/common/SoftmaxCore.h"
 #include "TestMpiUtils.h" // for LLAMINAR_DEFINE_GTEST_MPI_MAIN and MPIEnvironment
 
 using namespace llaminar::kernels;

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "common.h"
+#include "SystemTopology.h"
 #include "ModelLoader.h"
-#include "tensors/tensor_base.h"
+#include "tensors/TensorBase.h"
 #include <memory>
 #include <vector>
 #include <string>

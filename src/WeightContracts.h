@@ -11,9 +11,9 @@
  */
 #pragma once
 
-#include "tensors/tensor_base.h"
+#include "tensors/TensorBase.h"
 #include "TransformerConfig.h"
-#include "logger.h"
+#include "Logger.h"
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -705,7 +705,7 @@ namespace llaminar
      *
      * CRITICAL: ALL KERNELS USE GGUF FORMAT DIRECTLY
      *
-     * Both MPIAttentionKernel and MPILinearKernel expect weights in GGUF format:
+     * Both MPIAttentionOperator and MPILinearOperator expect weights in GGUF format:
      * - Format: [output_features, input_features] (PyTorch convention)
      * - Both kernels use GEMM with transpose_B flags internally
      * - NO post-load transposes are needed!

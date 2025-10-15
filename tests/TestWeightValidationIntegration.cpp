@@ -7,7 +7,7 @@
 #include <gtest/gtest.h>
 #include "WeightContracts.h"
 #include "TransformerConfig.h"
-#include "tensors/tensor_factory.h"
+#include "tensors/TensorFactory.h"
 #include <filesystem>
 #include <stdexcept>
 

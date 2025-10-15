@@ -4,7 +4,7 @@
  */
 #include "AbstractPipeline.h"
 #include "PipelineSnapshotManager.h"
-#include "logger.h"
+#include "Logger.h"
 
 namespace llaminar
 {

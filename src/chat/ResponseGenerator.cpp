@@ -1,7 +1,7 @@
 #include "ResponseGenerator.h"
-#include "../logger.h"
-#include "../tensors/tensor_factory.h"
-#include "../json_export.h"
+#include "../Logger.h"
+#include "../tensors/TensorFactory.h"
+#include "../JsonExport.h"
 #include <algorithm>
 #include <random>
 #include <numeric>

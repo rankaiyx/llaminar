@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../mpi_kernel_base.h"
+#include "../MpiKernelBase.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -31,7 +31,7 @@ namespace llaminar
      * Expected outputs:
      * - output: [seq_len, hidden_size] - sum of input and residual
      */
-    class MPIResidualKernel : public MPIKernelBase
+    class MPIResidualOperator : public MPIKernelBase
     {
     public:
         enum class DistributionStrategy
@@ -41,15 +41,15 @@ namespace llaminar
         };
 
         /**
-         * @brief Construct MPIResidualKernel with specified distribution strategy
+         * @brief Construct MPIResidualOperator with specified distribution strategy
          * @param strategy Distribution strategy for MPI parallelization
          */
-        MPIResidualKernel(DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
+        MPIResidualOperator(DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
 
         /**
          * @brief Destructor
          */
-        ~MPIResidualKernel() override = default;
+        ~MPIResidualOperator() override = default;
 
         /**
          * @brief Execute residual connection with MPI distribution and OpenMP parallelization
@@ -76,7 +76,7 @@ namespace llaminar
          * @brief Get kernel name for debugging and profiling
          * @return Kernel name string
          */
-        std::string getName() const { return "MPIResidualKernel"; }
+        std::string getName() const { return "MPIResidualOperator"; }
 
         /**
          * @brief Get the kernel type name for debugging/logging

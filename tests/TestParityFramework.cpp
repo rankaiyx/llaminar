@@ -16,7 +16,7 @@
 #include "ModelLoader.h"
 #include "ModelWeightsProvider.h"
 #include "WeightVerifier.h"
-#include "logger.h"
+#include "Logger.h"
 #include "TestTimeoutGuard.h"
 #include "AbstractPipeline.h"
 #include "PipelineSnapshotManager.h"

@@ -6,7 +6,7 @@
  */
 
 #include "MpiSlicingHelper.h"
-#include "logger.h"
+#include "Logger.h"
 #include <stdexcept>
 #include <sstream>
 

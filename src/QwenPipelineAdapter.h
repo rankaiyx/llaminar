@@ -21,7 +21,7 @@ namespace llaminar
      * - Q/K/V: [out_features, in_features] = [n_head*head_dim, d_model]
      * - Output: [in_features, out_features] = [d_model, n_head*head_dim]
      *
-     * This contract is validated at load time via weight_contracts.h
+     * This contract is validated at load time via WeightContracts.h
      */
     struct QwenModelWeights : public IModelWeights
     {

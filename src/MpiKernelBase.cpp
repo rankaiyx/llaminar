@@ -1,9 +1,9 @@
 #include "MpiKernelBase.h"
-#include "logger.h"
+#include "Logger.h"
 #include <algorithm>
 #include <cmath>
 #include <sstream>
-#include "utils/perf_counters.h"
+#include "utils/PerfCounters.h"
 
 namespace llaminar
 {

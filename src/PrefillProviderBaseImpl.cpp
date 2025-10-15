@@ -6,11 +6,11 @@
 
 #include "PrefillProviderBaseImpl.h"
 #include "QwenPipelineAdapter.h"
-#include "kernels/MPIRMSNormKernel.h"
-#include "kernels/MPISwiGLUKernel.h"
-#include "kernels/MPIResidualKernel.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "operators/MPIRMSNormOperator.h"
+#include "operators/MPISwiGLUOperator.h"
+#include "operators/MPIResidualOperator.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 #include "PerformanceTimer.h"
 #include <chrono>
 #include <cstring>

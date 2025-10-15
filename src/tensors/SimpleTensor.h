@@ -1,7 +1,7 @@
 #pragma once
 
 #include "TensorBase.h"
-#include "../logger.h"
+#include "../Logger.h"
 #include <vector>
 #include <algorithm>
 #include <stdexcept>

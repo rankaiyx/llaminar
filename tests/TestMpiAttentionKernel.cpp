@@ -8,8 +8,8 @@
 #include <string>
 #include <algorithm>
 #include <chrono>
-#include "../src/kernels/MPIAttentionKernel.h"
-#include "../src/tensors/tensor_factory.h"
+#include "../src/operators/MPIAttentionOperator.h"
+#include "../src/tensors/TensorFactory.h"
 
 using namespace llaminar;
 
@@ -88,7 +88,7 @@ int main(int argc, char **argv)
     std::memset(v_cache->data(), 0, sizeof(float) * v_cache->size());
 
     // Execute kernel (replicated weight path triggers internal slicing)
-    MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
     std::vector<std::shared_ptr<TensorBase>> inputs = {input, wq_g, wk_g, wv_g, wo_g, bq_g, bk_g, bv_g, k_cache, v_cache};
     std::vector<std::shared_ptr<TensorBase>> outputs = {out_partial};
     bool ok = kernel.execute(inputs, outputs);

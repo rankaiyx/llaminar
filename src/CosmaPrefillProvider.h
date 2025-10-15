@@ -33,7 +33,7 @@
  * - Kernel registration infrastructure
  *
  * Key Difference from OpenBLAS:
- * - Uses adaptiveMatMul() instead of MPILinearKernel
+ * - Uses adaptiveMatMul() instead of MPILinearOperator
  * - Uses CosmaPrefillManager for fused attention operations
  * - Manual embedding (simple memcpy, no kernel needed)
  */
@@ -142,13 +142,13 @@ namespace llaminar
          * @brief Initialize COSMA-specific kernels
          *
          * Registers:
-         * - attention: MPIAttentionKernel (for snapshot callback mechanism)
-         * - rmsnorm: MPIRMSNormKernel (fallback if COSMA fused path unavailable)
-         * - swiglu: MPISwiGLUKernel
-         * - residual: MPIResidualKernel
+         * - attention: MPIAttentionOperator (for snapshot callback mechanism)
+         * - rmsnorm: MPIRMSNormOperator (fallback if COSMA fused path unavailable)
+         * - swiglu: MPISwiGLUOperator
+         * - residual: MPIResidualOperator
          *
          * Note: No linear kernel - uses adaptiveMatMul directly.
-         * Note: No embedding kernel - manual memcpy is faster.
+         * Note: No embedding operator - manual memcpy is faster.
          */
         void initializeKernels();
 

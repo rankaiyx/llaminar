@@ -6,8 +6,8 @@
 
 #include <cmath>
 #include <algorithm>
-#include "../../utils/debug_env.h"
-#include "../../logger.h"
+#include "../../utils/DebugEnv.h"
+#include "../../Logger.h"
 #ifdef _OPENMP
 #include <omp.h>
 #endif

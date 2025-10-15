@@ -8,8 +8,8 @@
 #include "OpenblasPrefillProvider.h"
 #include "CosmaPrefillProvider.h"
 #include "PipelineSnapshotManager.h"
-#include "logger.h"
-#include "utils/debug_env.h"
+#include "Logger.h"
+#include "utils/DebugEnv.h"
 #include <cstdlib>
 
 namespace llaminar

@@ -7,7 +7,7 @@
 #include <mpi.h>
 #include <unordered_set>
 
-#include "logger.h"
+#include "Logger.h"
 #include "ModelLoader.h"
 #include "QwenPipeline.h"
 #include "QwenPipelineAdapter.h"

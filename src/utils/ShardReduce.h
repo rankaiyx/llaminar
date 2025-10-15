@@ -3,9 +3,9 @@
 #include "PerfCounters.h"
 #include <memory>
 #include <cstring>
-#include "../tensors/tensor_base.h"
-#include "../tensors/sharded_simple_tensor.h"
-#include "../tensors/shard_spec.h"
+#include "../tensors/TensorBase.h"
+#include "../tensors/sharded_SimpleTensor.h"
+#include "../tensors/ShardSpec.h"
 
 namespace llaminar
 {

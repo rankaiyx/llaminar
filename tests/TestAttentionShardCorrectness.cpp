@@ -5,8 +5,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include "../src/kernels/MPIAttentionKernel.h"
-#include "../src/tensors/tensor_factory.h"
+#include "../src/operators/MPIAttentionOperator.h"
+#include "../src/tensors/TensorFactory.h"
 using namespace llaminar;
 static void fill_deterministic(std::shared_ptr<TensorBase> &t, float scale)
 {
@@ -299,7 +299,7 @@ int main(int argc, char **argv)
                  rank, wo->data()[0], wo->data()[1], wo->data()[2], wo->data()[3]);
     std::fflush(stderr);
 
-    auto kernel_multi = std::make_unique<MPIAttentionKernel>(n_head, n_head_kv, head_dim);
+    auto kernel_multi = std::make_unique<MPIAttentionOperator>(n_head, n_head_kv, head_dim);
     std::vector<std::shared_ptr<TensorBase>> inputs_multi = {input, wq, wk, wv, wo, bq, bk, bv, k_cache, v_cache};
     std::vector<std::shared_ptr<TensorBase>> outputs_multi = {out_multi};
     bool exec_ok = kernel_multi->execute(inputs_multi, outputs_multi);

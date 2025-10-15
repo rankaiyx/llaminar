@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../mpi_kernel_base.h"
+#include "../MpiKernelBase.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -27,7 +27,7 @@ namespace llaminar
      * Expected outputs:
      * - output: [seq_len, hidden_size] - distributed normalized output tensor
      */
-    class MPIRMSNormKernel : public MPIKernelBase
+    class MPIRMSNormOperator : public MPIKernelBase
     {
     public:
         enum class DistributionStrategy
@@ -36,7 +36,7 @@ namespace llaminar
             FEATURE_WISE   ///< Distribute hidden dimensions across processes (future)
         };
 
-        MPIRMSNormKernel(DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
+        MPIRMSNormOperator(DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
 
         // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,

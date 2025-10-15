@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "kernels/common/attention_primitives.h"
+#include "operators/common/AttentionPrimitives.h"
 #include <vector>
 #include <cmath>
 

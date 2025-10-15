@@ -4,10 +4,10 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
-#include "utils/debug_env.h"
-#include "kernels/MPIAttentionKernel.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "utils/DebugEnv.h"
+#include "operators/MPIAttentionOperator.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 
 using namespace llaminar;
 
@@ -37,7 +37,7 @@ public:
 };
 ::testing::Environment *const mpi_env = ::testing::AddGlobalTestEnvironment(new MPIGuardEnvironment());
 
-// Integration test: exercise MPIAttentionKernel::computeLocalOutputProjection with and without
+// Integration test: exercise MPIAttentionOperator::computeLocalOutputProjection with and without
 // TP simulation enabled via environment flags and verify output parity.
 // We restrict to single-process / single-rank usage (no MPI collectives required); the kernel's
 // internal simulation path should produce identical results to baseline path.
@@ -67,7 +67,7 @@ static void run_case(size_t seq_len, int heads, int head_dim, int tp_parts, cons
     std::memcpy(local_attended->data(), tmp.data(), tmp.size() * sizeof(float));
     std::memcpy(local_wo->data(), W.data(), W.size() * sizeof(float));
 
-    MPIAttentionKernel kernel(heads, heads, head_dim, 10000.0f, MPIAttentionKernel::DistributionStrategy::HEAD_WISE);
+    MPIAttentionOperator kernel(heads, heads, head_dim, 10000.0f, MPIAttentionOperator::DistributionStrategy::HEAD_WISE);
 
     // 1. Baseline (ensure tp_sim disabled)
     unsetenv("LLAMINAR_TP_WO_SIM_ENABLE");

@@ -2,7 +2,7 @@
 // Ensures consistent log level escalation when diagnostic env vars are set.
 // Linked into every test target via CMake so that static object constructor runs early.
 
-#include "logger.h"
+#include "Logger.h"
 #include <cstdlib>
 
 namespace

@@ -8,7 +8,7 @@
 #include "AbstractPipeline.h"
 #include "ModelLoader.h"
 #include "QwenPipelineAdapter.h"
-#include "logger.h"
+#include "Logger.h"
 #include <fstream>
 #include <cmath>
 #include <mpi.h>

@@ -2,8 +2,8 @@
 
 #include "ChatSession.h"
 #include "ResponseGenerator.h"
-#include "../argument_parser.h"
-#include "../abstract_pipeline.h"
+#include "../ArgumentParser.h"
+#include "../AbstractPipeline.h"
 #include <memory>
 #include <string>
 #include <atomic>

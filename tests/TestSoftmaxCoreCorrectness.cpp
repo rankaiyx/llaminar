@@ -6,7 +6,7 @@
 #include <random>
 #include <vector>
 #include <cmath>
-#include "kernels/common/softmax_core.h"
+#include "operators/common/SoftmaxCore.h"
 
 using namespace llaminar::kernels;
 

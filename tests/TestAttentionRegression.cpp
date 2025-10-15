@@ -17,10 +17,10 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
-#include "kernels/MPIAttentionKernel.h"
-#include "kernels/common/attention_primitives.h"
-#include "tensors/simple_tensor.h"
-#include "logger.h"
+#include "operators/MPIAttentionOperator.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "tensors/SimpleTensor.h"
+#include "Logger.h"
 
 using namespace llaminar;
 
@@ -191,7 +191,7 @@ TEST_F(AttentionRegressionTest, RopeMHABufferSafety)
  * Regression test for bug where size-1 dummy bias tensors were passed directly to
  * matmul_with_bias, causing buffer overflow when reading bias[n] for n=0..127.
  *
- * The kernel should:
+ * The operator should:
  * - Accept nullptr bias (no bias)
  * - Accept properly sized bias tensors
  * - NOT crash with size-1 dummy bias (should convert to nullptr)
@@ -236,7 +236,7 @@ TEST_F(AttentionRegressionTest, BiasBufferValidation)
     auto output = std::make_shared<SimpleTensor>(std::vector<int>{seq_len, d_model});
 
     // Create kernel
-    MPIAttentionKernel kernel(n_head, n_head, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head, head_dim);
 
     // Execute with dummy (size-1) bias - should NOT crash!
     std::vector<std::shared_ptr<TensorBase>> inputs = {
@@ -260,7 +260,7 @@ TEST_F(AttentionRegressionTest, BiasBufferValidation)
  * @brief Test dimension mismatch detection
  *
  * Regression test for missing validation that caused cblas crashes.
- * The kernel should detect and reject incorrect weight dimensions.
+ * The operator should detect and reject incorrect weight dimensions.
  */
 TEST_F(AttentionRegressionTest, DimensionMismatchDetection)
 {
@@ -288,7 +288,7 @@ TEST_F(AttentionRegressionTest, DimensionMismatchDetection)
     auto dummy_k_cache = std::make_shared<SimpleTensor>(std::vector<int>{1});
     auto dummy_v_cache = std::make_shared<SimpleTensor>(std::vector<int>{1});
 
-    MPIAttentionKernel kernel(n_head, n_head, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head, head_dim);
 
     std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, wq_wrong, wk, wv, wo, dummy_bias, dummy_bias, dummy_bias, dummy_k_cache, dummy_v_cache};
@@ -342,7 +342,7 @@ TEST_F(AttentionRegressionTest, GQADimensionHandling)
     auto dummy_v_cache = std::make_shared<SimpleTensor>(std::vector<int>{1});
 
     // Create GQA kernel (n_head_kv < n_head)
-    MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
 
     std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, wq, wk, wv, wo, dummy_bias, dummy_bias, dummy_bias, dummy_k_cache, dummy_v_cache};
@@ -397,7 +397,7 @@ TEST_F(AttentionRegressionTest, MinimalConfiguration)
     auto dummy_k_cache = std::make_shared<SimpleTensor>(std::vector<int>{1});
     auto dummy_v_cache = std::make_shared<SimpleTensor>(std::vector<int>{1});
 
-    MPIAttentionKernel kernel(n_head, n_head, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head, head_dim);
 
     std::vector<std::shared_ptr<TensorBase>> inputs = {
         input, wq, wk, wv, wo, dummy_bias, dummy_bias, dummy_bias, dummy_k_cache, dummy_v_cache};

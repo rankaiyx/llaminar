@@ -1,5 +1,5 @@
 /**
- * @file MPILinearKernel.cpp
+ * @file MPILinearOperator.cpp
  * @brief MPI-aware column-partitioned linear projection kernel.
  *
  * @section Contract
@@ -30,11 +30,11 @@
  *  - Uses rank/size from MPIKernelBase; collective communications must remain ordered.
  * @author David Sanftenberg
  */
-#include "MPILinearKernel.h"
-#include "../logger.h"
-#include "../debug_utils.h"
-#include "../adaptive_matmul.h"
-#include "../utils/debug_env.h"
+#include "MPILinearOperator.h"
+#include "../Logger.h"
+#include "../DebugUtils.h"
+#include "../AdaptiveMatmul.h"
+#include "../utils/DebugEnv.h"
 #include <algorithm>
 #include <cstring>
 #include <chrono>
@@ -43,17 +43,17 @@
 namespace llaminar
 {
 
-    MPILinearKernel::MPILinearKernel(MPI_Comm comm) : MPIKernelBase(comm, false)
+    MPILinearOperator::MPILinearOperator(MPI_Comm comm) : MPIKernelBase(comm, false)
     {
-        LOG_DEBUG("MPILinearKernel initialized on rank " << getRank() << " of " << getSize());
+        LOG_DEBUG("MPILinearOperator initialized on rank " << getRank() << " of " << getSize());
     }
 
-    bool MPILinearKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPILinearOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                   std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         if (!validate(inputs, outputs))
         {
-            LOG_ERROR("MPILinearKernel validation failed on rank " << getRank());
+            LOG_ERROR("MPILinearOperator validation failed on rank " << getRank());
             return false;
         }
 
@@ -71,7 +71,7 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(global_weight, "Linear weight");
 
         // Log detailed tensor information
-        TensorLogger::logMatMulOperation(input, global_weight, global_output, "MPILinearKernel");
+        TensorLogger::logMatMulOperation(input, global_weight, global_output, "MPILinearOperator");
 
         // Extract dimensions
         size_t seq_len = input->shape()[0];
@@ -169,19 +169,19 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(global_output, "Linear output after computation");
 
         // Log output tensor statistics
-        TensorLogger::logTensorStats(global_output, "Linear final_output", "MPILinearKernel_COMPLETE");
+        TensorLogger::logTensorStats(global_output, "Linear final_output", "MPILinearOperator_COMPLETE");
 
-        LOG_DEBUG("MPILinearKernel executed successfully on rank " << getRank());
+        LOG_DEBUG("MPILinearOperator executed successfully on rank " << getRank());
         return true;
     }
 
-    bool MPILinearKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPILinearOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                    const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Basic validation similar to LinearKernel
         if (inputs.size() < 2 || inputs.size() > 3 || outputs.size() != 1)
         {
-            LOG_ERROR("MPILinearKernel: Expected 2-3 inputs and 1 output, got "
+            LOG_ERROR("MPILinearOperator: Expected 2-3 inputs and 1 output, got "
                       << inputs.size() << " inputs and " << outputs.size() << " outputs");
             return false;
         }
@@ -192,7 +192,7 @@ namespace llaminar
 
         if (!input || !weight || !output)
         {
-            LOG_ERROR("MPILinearKernel: Null tensor provided - input: " << (input ? "valid" : "null")
+            LOG_ERROR("MPILinearOperator: Null tensor provided - input: " << (input ? "valid" : "null")
                                                                         << ", weight: " << (weight ? "valid" : "null")
                                                                         << ", output: " << (output ? "valid" : "null"));
             return false;
@@ -201,21 +201,21 @@ namespace llaminar
         // Check input is 2D [seq_len, input_size]
         if (input->shape().size() != 2)
         {
-            LOG_ERROR("MPILinearKernel: Input must be 2D, got " << input->shape().size() << " dimensions");
+            LOG_ERROR("MPILinearOperator: Input must be 2D, got " << input->shape().size() << " dimensions");
             return false;
         }
 
         // Check weight is 2D [output_size, input_size] per new convention
         if (weight->shape().size() != 2)
         {
-            LOG_ERROR("MPILinearKernel: Weight must be 2D, got " << weight->shape().size() << " dimensions");
+            LOG_ERROR("MPILinearOperator: Weight must be 2D, got " << weight->shape().size() << " dimensions");
             return false;
         }
 
         // Check dimensions match: input[1] (in_dim) should match weight[1] (in_dim)
         if (input->shape()[1] != weight->shape()[1])
         {
-            LOG_ERROR("MPILinearKernel: Input size " << input->shape()[1]
+            LOG_ERROR("MPILinearOperator: Input size " << input->shape()[1]
                                                      << " doesn't match weight input size " << weight->shape()[1]
                                                      << " (weight shape=[" << weight->shape()[0] << ", " << weight->shape()[1] << "])");
             return false;
@@ -227,7 +227,7 @@ namespace llaminar
             output->shape()[0] != input->shape()[0] ||
             output->shape()[1] != weight->shape()[0]) // Changed from weight->shape()[1]
         {
-            LOG_ERROR("MPILinearKernel: Output shape mismatch - expected [" << input->shape()[0]
+            LOG_ERROR("MPILinearOperator: Output shape mismatch - expected [" << input->shape()[0]
                                                                             << ", " << weight->shape()[0] << "], got [" << output->shape()[0] << ", " << output->shape()[1] << "]");
             return false;
         }
@@ -238,7 +238,7 @@ namespace llaminar
             auto bias = inputs[2];
             if (bias->shape().size() != 1 || bias->shape()[0] != weight->shape()[1])
             {
-                LOG_ERROR("MPILinearKernel: Bias shape mismatch");
+                LOG_ERROR("MPILinearOperator: Bias shape mismatch");
                 return false;
             }
         }
@@ -246,7 +246,7 @@ namespace llaminar
         return true;
     }
 
-    void MPILinearKernel::distributeWeight(const std::shared_ptr<TensorBase> &global_weight,
+    void MPILinearOperator::distributeWeight(const std::shared_ptr<TensorBase> &global_weight,
                                            std::shared_ptr<TensorBase> &local_weight,
                                            size_t output_size)
     {
@@ -275,7 +275,7 @@ namespace llaminar
                                                             << "], offset " << output_offset << " on rank " << getRank());
     }
 
-    void MPILinearKernel::distributeBias(const std::shared_ptr<TensorBase> &global_bias,
+    void MPILinearOperator::distributeBias(const std::shared_ptr<TensorBase> &global_bias,
                                          std::shared_ptr<TensorBase> &local_bias,
                                          size_t output_size)
     {
@@ -291,7 +291,7 @@ namespace llaminar
                                                          << ", offset " << output_offset << " on rank " << getRank());
     }
 
-    void MPILinearKernel::gatherOutput(const std::shared_ptr<TensorBase> &local_output,
+    void MPILinearOperator::gatherOutput(const std::shared_ptr<TensorBase> &local_output,
                                        std::shared_ptr<TensorBase> &global_output,
                                        size_t seq_len,
                                        size_t output_size)
@@ -327,7 +327,7 @@ namespace llaminar
         LOG_DEBUG("Gathered output: [" << seq_len << ", " << output_size << "] on rank " << getRank());
     }
 
-    void MPILinearKernel::addBiasLocal(float *output, const float *bias,
+    void MPILinearOperator::addBiasLocal(float *output, const float *bias,
                                        size_t seq_len, size_t local_output_size)
     {
         // Add bias to each sequence position: output[i, j] += bias[j]
@@ -349,7 +349,7 @@ namespace llaminar
                                                      << "] on rank " << getRank());
     }
 
-    std::shared_ptr<TensorBase> MPILinearKernel::createLocalTensor(const std::vector<size_t> &shape)
+    std::shared_ptr<TensorBase> MPILinearOperator::createLocalTensor(const std::vector<size_t> &shape)
     {
         // Convert size_t vector to int vector for TensorFactory
         std::vector<int> int_shape(shape.begin(), shape.end());

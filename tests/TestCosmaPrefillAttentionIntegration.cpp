@@ -1,6 +1,6 @@
-#include "../src/qwen_pipeline.h"
-#include "../src/cosma_prefill_manager.h"
-#include "../src/tensors/tensor_factory.h"
+#include "../src/QwenPipeline.h"
+#include "../src/CosmaPrefillManager.h"
+#include "../src/tensors/TensorFactory.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <chrono>

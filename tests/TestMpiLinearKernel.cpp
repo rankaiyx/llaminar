@@ -1,6 +1,6 @@
 #include "TestTimeoutGuard.h"
-#include "kernels/MPILinearKernel.h"
-#include "tensors/tensor_factory.h"
+#include "operators/MPILinearOperator.h"
+#include "tensors/TensorFactory.h"
 #include <gtest/gtest.h>
 #include "TestMpiUtils.h"
 #include <chrono>
@@ -9,7 +9,7 @@
 
 using namespace llaminar;
 
-class MPILinearKernelTest : public ::testing::Test
+class MPILinearOperatorTest : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -58,9 +58,9 @@ protected:
     std::mt19937 generator;
 };
 
-TEST_F(MPILinearKernelTest, BasicFunctionality)
+TEST_F(MPILinearOperatorTest, BasicFunctionality)
 {
-    MPILinearKernel mpi_kernel;
+    MPILinearOperator mpi_kernel;
 
     // Test dimensions
     size_t seq_len = 4;
@@ -97,9 +97,9 @@ TEST_F(MPILinearKernelTest, BasicFunctionality)
     EXPECT_TRUE(has_nonzero);
 }
 
-TEST_F(MPILinearKernelTest, WithoutBias)
+TEST_F(MPILinearOperatorTest, WithoutBias)
 {
-    MPILinearKernel mpi_kernel;
+    MPILinearOperator mpi_kernel;
 
     // Test dimensions
     size_t seq_len = 3;
@@ -122,9 +122,9 @@ TEST_F(MPILinearKernelTest, WithoutBias)
     EXPECT_TRUE(mpi_kernel.execute(inputs, outputs));
 }
 
-TEST_F(MPILinearKernelTest, ValidationTests)
+TEST_F(MPILinearOperatorTest, ValidationTests)
 {
-    MPILinearKernel mpi_kernel;
+    MPILinearOperator mpi_kernel;
 
     size_t seq_len = 2;
     size_t input_size = 3;
@@ -142,7 +142,7 @@ TEST_F(MPILinearKernelTest, ValidationTests)
     }
 
     // Note: Dimension validation tests removed since validate() is private
-    // The kernel will handle validation internally during execute()
+    // The operator will handle validation internally during execute()
 }
 
 LLAMINAR_DEFINE_GTEST_MPI_MAIN();

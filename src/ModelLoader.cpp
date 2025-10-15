@@ -27,14 +27,14 @@
 // INCLUDES
 // =============================================================================
 #include "ModelLoader.h"
-#include "logger.h"
+#include "Logger.h"
 #include "QuantDequant.h"
-#include "weights/weight_roles.h"
+#include "weights/WeightRoles.h"
 #include "../llama.cpp/ggml/src/ggml-quants.h" // Upstream dequantize_row_q* functions
 #include <cstring>
 #include <numeric>
 #include <cstdlib>
-#include "utils/debug_env.h"
+#include "utils/DebugEnv.h"
 
 // Include upstream gguf API for offset comparison diagnostics
 extern "C"
@@ -50,7 +50,7 @@ extern "C"
 #include <mpi.h>
 #endif
 #include <filesystem>
-#include "tensors/simple_tensor.h"
+#include "tensors/SimpleTensor.h"
 #include <iostream>
 #include <cstdio>
 #include <cstdint>

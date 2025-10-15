@@ -4,10 +4,10 @@
 
 #include "gtest/gtest.h"
 #include "QwenPipeline.h" // for createQwenPipeline & weights struct
-#include "chat/response_generator.h"
-#include "chat/gguf_tokenizer.h"
+#include "chat/ResponseGenerator.h"
+#include "chat/GgufTokenizer.h"
 #include "ModelLoader.h"
-#include "utils/debug_env.h"
+#include "utils/DebugEnv.h"
 #include <mpi.h>
 
 using namespace llaminar;

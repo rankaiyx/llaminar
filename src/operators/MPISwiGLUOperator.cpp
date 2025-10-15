@@ -1,5 +1,5 @@
 /**
- * @file MPISwiGLUKernel.cpp
+ * @file MPISwiGLUOperator.cpp
  * @brief Applies SwiGLU feed-forward activation: (X * W1) ⊗ swish(X * W2) * W3 (variant) depending on architecture.
  *
  * @section Contract
@@ -28,11 +28,11 @@
  * @warning Ensure that upstream linear projections have consistent floating layout to avoid silent divergence.
  * @author David Sanftenberg
  */
-#include "MPISwiGLUKernel.h"
-#include "../debug_utils.h"
-#include "../performance_timer.h"
-#include "../utils/debug_env.h"
-#include "../utils/perf_counters.h"
+#include "MPISwiGLUOperator.h"
+#include "../DebugUtils.h"
+#include "../PerformanceTimer.h"
+#include "../utils/DebugEnv.h"
+#include "../utils/PerfCounters.h"
 #include <chrono>
 #include <cmath>
 #include <algorithm>
@@ -42,22 +42,22 @@
 namespace llaminar
 {
 
-    MPISwiGLUKernel::MPISwiGLUKernel(DistributionStrategy strategy)
+    MPISwiGLUOperator::MPISwiGLUOperator(DistributionStrategy strategy)
         : MPIKernelBase(), strategy_(strategy), num_threads_(omp_get_max_threads())
     {
-        LOG_DEBUG("MPISwiGLUKernel initialized on rank " << getRank() << "/" << getSize()
+        LOG_DEBUG("MPISwiGLUOperator initialized on rank " << getRank() << "/" << getSize()
                                                          << " with strategy: " << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "FEATURE_WISE")
                                                          << ", OpenMP threads: " << num_threads_);
     }
 
-    bool MPISwiGLUKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPISwiGLUOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                   std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
-        PERF_SCOPED_TIMER("MPISwiGLUKernel::execute");
+        PERF_SCOPED_TIMER("MPISwiGLUOperator::execute");
 
         if (!validate(inputs, outputs))
         {
-            LOG_ERROR("MPISwiGLUKernel: Validation failed");
+            LOG_ERROR("MPISwiGLUOperator: Validation failed");
             return false;
         }
 
@@ -78,7 +78,7 @@ namespace llaminar
         const bool output_distributed = output_tensor->is_distributed();
         const bool replicated_inputs = !gate_distributed && !up_distributed && !output_distributed;
 
-        LOG_DEBUG("MPISwiGLUKernel tensor types: gate=" << gate_tensor->type_name()
+        LOG_DEBUG("MPISwiGLUOperator tensor types: gate=" << gate_tensor->type_name()
                                                         << " up=" << up_tensor->type_name()
                                                         << " output=" << output_tensor->type_name()
                                                         << " distributed_flags=(" << (gate_distributed ? "D" : "R")
@@ -111,7 +111,7 @@ namespace llaminar
             MPI_Comm_rank(MPI_COMM_WORLD, &rank_cached);
             if (rank_cached == 0)
             {
-                LOG_INFO("MPISwiGLUKernel SwiGLU algorithm: " << (legacy_algo ? "legacy(gate * silu(up))" : "standard(silu(gate) * up)")
+                LOG_INFO("MPISwiGLUOperator SwiGLU algorithm: " << (legacy_algo ? "legacy(gate * silu(up))" : "standard(silu(gate) * up)")
                                                               << (validation_enabled ? " (validation enabled)" : ""));
             }
             algo_initialized = true;
@@ -139,13 +139,13 @@ namespace llaminar
                 executeFeatureWise(gate_data, up_data, output_data, seq_len, d_ff, replicated_inputs);
                 break;
             default:
-                LOG_ERROR("MPISwiGLUKernel: Unknown distribution strategy");
+                LOG_ERROR("MPISwiGLUOperator: Unknown distribution strategy");
                 return false;
             }
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("MPISwiGLUKernel: Execution failed: " << e.what());
+            LOG_ERROR("MPISwiGLUOperator: Execution failed: " << e.what());
             return false;
         }
 
@@ -156,27 +156,27 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(output_tensor, "SwiGLU output has NaN");
         TensorLogger::logTensorStats(output_tensor, "swiglu_output");
 
-        LOG_DEBUG("MPISwiGLUKernel executed: " << seq_len << "x" << d_ff
+        LOG_DEBUG("MPISwiGLUOperator executed: " << seq_len << "x" << d_ff
                                                << " in " << std::fixed << std::setprecision(2) << execution_time
                                                << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
 
         return true;
     }
 
-    bool MPISwiGLUKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPISwiGLUOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                    const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Check input count
         if (inputs.size() != 2)
         {
-            LOG_ERROR("MPISwiGLUKernel: Expected 2 inputs (gate, up), got " << inputs.size());
+            LOG_ERROR("MPISwiGLUOperator: Expected 2 inputs (gate, up), got " << inputs.size());
             return false;
         }
 
         // Check output count
         if (outputs.size() != 1)
         {
-            LOG_ERROR("MPISwiGLUKernel: Expected 1 output (result), got " << outputs.size());
+            LOG_ERROR("MPISwiGLUOperator: Expected 1 output (result), got " << outputs.size());
             return false;
         }
 
@@ -186,7 +186,7 @@ namespace llaminar
 
         if (!gate_tensor || !up_tensor)
         {
-            LOG_ERROR("MPISwiGLUKernel: Input tensors are null");
+            LOG_ERROR("MPISwiGLUOperator: Input tensors are null");
             return false;
         }
 
@@ -196,7 +196,7 @@ namespace llaminar
         // Check tensor dimensions
         if (gate_shape.size() != 2 || up_shape.size() != 2)
         {
-            LOG_ERROR("MPISwiGLUKernel: Input tensors must be 2D, got gate: "
+            LOG_ERROR("MPISwiGLUOperator: Input tensors must be 2D, got gate: "
                       << gate_shape.size() << "D, up: " << up_shape.size() << "D");
             return false;
         }
@@ -204,7 +204,7 @@ namespace llaminar
         // Check shape compatibility
         if (gate_shape[0] != up_shape[0] || gate_shape[1] != up_shape[1])
         {
-            LOG_ERROR("MPISwiGLUKernel: Input shape mismatch - gate: ["
+            LOG_ERROR("MPISwiGLUOperator: Input shape mismatch - gate: ["
                       << gate_shape[0] << ", " << gate_shape[1] << "], up: ["
                       << up_shape[0] << ", " << up_shape[1] << "]");
             return false;
@@ -214,21 +214,21 @@ namespace llaminar
         auto output_tensor = outputs[0];
         if (!output_tensor)
         {
-            LOG_ERROR("MPISwiGLUKernel: Output tensor is null");
+            LOG_ERROR("MPISwiGLUOperator: Output tensor is null");
             return false;
         }
 
         const auto &output_shape = output_tensor->shape();
         if (output_shape.size() != 2)
         {
-            LOG_ERROR("MPISwiGLUKernel: Output tensor must be 2D, got " << output_shape.size() << "D");
+            LOG_ERROR("MPISwiGLUOperator: Output tensor must be 2D, got " << output_shape.size() << "D");
             return false;
         }
 
         // Check output shape matches input
         if (output_shape[0] != gate_shape[0] || output_shape[1] != gate_shape[1])
         {
-            LOG_ERROR("MPISwiGLUKernel: Output shape mismatch - expected: ["
+            LOG_ERROR("MPISwiGLUOperator: Output shape mismatch - expected: ["
                       << gate_shape[0] << ", " << gate_shape[1] << "], got: ["
                       << output_shape[0] << ", " << output_shape[1] << "]");
             return false;
@@ -237,30 +237,30 @@ namespace llaminar
         return true;
     }
 
-    void MPISwiGLUKernel::setDistributionStrategy(DistributionStrategy strategy)
+    void MPISwiGLUOperator::setDistributionStrategy(DistributionStrategy strategy)
     {
         strategy_ = strategy;
-        LOG_DEBUG("MPISwiGLUKernel: Distribution strategy changed to "
+        LOG_DEBUG("MPISwiGLUOperator: Distribution strategy changed to "
                   << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "FEATURE_WISE"));
     }
 
-    void MPISwiGLUKernel::configureOpenMPThreading(size_t tensor_size)
+    void MPISwiGLUOperator::configureOpenMPThreading(size_t tensor_size)
     {
         // Small operations: single-threaded to avoid overhead
         if (tensor_size < 8192)
         {
             omp_set_num_threads(1);
-            LOG_DEBUG("MPISwiGLUKernel: Using single thread for small tensor (" << tensor_size << " elements)");
+            LOG_DEBUG("MPISwiGLUOperator: Using single thread for small tensor (" << tensor_size << " elements)");
             return;
         }
 
         // Medium to large operations: use available threads
         int max_threads = omp_get_max_threads();
         omp_set_num_threads(max_threads);
-        LOG_DEBUG("MPISwiGLUKernel: Using " << max_threads << " threads for tensor (" << tensor_size << " elements)");
+        LOG_DEBUG("MPISwiGLUOperator: Using " << max_threads << " threads for tensor (" << tensor_size << " elements)");
     }
 
-    void MPISwiGLUKernel::distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx) const
+    void MPISwiGLUOperator::distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx) const
     {
         int rank = getRank();
         int size = getSize();
@@ -283,11 +283,11 @@ namespace llaminar
             end_idx += remainder;
         }
 
-        LOG_DEBUG("MPISwiGLUKernel: Rank " << rank << " processing elements ["
+        LOG_DEBUG("MPISwiGLUOperator: Rank " << rank << " processing elements ["
                                            << start_idx << ", " << end_idx << ") of " << total_elements);
     }
 
-    void MPISwiGLUKernel::executeSequenceWise(const float *gate_data, const float *up_data, float *output_data,
+    void MPISwiGLUOperator::executeSequenceWise(const float *gate_data, const float *up_data, float *output_data,
                                               int seq_len, int d_ff, bool replicated_inputs)
     {
         // Distribute sequence positions across MPI ranks
@@ -301,7 +301,7 @@ namespace llaminar
         }
         else
         {
-            LOG_DEBUG("MPISwiGLUKernel: Replicated tensors detected; each rank processing full range [0, "
+            LOG_DEBUG("MPISwiGLUOperator: Replicated tensors detected; each rank processing full range [0, "
                       << total_positions << ")");
         }
 
@@ -380,13 +380,13 @@ namespace llaminar
 
         auto omp_end = std::chrono::high_resolution_clock::now();
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
-        LOG_DEBUG("MPISwiGLUKernel sequence-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
+        LOG_DEBUG("MPISwiGLUOperator sequence-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
         // Synchronize all ranks before proceeding
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
-    void MPISwiGLUKernel::executeFeatureWise(const float *gate_data, const float *up_data, float *output_data,
+    void MPISwiGLUOperator::executeFeatureWise(const float *gate_data, const float *up_data, float *output_data,
                                              int seq_len, int d_ff, bool replicated_inputs)
     {
         // Distribute feature dimensions across MPI ranks
@@ -400,7 +400,7 @@ namespace llaminar
         }
         else
         {
-            LOG_DEBUG("MPISwiGLUKernel: Replicated tensors detected; each rank processing full range [0, "
+            LOG_DEBUG("MPISwiGLUOperator: Replicated tensors detected; each rank processing full range [0, "
                       << total_features << ")");
         }
 
@@ -474,13 +474,13 @@ namespace llaminar
 
         auto omp_end = std::chrono::high_resolution_clock::now();
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
-        LOG_DEBUG("MPISwiGLUKernel feature-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
+        LOG_DEBUG("MPISwiGLUOperator feature-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
         // Synchronize all ranks before proceeding
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
-    inline float MPISwiGLUKernel::computeSiLU(float x) const
+    inline float MPISwiGLUOperator::computeSiLU(float x) const
     {
         // SiLU (Swish) activation: x / (1 + exp(-x))
         // Use stable computation to avoid overflow

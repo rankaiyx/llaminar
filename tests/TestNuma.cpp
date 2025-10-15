@@ -1,5 +1,5 @@
-#include "../src/common.h"
-#include "../src/argument_parser.h"
+#include "../src/SystemTopology.h"
+#include "../src/ArgumentParser.h"
 #include <mpi.h>
 #include <sched.h>
 #include <iostream>

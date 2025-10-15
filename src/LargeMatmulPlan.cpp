@@ -5,8 +5,8 @@
  */
 
 #include "LargeMatmulPlan.h"
-#include "utils/debug_env.h"
-#include "logger.h"
+#include "utils/DebugEnv.h"
+#include "Logger.h"
 #include <cstdlib>
 
 namespace llaminar

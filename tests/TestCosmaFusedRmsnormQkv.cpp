@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
-#include "../src/cosma_prefill_manager.h"
-#include "../src/logger.h"
+#include "../src/CosmaPrefillManager.h"
+#include "../src/Logger.h"
 #include <cblas.h>
 // NOTE: Direct MPI include replaced by shared test utilities.
 #include "TestMpiUtils.h"

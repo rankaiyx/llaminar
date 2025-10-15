@@ -1,4 +1,4 @@
-#include "../src/tensors/tp_generic_matmul_executor.h"
+#include "../src/tensors/TpGenericMatmulExecutor.h"
 #include <gtest/gtest.h>
 #include <random>
 #include <numeric>

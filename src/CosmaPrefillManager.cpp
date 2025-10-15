@@ -99,10 +99,10 @@
  */
 
 #include "CosmaPrefillManager.h"
-#include "logger.h"
-#include "utils/debug_env.h"
-#include "utils/perf_counters.h"
-#include "kernels/common/rmsnorm_t5.h"
+#include "Logger.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfCounters.h"
+#include "operators/common/RmsnormT5.h"
 #include <cosma/multiply.hpp>
 #include <cblas.h>
 #include <mpi.h>
@@ -1242,7 +1242,7 @@ namespace llaminar
     // ========================================================================
 
     /**
-     * @brief Wrapper for convert_activation_in - used by adaptive_matmul.h
+     * @brief Wrapper for convert_activation_in - used by AdaptiveMatmul.h
      *
      * Note: The refactored version internally gets the strategy, so we ignore the passed strat.
      */
@@ -1253,7 +1253,7 @@ namespace llaminar
     }
 
     /**
-     * @brief Wrapper for load_weight - used by adaptive_matmul.h
+     * @brief Wrapper for load_weight - used by AdaptiveMatmul.h
      *
      * Note: The refactored version internally gets the strategy, so we ignore the passed strat.
      */

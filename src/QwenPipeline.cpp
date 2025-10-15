@@ -61,14 +61,14 @@
 #include "ModelLoader.h"
 #include "WeightContracts.h" // For contract-driven weight loading
 #include "BiasContracts.h"   // For bias dimension validation
-#include "kernels/MPISwiGLUKernel.h"
-#include "kernels/MPIRoPEKernel.h"
-#include "kernels/MPIResidualKernel.h"
-#include "kernels/MPIEmbeddingKernel.h"
-#include "kernels/common/rmsnorm_core.h"
-#include "kernels/common/attention_primitives.h"
-#include "tensors/tensor_factory.h"
-#include "tensors/simple_tensor.h"
+#include "operators/MPISwiGLUOperator.h"
+#include "operators/MPIRoPEOperator.h"
+#include "operators/MPIResidualOperator.h"
+#include "operators/MPIEmbeddingOperator.h"
+#include "operators/common/RmsnormCore.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "tensors/TensorFactory.h"
+#include "tensors/SimpleTensor.h"
 #include "DebugUtils.h"
 #include "PerformanceTimer.h"
 #include "CosmaPrefillManager.h"
@@ -87,7 +87,7 @@ using llaminar::MatMulBackendSelector;
 #include <limits>
 #include <numeric>
 #include <algorithm>
-#include "utils/debug_env.h"
+#include "utils/DebugEnv.h"
 #include <cblas.h>
 #include <omp.h>
 #include <sstream>
@@ -100,7 +100,7 @@ using llaminar::MatMulBackendSelector;
 
 namespace
 {
-    // (BufferStats, computeBufferStats, DiffSummary, computeDiffSummary moved to prefill_diagnostics.h/.cpp)
+    // (BufferStats, computeBufferStats, DiffSummary, computeDiffSummary moved to PrefillDiagnostics.h/.cpp)
 
     // (parity sentinel accessors defined later after the atomic is declared)
     static std::atomic<bool> g_replay_first_exceed{false};
@@ -170,7 +170,7 @@ namespace llaminar
         return std::make_unique<QwenPipeline>(config);
     }
 
-    // (logFFNRowPreviewIfEnabled and isFFNShardTracingEnabledFor moved to prefill_diagnostics.h/.cpp)
+    // (logFFNRowPreviewIfEnabled and isFFNShardTracingEnabledFor moved to PrefillDiagnostics.h/.cpp)
 
     /**
      * @brief Helper to capture pipeline stage snapshots for parity testing
@@ -228,7 +228,7 @@ namespace llaminar
         PERF_SCOPED_TIMER("QwenPipeline::executeTransformerLayer");
         int seq_len = input->shape()[0];
 
-        // Initialize thread-local attention instrumentation context (consumed inside MPIAttentionKernel)
+        // Initialize thread-local attention instrumentation context (consumed inside MPIAttentionOperator)
         // Only active when both global layer_token_diff (for outer diff collection) AND
         // attention.internal_diff are enabled. We snapshot minimal metadata to avoid extra lookups in kernel.
         struct AttnInternalCaptureContext
@@ -346,8 +346,8 @@ namespace llaminar
                 capture_stage(attn_norm_out, "attn_qkv_in");
                 // Parity capture: attention norm output (input to QKV)
                 captureIfEnabled(PipelineStage::ATTENTION_NORM, layer_idx, attn_norm_out);
-                // Attention kernel
-                auto attention_kernel = dynamic_cast<MPIAttentionKernel *>(getKernel("attention"));
+                // Attention operator
+                auto attention_kernel = dynamic_cast<MPIAttentionOperator *>(getKernel("attention"));
                 if (attention_kernel)
                 {
                     attention_kernel->setSequencePosition(n_past_);
@@ -636,7 +636,7 @@ namespace llaminar
         }
         LOG_WARN(label << " unexpected shape [" << shape[0] << "," << shape[1] << "] expected [" << expected_rows << "," << expected_cols << "] or transpose");
     }
-    // (isFFNShardTracingEnabledFor and PrefillBaselineRegistry moved to prefill_diagnostics.h/.cpp)
+    // (isFFNShardTracingEnabledFor and PrefillBaselineRegistry moved to PrefillDiagnostics.h/.cpp)
 
     // DEPRECATED: Old registration function - use qwen_pipeline_adapter.cpp version instead
     // static std::once_flag qwen_register_flag;
@@ -718,20 +718,20 @@ namespace llaminar
     void QwenPipeline::initializeKernels()
     {
         {
-            auto embedding_kernel = std::make_unique<MPIEmbeddingKernel>(config_.getLayerConfig().vocab_size, config_.getLayerConfig().d_model);
+            auto embedding_kernel = std::make_unique<MPIEmbeddingOperator>(config_.getLayerConfig().vocab_size, config_.getLayerConfig().d_model);
             if (!registerKernel("embedding", std::move(embedding_kernel)))
                 throw std::runtime_error("Failed to register Embedding kernel");
         }
-        auto rmsnorm_kernel = std::make_unique<MPIRMSNormKernel>(MPIRMSNormKernel::DistributionStrategy::SEQUENCE_WISE);
+        auto rmsnorm_kernel = std::make_unique<MPIRMSNormOperator>(MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
         rmsnorm_kernel->setEpsilon(config_.getLayerConfig().eps);
         if (!registerKernel("rmsnorm", std::move(rmsnorm_kernel)))
-            throw std::runtime_error("Failed to register RMSNorm kernel");
+            throw std::runtime_error("Failed to register RMSNorm operator");
 
-        auto attention_kernel = std::make_unique<MPIAttentionKernel>(config_.getLayerConfig().n_head, config_.getLayerConfig().n_head_kv, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base);
+        auto attention_kernel = std::make_unique<MPIAttentionOperator>(config_.getLayerConfig().n_head, config_.getLayerConfig().n_head_kv, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base);
 
         // CRITICAL FIX: Must set GatherHeadsPostProjection mode for multi-rank execution!
         //
-        // Background: MPIAttentionKernel defaults to LocalHeads mode, which was designed for
+        // Background: MPIAttentionOperator defaults to LocalHeads mode, which was designed for
         // future tensor-parallel sharding where each rank owns a subset of heads. In that mode,
         // the kernel returns only the local rank's head contributions WITHOUT summing across ranks.
         //
@@ -750,28 +750,28 @@ namespace llaminar
         //   - All parity tests pass
         //
         // See: Investigation in docs/OPENBLAS_PREFILL_ROOT_CAUSE_ANALYSIS.md
-        attention_kernel->setOutputMode(MPIAttentionKernel::AttentionOutputMode::GatherHeadsPostProjection);
+        attention_kernel->setOutputMode(MPIAttentionOperator::AttentionOutputMode::GatherHeadsPostProjection);
 
         // Wire up snapshot callback for intermediate attention stages (Q/K/V proj, RoPE, scores, etc.)
         attention_kernel->setSnapshotCallback([this](PipelineStage stage, int layer_idx, const float *data, int seq_len, int feature_dim)
                                               { AbstractPipeline::captureStageSnapshot(stage, layer_idx, data, seq_len, feature_dim); });
 
         if (!registerKernel("attention", std::move(attention_kernel)))
-            throw std::runtime_error("Failed to register Attention kernel");
+            throw std::runtime_error("Failed to register Attention operator");
 
-        auto linear_kernel = std::make_unique<MPILinearKernel>();
+        auto linear_kernel = std::make_unique<MPILinearOperator>();
         if (!registerKernel("linear", std::move(linear_kernel)))
             throw std::runtime_error("Failed to register Linear kernel");
 
-        auto swiglu_kernel = std::make_unique<MPISwiGLUKernel>(MPISwiGLUKernel::DistributionStrategy::SEQUENCE_WISE);
+        auto swiglu_kernel = std::make_unique<MPISwiGLUOperator>(MPISwiGLUOperator::DistributionStrategy::SEQUENCE_WISE);
         if (!registerKernel("swiglu", std::move(swiglu_kernel)))
             throw std::runtime_error("Failed to register SwiGLU kernel");
 
-        auto rope_kernel = std::make_unique<MPIRoPEKernel>(config_.getLayerConfig().max_seq_len, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base, MPIRoPEKernel::DistributionStrategy::SEQUENCE_WISE);
+        auto rope_kernel = std::make_unique<MPIRoPEOperator>(config_.getLayerConfig().max_seq_len, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base, MPIRoPEOperator::DistributionStrategy::SEQUENCE_WISE);
         if (!registerKernel("rope", std::move(rope_kernel)))
             throw std::runtime_error("Failed to register RoPE kernel");
 
-        auto residual_kernel = std::make_unique<MPIResidualKernel>(MPIResidualKernel::DistributionStrategy::SEQUENCE_WISE);
+        auto residual_kernel = std::make_unique<MPIResidualOperator>(MPIResidualOperator::DistributionStrategy::SEQUENCE_WISE);
         if (!registerKernel("residual", std::move(residual_kernel)))
             throw std::runtime_error("Failed to register Residual kernel");
 
@@ -1136,7 +1136,7 @@ namespace llaminar
             if (!bq_full || !bk_full || !bv_full)
                 throw std::runtime_error("Failed to load attention biases for layer " + std::to_string(layer));
 
-            // Calculate head distribution for this rank (same logic as MPIAttentionKernel)
+            // Calculate head distribution for this rank (same logic as MPIAttentionOperator)
             auto calc_head_distribution = [](int total_heads, int rank, int world_size) -> std::pair<int, int>
             {
                 int heads_per_rank = total_heads / world_size;
@@ -1268,7 +1268,7 @@ namespace llaminar
         // (Helper forward declarations below weight loader section)
     }
 
-    // (handle_prefill_stage_snapshot moved to prefill_diagnostics.h/.cpp)
+    // (handle_prefill_stage_snapshot moved to PrefillDiagnostics.h/.cpp)
 
     // Minimal row-spec parser (range/list) used for embedding traces if central util not yet migrated.
     static std::vector<int> parseSimpleRowSpec(const std::string &spec, int max_rows)
@@ -1836,7 +1836,7 @@ namespace llaminar
         for (int layer = 0; layer < config_.getLayerConfig().n_layers; ++layer)
         {
             // Ensure attention kernel records correct layer index during standard prefill execution
-            if (auto attn = dynamic_cast<MPIAttentionKernel *>(getKernel("attention")))
+            if (auto attn = dynamic_cast<MPIAttentionOperator *>(getKernel("attention")))
             {
                 attn->setLayerIndex(layer);
             }
@@ -1892,7 +1892,7 @@ namespace llaminar
         return &kv_snapshot_;
     }
 
-    // (handle_prefill_stage_snapshot moved to prefill_diagnostics.h/.cpp)
+    // (handle_prefill_stage_snapshot moved to PrefillDiagnostics.h/.cpp)
 } // namespace llaminar
 
 // === Section 4: AbstractPipeline interface (prefill/decode/logits) partial migration ===
@@ -2165,7 +2165,7 @@ namespace llaminar
         for (int layer = 0; layer < config_.getLayerConfig().n_layers; ++layer)
         {
             // Update attention kernel context (expected window = committed + 1)
-            if (auto attn = dynamic_cast<MPIAttentionKernel *>(getKernel("attention")))
+            if (auto attn = dynamic_cast<MPIAttentionOperator *>(getKernel("attention")))
             {
                 attn->setSequencePosition(n_past_);
                 attn->setLayerIndex(layer);
@@ -2412,7 +2412,7 @@ namespace llaminar
      * Stages:
      *  1. Descriptor setup & fused rmsnorm+qkv generation (CosmaPrefillManager)
      *  2. Materialize normalized + Q/K/V into row-major temporary buffers
-     *  3. Apply RoPE and compute attention using optimized primitives (attention_primitives.h)
+     *  3. Apply RoPE and compute attention using optimized primitives (AttentionPrimitives.h)
      *  4. Output projection via adaptiveMatMul (may dispatch COSMA/local backend internally)
      *  5. Timing capture for norm/attention/linear phases
      *
@@ -2460,11 +2460,11 @@ namespace llaminar
         // Parity capture: attention norm output (input to QKV)
         captureIfEnabled(PipelineStage::ATTENTION_NORM, layer_idx, attn_norm_out);
 
-        // --- Stage 2: Attention via MPIAttentionKernel with COSMA backend ---
+        // --- Stage 2: Attention via MPIAttentionOperator with COSMA backend ---
         auto attention_start = std::chrono::high_resolution_clock::now();
 
         // Configure attention kernel
-        auto attention_kernel = dynamic_cast<MPIAttentionKernel *>(getKernel("attention"));
+        auto attention_kernel = dynamic_cast<MPIAttentionOperator *>(getKernel("attention"));
         if (attention_kernel)
         {
             attention_kernel->setSequencePosition(n_past_);
@@ -2520,7 +2520,7 @@ namespace llaminar
         auto attention_end = std::chrono::high_resolution_clock::now();
         timing.attention_ms = std::chrono::duration<double, std::milli>(attention_end - attention_start).count();
 
-        // Note: Output projection is now handled inside MPIAttentionKernel
+        // Note: Output projection is now handled inside MPIAttentionOperator
         // No need for separate adaptiveMatMul call
         timing.linear_ms = 0.0; // Included in attention_ms
 

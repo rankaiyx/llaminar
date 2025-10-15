@@ -1,6 +1,6 @@
 #include "ModelLoader.h"
-#include "logger.h"
-#include "../src/quant_dequant.h"
+#include "Logger.h"
+#include "../src/QuantDequant.h"
 #include <gtest/gtest.h>
 #include <random>
 #include <cstring>

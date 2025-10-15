@@ -18,12 +18,12 @@
 // Target: Determine if COSMA's communication-optimal algorithm provides
 //         acceptable per-token latency for real-time inference workloads.
 
-#include "../src/common.h"
-#include "../src/argument_parser.h"
-#include "../src/adaptive_matmul.h"
-#include "../src/tensors/tensor_base.h"
-#include "../src/tensors/simple_tensor.h"
-#include "../src/tensors/tensor_factory.h"
+#include "../src/SystemTopology.h"
+#include "../src/ArgumentParser.h"
+#include "../src/AdaptiveMatmul.h"
+#include "../src/tensors/TensorBase.h"
+#include "../src/tensors/SimpleTensor.h"
+#include "../src/tensors/TensorFactory.h"
 #include <mpi.h>
 #include <iostream>
 #include <vector>

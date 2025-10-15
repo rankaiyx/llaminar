@@ -76,7 +76,7 @@ namespace llaminar
         }
     };
 
-    // Forward declaration - full definition in tensor_factory.h
+    // Forward declaration - full definition in TensorFactory.h
     class TensorFactory;
 
 } // namespace llaminar

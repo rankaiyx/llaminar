@@ -1,4 +1,4 @@
-#include "weights/weight_roles.h"
+#include "weights/WeightRoles.h"
 #include <algorithm>
 
 namespace llaminar

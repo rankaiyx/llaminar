@@ -6,7 +6,7 @@
 
 #include "ParityTestFramework.h"
 #include "NpzLoader.h"
-#include "logger.h"
+#include "Logger.h"
 #include "PipelineStages.h"
 #include <gtest/gtest.h>
 #include <vector>

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
-#include "../src/model_loader.h"
-#include "../src/quant_dequant.h"
+#include "../src/ModelLoader.h"
+#include "../src/QuantDequant.h"
 #include <array>
 #include <vector>
 #include <cstring>

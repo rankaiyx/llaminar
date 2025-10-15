@@ -7,9 +7,9 @@
 #include <memory>
 #include <string>
 
-#include "../src/tensors/tp_generic_matmul_executor.h"
-#include "../src/adaptive_matmul.h" // corrected path
-#include "../src/utils/debug_env.h"
+#include "../src/tensors/TpGenericMatmulExecutor.h"
+#include "../src/AdaptiveMatmul.h" // corrected path
+#include "../src/utils/DebugEnv.h"
 
 using namespace llaminar;
 

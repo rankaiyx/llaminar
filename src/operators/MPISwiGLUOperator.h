@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../mpi_kernel_base.h"
+#include "../MpiKernelBase.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -31,7 +31,7 @@ namespace llaminar
      * Expected outputs:
      * - swiglu_result: [seq_len, d_ff] - SwiGLU activation result
      */
-    class MPISwiGLUKernel : public MPIKernelBase
+    class MPISwiGLUOperator : public MPIKernelBase
     {
     public:
         enum class DistributionStrategy
@@ -41,15 +41,15 @@ namespace llaminar
         };
 
         /**
-         * @brief Construct MPISwiGLUKernel with specified distribution strategy
+         * @brief Construct MPISwiGLUOperator with specified distribution strategy
          * @param strategy Distribution strategy for MPI parallelization
          */
-        MPISwiGLUKernel(DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
+        MPISwiGLUOperator(DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
 
         /**
          * @brief Destructor
          */
-        ~MPISwiGLUKernel() override = default;
+        ~MPISwiGLUOperator() override = default;
 
         /**
          * @brief Execute SwiGLU activation with MPI distribution and OpenMP parallelization
@@ -76,7 +76,7 @@ namespace llaminar
          * @brief Get kernel name for debugging and profiling
          * @return Kernel name string
          */
-        std::string getName() const { return "MPISwiGLUKernel"; }
+        std::string getName() const { return "MPISwiGLUOperator"; }
 
         /**
          * @brief Get the kernel type name for debugging/logging

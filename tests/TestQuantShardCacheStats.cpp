@@ -13,7 +13,7 @@
 #include <algorithm>
 #include <limits>
 #include "ModelLoader.h"
-#include "logger.h"
+#include "Logger.h"
 
 using namespace llaminar;
 

@@ -1,6 +1,6 @@
 /**
  * @file AttentionStageContracts.h
- * @brief Stage contracts for MPIAttentionKernel data flow validation
+ * @brief Stage contracts for MPIAttentionOperator data flow validation
  * @author David Sanftenberg
  *
  * Defines explicit contracts between attention kernel transformation stages:
@@ -20,8 +20,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <memory>
-#include "../../tensors/tensor_base.h"
-#include "../../logger.h"
+#include "../../tensors/TensorBase.h"
+#include "../../Logger.h"
 
 namespace llaminar
 {

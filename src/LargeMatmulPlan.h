@@ -11,8 +11,8 @@
 #pragma once
 
 #include "TransformerConfig.h"
-#include "utils/debug_env.h"
-#include "logger.h"
+#include "utils/DebugEnv.h"
+#include "Logger.h"
 #include <string>
 #include <cstddef>
 

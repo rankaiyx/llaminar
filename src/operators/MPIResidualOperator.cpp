@@ -1,5 +1,5 @@
 /**
- * @file MPIResidualKernel.cpp
+ * @file MPIResidualOperator.cpp
  * @brief Performs elementwise residual addition: Y = X + R (optionally in-place) with basic validation.
  *
  * @section Contract
@@ -26,10 +26,10 @@
  * @warning Ensure that upstream kernels have synchronized outputs across ranks before residual addition to avoid divergence amplification.
  * @author David Sanftenberg
  */
-#include "MPIResidualKernel.h"
-#include "../debug_utils.h"
-#include "../performance_timer.h"
-#include "../tensors/simple_tensor.h"
+#include "MPIResidualOperator.h"
+#include "../DebugUtils.h"
+#include "../PerformanceTimer.h"
+#include "../tensors/SimpleTensor.h"
 #include <chrono>
 #include <algorithm>
 #include <iomanip>
@@ -38,22 +38,22 @@
 namespace llaminar
 {
 
-    MPIResidualKernel::MPIResidualKernel(DistributionStrategy strategy)
+    MPIResidualOperator::MPIResidualOperator(DistributionStrategy strategy)
         : MPIKernelBase(), strategy_(strategy), num_threads_(omp_get_max_threads()), broadcasting_enabled_(false)
     {
-        LOG_DEBUG("MPIResidualKernel initialized on rank " << getRank() << "/" << getSize()
+        LOG_DEBUG("MPIResidualOperator initialized on rank " << getRank() << "/" << getSize()
                                                            << " with strategy: " << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "ELEMENT_WISE")
                                                            << ", OpenMP threads: " << num_threads_);
     }
 
-    bool MPIResidualKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPIResidualOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                     std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
-        PERF_SCOPED_TIMER("MPIResidualKernel::execute");
+        PERF_SCOPED_TIMER("MPIResidualOperator::execute");
 
         if (!validate(inputs, outputs))
         {
-            LOG_ERROR("MPIResidualKernel: Validation failed");
+            LOG_ERROR("MPIResidualOperator: Validation failed");
             return false;
         }
 
@@ -69,7 +69,7 @@ namespace llaminar
         {
             if (broadcasting_enabled_)
             {
-                LOG_DEBUG("MPIResidualKernel: Using broadcasting for shape mismatch");
+                LOG_DEBUG("MPIResidualOperator: Using broadcasting for shape mismatch");
                 const float *input_data = input_tensor->data();
                 const float *residual_data = residual_tensor->data();
                 float *output_data = output_tensor->data();
@@ -79,7 +79,7 @@ namespace llaminar
             }
             else
             {
-                LOG_ERROR("MPIResidualKernel: Shape mismatch and broadcasting disabled");
+                LOG_ERROR("MPIResidualOperator: Shape mismatch and broadcasting disabled");
                 return false;
             }
         }
@@ -98,7 +98,7 @@ namespace llaminar
 
         const bool replicated_inputs = !input_distributed && !residual_distributed && !output_distributed;
 
-        LOG_DEBUG("MPIResidualKernel tensor types: input=" << input_tensor->type_name()
+        LOG_DEBUG("MPIResidualOperator tensor types: input=" << input_tensor->type_name()
                                                            << " residual=" << residual_tensor->type_name()
                                                            << " output=" << output_tensor->type_name()
                                                            << " distributed_flags=(" << (input_distributed ? "D" : "R")
@@ -132,13 +132,13 @@ namespace llaminar
                 executeElementWise(input_data, residual_data, output_data, total_elements, replicated_inputs);
                 break;
             default:
-                LOG_ERROR("MPIResidualKernel: Unknown distribution strategy");
+                LOG_ERROR("MPIResidualOperator: Unknown distribution strategy");
                 return false;
             }
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("MPIResidualKernel: Execution failed: " << e.what());
+            LOG_ERROR("MPIResidualOperator: Execution failed: " << e.what());
             return false;
         }
 
@@ -149,27 +149,27 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(output_tensor, "Residual output has NaN");
         TensorLogger::logTensorStats(output_tensor, "residual_output");
 
-        LOG_DEBUG("MPIResidualKernel executed: " << seq_len << "x" << hidden_size
+        LOG_DEBUG("MPIResidualOperator executed: " << seq_len << "x" << hidden_size
                                                  << " in " << std::fixed << std::setprecision(2) << execution_time
                                                  << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
 
         return true;
     }
 
-    bool MPIResidualKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPIResidualOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                      const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Check input count
         if (inputs.size() != 2)
         {
-            LOG_ERROR("MPIResidualKernel: Expected 2 inputs (input, residual), got " << inputs.size());
+            LOG_ERROR("MPIResidualOperator: Expected 2 inputs (input, residual), got " << inputs.size());
             return false;
         }
 
         // Check output count
         if (outputs.size() != 1)
         {
-            LOG_ERROR("MPIResidualKernel: Expected 1 output (result), got " << outputs.size());
+            LOG_ERROR("MPIResidualOperator: Expected 1 output (result), got " << outputs.size());
             return false;
         }
 
@@ -179,7 +179,7 @@ namespace llaminar
 
         if (!input_tensor || !residual_tensor)
         {
-            LOG_ERROR("MPIResidualKernel: Input tensors are null");
+            LOG_ERROR("MPIResidualOperator: Input tensors are null");
             return false;
         }
 
@@ -189,7 +189,7 @@ namespace llaminar
         // Check tensor dimensions
         if (input_shape.size() != 2 || residual_shape.size() != 2)
         {
-            LOG_ERROR("MPIResidualKernel: Input tensors must be 2D, got input: "
+            LOG_ERROR("MPIResidualOperator: Input tensors must be 2D, got input: "
                       << input_shape.size() << "D, residual: " << residual_shape.size() << "D");
             return false;
         }
@@ -197,7 +197,7 @@ namespace llaminar
         // Check shape compatibility (exact match or broadcasting)
         if (!areShapesCompatible(input_shape, residual_shape) && !broadcasting_enabled_)
         {
-            LOG_ERROR("MPIResidualKernel: Input shape mismatch - input: ["
+            LOG_ERROR("MPIResidualOperator: Input shape mismatch - input: ["
                       << input_shape[0] << ", " << input_shape[1] << "], residual: ["
                       << residual_shape[0] << ", " << residual_shape[1]
                       << "] and broadcasting disabled");
@@ -208,21 +208,21 @@ namespace llaminar
         auto output_tensor = outputs[0];
         if (!output_tensor)
         {
-            LOG_ERROR("MPIResidualKernel: Output tensor is null");
+            LOG_ERROR("MPIResidualOperator: Output tensor is null");
             return false;
         }
 
         const auto &output_shape = output_tensor->shape();
         if (output_shape.size() != 2)
         {
-            LOG_ERROR("MPIResidualKernel: Output tensor must be 2D, got " << output_shape.size() << "D");
+            LOG_ERROR("MPIResidualOperator: Output tensor must be 2D, got " << output_shape.size() << "D");
             return false;
         }
 
         // Check output shape matches input (should be larger of the two inputs)
         if (output_shape[0] != input_shape[0] || output_shape[1] != input_shape[1])
         {
-            LOG_ERROR("MPIResidualKernel: Output shape mismatch - expected: ["
+            LOG_ERROR("MPIResidualOperator: Output shape mismatch - expected: ["
                       << input_shape[0] << ", " << input_shape[1] << "], got: ["
                       << output_shape[0] << ", " << output_shape[1] << "]");
             return false;
@@ -231,30 +231,30 @@ namespace llaminar
         return true;
     }
 
-    void MPIResidualKernel::setDistributionStrategy(DistributionStrategy strategy)
+    void MPIResidualOperator::setDistributionStrategy(DistributionStrategy strategy)
     {
         strategy_ = strategy;
-        LOG_DEBUG("MPIResidualKernel: Distribution strategy changed to "
+        LOG_DEBUG("MPIResidualOperator: Distribution strategy changed to "
                   << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "ELEMENT_WISE"));
     }
 
-    void MPIResidualKernel::configureOpenMPThreading(size_t tensor_size)
+    void MPIResidualOperator::configureOpenMPThreading(size_t tensor_size)
     {
         // Small operations: single-threaded to avoid overhead
         if (tensor_size < 8192)
         {
             omp_set_num_threads(1);
-            LOG_DEBUG("MPIResidualKernel: Using single thread for small tensor (" << tensor_size << " elements)");
+            LOG_DEBUG("MPIResidualOperator: Using single thread for small tensor (" << tensor_size << " elements)");
             return;
         }
 
         // Medium to large operations: use available threads
         int max_threads = omp_get_max_threads();
         omp_set_num_threads(max_threads);
-        LOG_DEBUG("MPIResidualKernel: Using " << max_threads << " threads for tensor (" << tensor_size << " elements)");
+        LOG_DEBUG("MPIResidualOperator: Using " << max_threads << " threads for tensor (" << tensor_size << " elements)");
     }
 
-    void MPIResidualKernel::distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx, bool replicated) const
+    void MPIResidualOperator::distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx, bool replicated) const
     {
         if (replicated || getSize() <= 1)
         {
@@ -262,7 +262,7 @@ namespace llaminar
             end_idx = total_elements;
             if (replicated)
             {
-                LOG_DEBUG("MPIResidualKernel: Replicated tensors detected; each rank processing full range [0, "
+                LOG_DEBUG("MPIResidualOperator: Replicated tensors detected; each rank processing full range [0, "
                           << total_elements << ")");
             }
             return;
@@ -289,11 +289,11 @@ namespace llaminar
             end_idx += remainder;
         }
 
-        LOG_DEBUG("MPIResidualKernel: Rank " << rank << " processing elements ["
+        LOG_DEBUG("MPIResidualOperator: Rank " << rank << " processing elements ["
                                              << start_idx << ", " << end_idx << ") of " << total_elements);
     }
 
-    void MPIResidualKernel::executeSequenceWise(const float *input_data, const float *residual_data, float *output_data,
+    void MPIResidualOperator::executeSequenceWise(const float *input_data, const float *residual_data, float *output_data,
                                                 int seq_len, int hidden_size, bool replicated)
     {
         // Distribute sequence positions across MPI ranks
@@ -319,7 +319,7 @@ namespace llaminar
 
         auto omp_end = std::chrono::high_resolution_clock::now();
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
-        LOG_DEBUG("MPIResidualKernel sequence-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
+        LOG_DEBUG("MPIResidualOperator sequence-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
         // Synchronize all ranks before proceeding when work was partitioned
         if (!replicated && getSize() > 1)
@@ -328,7 +328,7 @@ namespace llaminar
         }
     }
 
-    void MPIResidualKernel::executeElementWise(const float *input_data, const float *residual_data, float *output_data,
+    void MPIResidualOperator::executeElementWise(const float *input_data, const float *residual_data, float *output_data,
                                                size_t total_elements, bool replicated)
     {
         // Distribute all elements across MPI ranks
@@ -346,7 +346,7 @@ namespace llaminar
 
         auto omp_end = std::chrono::high_resolution_clock::now();
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
-        LOG_DEBUG("MPIResidualKernel element-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
+        LOG_DEBUG("MPIResidualOperator element-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
         // Synchronize all ranks before proceeding when work was partitioned
         if (!replicated && getSize() > 1)
@@ -355,7 +355,7 @@ namespace llaminar
         }
     }
 
-    bool MPIResidualKernel::areShapesCompatible(const std::vector<int> &input_shape,
+    bool MPIResidualOperator::areShapesCompatible(const std::vector<int> &input_shape,
                                                 const std::vector<int> &residual_shape) const
     {
         // Check for exact match
@@ -375,7 +375,7 @@ namespace llaminar
         return true;
     }
 
-    void MPIResidualKernel::executeBroadcast(const float *input_data, const float *residual_data, float *output_data,
+    void MPIResidualOperator::executeBroadcast(const float *input_data, const float *residual_data, float *output_data,
                                              const std::vector<int> &input_shape,
                                              const std::vector<int> &residual_shape)
     {
@@ -433,7 +433,7 @@ namespace llaminar
         }
         else
         {
-            LOG_ERROR("MPIResidualKernel: Unsupported broadcasting pattern - input: ["
+            LOG_ERROR("MPIResidualOperator: Unsupported broadcasting pattern - input: ["
                       << input_seq_len << ", " << input_hidden_size << "], residual: ["
                       << residual_seq_len << ", " << residual_hidden_size << "]");
             throw std::runtime_error("Unsupported broadcasting pattern");
@@ -441,7 +441,7 @@ namespace llaminar
 
         auto omp_end = std::chrono::high_resolution_clock::now();
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
-        LOG_DEBUG("MPIResidualKernel broadcast OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
+        LOG_DEBUG("MPIResidualOperator broadcast OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
         // Synchronize all ranks after broadcasting
         MPI_Barrier(MPI_COMM_WORLD);

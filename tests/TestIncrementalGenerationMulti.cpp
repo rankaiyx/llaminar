@@ -5,9 +5,9 @@
 
 #include "gtest/gtest.h"
 #include "QwenPipeline.h"
-#include "chat/response_generator.h"
+#include "chat/ResponseGenerator.h"
 #include "ModelLoader.h"
-#include "utils/debug_env.h"
+#include "utils/DebugEnv.h"
 #include <mpi.h>
 
 using namespace llaminar;
@@ -89,7 +89,7 @@ TEST(IncrementalGenerationMultiRankTest, PrefillDecodeIdenticalAcrossRanks)
     // Tiny config stressing distribution logic (heads=1 keeps shape simple)
     // IMPORTANT: Use n_head divisible by world size to avoid ranks with zero local heads
     // (which would yield empty local projection tensors and trigger null pointer checks
-    // inside MPIAttentionKernel::distributeInputs). With world=2, choose n_head=2.
+    // inside MPIAttentionOperator::distributeInputs). With world=2, choose n_head=2.
     TransformerLayerConfig cfg;
     cfg.n_layers = 1;
     cfg.n_head = 2;

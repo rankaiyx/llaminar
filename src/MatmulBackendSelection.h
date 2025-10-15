@@ -12,8 +12,8 @@
 
 #include "AbstractPipeline.h"
 #include "TransformerConfig.h"
-#include "utils/debug_env.h"
-#include "logger.h"
+#include "utils/DebugEnv.h"
+#include "Logger.h"
 #include <string>
 
 namespace llaminar

@@ -10,7 +10,7 @@
 #include <sstream>
 
 #include "ArgumentParser.h"
-#include "logger.h"
+#include "Logger.h"
 #include "TopologyManager.h"
 #include "ModelLoader.h"
 #include "MpiContext.h"
@@ -19,13 +19,13 @@
 #include "QwenPipelineAdapter.h"
 #include "LlamaPipelineAdapter.h"
 #include "PerformanceTimer.h"
-#include "utils/debug_env.h"
-#include "utils/perf_counters.h"
-#include "tensors/tensor_factory.h"
-#include "tensors/sharded_tensor_registry.h" // required for ShardedTensorRegistry snapshot logging
-#include "chat/tokenizer_interface.h"
-#include "chat/chat_interface.h"
-#include "chat/response_generator.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfCounters.h"
+#include "tensors/TensorFactory.h"
+#include "tensors/ShardedTensorRegistry.h" // required for ShardedTensorRegistry snapshot logging
+#include "chat/TokenizerInterface.h"
+#include "chat/ChatInterface.h"
+#include "chat/ResponseGenerator.h"
 
 using namespace llaminar;
 

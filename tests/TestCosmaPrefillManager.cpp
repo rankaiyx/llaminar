@@ -1,6 +1,6 @@
 // CosmaPrefillManager correctness test
-#include "../src/cosma_prefill_manager.h"
-#include "../src/logger.h"
+#include "../src/CosmaPrefillManager.h"
+#include "../src/Logger.h"
 #include <gtest/gtest.h>
 #include <cblas.h>
 #include <random>

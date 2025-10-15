@@ -1,4 +1,4 @@
-// Negative test: verifies that using the MPIAttentionKernel partial (per-rank) output
+// Negative test: verifies that using the MPIAttentionOperator partial (per-rank) output
 // without performing the required post-attention reduction does NOT accidentally
 // match the full single-rank reference output. The test PASSES only if a large
 // mismatch is observed (i.e. misuse is detectable). It also enables the
@@ -16,8 +16,8 @@
 #include <cstring>
 #include <cstdlib>
 
-#include "../src/kernels/MPIAttentionKernel.h"
-#include "../src/tensors/tensor_factory.h"
+#include "../src/operators/MPIAttentionOperator.h"
+#include "../src/tensors/TensorFactory.h"
 
 using namespace llaminar;
 
@@ -244,7 +244,7 @@ int main(int argc, char **argv)
     copy_col_shard(wv, wv_global);
     copy_row_shard(wo, wo_global);
 
-    auto kernel = std::make_unique<MPIAttentionKernel>(n_head, n_head_kv, head_dim);
+    auto kernel = std::make_unique<MPIAttentionOperator>(n_head, n_head_kv, head_dim);
     std::vector<std::shared_ptr<TensorBase>> inputs = {input, wq, wk, wv, wo, k_cache, v_cache};
     std::vector<std::shared_ptr<TensorBase>> outputs = {out_partial};
     bool ok = kernel->execute(inputs, outputs);

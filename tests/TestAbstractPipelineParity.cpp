@@ -9,8 +9,8 @@
 #include "gtest/gtest.h"
 #include "QwenPipeline.h" // provides QwenPipeline & factory
 #include "AbstractPipeline.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 #include "TestMpiUtils.h"
 #include <random>
 #include <numeric>

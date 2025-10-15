@@ -1,10 +1,10 @@
 /**
  * @file TestMpiAttentionComponents.cpp
- * @brief Comprehensive unit tests for MPIAttentionKernel and its components
+ * @brief Comprehensive unit tests for MPIAttentionOperator and its components
  * @author David Sanftenberg
  *
  * This test suite validates:
- * 1. MPIAttentionKernel uses shared attention primitives (not custom implementations)
+ * 1. MPIAttentionOperator uses shared attention primitives (not custom implementations)
  * 2. Individual attention components work correctly in isolation
  * 3. Head distribution logic is correct across MPI ranks
  * 4. Tensor partition (TP) output projection produces correct results
@@ -18,12 +18,12 @@
 #include <memory>
 #include <cstring>
 
-#include "kernels/MPIAttentionKernel.h"
-#include "kernels/MPILinearKernel.h"
-#include "kernels/MPIRMSNormKernel.h"
-#include "kernels/common/attention_primitives.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "operators/MPIAttentionOperator.h"
+#include "operators/MPILinearOperator.h"
+#include "operators/MPIRMSNormOperator.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 
 using namespace llaminar;
 
@@ -76,10 +76,10 @@ protected:
 };
 
 /**
- * @brief Verify MPIAttentionKernel uses shared attention primitives
+ * @brief Verify MPIAttentionOperator uses shared attention primitives
  *
- * This test confirms that MPIAttentionKernel delegates to the shared
- * attention_primitives.h functions rather than implementing its own
+ * This test confirms that MPIAttentionOperator delegates to the shared
+ * AttentionPrimitives.h functions rather than implementing its own
  * attention math.
  */
 TEST_F(MPIAttentionComponentsTest, UsesSharedAttentionPrimitives)
@@ -91,7 +91,7 @@ TEST_F(MPIAttentionComponentsTest, UsesSharedAttentionPrimitives)
     const int seq_len = 8;
     const int d_model = n_head * head_dim;
 
-    MPIAttentionKernel attention_kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator attention_kernel(n_head, n_head_kv, head_dim);
 
     // Create inputs
     auto input = TensorFactory::create_simple({seq_len, d_model});
@@ -132,7 +132,7 @@ TEST_F(MPIAttentionComponentsTest, UsesSharedAttentionPrimitives)
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     bool success = attention_kernel.execute(inputs, outputs);
-    ASSERT_TRUE(success) << "Attention kernel execution failed on rank " << rank_;
+    ASSERT_TRUE(success) << "Attention operator execution failed on rank " << rank_;
 
     // Debug: Check output tensor after execution
     if (rank_ == 0)
@@ -185,7 +185,7 @@ TEST_F(MPIAttentionComponentsTest, UsesSharedAttentionPrimitives)
 
     // This test primarily verifies the kernel executes successfully
     // The actual correctness is tested by other golden oracle tests
-    // Note: This just confirms MPIAttentionKernel is wired to use shared primitives
+    // Note: This just confirms MPIAttentionOperator is wired to use shared primitives
 }
 
 /**
@@ -363,7 +363,7 @@ TEST_F(MPIAttentionComponentsTest, HeadDistributionCorrect)
     const int n_head_kv = 8;
     const int head_dim = 32;
 
-    MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
 
     // Get head distribution for this rank
     auto [local_heads, head_offset] = kernel.getHeadDistribution();
@@ -431,7 +431,7 @@ TEST_F(MPIAttentionComponentsTest, TPOutputProjectionCorrect)
     const int seq_len = 4;
     const int d_model = n_head * head_dim;
 
-    MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
     auto [local_heads, head_offset] = kernel.getHeadDistribution();
 
     // Create attended output (from local heads)
@@ -501,11 +501,11 @@ TEST_F(MPIAttentionComponentsTest, OutputModeConfigurationsWork)
     const int seq_len = 4;
     const int d_model = n_head * head_dim;
 
-    MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
 
     // Test LocalHeads mode (default)
-    kernel.setOutputMode(MPIAttentionKernel::AttentionOutputMode::LocalHeads);
-    EXPECT_EQ(kernel.outputMode(), MPIAttentionKernel::AttentionOutputMode::LocalHeads);
+    kernel.setOutputMode(MPIAttentionOperator::AttentionOutputMode::LocalHeads);
+    EXPECT_EQ(kernel.outputMode(), MPIAttentionOperator::AttentionOutputMode::LocalHeads);
 
     // Create inputs
     auto input = TensorFactory::create_simple({seq_len, d_model});
@@ -533,7 +533,7 @@ TEST_F(MPIAttentionComponentsTest, OutputModeConfigurationsWork)
 
     // Check result metadata
     const auto &meta = kernel.last_result_meta();
-    EXPECT_EQ(meta.mode, MPIAttentionKernel::AttentionOutputMode::LocalHeads);
+    EXPECT_EQ(meta.mode, MPIAttentionOperator::AttentionOutputMode::LocalHeads);
     EXPECT_FALSE(meta.replicated) << "LocalHeads mode should produce partial (non-replicated) output";
     EXPECT_GT(meta.local_head_count, 0) << "Should report local head count";
 }
@@ -552,7 +552,7 @@ TEST_F(MPIAttentionComponentsTest, QKVProjectionsProduceValidOutputs)
     const int seq_len = 8;
     const int d_model = n_head * head_dim;
 
-    MPIAttentionKernel attention_kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator attention_kernel(n_head, n_head_kv, head_dim);
 
     // Create simple test inputs with known values
     auto input = TensorFactory::create_simple({seq_len, d_model});
@@ -625,7 +625,7 @@ TEST_F(MPIAttentionComponentsTest, AllOnesInputProducesValidOutput)
     const int seq_len = 4; // Smaller for easier debugging
     const int d_model = n_head * head_dim;
 
-    MPIAttentionKernel attention_kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator attention_kernel(n_head, n_head_kv, head_dim);
 
     auto input = TensorFactory::create_simple({seq_len, d_model});
     auto wq = TensorFactory::create_simple({d_model, d_model});
@@ -654,7 +654,7 @@ TEST_F(MPIAttentionComponentsTest, AllOnesInputProducesValidOutput)
     }
 
     bool success = attention_kernel.execute(inputs, outputs);
-    ASSERT_TRUE(success) << "Attention kernel should execute successfully with all-ones input";
+    ASSERT_TRUE(success) << "Attention operator should execute successfully with all-ones input";
 
     // Check output validity
     float *out_data = output->data();
@@ -704,7 +704,7 @@ TEST_F(MPIAttentionComponentsTest, IdentityWeightsPassThrough)
     const int seq_len = 2;
     const int d_model = n_head * head_dim;
 
-    MPIAttentionKernel attention_kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator attention_kernel(n_head, n_head_kv, head_dim);
 
     auto input = TensorFactory::create_simple({seq_len, d_model});
     auto wq = TensorFactory::create_simple({d_model, d_model});
@@ -745,7 +745,7 @@ TEST_F(MPIAttentionComponentsTest, IdentityWeightsPassThrough)
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
 
     bool success = attention_kernel.execute(inputs, outputs);
-    ASSERT_TRUE(success) << "Attention kernel should execute with identity weights";
+    ASSERT_TRUE(success) << "Attention operator should execute with identity weights";
 
     // With identity weights, we should get some predictable output
     bool all_finite = true;
@@ -777,7 +777,7 @@ TEST_F(MPIAttentionComponentsTest, MinimalDimensionsSingleHead)
     const int seq_len = 2;
     const int d_model = n_head * head_dim;
 
-    MPIAttentionKernel attention_kernel(n_head, n_head_kv, head_dim);
+    MPIAttentionOperator attention_kernel(n_head, n_head_kv, head_dim);
 
     auto input = TensorFactory::create_simple({seq_len, d_model});
     auto wq = TensorFactory::create_simple({d_model, d_model});

@@ -2,11 +2,11 @@
 #include <gtest/gtest.h>
 #include <random>
 #include <cstring>
-#include "kernels/MPIRMSNormKernel.h"
-#include "tensors/tensor_factory.h"
-#include "tensors/sharded_simple_tensor.h"
-#include "tensors/shard_spec.h"
-#include "utils/debug_env.h"
+#include "operators/MPIRMSNormOperator.h"
+#include "tensors/TensorFactory.h"
+#include "tensors/ShardedSimpleTensor.h"
+#include "tensors/ShardSpec.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar;
 
@@ -96,7 +96,7 @@ TEST(RMSNormShardStatsTest, ShardedGammaParity)
     auto gamma_repl = TensorFactory::create_simple({hidden});
     std::memcpy(gamma_repl->data(), full_gamma.data(), sizeof(float) * hidden);
 
-    MPIRMSNormKernel kernel(MPIRMSNormKernel::DistributionStrategy::SEQUENCE_WISE);
+    MPIRMSNormOperator kernel(MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
     kernel.setEpsilon(eps);
 
     std::vector<std::shared_ptr<TensorBase>> inputs = {act_shard, gamma_repl};

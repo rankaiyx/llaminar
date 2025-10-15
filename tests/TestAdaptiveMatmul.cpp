@@ -5,9 +5,9 @@
 
 #include <gtest/gtest.h>
 #include "TestTimeoutGuard.h"
-#include "../src/adaptive_matmul.h"
-#include "../src/adaptive_transformer_pipeline.h"
-#include "../src/transformer_config.h"
+#include "../src/AdaptiveMatmul.h"
+#include "../src/AdaptiveTransformerPipeline.h"
+#include "../src/TransformerConfig.h"
 #include "TestMpiUtils.h"
 #include <chrono>
 #include <vector>

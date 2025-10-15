@@ -1,5 +1,5 @@
-#include "../src/common.h"
-#include "../src/argument_parser.h"
+#include "../src/SystemTopology.h"
+#include "../src/ArgumentParser.h"
 #include "TestMpiUtils.h" // unified MPI helpers
 #include <gtest/gtest.h>
 #include <iostream>

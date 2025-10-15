@@ -1,6 +1,6 @@
 /**
  * @file TestMpiAttentionKernelClean.cpp
- * @brief Comprehensive unit tests for clean MPIAttentionKernel implementation
+ * @brief Comprehensive unit tests for clean MPIAttentionOperator implementation
  * @author David Sanftenberg
  *
  * Tests cover:
@@ -19,8 +19,8 @@
 #include <cmath>
 #include <vector>
 #include <memory>
-#include "kernels/MPIAttentionKernel.h"
-#include "tensors/tensor_factory.h"
+#include "operators/MPIAttentionOperator.h"
+#include "tensors/TensorFactory.h"
 
 using namespace llaminar;
 
@@ -95,7 +95,7 @@ namespace
     // Test Fixture
     // ============================================================================
 
-    class MPIAttentionKernelCleanTest : public ::testing::Test
+    class MPIAttentionOperatorCleanTest : public ::testing::Test
     {
     protected:
         MPIContext mpi;
@@ -187,7 +187,7 @@ namespace
     // Basic Functionality Tests
     // ============================================================================
 
-    TEST_F(MPIAttentionKernelCleanTest, BasicExecuteSingleRank)
+    TEST_F(MPIAttentionOperatorCleanTest, BasicExecuteSingleRank)
     {
         if (mpi.world_size > 1)
         {
@@ -200,7 +200,7 @@ namespace
         const int n_head_kv = 2;
         const int head_dim = 64;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv);
 
         auto output = TensorFactory::create_simple({seq_len, d_model});
@@ -218,7 +218,7 @@ namespace
         EXPECT_GT(sum, 0.0f) << "Output should be non-zero";
     }
 
-    TEST_F(MPIAttentionKernelCleanTest, BasicExecuteMultiRank)
+    TEST_F(MPIAttentionOperatorCleanTest, BasicExecuteMultiRank)
     {
         if (mpi.world_size < 2)
         {
@@ -231,7 +231,7 @@ namespace
         const int n_head_kv = 4;
         const int head_dim = 64;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv);
 
         auto output = TensorFactory::create_simple({seq_len, d_model});
@@ -247,7 +247,7 @@ namespace
         EXPECT_EQ(all_success, 1) << "Some ranks failed";
     }
 
-    TEST_F(MPIAttentionKernelCleanTest, OutputDeterminism)
+    TEST_F(MPIAttentionOperatorCleanTest, OutputDeterminism)
     {
         const int seq_len = 4;
         const int d_model = 128;
@@ -255,7 +255,7 @@ namespace
         const int n_head_kv = 2;
         const int head_dim = 64;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv);
 
         // Run twice with same inputs
@@ -276,10 +276,10 @@ namespace
     // Dimension Validation Tests
     // ============================================================================
 
-    TEST_F(MPIAttentionKernelCleanTest, InvalidInputCount)
+    TEST_F(MPIAttentionOperatorCleanTest, InvalidInputCount)
     {
         const int n_head = 2, n_head_kv = 2, head_dim = 64;
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
 
         // Only 5 inputs instead of 10
         std::vector<std::shared_ptr<TensorBase>> inputs(5);
@@ -289,7 +289,7 @@ namespace
         EXPECT_FALSE(success) << "Should fail with invalid input count";
     }
 
-    TEST_F(MPIAttentionKernelCleanTest, MismatchedDimensions)
+    TEST_F(MPIAttentionOperatorCleanTest, MismatchedDimensions)
     {
         const int seq_len = 4;
         const int d_model = 128;
@@ -297,7 +297,7 @@ namespace
         const int n_head_kv = 2;
         const int head_dim = 64;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv);
 
         // Corrupt weight dimension
@@ -316,7 +316,7 @@ namespace
     // Bias Handling Tests
     // ============================================================================
 
-    TEST_F(MPIAttentionKernelCleanTest, WithBias)
+    TEST_F(MPIAttentionOperatorCleanTest, WithBias)
     {
         const int seq_len = 4;
         const int d_model = 128;
@@ -324,7 +324,7 @@ namespace
         const int n_head_kv = 2;
         const int head_dim = 64;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
 
         // Run with bias
         auto inputs_with_bias = createInputs(seq_len, d_model, n_head, n_head_kv, true);
@@ -343,7 +343,7 @@ namespace
         EXPECT_GT(max_diff, 1e-4f) << "Bias should affect output";
     }
 
-    TEST_F(MPIAttentionKernelCleanTest, BiasDistributionMultiRank)
+    TEST_F(MPIAttentionOperatorCleanTest, BiasDistributionMultiRank)
     {
         if (mpi.world_size < 2)
         {
@@ -356,7 +356,7 @@ namespace
         const int n_head_kv = 4;
         const int head_dim = 64;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv, true);
 
         auto output = TensorFactory::create_simple({seq_len, d_model});
@@ -370,7 +370,7 @@ namespace
     // GQA (Grouped Query Attention) Tests
     // ============================================================================
 
-    TEST_F(MPIAttentionKernelCleanTest, GQASupport)
+    TEST_F(MPIAttentionOperatorCleanTest, GQASupport)
     {
         const int seq_len = 4;
         const int d_model = 128;
@@ -378,7 +378,7 @@ namespace
         const int n_head_kv = 2; // KV heads (GQA with 2:1 ratio)
         const int head_dim = 32;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv, false, head_dim);
 
         auto output = TensorFactory::create_simple({seq_len, d_model});
@@ -396,7 +396,7 @@ namespace
         EXPECT_GT(sum, 0.0f) << "GQA output should be non-zero";
     }
 
-    TEST_F(MPIAttentionKernelCleanTest, GQAVsMHADifferent)
+    TEST_F(MPIAttentionOperatorCleanTest, GQAVsMHADifferent)
     {
         const int seq_len = 4;
         const int d_model = 128;
@@ -404,14 +404,14 @@ namespace
         const int head_dim = 32;
 
         // MHA (n_head == n_head_kv)
-        MPIAttentionKernel kernel_mha(n_head, n_head, head_dim);
+        MPIAttentionOperator kernel_mha(n_head, n_head, head_dim);
         auto inputs_mha = createInputs(seq_len, d_model, n_head, n_head, false, head_dim);
         auto output_mha = TensorFactory::create_simple({seq_len, d_model});
         std::vector<std::shared_ptr<TensorBase>> outputs_mha = {output_mha};
         ASSERT_TRUE(kernel_mha.execute(inputs_mha, outputs_mha));
 
         // GQA (n_head != n_head_kv)
-        MPIAttentionKernel kernel_gqa(n_head, n_head / 2, head_dim);
+        MPIAttentionOperator kernel_gqa(n_head, n_head / 2, head_dim);
         auto inputs_gqa = createInputs(seq_len, d_model, n_head, n_head / 2, false, head_dim);
         auto output_gqa = TensorFactory::create_simple({seq_len, d_model});
         std::vector<std::shared_ptr<TensorBase>> outputs_gqa = {output_gqa};
@@ -426,7 +426,7 @@ namespace
     // MPI Synchronization Tests
     // ============================================================================
 
-    TEST_F(MPIAttentionKernelCleanTest, MultiRankOutputAggregation)
+    TEST_F(MPIAttentionOperatorCleanTest, MultiRankOutputAggregation)
     {
         if (mpi.world_size < 2)
         {
@@ -439,7 +439,7 @@ namespace
         const int n_head_kv = 4;
         const int head_dim = 32;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv, false, head_dim);
 
         auto output_partial = TensorFactory::create_simple({seq_len, d_model});
@@ -469,7 +469,7 @@ namespace
     // Numerical Correctness Tests
     // ============================================================================
 
-    TEST_F(MPIAttentionKernelCleanTest, SmallScaleCorrectness)
+    TEST_F(MPIAttentionOperatorCleanTest, SmallScaleCorrectness)
     {
         // Small dimensions for numerical verification
         const int seq_len = 2;
@@ -478,7 +478,7 @@ namespace
         const int n_head_kv = 1;
         const int head_dim = 64;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv);
 
         auto output = TensorFactory::create_simple({seq_len, d_model});
@@ -495,7 +495,7 @@ namespace
         }
     }
 
-    TEST_F(MPIAttentionKernelCleanTest, LargeSequenceLength)
+    TEST_F(MPIAttentionOperatorCleanTest, LargeSequenceLength)
     {
         const int seq_len = 512; // Larger sequence
         const int d_model = 128;
@@ -503,7 +503,7 @@ namespace
         const int n_head_kv = 2;
         const int head_dim = 64;
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv);
 
         auto output = TensorFactory::create_simple({seq_len, d_model});
@@ -526,7 +526,7 @@ namespace
     // Snapshot Callback Tests
     // ============================================================================
 
-    TEST_F(MPIAttentionKernelCleanTest, SnapshotCallbackInvoked)
+    TEST_F(MPIAttentionOperatorCleanTest, SnapshotCallbackInvoked)
     {
         const int seq_len = 4;
         const int d_model = 128;
@@ -540,7 +540,7 @@ namespace
             callback_count++;
         };
 
-        MPIAttentionKernel kernel(n_head, n_head_kv, head_dim);
+        MPIAttentionOperator kernel(n_head, n_head_kv, head_dim);
         kernel.setSnapshotCallback(callback);
 
         auto inputs = createInputs(seq_len, d_model, n_head, n_head_kv);

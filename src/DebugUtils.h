@@ -1,7 +1,7 @@
 #pragma once
 
-#include "logger.h"
-#include "tensors/tensor_base.h"
+#include "Logger.h"
+#include "tensors/TensorBase.h"
 #include <memory>
 #include <cmath>
 #include <string>

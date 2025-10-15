@@ -2,7 +2,7 @@
 
 #include "TokenizerInterface.h"
 #include "BpeProcessor.h"
-#include "../model_loader.h"
+#include "../ModelLoader.h"
 #include <unordered_map>
 #include <vector>
 #include <string>

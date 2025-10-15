@@ -4,7 +4,7 @@
 #include <memory>
 #include <mpi.h>
 #include "TopologyManager.h"
-#include "tensors/tensor_base.h"
+#include "tensors/TensorBase.h"
 
 namespace llaminar
 {

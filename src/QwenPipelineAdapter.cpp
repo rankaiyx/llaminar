@@ -4,8 +4,8 @@
 #include "QwenPipelineAdapter.h"
 #include "AbstractPipeline.h"
 #include "QwenPipeline.h"
-#include "logger.h"
-#include "utils/debug_env.h"
+#include "Logger.h"
+#include "utils/DebugEnv.h"
 
 namespace llaminar
 {

@@ -8,7 +8,7 @@
  */
 #pragma once
 
-#include "tensors/tensor_base.h"
+#include "tensors/TensorBase.h"
 #include <memory>
 #include <string>
 #include <vector>

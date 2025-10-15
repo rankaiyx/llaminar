@@ -13,8 +13,8 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
-#include "kernels/common/attention_primitives.h"
-#include "kernels/common/softmax_core.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "operators/common/SoftmaxCore.h"
 
 namespace
 {

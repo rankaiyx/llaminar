@@ -8,7 +8,7 @@
 #include <sched.h>
 #include <unistd.h>
 
-#include "logger.h"
+#include "Logger.h"
 #include "ModelLoader.h"
 #include "QwenPipeline.h"
 #include "QwenPipelineAdapter.h"

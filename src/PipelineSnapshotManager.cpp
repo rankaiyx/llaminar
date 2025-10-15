@@ -5,12 +5,12 @@
  */
 
 #include "PipelineSnapshotManager.h"
-#include "logger.h"
-#include "utils/debug_env.h"
+#include "Logger.h"
+#include "utils/DebugEnv.h"
 
 #ifndef NDEBUG
 // Debug build: full implementation
-#include "../tests/parity_test_framework.h"
+#include "../tests/ParityTestFramework.h"
 #include <cstring>
 #endif
 

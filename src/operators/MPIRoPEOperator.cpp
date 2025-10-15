@@ -1,5 +1,5 @@
 /**
- * @file MPIRoPEKernel.cpp
+ * @file MPIRoPEOperator.cpp
  * @brief Applies Rotary Positional Embeddings (RoPE) to query/key tensors in a distributed context.
  *
  * @section Contract
@@ -27,9 +27,9 @@
  * @note Any caching of sin/cos tables must remain thread-safe (either precomputed or guarded).
  * @author David Sanftenberg
  */
-#include "MPIRoPEKernel.h"
-#include "../debug_utils.h"
-#include "../performance_timer.h"
+#include "MPIRoPEOperator.h"
+#include "../DebugUtils.h"
+#include "../PerformanceTimer.h"
 #include <chrono>
 #include <cmath>
 #include <algorithm>
@@ -39,33 +39,33 @@
 namespace llaminar
 {
 
-    MPIRoPEKernel::MPIRoPEKernel(int max_seq_len, int head_dim, float theta, DistributionStrategy strategy)
+    MPIRoPEOperator::MPIRoPEOperator(int max_seq_len, int head_dim, float theta, DistributionStrategy strategy)
         : MPIKernelBase(), max_seq_len_(max_seq_len), head_dim_(head_dim), theta_(theta),
           strategy_(strategy), num_threads_(omp_get_max_threads())
     {
         if (head_dim_ % 2 != 0)
         {
-            LOG_ERROR("MPIRoPEKernel: head_dim must be even, got " << head_dim_);
+            LOG_ERROR("MPIRoPEOperator: head_dim must be even, got " << head_dim_);
             throw std::invalid_argument("head_dim must be even for RoPE");
         }
 
         precomputeFrequencyTables();
 
-        LOG_DEBUG("MPIRoPEKernel initialized on rank " << getRank() << "/" << getSize()
+        LOG_DEBUG("MPIRoPEOperator initialized on rank " << getRank() << "/" << getSize()
                                                        << " with max_seq_len: " << max_seq_len_ << ", head_dim: " << head_dim_
                                                        << ", theta: " << theta_ << ", strategy: "
                                                        << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "HEAD_WISE")
                                                        << ", OpenMP threads: " << num_threads_);
     }
 
-    bool MPIRoPEKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPIRoPEOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                 std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
-        PERF_SCOPED_TIMER("MPIRoPEKernel::execute");
+        PERF_SCOPED_TIMER("MPIRoPEOperator::execute");
 
         if (!validate(inputs, outputs))
         {
-            LOG_ERROR("MPIRoPEKernel: Validation failed");
+            LOG_ERROR("MPIRoPEOperator: Validation failed");
             return false;
         }
 
@@ -80,14 +80,14 @@ namespace llaminar
 
         if (actual_head_dim != head_dim_)
         {
-            LOG_ERROR("MPIRoPEKernel: Head dimension mismatch - expected: " << head_dim_
+            LOG_ERROR("MPIRoPEOperator: Head dimension mismatch - expected: " << head_dim_
                                                                             << ", got: " << actual_head_dim);
             return false;
         }
 
         if (seq_len > max_seq_len_)
         {
-            LOG_WARN("MPIRoPEKernel: Sequence length " << seq_len
+            LOG_WARN("MPIRoPEOperator: Sequence length " << seq_len
                                                        << " exceeds max_seq_len " << max_seq_len_ << ", updating tables");
             updateMaxSeqLen(seq_len);
         }
@@ -158,13 +158,13 @@ namespace llaminar
                 executeHeadWise(input_data, position_ids.data(), output_data, seq_len, n_heads, head_dim_);
                 break;
             default:
-                LOG_ERROR("MPIRoPEKernel: Unknown distribution strategy");
+                LOG_ERROR("MPIRoPEOperator: Unknown distribution strategy");
                 return false;
             }
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("MPIRoPEKernel: Execution failed: " << e.what());
+            LOG_ERROR("MPIRoPEOperator: Execution failed: " << e.what());
             return false;
         }
 
@@ -229,27 +229,27 @@ namespace llaminar
         ASSERT_TENSOR_NOT_NAN(output_tensor, "RoPE output has NaN");
         TensorLogger::logTensorStats(output_tensor, "rope_output");
 
-        LOG_DEBUG("MPIRoPEKernel executed: " << seq_len << "x" << n_heads << "x" << head_dim_
+        LOG_DEBUG("MPIRoPEOperator executed: " << seq_len << "x" << n_heads << "x" << head_dim_
                                              << " in " << std::fixed << std::setprecision(2) << execution_time
                                              << "ms on rank " << getRank() << " (threads: " << omp_get_max_threads() << ")");
 
         return true;
     }
 
-    bool MPIRoPEKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPIRoPEOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                  const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         // Check input count
         if (inputs.size() != 2)
         {
-            LOG_ERROR("MPIRoPEKernel: Expected 2 inputs (input, position_ids), got " << inputs.size());
+            LOG_ERROR("MPIRoPEOperator: Expected 2 inputs (input, position_ids), got " << inputs.size());
             return false;
         }
 
         // Check output count
         if (outputs.size() != 1)
         {
-            LOG_ERROR("MPIRoPEKernel: Expected 1 output (rotated), got " << outputs.size());
+            LOG_ERROR("MPIRoPEOperator: Expected 1 output (rotated), got " << outputs.size());
             return false;
         }
 
@@ -259,7 +259,7 @@ namespace llaminar
 
         if (!input_tensor || !position_ids_tensor)
         {
-            LOG_ERROR("MPIRoPEKernel: Input tensors are null");
+            LOG_ERROR("MPIRoPEOperator: Input tensors are null");
             return false;
         }
 
@@ -269,7 +269,7 @@ namespace llaminar
         // Check input tensor dimensions
         if (input_shape.size() != 3)
         {
-            LOG_ERROR("MPIRoPEKernel: Input tensor must be 3D [seq_len, n_heads, head_dim], got "
+            LOG_ERROR("MPIRoPEOperator: Input tensor must be 3D [seq_len, n_heads, head_dim], got "
                       << input_shape.size() << "D");
             return false;
         }
@@ -277,7 +277,7 @@ namespace llaminar
         // Check position_ids dimensions
         if (position_shape.size() != 1)
         {
-            LOG_ERROR("MPIRoPEKernel: Position IDs must be 1D [seq_len], got "
+            LOG_ERROR("MPIRoPEOperator: Position IDs must be 1D [seq_len], got "
                       << position_shape.size() << "D");
             return false;
         }
@@ -285,7 +285,7 @@ namespace llaminar
         // Check sequence length consistency
         if (input_shape[0] != position_shape[0])
         {
-            LOG_ERROR("MPIRoPEKernel: Sequence length mismatch - input: "
+            LOG_ERROR("MPIRoPEOperator: Sequence length mismatch - input: "
                       << input_shape[0] << ", position_ids: " << position_shape[0]);
             return false;
         }
@@ -293,7 +293,7 @@ namespace llaminar
         // Check head dimension
         if (input_shape[2] % 2 != 0)
         {
-            LOG_ERROR("MPIRoPEKernel: Head dimension must be even, got " << input_shape[2]);
+            LOG_ERROR("MPIRoPEOperator: Head dimension must be even, got " << input_shape[2]);
             return false;
         }
 
@@ -301,14 +301,14 @@ namespace llaminar
         auto output_tensor = outputs[0];
         if (!output_tensor)
         {
-            LOG_ERROR("MPIRoPEKernel: Output tensor is null");
+            LOG_ERROR("MPIRoPEOperator: Output tensor is null");
             return false;
         }
 
         const auto &output_shape = output_tensor->shape();
         if (output_shape.size() != 3)
         {
-            LOG_ERROR("MPIRoPEKernel: Output tensor must be 3D, got " << output_shape.size() << "D");
+            LOG_ERROR("MPIRoPEOperator: Output tensor must be 3D, got " << output_shape.size() << "D");
             return false;
         }
 
@@ -317,7 +317,7 @@ namespace llaminar
             output_shape[1] != input_shape[1] ||
             output_shape[2] != input_shape[2])
         {
-            LOG_ERROR("MPIRoPEKernel: Output shape mismatch - expected: ["
+            LOG_ERROR("MPIRoPEOperator: Output shape mismatch - expected: ["
                       << input_shape[0] << ", " << input_shape[1] << ", " << input_shape[2]
                       << "], got: [" << output_shape[0] << ", " << output_shape[1]
                       << ", " << output_shape[2] << "]");
@@ -327,22 +327,22 @@ namespace llaminar
         return true;
     }
 
-    void MPIRoPEKernel::setDistributionStrategy(DistributionStrategy strategy)
+    void MPIRoPEOperator::setDistributionStrategy(DistributionStrategy strategy)
     {
         strategy_ = strategy;
-        LOG_DEBUG("MPIRoPEKernel: Distribution strategy changed to "
+        LOG_DEBUG("MPIRoPEOperator: Distribution strategy changed to "
                   << (strategy == DistributionStrategy::SEQUENCE_WISE ? "SEQUENCE_WISE" : "HEAD_WISE"));
     }
 
-    void MPIRoPEKernel::updateMaxSeqLen(int max_seq_len)
+    void MPIRoPEOperator::updateMaxSeqLen(int max_seq_len)
     {
         max_seq_len_ = max_seq_len;
         precomputeFrequencyTables();
-        LOG_DEBUG("MPIRoPEKernel: Updated max_seq_len to " << max_seq_len_
+        LOG_DEBUG("MPIRoPEOperator: Updated max_seq_len to " << max_seq_len_
                                                            << ", recomputed frequency tables");
     }
 
-    void MPIRoPEKernel::precomputeFrequencyTables()
+    void MPIRoPEOperator::precomputeFrequencyTables()
     {
         int freq_dims = head_dim_ / 2;
         cos_table_.resize(max_seq_len_ * freq_dims);
@@ -362,27 +362,27 @@ namespace llaminar
             }
         }
 
-        LOG_DEBUG("MPIRoPEKernel: Precomputed frequency tables for max_seq_len: "
+        LOG_DEBUG("MPIRoPEOperator: Precomputed frequency tables for max_seq_len: "
                   << max_seq_len_ << ", freq_dims: " << freq_dims);
     }
 
-    void MPIRoPEKernel::configureOpenMPThreading(size_t tensor_size)
+    void MPIRoPEOperator::configureOpenMPThreading(size_t tensor_size)
     {
         // Small operations: single-threaded to avoid overhead
         if (tensor_size < 8192)
         {
             omp_set_num_threads(1);
-            LOG_DEBUG("MPIRoPEKernel: Using single thread for small tensor (" << tensor_size << " elements)");
+            LOG_DEBUG("MPIRoPEOperator: Using single thread for small tensor (" << tensor_size << " elements)");
             return;
         }
 
         // Medium to large operations: use available threads
         int max_threads = omp_get_max_threads();
         omp_set_num_threads(max_threads);
-        LOG_DEBUG("MPIRoPEKernel: Using " << max_threads << " threads for tensor (" << tensor_size << " elements)");
+        LOG_DEBUG("MPIRoPEOperator: Using " << max_threads << " threads for tensor (" << tensor_size << " elements)");
     }
 
-    void MPIRoPEKernel::distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx) const
+    void MPIRoPEOperator::distributeMPIWork(size_t total_elements, size_t &start_idx, size_t &end_idx) const
     {
         int rank = getRank();
         int size = getSize();
@@ -405,11 +405,11 @@ namespace llaminar
             end_idx += remainder;
         }
 
-        LOG_DEBUG("MPIRoPEKernel: Rank " << rank << " processing elements ["
+        LOG_DEBUG("MPIRoPEOperator: Rank " << rank << " processing elements ["
                                          << start_idx << ", " << end_idx << ") of " << total_elements);
     }
 
-    void MPIRoPEKernel::executeSequenceWise(const float *input_data, const int *position_ids, float *output_data,
+    void MPIRoPEOperator::executeSequenceWise(const float *input_data, const int *position_ids, float *output_data,
                                             int seq_len, int n_heads, int head_dim)
     {
         // Distribute sequence positions across MPI ranks
@@ -433,13 +433,13 @@ namespace llaminar
 
         auto omp_end = std::chrono::high_resolution_clock::now();
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
-        LOG_DEBUG("MPIRoPEKernel sequence-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
+        LOG_DEBUG("MPIRoPEOperator sequence-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
         // Synchronize all ranks before proceeding
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
-    void MPIRoPEKernel::executeHeadWise(const float *input_data, const int *position_ids, float *output_data,
+    void MPIRoPEOperator::executeHeadWise(const float *input_data, const int *position_ids, float *output_data,
                                         int seq_len, int n_heads, int head_dim)
     {
         // Distribute attention heads across MPI ranks
@@ -463,13 +463,13 @@ namespace llaminar
 
         auto omp_end = std::chrono::high_resolution_clock::now();
         double omp_time = std::chrono::duration<double, std::milli>(omp_end - omp_start).count();
-        LOG_DEBUG("MPIRoPEKernel head-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
+        LOG_DEBUG("MPIRoPEOperator head-wise OpenMP: " << omp_time << "ms, threads: " << omp_get_max_threads());
 
         // Synchronize all ranks before proceeding
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
-    void MPIRoPEKernel::applyRotaryEmbedding(const float *input_ptr, float *output_ptr, int position, int head_dim)
+    void MPIRoPEOperator::applyRotaryEmbedding(const float *input_ptr, float *output_ptr, int position, int head_dim)
     {
 // Apply rotary embedding to pairs of dimensions
 #pragma omp simd aligned(input_ptr, output_ptr : 32)
@@ -487,11 +487,11 @@ namespace llaminar
         }
     }
 
-    inline float MPIRoPEKernel::getCos(int position, int dim) const
+    inline float MPIRoPEOperator::getCos(int position, int dim) const
     {
         if (position >= max_seq_len_ || dim >= head_dim_)
         {
-            LOG_ERROR("MPIRoPEKernel: Position " << position << " or dim " << dim << " out of bounds");
+            LOG_ERROR("MPIRoPEOperator: Position " << position << " or dim " << dim << " out of bounds");
             return 1.0f; // Safe fallback
         }
 
@@ -500,11 +500,11 @@ namespace llaminar
         return cos_table_[position * freq_dims + freq_dim];
     }
 
-    inline float MPIRoPEKernel::getSin(int position, int dim) const
+    inline float MPIRoPEOperator::getSin(int position, int dim) const
     {
         if (position >= max_seq_len_ || dim >= head_dim_)
         {
-            LOG_ERROR("MPIRoPEKernel: Position " << position << " or dim " << dim << " out of bounds");
+            LOG_ERROR("MPIRoPEOperator: Position " << position << " or dim " << dim << " out of bounds");
             return 0.0f; // Safe fallback
         }
 

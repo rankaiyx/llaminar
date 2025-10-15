@@ -16,11 +16,11 @@
 
 #include "RocblasPrefillProvider.h"
 #include "QwenPipelineAdapter.h"
-#include "kernels/MPIRMSNormKernel.h"
-#include "kernels/MPISwiGLUKernel.h"
-#include "kernels/MPIResidualKernel.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "operators/MPIRMSNormOperator.h"
+#include "operators/MPISwiGLUOperator.h"
+#include "operators/MPIResidualOperator.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 #include "PerformanceTimer.h"
 #include <chrono>
 #include <cstring>
@@ -123,10 +123,10 @@ namespace llaminar
         // NOTE: In production, these would be HIP-accelerated versions!
         // For the stub, we reuse CPU kernels (suboptimal but demonstrates API)
 
-        // RMSNorm kernel
+        // RMSNorm operator
         {
-            auto rmsnorm_kernel = std::make_unique<MPIRMSNormKernel>(
-                MPIRMSNormKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto rmsnorm_kernel = std::make_unique<MPIRMSNormOperator>(
+                MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
             rmsnorm_kernel->setEpsilon(layer_cfg.eps);
             if (!registerKernel("rmsnorm", std::move(rmsnorm_kernel)))
             {
@@ -136,8 +136,8 @@ namespace llaminar
 
         // SwiGLU activation kernel
         {
-            auto swiglu_kernel = std::make_unique<MPISwiGLUKernel>(
-                MPISwiGLUKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto swiglu_kernel = std::make_unique<MPISwiGLUOperator>(
+                MPISwiGLUOperator::DistributionStrategy::SEQUENCE_WISE);
             if (!registerKernel("swiglu", std::move(swiglu_kernel)))
             {
                 throw std::runtime_error("ROCBLASPrefillProvider: Failed to register swiglu kernel");
@@ -146,8 +146,8 @@ namespace llaminar
 
         // Residual connection kernel
         {
-            auto residual_kernel = std::make_unique<MPIResidualKernel>(
-                MPIResidualKernel::DistributionStrategy::SEQUENCE_WISE);
+            auto residual_kernel = std::make_unique<MPIResidualOperator>(
+                MPIResidualOperator::DistributionStrategy::SEQUENCE_WISE);
             if (!registerKernel("residual", std::move(residual_kernel)))
             {
                 throw std::runtime_error("ROCBLASPrefillProvider: Failed to register residual kernel");
@@ -289,7 +289,7 @@ namespace llaminar
         // 6. Copy results to CPU for snapshot capture
         // ====================================================================
 
-        // CPU fallback: Use RMSNorm kernel
+        // CPU fallback: Use RMSNorm operator
         {
             std::vector<std::shared_ptr<TensorBase>> norm_inputs = {
                 input,

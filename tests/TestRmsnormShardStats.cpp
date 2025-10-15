@@ -1,10 +1,10 @@
 #include <mpi.h>
 #include <gtest/gtest.h>
-#include "kernels/MPIRMSNormKernel.h"
-#include "tensors/tensor_factory.h"
-#include "tensors/sharded_simple_tensor.h"
-#include "tensors/shard_spec.h"
-#include "utils/debug_env.h"
+#include "operators/MPIRMSNormOperator.h"
+#include "tensors/TensorFactory.h"
+#include "tensors/ShardedSimpleTensor.h"
+#include "tensors/ShardSpec.h"
+#include "utils/DebugEnv.h"
 #include <random>
 
 using namespace llaminar;
@@ -83,7 +83,7 @@ TEST(RMSNormShardStatsTest, GlobalInverseScaleParity)
     auto out_shard = make_hidden_shard(seq_len, hidden, world, rank);
 
     // Use sequence-wise strategy; each rank will gather feature slices for parity reconstruction
-    MPIRMSNormKernel kernel(MPIRMSNormKernel::DistributionStrategy::SEQUENCE_WISE);
+    MPIRMSNormOperator kernel(MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
     kernel.setEpsilon(eps);
 
     std::vector<std::shared_ptr<TensorBase>> inputs = {shard_tensor, weight_repl};

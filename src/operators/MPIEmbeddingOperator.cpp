@@ -1,5 +1,5 @@
 ﻿/**
- * @file MPIEmbeddingKernel.cpp
+ * @file MPIEmbeddingOperator.cpp
  * @brief Token embedding lookup kernel with optional positional addition; MPI-replicated strategy.
  *
  * @section Contract
@@ -29,10 +29,10 @@
  *  - Optional stop-gradient semantics for fine-tuning scenarios.
  * @author David Sanftenberg
  */
-#include "MPIEmbeddingKernel.h"
-#include "../logger.h"
-#include "../utils/debug_env.h"
-#include "../utils/perf_counters.h"
+#include "MPIEmbeddingOperator.h"
+#include "../Logger.h"
+#include "../utils/DebugEnv.h"
+#include "../utils/PerfCounters.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -274,7 +274,7 @@ namespace
         const std::string token_preview = formatTokenPreview(token_ids, config.max_tokens);
 
         std::ostringstream oss;
-        oss << "MPIEmbeddingKernel[" << label << "] rank=" << rank
+        oss << "MPIEmbeddingOperator[" << label << "] rank=" << rank
             << " seq_len=" << seq_len
             << " emb_dim=" << embedding_dim
             << " finite=" << stats.finite_count
@@ -301,7 +301,7 @@ namespace
             const size_t index = *stats.first_nan_index;
             const size_t token = index / embedding_dim;
             const size_t dim = index % embedding_dim;
-            LOG_TRACE("MPIEmbeddingKernel[" << label << "] rank=" << rank
+            LOG_TRACE("MPIEmbeddingOperator[" << label << "] rank=" << rank
                                             << " first_nan at token=" << token
                                             << " dim=" << dim);
         }
@@ -311,7 +311,7 @@ namespace
             const size_t index = *stats.first_inf_index;
             const size_t token = index / embedding_dim;
             const size_t dim = index % embedding_dim;
-            LOG_TRACE("MPIEmbeddingKernel[" << label << "] rank=" << rank
+            LOG_TRACE("MPIEmbeddingOperator[" << label << "] rank=" << rank
                                             << " first_inf at token=" << token
                                             << " dim=" << dim);
         }
@@ -366,7 +366,7 @@ namespace
 namespace llaminar
 {
 
-    MPIEmbeddingKernel::MPIEmbeddingKernel(size_t vocab_size, size_t embedding_dim)
+    MPIEmbeddingOperator::MPIEmbeddingOperator(size_t vocab_size, size_t embedding_dim)
         : vocab_size_(vocab_size), embedding_dim_(embedding_dim)
     {
         initializeMPI();
@@ -389,17 +389,17 @@ namespace llaminar
 
         local_vocab_end_ = local_vocab_start_ + local_vocab_size_;
 
-        LOG_DEBUG("MPIEmbeddingKernel initialized on rank " << rank_ << "/" << size_
+        LOG_DEBUG("MPIEmbeddingOperator initialized on rank " << rank_ << "/" << size_
                                                             << " with vocab_size=" << vocab_size << ", embedding_dim=" << embedding_dim
                                                             << ", local_vocab_range=[" << local_vocab_start_ << ", " << local_vocab_end_ << ")");
     }
 
-    bool MPIEmbeddingKernel::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPIEmbeddingOperator::execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                      std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
         if (!validate(inputs, outputs))
         {
-            LOG_ERROR("MPIEmbeddingKernel validation failed");
+            LOG_ERROR("MPIEmbeddingOperator validation failed");
             return false;
         }
 
@@ -434,14 +434,14 @@ namespace llaminar
         const bool debug_enabled = debug_config.enabled;
         if (debug_enabled)
         {
-            LOG_TRACE("MPIEmbeddingKernel execute rank=" << rank_ << " tokens="
+            LOG_TRACE("MPIEmbeddingOperator execute rank=" << rank_ << " tokens="
                                                          << formatTokenPreview(token_ids, debug_config.max_tokens));
         }
 
         // Orientation & mode already determined in validate()
         bool full_table_mode = full_table_mode_;
         bool transposed = transposed_;
-        LOG_DEBUG("MPIEmbeddingKernel execute: full_table_mode=" << full_table_mode
+        LOG_DEBUG("MPIEmbeddingOperator execute: full_table_mode=" << full_table_mode
                                                                  << " transposed=" << transposed
                                                                  << " shape=[" << embedding_table->shape()[0]
                                                                  << ", " << embedding_table->shape()[1] << "] seq_len=" << seq_len);
@@ -486,7 +486,7 @@ namespace llaminar
                 const float owned_diff = computeOwnedTokenMaxAbsDiff(
                     local_output->data(), output->data(), seq_len, embedding_dim_,
                     token_ids, local_vocab_start_, local_vocab_end_);
-                LOG_TRACE("MPIEmbeddingKernel gather diff rank=" << rank_
+                LOG_TRACE("MPIEmbeddingOperator gather diff rank=" << rank_
                                                                  << " owned_token_max_abs_diff=" << owned_diff);
             }
         }
@@ -494,12 +494,12 @@ namespace llaminar
         return true;
     }
 
-    bool MPIEmbeddingKernel::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
+    bool MPIEmbeddingOperator::validate(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                                       const std::vector<std::shared_ptr<TensorBase>> &outputs) const
     {
         if (inputs.size() != 2 || outputs.size() != 1)
         {
-            LOG_ERROR("MPIEmbeddingKernel: Expected 2 inputs and 1 output, got "
+            LOG_ERROR("MPIEmbeddingOperator: Expected 2 inputs and 1 output, got "
                       << inputs.size() << " inputs and " << outputs.size() << " outputs");
             return false;
         }
@@ -510,14 +510,14 @@ namespace llaminar
 
         if (!token_ids || !embedding_table || !output)
         {
-            LOG_ERROR("MPIEmbeddingKernel: Null tensor provided");
+            LOG_ERROR("MPIEmbeddingOperator: Null tensor provided");
             return false;
         }
 
         // Check token_ids is 1D
         if (token_ids->shape().size() != 1)
         {
-            LOG_ERROR("MPIEmbeddingKernel: Token IDs must be 1D, got "
+            LOG_ERROR("MPIEmbeddingOperator: Token IDs must be 1D, got "
                       << token_ids->shape().size() << " dimensions");
             return false;
         }
@@ -525,7 +525,7 @@ namespace llaminar
         // Embedding table may be sharded [local_vocab_size, dim] or full [vocab_size, dim]
         if (embedding_table->shape().size() != 2)
         {
-            LOG_ERROR("MPIEmbeddingKernel: Embedding table must be 2D, got " << embedding_table->shape().size());
+            LOG_ERROR("MPIEmbeddingOperator: Embedding table must be 2D, got " << embedding_table->shape().size());
             return false;
         }
         // Accept both standard and transposed orientations:
@@ -539,7 +539,7 @@ namespace llaminar
         bool shard_trans = (r0 == embedding_dim_ && r1 == local_vocab_size_);
         if (!(full_std || shard_std || full_trans || shard_trans))
         {
-            LOG_ERROR("MPIEmbeddingKernel: Embedding table shape mismatch. Expected one of: "
+            LOG_ERROR("MPIEmbeddingOperator: Embedding table shape mismatch. Expected one of: "
                       << "[" << vocab_size_ << ", " << embedding_dim_ << "] (full), "
                       << "[" << local_vocab_size_ << ", " << embedding_dim_ << "] (shard), "
                       << "[" << embedding_dim_ << ", " << vocab_size_ << "] (full transposed), "
@@ -551,14 +551,14 @@ namespace llaminar
         // Cache orientation flags for execute()
         full_table_mode_ = (full_std || full_trans);
         transposed_ = (full_trans || shard_trans);
-        LOG_DEBUG("MPIEmbeddingKernel validate: full_table_mode_=" << full_table_mode_ << " transposed_=" << transposed_
+        LOG_DEBUG("MPIEmbeddingOperator validate: full_table_mode_=" << full_table_mode_ << " transposed_=" << transposed_
                                                                    << " table_shape=[" << r0 << ", " << r1 << "]");
 
         // Output must be [seq_len, embedding_dim]
         size_t seq_len = token_ids->shape()[0];
         if (output->shape().size() != 2 || output->shape()[0] != seq_len || output->shape()[1] != embedding_dim_)
         {
-            LOG_ERROR("MPIEmbeddingKernel: Output shape mismatch. Expected [" << seq_len << ", " << embedding_dim_ << "], got ["
+            LOG_ERROR("MPIEmbeddingOperator: Output shape mismatch. Expected [" << seq_len << ", " << embedding_dim_ << "], got ["
                                                                               << output->shape()[0] << ", " << output->shape()[1] << "]");
             return false;
         }
@@ -566,7 +566,7 @@ namespace llaminar
         return true;
     }
 
-    void MPIEmbeddingKernel::computeLocalEmbedding(const int *token_ids, const float *embedding_table,
+    void MPIEmbeddingOperator::computeLocalEmbedding(const int *token_ids, const float *embedding_table,
                                                    float *output, size_t seq_len, size_t embedding_dim,
                                                    bool full_table_mode, bool transposed,
                                                    size_t table_rows, size_t table_cols)
@@ -578,7 +578,7 @@ namespace llaminar
             int token_id = token_ids[i];
             if (token_id < 0 || token_id >= static_cast<int>(vocab_size_))
             {
-                LOG_WARN("MPIEmbeddingKernel: token id out of range: " << token_id);
+                LOG_WARN("MPIEmbeddingOperator: token id out of range: " << token_id);
                 continue;
             }
 
@@ -638,7 +638,7 @@ namespace llaminar
                 for (; bad_dim < embedding_dim; ++bad_dim)
                     if (!std::isfinite(row_ptr[bad_dim]))
                         break;
-                LOG_ERROR("MPIEmbeddingKernel: non-finite value detected after embedding copy (token=" << token_id
+                LOG_ERROR("MPIEmbeddingOperator: non-finite value detected after embedding copy (token=" << token_id
                                                                                                        << ", seq_index=" << i << ", dim=" << bad_dim << ") value=" << row_ptr[bad_dim]
                                                                                                        << " full_table_mode=" << (full_table_mode ? "1" : "0")
                                                                                                        << " transposed=" << (transposed ? "1" : "0")
@@ -662,13 +662,13 @@ namespace llaminar
             }
             else if (!row_ok)
             {
-                LOG_WARN("MPIEmbeddingKernel: non-finite value detected in embedding row (token=" << token_id
+                LOG_WARN("MPIEmbeddingOperator: non-finite value detected in embedding row (token=" << token_id
                                                                                                   << ", seq_index=" << i << ") proceeding (LLAMINAR_EMBED_FAIL_FAST unset)");
             }
         }
     }
 
-    void MPIEmbeddingKernel::gatherEmbeddings(const std::shared_ptr<TensorBase> &local_output,
+    void MPIEmbeddingOperator::gatherEmbeddings(const std::shared_ptr<TensorBase> &local_output,
                                               std::shared_ptr<TensorBase> &global_output,
                                               size_t seq_len, size_t embedding_dim,
                                               bool full_table_mode)
@@ -686,7 +686,7 @@ namespace llaminar
                       "MPI_Allreduce in gatherEmbeddings");
     }
 
-    int MPIEmbeddingKernel::getTokenRank(int token_id) const
+    int MPIEmbeddingOperator::getTokenRank(int token_id) const
     {
         if (token_id < 0 || token_id >= static_cast<int>(vocab_size_))
         {
@@ -707,7 +707,7 @@ namespace llaminar
         }
     }
 
-    int MPIEmbeddingKernel::getLocalTokenId(int global_token_id) const
+    int MPIEmbeddingOperator::getLocalTokenId(int global_token_id) const
     {
         if (global_token_id < static_cast<int>(local_vocab_start_) ||
             global_token_id >= static_cast<int>(local_vocab_end_))

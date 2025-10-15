@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../mpi_kernel_base.h"
+#include "../MpiKernelBase.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -36,7 +36,7 @@ namespace llaminar
      * Expected outputs:
      * - rotated_output: [seq_len, n_heads, head_dim] - position-encoded tensor
      */
-    class MPIRoPEKernel : public MPIKernelBase
+    class MPIRoPEOperator : public MPIKernelBase
     {
     public:
         enum class DistributionStrategy
@@ -46,19 +46,19 @@ namespace llaminar
         };
 
         /**
-         * @brief Construct MPIRoPEKernel with specified parameters
+         * @brief Construct MPIRoPEOperator with specified parameters
          * @param max_seq_len Maximum sequence length for precomputation
          * @param head_dim Dimension of each attention head
          * @param theta Base frequency for rotary embeddings (default: 10000.0)
          * @param strategy Distribution strategy for MPI parallelization
          */
-        MPIRoPEKernel(int max_seq_len, int head_dim, float theta = 10000.0f,
+        MPIRoPEOperator(int max_seq_len, int head_dim, float theta = 10000.0f,
                       DistributionStrategy strategy = DistributionStrategy::SEQUENCE_WISE);
 
         /**
          * @brief Destructor
          */
-        ~MPIRoPEKernel() override = default;
+        ~MPIRoPEOperator() override = default;
 
         /**
          * @brief Execute RoPE with MPI distribution and OpenMP parallelization
@@ -85,7 +85,7 @@ namespace llaminar
          * @brief Get kernel name for debugging and profiling
          * @return Kernel name string
          */
-        std::string getName() const { return "MPIRoPEKernel"; }
+        std::string getName() const { return "MPIRoPEOperator"; }
 
         /**
          * @brief Get the kernel type name for debugging/logging

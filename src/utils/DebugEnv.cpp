@@ -1,5 +1,5 @@
 #include "DebugEnv.h"
-#include "logger.h"
+#include "Logger.h"
 #include "TopologyManager.h"
 #include <omp.h>
 #include <sched.h>

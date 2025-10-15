@@ -1,5 +1,5 @@
-#include "kernels/MPIEmbeddingKernel.h"
-#include "tensors/tensor_factory.h"
+#include "operators/MPIEmbeddingOperator.h"
+#include "tensors/TensorFactory.h"
 #include "TestTimeoutGuard.h"
 #include "TestMpiUtils.h"
 #include <gtest/gtest.h>
@@ -21,7 +21,7 @@ namespace
         return static_cast<float>((token * 1000 + dim) * 0.001); // token + dim/1000 pattern
     }
 
-    // Partition logic replicated from MPIEmbeddingKernel ctor (kept in sync)
+    // Partition logic replicated from MPIEmbeddingOperator ctor (kept in sync)
     inline void compute_partition(size_t vocab_size, int world, int rank,
                                   size_t &local_start, size_t &local_size)
     {
@@ -126,7 +126,7 @@ namespace
         {
             int rank = 0;
             MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            fprintf(stderr, "[MPIEmbeddingKernelTest] rank %d triggering early finalize after %s\n", rank, test_name);
+            fprintf(stderr, "[MPIEmbeddingOperatorTest] rank %d triggering early finalize after %s\n", rank, test_name);
             // Ensure we do NOT skip finalize even though the test-level property sets it.
             unsetenv("LLAMINAR_TEST_SKIP_FINALIZE");
             // Provide a default watchdog if user did not set one explicitly.
@@ -142,7 +142,7 @@ namespace
     }
 } // namespace
 
-class MPIEmbeddingKernelTest : public ::testing::Test
+class MPIEmbeddingOperatorTest : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -160,7 +160,7 @@ protected:
     int world_ = 1;
 };
 
-TEST_F(MPIEmbeddingKernelTest, FullTableNonTransposed)
+TEST_F(MPIEmbeddingOperatorTest, FullTableNonTransposed)
 {
     const size_t vocab = 17;
     const size_t emb = 8;
@@ -171,7 +171,7 @@ TEST_F(MPIEmbeddingKernelTest, FullTableNonTransposed)
     auto table = make_embedding_table(vocab, emb, /*transposed=*/false, vocab, emb);
     auto output = TensorFactory::create_simple({(int)tokens.size(), (int)emb});
 
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<std::shared_ptr<TensorBase>> inputs = {token_tensor, table};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
     ASSERT_TRUE(kernel.execute(inputs, outputs));
@@ -182,7 +182,7 @@ TEST_F(MPIEmbeddingKernelTest, FullTableNonTransposed)
     maybe_finalize_after("FullTableNonTransposed");
 }
 
-TEST_F(MPIEmbeddingKernelTest, FullTableTransposed)
+TEST_F(MPIEmbeddingOperatorTest, FullTableTransposed)
 {
     const size_t vocab = 19;
     const size_t emb = 6;
@@ -193,7 +193,7 @@ TEST_F(MPIEmbeddingKernelTest, FullTableTransposed)
     auto table = make_embedding_table(emb, vocab, /*transposed=*/true, vocab, emb);
     auto output = TensorFactory::create_simple({(int)tokens.size(), (int)emb});
 
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<std::shared_ptr<TensorBase>> inputs = {token_tensor, table};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
     ASSERT_TRUE(kernel.execute(inputs, outputs));
@@ -204,7 +204,7 @@ TEST_F(MPIEmbeddingKernelTest, FullTableTransposed)
     maybe_finalize_after("FullTableTransposed");
 }
 
-TEST_F(MPIEmbeddingKernelTest, ShardedNonTransposed)
+TEST_F(MPIEmbeddingOperatorTest, ShardedNonTransposed)
 {
     if (world_ < 2)
     {
@@ -220,7 +220,7 @@ TEST_F(MPIEmbeddingKernelTest, ShardedNonTransposed)
     auto shard = make_embedding_table(local_size, emb, /*transposed=*/false, vocab, emb, local_start);
     auto output = TensorFactory::create_simple({(int)tokens.size(), (int)emb});
 
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<std::shared_ptr<TensorBase>> inputs = {token_tensor, shard};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
     ASSERT_TRUE(kernel.execute(inputs, outputs));
@@ -231,7 +231,7 @@ TEST_F(MPIEmbeddingKernelTest, ShardedNonTransposed)
     maybe_finalize_after("ShardedNonTransposed");
 }
 
-TEST_F(MPIEmbeddingKernelTest, ShardedTransposed)
+TEST_F(MPIEmbeddingOperatorTest, ShardedTransposed)
 {
     if (world_ < 2)
     {
@@ -247,7 +247,7 @@ TEST_F(MPIEmbeddingKernelTest, ShardedTransposed)
     auto shardT = make_embedding_table(emb, local_size, /*transposed=*/true, vocab, emb, local_start);
     auto output = TensorFactory::create_simple({(int)tokens.size(), (int)emb});
 
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<std::shared_ptr<TensorBase>> inputs = {token_tensor, shardT};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
     ASSERT_TRUE(kernel.execute(inputs, outputs));
@@ -258,7 +258,7 @@ TEST_F(MPIEmbeddingKernelTest, ShardedTransposed)
     maybe_finalize_after("ShardedTransposed");
 }
 
-TEST_F(MPIEmbeddingKernelTest, OutOfRangeTokenZeroRow)
+TEST_F(MPIEmbeddingOperatorTest, OutOfRangeTokenZeroRow)
 {
     const size_t vocab = 11;
     const size_t emb = 4;
@@ -267,7 +267,7 @@ TEST_F(MPIEmbeddingKernelTest, OutOfRangeTokenZeroRow)
     auto table = make_embedding_table(vocab, emb, false, vocab, emb);
     auto output = TensorFactory::create_simple({(int)tokens.size(), (int)emb});
 
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<std::shared_ptr<TensorBase>> inputs = {token_tensor, table};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
     ASSERT_TRUE(kernel.execute(inputs, outputs));
@@ -281,7 +281,7 @@ TEST_F(MPIEmbeddingKernelTest, OutOfRangeTokenZeroRow)
     maybe_finalize_after("OutOfRangeTokenZeroRow");
 }
 
-TEST_F(MPIEmbeddingKernelTest, ValidationFailureBadShape)
+TEST_F(MPIEmbeddingOperatorTest, ValidationFailureBadShape)
 {
     const size_t vocab = 10;
     const size_t emb = 4;
@@ -291,7 +291,7 @@ TEST_F(MPIEmbeddingKernelTest, ValidationFailureBadShape)
     auto bad = make_embedding_table(emb, emb, false, vocab, emb); // rows=emb != vocab or local shard; cols=emb OK but mismatch
     auto output = TensorFactory::create_simple({(int)tokens.size(), (int)emb});
 
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<std::shared_ptr<TensorBase>> inputs = {token_tensor, bad};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
     EXPECT_FALSE(kernel.execute(inputs, outputs));
@@ -304,7 +304,7 @@ LLAMINAR_DEFINE_GTEST_MPI_MAIN();
 // Fuzz / randomized coverage test: random vocab sizes, embedding dims, seq lens, token ids,
 // and orientation / sharding modes. Ensures indexing & partition logic remain correct
 // under varied scenarios. Fixed seed for reproducibility.
-TEST_F(MPIEmbeddingKernelTest, RandomizedFuzz)
+TEST_F(MPIEmbeddingOperatorTest, RandomizedFuzz)
 {
     if (!std::getenv("LLAMINAR_EMBED_EXTENDED"))
     {
@@ -345,7 +345,7 @@ TEST_F(MPIEmbeddingKernelTest, RandomizedFuzz)
         bool transposed = (transposed_flag != 0);
 
         // Instantiate kernel with (possibly) different global vocab each iteration
-        MPIEmbeddingKernel kernel(vocab, emb);
+        MPIEmbeddingOperator kernel(vocab, emb);
 
         // Generate random token ids in [0, vocab) with a small chance of out-of-range to exercise guard
         std::vector<int> tokens(seq_len);
@@ -409,7 +409,7 @@ TEST_F(MPIEmbeddingKernelTest, RandomizedFuzz)
 
 // Reuse a single kernel across alternating table orientations to ensure internal flags
 // are recomputed per validate() and no stale state leaks.
-TEST_F(MPIEmbeddingKernelTest, AlternatingOrientationReuse)
+TEST_F(MPIEmbeddingOperatorTest, AlternatingOrientationReuse)
 {
     const int vocab = 29;
     const int emb = 7;
@@ -417,7 +417,7 @@ TEST_F(MPIEmbeddingKernelTest, AlternatingOrientationReuse)
     auto token_tensor = make_token_tensor(tokens);
     auto output = TensorFactory::create_simple({(int)tokens.size(), emb});
 
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
 
     // First run: full transposed table
     auto full_transposed = make_embedding_table(emb, vocab, /*transposed=*/true, vocab, emb, 0);
@@ -447,7 +447,7 @@ TEST_F(MPIEmbeddingKernelTest, AlternatingOrientationReuse)
 }
 
 // Precision boundary test: ensure token IDs near upper vocab limit are stable when stored as float.
-TEST_F(MPIEmbeddingKernelTest, PrecisionBoundaryTokens)
+TEST_F(MPIEmbeddingOperatorTest, PrecisionBoundaryTokens)
 {
     if (!std::getenv("LLAMINAR_EMBED_EXTENDED"))
     {
@@ -461,7 +461,7 @@ TEST_F(MPIEmbeddingKernelTest, PrecisionBoundaryTokens)
 
     auto table = make_embedding_table(vocab, emb, false, vocab, emb, 0); // full table
     auto output = TensorFactory::create_simple({(int)tokens.size(), emb});
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<std::shared_ptr<TensorBase>> inputs = {token_tensor, table};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
     ASSERT_TRUE(kernel.execute(inputs, outputs));
@@ -473,13 +473,13 @@ TEST_F(MPIEmbeddingKernelTest, PrecisionBoundaryTokens)
 
 // All requested tokens are owned by a single (remote for one rank) shard; both ranks request the SAME list.
 // Verifies that the owning rank populates rows and MPI_Allreduce distributes them to the non-owning rank.
-TEST_F(MPIEmbeddingKernelTest, RemoteOwnedTokensGather)
+TEST_F(MPIEmbeddingOperatorTest, RemoteOwnedTokensGather)
 {
     if (world_ != 2)
         GTEST_SKIP() << "Test expects 2 ranks";
     const int vocab = 50; // simple even split 25/25
     const int emb = 6;
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
 
     // Choose an owner rank deterministically (rank 0) whose tokens we'll request.
     const int owner_rank = 0;
@@ -520,11 +520,11 @@ TEST_F(MPIEmbeddingKernelTest, RemoteOwnedTokensGather)
 }
 
 // Duplicate heavy tokens to ensure no accumulation artifacts.
-TEST_F(MPIEmbeddingKernelTest, DuplicateTokens)
+TEST_F(MPIEmbeddingOperatorTest, DuplicateTokens)
 {
     const int vocab = 37;
     const int emb = 9;
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<int> tokens(16, 13); // same token repeated
     auto token_tensor = make_token_tensor(tokens);
     auto table = make_embedding_table(vocab, emb, false, vocab, emb, 0);
@@ -539,11 +539,11 @@ TEST_F(MPIEmbeddingKernelTest, DuplicateTokens)
 }
 
 // Inject NaN into embedding table (full table mode) and confirm it propagates when fail-fast is off.
-TEST_F(MPIEmbeddingKernelTest, NaNPropagationNoFailFast)
+TEST_F(MPIEmbeddingOperatorTest, NaNPropagationNoFailFast)
 {
     const int vocab = 23;
     const int emb = 6;
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<int> tokens = {3, 7, 11};
     auto token_tensor = make_token_tensor(tokens);
     auto table = make_embedding_table(vocab, emb, false, vocab, emb, 0);
@@ -565,7 +565,7 @@ TEST_F(MPIEmbeddingKernelTest, NaNPropagationNoFailFast)
 }
 
 // Idempotent repeat execution: same inputs twice produce same outputs.
-TEST_F(MPIEmbeddingKernelTest, IdempotentRepeatExecution)
+TEST_F(MPIEmbeddingOperatorTest, IdempotentRepeatExecution)
 {
     const int vocab = 41;
     const int emb = 8;
@@ -573,7 +573,7 @@ TEST_F(MPIEmbeddingKernelTest, IdempotentRepeatExecution)
     auto token_tensor = make_token_tensor(tokens);
     auto table = make_embedding_table(vocab, emb, true, vocab, emb, 0); // transposed
     auto output = TensorFactory::create_simple({(int)tokens.size(), emb});
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     std::vector<std::shared_ptr<TensorBase>> inputs = {token_tensor, table};
     std::vector<std::shared_ptr<TensorBase>> outputs = {output};
     ASSERT_TRUE(kernel.execute(inputs, outputs));
@@ -590,7 +590,7 @@ TEST_F(MPIEmbeddingKernelTest, IdempotentRepeatExecution)
     if (w > 1)
     {
         MPI_Barrier(MPI_COMM_WORLD);
-        fprintf(stderr, "[MPIEmbeddingKernelTest] rank %d reached end-of-suite barrier\n", r);
+        fprintf(stderr, "[MPIEmbeddingOperatorTest] rank %d reached end-of-suite barrier\n", r);
         fflush(stderr);
     }
     maybe_finalize_after("IdempotentRepeatExecution");
@@ -599,7 +599,7 @@ TEST_F(MPIEmbeddingKernelTest, IdempotentRepeatExecution)
 // Disabled zero-row shard test: known to trigger MPI_Finalize hang on current MPI stack.
 // To run manually for debugging set GTest filter to ...EmptyShardSafe AND export LLAMINAR_RUN_EMPTY_SHARD=1.
 // Normal CI runs skip it (prefixed DISABLED_). Root cause investigation tracked in issue: EMBED-ZERO-SHARD-HANG.
-TEST_F(MPIEmbeddingKernelTest, DISABLED_EmptyShardSafe)
+TEST_F(MPIEmbeddingOperatorTest, DISABLED_EmptyShardSafe)
 {
     if (!std::getenv("LLAMINAR_RUN_EMPTY_SHARD"))
     {
@@ -609,7 +609,7 @@ TEST_F(MPIEmbeddingKernelTest, DISABLED_EmptyShardSafe)
         GTEST_SKIP() << "Test expects 2 ranks";
     const int vocab = 1;
     const int emb = 5;
-    MPIEmbeddingKernel kernel(vocab, emb);
+    MPIEmbeddingOperator kernel(vocab, emb);
     size_t local_start = 0, local_size = 0;
     compute_partition(vocab, world_, rank_, local_start, local_size);
     ASSERT_TRUE((local_size == 1 && rank_ == 0) || (local_size == 0 && rank_ == 1));

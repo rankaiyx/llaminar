@@ -4,7 +4,7 @@
 #include <numeric>
 #include <cmath>
 #include <cstring>
-#include "tensors/tp_partition.h"
+#include "tensors/TpPartition.h"
 
 using namespace llaminar;
 

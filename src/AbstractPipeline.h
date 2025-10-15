@@ -6,7 +6,7 @@
 #pragma once
 
 #include "TransformerConfig.h"
-#include "tensors/tensor_base.h"
+#include "tensors/TensorBase.h"
 #include "PipelineStages.h"
 #include <memory>
 #include <vector>

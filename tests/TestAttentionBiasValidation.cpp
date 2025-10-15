@@ -1,14 +1,14 @@
 /**
  * @file TestAttentionBiasValidation.cpp
- * @brief Test that MPIAttentionKernel properly validates bias tensor sizes
+ * @brief Test that MPIAttentionOperator properly validates bias tensor sizes
  * @author David Sanftenberg
  */
 
 #include <gtest/gtest.h>
 #include <mpi.h>
-#include "kernels/MPIAttentionKernel.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "operators/MPIAttentionOperator.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 
 using namespace llaminar;
 
@@ -33,8 +33,8 @@ TEST_F(AttentionBiasValidationTest, RejectIncorrectBiasSize)
     const int head_dim = 64;
     const int d_model = n_head * head_dim; // 256
 
-    MPIAttentionKernel kernel(n_head, n_head_kv, head_dim, 10000.0f,
-                              MPIAttentionKernel::DistributionStrategy::HEAD_WISE);
+    MPIAttentionOperator kernel(n_head, n_head_kv, head_dim, 10000.0f,
+                              MPIAttentionOperator::DistributionStrategy::HEAD_WISE);
 
     // Create valid inputs
     const int seq_len = 4;

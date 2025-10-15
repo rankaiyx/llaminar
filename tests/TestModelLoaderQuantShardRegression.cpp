@@ -16,7 +16,7 @@
 #include <random>
 #include <mpi.h>
 
-#include "logger.h"
+#include "Logger.h"
 #include "ModelLoader.h"
 
 using namespace llaminar;

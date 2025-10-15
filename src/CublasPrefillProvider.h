@@ -8,7 +8,7 @@
  * - CUDA runtime and cuBLAS library integration
  * - GPU memory management (cudaMalloc/cudaFree)
  * - Host-device data transfers (cudaMemcpy)
- * - Flash Attention kernel for efficient attention computation
+ * - Flash Attention operator for efficient attention computation
  * - Error handling for CUDA/cuBLAS API calls
  *
  * Implementation Effort:

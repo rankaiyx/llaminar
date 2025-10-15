@@ -2,9 +2,9 @@
 // Author: David Sanftenberg
 
 #include "PrefillBackend.h"
-#include "../adaptive_matmul.h"
-#include "../logger.h"
-#include "../utils/debug_env.h"
+#include "../AdaptiveMatmul.h"
+#include "../Logger.h"
+#include "../utils/DebugEnv.h"
 
 namespace llaminar
 {

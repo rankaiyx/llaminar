@@ -3,7 +3,7 @@
 #include "SimpleTensor.h"
 #include "CosmaTensor.h"
 #include "ShardedTensorRegistry.h"
-#include "../logger.h"
+#include "../Logger.h"
 #include <mpi.h>
 #include <atomic>
 #include <array>

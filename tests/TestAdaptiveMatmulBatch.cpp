@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "TestTimeoutGuard.h"
-#include "../src/adaptive_matmul.h"
+#include "../src/AdaptiveMatmul.h"
 #include <mpi.h>
 #include <chrono>
 #include <random>

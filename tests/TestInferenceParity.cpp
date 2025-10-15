@@ -17,11 +17,11 @@
 #include "QwenPipeline.h"
 #include "QwenPipelineAdapter.h"
 #include "ModelLoader.h"
-#include "chat/gguf_tokenizer.h"
-#include "chat/tokenizer_interface.h"
-#include "chat/response_generator.h"
+#include "chat/GgufTokenizer.h"
+#include "chat/TokenizerInterface.h"
+#include "chat/ResponseGenerator.h"
 #include "ArgumentParser.h"
-#include "logger.h"
+#include "Logger.h"
 
 #include <filesystem>
 #include <fstream>
@@ -48,11 +48,11 @@ namespace fs = std::filesystem;
 #include "QwenPipeline.h"
 #include "QwenPipelineAdapter.h"
 #include "ModelLoader.h"
-#include "chat/gguf_tokenizer.h"
-#include "chat/tokenizer_interface.h"
-#include "chat/response_generator.h"
+#include "chat/GgufTokenizer.h"
+#include "chat/TokenizerInterface.h"
+#include "chat/ResponseGenerator.h"
 #include "ArgumentParser.h"
-#include "logger.h"
+#include "Logger.h"
 
 #include <filesystem>
 #include <fstream>

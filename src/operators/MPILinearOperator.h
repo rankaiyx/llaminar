@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../mpi_kernel_base.h"
+#include "../MpiKernelBase.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -9,9 +9,9 @@ namespace llaminar
 {
 
     /**
-     * @brief MPI-enabled Linear layer kernel for distributed matrix multiplication with optional bias
+     * @brief MPI-enabled Linear layer operator for distributed matrix multiplication with optional bias
      *
-     * This kernel implements distributed linear projection using row-wise distribution of the weight matrix.
+     * This operator implements distributed linear projection using row-wise distribution of the weight matrix.
      * Each MPI process handles a subset of the output dimensions, computing partial results locally
      * and using MPI communication to gather the complete output.
      *
@@ -21,11 +21,11 @@ namespace llaminar
      * - Bias vector: Row-wise distribution matching weight matrix distribution
      * - Output tensor: Row-wise distribution, gathered to all processes at the end
      */
-    class MPILinearKernel : public MPIKernelBase
+    class MPILinearOperator : public MPIKernelBase
     {
     public:
-        MPILinearKernel(MPI_Comm comm = MPI_COMM_WORLD);
-        ~MPILinearKernel() = default;
+        MPILinearOperator(MPI_Comm comm = MPI_COMM_WORLD);
+        ~MPILinearOperator() = default;
 
         // KernelBase interface implementation
         bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,

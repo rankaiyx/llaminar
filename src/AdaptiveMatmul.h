@@ -20,8 +20,8 @@
 #include <string>
 #include <cctype>
 #include <cblas.h>
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 #include <mpi.h>
 #include <cosma/cinterface.hpp>
 #include <cosma/multiply.hpp>
@@ -29,8 +29,8 @@
 #include <cosma/strategy.hpp>
 #include <cosma/context.hpp>
 #include "CosmaPrefillManager.h"
-#include "utils/debug_env.h"     // Added for centralized debug environment access (debugEnv())
-#include "utils/perf_counters.h" // performance instrumentation
+#include "utils/DebugEnv.h"     // Added for centralized debug environment access (debugEnv())
+#include "utils/PerfCounters.h" // performance instrumentation
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -39,7 +39,7 @@
 
 namespace llaminar
 {
-    // Note: MatMulBackend enum now defined in matmul_backend_selection.h
+    // Note: MatMulBackend enum now defined in MatmulBackendSelection.h
     // Legacy MULTI_THREADED_OPENBLAS/COSMA values used directly
 
     class AdaptiveMatMulManager
@@ -174,7 +174,7 @@ namespace llaminar
 
         // High-level matrix multiplication interface
         // distributed_partition: set true when caller already partitions columns/rows
-        // across MPI ranks (e.g. MPILinearKernel splits output features). In that case
+        // across MPI ranks (e.g. MPILinearOperator splits output features). In that case
         // we must NOT invoke COSMA because COSMA would expect the full global matrices
         // and perform a collective matmul producing inconsistent partial results.
         bool multiply(const float *A, const float *B, float *C,

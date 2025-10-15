@@ -20,7 +20,7 @@
 #include "CosmaPrefillProvider.h"
 #include "QwenPipelineAdapter.h"
 #include "ModelLoader.h"
-#include "logger.h"
+#include "Logger.h"
 #include "PipelineSnapshotManager.h"
 
 #include <gtest/gtest.h>

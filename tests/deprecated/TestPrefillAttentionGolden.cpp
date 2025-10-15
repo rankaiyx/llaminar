@@ -1,9 +1,9 @@
 #include "QwenPipeline.h"
 #include "QwenPipelineAdapter.h"
 #include "CosmaPrefillManager.h"
-#include "tensors/tensor_factory.h"
+#include "tensors/TensorFactory.h"
 #include "ModelLoader.h"
-#include "logger.h"
+#include "Logger.h"
 #include "TestTimeoutGuard.h"
 
 #include <gtest/gtest.h>

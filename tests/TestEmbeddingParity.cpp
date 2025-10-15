@@ -14,10 +14,10 @@
 #include <fstream>
 #include <cmath>
 
-#include "../src/logger.h"
-#include "../src/model_loader.h"
-#include "../src/kernels/MPIEmbeddingKernel.h"
-#include "../src/tensor_factory.h"
+#include "../src/Logger.h"
+#include "../src/ModelLoader.h"
+#include "../src/operators/MPIEmbeddingOperator.h"
+#include "../src/TensorFactory.h"
 
 // Test tokens: [1, 2, 3, 4, 5]
 const std::vector<int> TEST_TOKENS = {1, 2, 3, 4, 5};
@@ -47,8 +47,8 @@ TEST(EmbeddingParity, CompareWithPyTorch)
     LOG_INFO("Embedding table shape: " << embedding_table->shape()[0]
                                        << " x " << embedding_table->shape()[1]);
 
-    // Create embedding kernel
-    MPIEmbeddingKernel emb_kernel(151936, 896);
+    // Create embedding operator
+    MPIEmbeddingOperator emb_kernel(151936, 896);
 
     // Create input/output tensors
     auto token_tensor = TensorFactory::create_simple({static_cast<int>(TEST_TOKENS.size()), 1});

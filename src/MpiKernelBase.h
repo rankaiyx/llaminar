@@ -1,7 +1,7 @@
 #pragma once
 
 #include "KernelBase.h"
-#include "tensors/tensor_factory.h"
+#include "tensors/TensorFactory.h"
 #include "MpiContext.h"
 #include <mpi.h>
 #include <vector>

@@ -1,6 +1,6 @@
 // Basic tests for TPPartitionSpec and trivial splitter
 #include <gtest/gtest.h>
-#include "tensors/tp_partition.h"
+#include "tensors/TpPartition.h"
 #include <vector>
 
 using namespace llaminar;

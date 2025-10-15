@@ -9,8 +9,8 @@
 #include <random>
 #include <cstdlib>
 
-#include "kernels/common/rmsnorm_core.h"
-#include "utils/debug_env.h"
+#include "operators/common/RmsnormCore.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar::kernels;
 

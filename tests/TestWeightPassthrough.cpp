@@ -4,7 +4,7 @@
  *
  * This test verifies that:
  * 1. Weights dequantized by ModelLoader maintain their values
- * 2. Weights passed to MPIAttentionKernel are identical to dequantized values
+ * 2. Weights passed to MPIAttentionOperator are identical to dequantized values
  * 3. No scaling, corruption, or transformation occurs in the pipeline
  *
  * @author David Sanftenberg
@@ -19,9 +19,9 @@
 
 #include "ModelLoader.h"
 #include "TransformerConfig.h"
-#include "kernels/MPIAttentionKernel.h"
-#include "tensors/tensor_factory.h"
-#include "logger.h"
+#include "operators/MPIAttentionOperator.h"
+#include "tensors/TensorFactory.h"
+#include "Logger.h"
 
 namespace llaminar
 {
@@ -152,11 +152,11 @@ namespace llaminar
         /**
          * @brief Custom attention kernel that captures weights passed to execute()
          */
-        class WeightCapturingAttentionKernel : public MPIAttentionKernel
+        class WeightCapturingAttentionKernel : public MPIAttentionOperator
         {
         public:
             WeightCapturingAttentionKernel(int n_head, int n_head_kv, int head_dim, float rope_freq_base)
-                : MPIAttentionKernel(n_head, n_head_kv, head_dim, rope_freq_base, DistributionStrategy::HEAD_WISE) {}
+                : MPIAttentionOperator(n_head, n_head_kv, head_dim, rope_freq_base, DistributionStrategy::HEAD_WISE) {}
 
             bool execute(const std::vector<std::shared_ptr<TensorBase>> &inputs,
                          std::vector<std::shared_ptr<TensorBase>> &outputs) override

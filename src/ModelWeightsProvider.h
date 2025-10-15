@@ -46,7 +46,7 @@
 #include "QwenPipeline.h"
 #include "MpiContext.h"
 #include "TransformerConfig.h"
-#include "tensors/tensor_base.h"
+#include "tensors/TensorBase.h"
 
 namespace llaminar
 {

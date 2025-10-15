@@ -1,7 +1,7 @@
 #include "PipelineBase.h"
 #include "DebugUtils.h"
 #include "PerformanceTimer.h"
-#include "utils/perf_counters.h"
+#include "utils/PerfCounters.h"
 #include "ParityHooks.h"
 #include <chrono>
 #include <algorithm>

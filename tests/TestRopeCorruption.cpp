@@ -1,12 +1,12 @@
-// Standalone RoPE corruption test matching MPIAttentionKernel dimensions
+// Standalone RoPE corruption test matching MPIAttentionOperator dimensions
 #include <gtest/gtest.h>
 #include <vector>
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
-#include "kernels/common/attention_primitives.h"
-#include "utils/debug_env.h"
+#include "operators/common/AttentionPrimitives.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar::attn;
 
@@ -20,7 +20,7 @@ static void fillSequential(std::vector<float> &v, float scale)
     }
 }
 
-// Test exact dimensions from failing MPIAttentionKernel test
+// Test exact dimensions from failing MPIAttentionOperator test
 TEST(RoPECorruption, ExactMPIAttentionDimensions)
 {
     const int seq_len = 4;

@@ -7,7 +7,7 @@
  * at various stages of the transformer pipeline between Llaminar and llama.cpp implementations.
  *
  * Key features:
- * - Stage-based snapshot capture (uses core PipelineStage enum from src/pipeline_stages.h)
+ * - Stage-based snapshot capture (uses core PipelineStage enum from src/PipelineStages.h)
  * - Configurable comparison metrics (max_abs, rel_l2, mean_abs)
  * - Extensible to new model architectures
  * - MPI-aware for distributed execution
@@ -30,7 +30,7 @@ namespace llaminar
     namespace parity
     {
         // Use core PipelineStage enum from llaminar::PipelineStage
-        // (No duplicate definition - we import from src/pipeline_stages.h)
+        // (No duplicate definition - we import from src/PipelineStages.h)
 
         /**
          * @brief Metadata for a captured tensor snapshot
@@ -368,7 +368,7 @@ namespace llaminar
         };
 
         // Note: stage_to_string() and string_to_stage() utilities are provided
-        // by the core pipeline_stages.h header (inline functions in llaminar namespace)
+        // by the core PipelineStages.h header (inline functions in llaminar namespace)
 
     } // namespace parity
 } // namespace llaminar

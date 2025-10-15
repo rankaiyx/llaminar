@@ -9,7 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <vector>
-#include "../../utils/debug_env.h"
+#include "../../utils/DebugEnv.h"
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #elif defined(__AVX2__)

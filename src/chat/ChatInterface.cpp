@@ -1,5 +1,5 @@
 #include "ChatInterface.h"
-#include "../logger.h"
+#include "../Logger.h"
 #include <iostream>
 #include <sstream>
 #include <algorithm>

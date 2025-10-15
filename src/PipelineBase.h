@@ -1,7 +1,7 @@
 #pragma once
 
 #include "MpiKernelBase.h"
-#include "tensors/tensor_factory.h"
+#include "tensors/TensorFactory.h"
 #include "PipelineStages.h"
 #include "AbstractPipeline.h"
 #include <unordered_map>
