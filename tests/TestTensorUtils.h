@@ -1,6 +1,6 @@
 #pragma once
 /**
- * @file test_tensor_utils.h
+ * @file TestTensorUtils.h
  * @brief Shared deterministic utilities for kernel unit tests (allocation, PRNG, metrics).
  *
  * Provides lightweight helpers so each micro-test avoids duplicating boilerplate.

@@ -1,5 +1,5 @@
 /**
- * @file prefill_provider_base_impl.h
+ * @file PrefillProviderBaseImpl.h
  * @brief Shared implementation logic for prefill providers
  * @author David Sanftenberg
  *
@@ -42,11 +42,11 @@
 
 #pragma once
 
-#include "prefill_provider.h"
-#include "qwen_pipeline.h"
-#include "pipeline_base.h"
+#include "PrefillProvider.h"
+#include "QwenPipeline.h"
+#include "PipelineBase.h"
 #include "logger.h"
-#include "performance_timer.h"
+#include "PerformanceTimer.h"
 #include <memory>
 #include <vector>
 #include <chrono>

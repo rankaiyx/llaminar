@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <sstream>
-#include "tensor_factory.h"
+#include "TensorFactory.h"
 
 namespace llaminar
 {

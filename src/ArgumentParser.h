@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common.h"
-#include "log_level.h"
+#include "LogLevel.h"
 #include <string>
 
 // Extended parameters structure for LLM inference engine

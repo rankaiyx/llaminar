@@ -1,12 +1,12 @@
 /**
- * @file test_bias_contracts.cpp
+ * @file TestBiasContracts.cpp
  * @brief Unit tests for BiasContract validation system
  * @author David Sanftenberg
  * @date 2025-10-12
  */
 
 #include <gtest/gtest.h>
-#include "bias_contracts.h"
+#include "BiasContracts.h"
 #include "tensors/tensor_factory.h"
 #include <mpi.h>
 

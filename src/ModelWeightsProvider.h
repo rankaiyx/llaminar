@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * @file model_weights_provider.h
+ * @file ModelWeightsProvider.h
  * @brief MPI-aware model weights accessor with structured access patterns
  * @author David Sanftenberg
  *
@@ -43,9 +43,9 @@
 #include <memory>
 #include <string>
 #include <utility>
-#include "qwen_pipeline.h"
-#include "mpi_context.h"
-#include "transformer_config.h"
+#include "QwenPipeline.h"
+#include "MpiContext.h"
+#include "TransformerConfig.h"
 #include "tensors/tensor_base.h"
 
 namespace llaminar

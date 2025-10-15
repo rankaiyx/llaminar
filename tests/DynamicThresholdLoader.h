@@ -1,5 +1,5 @@
 /**
- * @file dynamic_threshold_loader.h
+ * @file DynamicThresholdLoader.h
  * @brief Load variance-based dynamic thresholds for parity tests
  * @author David Sanftenberg
  *

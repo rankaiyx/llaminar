@@ -1,5 +1,5 @@
 /**
- * @file parity_test_framework.h
+ * @file ParityTestFramework.h
  * @brief Extensible parity test framework for comparing Llaminar pipeline stages with llama.cpp
  * @author David Sanftenberg
  *
@@ -15,7 +15,7 @@
 
 #pragma once
 
-#include "pipeline_stages.h" // Core PipelineStage enum from src/
+#include "PipelineStages.h" // Core PipelineStage enum from src/
 #include <string>
 #include <vector>
 #include <map>

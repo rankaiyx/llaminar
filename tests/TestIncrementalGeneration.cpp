@@ -3,10 +3,10 @@
 // replaying the full sequence. Keeps model tiny & synthetic for speed.
 
 #include "gtest/gtest.h"
-#include "qwen_pipeline.h" // for createQwenPipeline & weights struct
+#include "QwenPipeline.h" // for createQwenPipeline & weights struct
 #include "chat/response_generator.h"
 #include "chat/gguf_tokenizer.h"
-#include "model_loader.h"
+#include "ModelLoader.h"
 #include "utils/debug_env.h"
 #include <mpi.h>
 

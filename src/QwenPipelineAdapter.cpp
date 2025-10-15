@@ -1,9 +1,9 @@
 /**
- * @file qwen_pipeline_adapter.cpp
+ * @file QwenPipelineAdapter.cpp
  */
-#include "qwen_pipeline_adapter.h"
-#include "abstract_pipeline.h"
-#include "qwen_pipeline.h"
+#include "QwenPipelineAdapter.h"
+#include "AbstractPipeline.h"
+#include "QwenPipeline.h"
 #include "logger.h"
 #include "utils/debug_env.h"
 

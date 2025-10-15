@@ -1,5 +1,5 @@
 /**
- * @file test_k_gathering_and_rope_gqa.cpp
+ * @file TestKGatheringAndRopeGqa.cpp
  * @brief Tests for K tensor MPI gathering order and RoPE GQA head indexing
  * @author David Sanftenberg
  *

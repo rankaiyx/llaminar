@@ -1,5 +1,5 @@
 /**
- * @file test_attention_stage_contracts.cpp
+ * @file TestAttentionStageContracts.cpp
  * @brief Smoke tests for MPIAttentionKernel stage contract validation infrastructure
  * @author David Sanftenberg
  *

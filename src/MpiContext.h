@@ -1,5 +1,5 @@
 /**
- * @file mpi_context.h
+ * @file MpiContext.h
  * @brief MPI runtime context capturing rank, size, and communicator.
  * @author David Sanftenberg
  *

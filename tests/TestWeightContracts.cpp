@@ -1,5 +1,5 @@
 /**
- * @file test_weight_contracts.cpp
+ * @file TestWeightContracts.cpp
  * @brief Unit tests for the weight contract validation system
  *
  * Tests cover:
@@ -14,9 +14,9 @@
  */
 
 #include "gtest/gtest.h"
-#include "weight_contracts.h"
+#include "WeightContracts.h"
 #include "tensors/tensor_factory.h"
-#include "transformer_config.h"
+#include "TransformerConfig.h"
 #include <memory>
 #include <stdexcept>
 

@@ -1,5 +1,5 @@
 /**
- * @file cublas_prefill_provider.cpp
+ * @file CublasPrefillProvider.cpp
  * @brief Implementation of cuBLAS GPU-accelerated prefill provider (STUB)
  * @author David Sanftenberg
  *
@@ -13,14 +13,14 @@
  * In a real implementation, replace stub comments with actual CUDA/cuBLAS calls.
  */
 
-#include "cublas_prefill_provider.h"
-#include "qwen_pipeline_adapter.h"
+#include "CublasPrefillProvider.h"
+#include "QwenPipelineAdapter.h"
 #include "kernels/MPIRMSNormKernel.h"
 #include "kernels/MPISwiGLUKernel.h"
 #include "kernels/MPIResidualKernel.h"
 #include "tensors/tensor_factory.h"
 #include "logger.h"
-#include "performance_timer.h"
+#include "PerformanceTimer.h"
 #include <chrono>
 #include <cstring>
 #include <stdexcept>

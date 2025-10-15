@@ -1,10 +1,10 @@
 #pragma once
 
-#include "tensor_base.h"
-#include "simple_tensor.h"
-#include "cosma_tensor.h"
-#include "sharded_simple_tensor.h"
-#include "shard_spec.h"
+#include "TensorBase.h"
+#include "SimpleTensor.h"
+#include "CosmaTensor.h"
+#include "ShardedSimpleTensor.h"
+#include "ShardSpec.h"
 #include <functional>
 #include <memory>
 #include <vector>

@@ -1,6 +1,6 @@
 #include "gtest/gtest.h"
-#include "qwen_pipeline.h" // provides getReplayFirstExceedFlag/resetReplayFirstExceedFlag friend access
-#include "model_loader.h"
+#include "QwenPipeline.h" // provides getReplayFirstExceedFlag/resetReplayFirstExceedFlag friend access
+#include "ModelLoader.h"
 #include "utils/debug_env.h"
 #include <mpi.h>
 

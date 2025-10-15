@@ -1,9 +1,9 @@
 /**
- * @file abstract_pipeline.cpp
+ * @file AbstractPipeline.cpp
  * @brief Implementation of multi-architecture pipeline factory scaffolding.
  */
-#include "abstract_pipeline.h"
-#include "pipeline_snapshot_manager.h"
+#include "AbstractPipeline.h"
+#include "PipelineSnapshotManager.h"
 #include "logger.h"
 
 namespace llaminar

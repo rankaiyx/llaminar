@@ -7,7 +7,7 @@
 #include <vector>
 #include <iomanip>
 #include <mpi.h>
-#include "production_adaptive_matmul.h"
+#include "ProductionAdaptiveMatmul.h"
 #include <cosma/multiply.hpp>
 #include <cosma/strategy.hpp>
 

@@ -1,8 +1,8 @@
 /**
- * @file rmsnorm_core.cpp
+ * @file RmsnormCore.cpp
  * @brief Implementation of centralized RMSNorm math primitives.
  */
-#include "rmsnorm_core.h"
+#include "RmsnormCore.h"
 
 #include <cmath>
 #include <algorithm>

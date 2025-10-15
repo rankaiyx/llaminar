@@ -1,5 +1,5 @@
 /**
- * @file prefill_diagnostics.h
+ * @file PrefillDiagnostics.h
  * @brief Prefill diagnostics helpers for baseline comparison and FFN shard tracing.
  * @author David Sanftenberg
  *

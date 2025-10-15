@@ -1,5 +1,5 @@
 /**
- * @file test_cosma_precision.cpp
+ * @file TestCosmaPrecision.cpp
  * @brief Focused unit tests for COSMA float vs double precision comparison
  *
  * These tests directly invoke COSMA in multi-rank MPI setups to isolate

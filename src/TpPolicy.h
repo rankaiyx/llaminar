@@ -1,5 +1,5 @@
 /**
- * @file tp_policy.h
+ * @file TpPolicy.h
  * @brief Tensor parallel (TP) policy helper for deciding BLAS threading & outer parallel strategy.
  * @author David Sanftenberg
  */

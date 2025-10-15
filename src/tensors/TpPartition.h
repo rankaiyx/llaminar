@@ -1,5 +1,5 @@
 /**
- * @file tp_partition.h
+ * @file TpPartition.h
  * @brief Tensor Parallel (intra-socket) partition specification and splitter interfaces.
  */
 #pragma once

@@ -9,9 +9,9 @@
 #include <unistd.h>
 
 #include "logger.h"
-#include "model_loader.h"
-#include "qwen_pipeline.h"
-#include "qwen_pipeline_adapter.h"
+#include "ModelLoader.h"
+#include "QwenPipeline.h"
+#include "QwenPipelineAdapter.h"
 
 namespace
 {

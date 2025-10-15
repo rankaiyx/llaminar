@@ -1,5 +1,5 @@
 /**
- * @file test_attention_golden.cpp
+ * @file TestAttentionGolden.cpp
  * @brief Golden oracle tests for attention primitive operations
  * @author David Sanftenberg
  * 

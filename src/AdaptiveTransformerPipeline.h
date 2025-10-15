@@ -11,8 +11,8 @@
 
 #pragma once
 
-#include "qwen_pipeline.h" // Provides QwenPipeline definition
-#include "adaptive_matmul.h"
+#include "QwenPipeline.h" // Provides QwenPipeline definition
+#include "AdaptiveMatmul.h"
 #include "logger.h"
 #include <memory>
 #include <chrono>

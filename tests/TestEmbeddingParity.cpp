@@ -1,5 +1,5 @@
 /**
- * @file test_embedding_parity.cpp
+ * @file TestEmbeddingParity.cpp
  * @brief Minimal test to compare embedding lookup between Llaminar and PyTorch
  *
  * This is a focused diagnostic to find the root cause of EMBEDDING divergence.

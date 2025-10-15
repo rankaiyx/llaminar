@@ -1,4 +1,4 @@
-#include "qwen_pipeline.h" // QwenPipeline
+#include "QwenPipeline.h" // QwenPipeline
 #include "gtest/gtest.h"
 #include <cstdlib>
 

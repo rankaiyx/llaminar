@@ -1,5 +1,5 @@
 /**
- * @file test_attention_bias_validation.cpp
+ * @file TestAttentionBiasValidation.cpp
  * @brief Test that MPIAttentionKernel properly validates bias tensor sizes
  * @author David Sanftenberg
  */

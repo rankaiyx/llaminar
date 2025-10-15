@@ -1,5 +1,5 @@
 /**
- * @file npz_loader.h
+ * @file NpzLoader.h
  * @brief Simple .npz (NumPy archive) loader for PyTorch snapshot integration
  * @author David Sanftenberg
  *

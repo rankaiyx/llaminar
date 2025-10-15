@@ -1,5 +1,5 @@
 /**
- * @file transformer_config.h
+ * @file TransformerConfig.h
  * @brief Configuration structures for transformer models.
  * @author David Sanftenberg
  */

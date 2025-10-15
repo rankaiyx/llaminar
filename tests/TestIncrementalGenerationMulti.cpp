@@ -4,9 +4,9 @@
 // deterministic weight initialization and sampling temperature=0 (argmax sampling).
 
 #include "gtest/gtest.h"
-#include "qwen_pipeline.h"
+#include "QwenPipeline.h"
 #include "chat/response_generator.h"
-#include "model_loader.h"
+#include "ModelLoader.h"
 #include "utils/debug_env.h"
 #include <mpi.h>
 

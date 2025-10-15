@@ -1,13 +1,13 @@
 /**
- * @file abstract_pipeline.h
+ * @file AbstractPipeline.h
  * @brief Architecture-agnostic inference pipeline base (multi-architecture scaffolding).
  * @author David Sanftenberg
  */
 #pragma once
 
-#include "transformer_config.h"
+#include "TransformerConfig.h"
 #include "tensors/tensor_base.h"
-#include "pipeline_stages.h"
+#include "PipelineStages.h"
 #include <memory>
 #include <vector>
 #include <string>

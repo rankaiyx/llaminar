@@ -1,4 +1,4 @@
-#include "chat_interface.h"
+#include "ChatInterface.h"
 #include "../logger.h"
 #include <iostream>
 #include <sstream>

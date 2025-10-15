@@ -1,12 +1,12 @@
 /**
- * @file test_contract_loading.cpp
+ * @file TestContractLoading.cpp
  * @brief Simple test to verify contract-driven weight loading
  * @author David Sanftenberg
  */
 
-#include "model_loader.h"
-#include "weight_contracts.h"
-#include "transformer_config.h"
+#include "ModelLoader.h"
+#include "WeightContracts.h"
+#include "TransformerConfig.h"
 #include "logger.h"
 #include <mpi.h>
 #include <iostream>

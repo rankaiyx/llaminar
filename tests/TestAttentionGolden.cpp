@@ -1,5 +1,5 @@
 /**
- * @file test_attention_golden.cpp
+ * @file TestAttentionGolden.cpp
  * @brief Golden oracle tests for attention primitives
  *
  * This test suite validates individual attention operations against known-good

@@ -1,10 +1,10 @@
 /**
- * @file pipeline_snapshot_manager.cpp
+ * @file PipelineSnapshotManager.cpp
  * @brief Implementation of debug-only snapshot capture
  * @author David Sanftenberg
  */
 
-#include "pipeline_snapshot_manager.h"
+#include "PipelineSnapshotManager.h"
 #include "logger.h"
 #include "utils/debug_env.h"
 

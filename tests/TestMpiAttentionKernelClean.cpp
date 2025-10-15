@@ -1,5 +1,5 @@
 /**
- * @file test_mpi_attention_kernel_clean.cpp
+ * @file TestMpiAttentionKernelClean.cpp
  * @brief Comprehensive unit tests for clean MPIAttentionKernel implementation
  * @author David Sanftenberg
  *

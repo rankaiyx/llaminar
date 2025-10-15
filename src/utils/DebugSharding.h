@@ -1,5 +1,5 @@
 /**
- * @file debug_sharding.h
+ * @file DebugSharding.h
  * @brief Centralized parsing of tensor sharding related debug environment flags.
  *
  * This consolidates scattered getenv() calls into a single lightweight snapshot
@@ -17,7 +17,7 @@
  */
 #pragma once
 
-#include "debug_env.h" // Reuse unified snapshot but keep backwards compatibility for existing callers
+#include "DebugEnv.h" // Reuse unified snapshot but keep backwards compatibility for existing callers
 
 namespace llaminar
 {

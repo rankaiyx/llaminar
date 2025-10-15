@@ -1,5 +1,5 @@
 /**
- * @file json_export.h
+ * @file JsonExport.h
  * @brief JSON export utilities for logits and token data
  * @author David Sanftenberg
  */

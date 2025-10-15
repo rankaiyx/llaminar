@@ -1,6 +1,6 @@
 #pragma once
 #include <mpi.h>
-#include "perf_counters.h"
+#include "PerfCounters.h"
 #include <memory>
 #include <cstring>
 #include "../tensors/tensor_base.h"

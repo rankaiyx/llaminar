@@ -1,5 +1,5 @@
 /**
- * @file weight_verifier.h
+ * @file WeightVerifier.h
  * @brief Utility for verifying Llaminar weights against PyTorch reference snapshots
  * @author David Sanftenberg
  *
@@ -30,8 +30,8 @@
 
 #pragma once
 
-#include "npz_loader.h"
-#include "model_weights_provider.h"
+#include "NpzLoader.h"
+#include "ModelWeightsProvider.h"
 #include <string>
 #include <memory>
 #include <vector>

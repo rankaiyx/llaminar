@@ -1,10 +1,10 @@
 /**
- * @file json_export.cpp
+ * @file JsonExport.cpp
  * @brief Implementation of JSON export utilities
  * @author David Sanftenberg
  */
 
-#include "json_export.h"
+#include "JsonExport.h"
 #include "logger.h"
 #include <iomanip>
 

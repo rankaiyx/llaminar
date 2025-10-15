@@ -1,5 +1,5 @@
 /**
- * @file qwen_integration_test.cpp
+ * @file QwenIntegrationTest.cpp
  * @brief Comprehensive integration tests for Qwen models
  * @author David Sanftenberg
  *
@@ -10,7 +10,7 @@
  * - Edge cases (single token, long context, etc.)
  */
 
-#include "model_integration_test_base.h"
+#include "ModelIntegrationTestBase.h"
 #include "logger.h"
 #include <gtest/gtest.h>
 #include <mpi.h>

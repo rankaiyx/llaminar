@@ -1,5 +1,5 @@
 /**
- * @file attention_primitives.cpp
+ * @file AttentionPrimitives.cpp
  * @brief Refactored attention primitives with clean scalar + OpenMP implementation
  * @author David Sanftenberg
  *

@@ -29,7 +29,7 @@
 #include <cmath>
 #include <cstring>
 
-#include "model_loader.h"
+#include "ModelLoader.h"
 
 extern "C"
 {

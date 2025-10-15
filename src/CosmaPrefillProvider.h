@@ -1,5 +1,5 @@
 /**
- * @file cosma_prefill_provider.h
+ * @file CosmaPrefillProvider.h
  * @brief COSMA-based prefill provider using Template Method pattern
  * @author David Sanftenberg
  *
@@ -40,9 +40,9 @@
 
 #pragma once
 
-#include "prefill_provider_base_impl.h"
-#include "cosma_prefill_manager.h"
-#include "large_matmul_plan.h"
+#include "PrefillProviderBaseImpl.h"
+#include "CosmaPrefillManager.h"
+#include "LargeMatmulPlan.h"
 #include <memory>
 #include <vector>
 

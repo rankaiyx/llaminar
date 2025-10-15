@@ -1,5 +1,5 @@
 // Parity test: prefill + incremental decodes (with KV cache growth) vs replaying full sequence.
-#include "qwen_pipeline.h" // QwenPipeline
+#include "QwenPipeline.h" // QwenPipeline
 #include "gtest/gtest.h"
 #include <cstdlib>
 #include <cmath>

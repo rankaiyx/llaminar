@@ -1,8 +1,8 @@
-#include "tensor_factory.h"
-#include "tensor_base.h"
-#include "simple_tensor.h"
-#include "cosma_tensor.h"
-#include "sharded_tensor_registry.h"
+#include "TensorFactory.h"
+#include "TensorBase.h"
+#include "SimpleTensor.h"
+#include "CosmaTensor.h"
+#include "ShardedTensorRegistry.h"
 #include "../logger.h"
 #include <mpi.h>
 #include <atomic>

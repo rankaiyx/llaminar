@@ -1,5 +1,5 @@
 /**
- * @file test_attention_regression.cpp
+ * @file TestAttentionRegression.cpp
  * @brief Regression tests for attention kernel bugs (bias overflow, RoPE GQA, dimension validation)
  * @author David Sanftenberg
  *

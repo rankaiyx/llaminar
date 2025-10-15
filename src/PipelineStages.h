@@ -1,5 +1,5 @@
 /**
- * @file pipeline_stages.h
+ * @file PipelineStages.h
  * @brief Pipeline stage definitions for snapshot capture and instrumentation
  * @author David Sanftenberg
  *

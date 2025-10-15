@@ -1,5 +1,5 @@
 /**
- * @file pipeline_snapshot_manager.h
+ * @file PipelineSnapshotManager.h
  * @brief Debug-only layer snapshot capture for parity testing
  * @author David Sanftenberg
  *
@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "pipeline_stages.h"
+#include "PipelineStages.h"
 #include <string>
 #include <memory>
 

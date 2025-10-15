@@ -1,5 +1,5 @@
 /**
- * @file test_attention_output_mode_validation.cpp
+ * @file TestAttentionOutputModeValidation.cpp
  * @brief Unit test to validate MPIAttentionKernel output mode configuration
  *
  * This test ensures that the critical output mode configuration is correctly set

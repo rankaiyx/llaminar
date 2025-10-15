@@ -1,5 +1,5 @@
 /**
- * @file mpi_slicing_helper.h
+ * @file MpiSlicingHelper.h
  * @brief MPI-aware tensor loading with automatic dimension handling and slicing
  *
  * This file provides centralized logic for loading tensors with MPI slicing,
@@ -18,8 +18,8 @@
 
 #pragma once
 
-#include "model_loader.h"
-#include "weight_contracts.h"
+#include "ModelLoader.h"
+#include "WeightContracts.h"
 #include "tensors/tensor_base.h"
 #include "tensors/tensor_factory.h"
 #include <memory>

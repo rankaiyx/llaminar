@@ -1,5 +1,5 @@
 /**
- * @file rmsnorm_t5.h
+ * @file RmsnormT5.h
  * @brief T5-style RMSNorm implementation matching HuggingFace Transformers exactly
  * @author David Sanftenberg
  */

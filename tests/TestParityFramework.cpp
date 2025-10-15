@@ -1,5 +1,5 @@
 /**
- * @file test_parity_framework.cpp
+ * @file TestParityFramework.cpp
  * @brief Parity test framework for comparing Llaminar with llama.cpp and PyTorch
  * @author David Sanftenberg
  *
@@ -9,19 +9,19 @@
  * The framework is designed to be extensible to other model architectures.
  */
 
-#include "parity_test_framework.h"
-#include "npz_loader.h"
-#include "qwen_pipeline_adapter.h"
-#include "qwen_pipeline.h"
-#include "model_loader.h"
-#include "model_weights_provider.h"
-#include "weight_verifier.h"
+#include "ParityTestFramework.h"
+#include "NpzLoader.h"
+#include "QwenPipelineAdapter.h"
+#include "QwenPipeline.h"
+#include "ModelLoader.h"
+#include "ModelWeightsProvider.h"
+#include "WeightVerifier.h"
 #include "logger.h"
-#include "test_timeout_guard.h"
-#include "abstract_pipeline.h"
-#include "pipeline_snapshot_manager.h"
-#include "cosma_prefill_manager.h"
-#include "dynamic_threshold_loader.h"
+#include "TestTimeoutGuard.h"
+#include "AbstractPipeline.h"
+#include "PipelineSnapshotManager.h"
+#include "CosmaPrefillManager.h"
+#include "DynamicThresholdLoader.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>

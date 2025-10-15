@@ -1,5 +1,5 @@
 /**
- * @file qwen_pipeline.cpp
+ * @file QwenPipeline.cpp
  * @brief Canonical implementation of the QwenPipeline class.
  * @author David Sanftenberg
  *
@@ -53,14 +53,14 @@
  * Production incremental decode remains unchanged and incurs no overhead.
  */
 
-#include "qwen_pipeline.h"
-#include "qwen_pipeline_adapter.h" // For QwenModelWeights
-#include "prefill_diagnostics.h"   // For baseline comparison and FFN tracing
-#include "prefill_provider.h"      // For PrefillProviderFactory
-#include "kv_cache_provider.h"     // For SimpleKVCacheProvider
-#include "model_loader.h"
-#include "weight_contracts.h" // For contract-driven weight loading
-#include "bias_contracts.h"   // For bias dimension validation
+#include "QwenPipeline.h"
+#include "QwenPipelineAdapter.h" // For QwenModelWeights
+#include "PrefillDiagnostics.h"   // For baseline comparison and FFN tracing
+#include "PrefillProvider.h"      // For PrefillProviderFactory
+#include "KvCacheProvider.h"     // For SimpleKVCacheProvider
+#include "ModelLoader.h"
+#include "WeightContracts.h" // For contract-driven weight loading
+#include "BiasContracts.h"   // For bias dimension validation
 #include "kernels/MPISwiGLUKernel.h"
 #include "kernels/MPIRoPEKernel.h"
 #include "kernels/MPIResidualKernel.h"
@@ -69,12 +69,12 @@
 #include "kernels/common/attention_primitives.h"
 #include "tensors/tensor_factory.h"
 #include "tensors/simple_tensor.h"
-#include "debug_utils.h"
-#include "performance_timer.h"
-#include "cosma_prefill_manager.h"
-#include "adaptive_matmul.h"
-#include "backend_selector.h"
-#include "matmul_backend_selection.h"
+#include "DebugUtils.h"
+#include "PerformanceTimer.h"
+#include "CosmaPrefillManager.h"
+#include "AdaptiveMatmul.h"
+#include "BackendSelector.h"
+#include "MatmulBackendSelection.h"
 using llaminar::BackendContext;
 using llaminar::BackendDecision;
 using llaminar::MatMulBackendDecision;

@@ -1,10 +1,10 @@
 /**
- * @file weight_verifier.cpp
+ * @file WeightVerifier.cpp
  * @brief Implementation of weight verification utility
  * @author David Sanftenberg
  */
 
-#include "weight_verifier.h"
+#include "WeightVerifier.h"
 #include "logger.h"
 #include <cmath>
 #include <sstream>

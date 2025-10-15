@@ -1,7 +1,7 @@
 #pragma once
 
-#include "tokenizer_interface.h"
-#include "bpe_processor.h"
+#include "TokenizerInterface.h"
+#include "BpeProcessor.h"
 #include "../model_loader.h"
 #include <unordered_map>
 #include <vector>

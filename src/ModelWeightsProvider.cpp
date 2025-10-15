@@ -1,10 +1,10 @@
 /**
- * @file model_weights_provider.cpp
+ * @file ModelWeightsProvider.cpp
  * @brief Implementation of MPI-aware model weights provider
  * @author David Sanftenberg
  */
 
-#include "model_weights_provider.h"
+#include "ModelWeightsProvider.h"
 #include "logger.h"
 #include <stdexcept>
 #include <sstream>

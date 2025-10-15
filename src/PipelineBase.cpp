@@ -1,8 +1,8 @@
-#include "pipeline_base.h"
-#include "debug_utils.h"
-#include "performance_timer.h"
+#include "PipelineBase.h"
+#include "DebugUtils.h"
+#include "PerformanceTimer.h"
 #include "utils/perf_counters.h"
-#include "parity_hooks.h"
+#include "ParityHooks.h"
 #include <chrono>
 #include <algorithm>
 #include <iomanip>

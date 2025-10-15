@@ -1,5 +1,5 @@
 /**
- * @file debug_env.h
+ * @file DebugEnv.h
  * @brief Unified registry for LLAMINAR_* and related debug / diagnostic environment flags.
  *
  * This central facility avoids ad-hoc std::getenv() calls spread across the codebase.

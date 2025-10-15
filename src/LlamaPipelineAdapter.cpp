@@ -1,11 +1,11 @@
 /**
- * @file llama_pipeline_adapter.cpp
+ * @file LlamaPipelineAdapter.cpp
  * @brief Llama pipeline adapter implementation.
  * @author David Sanftenberg
  */
-#include "llama_pipeline_adapter.h"
-#include "abstract_pipeline.h"
-#include "qwen_pipeline.h"
+#include "LlamaPipelineAdapter.h"
+#include "AbstractPipeline.h"
+#include "QwenPipeline.h"
 #include "logger.h"
 #include "utils/debug_env.h"
 

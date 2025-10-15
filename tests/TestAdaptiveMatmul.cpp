@@ -4,11 +4,11 @@
 // proper performance characteristics for different matrix operation sizes.
 
 #include <gtest/gtest.h>
-#include "test_timeout_guard.h"
+#include "TestTimeoutGuard.h"
 #include "../src/adaptive_matmul.h"
 #include "../src/adaptive_transformer_pipeline.h"
 #include "../src/transformer_config.h"
-#include "test_mpi_utils.h"
+#include "TestMpiUtils.h"
 #include <chrono>
 #include <vector>
 #include <random>

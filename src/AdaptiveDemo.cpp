@@ -3,9 +3,9 @@
 // This program demonstrates the hybrid OpenBLAS/COSMA architecture
 // in action, showing automatic backend selection for different operation types.
 
-#include "adaptive_matmul.h"
-#include "adaptive_transformer_pipeline.h"
-#include "transformer_config.h"
+#include "AdaptiveMatmul.h"
+#include "AdaptiveTransformerPipeline.h"
+#include "TransformerConfig.h"
 #include "logger.h"
 #include <mpi.h>
 #include <iostream>

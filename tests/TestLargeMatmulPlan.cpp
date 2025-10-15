@@ -1,12 +1,12 @@
 /**
- * @file test_large_matmul_plan.cpp
+ * @file TestLargeMatmulPlan.cpp
  * @brief Tests for LargeMatmulPlan and plan_attention_prefill.
  * @author David Sanftenberg
  */
 
 #include <gtest/gtest.h>
-#include "large_matmul_plan.h"
-#include "transformer_config.h"
+#include "LargeMatmulPlan.h"
+#include "TransformerConfig.h"
 #include <cstdlib>
 
 using namespace llaminar;

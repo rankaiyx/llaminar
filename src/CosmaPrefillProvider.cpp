@@ -1,5 +1,5 @@
 /**
- * @file cosma_prefill_provider.cpp
+ * @file CosmaPrefillProvider.cpp
  * @brief COSMA-based prefill provider implementation
  * @author David Sanftenberg
  *
@@ -22,18 +22,18 @@
  * - executeAttentionBlock(): ~50 lines (uses MPIAttentionKernel with COSMA backend)
  */
 
-#include "cosma_prefill_provider.h"
-#include "qwen_pipeline_adapter.h"
+#include "CosmaPrefillProvider.h"
+#include "QwenPipelineAdapter.h"
 #include "kernels/MPIRMSNormKernel.h"
 #include "kernels/MPIAttentionKernel.h"
 #include "kernels/MPISwiGLUKernel.h"
 #include "kernels/MPIResidualKernel.h"
 #include "kernels/common/attention_primitives.h"
 #include "tensors/tensor_factory.h"
-#include "adaptive_matmul.h"
-#include "backend_selector.h"
+#include "AdaptiveMatmul.h"
+#include "BackendSelector.h"
 #include "logger.h"
-#include "performance_timer.h"
+#include "PerformanceTimer.h"
 #include <chrono>
 #include <cstring>
 #include <cmath>

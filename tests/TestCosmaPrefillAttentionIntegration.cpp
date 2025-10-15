@@ -14,7 +14,7 @@
 #include <cstdio>
 #include <tuple>
 #include <sstream>
-#include "test_timeout_guard.h"
+#include "TestTimeoutGuard.h"
 
 using namespace llaminar;
 

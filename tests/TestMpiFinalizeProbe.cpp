@@ -1,4 +1,4 @@
-#include "test_mpi_utils.h"
+#include "TestMpiUtils.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <chrono>

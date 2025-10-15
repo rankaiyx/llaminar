@@ -1,5 +1,5 @@
 /**
- * @file tp_generic_matmul_executor.h
+ * @file TpGenericMatmulExecutor.h
  * @brief Generic tensor-parallel matmul executor abstraction (row or column split) with reconstruction helpers.
  *
  * This generalizes the specialized TPOutputProjectionExecutor so FFN / projection kernels can share
@@ -15,7 +15,7 @@
  */
 #pragma once
 
-#include "tp_partition.h"
+#include "TpPartition.h"
 #include "../logger.h" // for LOG_DEBUG
 #include <chrono>
 #include <functional>

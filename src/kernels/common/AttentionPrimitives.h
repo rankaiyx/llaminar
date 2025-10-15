@@ -1,5 +1,5 @@
 /**
- * @file attention_primitives.h
+ * @file AttentionPrimitives.h
  * @brief Low-level scalar attention building blocks (layout-compatible with MPIAttentionKernel).
  *
  * Layout Assumptions:

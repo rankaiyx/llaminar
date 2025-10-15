@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tokenizer_interface.h"
+#include "TokenizerInterface.h"
 #include "../argument_parser.h"
 #include "../abstract_pipeline.h"
 #include "../qwen_pipeline_adapter.h" // for QwenModelWeights definition (inherits IModelWeights)

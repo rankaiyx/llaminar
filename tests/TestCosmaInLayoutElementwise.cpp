@@ -1,4 +1,4 @@
-#include "cosma_prefill_manager.h"
+#include "CosmaPrefillManager.h"
 #include <gtest/gtest.h>
 #include <random>
 #include <cmath>

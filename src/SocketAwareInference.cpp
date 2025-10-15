@@ -1,4 +1,4 @@
-#include "socket_aware_inference.h"
+#include "SocketAwareInference.h"
 #include "logger.h"
 #include "tensors/tensor_base.h"
 #include <numa.h>

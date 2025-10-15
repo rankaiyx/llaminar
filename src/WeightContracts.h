@@ -1,5 +1,5 @@
 /**
- * @file weight_contracts.h
+ * @file WeightContracts.h
  * @brief Weight dimension and orientation contracts for model loading.
  *
  * This system validates that model weights loaded from GGUF (or other formats)
@@ -12,7 +12,7 @@
 #pragma once
 
 #include "tensors/tensor_base.h"
-#include "transformer_config.h"
+#include "TransformerConfig.h"
 #include "logger.h"
 #include <string>
 #include <vector>

@@ -9,16 +9,16 @@
 #include <chrono>
 #include <sstream>
 
-#include "argument_parser.h"
+#include "ArgumentParser.h"
 #include "logger.h"
-#include "topology_manager.h"
-#include "model_loader.h"
-#include "mpi_context.h"
-#include "qwen_pipeline.h" // QwenPipeline (implements AbstractPipeline)
-#include "abstract_pipeline.h"
-#include "qwen_pipeline_adapter.h"
-#include "llama_pipeline_adapter.h"
-#include "performance_timer.h"
+#include "TopologyManager.h"
+#include "ModelLoader.h"
+#include "MpiContext.h"
+#include "QwenPipeline.h" // QwenPipeline (implements AbstractPipeline)
+#include "AbstractPipeline.h"
+#include "QwenPipelineAdapter.h"
+#include "LlamaPipelineAdapter.h"
+#include "PerformanceTimer.h"
 #include "utils/debug_env.h"
 #include "utils/perf_counters.h"
 #include "tensors/tensor_factory.h"

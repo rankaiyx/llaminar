@@ -1,6 +1,6 @@
 #pragma once
 /**
- * @file test_reference_impls.h
+ * @file TestReferenceImpls.h
  * @brief Scalar / naive reference implementations for kernel parity tests.
  */
 #include <vector>

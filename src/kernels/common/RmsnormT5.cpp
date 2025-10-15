@@ -1,5 +1,5 @@
 /**
- * @file rmsnorm_t5.cpp
+ * @file RmsnormT5.cpp
  * @brief T5-style RMSNorm implementation matching HuggingFace Transformers exactly
  * @author David Sanftenberg
  *
@@ -8,7 +8,7 @@
  * hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
  * return self.weight * hidden_states
  */
-#include "rmsnorm_t5.h"
+#include "RmsnormT5.h"
 #include <cmath>
 #include <algorithm>
 #include "../../logger.h"

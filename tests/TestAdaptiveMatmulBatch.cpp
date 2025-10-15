@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "test_timeout_guard.h"
+#include "TestTimeoutGuard.h"
 #include "../src/adaptive_matmul.h"
 #include <mpi.h>
 #include <chrono>

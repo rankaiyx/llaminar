@@ -1,9 +1,9 @@
 /**
- * @file softmax_core.cpp
+ * @file SoftmaxCore.cpp
  * @brief Implementation of unified softmax primitives
  * @author David Sanftenberg
  */
-#include "softmax_core.h"
+#include "SoftmaxCore.h"
 
 #include <algorithm>
 #include <cmath>

@@ -1,5 +1,5 @@
 /**
- * @file shard_spec.h
+ * @file ShardSpec.h
  * @brief Metadata definition for tensor sharding (hidden/head partitions).
  */
 #pragma once

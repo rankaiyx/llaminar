@@ -98,7 +98,7 @@
  * proven primitives from OpenBLAS execution path instead.
  */
 
-#include "cosma_prefill_manager.h"
+#include "CosmaPrefillManager.h"
 #include "logger.h"
 #include "utils/debug_env.h"
 #include "utils/perf_counters.h"

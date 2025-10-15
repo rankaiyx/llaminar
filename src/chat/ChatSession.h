@@ -1,7 +1,7 @@
 #pragma once
 
-#include "chat_message.h"
-#include "tokenizer_interface.h"
+#include "ChatMessage.h"
+#include "TokenizerInterface.h"
 #include "../argument_parser.h"
 #include <vector>
 #include <memory>

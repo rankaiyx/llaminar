@@ -1,5 +1,5 @@
 /**
- * @file softmax_core.h
+ * @file SoftmaxCore.h
  * @brief Unified row-major and (future) distributed softmax primitives.
  * @author David Sanftenberg
  */

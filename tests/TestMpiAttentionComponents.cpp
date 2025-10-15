@@ -1,5 +1,5 @@
 /**
- * @file test_mpi_attention_components.cpp
+ * @file TestMpiAttentionComponents.cpp
  * @brief Comprehensive unit tests for MPIAttentionKernel and its components
  * @author David Sanftenberg
  *

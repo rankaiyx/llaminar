@@ -1,6 +1,6 @@
-#include "debug_env.h"
+#include "DebugEnv.h"
 #include "logger.h"
-#include "topology_manager.h"
+#include "TopologyManager.h"
 #include <omp.h>
 #include <sched.h>
 #include <unistd.h>

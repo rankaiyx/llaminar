@@ -3,7 +3,7 @@
 #include <vector>
 #include <memory>
 #include <mpi.h>
-#include "topology_manager.h"
+#include "TopologyManager.h"
 #include "tensors/tensor_base.h"
 
 namespace llaminar

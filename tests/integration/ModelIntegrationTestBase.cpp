@@ -1,13 +1,13 @@
 /**
- * @file model_integration_test_base.cpp
+ * @file ModelIntegrationTestBase.cpp
  * @brief Implementation of base model integration test framework
  * @author David Sanftenberg
  */
 
-#include "model_integration_test_base.h"
-#include "abstract_pipeline.h"
-#include "model_loader.h"
-#include "qwen_pipeline_adapter.h"
+#include "ModelIntegrationTestBase.h"
+#include "AbstractPipeline.h"
+#include "ModelLoader.h"
+#include "QwenPipelineAdapter.h"
 #include "logger.h"
 #include <fstream>
 #include <cmath>

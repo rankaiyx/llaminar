@@ -1,5 +1,5 @@
 /**
- * @file openblas_prefill_provider.h
+ * @file OpenblasPrefillProvider.h
  * @brief OpenBLAS-based prefill provider using Template Method pattern
  * @author David Sanftenberg
  *
@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "prefill_provider_base_impl.h"
+#include "PrefillProviderBaseImpl.h"
 #include <memory>
 #include <vector>
 

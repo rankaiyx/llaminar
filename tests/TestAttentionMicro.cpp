@@ -1,9 +1,9 @@
-#include "test_tensor_utils.h"
-#include "test_reference_impls.h"
-#include "test_timeout_guard.h"
+#include "TestTensorUtils.h"
+#include "TestReferenceImpls.h"
+#include "TestTimeoutGuard.h"
 #include "kernels/MPIAttentionKernel.h"
 #include "tensors/tensor_factory.h"
-#include "test_mpi_utils.h"
+#include "TestMpiUtils.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <vector>

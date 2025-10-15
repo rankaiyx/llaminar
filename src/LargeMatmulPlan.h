@@ -1,5 +1,5 @@
 /**
- * @file large_matmul_plan.h
+ * @file LargeMatmulPlan.h
  * @brief Encapsulates COSMA prefill planning and validation.
  * @author David Sanftenberg
  *
@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include "transformer_config.h"
+#include "TransformerConfig.h"
 #include "utils/debug_env.h"
 #include "logger.h"
 #include <string>

@@ -1,8 +1,8 @@
-#include "test_timeout_guard.h"
+#include "TestTimeoutGuard.h"
 #include "kernels/MPILinearKernel.h"
 #include "tensors/tensor_factory.h"
 #include <gtest/gtest.h>
-#include "test_mpi_utils.h"
+#include "TestMpiUtils.h"
 #include <chrono>
 #include <memory>
 #include <random>

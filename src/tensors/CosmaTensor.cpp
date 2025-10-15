@@ -1,4 +1,4 @@
-#include "cosma_tensor.h"
+#include "CosmaTensor.h"
 #include "logger.h"
 #include <mpi.h>
 

@@ -1,11 +1,11 @@
 /**
- * @file sharded_simple_tensor.h
+ * @file ShardedSimpleTensor.h
  * @brief Simple in-memory tensor carrying a ShardSpec.
  */
 #pragma once
 
-#include "simple_tensor.h"
-#include "shard_spec.h"
+#include "SimpleTensor.h"
+#include "ShardSpec.h"
 #include <memory>
 
 namespace llaminar

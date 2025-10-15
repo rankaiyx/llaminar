@@ -9,7 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include "kernels/common/softmax_core.h"
-#include "test_mpi_utils.h" // for LLAMINAR_DEFINE_GTEST_MPI_MAIN and MPIEnvironment
+#include "TestMpiUtils.h" // for LLAMINAR_DEFINE_GTEST_MPI_MAIN and MPIEnvironment
 
 using namespace llaminar::kernels;
 

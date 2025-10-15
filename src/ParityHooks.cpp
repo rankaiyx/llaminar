@@ -1,5 +1,5 @@
 /**
- * @file parity_hooks.cpp
+ * @file ParityHooks.cpp
  * @brief Default no-op implementation of parity hooks (production build)
  * @author David Sanftenberg
  *
@@ -13,7 +13,7 @@
  * - Tests get full functionality by linking parity framework
  */
 
-#include "parity_hooks.h"
+#include "ParityHooks.h"
 #include <cstdlib>
 
 namespace llaminar

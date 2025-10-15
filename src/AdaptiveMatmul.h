@@ -28,14 +28,14 @@
 #include <cosma/matrix.hpp>
 #include <cosma/strategy.hpp>
 #include <cosma/context.hpp>
-#include "cosma_prefill_manager.h"
+#include "CosmaPrefillManager.h"
 #include "utils/debug_env.h"     // Added for centralized debug environment access (debugEnv())
 #include "utils/perf_counters.h" // performance instrumentation
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-#include "matmul_backend_selection.h" // For MatMulBackend enum and MatMulBackendSelector
+#include "MatmulBackendSelection.h" // For MatMulBackend enum and MatMulBackendSelector
 
 namespace llaminar
 {

@@ -1,5 +1,5 @@
 /**
- * @file test_prefill_providers.cpp
+ * @file TestPrefillProviders.cpp
  * @brief Isolated unit tests for PrefillProvider implementations
  * @author David Sanftenberg
  *
@@ -15,13 +15,13 @@
  * Instead, they validate internal consistency, API contracts, and basic correctness.
  */
 
-#include "prefill_provider.h"
-#include "openblas_prefill_provider.h"
-#include "cosma_prefill_provider.h"
-#include "qwen_pipeline_adapter.h"
-#include "model_loader.h"
+#include "PrefillProvider.h"
+#include "OpenblasPrefillProvider.h"
+#include "CosmaPrefillProvider.h"
+#include "QwenPipelineAdapter.h"
+#include "ModelLoader.h"
 #include "logger.h"
-#include "pipeline_snapshot_manager.h"
+#include "PipelineSnapshotManager.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>

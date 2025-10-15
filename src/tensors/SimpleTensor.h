@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tensor_base.h"
+#include "TensorBase.h"
 #include "../logger.h"
 #include <vector>
 #include <algorithm>

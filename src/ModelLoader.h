@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * @file model_loader.h
+ * @file ModelLoader.h
  * @brief GGUF Model Loader - Quantized Model Loading, Dequantization, and Weight Distribution
  * @author David Sanftenberg
  *
@@ -176,7 +176,7 @@
 
 #include "common.h"
 #include "tensors/tensor_base.h"
-#include "transformer_config.h"
+#include "TransformerConfig.h"
 #include <string>
 #include <vector>
 #include <memory>

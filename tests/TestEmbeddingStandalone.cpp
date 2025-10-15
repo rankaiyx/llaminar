@@ -1,5 +1,5 @@
 /**
- * @file test_embedding_standalone.cpp
+ * @file TestEmbeddingStandalone.cpp
  * @brief Minimal standalone test for embedding layer correctness
  * @author David Sanftenberg
  *
@@ -17,12 +17,12 @@
 #include <memory>
 #include <vector>
 #include <cmath>
-#include "model_loader.h"
+#include "ModelLoader.h"
 #include "tensors/tensor_factory.h"
-#include "parity_test_framework.h"
-#include "abstract_pipeline.h"
-#include "qwen_pipeline_adapter.h"
-#include "pipeline_snapshot_manager.h"
+#include "ParityTestFramework.h"
+#include "AbstractPipeline.h"
+#include "QwenPipelineAdapter.h"
+#include "PipelineSnapshotManager.h"
 #include "logger.h"
 
 namespace llaminar

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "model_loader.h"
+#include "ModelLoader.h"
 #include <fstream>
 #include <cstdlib>
 #include <sys/stat.h>

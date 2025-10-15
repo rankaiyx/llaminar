@@ -1,5 +1,5 @@
 /**
- * @file parity_hooks.h
+ * @file ParityHooks.h
  * @brief Parity testing snapshot capture hooks (production-safe interface)
  * @author David Sanftenberg
  *
@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "pipeline_stages.h"
+#include "PipelineStages.h"
 #include <string>
 
 namespace llaminar

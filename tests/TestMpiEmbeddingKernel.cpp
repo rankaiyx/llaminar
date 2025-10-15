@@ -1,7 +1,7 @@
 #include "kernels/MPIEmbeddingKernel.h"
 #include "tensors/tensor_factory.h"
-#include "test_timeout_guard.h"
-#include "test_mpi_utils.h"
+#include "TestTimeoutGuard.h"
+#include "TestMpiUtils.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <random>

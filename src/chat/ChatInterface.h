@@ -1,7 +1,7 @@
 #pragma once
 
-#include "chat_session.h"
-#include "response_generator.h"
+#include "ChatSession.h"
+#include "ResponseGenerator.h"
 #include "../argument_parser.h"
 #include "../abstract_pipeline.h"
 #include <memory>

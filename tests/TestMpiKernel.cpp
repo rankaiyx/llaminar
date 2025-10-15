@@ -1,5 +1,5 @@
-#include "test_timeout_guard.h"
-#include "mpi_kernel_base.h"
+#include "TestTimeoutGuard.h"
+#include "MpiKernelBase.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <chrono>

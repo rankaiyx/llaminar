@@ -1,5 +1,5 @@
 /**
- * @file openblas_prefill_provider.cpp
+ * @file OpenblasPrefillProvider.cpp
  * @brief OpenBLAS-based prefill provider implementation
  * @author David Sanftenberg
  *
@@ -23,8 +23,8 @@
  * - setKVCache(): ~10 lines
  */
 
-#include "openblas_prefill_provider.h"
-#include "qwen_pipeline_adapter.h"
+#include "OpenblasPrefillProvider.h"
+#include "QwenPipelineAdapter.h"
 #include "kernels/MPILinearKernel.h"
 #include "kernels/MPIRMSNormKernel.h"
 #include "kernels/MPIAttentionKernel.h"
@@ -33,7 +33,7 @@
 #include "kernels/MPIResidualKernel.h"
 #include "tensors/tensor_factory.h"
 #include "logger.h"
-#include "performance_timer.h"
+#include "PerformanceTimer.h"
 #include <chrono>
 #include <cstring>
 

@@ -7,7 +7,7 @@
 #include <string>
 #include <memory>
 #include <cstdint>
-#include "device_kind.h"
+#include "DeviceKind.h"
 
 namespace llaminar
 {

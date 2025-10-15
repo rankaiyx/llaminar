@@ -1,5 +1,5 @@
 /**
- * @file backend_selector.h
+ * @file BackendSelector.h
  * @brief Centralized matmul / attention backend selection for prefill vs decode stages.
  */
 #pragma once

@@ -9,7 +9,7 @@
 #include <cstring>
 #include <cmath>
 #include <string>
-#include "model_loader.h"
+#include "ModelLoader.h"
 
 using namespace llaminar;
 

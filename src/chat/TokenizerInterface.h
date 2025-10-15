@@ -1,6 +1,6 @@
 #pragma once
 
-#include "chat_message.h"
+#include "ChatMessage.h"
 #include "../model_loader.h"
 #include <string>
 #include <vector>

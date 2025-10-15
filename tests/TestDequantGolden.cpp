@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
-#include "model_loader.h"
+#include "ModelLoader.h"
 
 extern "C"
 {

@@ -1,5 +1,5 @@
 /**
- * @file model_integration_test_base.h
+ * @file ModelIntegrationTestBase.h
  * @brief Base class for model integration tests with PyTorch layer-by-layer parity
  * @author David Sanftenberg
  *
@@ -15,8 +15,8 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
-#include "parity_test_framework.h"
-#include "abstract_pipeline.h"
+#include "ParityTestFramework.h"
+#include "AbstractPipeline.h"
 
 namespace llaminar
 {

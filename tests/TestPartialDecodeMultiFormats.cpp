@@ -9,7 +9,7 @@
 #include <vector>
 #include <string>
 #include <limits>
-#include "model_loader.h"
+#include "ModelLoader.h"
 
 using namespace llaminar;
 

@@ -1,12 +1,12 @@
 /**
- * @file distributed_tensor_view.h
+ * @file DistributedTensorView.h
  * @brief Lightweight non-owning view that associates a TensorBase with sharding metadata.
  */
 #pragma once
 
-#include "tensor_base.h"
-#include "sharded_simple_tensor.h"
-#include "shard_spec.h"
+#include "TensorBase.h"
+#include "ShardedSimpleTensor.h"
+#include "ShardSpec.h"
 #include <memory>
 
 namespace llaminar

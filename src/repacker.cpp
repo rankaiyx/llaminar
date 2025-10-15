@@ -1,7 +1,7 @@
 #include "repacker.h"
 #include "tensors/tensor_base.h"
 #include "tensors/tensor_factory.h"
-#include "quant_dequant.h" // For proper Q4_0/Q8_0 dequantization matching llama.cpp
+#include "QuantDequant.h" // For proper Q4_0/Q8_0 dequantization matching llama.cpp
 #include <iostream>
 #include <algorithm>
 #include <numeric>

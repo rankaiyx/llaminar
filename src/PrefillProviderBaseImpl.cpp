@@ -1,17 +1,17 @@
 /**
- * @file prefill_provider_base_impl.cpp
+ * @file PrefillProviderBaseImpl.cpp
  * @brief Implementation of shared prefill execution logic
  * @author David Sanftenberg
  */
 
-#include "prefill_provider_base_impl.h"
-#include "qwen_pipeline_adapter.h"
+#include "PrefillProviderBaseImpl.h"
+#include "QwenPipelineAdapter.h"
 #include "kernels/MPIRMSNormKernel.h"
 #include "kernels/MPISwiGLUKernel.h"
 #include "kernels/MPIResidualKernel.h"
 #include "tensors/tensor_factory.h"
 #include "logger.h"
-#include "performance_timer.h"
+#include "PerformanceTimer.h"
 #include <chrono>
 #include <cstring>
 

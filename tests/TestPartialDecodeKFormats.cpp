@@ -8,7 +8,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include "model_loader.h"
+#include "ModelLoader.h"
 
 using namespace llaminar;
 

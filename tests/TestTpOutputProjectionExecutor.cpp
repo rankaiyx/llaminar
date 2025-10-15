@@ -1,4 +1,4 @@
-// @file test_tp_output_projection_executor.cpp
+// @file TestTpOutputProjectionExecutor.cpp
 #include "../src/tensors/tp_output_projection_executor.h"
 #include "../src/backends/inference_backend.h"
 #include "../src/backends/prefill_backend.h"

@@ -1,5 +1,5 @@
 /**
- * @file prefill_provider.h
+ * @file PrefillProvider.h
  * @brief Abstract prefill execution provider with built-in snapshot capture
  * @author David Sanftenberg
  *
@@ -27,12 +27,12 @@
 
 #pragma once
 
-#include "abstract_pipeline.h"
-#include "pipeline_stages.h"
-#include "transformer_config.h"
+#include "AbstractPipeline.h"
+#include "PipelineStages.h"
+#include "TransformerConfig.h"
 #include "tensors/tensor_base.h"
-#include "mpi_context.h"
-#include "kv_cache_provider.h"
+#include "MpiContext.h"
+#include "KvCacheProvider.h"
 #include <memory>
 #include <vector>
 #include <string>

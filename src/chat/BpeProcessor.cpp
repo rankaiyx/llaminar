@@ -1,4 +1,4 @@
-#include "bpe_processor.h"
+#include "BpeProcessor.h"
 #include "../logger.h"
 #include <regex>
 #include <algorithm>

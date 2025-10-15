@@ -1,5 +1,5 @@
 /**
- * @file bias_contracts.h
+ * @file BiasContracts.h
  * @brief Lightweight bias dimension validation system
  *
  * This file provides a simple contract-based validation system for bias tensors.

@@ -17,7 +17,7 @@
 #include <mpi.h>
 
 #include "logger.h"
-#include "model_loader.h"
+#include "ModelLoader.h"
 
 using namespace llaminar;
 

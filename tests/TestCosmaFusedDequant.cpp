@@ -1,5 +1,5 @@
-#include "cosma_prefill_manager.h"
-#include "quant_dequant.h"
+#include "CosmaPrefillManager.h"
+#include "QuantDequant.h"
 #include <gtest/gtest.h>
 #include <random>
 

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 #include <limits>
-#include "debug_env.h"
+#include "DebugEnv.h"
 
 namespace llaminar
 {

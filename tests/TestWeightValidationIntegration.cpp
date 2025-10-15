@@ -1,12 +1,12 @@
 /**
- * @file test_weight_validation_integration.cpp
+ * @file TestWeightValidationIntegration.cpp
  * @brief Integration test for weight contract validation with real GGUF models
  * @author David Sanftenberg
  */
 
 #include <gtest/gtest.h>
-#include "weight_contracts.h"
-#include "transformer_config.h"
+#include "WeightContracts.h"
+#include "TransformerConfig.h"
 #include "tensors/tensor_factory.h"
 #include <filesystem>
 #include <stdexcept>

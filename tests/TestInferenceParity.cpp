@@ -1,5 +1,5 @@
 /**
- * @file test_inference_parity.cpp
+ * @file TestInferenceParity.cpp
  * @brief Test inference parity between Llaminar and PyTorch for real prompts
  * @author David Sanftenberg
  *
@@ -14,13 +14,13 @@
 #include <mpi.h>
 #include <omp.h>
 
-#include "qwen_pipeline.h"
-#include "qwen_pipeline_adapter.h"
-#include "model_loader.h"
+#include "QwenPipeline.h"
+#include "QwenPipelineAdapter.h"
+#include "ModelLoader.h"
 #include "chat/gguf_tokenizer.h"
 #include "chat/tokenizer_interface.h"
 #include "chat/response_generator.h"
-#include "argument_parser.h"
+#include "ArgumentParser.h"
 #include "logger.h"
 
 #include <filesystem>
@@ -45,13 +45,13 @@ namespace fs = std::filesystem;
 #include <gtest/gtest.h>
 #include <mpi.h>
 
-#include "qwen_pipeline.h"
-#include "qwen_pipeline_adapter.h"
-#include "model_loader.h"
+#include "QwenPipeline.h"
+#include "QwenPipelineAdapter.h"
+#include "ModelLoader.h"
 #include "chat/gguf_tokenizer.h"
 #include "chat/tokenizer_interface.h"
 #include "chat/response_generator.h"
-#include "argument_parser.h"
+#include "ArgumentParser.h"
 #include "logger.h"
 
 #include <filesystem>

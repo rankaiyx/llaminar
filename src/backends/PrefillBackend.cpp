@@ -1,7 +1,7 @@
 // Implementation of prefill backend abstraction (CPU-only functional now)
 // Author: David Sanftenberg
 
-#include "prefill_backend.h"
+#include "PrefillBackend.h"
 #include "../adaptive_matmul.h"
 #include "../logger.h"
 #include "../utils/debug_env.h"

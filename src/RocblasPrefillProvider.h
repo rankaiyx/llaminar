@@ -1,5 +1,5 @@
 /**
- * @file rocblas_prefill_provider.h
+ * @file RocblasPrefillProvider.h
  * @brief ROCm/hipBLAS GPU-accelerated prefill provider for AMD GPUs (STUB)
  * @author David Sanftenberg
  *
@@ -32,7 +32,7 @@
 
 #pragma once
 
-#include "prefill_provider_base_impl.h"
+#include "PrefillProviderBaseImpl.h"
 #include <memory>
 #include <vector>
 

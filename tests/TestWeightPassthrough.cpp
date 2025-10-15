@@ -1,5 +1,5 @@
 /**
- * @file test_weight_passthrough.cpp
+ * @file TestWeightPassthrough.cpp
  * @brief Test to verify weights pass through intact from dequantizer to attention kernel
  *
  * This test verifies that:
@@ -17,8 +17,8 @@
 #include <numeric>
 #include <filesystem>
 
-#include "model_loader.h"
-#include "transformer_config.h"
+#include "ModelLoader.h"
+#include "TransformerConfig.h"
 #include "kernels/MPIAttentionKernel.h"
 #include "tensors/tensor_factory.h"
 #include "logger.h"

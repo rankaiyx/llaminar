@@ -1,5 +1,5 @@
 /**
- * @file prefill_diagnostics.cpp
+ * @file PrefillDiagnostics.cpp
  * @brief Implementation of prefill diagnostics helpers.
  * @author David Sanftenberg
  *
@@ -7,8 +7,8 @@
  * Preserves all existing log tags and behavior.
  */
 
-#include "prefill_diagnostics.h"
-#include "debug_utils.h"
+#include "PrefillDiagnostics.h"
+#include "DebugUtils.h"
 #include "utils/debug_env.h"
 #include "logger.h"
 #include <algorithm>

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common.h"
-#include "model_loader.h"
+#include "ModelLoader.h"
 #include "tensors/tensor_base.h"
 #include <memory>
 #include <vector>

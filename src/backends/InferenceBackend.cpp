@@ -1,8 +1,8 @@
 // Implementation of inference backend abstraction (CPU only now)
 // Author: David Sanftenberg
 
-#include "inference_backend.h"
-#include "prefill_backend.h" // reuse DeviceKind enum include
+#include "InferenceBackend.h"
+#include "PrefillBackend.h" // reuse DeviceKind enum include
 #include "../adaptive_matmul.h"
 #include "../logger.h"
 

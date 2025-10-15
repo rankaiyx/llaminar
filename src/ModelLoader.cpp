@@ -1,5 +1,5 @@
 /**
- * @file model_loader.cpp
+ * @file ModelLoader.cpp
  * @brief GGUF model loader with optimized tensor dequantization and MPI weight slicing
  * @author David Sanftenberg
  *
@@ -26,9 +26,9 @@
 // =============================================================================
 // INCLUDES
 // =============================================================================
-#include "model_loader.h"
+#include "ModelLoader.h"
 #include "logger.h"
-#include "quant_dequant.h"
+#include "QuantDequant.h"
 #include "weights/weight_roles.h"
 #include "../llama.cpp/ggml/src/ggml-quants.h" // Upstream dequantize_row_q* functions
 #include <cstring>

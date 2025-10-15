@@ -3,7 +3,7 @@
 #include "../src/logger.h"
 #include <cblas.h>
 // NOTE: Direct MPI include replaced by shared test utilities.
-#include "test_mpi_utils.h"
+#include "TestMpiUtils.h"
 #include <random>
 #include <vector>
 #include <cmath>

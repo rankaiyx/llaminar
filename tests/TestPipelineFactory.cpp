@@ -1,13 +1,13 @@
 /**
- * @file test_pipeline_factory.cpp
+ * @file TestPipelineFactory.cpp
  * @brief Tests for multi-architecture PipelineFactory.
  * @author David Sanftenberg
  */
 #include <gtest/gtest.h>
-#include "abstract_pipeline.h"
-#include "llama_pipeline_adapter.h"
-#include "qwen_pipeline_adapter.h"
-#include "transformer_config.h"
+#include "AbstractPipeline.h"
+#include "LlamaPipelineAdapter.h"
+#include "QwenPipelineAdapter.h"
+#include "TransformerConfig.h"
 
 using namespace llaminar;
 

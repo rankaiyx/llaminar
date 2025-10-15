@@ -1,9 +1,9 @@
 #pragma once
 
-#include "mpi_kernel_base.h"
+#include "MpiKernelBase.h"
 #include "tensors/tensor_factory.h"
-#include "pipeline_stages.h"
-#include "abstract_pipeline.h"
+#include "PipelineStages.h"
+#include "AbstractPipeline.h"
 #include <unordered_map>
 #include <string>
 #include <memory>

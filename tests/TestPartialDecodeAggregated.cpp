@@ -11,7 +11,7 @@
 #include <string>
 #include <unordered_set>
 #include <cmath>
-#include "model_loader.h"
+#include "ModelLoader.h"
 
 using namespace llaminar;
 

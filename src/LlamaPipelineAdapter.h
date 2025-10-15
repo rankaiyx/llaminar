@@ -1,5 +1,5 @@
 /**
- * @file llama_pipeline_adapter.h
+ * @file LlamaPipelineAdapter.h
  * @brief Adapter wrapping DistributedTransformerPipeline for Llama models.
  * @author David Sanftenberg
  *
@@ -14,8 +14,8 @@
  */
 #pragma once
 
-#include "abstract_pipeline.h"
-#include "qwen_pipeline.h"
+#include "AbstractPipeline.h"
+#include "QwenPipeline.h"
 #include <memory>
 
 namespace llaminar

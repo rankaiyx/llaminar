@@ -1,11 +1,11 @@
 /**
- * @file matmul_backend_selection.cpp
+ * @file MatmulBackendSelection.cpp
  * @brief Implementation of centralized backend selection logic.
  * @author David Sanftenberg
  */
 
-#include "matmul_backend_selection.h"
-#include "cosma_prefill_manager.h"
+#include "MatmulBackendSelection.h"
+#include "CosmaPrefillManager.h"
 #include <sstream>
 
 namespace llaminar

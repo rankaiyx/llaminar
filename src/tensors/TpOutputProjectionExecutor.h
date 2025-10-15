@@ -1,10 +1,10 @@
 /**
- * @file tp_output_projection_executor.h
+ * @file TpOutputProjectionExecutor.h
  * @brief Tensor-parallel (intra-socket) output projection executors (column & row) with reconstruction helpers.
  */
 #pragma once
 
-#include "tp_partition.h"
+#include "TpPartition.h"
 #include <vector>
 #include <functional>
 #include <cassert>

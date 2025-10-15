@@ -1,11 +1,11 @@
 /**
- * @file parity_test_framework.cpp
+ * @file ParityTestFramework.cpp
  * @brief Implementation of the parity test framework
  * @author David Sanftenberg
  */
 
-#include "parity_test_framework.h"
-#include "npz_loader.h"
+#include "ParityTestFramework.h"
+#include "NpzLoader.h"
 #include "logger.h"
 #include <mpi.h>
 #include <iostream>

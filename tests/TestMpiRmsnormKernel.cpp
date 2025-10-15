@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
-#include "test_timeout_guard.h"
+#include "TestTimeoutGuard.h"
 #include "../src/kernels/MPIRMSNormKernel.h"
 #include "../src/tensors/tensor_factory.h"
 #include <memory>
 #include <chrono>
 #include <cmath>
 #include <random>
-#include "test_mpi_utils.h"
+#include "TestMpiUtils.h"
 
 using namespace llaminar;
 

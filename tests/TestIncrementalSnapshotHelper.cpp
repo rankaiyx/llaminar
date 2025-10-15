@@ -1,13 +1,13 @@
 /**
- * @file test_incremental_snapshot_helper.cpp
+ * @file TestIncrementalSnapshotHelper.cpp
  * @brief Quick test to verify IncrementalSnapshotHelper and .npy writer work correctly
  * @author David Sanftenberg
  */
 
-#include "parity_test_framework.h"
-#include "npz_loader.h"
+#include "ParityTestFramework.h"
+#include "NpzLoader.h"
 #include "logger.h"
-#include "pipeline_stages.h"
+#include "PipelineStages.h"
 #include <gtest/gtest.h>
 #include <vector>
 #include <cstdio>

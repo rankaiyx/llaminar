@@ -1,4 +1,4 @@
-#include "simple_tensor.h"
+#include "SimpleTensor.h"
 #include <stdexcept>
 #include <algorithm>
 

@@ -1,5 +1,5 @@
 /**
- * @file matmul_backend_selection.h
+ * @file MatmulBackendSelection.h
  * @brief Centralized backend selection for matrix multiplication operations.
  * @author David Sanftenberg
  *
@@ -10,8 +10,8 @@
 
 #pragma once
 
-#include "abstract_pipeline.h"
-#include "transformer_config.h"
+#include "AbstractPipeline.h"
+#include "TransformerConfig.h"
 #include "utils/debug_env.h"
 #include "logger.h"
 #include <string>

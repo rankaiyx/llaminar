@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tensor_base.h"
+#include "TensorBase.h"
 #include <cosma/matrix.hpp>
 #include <cosma/strategy.hpp>
 #include <cosma/context.hpp>

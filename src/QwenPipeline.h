@@ -3,10 +3,10 @@
 // New code must include qwen_pipeline.h directly.
 #pragma once
 
-#include "pipeline_base.h"
-#include "abstract_pipeline.h"
-#include "mpi_context.h"
-#include "large_matmul_plan.h"
+#include "PipelineBase.h"
+#include "AbstractPipeline.h"
+#include "MpiContext.h"
+#include "LargeMatmulPlan.h"
 
 // Forward declarations
 class ModelLoader;
@@ -16,8 +16,8 @@ class ModelLoader;
 #include "kernels/MPISwiGLUKernel.h"
 #include "kernels/MPIRoPEKernel.h"
 #include "kernels/MPIResidualKernel.h"
-#include "transformer_config.h"
-#include "model_loader.h"
+#include "TransformerConfig.h"
+#include "ModelLoader.h"
 #include "logger.h"
 #include <memory>
 #include <vector>

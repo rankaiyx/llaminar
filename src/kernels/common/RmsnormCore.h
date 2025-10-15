@@ -1,5 +1,5 @@
 /**
- * @file rmsnorm_core.h
+ * @file RmsnormCore.h
  * @brief Core (backend-agnostic) RMSNorm primitives used by both simple and MPI kernels.
  *
  * Centralizes the mathematical logic so higher-level kernels only provide

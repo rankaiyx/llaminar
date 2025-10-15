@@ -1,6 +1,6 @@
 #pragma once
 
-#include "log_level.h"
+#include "LogLevel.h"
 #include <iostream>
 #include <sstream>
 #include <string>

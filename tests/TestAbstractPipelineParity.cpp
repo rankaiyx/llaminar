@@ -7,11 +7,11 @@
 // Tolerance kept tight (1e-5) because computation order is identical.
 
 #include "gtest/gtest.h"
-#include "qwen_pipeline.h" // provides QwenPipeline & factory
-#include "abstract_pipeline.h"
+#include "QwenPipeline.h" // provides QwenPipeline & factory
+#include "AbstractPipeline.h"
 #include "tensors/tensor_factory.h"
 #include "logger.h"
-#include "test_mpi_utils.h"
+#include "TestMpiUtils.h"
 #include <random>
 #include <numeric>
 #include <cstdlib>

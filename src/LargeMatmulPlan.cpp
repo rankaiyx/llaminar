@@ -1,10 +1,10 @@
 /**
- * @file large_matmul_plan.cpp
+ * @file LargeMatmulPlan.cpp
  * @brief Implementation of COSMA prefill planning.
  * @author David Sanftenberg
  */
 
-#include "large_matmul_plan.h"
+#include "LargeMatmulPlan.h"
 #include "utils/debug_env.h"
 #include "logger.h"
 #include <cstdlib>

@@ -1,5 +1,5 @@
 /**
- * @file test_mpi_attention_real_weights.cpp
+ * @file TestMpiAttentionRealWeights.cpp
  * @brief Test MPIAttentionKernel with real GGUF model weights
  * @author David Sanftenberg
  *
@@ -11,7 +11,7 @@
 #include <mpi.h>
 #include <filesystem>
 #include "kernels/MPIAttentionKernel.h"
-#include "model_loader.h"
+#include "ModelLoader.h"
 #include "tensors/tensor_factory.h"
 #include "logger.h"
 

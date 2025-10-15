@@ -1,12 +1,12 @@
 /**
- * @file qwen_pipeline_adapter.h
+ * @file QwenPipelineAdapter.h
  * @brief Adapter wrapping DistributedTransformerPipeline behind AbstractPipeline interface.
  */
 #pragma once
 
-#include "abstract_pipeline.h"
-#include "qwen_pipeline.h"
-#include "weight_contracts.h"
+#include "AbstractPipeline.h"
+#include "QwenPipeline.h"
+#include "WeightContracts.h"
 #include <memory>
 
 namespace llaminar

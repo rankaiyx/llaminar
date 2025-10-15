@@ -1,11 +1,11 @@
 /**
- * @file mpi_slicing_helper.cpp
+ * @file MpiSlicingHelper.cpp
  * @brief Implementation of MPI-aware tensor loading with automatic dimension handling
  * @author David Sanftenberg
  * @date 2025-01-12
  */
 
-#include "mpi_slicing_helper.h"
+#include "MpiSlicingHelper.h"
 #include "logger.h"
 #include <stdexcept>
 #include <sstream>

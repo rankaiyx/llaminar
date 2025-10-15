@@ -1,9 +1,9 @@
-#include "qwen_pipeline.h" // QwenPipeline
+#include "QwenPipeline.h" // QwenPipeline
 #include "logger.h"
-#include "test_timeout_guard.h"
+#include "TestTimeoutGuard.h"
 #include "tensors/tensor_factory.h"
 #include <gtest/gtest.h>
-#include "test_mpi_utils.h"
+#include "TestMpiUtils.h"
 #include <random>
 #include <algorithm>
 #include <iomanip>

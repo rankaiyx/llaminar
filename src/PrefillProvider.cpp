@@ -1,13 +1,13 @@
 /**
- * @file prefill_provider.cpp
+ * @file PrefillProvider.cpp
  * @brief Implementation of PrefillProvider base class
  * @author David Sanftenberg
  */
 
-#include "prefill_provider.h"
-#include "openblas_prefill_provider.h"
-#include "cosma_prefill_provider.h"
-#include "pipeline_snapshot_manager.h"
+#include "PrefillProvider.h"
+#include "OpenblasPrefillProvider.h"
+#include "CosmaPrefillProvider.h"
+#include "PipelineSnapshotManager.h"
 #include "logger.h"
 #include "utils/debug_env.h"
 #include <cstdlib>
