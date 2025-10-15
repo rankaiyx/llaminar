@@ -378,22 +378,6 @@ for (size_t i = 0; i < local_work_size; ++i) {
 MPI_Allreduce(local_result, global_result, work_size, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
 ```
 
-### NUMA-Aware Deployment
-
-```cpp
-// Optimal MPI process distribution: 1 process per NUMA node
-// Example for 2-socket system:
-// mpirun -np 2 numactl --cpubind=0 ./llaminar : numactl --cpubind=1 ./llaminar
-
-// In code - detect and bind to NUMA node
-int numa_node = numa_node_of_cpu(sched_getcpu());
-numa_bind(numa_get_membind());
-
-// Configure OpenMP for NUMA locality
-int cores_per_numa = numa_num_configured_cpus() / numa_max_node();
-omp_set_num_threads(cores_per_numa);
-```
-
 ## Performance Optimization
 
 ### Threading Strategy

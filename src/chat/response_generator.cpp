@@ -16,7 +16,7 @@ namespace llaminar
         ResponseGenerator::ResponseGenerator(std::shared_ptr<TokenizerInterface> tokenizer,
                                              std::shared_ptr<AbstractPipeline> pipeline,
                                              const LlaminarParams &params)
-            : tokenizer_(std::move(tokenizer)), pipeline_(std::move(pipeline)), params_(params), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
+            : tokenizer_(std::move(tokenizer)), pipeline_(std::move(pipeline)), params_(params), temperature_(params.temperature >= 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
         {
             if (!pipeline_)
             {
@@ -41,7 +41,7 @@ namespace llaminar
                                              std::shared_ptr<AbstractPipeline> pipeline,
                                              const LlaminarParams &params,
                                              const QwenModelWeights &weights)
-            : tokenizer_(std::move(tokenizer)), pipeline_(std::move(pipeline)), params_(params), weights_(weights), have_weights_(true), temperature_(params.temperature > 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
+            : tokenizer_(std::move(tokenizer)), pipeline_(std::move(pipeline)), params_(params), weights_(weights), have_weights_(true), temperature_(params.temperature >= 0.0f ? params.temperature : 0.7f), top_k_(params.top_k > 0 ? params.top_k : 40), top_p_(params.top_p > 0.0f ? params.top_p : 0.9f), max_tokens_(params.n_predict > 0 ? params.n_predict : 128)
         {
             if (!pipeline_)
                 throw std::invalid_argument("ResponseGenerator: pipeline cannot be null");

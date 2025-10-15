@@ -1127,6 +1127,14 @@ add_executable(test_parity_framework
 target_link_libraries(test_parity_framework PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
 add_llaminar_mpi_test(ParityFrameworkTest 2 test_parity_framework)
 
+# Inference parity test - compares generated text with PyTorch for real prompts
+add_executable(test_inference_parity
+    tests/test_inference_parity.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_inference_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(InferenceParityTest 2 test_inference_parity)
+set_tests_properties(InferenceParityTest PROPERTIES TIMEOUT 300 LABELS "integration;parity;inference")
+
 # Incremental snapshot helper test - verifies .npy writer and per-token snapshot saving
 add_executable(test_incremental_snapshot_helper
     tests/test_incremental_snapshot_helper.cpp

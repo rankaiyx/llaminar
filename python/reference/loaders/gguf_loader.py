@@ -249,6 +249,14 @@ class GGUFLoader:
                 
                 state_dict[hf_name] = tensor
             
+            # Handle tied embeddings: if lm_head.weight is missing, copy from embeddings
+            if 'lm_head.weight' not in state_dict:
+                if 'model.embed_tokens.weight' in state_dict:
+                    self._log(f"\n⚠ lm_head.weight missing - using tied embeddings (copying from model.embed_tokens.weight)")
+                    state_dict['lm_head.weight'] = state_dict['model.embed_tokens.weight']
+                else:
+                    self._log(f"\n⚠ WARNING: lm_head.weight missing and no embed_tokens found!")
+            
             # Summary
             self._log(f"\nState dict loaded successfully:")
             self._log(f"  Total tensors: {total_tensors}")

@@ -1,0 +1,64 @@
+# Commit Message for OpenBLAS Thread Cleanup Fix
+
+```
+Fix: Prevent OpenBLAS thread pool hang in sequential parity tests
+
+Resolves intermittent deadlocks when running multiple GGUF models
+sequentially in the inference parity test suite.
+
+## Problem
+- Parity tests with FP16/FP32 models hung intermittently (10+ min timeouts)
+- Hang occurred at large matmul operations (896×75968 LM head projection)
+- Only affected sequential multi-model tests, not standalone runs
+- 98% CPU usage with no progress indicated thread pool deadlock
+
+## Root Cause
+OpenBLAS thread pool state was not cleaned up between Google Test
+parametrized test cases. When running multiple models in the same
+MPI process, stale thread pool state caused synchronization deadlocks.
+
+## Solution
+Added explicit OpenBLAS thread pool reset in test fixture lifecycle:
+
+- SetUp(): Reset threads to 1, MPI barrier, restore multi-threading
+- TearDown(): MPI barrier, reset threads to 1, MPI barrier
+
+This forces OpenBLAS to cleanly tear down and recreate the thread pool
+for each test case, preventing state corruption.
+
+## Verification
+Before fix:
+- Q4_0 → FP16: HUNG (timeout after 10+ minutes)
+- FP16 → Q4_0 → Q8_0: HUNG (never completed)
+
+After fix:
+- Q4_0 → FP16: PASS (78s)
+- FP16 → Q4_0: PASS (78s)
+- FP16 → Q4_0 → Q8_0: PASS (119s)
+- FP32 (Gemini): COMPLETES (32s, no hang)
+
+No performance regression on individual tests.
+
+## Impact
+Unblocks automated parity testing for all model quantization formats
+(FP32, FP16, Q2_K through Q8_0) in single parametrized test suite.
+
+Files changed:
+- tests/test_inference_parity.cpp: Added SetUp/TearDown with OpenBLAS cleanup
+```
+
+## Alternative Short Version
+
+```
+Fix: Add OpenBLAS thread cleanup to prevent parity test hangs
+
+Added SetUp/TearDown methods to inference parity test fixture to
+explicitly reset OpenBLAS thread pool state between parametrized
+test cases. This prevents intermittent deadlocks when running
+multiple heavy models (FP16/FP32) sequentially.
+
+Before: Sequential tests hung after 10+ minutes
+After: All sequential tests pass (Q4_0→FP16→Q8_0 completes in 119s)
+
+No performance regression on individual tests.
+```

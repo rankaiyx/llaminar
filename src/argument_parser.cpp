@@ -113,7 +113,7 @@ bool ArgumentParser::parse(LlaminarParams &params)
             params.ctx_size = std::stoi(argv_[i + 1]);
             i++;
         }
-        else if (arg == "--predict" && i + 1 < argc_)
+        else if ((arg == "--predict" || arg == "-n") && i + 1 < argc_)
         {
             params.n_predict = std::stoi(argv_[i + 1]);
             i++;
@@ -245,7 +245,7 @@ void ArgumentParser::printUsage() const
     std::cout << "  --eval                   Evaluate prompt and exit (no generation)" << std::endl;
     std::cout << "  --interactive            Interactive chat mode" << std::endl;
     std::cout << "  --ctx-size <size>        Context window size (default: 2048)" << std::endl;
-    std::cout << "  --predict <tokens>       Max tokens to generate (default: 128)" << std::endl;
+    std::cout << "  -n, --predict <tokens>   Max tokens to generate (default: 128)" << std::endl;
     std::cout << "  --temperature <float>    Sampling temperature (default: 0.7)" << std::endl;
     std::cout << "  --top-k <int>            Top-K sampling (default: 40)" << std::endl;
     std::cout << "  --top-p <float>          Top-P sampling (default: 0.9)" << std::endl;

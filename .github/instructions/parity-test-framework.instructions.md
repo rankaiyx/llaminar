@@ -724,6 +724,59 @@ python run_reference.py \
     --output pytorch_snapshots.npz
 ```
 
+## Loading and Using GGUF Files for PyTorch Inference
+
+### Overview
+
+To ensure true apples-to-apples parity between Llaminar and PyTorch, the reference implementation must load and use the exact same quantized GGUF model files as Llaminar. This is achieved using the custom GGUF loader and dequantization utilities provided in `python/reference/loaders/gguf_loader.py` and `python/reference/dequantize.py`.
+
+### Workflow
+
+1. **Parse GGUF File**: The GGUFLoader reads the quantized GGUF file, extracts all tensor weights, and parses metadata (architecture, quantization type, shapes, etc).
+2. **Dequantize Weights**: Quantized tensors (e.g., Q4_0, Q6_K) are dequantized to FP32 using the logic in `dequantize.py`, matching Llaminar's dequantization path.
+3. **Map to PyTorch Model**: The dequantized weights are loaded into a HuggingFace-compatible PyTorch model, ensuring all layers use the same weights as Llaminar.
+4. **Run Inference**: The PyTorch model runs inference using the dequantized weights, producing outputs directly comparable to Llaminar.
+
+### Example Code
+
+```python
+from loaders.gguf_loader import GGUFLoader
+from dequantize import dequantize_tensor
+import torch
+
+# Load GGUF file and extract tensors
+gguf = GGUFLoader('models/qwen2.5-0.5b-instruct-q4_0.gguf')
+weights = gguf.load_all_tensors()
+
+# Dequantize all tensors
+fp32_weights = {name: dequantize_tensor(tensor) for name, tensor in weights.items()}
+
+# Load weights into PyTorch model
+from transformers import AutoModelForCausalLM
+model = AutoModelForCausalLM.from_config(gguf.make_hf_config())
+model.load_state_dict(fp32_weights, strict=False)
+
+# Run inference
+output = model.generate(input_ids, temperature=0.0)
+```
+
+### Key Points
+
+- **No conversion required**: PyTorch uses the same GGUF file as Llaminar, with no intermediate format.
+- **Dequantization matches Llaminar**: The logic in `dequantize.py` is identical to Llaminar's C++ path, ensuring bitwise parity.
+- **Supports all quantization types**: Q4_0, Q6_K, and others are supported.
+- **Direct comparison**: Outputs from PyTorch and Llaminar are directly comparable for every prompt and model.
+
+### Reference Files
+
+- `python/reference/loaders/gguf_loader.py`: GGUF parsing and tensor extraction
+- `python/reference/dequantize.py`: Quantized tensor dequantization
+- `python/reference/generate_text_reference.py`: End-to-end reference inference using GGUF files
+
+### Why This Matters
+
+This workflow guarantees that parity tests reflect true implementation differences, not quantization or model format mismatches. Any divergence in output is a real bug in the inference logic, not in the data loading or quantization.
+
 ### Step 2: Convert NPZ to .npy Files
 
 ```bash
