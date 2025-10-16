@@ -29,6 +29,8 @@ namespace llaminar
         PrefillMetrics &metrics,
         KVCacheProvider *cache_provider)
     {
+        std::cerr << "!!!!! ENTERING PrefillProviderBaseImpl::execute" << std::endl
+                  << std::flush;
         PERF_SCOPED_TIMER("PrefillProviderBaseImpl::execute");
 
         // Reset metrics (backend name set by derived class)
@@ -48,6 +50,8 @@ namespace llaminar
         int d_model = layer_cfg.d_model;
         int n_layers = layer_cfg.n_layers;
         int vocab_size = layer_cfg.vocab_size;
+
+        std::cerr << "[PROVIDER_EXEC_TRACE] Rank" << mpiContext().rank << " PrefillProviderBaseImpl::execute START: seq_len=" << seq_len << std::endl;
 
         // Update context
         ctx.seq_len = seq_len;
@@ -143,6 +147,16 @@ namespace llaminar
         // Capture LM head snapshot
         captureSnapshot(PipelineStage::LM_HEAD, -1, logits->data(), seq_len, vocab_size);
         incrementSnapshotCounter(metrics);
+
+        float sum_sq = 0.0f;
+        for (size_t i = 0; i < logits->size(); ++i)
+        {
+            sum_sq += logits->data()[i] * logits->data()[i];
+        }
+        float l2_norm = std::sqrt(sum_sq / logits->size());
+        std::cerr << "[MAGNITUDE_TRACE_SEQ] Rank" << mpiContext().rank << " FINAL LOGITS (sequential): L2_norm=" << l2_norm << " size=" << logits->size()
+                  << " first_5=[" << logits->data()[0] << "," << logits->data()[1] << ","
+                  << logits->data()[2] << "," << logits->data()[3] << "," << logits->data()[4] << "]" << std::endl;
 
         // Set output
         output = logits;
@@ -407,6 +421,17 @@ namespace llaminar
                               t_ffn_end - t_ffn_start)
                               .count() /
                           1000.0;
+
+        // [DEBUG] Log FFN down output magnitude
+        if (layer_idx == 0 && mpiContext().rank == 0)
+        {
+            double sum_sq = 0.0;
+            size_t count = seq_len * d_model;
+            for (size_t i = 0; i < count; ++i)
+                sum_sq += output->data()[i] * output->data()[i];
+            double l2_norm = std::sqrt(sum_sq / count);
+            std::cerr << "[MAGNITUDE_TRACE_SEQ] Layer0 FFN Down Output: L2_norm=" << l2_norm << " size=" << count << std::endl;
+        }
 
         // Capture FFN down snapshot
         captureSnapshot(PipelineStage::FFN_DOWN, layer_idx, output->data(), seq_len, d_model);

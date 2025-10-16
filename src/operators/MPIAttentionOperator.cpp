@@ -1097,25 +1097,6 @@ namespace llaminar
         // CONTRACT: QKV projections
         if (enable_validation)
         {
-            // CHECK: Q before contract validation
-            {
-                float *q_ptr = result.local_q->data();
-                bool q_corrupted = false;
-                for (int i = 0; i < result.local_q->size(); ++i)
-                {
-                    if (std::abs(q_ptr[i]) > 1e10f)
-                    {
-                        std::cerr << "[CHECK-BEFORE-CONTRACT] ⚠️ Q CORRUPTED before contract! Garbage at index " << i << ": " << q_ptr[i] << std::endl;
-                        q_corrupted = true;
-                        break;
-                    }
-                }
-                if (!q_corrupted)
-                {
-                    std::cerr << "[CHECK-BEFORE-CONTRACT] Q clean before contract validation" << std::endl;
-                }
-            }
-
             StageContract qkv_contract("QKV_Projections");
             qkv_contract.outputs = {
                 TensorContract("local_q", ShapeSpec({seq_len, local_head_dim}),
@@ -1128,25 +1109,6 @@ namespace llaminar
             try
             {
                 qkv_contract.validate_outputs({result.local_q, result.local_k, result.local_v});
-
-                // CHECK: Q after contract validation
-                {
-                    float *q_ptr = result.local_q->data();
-                    bool q_corrupted = false;
-                    for (int i = 0; i < result.local_q->size(); ++i)
-                    {
-                        if (std::abs(q_ptr[i]) > 1e10f)
-                        {
-                            std::cerr << "[CHECK-AFTER-CONTRACT] ⚠️ Q CORRUPTED after contract! Garbage at index " << i << ": " << q_ptr[i] << std::endl;
-                            q_corrupted = true;
-                            break;
-                        }
-                    }
-                    if (!q_corrupted)
-                    {
-                        std::cerr << "[CHECK-AFTER-CONTRACT] Q clean after contract validation" << std::endl;
-                    }
-                }
                 if (debugEnv().attention.verbose && rank == 0)
                     LOG_DEBUG("✓ QKV projection shape contracts validated");
             }
@@ -1272,7 +1234,7 @@ namespace llaminar
 
         if (snapshot_callback_ && world_size > 1)
         {
-            LOG_INFO("[GATHER_TRACE] Entering multi-rank gather path for layer " << layer_index_);
+            LOG_DEBUG("[GATHER_TRACE] Entering multi-rank gather path for layer " << layer_index_);
             // Multi-rank with snapshot callback: gather Q/K/V across all ranks
             // Allocate global tensors
             result.global_q = TensorFactory::create_simple({seq_len, n_head_ * head_dim_});
@@ -1321,7 +1283,7 @@ namespace llaminar
                 // DEBUG: Log gather parameters
                 if (rank == 0 && layer_index_ == 0)
                 {
-                    LOG_ERROR("[SEQ_GATHER_DEBUG] Q gather parameters:");
+                    LOG_DEBUG("[SEQ_GATHER_DEBUG] Q gather parameters:");
                     LOG_ERROR("  Using MPI_Allgather (not Allgatherv)");
                     LOG_ERROR("  sendcount=" << (seq_len * local_head_dim) << " per rank");
                     LOG_ERROR("  Local Q before gather [0:5]: [" << local_q->data()[0] << ", "
@@ -1350,7 +1312,7 @@ namespace llaminar
                 // DEBUG: Log gathered result
                 if (rank == 0 && layer_index_ == 0)
                 {
-                    LOG_ERROR("[SEQ_GATHER_DEBUG] After gather and rearrange:");
+                    LOG_DEBUG("[SEQ_GATHER_DEBUG] After gather and rearrange:");
                     LOG_ERROR("  Total size: " << result.global_q->size());
                     LOG_ERROR("  First 10: [" << result.global_q->data()[0] << ", " << result.global_q->data()[1] << ", "
                                               << result.global_q->data()[2] << ", " << result.global_q->data()[3] << ", "
@@ -1422,24 +1384,24 @@ namespace llaminar
                 // CRITICAL: These are Q/K/V BEFORE RoPE to match PyTorch's Q_PROJECTION stage
                 if (rank == 0)
                 {
-                    LOG_INFO("[CALLBACK_TRACE] About to invoke snapshot_callback_ for Q/K/V projections (layer " << layer_index_ << ")");
+                    LOG_DEBUG("[CALLBACK_TRACE] About to invoke snapshot_callback_ for Q/K/V projections (layer " << layer_index_ << ")");
                     snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, result.global_q->data(), seq_len, n_head_ * head_dim_);
                     snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, result.global_k->data(), seq_len, n_head_kv_ * head_dim_);
                     snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, result.global_v->data(), seq_len, n_head_kv_ * head_dim_);
                     result.snapshot_performed = true;
-                    LOG_INFO("[CALLBACK_TRACE] Snapshot callbacks invoked successfully for layer " << layer_index_);
+                    LOG_DEBUG("[CALLBACK_TRACE] Snapshot callbacks invoked successfully for layer " << layer_index_);
                 }
             }
         }
         else if (snapshot_callback_)
         {
             // Single rank: just snapshot the local tensors directly (also before RoPE)
-            LOG_INFO("[CALLBACK_TRACE] Single-rank path: invoking snapshot_callback_ for Q/K/V (layer " << layer_index_ << ")");
+            LOG_DEBUG("[CALLBACK_TRACE] Single-rank path: invoking snapshot_callback_ for Q/K/V (layer " << layer_index_ << ")");
             snapshot_callback_(PipelineStage::Q_PROJECTION, layer_index_, local_q->data(), seq_len, local_head_dim);
             snapshot_callback_(PipelineStage::K_PROJECTION, layer_index_, local_k->data(), seq_len, local_kv_head_dim);
             snapshot_callback_(PipelineStage::V_PROJECTION, layer_index_, local_v->data(), seq_len, local_kv_head_dim);
             result.snapshot_performed = true;
-            LOG_INFO("[CALLBACK_TRACE] Single-rank callbacks invoked successfully for layer " << layer_index_);
+            LOG_DEBUG("[CALLBACK_TRACE] Single-rank callbacks invoked successfully for layer " << layer_index_);
         }
 
         return result;
@@ -2600,6 +2562,17 @@ namespace llaminar
                           MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
         }
 
+        if (layer_index_ == 0 && rank == 0)
+        {
+            float sum_sq = 0.0f;
+            for (size_t i = 0; i < result.attention_output->size(); ++i)
+            {
+                sum_sq += result.attention_output->data()[i] * result.attention_output->data()[i];
+            }
+            float l2_norm = std::sqrt(sum_sq / result.attention_output->size());
+            LOG_ERROR("[MAGNITUDE_TRACE_SEQ] Rank0 Layer0 Sequential Attention Output: L2_norm=" << l2_norm << " size=" << result.attention_output->size());
+        }
+
         // Snapshot final attention output (after output projection and MPI reduction)
         if (snapshot_callback_)
         {
@@ -2719,9 +2692,9 @@ namespace llaminar
         // ========================================================================
         // STEP 4: Gather Q/K/V for snapshotting (BEFORE RoPE!) (REFACTORED)
         // ========================================================================
-        LOG_INFO("[EXECUTE_TRACE] About to call gatherAndSnapshotPreRoPE for layer " << layer_index_);
+        LOG_DEBUG("[EXECUTE_TRACE] About to call gatherAndSnapshotPreRoPE for layer " << layer_index_);
         auto gather_result = gatherAndSnapshotPreRoPE(setup, projections);
-        LOG_INFO("[EXECUTE_TRACE] Returned from gatherAndSnapshotPreRoPE for layer " << layer_index_);
+        LOG_DEBUG("[EXECUTE_TRACE] Returned from gatherAndSnapshotPreRoPE for layer " << layer_index_);
 
         // ========================================================================
         // STEP 5: Apply RoPE to Q and K (AFTER snapshotting but BEFORE attention!) (REFACTORED)

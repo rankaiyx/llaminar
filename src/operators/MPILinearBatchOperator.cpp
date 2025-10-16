@@ -75,64 +75,99 @@ namespace llaminar
         }
 
         auto input = inputs[0];
-        auto global_weight = inputs[1];
+        auto weight_input = inputs[1]; // May be pre-sliced or replicated
         auto global_output = outputs[0];
 
         // === COMPREHENSIVE TENSOR VALIDATION ===
         ASSERT_TENSOR_VALID(input, "LinearBatch input");
-        ASSERT_TENSOR_VALID(global_weight, "LinearBatch weight");
+        ASSERT_TENSOR_VALID(weight_input, "LinearBatch weight");
         ASSERT_TENSOR_VALID(global_output, "LinearBatch output");
 
         // Check for NaN in inputs before computation
         ASSERT_TENSOR_NOT_NAN(input, "LinearBatch input");
-        ASSERT_TENSOR_NOT_NAN(global_weight, "LinearBatch weight");
+        ASSERT_TENSOR_NOT_NAN(weight_input, "LinearBatch weight");
 
         // Log detailed tensor information
-        TensorLogger::logMatMulOperation(input, global_weight, global_output, "MPILinearBatchOperator");
+        TensorLogger::logMatMulOperation(input, weight_input, global_output, "MPILinearBatchOperator");
 
         // Extract dimensions
         size_t batch_size = input->shape()[0];
         size_t seq_len = input->shape()[1];
         size_t input_size = input->shape()[2];
-        // Weight is [out_dim, in_dim] per convention
-        size_t output_size = global_weight->shape()[0];
-        size_t weight_in_dim = global_weight->shape()[1];
+
+        // Weight dimensions from input tensor
+        size_t weight_out_dim = weight_input->shape()[0];
+        size_t weight_in_dim = weight_input->shape()[1];
 
         // Validate dimension compatibility
         if (weight_in_dim != input_size)
         {
-            LOG_ERROR("MPILinearBatch: Weight input dimension mismatch - weight[" << global_weight->shape()[0] << ", " << global_weight->shape()[1] << "] vs input[" << batch_size << ", " << seq_len << ", " << input_size << "]");
+            LOG_ERROR("MPILinearBatch: Weight input dimension mismatch - weight[" << weight_input->shape()[0] << ", " << weight_input->shape()[1] << "] vs input[" << batch_size << ", " << seq_len << ", " << input_size << "]");
             return false;
         }
 
-        // Calculate local distribution
-        auto [local_output_size, output_offset] = getRowDistribution(output_size);
+        // Determine if weight is pre-sliced or replicated by checking global output size
+        // If weight is pre-sliced, weight_out_dim will match our local partition size
+        // If weight is replicated, weight_out_dim will match the full global output size
+        size_t global_output_size = global_output->shape()[2];
+        auto [expected_local_size, output_offset] = getRowDistribution(global_output_size);
 
-        // Check weight cache before distributing
-        const float *weight_key = global_weight->data();
+        bool is_pre_sliced = (weight_out_dim == expected_local_size);
+        bool is_replicated = (weight_out_dim == global_output_size);
+
+        if (!is_pre_sliced && !is_replicated)
+        {
+            LOG_ERROR("MPILinearBatch: Weight dimension " << weight_out_dim
+                                                          << " doesn't match expected local (" << expected_local_size
+                                                          << ") or global (" << global_output_size << ") size");
+            return false;
+        }
+
         std::shared_ptr<TensorBase> local_weight;
 
-        auto weight_cache_it = weight_cache_.find(weight_key);
-        if (weight_cache_it != weight_cache_.end())
+        if (is_pre_sliced)
         {
-            // Cache hit: reuse previously distributed weight
-            PERF_TRACE_SCOPE_CAT("weight_cache_hit", "linear_kernel");
-            local_weight = weight_cache_it->second;
-        }
-        else
-        {
-            // Cache miss: distribute and cache the weight
-            PERF_TRACE_SCOPE_CAT("weight_cache_miss", "linear_kernel");
-            local_weight = createLocalTensor({static_cast<size_t>(local_output_size), input_size});
+            // Weight is already sliced - use directly
+            PERF_TRACE_SCOPE_CAT("weight_pre_sliced", "linear_kernel");
+            local_weight = weight_input;
+
+            if (getRank() == 0)
             {
-                PERF_TRACE_SCOPE_CAT("distribute_weight", "linear_kernel");
-                distributeWeight(global_weight, local_weight, output_size);
+                LOG_DEBUG("MPILinearBatch: Using PRE-SLICED weight [" << weight_out_dim << "," << weight_in_dim << "]");
             }
-            weight_cache_[weight_key] = local_weight;
+        }
+        else // is_replicated
+        {
+            // Weight is replicated - need to distribute
+            const float *weight_key = weight_input->data();
+
+            auto weight_cache_it = weight_cache_.find(weight_key);
+            if (weight_cache_it != weight_cache_.end())
+            {
+                // Cache hit: reuse previously distributed weight
+                PERF_TRACE_SCOPE_CAT("weight_cache_hit", "linear_kernel");
+                local_weight = weight_cache_it->second;
+            }
+            else
+            {
+                // Cache miss: distribute and cache the weight
+                PERF_TRACE_SCOPE_CAT("weight_cache_miss", "linear_kernel");
+                local_weight = createLocalTensor({static_cast<size_t>(expected_local_size), input_size});
+                {
+                    PERF_TRACE_SCOPE_CAT("distribute_weight", "linear_kernel");
+                    distributeWeight(weight_input, local_weight, global_output_size);
+                }
+                weight_cache_[weight_key] = local_weight;
+            }
+
+            if (getRank() == 0)
+            {
+                LOG_DEBUG("MPILinearBatch: Distributed REPLICATED weight to local [" << expected_local_size << "," << weight_in_dim << "]");
+            }
         }
 
         // Create local output tensor [batch, seq_len, local_out_dim]
-        auto local_output = createLocalTensor({batch_size, seq_len, static_cast<size_t>(local_output_size)});
+        auto local_output = createLocalTensor({batch_size, seq_len, static_cast<size_t>(expected_local_size)});
 
         // Handle optional bias with caching
         std::shared_ptr<TensorBase> local_bias = nullptr;
@@ -151,10 +186,10 @@ namespace llaminar
             {
                 // Cache miss: distribute and cache the bias
                 PERF_TRACE_SCOPE_CAT("bias_cache_miss", "linear_kernel");
-                local_bias = createLocalTensor({static_cast<size_t>(local_output_size)});
+                local_bias = createLocalTensor({static_cast<size_t>(expected_local_size)});
                 {
                     PERF_TRACE_SCOPE_CAT("distribute_bias", "linear_kernel");
-                    distributeBias(inputs[2], local_bias, output_size);
+                    distributeBias(inputs[2], local_bias, global_output_size);
                 }
                 bias_cache_[bias_key] = local_bias;
             }
@@ -168,15 +203,16 @@ namespace llaminar
 
         int total_seq = static_cast<int>(batch_size * seq_len);
         int d_model = static_cast<int>(input_size);
-        int d_out = static_cast<int>(local_output_size);
+        int d_out = static_cast<int>(expected_local_size);
 
         // Optional lightweight diagnostics
         bool linear_diag = debugEnv().linear.diag;
         if (linear_diag && getRank() == 0)
         {
-            LOG_INFO("[LinearBatchDiag] rank=" << getRank() << " batch=" << batch_size
-                                               << " seq_len=" << seq_len << " total_seq=" << total_seq
-                                               << " d_model=" << d_model << " d_out_local=" << d_out);
+            LOG_DEBUG("[LinearBatchDiag] rank=" << getRank() << " batch=" << batch_size
+                                                << " seq_len=" << seq_len << " total_seq=" << total_seq
+                                                << " d_model=" << d_model << " d_out_local=" << d_out
+                                                << " weight_mode=" << (is_pre_sliced ? "PRE_SLICED" : "REPLICATED"));
         }
 
         // Use adaptive matrix multiplication
@@ -192,11 +228,11 @@ namespace llaminar
             static int call_count = 0;
             if (getRank() == 0 && call_count < 10)
             {
-                LOG_ERROR("[MPILinearBatch_CALL_" << call_count << "] rank=0:");
-                LOG_ERROR("  batch=" << batch_size << " seq=" << seq_len << " total_seq=" << total_seq);
-                LOG_ERROR("  d_model(k)=" << d_model << " d_out(n)=" << d_out);
-                LOG_ERROR("  input_size=" << input_size << " output_size(global)=" << output_size
-                                          << " local_output_size=" << local_output_size << " output_offset=" << output_offset);
+                LOG_DEBUG("[MPILinearBatch_CALL_" << call_count << "] rank=0:");
+                LOG_DEBUG("  batch=" << batch_size << " seq=" << seq_len << " total_seq=" << total_seq);
+                LOG_DEBUG("  d_model(k)=" << d_model << " d_out(n)=" << d_out);
+                LOG_DEBUG("  input_size=" << input_size << " global_output_size=" << global_output_size
+                                          << " expected_local_size=" << expected_local_size << " output_offset=" << output_offset);
                 call_count++;
             }
 
@@ -224,18 +260,18 @@ namespace llaminar
         if (local_bias)
         {
             PERF_TRACE_SCOPE_CAT("add_bias_batch", "linear_kernel");
-            addBiasLocal(local_output->data(), local_bias->data(), batch_size, seq_len, local_output_size);
+            addBiasLocal(local_output->data(), local_bias->data(), batch_size, seq_len, expected_local_size);
         }
 
         // Gather results from all processes
         {
             PERF_TRACE_SCOPE_CAT("gather_output_batch", "mpi_collective");
-            gatherOutput(local_output, global_output, batch_size, seq_len, output_size);
+            gatherOutput(local_output, global_output, batch_size, seq_len, global_output_size);
         }
 
         if (linear_diag && getRank() == 0)
         {
-            LOG_INFO("[LinearBatchDiag] rank=" << getRank() << " gathered_global_shape=[" << batch_size << "," << seq_len << "," << output_size << "]");
+            LOG_DEBUG("[LinearBatchDiag] rank=" << getRank() << " gathered_global_shape=[" << batch_size << "," << seq_len << "," << global_output_size << "]");
         }
 
         // === POST-COMPUTATION VALIDATION ===

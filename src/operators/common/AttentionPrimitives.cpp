@@ -275,6 +275,49 @@ namespace llaminar::attn
     }
 
     // ============================================================================
+    // BATCHED ATTENTION PRIMITIVES
+    // ============================================================================
+
+    void apply_rope_batched(float *q, float *k, int batch_size, int seq_len, int head_dim,
+                            int q_heads, int k_heads, int n_past, float freq_base)
+    {
+        // Validate inputs
+        if (head_dim % 2 != 0)
+        {
+            LOG_ERROR("[RoPE_Batched] head_dim must be even, got " << head_dim);
+            return;
+        }
+
+        if (batch_size <= 0 || seq_len <= 0 || q_heads <= 0 || k_heads <= 0)
+        {
+            LOG_WARN("[RoPE_Batched] Invalid dimensions: batch_size=" << batch_size
+                                                                      << " seq_len=" << seq_len
+                                                                      << " q_heads=" << q_heads
+                                                                      << " k_heads=" << k_heads);
+            return;
+        }
+
+        // Compute inverse frequencies once (same for all batches)
+        const std::vector<float> inv_freq = compute_inv_freq(head_dim, freq_base);
+
+        // Process each batch element independently
+        // Layout: [batch_size, seq_len, num_heads * head_dim]
+        const int q_stride_batch = seq_len * q_heads * head_dim;
+        const int k_stride_batch = seq_len * k_heads * head_dim;
+
+        for (int b = 0; b < batch_size; ++b)
+        {
+            float *q_batch = q + b * q_stride_batch;
+            float *k_batch = k + b * k_stride_batch;
+
+            // Reuse the proven single-batch RoPE implementation
+            // It expects layout [seq_len, num_heads, head_dim] which matches our per-batch slice
+            apply_rope_to_tensor(q_batch, seq_len, q_heads, head_dim, n_past, inv_freq, false);
+            apply_rope_to_tensor(k_batch, seq_len, k_heads, head_dim, n_past, inv_freq, false);
+        }
+    }
+
+    // ============================================================================
     // HELPER FUNCTIONS - Attention Scores
     // ============================================================================
 
@@ -773,6 +816,63 @@ namespace llaminar::attn
         stats.max_prob = max_prob;
 
         return stats;
+    }
+
+    // ============================================================================
+    // BATCHED ATTENTION SCORE PRIMITIVES
+    // ============================================================================
+
+    void compute_qk_scores_batched(const float *q, const float *k, float *scores,
+                                   int batch_size, int seq_len, int head_dim, int heads, bool causal)
+    {
+        // Process each batch element independently
+        // Layout: Q, K: [batch_size, seq_len, heads * head_dim]
+        //         scores: [batch_size, heads, seq_len, seq_len]
+
+        const int q_stride_batch = seq_len * heads * head_dim;
+        const int k_stride_batch = seq_len * heads * head_dim;
+        const int scores_stride_batch = heads * seq_len * seq_len;
+
+        for (int b = 0; b < batch_size; ++b)
+        {
+            const float *q_batch = q + b * q_stride_batch;
+            const float *k_batch = k + b * k_stride_batch;
+            float *scores_batch = scores + b * scores_stride_batch;
+
+            // Delegate to proven single-batch implementation
+            // It expects: Q, K: [seq_len, heads * head_dim]
+            //            scores: [heads, seq_len, seq_len]
+            compute_qk_scores(q_batch, k_batch, scores_batch,
+                              seq_len, seq_len, head_dim, heads,
+                              causal, false);
+        }
+    }
+
+    void apply_scores_to_v_batched(const float *scores, const float *v, float *out,
+                                   int batch_size, int seq_len, int head_dim, int heads)
+    {
+        // Process each batch element independently
+        // Layout: scores: [batch_size, heads, seq_len, seq_len]
+        //         V: [batch_size, seq_len, heads * head_dim]
+        //         out: [batch_size, seq_len, heads * head_dim]
+
+        const int scores_stride_batch = heads * seq_len * seq_len;
+        const int v_stride_batch = seq_len * heads * head_dim;
+        const int out_stride_batch = seq_len * heads * head_dim;
+
+        for (int b = 0; b < batch_size; ++b)
+        {
+            const float *scores_batch = scores + b * scores_stride_batch;
+            const float *v_batch = v + b * v_stride_batch;
+            float *out_batch = out + b * out_stride_batch;
+
+            // Delegate to proven single-batch implementation
+            // It expects: scores: [heads, seq_len, seq_len]
+            //            V: [seq_len, heads * head_dim]
+            //            out: [seq_len, heads * head_dim]
+            apply_scores_to_v(scores_batch, v_batch, out_batch,
+                              seq_len, seq_len, head_dim, heads);
+        }
     }
 
 } // namespace llaminar::attn

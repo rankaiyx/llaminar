@@ -47,8 +47,18 @@ endif()
 
 # Compiler flags
 # Note: Removed -DDEBUG from global flags to prevent COSMA verbose output
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+# Debug build with gcov coverage support:
+#   -g: debug symbols
+#   -O0: no optimizations (required for accurate coverage)
+#   --coverage: enables gcov instrumentation (equivalent to -fprofile-arcs -ftest-coverage)
+#   -fprofile-abs-path: use absolute paths in .gcno files (helps gcov viewer match files)
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 --coverage -fprofile-abs-path")
+set(CMAKE_C_FLAGS_DEBUG "-g -O0 --coverage -fprofile-abs-path")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
+
+# Linker flags for coverage (Debug only)
+set(CMAKE_EXE_LINKER_FLAGS_DEBUG "--coverage")
+set(CMAKE_SHARED_LINKER_FLAGS_DEBUG "--coverage")
 
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/src)
@@ -1295,6 +1305,15 @@ add_executable(test_batch_correctness
 target_link_libraries(test_batch_correctness PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
 add_llaminar_mpi_test(BatchCorrectnessTest 2 test_batch_correctness)
 set_tests_properties(BatchCorrectnessTest PROPERTIES TIMEOUT 180 LABELS "integration;batch;correctness")
+
+# Batch vs Sequential parity test with pipeline snapshots - captures all intermediate stages
+add_executable(test_batch_sequential_parity
+    tests/test_batch_sequential_parity.cpp
+    tests/ParityTestFramework.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_batch_sequential_parity PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BatchSequentialParityTest 2 test_batch_sequential_parity)
+set_tests_properties(BatchSequentialParityTest PROPERTIES TIMEOUT 180 LABELS "integration;batch;parity;snapshots")
 
 # Batch embedding debug test - isolates embedding comparison
 add_executable(test_batch_embedding_debug

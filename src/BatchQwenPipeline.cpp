@@ -261,16 +261,17 @@ namespace llaminar
             return {};
         }
 
-        // Load weights using BATCH-MODE bridge function (REPLICATED weights)
-        // Batch operators handle weight distribution internally, so we need full weights
+        // CRITICAL: Use pre-sliced weights like sequential pipeline for architectural consistency
+        // This loads ROW_SLICED/COL_SLICED weights for MPI distribution
+        // Batch operators have been updated to handle pre-sliced weights directly
         auto weights_wrapper = std::make_unique<BatchQwenWeights>();
-        weights_wrapper->inner = loadModelWeights_batch_bridge(*loader, config_.getLayerConfig());
+        weights_wrapper->inner = loadModelWeights_impl_bridge(*loader, config_.getLayerConfig());
 
         if (getRank() == 0)
         {
-            LOG_INFO("[BatchQwenPipeline] Loaded weights: layers=" << weights_wrapper->layer_count()
-                                                                   << " vocab=" << config_.getLayerConfig().vocab_size
-                                                                   << " d_model=" << config_.getLayerConfig().d_model);
+            LOG_INFO("[BatchQwenPipeline] Loaded PRE-SLICED weights (architectural parity with sequential): layers=" << weights_wrapper->layer_count()
+                                                                                                                     << " vocab=" << config_.getLayerConfig().vocab_size
+                                                                                                                     << " d_model=" << config_.getLayerConfig().d_model);
         }
 
         return weights_wrapper;
@@ -489,6 +490,7 @@ namespace llaminar
                     return false;
                 }
             }
+            captureIfEnabled(PipelineStage::FFN_NORM, layer, ffn_norm_out);
 
             // 5. FFN projections (gate, up, down with SwiGLU)
             // Batch operators handle 3D [B, T, D] tensors natively - no flatten needed
@@ -508,6 +510,7 @@ namespace llaminar
                     return false;
                 }
             }
+            captureIfEnabled(PipelineStage::FFN_GATE, layer, gate);
 
             // Up projection [B, T, D] -> [B, T, d_ff]
             auto up = std::make_shared<SimpleTensor>(std::vector<int>{B, T, d_ff});
@@ -521,6 +524,7 @@ namespace llaminar
                     return false;
                 }
             }
+            captureIfEnabled(PipelineStage::FFN_UP, layer, up);
 
             // SwiGLU activation [B, T, d_ff]: gate * silu(up)
             auto swiglu = std::make_shared<SimpleTensor>(std::vector<int>{B, T, d_ff});
@@ -534,6 +538,7 @@ namespace llaminar
                     return false;
                 }
             }
+            captureIfEnabled(PipelineStage::FFN_SWIGLU, layer, swiglu);
 
             // Down projection [B, T, d_ff] -> [B, T, D]
             auto ffn_out = std::make_shared<SimpleTensor>(std::vector<int>{B, T, D});
@@ -546,7 +551,19 @@ namespace llaminar
                     LOG_ERROR("Layer " << layer << " down projection failed");
                     return false;
                 }
+
+                if (layer == 0 && getRank() == 0)
+                {
+                    float sum_sq = 0.0f;
+                    for (size_t i = 0; i < ffn_out->size(); ++i)
+                    {
+                        sum_sq += ffn_out->data()[i] * ffn_out->data()[i];
+                    }
+                    float l2_norm = std::sqrt(sum_sq / ffn_out->size());
+                    LOG_ERROR("[MAGNITUDE_TRACE] Rank0 Layer0 FFN Down Output: L2_norm=" << l2_norm << " size=" << ffn_out->size());
+                }
             }
+            captureIfEnabled(PipelineStage::FFN_DOWN, layer, ffn_out);
 
             // 6. Final residual connection
             {
@@ -555,11 +572,25 @@ namespace llaminar
                 float *output_data = hidden->data();
                 size_t total_elements = hidden->size();
 
+                if (layer == 0 && getRank() == 0)
+                {
+                    float attn_sum_sq = 0.0f, ffn_sum_sq = 0.0f;
+                    for (size_t i = 0; i < total_elements; ++i)
+                    {
+                        attn_sum_sq += post_attn_data[i] * post_attn_data[i];
+                        ffn_sum_sq += ffn_data[i] * ffn_data[i];
+                    }
+                    LOG_ERROR("[MAGNITUDE_TRACE] Rank0 Layer0 Before Final Residual: attn_L2="
+                              << std::sqrt(attn_sum_sq / total_elements)
+                              << " ffn_L2=" << std::sqrt(ffn_sum_sq / total_elements));
+                }
+
                 for (size_t i = 0; i < total_elements; ++i)
                 {
                     output_data[i] = post_attn_data[i] + ffn_data[i];
                 }
             }
+            captureIfEnabled(PipelineStage::FFN_RESIDUAL, layer, hidden);
 
             if (getRank() == 0 && layer % 6 == 0)
             {
@@ -592,6 +623,11 @@ namespace llaminar
         int D = h_shape[2];
         int vocab = config_.getLayerConfig().vocab_size;
 
+        // Capture FINAL_NORM snapshot (hidden state before LM head extraction)
+        // Note: BatchQwenPipeline doesn't have explicit final norm operator,
+        // but this captures the transformer output which matches sequential's FINAL_NORM output
+        captureIfEnabled(PipelineStage::FINAL_NORM, -1, hidden);
+
         // Gather last tokens: [B, D]
         auto last_hidden = std::make_shared<SimpleTensor>(std::vector<int>{B, D});
         const float *h_data = hidden->data();
@@ -610,9 +646,6 @@ namespace llaminar
             std::copy(src, src + D, dst);
         }
 
-        // Allocate logits [B, vocab]
-        logits_out = std::make_shared<SimpleTensor>(std::vector<int>{B, vocab});
-
         // Get LM head weight
         const auto &lm_head = weights.lm_head();
         if (!lm_head)
@@ -621,30 +654,45 @@ namespace llaminar
             return false;
         }
 
-        // LM head matmul: last_hidden [B, D] @ lm_head^T [D, V] = logits [B, V]
-        // lm_head is stored as [vocab, d_model], we use CblasTrans
-        const float *lm_data = lm_head->data();
-        float *logits_data = logits_out->data();
+        // Use the batch linear operator for proper distributed execution
+        // This will distribute the lm_head weight, compute locally, and gather results
+        // Reshape last_hidden to [B, 1, D] to match batch operator expectations
+        auto last_hidden_3d = std::make_shared<SimpleTensor>(std::vector<int>{B, 1, D});
+        std::copy(lh_data, lh_data + B * D, last_hidden_3d->data());
 
-        cblas_sgemm(
-            CblasRowMajor, CblasNoTrans, CblasTrans,
-            B,           // M: rows of last_hidden
-            vocab,       // N: cols of lm_head^T (rows of lm_head)
-            D,           // K: cols of last_hidden, cols of lm_head^T
-            1.0f,        // alpha
-            lh_data,     // A: last_hidden [B, D]
-            D,           // lda
-            lm_data,     // B: lm_head [vocab, D]
-            D,           // ldb
-            0.0f,        // beta
-            logits_data, // C: logits [B, vocab]
-            vocab        // ldc
-        );
+        // Allocate output [B, 1, vocab]
+        auto logits_3d = std::make_shared<SimpleTensor>(std::vector<int>{B, 1, vocab});
+
+        std::vector<std::shared_ptr<TensorBase>> linear_inputs = {last_hidden_3d, lm_head};
+        std::vector<std::shared_ptr<TensorBase>> linear_outputs = {logits_3d};
+
+        if (!executeKernel("linear", linear_inputs, linear_outputs))
+        {
+            LOG_ERROR("projectOutput: linear kernel execution failed");
+            return false;
+        }
+
+        // Reshape from [B, 1, vocab] to [B, vocab]
+        logits_out = std::make_shared<SimpleTensor>(std::vector<int>{B, vocab});
+        std::copy(logits_3d->data(), logits_3d->data() + B * vocab, logits_out->data());
+
+        // Capture LM_HEAD snapshot
+        captureIfEnabled(PipelineStage::LM_HEAD, -1, logits_out);
 
         if (getRank() == 0)
         {
+            float sum_sq = 0.0f;
+            for (size_t i = 0; i < logits_out->size(); ++i)
+            {
+                sum_sq += logits_out->data()[i] * logits_out->data()[i];
+            }
+            float l2_norm = std::sqrt(sum_sq / logits_out->size());
+            LOG_ERROR("[MAGNITUDE_TRACE] Rank0 FINAL LOGITS (batch): L2_norm=" << l2_norm << " size=" << logits_out->size()
+                                                                               << " first_5=[" << logits_out->data()[0] << "," << logits_out->data()[1] << ","
+                                                                               << logits_out->data()[2] << "," << logits_out->data()[3] << "," << logits_out->data()[4] << "]");
+
             LOG_DEBUG("[BatchQwenPipeline] projectOutput: extracted last tokens ["
-                      << B << "," << D << "] -> logits [" << B << "," << vocab << "] (real projection)");
+                      << B << "," << D << "] -> logits [" << B << "," << vocab << "] via distributed linear operator");
         }
 
         return true;

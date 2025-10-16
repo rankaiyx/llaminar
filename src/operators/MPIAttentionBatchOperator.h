@@ -151,6 +151,19 @@ namespace llaminar
             int batch_size,
             int seq_len);
 
+        /**
+         * @brief Get KV head distribution for current rank
+         * @return Pair of (local_kv_heads, kv_head_offset)
+         */
+        std::pair<int, int> getKVHeadDistribution() const;
+
+        /**
+         * @brief Get KV head distribution for specific rank
+         * @param rank MPI rank to query
+         * @return Pair of (local_kv_heads, kv_head_offset)
+         */
+        std::pair<int, int> getKVHeadDistribution(int rank) const;
+
         // Architecture parameters
         int n_heads_;          // Total query heads
         int n_kv_heads_;       // Total KV heads (GQA support)
@@ -161,9 +174,6 @@ namespace llaminar
         int n_heads_local_;    // Heads assigned to this rank
         int n_kv_heads_local_; // KV heads assigned to this rank
         int head_offset_;      // Starting head index for this rank
-
-        // RoPE precomputed frequencies
-        std::vector<float> rope_freqs_;
 
         // Snapshot capture callback (for parity testing)
         std::function<void(PipelineStage, int, const std::shared_ptr<TensorBase> &)> snapshot_callback_;

@@ -62,6 +62,12 @@ namespace llaminar
     }
     bool QwenPipelineAdapter::prefill(const std::vector<int> &tokens, const IModelWeights &weights_base, StageContext &ctx)
     {
+        {
+            std::ofstream trace("/tmp/adapter_trace.txt", std::ios::app);
+            trace << "ENTERING prefill, tokens.size()=" << tokens.size() << std::endl;
+            trace.close();
+        }
+
         // Use the new provider-based prefill path (PrefillProviderFactory)
         // This enables proper COSMA vs OpenBLAS selection based on sequence length
         ctx.stage = InferenceStage::Prefill;
@@ -74,6 +80,12 @@ namespace llaminar
             return false;
         }
 
+        {
+            std::ofstream trace("/tmp/adapter_trace.txt", std::ios::app);
+            trace << "ABOUT TO CALL legacy_->prefill" << std::endl;
+            trace.close();
+        }
+
         // Call the new provider-based prefill method (NOT legacy execute)
         // This will use PrefillProviderFactory to select OpenBLAS or COSMA based on sequence length
         if (!legacy_->prefill(tokens, weights_base, ctx))
@@ -82,11 +94,34 @@ namespace llaminar
             return false;
         }
 
+        {
+            std::ofstream trace("/tmp/adapter_trace.txt", std::ios::app);
+            trace << "RETURNED FROM legacy_->prefill" << std::endl;
+            trace.close();
+        }
+
         // Get the logits from the pipeline
         if (!legacy_->logits(last_logits_))
         {
             LOG_ERROR("QwenPipelineAdapter: failed to retrieve logits after prefill");
             return false;
+        }
+
+        {
+            std::ofstream trace("/tmp/adapter_trace.txt", std::ios::app);
+            trace << "GOT LOGITS, about to check" << std::endl;
+            if (last_logits_ && last_logits_->data())
+            {
+                size_t total_elements = 1;
+                for (auto d : last_logits_->shape())
+                    total_elements *= d;
+                double sum_sq = 0.0;
+                for (size_t i = 0; i < total_elements; ++i)
+                    sum_sq += last_logits_->data()[i] * last_logits_->data()[i];
+                double l2_norm = std::sqrt(sum_sq / total_elements);
+                trace << "FINAL LOGITS: L2_norm=" << l2_norm << std::endl;
+            }
+            trace.close();
         }
 
         // Context already updated by legacy_->prefill()
@@ -161,10 +196,10 @@ namespace llaminar
     }
 
     bool QwenPipelineAdapter::prefillBatch(
-        const std::vector<std::vector<int>>& token_batches,
-        const IModelWeights& weights_base,
-        StageContext& ctx,
-        std::shared_ptr<TensorBase>& out_logits)
+        const std::vector<std::vector<int>> &token_batches,
+        const IModelWeights &weights_base,
+        StageContext &ctx,
+        std::shared_ptr<TensorBase> &out_logits)
     {
         if (!legacy_)
         {
@@ -172,7 +207,7 @@ namespace llaminar
             return false;
         }
 
-        const auto* wm = dynamic_cast<const QwenModelWeights*>(&weights_base);
+        const auto *wm = dynamic_cast<const QwenModelWeights *>(&weights_base);
         if (!wm)
         {
             LOG_ERROR("QwenPipelineAdapter: invalid weights type (prefillBatch)");
@@ -192,10 +227,10 @@ namespace llaminar
     }
 
     bool QwenPipelineAdapter::decodeBatch(
-        const std::vector<int>& next_tokens,
-        const IModelWeights& weights_base,
-        StageContext& ctx,
-        std::shared_ptr<TensorBase>& out_logits)
+        const std::vector<int> &next_tokens,
+        const IModelWeights &weights_base,
+        StageContext &ctx,
+        std::shared_ptr<TensorBase> &out_logits)
     {
         if (!legacy_)
         {
@@ -203,7 +238,7 @@ namespace llaminar
             return false;
         }
 
-        const auto* wm = dynamic_cast<const QwenModelWeights*>(&weights_base);
+        const auto *wm = dynamic_cast<const QwenModelWeights *>(&weights_base);
         if (!wm)
         {
             LOG_ERROR("QwenPipelineAdapter: invalid weights type (decodeBatch)");

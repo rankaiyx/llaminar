@@ -10,6 +10,8 @@
 #include "Logger.h"
 #include "BiasContracts.h"
 #include "common/TensorHealthCheck.h"
+#include "common/AttentionPrimitives.h"
+#include "common/SoftmaxCore.h"
 #include "attention/AttentionStageContracts.h"
 #include "utils/DebugEnv.h"
 #include "AdaptiveMatmul.h"
@@ -53,13 +55,7 @@ namespace llaminar
             n_kv_heads_local_++;
         }
 
-        // Precompute RoPE frequencies for maximum sequence length
-        const int max_seq_len = 2048;
-        rope_freqs_.resize(head_dim_ / 2);
-        for (int i = 0; i < head_dim_ / 2; ++i)
-        {
-            rope_freqs_[i] = 1.0f / std::pow(rope_freq_base_, 2.0f * i / head_dim_);
-        }
+        // RoPE frequencies are computed on-demand by AttentionPrimitives::apply_rope_batched
 
         if (rank == 0)
         {
@@ -67,6 +63,22 @@ namespace llaminar
                                                                           << " n_kv_heads=" << n_kv_heads_ << " head_dim=" << head_dim_
                                                                           << " (local: " << n_heads_local_ << " heads, offset=" << head_offset_ << ")");
         }
+    }
+
+    std::pair<int, int> MPIAttentionBatchOperator::getKVHeadDistribution() const
+    {
+        return getKVHeadDistribution(getRank());
+    }
+
+    std::pair<int, int> MPIAttentionBatchOperator::getKVHeadDistribution(int rank) const
+    {
+        int heads_per_rank = n_kv_heads_ / getSize();
+        int remainder = n_kv_heads_ % getSize();
+
+        int local_heads = heads_per_rank + (rank < remainder ? 1 : 0);
+        int head_offset = rank * heads_per_rank + std::min(rank, remainder);
+
+        return {local_heads, head_offset};
     }
 
     bool MPIAttentionBatchOperator::validate(
@@ -124,12 +136,8 @@ namespace llaminar
         const std::vector<std::shared_ptr<TensorBase>> &inputs,
         std::vector<std::shared_ptr<TensorBase>> &outputs)
     {
-        // CRITICAL DEBUG: This should appear if execute() is being called!
-        std::cerr << "[RANK " << getRank() << "] *** MPIAttentionBatchOperator::execute() ENTRY POINT ***" << std::endl;
-
         if (!validate(inputs, outputs))
         {
-            std::cerr << "[RANK " << getRank() << "] *** MPIAttentionBatchOperator::execute() VALIDATION FAILED ***" << std::endl;
             return false;
         }
 
@@ -151,14 +159,23 @@ namespace llaminar
         int D = input_shape[2]; // d_model
 
         int rank = getRank();
+        int world_size = getSize();
 
         // ========================================================================
-        // Weight validation - catch dimension mismatches early
+        // Weight validation - detect whether weights are pre-sliced or replicated
         // ========================================================================
-        const int expected_wq_rows = n_heads_ * head_dim_;    // Full Q projection output
-        const int expected_wk_rows = n_kv_heads_ * head_dim_; // Full K projection output
-        const int expected_wv_rows = n_kv_heads_ * head_dim_; // Full V projection output
-        const int expected_wo_cols = n_heads_ * head_dim_;    // Full output projection input
+
+        // Expected dimensions for REPLICATED weights (full matrices)
+        const int expected_wq_rows_full = n_heads_ * head_dim_;    // Full Q projection output
+        const int expected_wk_rows_full = n_kv_heads_ * head_dim_; // Full K projection output
+        const int expected_wv_rows_full = n_kv_heads_ * head_dim_; // Full V projection output
+        const int expected_wo_cols_full = n_heads_ * head_dim_;    // Full output projection input
+
+        // Expected dimensions for PRE-SLICED weights (distributed across ranks)
+        const int expected_wq_rows_sliced = (n_heads_ / world_size) * head_dim_;    // Q slice: 7 heads per rank = 448
+        const int expected_wk_rows_sliced = (n_kv_heads_ / world_size) * head_dim_; // K slice: 1 head per rank = 64
+        const int expected_wv_rows_sliced = (n_kv_heads_ / world_size) * head_dim_; // V slice: 1 head per rank = 64
+        const int expected_wo_cols_sliced = (n_heads_ / world_size) * head_dim_;    // O slice: 7 heads per rank = 448
 
         const int wq_rows = static_cast<int>(wq->shape()[0]);
         const int wq_cols = static_cast<int>(wq->shape()[1]);
@@ -169,31 +186,41 @@ namespace llaminar
         const int wo_rows = static_cast<int>(wo->shape()[0]);
         const int wo_cols = static_cast<int>(wo->shape()[1]);
 
-        // Validate weight dimensions
-        if (wq_rows != expected_wq_rows || wq_cols != D)
+        // Detect weight distribution mode
+        bool wq_is_sliced = (wq_rows == expected_wq_rows_sliced);
+        bool wq_is_full = (wq_rows == expected_wq_rows_full);
+        bool wk_is_sliced = (wk_rows == expected_wk_rows_sliced);
+        bool wk_is_full = (wk_rows == expected_wk_rows_full);
+        bool wv_is_sliced = (wv_rows == expected_wv_rows_sliced);
+        bool wv_is_full = (wv_rows == expected_wv_rows_full);
+        bool wo_is_sliced = (wo_cols == expected_wo_cols_sliced);
+        bool wo_is_full = (wo_cols == expected_wo_cols_full);
+
+        // All weights must use same mode (either all sliced or all full)
+        bool all_sliced = (wq_is_sliced && wk_is_sliced && wv_is_sliced && wo_is_sliced);
+        bool all_full = (wq_is_full && wk_is_full && wv_is_full && wo_is_full);
+
+        if (!all_sliced && !all_full)
         {
-            LOG_ERROR("[MPIAttentionBatch] wq dimension mismatch: got [" << wq_rows << "," << wq_cols
-                                                                         << "], expected [" << expected_wq_rows << "," << D << "]");
-            LOG_ERROR("  n_heads=" << n_heads_ << " head_dim=" << head_dim_ << " D=" << D);
+            LOG_ERROR("[MPIAttentionBatch] Inconsistent weight distribution!");
+            LOG_ERROR("  wq: " << (wq_is_sliced ? "SLICED" : (wq_is_full ? "FULL" : "INVALID")) << " [" << wq_rows << "," << wq_cols << "]");
+            LOG_ERROR("  wk: " << (wk_is_sliced ? "SLICED" : (wk_is_full ? "FULL" : "INVALID")) << " [" << wk_rows << "," << wk_cols << "]");
+            LOG_ERROR("  wv: " << (wv_is_sliced ? "SLICED" : (wv_is_full ? "FULL" : "INVALID")) << " [" << wv_rows << "," << wv_cols << "]");
+            LOG_ERROR("  wo: " << (wo_is_sliced ? "SLICED" : (wo_is_full ? "FULL" : "INVALID")) << " [" << wo_rows << "," << wo_cols << "]");
             return false;
         }
-        if (wk_rows != expected_wk_rows || wk_cols != D)
+
+        bool using_pre_sliced_weights = all_sliced;
+
+        if (rank == 0)
         {
-            LOG_ERROR("[MPIAttentionBatch] wk dimension mismatch: got [" << wk_rows << "," << wk_cols
-                                                                         << "], expected [" << expected_wk_rows << "," << D << "]");
-            LOG_ERROR("  n_kv_heads=" << n_kv_heads_ << " head_dim=" << head_dim_ << " D=" << D);
-            return false;
+            LOG_DEBUG("[MPIAttentionBatch] Weight distribution mode: " << (using_pre_sliced_weights ? "PRE-SLICED" : "REPLICATED"));
         }
-        if (wv_rows != expected_wv_rows || wv_cols != D)
+
+        // Validate input/output dimensions (same for both modes)
+        if (wq_cols != D || wk_cols != D || wv_cols != D || wo_rows != D)
         {
-            LOG_ERROR("[MPIAttentionBatch] wv dimension mismatch: got [" << wv_rows << "," << wv_cols
-                                                                         << "], expected [" << expected_wv_rows << "," << D << "]");
-            return false;
-        }
-        if (wo_rows != D || wo_cols != expected_wo_cols)
-        {
-            LOG_ERROR("[MPIAttentionBatch] wo dimension mismatch: got [" << wo_rows << "," << wo_cols
-                                                                         << "], expected [" << D << "," << expected_wo_cols << "]");
+            LOG_ERROR("[MPIAttentionBatch] Weight column/row dimension mismatch with D=" << D);
             return false;
         }
 
@@ -256,54 +283,70 @@ namespace llaminar
 
         // Q projection (local computation, no MPI distribution)
         {
-            // Extract local rows from wq for this rank's heads
-            // Global wq shape: [n_heads * head_dim, d_model] = [out_dim, in_dim]
-            // Local wq shape: [n_heads_local * head_dim, d_model] = [out_dim_local, in_dim]
+            // Handle pre-sliced or replicated weights
             int local_rows = n_heads_local_ * head_dim_;
             int row_offset = head_offset_ * head_dim_;
 
-            if (getRank() == 0 && current_layer_idx_ == 0)
+            std::shared_ptr<TensorBase> wq_local;
+
+            if (using_pre_sliced_weights)
             {
-                LOG_INFO("[BATCH_Q_PROJ] Layer " << current_layer_idx_ << " Rank " << getRank()
-                                                 << " Q weight extraction:");
-                LOG_INFO("  n_heads=" << n_heads_ << " n_heads_local=" << n_heads_local_
-                                      << " head_dim=" << head_dim_ << " head_offset=" << head_offset_);
-                LOG_INFO("  local_rows=" << local_rows << " row_offset=" << row_offset
-                                         << " D=" << D);
-                LOG_INFO("  Global wq shape: [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
-                LOG_INFO("  Will extract rows [" << row_offset << ":" << (row_offset + local_rows) << "]");
-                LOG_INFO("  wq global first 5: [" << wq->data()[0] << ", " << wq->data()[1] << ", "
-                                                  << wq->data()[2] << ", " << wq->data()[3] << ", " << wq->data()[4] << "]");
-                LOG_INFO("  wq at offset " << (row_offset * D) << ": [" << wq->data()[row_offset * D]
-                                           << ", " << wq->data()[row_offset * D + 1] << ", " << wq->data()[row_offset * D + 2]
-                                           << ", " << wq->data()[row_offset * D + 3] << ", " << wq->data()[row_offset * D + 4] << "]");
+                // Weights already sliced - use directly
+                wq_local = wq;
+
+                if (getRank() == 0 && current_layer_idx_ == 0)
+                {
+                    LOG_DEBUG("[BATCH_Q_PROJ] Layer " << current_layer_idx_ << " Rank " << getRank()
+                                                      << " Using PRE-SLICED wq: [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
+                }
             }
+            else
+            {
+                // Replicated weights - extract local rows for this rank's heads
+                if (getRank() == 0 && current_layer_idx_ == 0)
+                {
+                    LOG_DEBUG("[BATCH_Q_PROJ] Layer " << current_layer_idx_ << " Rank " << getRank()
+                                                      << " Extracting from REPLICATED wq:");
+                    LOG_DEBUG("  n_heads=" << n_heads_ << " n_heads_local=" << n_heads_local_
+                                           << " head_dim=" << head_dim_ << " head_offset=" << head_offset_);
+                    LOG_DEBUG("  local_rows=" << local_rows << " row_offset=" << row_offset << " D=" << D);
+                    LOG_DEBUG("  Global wq shape: [" << wq->shape()[0] << ", " << wq->shape()[1] << "]");
+                }
 
-            // MPILinearBatchOperator expects weights as [out_dim, in_dim]
-            auto wq_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows, D});
+                wq_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows, D});
 
-            // Extract rows [row_offset : row_offset + local_rows] - simple memcpy of contiguous data
-            size_t offset_elements = static_cast<size_t>(row_offset) * D;
-            size_t copy_elements = static_cast<size_t>(local_rows) * D;
-            std::memcpy(wq_local->data(), wq->data() + offset_elements, copy_elements * sizeof(float));
+                // Extract rows [row_offset : row_offset + local_rows]
+                size_t offset_elements = static_cast<size_t>(row_offset) * D;
+                size_t copy_elements = static_cast<size_t>(local_rows) * D;
+                std::memcpy(wq_local->data(), wq->data() + offset_elements, copy_elements * sizeof(float));
+            }
 
             // Extract local bias if present
             std::shared_ptr<TensorBase> bq_local;
             if (bq && bq->size() > 0)
             {
-                bq_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows});
-                const float *bq_data = bq->data();
-                float *bq_local_data = bq_local->data();
-                std::copy(bq_data + row_offset, bq_data + row_offset + local_rows, bq_local_data);
+                if (using_pre_sliced_weights)
+                {
+                    // Bias already sliced - use directly
+                    bq_local = bq;
+                }
+                else
+                {
+                    // Replicated bias - extract local portion
+                    bq_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows});
+                    const float *bq_data = bq->data();
+                    float *bq_local_data = bq_local->data();
+                    std::copy(bq_data + row_offset, bq_data + row_offset + local_rows, bq_local_data);
+                }
             }
 
             if (getRank() == 0 && current_layer_idx_ == 0)
             {
-                LOG_INFO("[BATCH_Q_PROJ] Local wq_local first 5: [" << wq_local->data()[0] << ", "
-                                                                    << wq_local->data()[1] << ", " << wq_local->data()[2] << ", "
-                                                                    << wq_local->data()[3] << ", " << wq_local->data()[4] << "]");
-                LOG_INFO("[BATCH_Q_PROJ] Input first 5: [" << input->data()[0] << ", " << input->data()[1]
-                                                           << ", " << input->data()[2] << ", " << input->data()[3] << ", " << input->data()[4] << "]");
+                LOG_DEBUG("[BATCH_Q_PROJ] Local wq_local first 5: [" << wq_local->data()[0] << ", "
+                                                                     << wq_local->data()[1] << ", " << wq_local->data()[2] << ", "
+                                                                     << wq_local->data()[3] << ", " << wq_local->data()[4] << "]");
+                LOG_DEBUG("[BATCH_Q_PROJ] Input first 5: [" << input->data()[0] << ", " << input->data()[1]
+                                                            << ", " << input->data()[2] << ", " << input->data()[3] << ", " << input->data()[4] << "]");
             }
 
             // CONTRACT: Q projection must compute FULL local head dimensions without MPI re-distribution
@@ -317,7 +360,7 @@ namespace llaminar
 
             if (getRank() == 0)
             {
-                LOG_ERROR("[FIX_Q_PROJ] About to call adaptiveMatMul: m=" << m << " n=" << n << " k=" << k);
+                LOG_DEBUG("[FIX_Q_PROJ] About to call adaptiveMatMul: m=" << m << " n=" << n << " k=" << k);
             }
 
             // Flatten input: [B, T, D] -> [B*T, D]
@@ -349,14 +392,14 @@ namespace llaminar
 
             if (getRank() == 0 && current_layer_idx_ == 0)
             {
-                LOG_INFO("[BATCH_Q_PROJ] Q output (local) first 10: [" << q_local->data()[0] << ", "
-                                                                       << q_local->data()[1] << ", " << q_local->data()[2] << ", " << q_local->data()[3] << ", "
-                                                                       << q_local->data()[4] << ", " << q_local->data()[5] << ", " << q_local->data()[6] << ", "
-                                                                       << q_local->data()[7] << ", " << q_local->data()[8] << ", " << q_local->data()[9] << "]");
+                LOG_DEBUG("[BATCH_Q_PROJ] Q output (local) first 10: [" << q_local->data()[0] << ", "
+                                                                        << q_local->data()[1] << ", " << q_local->data()[2] << ", " << q_local->data()[3] << ", "
+                                                                        << q_local->data()[4] << ", " << q_local->data()[5] << ", " << q_local->data()[6] << ", "
+                                                                        << q_local->data()[7] << ", " << q_local->data()[8] << ", " << q_local->data()[9] << "]");
                 float q_min = *std::min_element(q_local->data(), q_local->data() + q_local->size());
                 float q_max = *std::max_element(q_local->data(), q_local->data() + q_local->size());
-                LOG_INFO("[BATCH_Q_PROJ] Q output stats: min=" << q_min << " max=" << q_max
-                                                               << " size=" << q_local->size());
+                LOG_DEBUG("[BATCH_Q_PROJ] Q output stats: min=" << q_min << " max=" << q_max
+                                                                << " size=" << q_local->size());
             }
 
             // Apply bias if present (linear operator doesn't support bias yet)
@@ -382,33 +425,52 @@ namespace llaminar
             int local_rows = n_kv_heads_local_ * head_dim_;
             int row_offset = (head_offset_ * n_kv_heads_ / n_heads_) * head_dim_; // Scale offset for GQA
 
-            if (debugEnv().attention.verbose && rank_ == 0)
+            std::shared_ptr<TensorBase> wk_local;
+
+            if (using_pre_sliced_weights)
             {
-                LOG_DEBUG("[MPIAttentionBatch] K weight extraction: wk->size()=" << wk->size()
-                                                                                 << " wk->shape()=[" << wk->shape()[0] << "," << wk->shape()[1] << "]"
-                                                                                 << " row_offset=" << row_offset << " local_rows=" << local_rows
-                                                                                 << " head_offset_=" << head_offset_ << " n_kv_heads_=" << n_kv_heads_ << " n_heads_=" << n_heads_);
-                // Check first few values of global wk
-                const float *wk_data = wk->data();
-                LOG_DEBUG("[MPIAttentionBatch] Global wk first 5 values: "
-                          << wk_data[0] << ", " << wk_data[1] << ", " << wk_data[2] << ", " << wk_data[3] << ", " << wk_data[4]);
+                // Weights already sliced - use directly
+                wk_local = wk;
+
+                if (debugEnv().attention.verbose && rank_ == 0)
+                {
+                    LOG_DEBUG("[MPIAttentionBatch] Using PRE-SLICED wk: [" << wk->shape()[0] << "," << wk->shape()[1] << "]");
+                }
             }
+            else
+            {
+                // Replicated weights - extract local rows
+                if (debugEnv().attention.verbose && rank_ == 0)
+                {
+                    LOG_DEBUG("[MPIAttentionBatch] K weight extraction from REPLICATED: wk->size()=" << wk->size()
+                                                                                                     << " wk->shape()=[" << wk->shape()[0] << "," << wk->shape()[1] << "]"
+                                                                                                     << " row_offset=" << row_offset << " local_rows=" << local_rows);
+                }
 
-            // MPILinearBatchOperator expects weights as [out_dim, in_dim]
-            auto wk_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows, D});
+                wk_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows, D});
 
-            // Extract rows - simple memcpy of contiguous data
-            size_t offset_elements = static_cast<size_t>(row_offset) * D;
-            size_t copy_elements = static_cast<size_t>(local_rows) * D;
-            std::memcpy(wk_local->data(), wk->data() + offset_elements, copy_elements * sizeof(float));
+                // Extract rows - simple memcpy of contiguous data
+                size_t offset_elements = static_cast<size_t>(row_offset) * D;
+                size_t copy_elements = static_cast<size_t>(local_rows) * D;
+                std::memcpy(wk_local->data(), wk->data() + offset_elements, copy_elements * sizeof(float));
+            }
 
             std::shared_ptr<TensorBase> bk_local;
             if (bk && bk->size() > 0)
             {
-                bk_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows});
-                const float *bk_data = bk->data();
-                float *bk_local_data = bk_local->data();
-                std::copy(bk_data + row_offset, bk_data + row_offset + local_rows, bk_local_data);
+                if (using_pre_sliced_weights)
+                {
+                    // Bias already sliced - use directly
+                    bk_local = bk;
+                }
+                else
+                {
+                    // Replicated bias - extract local portion
+                    bk_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows});
+                    const float *bk_data = bk->data();
+                    float *bk_local_data = bk_local->data();
+                    std::copy(bk_data + row_offset, bk_data + row_offset + local_rows, bk_local_data);
+                }
             }
 
             // Direct K projection (no MPI distribution)
@@ -463,21 +525,40 @@ namespace llaminar
             int local_rows = n_kv_heads_local_ * head_dim_;
             int row_offset = (head_offset_ * n_kv_heads_ / n_heads_) * head_dim_;
 
-            // MPILinearBatchOperator expects weights as [out_dim, in_dim]
-            auto wv_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows, D});
+            std::shared_ptr<TensorBase> wv_local;
 
-            // Extract rows - simple memcpy of contiguous data
-            size_t offset_elements = static_cast<size_t>(row_offset) * D;
-            size_t copy_elements = static_cast<size_t>(local_rows) * D;
-            std::memcpy(wv_local->data(), wv->data() + offset_elements, copy_elements * sizeof(float));
+            if (using_pre_sliced_weights)
+            {
+                // Weights already sliced - use directly
+                wv_local = wv;
+            }
+            else
+            {
+                // Replicated weights - extract local rows
+                wv_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows, D});
+
+                // Extract rows - simple memcpy of contiguous data
+                size_t offset_elements = static_cast<size_t>(row_offset) * D;
+                size_t copy_elements = static_cast<size_t>(local_rows) * D;
+                std::memcpy(wv_local->data(), wv->data() + offset_elements, copy_elements * sizeof(float));
+            }
 
             std::shared_ptr<TensorBase> bv_local;
             if (bv && bv->size() > 0)
             {
-                bv_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows});
-                const float *bv_data = bv->data();
-                float *bv_local_data = bv_local->data();
-                std::copy(bv_data + row_offset, bv_data + row_offset + local_rows, bv_local_data);
+                if (using_pre_sliced_weights)
+                {
+                    // Bias already sliced - use directly
+                    bv_local = bv;
+                }
+                else
+                {
+                    // Replicated bias - extract local portion
+                    bv_local = std::make_shared<SimpleTensor>(std::vector<int>{local_rows});
+                    const float *bv_data = bv->data();
+                    float *bv_local_data = bv_local->data();
+                    std::copy(bv_data + row_offset, bv_data + row_offset + local_rows, bv_local_data);
+                }
             }
 
             // Direct V projection (no MPI distribution)
@@ -555,7 +636,7 @@ namespace llaminar
             // DEBUG: Log local Q values before gathering
             if (rank == 0 && current_layer_idx_ == 0)
             {
-                LOG_ERROR("[Q_LOCAL_DEBUG] Before gather - Local Q first 10: ["
+                LOG_DEBUG("[Q_LOCAL_DEBUG] Before gather - Local Q first 10: ["
                           << q_local->data()[0] << ", " << q_local->data()[1] << ", "
                           << q_local->data()[2] << ", " << q_local->data()[3] << ", "
                           << q_local->data()[4] << ", " << q_local->data()[5] << ", "
@@ -563,7 +644,7 @@ namespace llaminar
                           << q_local->data()[8] << ", " << q_local->data()[9] << "]");
                 float q_min = *std::min_element(q_local->data(), q_local->data() + q_local->size());
                 float q_max = *std::max_element(q_local->data(), q_local->data() + q_local->size());
-                LOG_ERROR("[Q_LOCAL_DEBUG] Local Q stats: size=" << q_local->size()
+                LOG_DEBUG("[Q_LOCAL_DEBUG] Local Q stats: size=" << q_local->size()
                                                                  << " min=" << q_min << " max=" << q_max);
             }
 
@@ -580,10 +661,10 @@ namespace llaminar
                 // DEBUG: Log gather parameters
                 if (rank == 0 && current_layer_idx_ == 0)
                 {
-                    LOG_ERROR("[BATCH_GATHER_DEBUG] Q gather parameters:");
-                    LOG_ERROR("  Using MPI_Allgather (matching sequential path)");
-                    LOG_ERROR("  sendcount=" << q_local_size << " per rank");
-                    LOG_ERROR("  Local Q before gather [0:5]: [" << q_local->data()[0] << ", "
+                    LOG_DEBUG("[BATCH_GATHER_DEBUG] Q gather parameters:");
+                    LOG_DEBUG("  Using MPI_Allgather (matching sequential path)");
+                    LOG_DEBUG("  sendcount=" << q_local_size << " per rank");
+                    LOG_DEBUG("  Local Q before gather [0:5]: [" << q_local->data()[0] << ", "
                                                                  << q_local->data()[1] << ", " << q_local->data()[2] << ", "
                                                                  << q_local->data()[3] << ", " << q_local->data()[4] << "]");
                 }
@@ -609,14 +690,14 @@ namespace llaminar
                 // DEBUG: Log gathered result
                 if (rank == 0 && current_layer_idx_ == 0)
                 {
-                    LOG_ERROR("[BATCH_GATHER_DEBUG] After gather and rearrange:");
-                    LOG_ERROR("  Total size: " << q_snapshot->size());
-                    LOG_ERROR("  First 10: [" << q_snapshot->data()[0] << ", " << q_snapshot->data()[1] << ", "
+                    LOG_DEBUG("[BATCH_GATHER_DEBUG] After gather and rearrange:");
+                    LOG_DEBUG("  Total size: " << q_snapshot->size());
+                    LOG_DEBUG("  First 10: [" << q_snapshot->data()[0] << ", " << q_snapshot->data()[1] << ", "
                                               << q_snapshot->data()[2] << ", " << q_snapshot->data()[3] << ", "
                                               << q_snapshot->data()[4] << ", " << q_snapshot->data()[5] << ", "
                                               << q_snapshot->data()[6] << ", " << q_snapshot->data()[7] << ", "
                                               << q_snapshot->data()[8] << ", " << q_snapshot->data()[9] << "]");
-                    LOG_ERROR("  At offset 1792 (rank1 start): [" << q_snapshot->data()[1792] << ", "
+                    LOG_DEBUG("  At offset 1792 (rank1 start): [" << q_snapshot->data()[1792] << ", "
                                                                   << q_snapshot->data()[1793] << ", " << q_snapshot->data()[1794] << ", "
                                                                   << q_snapshot->data()[1795] << ", " << q_snapshot->data()[1796] << "]");
                 }
@@ -691,11 +772,27 @@ namespace llaminar
         // Q: [B, T, n_heads_local * head_dim] -> [B, n_heads_local, T, head_dim]
         // This is a logical reshape, we'll work with the data in-place
 
+        // DEBUG: Log Q/K BEFORE RoPE
+        if (rank == 0 && current_layer_idx_ == 0)
+        {
+            LOG_DEBUG("[ROPE_DEBUG] BEFORE RoPE application:");
+            LOG_DEBUG("  Q_local[0:5]: [" << q_local->data()[0] << ", " << q_local->data()[1] << ", "
+                                          << q_local->data()[2] << ", " << q_local->data()[3] << ", " << q_local->data()[4] << "]");
+            LOG_DEBUG("  K_local[0:5]: [" << k_local->data()[0] << ", " << k_local->data()[1] << ", "
+                                          << k_local->data()[2] << ", " << k_local->data()[3] << ", " << k_local->data()[4] << "]");
+        }
+
         applyRoPE(q_local->data(), k_local->data(), B, T);
 
         // DEBUG: Check Q/K after RoPE
-        if (rank == 0 && debugEnv().attention.verbose)
+        if (rank == 0 && current_layer_idx_ == 0)
         {
+            LOG_DEBUG("[ROPE_DEBUG] AFTER RoPE application:");
+            LOG_DEBUG("  Q_local[0:5]: [" << q_local->data()[0] << ", " << q_local->data()[1] << ", "
+                                          << q_local->data()[2] << ", " << q_local->data()[3] << ", " << q_local->data()[4] << "]");
+            LOG_DEBUG("  K_local[0:5]: [" << k_local->data()[0] << ", " << k_local->data()[1] << ", "
+                                          << k_local->data()[2] << ", " << k_local->data()[3] << ", " << k_local->data()[4] << "]");
+
             auto check_tensor = [](const float *data, size_t size, const char *name)
             {
                 float min_val = data[0], max_val = data[0];
@@ -717,50 +814,108 @@ namespace llaminar
             int rank = getRank();
             int size = getSize();
 
-            // First gather Q globally
+            // First gather Q globally using same pattern as Q/K/V projections
             auto q_global = std::make_shared<SimpleTensor>(std::vector<int>{B, T, n_heads_ * head_dim_});
             int q_local_size = B * T * n_heads_local_ * head_dim_;
 
             if (size > 1)
             {
-                std::vector<int> recvcounts(size);
-                std::vector<int> displs(size);
-                int offset = 0;
-                for (int r = 0; r < size; ++r)
+                // DEBUG: Log Q_local before gather
+                if (rank == 0 && current_layer_idx_ == 0)
                 {
-                    int heads_on_rank = n_heads_ / size + (r < (n_heads_ % size) ? 1 : 0);
-                    recvcounts[r] = B * T * heads_on_rank * head_dim_;
-                    displs[r] = offset;
-                    offset += recvcounts[r];
+                    LOG_DEBUG("[ROPE_GATHER_DEBUG] Q_local BEFORE gather:");
+                    LOG_DEBUG("  Token 0: [" << q_local->data()[0] << ", " << q_local->data()[1] << ", " << q_local->data()[2] << "]");
+                    LOG_DEBUG("  Token 1 (offset 448): [" << q_local->data()[448] << ", " << q_local->data()[449] << ", " << q_local->data()[450] << "]");
                 }
-                MPI_Allgatherv(q_local->data(), q_local_size, MPI_FLOAT,
-                               q_global->data(), recvcounts.data(), displs.data(), MPI_FLOAT,
-                               MPI_COMM_WORLD);
+
+                // Gather into temp buffer, then rearrange from rank-major to row-interleaved
+                auto temp_q = std::make_shared<SimpleTensor>(std::vector<int>{B * T * n_heads_ * head_dim_});
+                MPI_Allgather(q_local->data(), q_local_size, MPI_FLOAT,
+                              temp_q->data(), q_local_size, MPI_FLOAT,
+                              MPI_COMM_WORLD);
+
+                // DEBUG: Log temp_q after gather
+                if (rank == 0 && current_layer_idx_ == 0)
+                {
+                    LOG_DEBUG("[ROPE_GATHER_DEBUG] temp_q AFTER gather:");
+                    LOG_DEBUG("  Rank0 token 0: [" << temp_q->data()[0] << ", " << temp_q->data()[1] << ", " << temp_q->data()[2] << "]");
+                    LOG_DEBUG("  Rank0 token 1 (offset 448): [" << temp_q->data()[448] << ", " << temp_q->data()[449] << ", " << temp_q->data()[450] << "]");
+                    LOG_DEBUG("  Rank1 start (offset 1792): [" << temp_q->data()[1792] << ", " << temp_q->data()[1793] << ", " << temp_q->data()[1794] << "]");
+                }
+
+                // Rearrange from rank-major to row-interleaved
+                for (int t = 0; t < T; ++t)
+                {
+                    for (int r = 0; r < size; ++r)
+                    {
+                        const float *src = temp_q->data() + r * q_local_size + t * n_heads_local_ * head_dim_;
+                        float *dst = q_global->data() + t * n_heads_ * head_dim_ + r * n_heads_local_ * head_dim_;
+                        std::memcpy(dst, src, n_heads_local_ * head_dim_ * sizeof(float));
+                    }
+                }
+
+                // DEBUG: Log q_global after rearrange
+                if (rank == 0 && current_layer_idx_ == 0)
+                {
+                    LOG_DEBUG("[ROPE_GATHER_DEBUG] q_global AFTER rearrange:");
+                    LOG_DEBUG("  Token 0: [" << q_global->data()[0] << ", " << q_global->data()[1] << ", " << q_global->data()[2] << "]");
+                    LOG_DEBUG("  Token 1 (offset 896): [" << q_global->data()[896] << ", " << q_global->data()[897] << ", " << q_global->data()[898] << "]");
+                }
             }
             else
             {
                 std::copy(q_local->data(), q_local->data() + q_local_size, q_global->data());
             }
 
-            // Then gather K globally
+            // Then gather K globally using same pattern
             auto k_global = std::make_shared<SimpleTensor>(std::vector<int>{B, T, n_kv_heads_ * head_dim_});
             int k_local_size = B * T * n_kv_heads_local_ * head_dim_;
 
             if (size > 1)
             {
-                std::vector<int> recvcounts(size);
-                std::vector<int> displs(size);
-                int offset = 0;
-                for (int r = 0; r < size; ++r)
+                // DEBUG: Log K_local before gather
+                if (rank == 0 && current_layer_idx_ == 0)
                 {
-                    int kv_heads_on_rank = n_kv_heads_ / size + (r < (n_kv_heads_ % size) ? 1 : 0);
-                    recvcounts[r] = B * T * kv_heads_on_rank * head_dim_;
-                    displs[r] = offset;
-                    offset += recvcounts[r];
+                    LOG_DEBUG("[ROPE_K_GATHER_DEBUG] K_local BEFORE gather:");
+                    LOG_DEBUG("  k_local_size=" << k_local_size << " n_kv_heads_local_=" << n_kv_heads_local_);
+                    LOG_DEBUG("  Token 0: [" << k_local->data()[0] << ", " << k_local->data()[1] << ", " << k_local->data()[2] << "]");
                 }
-                MPI_Allgatherv(k_local->data(), k_local_size, MPI_FLOAT,
-                               k_global->data(), recvcounts.data(), displs.data(), MPI_FLOAT,
-                               MPI_COMM_WORLD);
+
+                // Gather into temp buffer, then rearrange from rank-major to row-interleaved
+                auto temp_k = std::make_shared<SimpleTensor>(std::vector<int>{B * T * n_kv_heads_ * head_dim_});
+                MPI_Allgather(k_local->data(), k_local_size, MPI_FLOAT,
+                              temp_k->data(), k_local_size, MPI_FLOAT,
+                              MPI_COMM_WORLD);
+
+                // DEBUG: Log temp_k after gather
+                if (rank == 0 && current_layer_idx_ == 0)
+                {
+                    LOG_DEBUG("[ROPE_K_GATHER_DEBUG] temp_k AFTER gather:");
+                    LOG_DEBUG("  Rank0 token 0: [" << temp_k->data()[0] << ", " << temp_k->data()[1] << ", " << temp_k->data()[2] << "]");
+                    LOG_DEBUG("  Rank1 start (offset " << k_local_size << "): [" << temp_k->data()[k_local_size] << ", " << temp_k->data()[k_local_size + 1] << ", " << temp_k->data()[k_local_size + 2] << "]");
+                }
+
+                // Rearrange from rank-major to row-interleaved
+                for (int t = 0; t < T; ++t)
+                {
+                    for (int r = 0; r < size; ++r)
+                    {
+                        const float *src = temp_k->data() + r * k_local_size + t * n_kv_heads_local_ * head_dim_;
+                        float *dst = k_global->data() + t * n_kv_heads_ * head_dim_ + r * n_kv_heads_local_ * head_dim_;
+                        std::memcpy(dst, src, n_kv_heads_local_ * head_dim_ * sizeof(float));
+                    }
+                }
+
+                // DEBUG: Log k_global after rearrange
+                if (rank == 0 && current_layer_idx_ == 0)
+                {
+                    LOG_DEBUG("[ROPE_K_GATHER_DEBUG] k_global AFTER rearrange:");
+                    LOG_DEBUG("  Token 0: [" << k_global->data()[0] << ", " << k_global->data()[1] << ", " << k_global->data()[2] << "]");
+                    LOG_DEBUG("  Token 0 rank1 offset (offset 64): [" << k_global->data()[64] << ", " << k_global->data()[65] << ", " << k_global->data()[66] << "]");
+                    LOG_DEBUG("  Token 3 offset 384 (3*128): [" << k_global->data()[384] << ", " << k_global->data()[385] << ", " << k_global->data()[386] << "]");
+                    LOG_DEBUG("  Token 3 rank1 head (offset 448=384+64): [" << k_global->data()[448] << ", " << k_global->data()[449] << ", " << k_global->data()[450] << "]");
+                    LOG_DEBUG("  Token 3 pos 96 (offset 480=384+96): " << k_global->data()[480]);
+                }
             }
             else
             {
@@ -775,20 +930,127 @@ namespace llaminar
             auto rope_snapshot = std::make_shared<SimpleTensor>(std::vector<int>{B, T, total_features});
             float *rope_data = rope_snapshot->data();
 
+            // DEBUG: Log concatenation parameters
+            if (rank == 0 && current_layer_idx_ == 0)
+            {
+                LOG_DEBUG("[ROPE_CONCAT_DEBUG] Concatenation parameters:");
+                LOG_DEBUG("  B=" << B << " T=" << T);
+                LOG_DEBUG("  q_features_global=" << q_features_global << " k_features_global=" << k_features_global);
+                LOG_DEBUG("  total_features=" << total_features);
+                LOG_DEBUG("  q_global size=" << q_global->size() << " k_global size=" << k_global->size());
+            }
+
             for (int b = 0; b < B; ++b)
             {
                 for (int t = 0; t < T; ++t)
                 {
-                    const float *q_src = q_global->data() + (b * T + t) * q_features_global;
-                    const float *k_src = k_global->data() + (b * T + t) * k_features_global;
-                    float *dst = rope_data + (b * T + t) * total_features;
+                    int q_offset = (b * T + t) * q_features_global;
+                    int k_offset = (b * T + t) * k_features_global;
+                    int dst_offset = (b * T + t) * total_features;
+
+                    const float *q_src = q_global->data() + q_offset;
+                    const float *k_src = k_global->data() + k_offset;
+                    float *dst = rope_data + dst_offset;
+
+                    // DEBUG: Log first token concatenation
+                    if (rank == 0 && current_layer_idx_ == 0 && b == 0 && t == 0)
+                    {
+                        LOG_DEBUG("[ROPE_CONCAT_DEBUG] Token t=0:");
+                        LOG_DEBUG("  q_offset=" << q_offset << " k_offset=" << k_offset << " dst_offset=" << dst_offset);
+                        LOG_DEBUG("  q_src[0:3]: [" << q_src[0] << ", " << q_src[1] << ", " << q_src[2] << "]");
+                        LOG_DEBUG("  k_src[0:3]: [" << k_src[0] << ", " << k_src[1] << ", " << k_src[2] << "]");
+                    }
 
                     std::copy(q_src, q_src + q_features_global, dst);
-                    std::copy(k_src, k_src + k_features_global, dst + k_features_global);
+                    std::copy(k_src, k_src + k_features_global, dst + q_features_global);
+
+                    // DEBUG: Verify after copy
+                    if (rank == 0 && current_layer_idx_ == 0 && b == 0 && t == 0)
+                    {
+                        LOG_DEBUG("[ROPE_CONCAT_DEBUG] After copy:");
+                        LOG_DEBUG("  dst[0:3] (Q): [" << dst[0] << ", " << dst[1] << ", " << dst[2] << "]");
+                        LOG_DEBUG("  dst[896:899] (K): [" << dst[896] << ", " << dst[897] << ", " << dst[898] << "]");
+                    }
                 }
             }
 
+            // DEBUG: Log rope_snapshot before callback
+            if (rank == 0 && current_layer_idx_ == 0)
+            {
+                LOG_DEBUG("[ROPE_SNAPSHOT_DEBUG] rope_snapshot before callback:");
+                LOG_DEBUG("  Shape: [" << B << ", " << T << ", " << total_features << "]");
+                LOG_DEBUG("  Total size: " << rope_snapshot->size());
+                LOG_DEBUG("  First token Q part [0:3]: [" << rope_snapshot->data()[0] << ", " << rope_snapshot->data()[1] << ", " << rope_snapshot->data()[2] << "]");
+                LOG_DEBUG("  First token K start (offset 896): [" << rope_snapshot->data()[896] << ", " << rope_snapshot->data()[897] << ", " << rope_snapshot->data()[898] << "]");
+                LOG_DEBUG("  Token 1 Q part (offset 1024): [" << rope_snapshot->data()[1024] << ", " << rope_snapshot->data()[1025] << ", " << rope_snapshot->data()[1026] << "]");
+            }
+
             snapshot_callback_(PipelineStage::ROPE_APPLICATION, current_layer_idx_, rope_snapshot);
+        }
+
+        // Step 2.5: Expand K and V for GQA (Grouped Query Attention)
+        // IMPORTANT: This must be OUTSIDE the snapshot_callback block!
+        // If n_kv_heads < n_heads, replicate KV heads to match Q head count
+        // E.g., Qwen: 2 KV heads → 14 Q heads, group_size=7
+        // Each KV head serves multiple Q heads
+
+        std::shared_ptr<SimpleTensor> k_expanded_local = k_local;
+        std::shared_ptr<SimpleTensor> v_expanded_local = v_local;
+
+        {
+            int rank = getRank();
+            LOG_DEBUG("[GQA_DEBUG] rank=" << rank << " current_layer_idx_=" << current_layer_idx_);
+            if (rank == 0 && current_layer_idx_ == 0)
+            {
+                LOG_DEBUG("[GQA_DEBUG] Checking GQA condition: n_kv_heads_=" << n_kv_heads_ << " n_heads_=" << n_heads_);
+            }
+
+            if (n_kv_heads_ < n_heads_)
+            {
+                if (rank == 0 && current_layer_idx_ == 0)
+                {
+                    LOG_DEBUG("[GQA_DEBUG] GQA expansion needed!");
+                }
+                // Allocate expanded K and V: [B, T, n_heads_local * head_dim]
+                k_expanded_local = std::make_shared<SimpleTensor>(
+                    std::vector<int>{B, T, n_heads_local_ * head_dim_});
+                v_expanded_local = std::make_shared<SimpleTensor>(
+                    std::vector<int>{B, T, n_heads_local_ * head_dim_});
+
+                // Get KV head distribution for this rank
+                auto [local_kv_heads, kv_offset] = getKVHeadDistribution();
+
+                // Expand K and V for each batch element
+                for (int b = 0; b < B; ++b)
+                {
+                    const float *k_src = k_local->data() + b * T * n_kv_heads_local_ * head_dim_;
+                    const float *v_src = v_local->data() + b * T * n_kv_heads_local_ * head_dim_;
+                    float *k_dst = k_expanded_local->data() + b * T * n_heads_local_ * head_dim_;
+                    float *v_dst = v_expanded_local->data() + b * T * n_heads_local_ * head_dim_;
+
+                    llaminar::attn::expand_kv_for_gqa(
+                        k_src, v_src,
+                        k_dst, v_dst,
+                        T,                 // seq_len
+                        head_dim_,         // head_dim
+                        n_heads_local_,    // n_heads (local Q heads)
+                        n_kv_heads_local_, // n_kv_heads (local KV heads)
+                        head_offset_,      // head_offset
+                        n_heads_,          // total_q_heads
+                        false,             // gathered_rank_major (data is already token-major)
+                        kv_offset);        // kv_head_offset_for_rank
+                }
+
+                // DEBUG: Log GQA expansion
+                if (rank == 0 && current_layer_idx_ == 0 && debugEnv().attention.verbose)
+                {
+                    LOG_DEBUG("[MPIAttentionBatch] GQA expansion:");
+                    LOG_DEBUG("  n_kv_heads_local=" << n_kv_heads_local_ << " → n_heads_local=" << n_heads_local_);
+                    LOG_DEBUG("  head_offset=" << head_offset_ << " kv_offset=" << kv_offset);
+                    LOG_DEBUG("  K before: [" << k_local->data()[0] << ", " << k_local->data()[1] << ", ...]");
+                    LOG_DEBUG("  K after: [" << k_expanded_local->data()[0] << ", " << k_expanded_local->data()[1] << ", ...]");
+                }
+            }
         }
 
         // Step 3: Compute attention scores with per-batch causal masking
@@ -798,7 +1060,7 @@ namespace llaminar
 
         computeAttentionScores(
             q_local->data(),
-            k_local->data(),
+            k_expanded_local->data(),
             scores.data(),
             B,
             T);
@@ -806,8 +1068,8 @@ namespace llaminar
         // Step 4: Apply causal mask and softmax per-batch
         applyCausalMaskAndSoftmax(scores.data(), B, T);
 
-        // DEBUG: Check scores after softmax
-        if (rank == 0 && debugEnv().attention.verbose)
+        // DEBUG: Check scores after softmax on all ranks at layer 0
+        if (current_layer_idx_ == 0)
         {
             float min_val = scores[0], max_val = scores[0];
             int nan_count = 0;
@@ -818,20 +1080,34 @@ namespace llaminar
                 min_val = std::min(min_val, scores[i]);
                 max_val = std::max(max_val, scores[i]);
             }
-            LOG_DEBUG("[MPIAttentionBatch] After softmax scores: min=" << min_val << " max=" << max_val << " nan_count=" << nan_count);
+            LOG_DEBUG("[SOFTMAX_CHECK] Rank " << getRank() << " After softmax: min=" << min_val << " max=" << max_val << " nan_count=" << nan_count);
         }
 
         // Step 5: Compute attention output: scores @ V
-        // attn_output: [B, n_heads_local, T, head_dim]
+        // CRITICAL: Primitive outputs [B, T, n_heads_local * head_dim], NOT [B, n_heads_local, T, head_dim]!
         auto attn_output_local = std::make_shared<SimpleTensor>(
-            std::vector<int>{B, n_heads_local_ * T, head_dim_});
+            std::vector<int>{B, T, n_heads_local_ * head_dim_});
 
         computeAttentionOutput(
             scores.data(),
-            v_local->data(),
+            v_expanded_local->data(),
             attn_output_local->data(),
             B,
             T);
+
+        // DEBUG: Check attention output after scores @ V on all ranks at layer 0
+        if (current_layer_idx_ == 0)
+        {
+            int nan_count = 0;
+            for (size_t i = 0; i < attn_output_local->size(); ++i)
+            {
+                if (std::isnan(attn_output_local->data()[i]))
+                    nan_count++;
+            }
+            LOG_DEBUG("[ATTN_OUTPUT_CHECK] Rank " << getRank() << " After scores@V: nan_count=" << nan_count
+                                                  << " first 5: [" << attn_output_local->data()[0] << ", " << attn_output_local->data()[1]
+                                                  << ", " << attn_output_local->data()[2] << ", " << attn_output_local->data()[3] << ", " << attn_output_local->data()[4] << "]");
+        }
 
         // Capture attention context (before output projection)
         // For consistency with sequential pipeline, gather to global tensors
@@ -840,78 +1116,66 @@ namespace llaminar
             int rank = getRank();
             int size = getSize();
 
-            // First transpose local data from [B, n_heads_local, T, head_dim] to [B, T, n_heads_local * head_dim]
-            auto context_local = std::make_shared<SimpleTensor>(
-                std::vector<int>{B, T, n_heads_local_ * head_dim_});
-
-            const float *attn_data = attn_output_local->data();
-            float *context_local_data = context_local->data();
-
-            for (int b = 0; b < B; ++b)
-            {
-                for (int h = 0; h < n_heads_local_; ++h)
-                {
-                    for (int t = 0; t < T; ++t)
-                    {
-                        const float *src = attn_data + (b * n_heads_local_ * T + h * T + t) * head_dim_;
-                        float *dst = context_local_data + (b * T + t) * (n_heads_local_ * head_dim_) + h * head_dim_;
-                        std::copy(src, src + head_dim_, dst);
-                    }
-                }
-            }
+            // attn_output_local is already in [B, T, n_heads_local * head_dim] format - perfect!
+            // No transpose needed, just use it directly as context_local
+            const float *context_local_data = attn_output_local->data();
 
             // Now gather to global tensor [B, T, n_heads * head_dim]
+            // CRITICAL: Must use row-by-row gather to match sequential operator's token-major layout!
             auto context_snapshot = std::make_shared<SimpleTensor>(
                 std::vector<int>{B, T, n_heads_ * head_dim_});
-            int context_local_size = B * T * n_heads_local_ * head_dim_;
 
             if (size > 1)
             {
-                std::vector<int> recvcounts(size);
-                std::vector<int> displs(size);
-                int offset = 0;
-                for (int r = 0; r < size; ++r)
+                // Gather row-by-row (token-by-token) across all batches
+                // This creates token-major layout where heads from all ranks are interleaved
+                int local_head_dim = n_heads_local_ * head_dim_;
+                int global_head_dim = n_heads_ * head_dim_;
+
+                if (rank == 0 && current_layer_idx_ == 0)
                 {
-                    int heads_on_rank = n_heads_ / size + (r < (n_heads_ % size) ? 1 : 0);
-                    recvcounts[r] = B * T * heads_on_rank * head_dim_;
-                    displs[r] = offset;
-                    offset += recvcounts[r];
+                    LOG_DEBUG("[ATTN_CONTEXT_GATHER] Gathering ATTENTION_CONTEXT:");
+                    LOG_DEBUG("  B=" << B << " T=" << T);
+                    LOG_DEBUG("  local_head_dim=" << local_head_dim << " (n_heads_local=" << n_heads_local_ << " * head_dim=" << head_dim_ << ")");
+                    LOG_DEBUG("  global_head_dim=" << global_head_dim << " (n_heads=" << n_heads_ << " * head_dim=" << head_dim_ << ")");
+                    LOG_DEBUG("  context_local first 5: [" << context_local_data[0] << ", " << context_local_data[1] << ", "
+                                                           << context_local_data[2] << ", " << context_local_data[3] << ", " << context_local_data[4] << "]");
                 }
-                MPI_Allgatherv(context_local_data, context_local_size, MPI_FLOAT,
-                               context_snapshot->data(), recvcounts.data(), displs.data(), MPI_FLOAT,
-                               MPI_COMM_WORLD);
+
+                for (int b = 0; b < B; ++b)
+                {
+                    for (int t = 0; t < T; ++t)
+                    {
+                        const float *local_row = context_local_data + (b * T + t) * local_head_dim;
+                        float *global_row = context_snapshot->data() + (b * T + t) * global_head_dim;
+
+                        MPI_Allgather(local_row, local_head_dim, MPI_FLOAT,
+                                      global_row, local_head_dim, MPI_FLOAT,
+                                      MPI_COMM_WORLD);
+                    }
+                }
+
+                if (rank == 0 && current_layer_idx_ == 0)
+                {
+                    LOG_DEBUG("[ATTN_CONTEXT_GATHER] After gather:");
+                    LOG_DEBUG("  context_snapshot first 5: [" << context_snapshot->data()[0] << ", " << context_snapshot->data()[1] << ", "
+                                                              << context_snapshot->data()[2] << ", " << context_snapshot->data()[3] << ", " << context_snapshot->data()[4] << "]");
+                    LOG_DEBUG("  At offset 448 (rank1 start): [" << context_snapshot->data()[448] << ", " << context_snapshot->data()[449] << ", "
+                                                                 << context_snapshot->data()[450] << "]");
+                }
             }
             else
             {
+                int context_local_size = B * T * n_heads_local_ * head_dim_;
                 std::copy(context_local_data, context_local_data + context_local_size, context_snapshot->data());
             }
 
             snapshot_callback_(PipelineStage::ATTENTION_CONTEXT, current_layer_idx_, context_snapshot);
         }
 
-        // Step 6: Reshape and concatenate heads
-        // attn_output_local: [B, n_heads_local, T, head_dim] -> [B, T, n_heads_local * head_dim]
-        auto attn_concat_local = std::make_shared<SimpleTensor>(
-            std::vector<int>{B, T, n_heads_local_ * head_dim_});
-
-        {
-            const float *attn_data = attn_output_local->data();
-            float *concat_data = attn_concat_local->data();
-
-            // Transpose from [B, n_heads_local, T, head_dim] to [B, T, n_heads_local, head_dim]
-            for (int b = 0; b < B; ++b)
-            {
-                for (int h = 0; h < n_heads_local_; ++h)
-                {
-                    for (int t = 0; t < T; ++t)
-                    {
-                        const float *src = attn_data + (b * n_heads_local_ * T + h * T + t) * head_dim_;
-                        float *dst = concat_data + (b * T + t) * (n_heads_local_ * head_dim_) + h * head_dim_;
-                        std::copy(src, src + head_dim_, dst);
-                    }
-                }
-            }
-        }
+        // Step 6: Output projection preparation
+        // attn_output_local is already in [B, T, n_heads_local * head_dim] format - no reshape needed!
+        auto attn_concat_local = attn_output_local; // Just alias, no copy needed
 
         // Step 7: Output projection with distributed computation
         // Each rank computes partial output: [B*T, n_heads_local*head_dim] @ [n_heads_local*head_dim, D]^T
@@ -924,23 +1188,71 @@ namespace llaminar
         int local_out_cols = n_heads_local_ * head_dim_;
         int col_offset = head_offset_ * head_dim_;
 
-        auto wo_local = std::make_shared<SimpleTensor>(std::vector<int>{D, local_out_cols});
-        const float *wo_data = wo->data();
-        float *wo_local_data = wo_local->data();
+        std::shared_ptr<TensorBase> wo_local;
 
-        // Extract columns - need to copy column-wise from row-major matrix
-        for (int row = 0; row < D; ++row)
+        if (using_pre_sliced_weights)
         {
-            std::copy(
-                wo_data + row * wo_cols + col_offset,
-                wo_data + row * wo_cols + col_offset + local_out_cols,
-                wo_local_data + row * local_out_cols);
+            // Weights already column-sliced - use directly
+            wo_local = wo;
+        }
+        else
+        {
+            // Replicated weights - extract column slice
+            wo_local = std::make_shared<SimpleTensor>(std::vector<int>{D, local_out_cols});
+            const float *wo_data = wo->data();
+            float *wo_local_data = wo_local->data();
+
+            // Extract columns - need to copy column-wise from row-major matrix
+            for (int row = 0; row < D; ++row)
+            {
+                std::copy(
+                    wo_data + row * wo_cols + col_offset,
+                    wo_data + row * wo_cols + col_offset + local_out_cols,
+                    wo_local_data + row * local_out_cols);
+            }
         }
 
         // Reshape attn_concat_local to 2D for matrix multiplication
         int M = B * T;
         int K = local_out_cols;
         int N = D;
+
+        if (current_layer_idx_ == 0) // Log for all ranks on layer 0
+        {
+            // Check for NaN/Inf in input tensors
+            int attn_nan_count = 0, attn_inf_count = 0;
+            for (size_t i = 0; i < attn_concat_local->size(); ++i)
+            {
+                float val = attn_concat_local->data()[i];
+                if (std::isnan(val))
+                    attn_nan_count++;
+                if (std::isinf(val))
+                    attn_inf_count++;
+            }
+
+            int wo_nan_count = 0, wo_inf_count = 0;
+            for (size_t i = 0; i < wo_local->size(); ++i)
+            {
+                float val = wo_local->data()[i];
+                if (std::isnan(val))
+                    wo_nan_count++;
+                if (std::isinf(val))
+                    wo_inf_count++;
+            }
+
+            LOG_DEBUG("[WO_PROJ_DEBUG] Rank " << getRank() << " Output projection setup:");
+            LOG_DEBUG("  wo_local shape: [" << wo_local->shape()[0] << ", " << wo_local->shape()[1] << "]");
+            LOG_DEBUG("  attn_concat_local shape: [" << attn_concat_local->shape()[0] << ", "
+                                                     << attn_concat_local->shape()[1] << ", " << attn_concat_local->shape()[2] << "]");
+            LOG_DEBUG("  Matrix dims: M=" << M << " N=" << N << " K=" << K);
+            LOG_DEBUG("  using_pre_sliced_weights=" << using_pre_sliced_weights);
+            LOG_DEBUG("  attn_concat NaN/Inf: " << attn_nan_count << "/" << attn_inf_count);
+            LOG_DEBUG("  wo_local NaN/Inf: " << wo_nan_count << "/" << wo_inf_count);
+            LOG_DEBUG("  attn_concat first 5: [" << attn_concat_local->data()[0] << ", " << attn_concat_local->data()[1]
+                                                 << ", " << attn_concat_local->data()[2] << ", " << attn_concat_local->data()[3] << ", " << attn_concat_local->data()[4] << "]");
+            LOG_DEBUG("  wo_local first 5: [" << wo_local->data()[0] << ", " << wo_local->data()[1]
+                                              << ", " << wo_local->data()[2] << ", " << wo_local->data()[3] << ", " << wo_local->data()[4] << "]");
+        }
 
         // Compute partial output: [M, K] @ [N, K]^T = [M, N]
         // Note: wo_local is [N, K] stored row-major, so we use CblasTrans
@@ -952,11 +1264,48 @@ namespace llaminar
                     0.0f,
                     output->data(), N);
 
+        if (current_layer_idx_ == 0) // Log for all ranks on layer 0
+        {
+            LOG_DEBUG("[WO_PROJ_DEBUG] Rank " << getRank() << " After sgemm, before Allreduce:");
+            LOG_DEBUG("  output first 5: [" << output->data()[0] << ", " << output->data()[1]
+                                            << ", " << output->data()[2] << ", " << output->data()[3] << ", " << output->data()[4] << "]");
+
+            // Check for NaN/Inf
+            int nan_count = 0, inf_count = 0;
+            for (size_t i = 0; i < output->size(); ++i)
+            {
+                if (std::isnan(output->data()[i]))
+                    nan_count++;
+                if (std::isinf(output->data()[i]))
+                    inf_count++;
+            }
+            if (nan_count > 0 || inf_count > 0)
+            {
+                LOG_ERROR("  PRE-ALLREDUCE: Detected nan_count=" << nan_count << " inf_count=" << inf_count);
+            }
+        }
+
         // Step 8: MPI_Allreduce to sum partial outputs across ranks
         if (getSize() > 1)
         {
             MPI_Allreduce(MPI_IN_PLACE, output->data(), output->size(),
                           MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+        }
+
+        if (current_layer_idx_ == 0) // Log for all ranks on layer 0
+        {
+            LOG_DEBUG("[WO_PROJ_DEBUG] Rank " << getRank() << " After Allreduce:");
+            LOG_DEBUG("  output first 5: [" << output->data()[0] << ", " << output->data()[1]
+                                            << ", " << output->data()[2] << ", " << output->data()[3] << ", " << output->data()[4] << "]");
+
+            // Compute L2 norm for magnitude comparison
+            float sum_sq = 0.0f;
+            for (size_t i = 0; i < output->size(); ++i)
+            {
+                sum_sq += output->data()[i] * output->data()[i];
+            }
+            float l2_norm = std::sqrt(sum_sq / output->size());
+            LOG_ERROR("[MAGNITUDE_TRACE] Rank " << getRank() << " Layer0 Attention Output: L2_norm=" << l2_norm << " size=" << output->size());
         }
 
         if (rank == 0)
@@ -973,63 +1322,43 @@ namespace llaminar
         int batch_size,
         int seq_len)
     {
-        // Apply RoPE to Q and K tensors
-        // Q: [B, T, n_heads_local * head_dim] viewed as [B, n_heads_local, T, head_dim]
-        // K: [B, T, n_kv_heads_local * head_dim] viewed as [B, n_kv_heads_local, T, head_dim]
+        // Apply RoPE to Q and K tensors using proven AttentionPrimitives implementation
+        // Q: [B, T, n_heads_local * head_dim]
+        // K: [B, T, n_kv_heads_local * head_dim]
 
-        const int half_dim = head_dim_ / 2;
+        // Batch operator is for prefill mode, so n_past = 0
+        const int n_past = 0;
 
-// Apply to Q
-#pragma omp parallel for collapse(3)
-        for (int b = 0; b < batch_size; ++b)
+        // DEBUG: Log RoPE parameters
+        if (getRank() == 0 && current_layer_idx_ == 0)
         {
-            for (int h = 0; h < n_heads_local_; ++h)
-            {
-                for (int t = 0; t < seq_len; ++t)
-                {
-                    float *q_pos = q + (b * seq_len + t) * (n_heads_local_ * head_dim_) + h * head_dim_;
-
-                    for (int i = 0; i < half_dim; ++i)
-                    {
-                        float freq = rope_freqs_[i];
-                        float theta = t * freq;
-                        float cos_theta = std::cos(theta);
-                        float sin_theta = std::sin(theta);
-
-                        float x0 = q_pos[2 * i];
-                        float x1 = q_pos[2 * i + 1];
-
-                        q_pos[2 * i] = x0 * cos_theta - x1 * sin_theta;
-                        q_pos[2 * i + 1] = x0 * sin_theta + x1 * cos_theta;
-                    }
-                }
-            }
+            LOG_DEBUG("[ROPE_APPLY_DEBUG] Delegating to llaminar::attn::apply_rope_batched:");
+            LOG_DEBUG("  batch_size=" << batch_size << " seq_len=" << seq_len);
+            LOG_DEBUG("  n_heads_local_=" << n_heads_local_ << " n_kv_heads_local_=" << n_kv_heads_local_);
+            LOG_DEBUG("  head_dim_=" << head_dim_);
+            LOG_DEBUG("  n_past=" << n_past << " rope_freq_base_=" << rope_freq_base_);
         }
 
-// Apply to K
-#pragma omp parallel for collapse(3)
-        for (int b = 0; b < batch_size; ++b)
+        // Use proven RoPE implementation from AttentionPrimitives
+        // This ensures consistency with sequential operator and eliminates code duplication
+        llaminar::attn::apply_rope_batched(
+            q, k,
+            batch_size, seq_len, head_dim_,
+            n_heads_local_, n_kv_heads_local_,
+            n_past, rope_freq_base_);
+
+        // DEBUG: Log first few values after RoPE
+        if (getRank() == 0 && current_layer_idx_ == 0 && batch_size > 0 && seq_len > 0)
         {
-            for (int h = 0; h < n_kv_heads_local_; ++h)
+            LOG_DEBUG("[ROPE_APPLY_DEBUG] After apply_rope_batched:");
+            LOG_DEBUG("  q[batch=0, t=0, head=0, dim=0:3]: ["
+                      << q[0] << ", " << q[1] << ", " << q[2] << ", " << q[3] << "]");
+            if (seq_len > 1)
             {
-                for (int t = 0; t < seq_len; ++t)
-                {
-                    float *k_pos = k + (b * seq_len + t) * (n_kv_heads_local_ * head_dim_) + h * head_dim_;
-
-                    for (int i = 0; i < half_dim; ++i)
-                    {
-                        float freq = rope_freqs_[i];
-                        float theta = t * freq;
-                        float cos_theta = std::cos(theta);
-                        float sin_theta = std::sin(theta);
-
-                        float x0 = k_pos[2 * i];
-                        float x1 = k_pos[2 * i + 1];
-
-                        k_pos[2 * i] = x0 * cos_theta - x1 * sin_theta;
-                        k_pos[2 * i + 1] = x0 * sin_theta + x1 * cos_theta;
-                    }
-                }
+                int t1_offset = n_heads_local_ * head_dim_;
+                LOG_DEBUG("  q[batch=0, t=1, head=0, dim=0:3]: ["
+                          << q[t1_offset] << ", " << q[t1_offset + 1] << ", "
+                          << q[t1_offset + 2] << ", " << q[t1_offset + 3] << "]");
             }
         }
     }
@@ -1041,61 +1370,24 @@ namespace llaminar
         int batch_size,
         int seq_len)
     {
-        // Compute Q @ K^T for each batch and head independently
-        // Q: [B, T, n_heads_local * head_dim] viewed as [B, n_heads_local, T, head_dim]
-        // K: [B, T, n_kv_heads_local * head_dim] viewed as [B, n_kv_heads_local, T, head_dim]
+        // Compute Q @ K^T using proven AttentionPrimitives
+        // Q, K: [B, T, n_heads_local * head_dim]
         // scores: [B, n_heads_local, T, T]
 
-        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
-
-        // For GQA, we need to handle head groups
-        int heads_per_kv = n_heads_ / n_kv_heads_;
-
-        for (int b = 0; b < batch_size; ++b)
+        if (getRank() == 0 && current_layer_idx_ == 0)
         {
-            for (int h = 0; h < n_heads_local_; ++h)
-            {
-                // Determine which KV head this query head uses (for GQA)
-                // For tensor parallelism, typically each rank has n_kv_heads_local == 1
-                // and all local query heads share that single KV head
-                int kv_h = 0; // Simplified: use first local KV head
-                if (n_kv_heads_local_ > 1)
-                {
-                    // If we have multiple KV heads per rank, distribute query heads among them
-                    int heads_per_kv_local = (n_heads_local_ + n_kv_heads_local_ - 1) / n_kv_heads_local_;
-                    kv_h = h / heads_per_kv_local;
-                    if (kv_h >= n_kv_heads_local_)
-                        kv_h = n_kv_heads_local_ - 1;
-                }
-
-                // Get pointers for this batch and head
-                const float *q_head = q + (b * seq_len) * (n_heads_local_ * head_dim_) + h * head_dim_;
-                const float *k_head = k + (b * seq_len) * (n_kv_heads_local_ * head_dim_) + kv_h * head_dim_;
-                float *scores_head = scores + (b * n_heads_local_ + h) * seq_len * seq_len;
-
-                // Compute Q @ K^T: [T, head_dim] @ [head_dim, T] = [T, T]
-                // Q layout: q_head[t * (n_heads_local * head_dim) + 0..head_dim-1]
-                // K layout: k_head[t * (n_kv_heads_local * head_dim) + 0..head_dim-1]
-
-                int q_stride = n_heads_local_ * head_dim_;
-                int k_stride = n_kv_heads_local_ * head_dim_;
-
-                cblas_sgemm(
-                    CblasRowMajor, CblasNoTrans, CblasTrans,
-                    seq_len,     // M: rows of Q
-                    seq_len,     // N: cols of K^T (rows of K)
-                    head_dim_,   // K: cols of Q, cols of K^T
-                    scale,       // alpha: scale by 1/sqrt(head_dim)
-                    q_head,      // A: Q
-                    q_stride,    // lda: stride includes all heads
-                    k_head,      // B: K
-                    k_stride,    // ldb: stride includes all KV heads
-                    0.0f,        // beta
-                    scores_head, // C: scores
-                    seq_len      // ldc
-                );
-            }
+            LOG_DEBUG("[ATTN_SCORES_DEBUG] Delegating to llaminar::attn::compute_qk_scores_batched:");
+            LOG_DEBUG("  batch_size=" << batch_size << " seq_len=" << seq_len);
+            LOG_DEBUG("  n_heads_local_=" << n_heads_local_ << " head_dim_=" << head_dim_);
         }
+
+        // Use proven implementation from AttentionPrimitives
+        // This ensures consistency with sequential operator
+        llaminar::attn::compute_qk_scores_batched(
+            q, k, scores,
+            batch_size, seq_len, head_dim_, n_heads_local_,
+            true // causal masking
+        );
     }
 
     void MPIAttentionBatchOperator::applyCausalMaskAndSoftmax(
@@ -1103,55 +1395,33 @@ namespace llaminar
         int batch_size,
         int seq_len)
     {
-        // Apply causal mask and softmax independently per batch and head
+        // Apply softmax using proven SoftmaxCore implementation
         // scores: [B, n_heads_local, T, T]
+        // Note: causal masking already applied by compute_qk_scores_batched
 
-        const float NEG_INF = -1e9f;
+        if (getRank() == 0 && current_layer_idx_ == 0)
+        {
+            LOG_DEBUG("[SOFTMAX_DEBUG] Delegating to llaminar::kernels::softmax_row_major:");
+            LOG_DEBUG("  batch_size=" << batch_size << " seq_len=" << seq_len);
+            LOG_DEBUG("  n_heads_local_=" << n_heads_local_);
+        }
 
-#pragma omp parallel for collapse(2)
+        // Apply softmax to each head in each batch
         for (int b = 0; b < batch_size; ++b)
         {
             for (int h = 0; h < n_heads_local_; ++h)
             {
                 float *scores_head = scores + (b * n_heads_local_ + h) * seq_len * seq_len;
 
-                // Apply causal mask: position i can only attend to positions <= i
-                for (int i = 0; i < seq_len; ++i)
-                {
-                    // Apply mask to future positions
-                    for (int j = i + 1; j < seq_len; ++j)
-                    {
-                        scores_head[i * seq_len + j] = NEG_INF;
-                    }
+                // Use proven softmax implementation
+                llaminar::kernels::SoftmaxRowArgs args;
+                args.scores = scores_head;
+                args.rows = seq_len;
+                args.cols = seq_len;
+                args.causal = false; // Causal masking already applied in compute_qk_scores
+                args.scale = 1.0f;
 
-                    // Compute softmax for this row
-                    float *row = scores_head + i * seq_len;
-
-                    // Find max (only over valid positions 0..i)
-                    float max_val = row[0];
-                    for (int j = 1; j <= i; ++j)
-                    {
-                        max_val = std::max(max_val, row[j]);
-                    }
-
-                    // Compute exp and sum
-                    float sum = 0.0f;
-                    for (int j = 0; j <= i; ++j)
-                    {
-                        row[j] = std::exp(row[j] - max_val);
-                        sum += row[j];
-                    }
-
-                    // Normalize (and zero out future positions)
-                    for (int j = 0; j <= i; ++j)
-                    {
-                        row[j] /= sum;
-                    }
-                    for (int j = i + 1; j < seq_len; ++j)
-                    {
-                        row[j] = 0.0f;
-                    }
-                }
+                llaminar::kernels::softmax_row_major(args);
             }
         }
     }
@@ -1163,50 +1433,22 @@ namespace llaminar
         int batch_size,
         int seq_len)
     {
-        // Compute scores @ V for each batch and head
+        // Compute scores @ V using proven AttentionPrimitives
         // scores: [B, n_heads_local, T, T]
-        // V: [B, T, n_kv_heads_local * head_dim] viewed as [B, n_kv_heads_local, T, head_dim]
-        // output: [B, n_heads_local, T, head_dim]
+        // V: [B, T, n_kv_heads_local * head_dim]
+        // output: [B, T, n_heads_local * head_dim]
 
-        int heads_per_kv = n_heads_ / n_kv_heads_;
-
-        for (int b = 0; b < batch_size; ++b)
+        if (getRank() == 0 && current_layer_idx_ == 0)
         {
-            for (int h = 0; h < n_heads_local_; ++h)
-            {
-                // Map local query head to local KV head (simplified for tensor parallelism)
-                int kv_h = 0;
-                if (n_kv_heads_local_ > 1)
-                {
-                    int heads_per_kv_local = (n_heads_local_ + n_kv_heads_local_ - 1) / n_kv_heads_local_;
-                    kv_h = h / heads_per_kv_local;
-                    if (kv_h >= n_kv_heads_local_)
-                        kv_h = n_kv_heads_local_ - 1;
-                }
-
-                const float *scores_head = scores + (b * n_heads_local_ + h) * seq_len * seq_len;
-                const float *v_head = v + (b * seq_len) * (n_kv_heads_local_ * head_dim_) + kv_h * head_dim_;
-                float *out_head = output + (b * n_heads_local_ + h) * seq_len * head_dim_;
-
-                int v_stride = n_kv_heads_local_ * head_dim_;
-
-                // scores @ V: [T, T] @ [T, head_dim] = [T, head_dim]
-                cblas_sgemm(
-                    CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    seq_len,     // M: rows of scores
-                    head_dim_,   // N: cols of V
-                    seq_len,     // K: cols of scores, rows of V
-                    1.0f,        // alpha
-                    scores_head, // A: scores
-                    seq_len,     // lda
-                    v_head,      // B: V
-                    v_stride,    // ldb
-                    0.0f,        // beta
-                    out_head,    // C: output
-                    head_dim_    // ldc
-                );
-            }
+            LOG_DEBUG("[ATTN_OUTPUT_DEBUG] Delegating to llaminar::attn::apply_scores_to_v_batched:");
+            LOG_DEBUG("  batch_size=" << batch_size << " seq_len=" << seq_len);
+            LOG_DEBUG("  n_heads_local_=" << n_heads_local_ << " head_dim_=" << head_dim_);
         }
+
+        // Use proven implementation from AttentionPrimitives
+        llaminar::attn::apply_scores_to_v_batched(
+            scores, v, output,
+            batch_size, seq_len, head_dim_, n_heads_local_);
     }
 
 } // namespace llaminar

@@ -1108,9 +1108,15 @@ namespace llaminar
 
         // Log first few embedding values to verify consistency across ranks
         {
+            // Note: This is a free function, so we query MPI directly
             int mpi_rank = 0;
 #ifdef LLAMINAR_HAVE_MPI
-            MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+            int mpi_initialized = 0;
+            MPI_Initialized(&mpi_initialized);
+            if (mpi_initialized)
+            {
+                MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+            }
 #endif
             const float *emb_ptr = weights.token_embedding->data();
             LOG_INFO("[WeightLoad] rank=" << mpi_rank
@@ -1683,6 +1689,19 @@ namespace llaminar
         }
         last_logits_ = output; // cache
 
+        if (getRank() == 0)
+        {
+            float sum_sq = 0.0f;
+            for (size_t i = 0; i < output->size(); ++i)
+            {
+                sum_sq += output->data()[i] * output->data()[i];
+            }
+            float l2_norm = std::sqrt(sum_sq / output->size());
+            LOG_ERROR("[MAGNITUDE_TRACE_SEQ] Rank0 FINAL LOGITS (sequential): L2_norm=" << l2_norm << " size=" << output->size()
+                                                                                        << " first_5=[" << output->data()[0] << "," << output->data()[1] << ","
+                                                                                        << output->data()[2] << "," << output->data()[3] << "," << output->data()[4] << "]");
+        }
+
         // Parity capture: LM head output (final logits)
         captureIfEnabled(PipelineStage::LM_HEAD, -1, output);
 
@@ -2187,8 +2206,15 @@ namespace llaminar
         // Execute prefill via provider (with cache capture if enabled)
         std::shared_ptr<TensorBase> output;
         PrefillMetrics metrics;
+
+        std::cerr << "!!!!! [QwenPipeline] ABOUT TO CALL provider->execute, seq_len=" << tokens.size() << std::endl
+                  << std::flush;
+
         bool success = provider->execute(tokens, weights_iface, output, ctx, metrics,
                                          use_kv_cache_ ? &cache_provider : nullptr);
+
+        std::cerr << "!!!!! [QwenPipeline] RETURNED FROM provider->execute, success=" << success << std::endl
+                  << std::flush;
 
         if (!success)
         {

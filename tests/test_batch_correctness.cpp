@@ -435,9 +435,9 @@ TEST_F(BatchCorrectnessTest, DecodeBatchVsSequential)
 }
 
 /**
- * @brief Test: Find first divergence stage between batch and sequential pipelines
+ * @brief Test: Verify stage-by-stage parity between batch and sequential attention operators
  */
-TEST_F(BatchCorrectnessTest, FindFirstDivergenceStage)
+TEST_F(BatchCorrectnessTest, BatchedAttentionStagesParity)
 {
     auto rank = MPIContext::capture().rank;
 
@@ -691,22 +691,32 @@ TEST_F(BatchCorrectnessTest, FindFirstDivergenceStage)
         }
 
         std::cout << "\n=== SUMMARY ===\n";
+        std::cout << "Stages compared: " << stages.size() << "\n";
         std::cout << "Passed: " << passed << "\n";
         std::cout << "Failed: " << failed << "\n";
         std::cout << "Missing: " << missing << "\n";
+        std::cout << "\n=== SNAPSHOT CAPTURE STATS (All Layers) ===\n";
         std::cout << "Expected per pipeline: " << expected_per_pipeline << "\n";
         std::cout << "Sequential captured: " << seq_snapshot_count << " / " << expected_per_pipeline << "\n";
         std::cout << "Batch captured: " << batch_snapshot_count << " / " << expected_per_pipeline << "\n";
 
         if (!found_divergence && failed == 0 && missing == 0)
         {
-            std::cout << "\n✓ ALL STAGES MATCH!\n";
+            std::cout << "\n✓ ALL TESTED STAGES MATCH!\n";
+        }
+        else if (found_divergence)
+        {
+            std::cout << "\n✗ DIVERGENCE DETECTED - TEST WILL FAIL\n";
         }
     }
 
-    // Fail test if critical snapshots are missing
-    // Note: We check the 8 critical early-stage snapshots we're explicitly comparing
+    // Synchronize counters across ranks (only rank 0 performs comparison)
+    MPI_Bcast(&missing, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&failed, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // CRITICAL FIX: Fail test if divergence detected OR snapshots missing
     ASSERT_EQ(missing, 0) << "Missing " << missing << " critical snapshot comparisons";
+    ASSERT_EQ(failed, 0) << "Detected divergence in " << failed << " stage(s) - see output above for details";
 }
 
 int main(int argc, char **argv)

@@ -23,19 +23,164 @@ Llaminar is a high-performance, distributed LLM inference engine built on:
 - **Adaptive Backends**: OpenBLAS for small operations, COSMA for large-scale distributed computing
 - **Comprehensive Observability**: Structured environment snapshot, performance counters, validation framework
 
+### Pipeline Architecture
+
+**Sequential vs Batch Execution Modes:**
+- **Sequential Pipelines**: Process one sequence at a time (QwenPipeline, LlamaPipelineAdapter)
+  - Lower memory footprint
+  - Simpler implementation
+  - Ideal for single-user inference
+  
+- **Batch Pipelines**: Process multiple sequences simultaneously (BatchQwenPipeline)
+  - Higher throughput for multi-user scenarios
+  - More complex tensor management (sequence padding, batch dimension handling)
+  - Requires careful attention to MPI aggregation and dimension ordering
+  - **Parity Testing**: Automated validation that batch and sequential paths produce identical results (see `.github/instructions/parity-test-framework.instructions.md`)
+
+**Operator-Based Architecture:**
+All transformer operations are implemented as MPI-aware operators in `src/operators/`:
+- `MPIEmbeddingOperator`: Token embedding lookup with vocabulary partitioning
+- `MPILinearOperator` / `MPILinearBatchOperator`: Matrix multiplication with weight sharding
+- `MPIAttentionOperator` / `MPIAttentionBatchOperator`: Multi-head attention with KV cache
+- `MPIRMSNormOperator`: RMS normalization
+- `MPIRoPEOperator`: Rotary position embeddings
+- `MPISwiGLUOperator` / `MPISwiGLUBatchOperator`: SwiGLU activation with gating
+- `MPIResidualOperator`: Residual connection
+
+Each operator handles:
+- Tensor partition specifications (which dimensions are sharded vs replicated)
+- MPI collective operations (Allreduce, broadcast, gather)
+- Backend selection (OpenBLAS vs COSMA for large operations)
+- NUMA-aware memory allocation
+
+### Batch Processing Architecture
+
+**Batch processing** enables efficient multi-sequence inference by processing multiple prompts simultaneously:
+
+#### Key Differences: Sequential vs Batch
+
+| Aspect | Sequential Pipeline | Batch Pipeline |
+|--------|--------------------|-----------------|
+| **Throughput** | 1 sequence at a time | N sequences simultaneously |
+| **Memory** | Lower footprint | Higher (padded sequences) |
+| **Complexity** | Simpler tensor shapes | Complex dimension handling |
+| **MPI Aggregation** | Standard reduction | Requires careful batch-aware aggregation |
+| **Use Case** | Single-user inference | Multi-user serving, batch jobs |
+
+#### Batch Pipeline Implementation (`BatchQwenPipeline`)
+
+**Core challenges solved:**
+
+1. **Sequence Padding**: Variable-length sequences must be padded to uniform length
+   - Handled by `BatchPaddingUtils`: Pads to longest sequence in batch
+   - Tracks original lengths to avoid processing padding tokens
+
+2. **Dimension Ordering**: Batch dimension handling throughout pipeline
+   - Input: `[batch_size, max_seq_len]`
+   - Activations: `[batch_size, seq_len, d_model]`
+   - Attention: Special handling for batch dimension in score computation
+
+3. **MPI Aggregation**: Batch-aware collective operations
+   - Weight partitioning: Same as sequential (sharded across ranks)
+   - Activation gathering: Must preserve batch dimension
+   - Attention reduction: Per-sequence reduction within batch
+
+4. **Memory Management**: Efficient allocation for batched tensors
+   - Pre-allocated buffers sized for `batch_size × max_seq_len`
+   - NUMA-aware first-touch for large activations
+   - KV cache: Separate cache entries per sequence
+
+#### Batch Operators
+
+All operators have batch-aware variants:
+
+- `MPILinearBatchOperator`: Batched linear projections (Q/K/V, FFN)
+- `MPIAttentionBatchOperator`: Batched multi-head attention with per-sequence masking
+- `MPISwiGLUBatchOperator`: Batched SwiGLU activation
+- Shared operators: `MPIRMSNormOperator`, `MPIRoPEOperator` (dimension-agnostic)
+
+**Key implementation pattern:**
+```cpp
+// Sequential: [seq_len, d_model]
+auto output_seq = linear_op->forward(input, weight);
+
+// Batch: [batch_size, seq_len, d_model]
+auto output_batch = linear_batch_op->forward(input, weight, batch_size);
+```
+
+#### Parity Testing
+
+**Critical validation**: Batch and sequential paths must produce identical results for the same input.
+
+- **Test**: `tests/test_batch_correctness.cpp` (`BatchCorrectnessTest.BatchedAttentionStagesParity`)
+- **Status**: ✅ **8/8 attention stages passing** with exact numerical matches
+- **Coverage**: Embedding → Q/K/V projections → RoPE → Attention → Output projection
+- **Methodology**: Snapshot-based comparison using `SnapshotRegistry` and `SnapshotComparator`
+
+For details, see `.github/instructions/parity-test-framework.instructions.md` "Batch vs Sequential Parity Testing" section.
+
+#### Performance Characteristics
+
+**When to use batch processing:**
+- ✅ Multi-user serving (requests can be batched)
+- ✅ Batch inference jobs (many prompts to process)
+- ✅ High-throughput scenarios (latency less critical)
+
+**When to use sequential:**
+- ✅ Single-user interactive inference (low latency)
+- ✅ Memory-constrained environments
+- ✅ Variable-length sequences with large variance
+
+**Benchmark script:**
+```bash
+# Compare batch vs sequential performance
+./run_batch_performance.sh
+
+# Shows:
+# - Throughput improvement (tokens/sec)
+# - Memory overhead
+# - Scaling with batch size
+```
+
 ### Key Architecture Components
-- `src/main.cpp`: Application entry point with pipeline factory-based execution
-- `src/abstract_pipeline.h`: Pipeline interface defining prefill/decode lifecycle
-- `src/pipeline_factory.h`: Factory registration system for model architectures
-- `src/qwen_pipeline.{h,cpp}`: Production Qwen model implementation
-- `src/qwen_pipeline_adapter.{h,cpp}`: Qwen adapter implementing AbstractPipeline
-- `src/llama_pipeline_adapter.{h,cpp}`: LLaMA adapter (prototype)
-- `src/matmul_backend_selection.{h,cpp}`: Centralized backend decision logic
-- `src/cosma_prefill_manager.{h,cpp}`: COSMA distributed prefill coordination
-- `src/prefill_diagnostics.{h,cpp}`: Modular prefill validation and comparison
-- `src/kernels/`: MPI-aware matrix operations, attention, and transformer components
+
+**Core Pipeline Infrastructure:**
+- `src/Main.cpp`: Application entry point with pipeline factory-based execution
+- `src/AbstractPipeline.{h,cpp}`: Pipeline interface defining prefill/decode lifecycle
+- `src/PipelineBase.{h,cpp}`: Base implementation for pipelines
+
+**Model Implementations:**
+- `src/QwenPipeline.{h,cpp}`: Sequential Qwen model implementation
+- `src/BatchQwenPipeline.{h,cpp}`: Batched Qwen model implementation (multi-sequence processing)
+- `src/QwenPipelineAdapter.{h,cpp}`: Qwen adapter implementing AbstractPipeline
+- `src/BatchQwenPipelineAdapter.{h,cpp}`: Batch Qwen adapter implementing AbstractPipeline
+- `src/LlamaPipelineAdapter.{h,cpp}`: LLaMA adapter (prototype)
+
+**Backend and Execution:**
+- `src/MatmulBackendSelection.{h,cpp}`: Centralized backend decision logic (OpenBLAS vs COSMA)
+- `src/BackendSelector.{h,cpp}`: Backend selection infrastructure
+- `src/CosmaPrefillManager.{h,cpp}`: COSMA distributed prefill coordination
+- `src/CosmaPrefillProvider.{h,cpp}`: COSMA-specific prefill implementation
+- `src/OpenblasPrefillProvider.{h,cpp}`: OpenBLAS prefill implementation
+- `src/PrefillProvider.{h,cpp}`: Base prefill provider interface
+- `src/PrefillProviderBaseImpl.{h,cpp}`: Shared prefill provider implementation
+
+**Validation and Testing:**
+- `src/PrefillDiagnostics.{h,cpp}`: Modular prefill validation and comparison
+- `src/ParityHooks.{h,cpp}`: Snapshot capture hooks for parity testing
+- `src/PipelineSnapshotManager.{h,cpp}`: Pipeline-level snapshot management
+- `src/PipelineStages.h`: Stage enumeration for snapshot capture
+
+**Component Systems:**
+- `src/operators/`: MPI-aware operators (attention, linear, embedding, RMSNorm, RoPE, SwiGLU)
 - `src/tensors/`: Hybrid tensor system (SimpleTensor + COSMATensor)
-- `src/debug_env.{h,cpp}`: Centralized environment snapshot (replaces scattered getenv)
+- `src/utils/`: Utilities (DebugEnv, logging, performance tracing)
+- `src/weights/`: Weight loading and management (ModelLoader, ModelWeightsProvider)
+- `src/backends/`: Backend-specific implementations
+
+**Batch Processing Utilities:**
+- `src/BatchPaddingUtils.{h,cpp}`: Sequence padding and alignment for batch processing
+- `src/SequentialBatchBenchmark.{h,cpp}`: Performance comparison between batch and sequential modes
 
 ## Build System
 
@@ -144,7 +289,7 @@ mpirun -np 2 --bind-to socket --map-by socket \
 ### Implementation Details
 
 - **Source**: `src/BenchmarkRunner.{h,cpp}` (~300 lines)
-- **Integration**: `src/Main.cpp` section 6, `src/ArgumentParser.{h,cpp}`
+- **Integration**: `src/Main.cpp`, `src/ArgumentParser.{h,cpp}`
 - **Key patterns**:
   - Logits fetched via `pipeline.logits(latest_logits)` after prefill/decode
   - Token broadcast from rank 0 to all ranks via MPI_Bcast
@@ -213,17 +358,19 @@ unset LLAMINAR_EMBED_TRACE
 
 ## Development Profiling (Advanced)
 
-### Performance Bench Script for Developers
+### Performance Testing Scripts
 
-For detailed parallelization efficiency analysis, use the GTest-based profiling suite:
+Llaminar includes several specialized performance testing scripts:
 
 ```bash
-# Run all prefill performance benchmarks
-./run_performance_bench.sh
+# Batch vs Sequential Performance Comparison
+./run_batch_performance.sh
 
-# Run specific test suites
-./run_performance_bench.sh --filter "OpenBLAS_StrongScaling*"
-./run_performance_bench.sh --filter "COSMA_ModelShapes*"
+# Production-style adaptive matmul demonstration
+./run_performance_demo.sh
+
+# PyTorch parity testing with performance metrics
+./run_pytorch_parity_test.sh
 ```
 
 **Important Distinction:**
@@ -231,11 +378,13 @@ For detailed parallelization efficiency analysis, use the GTest-based profiling 
   - Use this for: End-to-end performance measurement, model comparisons, user-facing benchmarks
   - Outputs: Clean tok/s metrics for prefill/decode phases
   
-- **`run_performance_bench.sh`**: Development profiling with GTest suite
-  - Use this for: Analyzing parallelization efficiency, tuning threading strategies, backend selection optimization
-  - Outputs: Detailed GTest metrics with efficiency percentages (>90% excellent, <50% poor)
-
-The performance bench script runs the `test_prefill_performance_bench` executable with identical OpenMP/MPI configuration to the canonical launcher, but provides developer-focused metrics for optimization work.
+- **Performance test executables**: Development profiling with GTest suite
+  - Use this for: Analyzing specific components, batch vs sequential comparison, parity testing
+  - Outputs: Detailed GTest metrics with component-level timing
+  
+- **`run_batch_performance.sh`**: Compares batch and sequential execution performance
+  - Validates throughput improvements from batching
+  - Measures memory overhead and scaling characteristics
 
 ### Canonical Environment Variables
 
@@ -266,6 +415,23 @@ mpirun -np 2 --bind-to socket --map-by socket \
 ```
 
 ## Testing Guidelines
+
+### Test Organization
+
+Llaminar has a comprehensive test suite organized into several categories:
+
+1. **Smoke Tests** (~5s): Fast sanity checks for core functionality
+2. **Unit Tests** (~2m30s): Individual component validation (no model loading)
+3. **Parity Tests** (~4m): Ground truth comparison against PyTorch and llama.cpp
+4. **Integration Tests** (~3m): Full pipeline tests with model loading
+5. **Batch Correctness Tests**: Validation that batch and sequential execution produce identical results
+
+**Key Testing Infrastructure:**
+- `src/ParityHooks.{h,cpp}`: Snapshot capture hooks for parity testing
+- `src/PipelineSnapshotManager.{h,cpp}`: Pipeline-level snapshot management
+- `tests/TestParityFramework.cpp`: PyTorch ground truth comparison tests
+- `tests/test_batch_correctness.cpp`: Batch vs sequential parity validation
+- **Comprehensive documentation**: See `.github/instructions/parity-test-framework.instructions.md`
 
 ### Running Tests
 
@@ -317,16 +483,18 @@ bash -lc 'set -m; mpirun -np 2 gdb -q --batch -ex "handle SIGUSR1 pass nostop no
 - **BasicTest**: MPI initialization and basic functionality
 - **NumaTest**: NUMA topology detection and affinity
 - **PipelineFactoryTest**: Pipeline factory registration and creation
-- **QwenPipelineTest**: Qwen pipeline functionality (4 test cases)
+- **QwenPipelineTest**: Qwen pipeline functionality
+- **BatchCorrectnessTest**: Batch vs sequential execution parity (8/8 attention stages passing)
 - **AbstractPipelineParity**: Prefill vs incremental decode equivalence
-- **CosmaTest**: Matrix multiplication and COSMA integration (some precision edge cases)
-- **CosmaPrefillTests**: Fused COSMA correctness and statistics
+- **ParityFrameworkTest**: PyTorch ground truth comparison (OpenBLAS, COSMA, incremental decode)
+- **CosmaPrefillTests**: COSMA distributed prefill correctness
 - **AdaptiveMatmulTests**: Backend decision logic validation
-- **MPILinearKernelTest**: Distributed linear projection
-- **AttentionTests**: Attention mechanism validation  
+- **MPIOperatorTests**: MPI operator correctness (Linear, Attention, RMSNorm, Embedding, RoPE, SwiGLU)
+- **AttentionTests**: Attention mechanism validation (bias, sharding, output modes)
 - **RMSNormTests**: RMSNorm parity and edge cases
-- **KVCacheTests**: KV cache capacity management
+- **KVCacheTests**: KV cache capacity and state management
 - **TPTests**: Tensor partition correctness
+- **WeightTests**: Weight loading, role classification, and verification
 
 **Removed Historical Tests:**
 - ❌ `test_graph.cpp`: Generic compute graph (architecture removed)
@@ -691,6 +859,166 @@ bool execute_with_fallback(const TensorInputs& inputs) {
 }
 ```
 
+## Parity Testing Framework
+
+Llaminar includes a comprehensive **parity testing framework** that validates correctness by comparing against ground truth implementations (PyTorch, llama.cpp) and between execution modes (batch vs sequential, prefill vs decode).
+
+### Framework Components
+
+**Infrastructure:**
+- `src/ParityHooks.{h,cpp}`: Hooks for capturing intermediate activations (snapshots)
+- `src/PipelineSnapshotManager.{h,cpp}`: Pipeline-level snapshot orchestration
+- `src/PipelineStages.h`: Enumeration of all capturable stages (18 stages per layer)
+- `tests/ParityTestFramework.{h,cpp}`: Test utilities and comparison framework
+- `tests/WeightVerifier.h`: Weight loading verification against ground truth
+
+**Test Suites:**
+- `tests/TestParityFramework.cpp`: PyTorch ground truth comparison (prefill, decode)
+- `tests/test_batch_correctness.cpp`: Batch vs sequential validation
+- Various operator-level parity tests in `tests/`
+
+### Snapshot Capture System
+
+**18 Pipeline Stages per Layer:**
+1. `EMBEDDING`: Token embedding lookup
+2. `ATTENTION_NORM`: Pre-attention RMSNorm
+3. `Q_PROJECTION`: Query projection
+4. `K_PROJECTION`: Key projection
+5. `V_PROJECTION`: Value projection
+6. `ROPE_APPLICATION`: Rotary position embeddings applied
+7. `ATTENTION_SCORES`: Q·K^T scores
+8. `ATTENTION_WEIGHTS`: Softmax attention weights
+9. `ATTENTION_CONTEXT`: Weighted sum of values
+10. `ATTENTION_OUTPUT`: Output projection
+11. `ATTENTION_RESIDUAL`: Post-attention residual connection
+12. `FFN_NORM`: Pre-FFN RMSNorm
+13. `FFN_GATE`: FFN gate projection
+14. `FFN_UP`: FFN up projection
+15. `FFN_SWIGLU`: SwiGLU activation output
+16. `FFN_DOWN`: FFN down projection
+17. `FFN_RESIDUAL`: Post-FFN residual connection
+18. `FINAL_NORM`: Final RMSNorm before LM head
+19. `LM_HEAD`: Logits over vocabulary
+
+**Usage Example:**
+```cpp
+// In pipeline code:
+captureSnapshot(PipelineStage::Q_PROJECTION, layer_idx, data_ptr, seq_len, d_model);
+
+// In test code:
+SnapshotRegistry& registry = SnapshotRegistry::instance();
+TensorSnapshot snapshot;
+std::string key = registry.make_key("OpenBLAS", "Q_PROJECTION", 0);
+if (registry.get_snapshot(key, snapshot)) {
+    // Compare against ground truth
+    auto result = SnapshotComparator::compare(snapshot, ground_truth, tolerance);
+    EXPECT_TRUE(result.passed());
+}
+```
+
+### Parity Test Types
+
+#### 1. PyTorch Parity (`ParityFrameworkTest`)
+
+**Purpose**: Validate Llaminar produces identical outputs to PyTorch reference implementation
+
+**Tests:**
+- `COSMAPrefillVsPyTorch`: COSMA backend vs PyTorch (prefill phase)
+- `OpenBLASPrefillVsPyTorch`: OpenBLAS backend vs PyTorch (prefill phase)
+- `TrueIncrementalDecodeVsPyTorch`: Incremental decode vs PyTorch (autoregressive)
+
+**Status**: ✅ All passing with <0.1% relative error
+
+**Run:**
+```bash
+# All PyTorch parity tests
+ctest --test-dir build -R "ParityFrameworkTest" --output-on-failure --verbose
+
+# Specific backend
+GTEST_FILTER="ParityFramework.OpenBLASPrefillVsPyTorch" \
+  ctest --test-dir build -R "ParityFrameworkTest" --verbose
+```
+
+#### 2. Batch vs Sequential Parity (`BatchCorrectnessTest`)
+
+**Purpose**: Validate batch and sequential pipelines produce identical results
+
+**Tests:**
+- `BatchedAttentionStagesParity`: ✅ **8/8 attention stages passing** (exact matches)
+- `PrefillBatchVsSequential`: 🔄 In progress (extending to FFN/LM head)
+
+**Status**: Attention mechanism fully validated, FFN stages under investigation
+
+**Run:**
+```bash
+mpirun -np 2 ./build/test_batch_correctness \
+  --gtest_filter="BatchCorrectnessTest.BatchedAttentionStagesParity"
+```
+
+#### 3. Prefill vs Decode Parity (`AbstractPipelineParity`)
+
+**Purpose**: Validate incremental decode produces same results as prefill
+
+**Status**: ✅ Passing - proves KV cache and incremental attention correctness
+
+#### 4. Weight Verification
+
+**Purpose**: Validate weights loaded from GGUF match PyTorch checkpoint
+
+**Coverage:**
+- Embedding table: Token embeddings
+- Layer weights: Q/K/V/O projections, FFN gate/up/down, RMSNorm gamma
+- LM head: Output projection weights
+
+**Verification:**
+```cpp
+WeightVerifier verifier("path/to/pytorch_weights.npz");
+auto result = verifier.verifyEmbedding(model_loader.getEmbeddingTable());
+EXPECT_TRUE(result.passed()) << result.summary();
+```
+
+### Debugging with Snapshots
+
+**When a parity test fails:**
+
+1. **Identify divergence point**: Framework reports first mismatching stage
+   ```
+   ✓ Q_PROJECTION layer 0 (max_diff=0)
+   ✗ ATTENTION_SCORES layer 0 FAILED (max_diff=0.523)
+   ```
+
+2. **Inspect tensors**: Snapshots contain shape, data, metadata
+   ```cpp
+   std::cout << "Shape: " << snapshot.seq_len << " × " << snapshot.feature_dim << std::endl;
+   std::cout << "First values: " << snapshot.data[0] << ", " << snapshot.data[1] << std::endl;
+   ```
+
+3. **Compare metrics**: Relative L2, max absolute difference, mismatch count
+   ```cpp
+   std::cout << "Relative L2: " << result.metrics.rel_l2 << std::endl;
+   std::cout << "Max abs diff: " << result.metrics.max_abs_diff << std::endl;
+   std::cout << "Mismatches: " << result.metrics.num_mismatches << "/" << total << std::endl;
+   ```
+
+4. **Isolate bug**: Stage-by-stage validation narrows down to specific operation
+
+### Best Practices
+
+1. **Always add snapshots** when implementing new pipeline stages
+2. **Run parity tests** before merging pipeline changes
+3. **Use strict tolerances** for early stages (embedding, projections): `1e-4`
+4. **Use relaxed tolerances** for late stages (accumulated error): `1e-3`
+5. **Capture on rank 0 only** to avoid MPI synchronization overhead
+6. **Clear registry** between test cases to avoid stale snapshots
+
+### Documentation
+
+For comprehensive guide including API reference, debugging workflows, and advanced usage:
+- **`.github/instructions/parity-test-framework.instructions.md`** (2600+ lines)
+
+For architectural overview and batch parity testing:
+- **`.github/instructions/llaminar-architecture.instructions.md`**
+
 ## Code Quality Guidelines
 
 ### Logging Standards
@@ -747,8 +1075,8 @@ TEST_CASE("MyNewKernel basic functionality") {
 
 All new or refactored code on hot paths (kernels, matmul selection, attention assembly, tensor partition loops) MUST avoid direct `std::getenv` calls. Instead:
 
-1. Add any new environment flag/knob to the structured snapshot in `DebugEnv.h` inside the appropriate group (or create one).
-2. Parse it once in `debug_env.cpp` (lazy static initialization already provided) and expose typed fields.
+1. Add any new environment flag/knob to the structured snapshot in `src/utils/DebugEnv.h` inside the appropriate group (or create one).
+2. Parse it once in `src/utils/DebugEnv.cpp` (lazy static initialization already provided) and expose typed fields.
 3. Consume via `const auto &snap = debugEnv();` then reference `snap.<group>.<field>`.
 
 Rationale:
@@ -771,7 +1099,7 @@ const auto &env = debugEnv();
 if (env.attention.micro_trace && rank == 0) { ... }
 ```
 
-Do NOT add another ad-hoc snapshot facility; extend the existing one. If grouping is unclear, prefer adding a new subgroup struct within `DebugEnv.h` rather than mixing unrelated flags.
+Do NOT add another ad-hoc snapshot facility; extend the existing one. If grouping is unclear, prefer adding a new subgroup struct within `src/utils/DebugEnv.h` rather than mixing unrelated flags.
 
 
 ## Documentation Standards
@@ -927,6 +1255,85 @@ All COSMA-associated tests have an external 60s CTest timeout. Internally, watch
 
 Disable heavy validation & trace logging prior to performance measurement to ensure representative timing.
 
-# Writing Documentation and Changelogs
+## Documentation and Project Resources
 
-When we write documentation and changelogs at the end of our work runs, we place them in the `changelog/` folder in the workspace to avoid cluttering up the rest of the repo. We also use the `date` command to get the current date before naming changelog files.
+### Key Documentation Files
+
+**Developer Guidelines:**
+- **`.github/copilot-instructions.md`** (this file): Comprehensive development guidelines
+- **`.github/instructions/parity-test-framework.instructions.md`**: Complete parity testing guide
+- **`.github/instructions/llaminar-architecture.instructions.md`**: Architecture deep dive
+
+**Performance and Benchmarking:**
+- `./run_llaminar.sh`: Canonical launcher with optimal MPI/OpenMP settings
+- `./run_batch_performance.sh`: Batch vs sequential performance comparison
+- `./run_pytorch_parity_test.sh`: PyTorch parity testing with metrics
+- `./run_performance_demo.sh`: Production-style adaptive matmul demo
+
+**Model Support:**
+- Qwen 2.5 family: Fully supported (0.5B-72B)
+- LLaMA 3.x: Prototype support (adapter exists)
+- Quantization: Q4_0, Q6_K, Q8_0, F16, F32
+
+**Key Source Directories:**
+- `src/`: Core inference engine
+- `src/operators/`: MPI-aware transformer operators
+- `src/tensors/`: Hybrid tensor system (SimpleTensor, COSMATensor)
+- `src/backends/`: Backend implementations (OpenBLAS, COSMA, CUDA/ROCm stubs)
+- `src/weights/`: Weight loading and verification
+- `src/utils/`: Utilities (logging, performance tracing, environment config)
+- `tests/`: Comprehensive test suite (unit, integration, parity)
+
+### Writing Documentation and Changelogs
+
+When we write documentation and changelogs at the end of our work runs:
+
+1. **Location**: Place in `changelog/` folder to avoid cluttering the repo root
+2. **Naming**: Use ISO date prefix: `YYYY-MM-DD-description.md`
+   ```bash
+   # Get current date
+   date +%Y-%m-%d
+   # Example: 2025-10-16-batch-parity-testing-implementation.md
+   ```
+3. **Content**: Include:
+   - Summary of changes
+   - Key findings or results
+   - Code changes with file paths
+   - Test results (pass/fail counts)
+   - Performance metrics (before/after)
+   - Next steps or follow-up tasks
+
+4. **Session Summaries**: For major work sessions, create a summary document:
+   - `changelog/YYYY-MM-DD-session-summary.md`
+   - Include: objectives, discoveries, outcomes, remaining work
+
+### Project Status (October 2025)
+
+**Production Ready:**
+- ✅ Sequential Qwen inference (0.5B-72B)
+- ✅ Multi-rank MPI distribution
+- ✅ OpenBLAS backend (all sizes)
+- ✅ COSMA backend (large prefill ≥8K tokens)
+- ✅ NUMA-aware memory allocation
+- ✅ PyTorch parity tests (prefill + decode)
+- ✅ Batch attention parity (8/8 stages)
+
+**In Progress:**
+- 🔄 Batch pipeline full validation (attention ✅, FFN/LM head 🔍)
+- 🔄 LLaMA adapter completion
+- 🔄 CUDA/ROCm backend integration
+
+**Experimental:**
+- 🧪 Graph-based execution (deprecated, may be removed)
+- 🧪 Adaptive transformer pipeline
+
+### Getting Help
+
+**Common issues:**
+1. **MPI hangs**: Check barriers around collective operations, verify all ranks participate
+2. **Numerical divergence**: Run parity tests to identify diverging stage
+3. **Performance issues**: Profile with `run_batch_performance.sh`, check OpenMP thread settings
+4. **Memory errors**: Enable NUMA verification, check first-touch allocation
+5. **Build errors**: Clean build directory, verify dependencies (OpenBLAS, MPI, ScaLAPACK)
+
+**Debug environment variables**: See "Debug / Instrumentation Environment Variables" section for full list of `LLAMINAR_*` flags.
