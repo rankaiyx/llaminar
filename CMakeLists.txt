@@ -158,6 +158,7 @@ set(LLAMINAR_CORE_SOURCES
     src/BenchmarkRunner.cpp
     src/SequentialBatchBenchmark.cpp
     src/BatchPaddingUtils.cpp
+    src/BatchQwenPipeline.cpp
     src/JsonExport.cpp
     src/TopologyManager.cpp
     src/MpiKernelBase.cpp
@@ -165,12 +166,14 @@ set(LLAMINAR_CORE_SOURCES
     src/utils/DebugEnv.cpp
     src/PerformanceTracer.cpp
     src/operators/MPILinearOperator.cpp
+    src/operators/MPILinearBatchOperator.cpp
     src/operators/MPIRMSNormOperator.cpp
     src/operators/MPIAttentionOperator.cpp
     src/operators/MPIEmbeddingOperator.cpp
     src/operators/MPIResidualOperator.cpp
     src/operators/MPIRoPEOperator.cpp
     src/operators/MPISwiGLUOperator.cpp
+    src/operators/MPISwiGLUBatchOperator.cpp
     src/operators/attention/AttentionValidator.cpp
     src/operators/common/AttentionPrimitives.cpp
     src/operators/common/RmsnormCore.cpp
@@ -194,6 +197,7 @@ set(LLAMINAR_CORE_SOURCES
     src/tensors/SimpleTensor.cpp
     src/tensors/CosmaTensor.cpp
     src/tensors/TensorFactory.cpp
+    src/tensors/BatchedKVCache.cpp
     src/ModelLoader.cpp
     src/ModelWeightsProvider.cpp
     src/MpiSlicingHelper.cpp
@@ -547,12 +551,19 @@ if(GTEST_FOUND)
     set_tests_properties(LinearOrientationCorrectnessTest PROPERTIES TIMEOUT 30)
     set_tests_properties(LinearOrientationCorrectnessTest PROPERTIES LABELS "linear;parity;kernel")
 
-    # MPI Linear Batch support test
-    add_executable(test_mpi_linear_batch tests/test_mpi_linear_batch.cpp)
-    target_link_libraries(test_mpi_linear_batch llaminar_core GTest::gtest)
-    add_llaminar_mpi_test(MPILinearBatchTest 2 test_mpi_linear_batch)
-    set_tests_properties(MPILinearBatchTest PROPERTIES TIMEOUT 60)
-    set_tests_properties(MPILinearBatchTest PROPERTIES LABELS "linear;batch")
+    # MPI Linear Batch Operator test - comprehensive parity and equivalence validation
+    add_executable(test_linear_batch_operator tests/test_linear_batch_operator.cpp)
+    target_link_libraries(test_linear_batch_operator llaminar_core GTest::gtest)
+    add_llaminar_mpi_test(LinearBatchOperatorTest 2 test_linear_batch_operator)
+    set_tests_properties(LinearBatchOperatorTest PROPERTIES TIMEOUT 90)
+    set_tests_properties(LinearBatchOperatorTest PROPERTIES LABELS "linear;batch;parity;kernel")
+
+    # MPI SwiGLU Batch Operator test - comprehensive parity and equivalence validation
+    add_executable(test_swiglu_batch_operator tests/test_swiglu_batch_operator.cpp)
+    target_link_libraries(test_swiglu_batch_operator llaminar_core GTest::gtest)
+    add_llaminar_mpi_test(SwiGLUBatchOperatorTest 2 test_swiglu_batch_operator)
+    set_tests_properties(SwiGLUBatchOperatorTest PROPERTIES TIMEOUT 60)
+    set_tests_properties(SwiGLUBatchOperatorTest PROPERTIES LABELS "swiglu;batch;parity;kernel;activation")
 
     # MPI RMSNorm Batch support test
     add_executable(test_mpi_rmsnorm_batch tests/test_mpi_rmsnorm_batch.cpp)
@@ -617,6 +628,18 @@ if(GTEST_FOUND)
         target_include_directories(test_mpi_attention_kernel_clean PRIVATE ${GTEST_INCLUDE_DIR})
         target_link_libraries(test_mpi_attention_kernel_clean ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} pthread)
     endif()
+    
+    # Batch prefill skeleton test (validates BatchQwenPipeline foundation)
+    add_executable(test_batch_prefill_skeleton tests/TestBatchPrefillSkeleton.cpp)
+    target_link_libraries(test_batch_prefill_skeleton llaminar_core MPI::MPI_CXX)
+    if (GTest_FOUND)
+        target_link_libraries(test_batch_prefill_skeleton GTest::gtest pthread)
+    else()
+        target_include_directories(test_batch_prefill_skeleton PRIVATE ${GTEST_INCLUDE_DIR})
+        target_link_libraries(test_batch_prefill_skeleton ${GTEST_LIBRARY} pthread)
+    endif()
+    add_llaminar_mpi_test(BatchPrefillSkeletonTest 2 test_batch_prefill_skeleton)
+    set_tests_properties(BatchPrefillSkeletonTest PROPERTIES TIMEOUT 120 LABELS "batch;pipeline;skeleton")
     # Single-rank tests
     add_test(NAME MPIAttentionKernelClean_SingleRank 
              COMMAND $<TARGET_FILE:test_mpi_attention_kernel_clean> --gtest_filter=*SingleRank*:*Determinism*:*InvalidInput*:*MismatchedDimensions*:*WithBias*:*GQASupport*:*GQAVsMHA*:*SmallScale*:*LargeSequence*:*SnapshotCallback*)
@@ -1258,6 +1281,71 @@ add_executable(test_incremental_snapshot_helper
     tests/ParityTestFramework.cpp
     $<TARGET_OBJECTS:test_logging_bootstrap>)
 target_link_libraries(test_incremental_snapshot_helper PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
+
+# QwenPipeline batch processing tests - validates prefillBatch and decodeBatch
+add_executable(test_qwen_pipeline_batch
+    tests/test_qwen_pipeline_batch.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_qwen_pipeline_batch PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(QwenPipelineBatchTest 2 test_qwen_pipeline_batch)
+set_tests_properties(QwenPipelineBatchTest PROPERTIES TIMEOUT 120 LABELS "integration;batch;qwen")
+
+# Batch benchmark tests - validates batch benchmarking infrastructure and correctness
+add_executable(test_batch_benchmark
+    tests/test_batch_benchmark.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_batch_benchmark PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BatchBenchmarkTest 2 test_batch_benchmark)
+set_tests_properties(BatchBenchmarkTest PROPERTIES TIMEOUT 60 LABELS "unit;batch;benchmark")
+
+# Batch correctness tests - validates batch vs sequential equivalence with real models
+add_executable(test_batch_correctness
+    tests/test_batch_correctness.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_batch_correctness PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BatchCorrectnessTest 2 test_batch_correctness)
+set_tests_properties(BatchCorrectnessTest PROPERTIES TIMEOUT 180 LABELS "integration;batch;correctness")
+
+# Batch performance tests - measures throughput scaling and bandwidth utilization
+add_executable(test_batch_performance
+    tests/test_batch_performance.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_batch_performance PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(BatchPerformanceTest 2 test_batch_performance)
+set_tests_properties(BatchPerformanceTest PROPERTIES TIMEOUT 300 LABELS "integration;batch;performance")
+
+# Batch tensor operations tests - Day 2: SimpleTensor batch dimension support
+add_executable(test_batch_tensor_operations
+    tests/test_batch_tensor_operations.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_batch_tensor_operations PRIVATE llaminar_core GTest::gtest_main)
+add_test(NAME BatchTensorOperationsTest COMMAND test_batch_tensor_operations)
+set_tests_properties(BatchTensorOperationsTest PROPERTIES TIMEOUT 30 LABELS "unit;batch;tensor;day2")
+
+# Batched KV cache tests - Day 3: Per-sequence cache management
+add_executable(test_batched_kv_cache
+    tests/test_batched_kv_cache.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_batched_kv_cache PRIVATE llaminar_core GTest::gtest_main)
+add_test(NAME BatchedKVCacheTest COMMAND test_batched_kv_cache)
+set_tests_properties(BatchedKVCacheTest PROPERTIES TIMEOUT 30 LABELS "unit;batch;kvcache;day3")
+
+# Attention batch integration tests - Day 3: MPIAttentionOperator with BatchedKVCache
+add_executable(test_attention_batch_integration
+    tests/test_attention_batch_integration.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_attention_batch_integration PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(AttentionBatchIntegrationTest 2 test_attention_batch_integration)
+set_tests_properties(AttentionBatchIntegrationTest PROPERTIES TIMEOUT 120 LABELS "integration;batch;attention;kvcache;day3")
+
+# Operator batch interface tests - Day 4-5: Batch dimension detection and validation
+add_executable(test_operator_batch_interfaces
+    tests/test_operator_batch_interfaces.cpp
+    $<TARGET_OBJECTS:test_logging_bootstrap>)
+target_link_libraries(test_operator_batch_interfaces PRIVATE llaminar_core GTest::gtest_main MPI::MPI_CXX)
+add_llaminar_mpi_test(OperatorBatchInterfaceTest 2 test_operator_batch_interfaces)
+set_tests_properties(OperatorBatchInterfaceTest PROPERTIES TIMEOUT 60 LABELS "unit;batch;operators;day4")
+
 add_test(NAME IncrementalSnapshotHelper COMMAND test_incremental_snapshot_helper)
 set_tests_properties(IncrementalSnapshotHelper PROPERTIES TIMEOUT 30 LABELS "unit;parity;snapshot")
 

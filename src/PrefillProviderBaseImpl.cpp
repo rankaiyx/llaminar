@@ -449,7 +449,7 @@ namespace llaminar
         return it->second.get();
     }
 
-    bool PrefillProviderBaseImpl::registerKernel(
+    bool PrefillProviderBaseImpl::registerOperator(
         const std::string &name,
         std::unique_ptr<MPIKernelBase> kernel)
     {

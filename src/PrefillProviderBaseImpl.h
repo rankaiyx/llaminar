@@ -297,7 +297,7 @@ namespace llaminar
          * @param kernel Kernel instance (ownership transferred)
          * @return true if successful, false if already registered
          */
-        bool registerKernel(const std::string &name, std::unique_ptr<MPIKernelBase> kernel);
+        bool registerOperator(const std::string &name, std::unique_ptr<MPIKernelBase> kernel);
 
         // ========================================================================
         // Member variables

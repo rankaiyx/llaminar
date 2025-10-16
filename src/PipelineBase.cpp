@@ -22,7 +22,7 @@ namespace llaminar
         LOG_DEBUG("PipelineBase initialized from MPIContext: " << mpi_ctx_.toString());
     }
 
-    bool PipelineBase::registerKernel(const std::string &name, std::unique_ptr<MPIKernelBase> kernel)
+    bool PipelineBase::registerOperator(const std::string &name, std::unique_ptr<MPIKernelBase> kernel)
     {
         if (hasKernel(name))
         {

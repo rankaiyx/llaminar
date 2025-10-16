@@ -75,7 +75,7 @@ namespace llaminar
          * @param kernel Kernel instance to register
          * @return true if registration successful, false if name already exists
          */
-        bool registerKernel(const std::string &name, std::unique_ptr<MPIKernelBase> kernel);
+        bool registerOperator(const std::string &name, std::unique_ptr<MPIKernelBase> kernel);
 
         /**
          * @brief Get registered kernel by name

@@ -261,6 +261,7 @@ namespace llaminar
         }
 
         // Check dimensions match: input[1] (in_dim) should match weight[1] (in_dim)
+        // Weight format is [out_dim, in_dim] so weight[1] is the input dimension
         if (input->shape()[1] != weight->shape()[1])
         {
             LOG_ERROR("MPILinearOperator: Input size " << input->shape()[1]
@@ -273,7 +274,7 @@ namespace llaminar
         // output[1] should match weight[0] (out_dim)
         if (output->shape().size() != 2 ||
             output->shape()[0] != input->shape()[0] ||
-            output->shape()[1] != weight->shape()[0]) // Changed from weight->shape()[1]
+            output->shape()[1] != weight->shape()[0])
         {
             LOG_ERROR("MPILinearOperator: Output shape mismatch - expected [" << input->shape()[0]
                                                                               << ", " << weight->shape()[0] << "], got [" << output->shape()[0] << ", " << output->shape()[1] << "]");
@@ -284,9 +285,9 @@ namespace llaminar
         if (inputs.size() == 3 && inputs[2])
         {
             auto bias = inputs[2];
-            if (bias->shape().size() != 1 || bias->shape()[0] != weight->shape()[1])
+            if (bias->shape().size() != 1 || bias->shape()[0] != weight->shape()[0])
             {
-                LOG_ERROR("MPILinearOperator: Bias shape mismatch");
+                LOG_ERROR("MPILinearOperator: Bias shape mismatch - expected [" << weight->shape()[0] << "], got [" << bias->shape()[0] << "]");
                 return false;
             }
         }

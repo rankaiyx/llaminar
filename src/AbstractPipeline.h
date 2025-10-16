@@ -30,6 +30,7 @@ namespace llaminar
     {
         InferenceStage stage{InferenceStage::Prefill};
         int seq_len = 0;     // current prompt / token window length
+        int batch_size = 1;  // number of sequences in batch (1 for single sequence)
         int generated = 0;   // number of tokens already generated (decode context)
         int kv_capacity = 0; // total allocated KV slots (per layer) if available
         int kv_used = 0;     // populated KV token rows

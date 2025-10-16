@@ -112,6 +112,14 @@ namespace llaminar
         const ModelConfig &config() const override { return cfg_; }
         bool prefill(const std::vector<int> &tokens, const IModelWeights &weights, StageContext &ctx) override;
         bool decode(int next_token, const IModelWeights &weights, StageContext &ctx) override;
+        bool prefillBatch(const std::vector<std::vector<int>>& token_batches,
+                         const IModelWeights& weights,
+                         StageContext& ctx,
+                         std::shared_ptr<TensorBase>& out_logits) override;
+        bool decodeBatch(const std::vector<int>& next_tokens,
+                        const IModelWeights& weights,
+                        StageContext& ctx,
+                        std::shared_ptr<TensorBase>& out_logits) override;
         bool logits(std::shared_ptr<TensorBase> &out_logits) override;
         std::string name() const override { return "QwenPipelineAdapter"; }
         const KVCacheState *kvCacheState() const override;

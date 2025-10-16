@@ -160,6 +160,68 @@ namespace llaminar
         return true;
     }
 
+    bool QwenPipelineAdapter::prefillBatch(
+        const std::vector<std::vector<int>>& token_batches,
+        const IModelWeights& weights_base,
+        StageContext& ctx,
+        std::shared_ptr<TensorBase>& out_logits)
+    {
+        if (!legacy_)
+        {
+            LOG_ERROR("QwenPipelineAdapter: legacy pipeline is null (prefillBatch)");
+            return false;
+        }
+
+        const auto* wm = dynamic_cast<const QwenModelWeights*>(&weights_base);
+        if (!wm)
+        {
+            LOG_ERROR("QwenPipelineAdapter: invalid weights type (prefillBatch)");
+            return false;
+        }
+
+        // Forward to QwenPipeline batch implementation
+        if (!legacy_->prefillBatch(token_batches, weights_base, ctx, out_logits))
+        {
+            LOG_ERROR("QwenPipelineAdapter: prefillBatch failed");
+            return false;
+        }
+
+        // Store logits for logits() accessor
+        last_logits_ = out_logits;
+        return true;
+    }
+
+    bool QwenPipelineAdapter::decodeBatch(
+        const std::vector<int>& next_tokens,
+        const IModelWeights& weights_base,
+        StageContext& ctx,
+        std::shared_ptr<TensorBase>& out_logits)
+    {
+        if (!legacy_)
+        {
+            LOG_ERROR("QwenPipelineAdapter: legacy pipeline is null (decodeBatch)");
+            return false;
+        }
+
+        const auto* wm = dynamic_cast<const QwenModelWeights*>(&weights_base);
+        if (!wm)
+        {
+            LOG_ERROR("QwenPipelineAdapter: invalid weights type (decodeBatch)");
+            return false;
+        }
+
+        // Forward to QwenPipeline batch implementation
+        if (!legacy_->decodeBatch(next_tokens, weights_base, ctx, out_logits))
+        {
+            LOG_ERROR("QwenPipelineAdapter: decodeBatch failed");
+            return false;
+        }
+
+        // Store logits for logits() accessor
+        last_logits_ = out_logits;
+        return true;
+    }
+
     bool QwenPipelineAdapter::logits(std::shared_ptr<TensorBase> &out_logits)
     {
         out_logits = last_logits_;

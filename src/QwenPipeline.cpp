@@ -781,12 +781,12 @@ namespace llaminar
     {
         {
             auto embedding_kernel = std::make_unique<MPIEmbeddingOperator>(config_.getLayerConfig().vocab_size, config_.getLayerConfig().d_model);
-            if (!registerKernel("embedding", std::move(embedding_kernel)))
+            if (!registerOperator("embedding", std::move(embedding_kernel)))
                 throw std::runtime_error("Failed to register Embedding kernel");
         }
         auto rmsnorm_kernel = std::make_unique<MPIRMSNormOperator>(MPIRMSNormOperator::DistributionStrategy::SEQUENCE_WISE);
         rmsnorm_kernel->setEpsilon(config_.getLayerConfig().eps);
-        if (!registerKernel("rmsnorm", std::move(rmsnorm_kernel)))
+        if (!registerOperator("rmsnorm", std::move(rmsnorm_kernel)))
             throw std::runtime_error("Failed to register RMSNorm operator");
 
         auto attention_kernel = std::make_unique<MPIAttentionOperator>(config_.getLayerConfig().n_head, config_.getLayerConfig().n_head_kv, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base);
@@ -818,23 +818,23 @@ namespace llaminar
         attention_kernel->setSnapshotCallback([this](PipelineStage stage, int layer_idx, const float *data, int seq_len, int feature_dim)
                                               { AbstractPipeline::captureStageSnapshot(stage, layer_idx, data, seq_len, feature_dim); });
 
-        if (!registerKernel("attention", std::move(attention_kernel)))
+        if (!registerOperator("attention", std::move(attention_kernel)))
             throw std::runtime_error("Failed to register Attention operator");
 
         auto linear_kernel = std::make_unique<MPILinearOperator>();
-        if (!registerKernel("linear", std::move(linear_kernel)))
+        if (!registerOperator("linear", std::move(linear_kernel)))
             throw std::runtime_error("Failed to register Linear kernel");
 
         auto swiglu_kernel = std::make_unique<MPISwiGLUOperator>(MPISwiGLUOperator::DistributionStrategy::SEQUENCE_WISE);
-        if (!registerKernel("swiglu", std::move(swiglu_kernel)))
+        if (!registerOperator("swiglu", std::move(swiglu_kernel)))
             throw std::runtime_error("Failed to register SwiGLU kernel");
 
         auto rope_kernel = std::make_unique<MPIRoPEOperator>(config_.getLayerConfig().max_seq_len, config_.getLayerConfig().head_dim, config_.getLayerConfig().rope_freq_base, MPIRoPEOperator::DistributionStrategy::SEQUENCE_WISE);
-        if (!registerKernel("rope", std::move(rope_kernel)))
+        if (!registerOperator("rope", std::move(rope_kernel)))
             throw std::runtime_error("Failed to register RoPE kernel");
 
         auto residual_kernel = std::make_unique<MPIResidualOperator>(MPIResidualOperator::DistributionStrategy::SEQUENCE_WISE);
-        if (!registerKernel("residual", std::move(residual_kernel)))
+        if (!registerOperator("residual", std::move(residual_kernel)))
             throw std::runtime_error("Failed to register Residual kernel");
 
         LOG_DEBUG("QwenPipeline: Registered " << getKernelNames().size() << " kernels on rank " << getRank());
@@ -2640,5 +2640,56 @@ namespace llaminar
         return true;
     }
 } // namespace llaminar
+
+// === Batch Interface Stubs (redirect to sequential) ===
+namespace llaminar
+{
+    bool QwenPipeline::prefillBatch(const std::vector<std::vector<int>> &token_batches,
+                                    const IModelWeights &weights,
+                                    StageContext &ctx,
+                                    std::shared_ptr<TensorBase> &out_logits)
+    {
+        // Sequential fallback: process each sequence independently
+        if (token_batches.empty())
+            return false;
+
+        // For now, just process first sequence (full implementation would loop)
+        StageContext temp_ctx;
+        bool success = prefill(token_batches[0], weights, temp_ctx);
+        if (success)
+        {
+            return logits(out_logits);
+        }
+        return false;
+    }
+
+    bool QwenPipeline::decodeBatch(const std::vector<int> &next_tokens,
+                                   const IModelWeights &weights,
+                                   StageContext &ctx,
+                                   std::shared_ptr<TensorBase> &out_logits)
+    {
+        // Sequential fallback: process only first token
+        if (next_tokens.empty())
+            return false;
+
+        StageContext temp_ctx;
+        bool success = decode(next_tokens[0], weights, temp_ctx);
+        if (success)
+        {
+            return logits(out_logits);
+        }
+        return false;
+    }
+
+    void QwenPipeline::ensureBatchState(int batch_size)
+    {
+        // Stub for now - sequential pipeline doesn't need batch state
+    }
+
+    void QwenPipeline::clearBatchState()
+    {
+        // Stub
+    }
+}
 
 // === Section 6: Weight Loading Bridge removed (handled fully inline via bridge decl in header) ===
