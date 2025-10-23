@@ -95,6 +95,14 @@ endif()
 add_executable(llaminar2 Main.cpp)
 target_link_libraries(llaminar2 llaminar2_core)
 
+# Enable testing for V2
+enable_testing()
+
+# V2 Tests
+# Include test subdirectory (unit, integration, e2e, pytorch_parity)
+# Note: The source tree is at ../../tests/v2 relative to src/v2
+add_subdirectory(../../tests/v2 ${CMAKE_BINARY_DIR}/tests/v2)
+
 # TODO: GPU backends (CUDA, ROCm, Vulkan) - not yet implemented
 # TODO: Intel MKL backend - not yet implemented
 
