@@ -475,7 +475,7 @@ TEST_F(Test__IQ4_NLTensor, GEMM_NumericalStability)
 
 /**
  * @brief Test decode_to_bf16 method
- * 
+ *
  * Verifies that decoding to BF16 produces reasonable results and can be
  * converted back to FP32 without major precision loss.
  */
@@ -483,8 +483,8 @@ TEST_F(Test__IQ4_NLTensor, DecodeToBF16)
 {
     // Create a small IQ4_NL tensor (2×64 = 128 elements = 4 blocks)
     std::vector<size_t> shape = {2, 64};
-    size_t blocks_per_row = 2;  // 64 / 32 = 2 blocks per row
-    size_t total_blocks = 2 * 2; // 2 rows × 2 blocks
+    size_t blocks_per_row = 2;                        // 64 / 32 = 2 blocks per row
+    size_t total_blocks = 2 * 2;                      // 2 rows × 2 blocks
     std::vector<uint8_t> raw_data(total_blocks * 18); // 18 bytes per IQ4_NL block
 
     // Initialize blocks with test data
