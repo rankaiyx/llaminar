@@ -243,6 +243,11 @@ namespace llaminar
         s.dequant.anomalies = flag(std::getenv("LLAMINAR_DEQUANT_ANOMALIES"));
         // IQ4 experimental decode flags
         s.dequant.iq4_microkernel = flag(std::getenv("LLAMINAR_IQ4_MICROKERNEL"));
+        s.dequant.iq4_gemm_microkernel = flag(std::getenv("LLAMINAR_IQ4_GEMM_MICROKERNEL"));
+        s.dequant.iq4_override_m_tile = std::getenv("LLAMINAR_IQ4_M_TILE") ? std::atoi(std::getenv("LLAMINAR_IQ4_M_TILE")) : 0;
+        s.dequant.iq4_override_n_tile = std::getenv("LLAMINAR_IQ4_N_TILE") ? std::atoi(std::getenv("LLAMINAR_IQ4_N_TILE")) : 0;
+        s.dequant.iq4_override_m_tile_bf16 = std::getenv("LLAMINAR_IQ4_M_TILE_BF16") ? std::atoi(std::getenv("LLAMINAR_IQ4_M_TILE_BF16")) : 0;
+        s.dequant.iq4_override_n_tile_bf16 = std::getenv("LLAMINAR_IQ4_N_TILE_BF16") ? std::atoi(std::getenv("LLAMINAR_IQ4_N_TILE_BF16")) : 0;
         if (const char *dd = std::getenv("LLAMINAR_IQ4_DIRECT_DECODE"))
         {
             // default true; explicit 0 disables

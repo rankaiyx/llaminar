@@ -12,6 +12,14 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Option: Build V2 architecture instead of V1
+option(BUILD_V2 "Build V2 architecture (disables V1)" ON)
+if(BUILD_V2)
+    message(STATUS "Building Llaminar V2 architecture")
+else()
+    message(STATUS "Building Llaminar V1 architecture (legacy)")
+endif()
+
 # Option: enable heavy RMSNorm reference validation code
 option(LLAMINAR_ENABLE_RMSNORM_REFERENCE "Enable RMSNorm reference validation path" ON)
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -357,14 +365,15 @@ set(LLAMINAR_CORE_SOURCES
     src/weights/WeightRoles.cpp
 )
 
-# Create the core library
-add_library(llaminar_core STATIC ${LLAMINAR_CORE_SOURCES})
+# Create the core library (V1 only)
+if(NOT BUILD_V2)
+    add_library(llaminar_core STATIC ${LLAMINAR_CORE_SOURCES})
 
-# Redundant safety: explicitly add WeightRoles.cpp in case list edits are missed
-target_sources(llaminar_core PRIVATE src/weights/WeightRoles.cpp)
+    # Redundant safety: explicitly add WeightRoles.cpp in case list edits are missed
+    target_sources(llaminar_core PRIVATE src/weights/WeightRoles.cpp)
 
-# Link libraries to core
-target_link_libraries(llaminar_core
+    # Link libraries to core
+    target_link_libraries(llaminar_core
     PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
@@ -375,58 +384,71 @@ target_link_libraries(llaminar_core
 
 # Optional GNU libmvec (vector math) for accelerated transcendentals (e.g., RoPE sin/cos)
 find_library(MVEC_LIB mvec)
-if(MVEC_LIB)
-    message(STATUS "Found libmvec: ${MVEC_LIB}")
-    target_link_libraries(llaminar_core PUBLIC ${MVEC_LIB})
-    target_compile_definitions(llaminar_core PUBLIC LLAMINAR_HAVE_LIBMVEC=1)
+    if(MVEC_LIB)
+        message(STATUS "Found libmvec: ${MVEC_LIB}")
+        target_link_libraries(llaminar_core PUBLIC ${MVEC_LIB})
+        target_compile_definitions(llaminar_core PUBLIC LLAMINAR_HAVE_LIBMVEC=1)
+    endif()
+
+    # Add NUMA if available
+    if(NUMA_FOUND)
+        target_include_directories(llaminar_core PRIVATE ${NUMA_INCLUDE_DIR})
+        target_link_libraries(llaminar_core PRIVATE ${NUMA_LIBRARY})
+    endif()
+
+    # Add CUDA if available
+    if(ENABLE_CUDA)
+        target_include_directories(llaminar_core PRIVATE ${CUDA_INCLUDE_DIRS})
+        target_link_libraries(llaminar_core PRIVATE ${CUDA_LIBRARIES} ${CUDA_NVML_LIBRARY})
+    endif()
+
+    # Add ROCm if available
+    if(ENABLE_ROCM)
+        target_include_directories(llaminar_core PRIVATE ${ROCM_INCLUDE_DIR})
+        target_link_libraries(llaminar_core PRIVATE ${HIP_LIBRARY})
+    endif()
+
+    # Set compile features
+    target_compile_features(llaminar_core PUBLIC cxx_std_17)
+
+    # Add DEBUG flag only to our targets (not COSMA) when in Debug build
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_compile_definitions(llaminar_core PRIVATE DEBUG)
+    endif()
+
+    # Include directories for core library
+    target_include_directories(llaminar_core PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/COSMA/src
+        ${CBLAS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
+        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
+        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml
+    )
+
+    # Add Intel MKL if enabled (AFTER OpenBLAS includes to avoid header conflicts)
+    if(USE_MKL)
+        target_include_directories(llaminar_core SYSTEM PRIVATE ${MKL_INCLUDE_DIRS})
+        target_link_libraries(llaminar_core PRIVATE $<LINK_ONLY:MKL::MKL>)
+        message(STATUS "Linked llaminar_core with Intel MKL")
+    endif()
+endif() # NOT BUILD_V2
+
+# Main executable (V1 or V2)
+if(BUILD_V2)
+    # V2 uses its own subdirectory build
+    add_subdirectory(src/v2)
+    # V2 main executable will be defined in src/v2/CMakeLists.txt
+else()
+    # V1 main executable
+    add_executable(llaminar src/Main.cpp)
+    target_link_libraries(llaminar llaminar_core)
 endif()
 
-# Add NUMA if available
-if(NUMA_FOUND)
-    target_include_directories(llaminar_core PRIVATE ${NUMA_INCLUDE_DIR})
-    target_link_libraries(llaminar_core PRIVATE ${NUMA_LIBRARY})
-endif()
-
-# Add CUDA if available
-if(ENABLE_CUDA)
-    target_include_directories(llaminar_core PRIVATE ${CUDA_INCLUDE_DIRS})
-    target_link_libraries(llaminar_core PRIVATE ${CUDA_LIBRARIES} ${CUDA_NVML_LIBRARY})
-endif()
-
-# Add ROCm if available
-if(ENABLE_ROCM)
-    target_include_directories(llaminar_core PRIVATE ${ROCM_INCLUDE_DIR})
-    target_link_libraries(llaminar_core PRIVATE ${HIP_LIBRARY})
-endif()
-
-# Set compile features
-target_compile_features(llaminar_core PUBLIC cxx_std_17)
-
-# Add DEBUG flag only to our targets (not COSMA) when in Debug build
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_definitions(llaminar_core PRIVATE DEBUG)
-endif()
-
-# Include directories for core library
-target_include_directories(llaminar_core PUBLIC
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/COSMA/src
-    ${CBLAS_INCLUDE_DIR}
-    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
-    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
-    ${CMAKE_SOURCE_DIR}/llama.cpp/ggml
-)
-
-# Add Intel MKL if enabled (AFTER OpenBLAS includes to avoid header conflicts)
-if(USE_MKL)
-    target_include_directories(llaminar_core SYSTEM PRIVATE ${MKL_INCLUDE_DIRS})
-    target_link_libraries(llaminar_core PRIVATE $<LINK_ONLY:MKL::MKL>)
-    message(STATUS "Linked llaminar_core with Intel MKL")
-endif()
-
-# Main executable
-add_executable(llaminar src/Main.cpp)
-target_link_libraries(llaminar llaminar_core)
+# ============================================================================
+# V1 Tests and Utilities (disabled when BUILD_V2=ON)
+# ============================================================================
+if(NOT BUILD_V2)
 
 # BF16 basic test (minimal isolate test)
 add_executable(test_bf16_basic test_bf16_basic.cpp)
@@ -2253,3 +2275,4 @@ if(GTEST_FOUND)
     message(STATUS "IQ4 vs llama.cpp accuracy and performance tests enabled")
 endif()
 
+endif() # NOT BUILD_V2 (end of V1 tests and utilities)

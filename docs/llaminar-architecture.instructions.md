@@ -1,6 +1,7 @@
-# Llaminar LLM Inference Engine - Architecture Documentation
+# Llaminar V2 Architecture - Operator-Free Design
 
-*Last Updated: October 20, 2025*
+*Last Updated: October 23, 2025*  
+*Architecture Version: 2.0 (Greenfield Rewrite)*
 
 ## Overview
 

@@ -2,18 +2,75 @@
 
 This document provides comprehensive guidelines for working with the Llaminar LLM inference engine, including build processes, debugging techniques, and kernel development best practices learned from our MPI and performance optimization work.
 
+**⚠️ Architecture Note**: Llaminar has two parallel architectures:
+- **V1 (Production)**: `src/` - Operator-based MPI distributed inference (fully functional)
+- **V2 (Development)**: `src/v2/` - Operator-free kernel-centric design (in development)
+
+Most sections in this document apply to **V1**. For V2-specific guidance, see `.github/instructions/llaminar-v2-architecture.instructions.md`.
+
 ## Table of Contents
-- [Project Overview](#project-overview)
+- [Architecture Overview (V1 vs V2)](#architecture-overview-v1-vs-v2)
+- [Project Overview (V1)](#project-overview-v1)
 - [Build System](#build-system)
-- [Testing Guidelines](#testing-guidelines)
+- [Testing Guidelines (V1)](#testing-guidelines-v1)
 - [Debugging with GDB](#debugging-with-gdb)
-- [Kernel Development](#kernel-development)
+- [Kernel Development (V1)](#kernel-development-v1)
+- [Kernel Development (V2)](#kernel-development-v2)
 - [MPI Development Best Practices](#mpi-development-best-practices)
 - [Performance Optimization](#performance-optimization)
-- [COSMA vs OpenBLAS Integration](#cosma-vs-openblas-integration)
+- [COSMA vs OpenBLAS Integration (V1)](#cosma-vs-openblas-integration-v1)
 - [Code Quality Guidelines](#code-quality-guidelines)
+- [Documentation Standards](#documentation-standards)
 
-## Project Overview
+## Architecture Overview (V1 vs V2)
+
+### V1 Architecture (Production - `src/`)
+
+**Design Philosophy**: Operator-based MPI distributed inference
+
+**Key Characteristics**:
+- ✅ **Production Ready**: Fully functional Qwen inference with MPI distribution
+- ✅ **Operator Abstraction**: `MPILinearOperator`, `MPIAttentionOperator`, etc.
+- ✅ **Centralized Backend Selection**: MatMulBackendSelector for OpenBLAS/COSMA/MKL
+- ✅ **Parity Testing**: PyTorch ground truth validation
+- ✅ **Batch Processing**: BatchQwenPipeline for multi-sequence throughput
+
+**When to use V1**:
+- Production inference workloads
+- MPI multi-node distributed execution
+- Batch processing (multi-user serving)
+- When you need proven, tested code
+
+### V2 Architecture (Development - `src/v2/`)
+
+**Design Philosophy**: Operator-free kernel-centric design
+
+**Key Characteristics**:
+- 🔄 **In Development**: Basic pipeline structure, not feature-complete
+- 🎯 **No Operator Layer**: Pipelines call kernels directly
+- 🎯 **Per-Tensor Device Affinity**: Each tensor knows its device placement
+- 🎯 **Heterogeneous Execution**: Mix CUDA, ROCm, Vulkan in single run
+- 🎯 **IBlockDecoder Pattern**: Generic quantized GEMM kernel (see V2 kernel development)
+
+**When to use V2**:
+- Experimenting with new architectures
+- Multi-GPU heterogeneous execution (future)
+- Learning the next-generation design
+- Contributing to V2 development
+
+**Migration Status**:
+- ✅ Basic infrastructure (tensors, kernels, backends)
+- ✅ IQ4_NL quantized tensor with fused GEMM
+- ✅ Generic QuantizedGemmKernel (IBlockDecoder pattern)
+- ❌ Full pipeline implementation (incomplete)
+- ❌ MPI distribution (not yet ported)
+- ❌ Production testing (not validated)
+
+**See Also**: `.github/instructions/llaminar-v2-architecture.instructions.md` for comprehensive V2 documentation.
+
+---
+
+## Project Overview (V1)
 
 Llaminar is a high-performance, distributed LLM inference engine built on:
 - **Multi-Architecture Pipeline System**: Factory-based extensible architecture for Qwen, LLaMA, and future models
@@ -201,7 +258,7 @@ For details, see:
 
 ## Build System
 
-### Standard Build Process
+### V1 Build Process
 
 ```bash
 # Debug build (development)
@@ -225,7 +282,26 @@ cmake -B build_mkl -S . -DCMAKE_BUILD_TYPE=Release \
 cmake --build build_mkl --parallel
 ```
 
-### Available Build Targets
+### V2 Build Process
+
+```bash
+# V2 Debug build (experimental)
+cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build build_v2 --parallel
+
+# V2 Release build
+cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
+cmake --build build_v2_release --parallel
+
+# Run V2 (device enumeration)
+./build_v2/src/v2/llaminar2 --list-devices
+```
+
+**V2 Build Targets**:
+- `llaminar2_core`: Core V2 library
+- `llaminar2`: V2 executable (minimal functionality)
+
+### Available Build Targets (V1)
 
 ```bash
 # Core library only
@@ -491,11 +567,13 @@ mpirun -np 2 --bind-to socket --map-by socket \
   --report-bindings ./build/llaminar
 ```
 
-## Testing Guidelines
+## Testing Guidelines (V1)
+
+**Note**: This section describes V1 testing infrastructure. V2 testing is minimal and under development.
 
 ### Test Organization
 
-Llaminar has a comprehensive test suite organized into several categories:
+Llaminar V1 has a comprehensive test suite organized into several categories:
 
 1. **Smoke Tests** (~5s): Fast sanity checks for core functionality
 2. **Unit Tests** (~2m30s): Individual component validation (no model loading)
@@ -654,11 +732,13 @@ mpirun -np 2 numactl --cpubind=0 ./build/llaminar : numactl --cpubind=1 ./build/
 timeout 60 mpirun -np 2 ./build/llaminar
 ```
 
-## Kernel Development
+## Kernel Development (V1)
+
+**Note**: This section describes V1 operator-based kernel development. For V2's operator-free approach, see [Kernel Development (V2)](#kernel-development-v2).
 
 ### Kernel Base Classes
 
-All kernels should inherit from appropriate base classes:
+All V1 kernels should inherit from appropriate base classes:
 ```cpp
 // For MPI-aware kernels
 class MyKernel : public MPIKernelBase {
@@ -736,6 +816,138 @@ bool MyKernel::execute(const std::vector<std::shared_ptr<TensorBase>>& inputs,
     }
 }
 ```
+
+## Kernel Development (V2)
+
+**Purpose**: V2 kernel development follows the **operator-free design** with direct pipeline orchestration and the **IBlockDecoder strategy pattern** for quantized tensors.
+
+### Core V2 Principles
+
+1. **No Operator Layer**: Pipelines call kernels directly (no `MPILinearOperator`, etc.)
+2. **Per-Tensor Device Affinity**: Tensors know their device placement
+3. **Strategy Pattern**: Generic kernels + format-specific decode strategies
+4. **ITensor Interfaces**: `ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.
+
+### IBlockDecoder Strategy Pattern
+
+**Problem**: Quantized tensors (IQ4_NL, Q6_K, Q8_0) need format-specific decode logic, but we want a **single generic GEMM kernel**.
+
+**Solution**: IBlockDecoder interface + QuantizedGemmKernel
+
+```cpp
+// src/v2/tensors/TensorKernels.h
+class IBlockDecoder {
+public:
+    __attribute__((always_inline))
+    virtual void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const = 0;
+    
+    __attribute__((always_inline))
+    virtual const void* get_raw_block_at(size_t row_idx, size_t k_block_offset) const = 0;
+    
+    __attribute__((always_inline))
+    virtual size_t block_size() const = 0;
+};
+
+// src/v2/tensors/Tensors.h
+class IQ4_NLTensor : public TensorBase, public IBlockDecoder {
+    // Inline implementation for zero overhead
+    void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const override {
+        const IQ4_NLBlock& block = blocks_[row_idx * blocks_per_row_ + k_block_offset];
+        decodeBlock(block, output);  // Format-specific decode
+    }
+    
+    size_t block_size() const override { return 32; }  // IQ4_NL: 32 elements/block
+    
+    std::unique_ptr<ITensorGemm> createGemm() const override {
+        return std::make_unique<QuantizedGemmKernel>(this);  // Generic kernel
+    }
+};
+
+// src/v2/kernels/cpu/QuantizedGemm.h
+class QuantizedGemmKernel : public ITensorGemm {
+    const IBlockDecoder* decoder_;  // Strategy interface
+    
+    bool multiply(...) override {
+        // Generic implementation works for all quantized formats
+        decoder_->decode_block_at(j, kb, B_block);  // Inlined (zero overhead)
+        // ... accumulate ...
+    }
+};
+```
+
+**Benefits**:
+- ✅ **Code Reuse**: ~350 lines generic kernel vs ~1000 lines per format
+- ✅ **Zero Overhead**: `always_inline` eliminates virtual dispatch
+- ✅ **Extensibility**: New formats just implement IBlockDecoder
+
+### Adding New Quantized Formats (V2)
+
+```cpp
+// tensors/Q6_KTensor.h
+class Q6_KTensor : public TensorBase, public IBlockDecoder {
+public:
+    void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const override {
+        const Q6_KBlock& block = blocks_[row_idx * blocks_per_row_ + k_block_offset];
+        decodeQ6KBlock(block, output);  // Q6_K-specific decode
+    }
+    
+    size_t block_size() const override { return 256; }  // Q6_K: 256 elements/block
+    
+    std::unique_ptr<ITensorGemm> createGemm() const override {
+        return std::make_unique<QuantizedGemmKernel>(this);  // Reuse generic kernel!
+    }
+    
+private:
+    static void decodeQ6KBlock(const Q6_KBlock& block, float* output);
+};
+```
+
+**Result**: Single QuantizedGemmKernel works for IQ4_NL, Q6_K, Q8_0, etc.
+
+### V2 Kernel Interface Design
+
+All V2 kernels implement ITensor* interfaces:
+
+```cpp
+// src/v2/tensors/TensorKernels.h
+class ITensorGemm {
+public:
+    virtual bool multiply(const float* A, float* C, int m, int n, int k, ...) = 0;
+};
+
+class ITensorAttention {
+public:
+    virtual bool execute(const TensorBase* Q, const TensorBase* K, 
+                        const TensorBase* V, TensorBase* output, ...) = 0;
+};
+
+class ITensorRoPE {
+public:
+    virtual bool execute(TensorBase* tensor, const RoPEParams& params) = 0;
+};
+```
+
+**Key Difference from V1**: No MPI context in kernel interfaces (handled by pipeline)
+
+### V2 Pipeline Orchestration
+
+```cpp
+// src/v2/pipelines/QwenPipeline.cpp
+bool QwenPipeline::attention_block(int layer, TensorBase* in, TensorBase* out) {
+    // Direct kernel calls (no operators!)
+    auto device = device_mgr_.selectDevice(in->size_bytes(), OperationType::ATTENTION);
+    auto gemm = device->getGemmKernel();
+    auto rope = device->getRoPEKernel();
+    
+    auto Q = allocateTensor({seq_len, d_model});
+    gemm->execute(in, weights_.wq[layer], Q.get(), {});  // Q projection
+    
+    rope->execute(Q.get(), {.seq_offset = 0, .theta_base = 10000.0f});
+    // ... etc
+}
+```
+
+**See Also**: `.github/instructions/llaminar-v2-architecture.instructions.md` for complete V2 documentation.
 
 ## MPI Development Best Practices
 
@@ -945,7 +1157,9 @@ cmake --build build_release --target test_batch_performance --parallel
 ./run_batch_performance.sh --filter '*PrefillThroughputScaling'
 ```
 
-## COSMA vs OpenBLAS Integration
+## COSMA vs OpenBLAS Integration (V1)
+
+**Note**: This section applies to V1 architecture. V2 backend selection works differently (per-tensor device affinity).
 
 ### When to Use Each Backend
 
@@ -1446,30 +1660,38 @@ Disable heavy validation & trace logging prior to performance measurement to ens
 ### Key Documentation Files
 
 **Developer Guidelines:**
-- **`.github/copilot-instructions.md`** (this file): Comprehensive development guidelines
-- **`.github/instructions/parity-test-framework.instructions.md`**: Complete parity testing guide
-- **`.github/instructions/llaminar-architecture.instructions.md`**: Architecture deep dive
+- **`.github/copilot-instructions.md`** (this file): Comprehensive development guidelines for V1 and V2
+- **`.github/instructions/llaminar-v2-architecture.instructions.md`**: Complete V2 architecture documentation
+- **`.github/instructions/parity-test-framework.instructions.md`**: V1 parity testing guide
 
 **Performance and Benchmarking:**
-- `./run_llaminar.sh`: Canonical launcher with optimal MPI/OpenMP settings (RELEASE mode: `build_release/`)
-- `./run_llaminar_debug.sh`: Debug version of the above launcher (DEBUG mode: `build/`)
-- `./run_batch_performance.sh`: Batch vs sequential performance comparison
-- `./run_pytorch_parity_test.sh`: PyTorch parity testing with metrics
-- `./run_performance_demo.sh`: Production-style adaptive matmul demo
+- `./run_llaminar.sh`: Canonical V1 launcher with optimal MPI/OpenMP settings (RELEASE mode: `build_release/`)
+- `./run_llaminar_debug.sh`: V1 debug version of the above launcher (DEBUG mode: `build/`)
+- `./run_batch_performance.sh`: V1 batch vs sequential performance comparison
+- `./run_pytorch_parity_test.sh`: V1 PyTorch parity testing with metrics
+- `./run_performance_demo.sh`: V1 production-style adaptive matmul demo
 
 **Model Support:**
-- Qwen 2.5 family: Fully supported (0.5B-72B)
-- LLaMA 3.x: Prototype support (adapter exists)
-- Quantization: Q4_0, Q6_K, Q8_0, F16, F32
+- **V1**: Qwen 2.5 family (0.5B-72B), LLaMA 3.x (prototype)
+- **V2**: Basic infrastructure only (not production-ready)
+- **Quantization**: Q4_0, Q6_K, Q8_0, IQ4_NL, F16, F32
 
-**Key Source Directories:**
-- `src/`: Core inference engine
+**Key Source Directories (V1):**
+- `src/`: Core V1 inference engine
 - `src/operators/`: MPI-aware transformer operators
 - `src/tensors/`: Hybrid tensor system (SimpleTensor, COSMATensor)
 - `src/backends/`: Backend implementations (OpenBLAS, COSMA, CUDA/ROCm stubs)
 - `src/weights/`: Weight loading and verification
 - `src/utils/`: Utilities (logging, performance tracing, environment config)
 - `tests/`: Comprehensive test suite (unit, integration, parity)
+
+**Key Source Directories (V2):**
+- `src/v2/`: V2 operator-free architecture
+- `src/v2/tensors/`: Tensor base classes, quantized tensors (IQ4_NL)
+- `src/v2/kernels/`: Kernel implementations (CPU, CUDA, ROCm, Vulkan)
+- `src/v2/pipelines/`: Pipeline orchestration (QwenPipeline)
+- `src/v2/backends/`: Backend device management
+- `src/v2/utils/`: V2-specific utilities (MPIContext, CPUFeatures)
 
 ### Writing Documentation and Changelogs
 
@@ -1496,7 +1718,7 @@ When we write documentation and changelogs at the end of our work runs:
 
 ### Project Status (October 2025)
 
-**Production Ready:**
+**V1 Production Ready:**
 - ✅ Sequential Qwen inference (0.5B-72B)
 - ✅ Multi-rank MPI distribution
 - ✅ OpenBLAS backend (all sizes)
@@ -1504,16 +1726,26 @@ When we write documentation and changelogs at the end of our work runs:
 - ✅ COSMA backend (large prefill ≥8K tokens)
 - ✅ NUMA-aware memory allocation
 - ✅ PyTorch parity tests (prefill + decode)
-- ✅ Batch attention parity (8/8 stages)
+- ✅ Batch attention parity (17/17 stages)
 
-**In Progress:**
-- 🔄 Batch pipeline full validation (attention ✅, FFN/LM head 🔍)
+**V1 In Progress:**
+- 🔄 Batch pipeline full validation (attention ✅, FFN/LM head ✅)
 - 🔄 LLaMA adapter completion
 - 🔄 CUDA/ROCm backend integration
 
-**Experimental:**
-- 🧪 Graph-based execution (deprecated, may be removed)
-- 🧪 Adaptive transformer pipeline
+**V2 Development Status:**
+- ✅ Basic infrastructure (tensors, kernels, backends)
+- ✅ IQ4_NL quantized tensor with IBlockDecoder pattern
+- ✅ Generic QuantizedGemmKernel (335-451 GFLOPS)
+- ✅ FP32/BF16 tensor types
+- ✅ Device enumeration (CPU, CUDA, ROCm, Vulkan stubs)
+- ❌ Full pipeline implementation (incomplete)
+- ❌ MPI distribution (not yet ported)
+- ❌ Production testing (not validated)
+
+**Deprecated/Experimental:**
+- 🧪 Graph-based execution (V1, deprecated, may be removed)
+- 🧪 Adaptive transformer pipeline (V1, experimental)
 
 ### Getting Help
 

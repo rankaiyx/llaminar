@@ -115,10 +115,19 @@ namespace llaminar
 
     struct DequantEnv
     {
-        bool stats = false;            // LLAMINAR_DEQUANT_STATS
-        bool anomalies = false;        // LLAMINAR_DEQUANT_ANOMALIES
-        bool iq4_microkernel = false;  // LLAMINAR_IQ4_MICROKERNEL (enable experimental multi-block IQ4 decode path)
-        bool iq4_direct_decode = true; // LLAMINAR_IQ4_DIRECT_DECODE (use direct nibble expansion instead of helper buffer; can disable for A/B)
+        bool stats = false;                // LLAMINAR_DEQUANT_STATS
+        bool anomalies = false;            // LLAMINAR_DEQUANT_ANOMALIES
+        bool iq4_microkernel = false;      // LLAMINAR_IQ4_MICROKERNEL (enable experimental multi-block IQ4 decode path)
+        bool iq4_direct_decode = true;     // LLAMINAR_IQ4_DIRECT_DECODE (use direct nibble expansion instead of helper buffer; can disable for A/B)
+        bool iq4_gemm_microkernel = false; // LLAMINAR_IQ4_GEMM_MICROKERNEL (enable multi-column vectorized decode in fused GEMM)
+
+        // FP32 tile size overrides (0 = use adaptive defaults)
+        int iq4_override_m_tile = 0; // LLAMINAR_IQ4_M_TILE (override M_TILE for FP32 path)
+        int iq4_override_n_tile = 0; // LLAMINAR_IQ4_N_TILE (override N_TILE for FP32 path)
+
+        // BF16 tile size overrides (0 = use adaptive defaults)
+        int iq4_override_m_tile_bf16 = 0; // LLAMINAR_IQ4_M_TILE_BF16 (override M_TILE for BF16 path)
+        int iq4_override_n_tile_bf16 = 0; // LLAMINAR_IQ4_N_TILE_BF16 (override N_TILE for BF16 path)
     };
 
     struct AdaptiveEnv
