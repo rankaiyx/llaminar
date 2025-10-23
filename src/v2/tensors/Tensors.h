@@ -265,6 +265,7 @@ namespace llaminar2
         virtual std::unique_ptr<ITensorRMSNorm> createRMSNorm() = 0;
     };
 
+    // Implementation: FP32Tensor.cpp
     /**
      * @brief FP32 tensor with optional device storage
      */
@@ -305,6 +306,7 @@ namespace llaminar2
         bool sync_from_device();
     };
 
+    // Implementation: FP16Tensor.cpp
     /**
      * @brief FP16 tensor with optional device storage
      *
@@ -355,6 +357,7 @@ namespace llaminar2
         bool sync_from_device();
     };
 
+    // Implementation: BF16Tensor.cpp
     /**
      * @brief BF16 tensor with optional device storage
      *
@@ -409,6 +412,7 @@ namespace llaminar2
     // Forward declare for IBlockDecoder
     class IBlockDecoder;
 
+    // Implementation: IQ4_NLTensor.cpp
     /**
      * @brief IQ4_NL quantized tensor (4.5 bpw, 7.1× compression)
      *
@@ -513,6 +517,7 @@ namespace llaminar2
 
     // ===== Q8_0 Tensor (8-bit quantization) =====
 
+    // Implementation: Q8_0Tensor.cpp
     /**
      * @brief Q8_0 quantized tensor (8-bit uniform quantization)
      *
@@ -560,6 +565,7 @@ namespace llaminar2
 
     // ===== Q4_0 Tensor (4-bit quantization) =====
 
+    // Implementation: Q4_0Tensor.cpp
     /**
      * @brief Q4_0 quantized tensor (4-bit uniform quantization)
      *
@@ -605,6 +611,7 @@ namespace llaminar2
 
     // ===== Q4_1 Tensor (4-bit with min) =====
 
+    // Implementation: Q4_1Tensor.cpp
     /**
      * @brief Q4_1 quantized tensor (4-bit with min offset)
      *
@@ -650,6 +657,7 @@ namespace llaminar2
 
     // ===== K-quant Tensors =====
 
+    // Implementation: Q6_KTensor.cpp
     /**
      * @brief Q6_K tensor (6-bit K-quant super-block)
      */
@@ -690,6 +698,7 @@ namespace llaminar2
         static void decodeBlock(const Q6_KBlock &block, float *output);
     };
 
+    // Implementation: Q2_KTensor.cpp
     /**
      * @brief Q2_K tensor (2-bit K-quant super-block)
      */
@@ -730,6 +739,7 @@ namespace llaminar2
         static void decodeBlock(const Q2_KBlock &block, float *output);
     };
 
+    // Implementation: Q5_KTensor.cpp
     /**
      * @brief Q5_K tensor (5-bit K-quant super-block)
      */
@@ -770,6 +780,7 @@ namespace llaminar2
         static void decodeBlock(const Q5_KBlock &block, float *output);
     };
 
+    // Implementation: Q3_KTensor.cpp
     /**
      * @brief Q3_K tensor (3-bit K-quant super-block)
      */
@@ -810,6 +821,7 @@ namespace llaminar2
         static void decodeBlock(const Q3_KBlock &block, float *output);
     };
 
+    // Implementation: Q4_KTensor.cpp
     /**
      * @brief Q4_K tensor (4-bit K-quant super-block)
      */
@@ -850,6 +862,7 @@ namespace llaminar2
         static void decodeBlock(const Q4_KBlock &block, float *output);
     };
 
+    // Implementation: Q8_KTensor.cpp
     /**
      * @brief Q8_K tensor (8-bit K-quant super-block)
      */
@@ -892,6 +905,7 @@ namespace llaminar2
 
     // ===== IQ Tensors =====
 
+    // Implementation: IQ4_XSTensor.cpp
     /**
      * @brief IQ4_XS tensor (4-bit extra-small IQ)
      */
@@ -932,6 +946,7 @@ namespace llaminar2
         static void decodeBlock(const IQ4_XSBlock &block, float *output);
     };
 
+    // Implementation: IQ2_XXSTensor.cpp
     /**
      * @brief IQ2_XXS tensor (2-bit extra-extra-small IQ)
      */
@@ -972,6 +987,7 @@ namespace llaminar2
         static void decodeBlock(const IQ2_XXSBlock &block, float *output);
     };
 
+    // Implementation: IQ2_XSTensor.cpp
     /**
      * @brief IQ2_XS tensor (2-bit extra-small IQ)
      */
@@ -1012,6 +1028,7 @@ namespace llaminar2
         static void decodeBlock(const IQ2_XSBlock &block, float *output);
     };
 
+    // Implementation: IQ3_XXSTensor.cpp
     /**
      * @brief IQ3_XXS tensor (3-bit extra-extra-small IQ)
      */
@@ -1052,6 +1069,7 @@ namespace llaminar2
         static void decodeBlock(const IQ3_XXSBlock &block, float *output);
     };
 
+    // Implementation: IQ2_STensor.cpp
     /**
      * @brief IQ2_S tensor (2-bit small IQ)
      */
@@ -1092,6 +1110,7 @@ namespace llaminar2
         static void decodeBlock(const IQ2_SBlock &block, float *output);
     };
 
+    // Implementation: IQ3_STensor.cpp
     /**
      * @brief IQ3_S tensor (3-bit small IQ)
      */
@@ -1132,6 +1151,7 @@ namespace llaminar2
         static void decodeBlock(const IQ3_SBlock &block, float *output);
     };
 
+    // Implementation: IQ1_STensor.cpp
     /**
      * @brief IQ1_S tensor (1-bit small IQ)
      */
@@ -1172,6 +1192,7 @@ namespace llaminar2
         static void decodeBlock(const IQ1_SBlock &block, float *output);
     };
 
+    // Implementation: IQ1_MTensor.cpp
     /**
      * @brief IQ1_M tensor (1-bit medium IQ)
      */
