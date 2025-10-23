@@ -125,7 +125,7 @@ namespace llaminar2
      *
      * Implements non-linear 4-bit quantization with lookup table.
      * Provides both full decode and fused kernel interfaces.
-     * 
+     *
      * Also implements IBlockDecoder to enable generic QuantizedGemmKernel.
      */
     class IQ4_NLTensor : public TensorBase, public IBlockDecoder
@@ -175,8 +175,8 @@ namespace llaminar2
         void decode_tile_blocks(size_t row_start, size_t tile_n, size_t k_block_offset, float *output) const;
 
         // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
-        __attribute__((always_inline))
-        void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const override {
+        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
+        {
             const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
             const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
@@ -184,7 +184,9 @@ namespace llaminar2
         }
 
         __attribute__((always_inline))
-        const void* get_raw_block_at(size_t row_idx, size_t k_block_offset) const override {
+        const void *
+        get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
+        {
             const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
             const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(raw_data_.data());
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
