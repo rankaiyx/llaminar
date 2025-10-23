@@ -9,8 +9,8 @@
  * Functions are inline and header-only for zero-cost abstraction.
  */
 
-#include "CPUFeatures.h"
-#include "../tensors/FP16Utils.h"
+#include "../utils/CPUFeatures.h"
+#include "FP16Utils.h"
 #include <cstdint>
 #include <cstring>
 

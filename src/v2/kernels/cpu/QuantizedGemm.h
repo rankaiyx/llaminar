@@ -12,7 +12,7 @@
 
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/DebugEnv.h"
-#include "../../utils/SIMDHelpers.h"
+#include "../../tensors/SIMDHelpers.h"
 #include <algorithm>
 #include <vector>
 

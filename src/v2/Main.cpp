@@ -12,7 +12,7 @@
 
 #include "utils/MPIContext.h"
 #include "backends/ComputeBackend.h"
-#include "pipelines/QwenPipeline.h"
+#include "pipelines/qwen/Qwen2Pipeline.h"
 #include <mpi.h>
 #include <iostream>
 #include <vector>
@@ -206,7 +206,7 @@ int main(int argc, char *argv[])
     }
 
     // Create pipeline
-    auto pipeline = std::make_unique<QwenPipeline>(model_path, mpi_ctx, device_idx);
+    auto pipeline = std::make_unique<Qwen2Pipeline>(model_path, mpi_ctx, device_idx);
 
     // TODO: Tokenize prompt (for now, use dummy tokens)
     std::vector<int> tokens = {1, 2, 3, 4, 5, 6, 7, 8}; // Placeholder

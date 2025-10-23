@@ -35,17 +35,182 @@ namespace llaminar2
 
     static_assert(sizeof(IQ4_NLBlock) == 18, "IQ4_NLBlock must be 18 bytes");
 
+    /** @brief Q8_0 block: 8-bit quantization (32 elements per block, 34 bytes) */
+    struct Q8_0Block
+    {
+        uint16_t d;    ///< FP16 scale factor
+        int8_t qs[32]; ///< 32 quantized int8 values
+        static constexpr size_t BLOCK_SIZE = 32;
+    };
+    static_assert(sizeof(Q8_0Block) == 34, "Q8_0Block must be 34 bytes");
+
+    /** @brief Q4_0 block: 4-bit quantization (32 elements per block, 18 bytes) */
+    struct Q4_0Block
+    {
+        uint16_t d;     ///< FP16 scale factor
+        uint8_t qs[16]; ///< 32 4-bit values packed (2 per byte)
+        static constexpr size_t BLOCK_SIZE = 32;
+    };
+    static_assert(sizeof(Q4_0Block) == 18, "Q4_0Block must be 18 bytes");
+
+    /** @brief Q4_1 block: 4-bit quantization with min (32 elements per block, 20 bytes) */
+    struct Q4_1Block
+    {
+        uint16_t d;     ///< FP16 scale factor
+        uint16_t m;     ///< FP16 minimum value
+        uint8_t qs[16]; ///< 32 4-bit values packed (2 per byte)
+        static constexpr size_t BLOCK_SIZE = 32;
+    };
+    static_assert(sizeof(Q4_1Block) == 20, "Q4_1Block must be 20 bytes");
+
+    /** @brief Q6_K block: 6-bit K-quant (256 elements per super-block, 210 bytes) */
+    struct Q6_KBlock
+    {
+        uint8_t ql[128];   ///< Lower 4 bits of 6-bit values
+        uint8_t qh[64];    ///< Upper 2 bits of 6-bit values (packed)
+        int8_t scales[16]; ///< Per-block scales
+        uint16_t d;        ///< FP16 super-block scale
+        static constexpr size_t BLOCK_SIZE = 256;
+    };
+    static_assert(sizeof(Q6_KBlock) == 210, "Q6_KBlock must be 210 bytes");
+
+    /** @brief Q2_K block: 2-bit K-quant (256 elements per super-block, 84 bytes) */
+    struct Q2_KBlock
+    {
+        uint8_t scales[16]; ///< Scales and mins (packed)
+        uint8_t qs[64];     ///< 2-bit values packed (4 per byte)
+        uint16_t d;         ///< FP16 super-block scale for scales
+        uint16_t dmin;      ///< FP16 super-block scale for mins
+        static constexpr size_t BLOCK_SIZE = 256;
+    };
+    static_assert(sizeof(Q2_KBlock) == 84, "Q2_KBlock must be 84 bytes");
+
+    /** @brief Q5_K block: 5-bit K-quant (256 elements per super-block, 176 bytes) */
+    struct Q5_KBlock
+    {
+        uint16_t d;         ///< FP16 super-block scale
+        uint16_t dmin;      ///< FP16 super-block min scale
+        uint8_t scales[12]; ///< 8 6-bit scales packed
+        uint8_t qh[32];     ///< High bits (5th bit of 5-bit values)
+        uint8_t qs[128];    ///< Lower 4 bits of 5-bit values
+        static constexpr size_t BLOCK_SIZE = 256;
+    };
+    static_assert(sizeof(Q5_KBlock) == 176, "Q5_KBlock must be 176 bytes");
+
+    /** @brief Q3_K block: 3-bit K-quant (256 elements per super-block, 110 bytes) */
+    struct Q3_KBlock
+    {
+        uint8_t hmask[32];  ///< High bit masks (1 bit per element)
+        uint8_t qs[64];     ///< Lower 2 bits of 3-bit values
+        uint8_t scales[12]; ///< 16 scales packed (6 bits each)
+        uint16_t d;         ///< FP16 super-block scale
+        static constexpr size_t BLOCK_SIZE = 256;
+    };
+    static_assert(sizeof(Q3_KBlock) == 110, "Q3_KBlock must be 110 bytes");
+
+    /** @brief IQ4_XS block: 4-bit extra-small IQ (32 elements per block, 18 bytes) */
+    struct IQ4_XSBlock
+    {
+        uint16_t d;     ///< FP16 scale factor
+        uint8_t qs[16]; ///< 32 4-bit grid indices packed
+        static constexpr size_t BLOCK_SIZE = 32;
+    };
+    static_assert(sizeof(IQ4_XSBlock) == 18, "IQ4_XSBlock must be 18 bytes");
+
+    /** @brief IQ2_XXS block: 2-bit extra-extra-small IQ (256 elements per super-block, 66 bytes) */
+    struct IQ2_XXSBlock
+    {
+        uint16_t d;      ///< FP16 scale factor
+        uint16_t qs[32]; ///< 256 2-bit grid indices packed (16 per uint16)
+        static constexpr size_t BLOCK_SIZE = 256;
+    };
+    static_assert(sizeof(IQ2_XXSBlock) == 66, "IQ2_XXSBlock must be 66 bytes");
+
+    /** @brief IQ2_XS block: 2-bit extra-small IQ (256 elements per super-block, 74 bytes) */
+    struct IQ2_XSBlock
+    {
+        uint16_t d;        ///< FP16 scale factor
+        uint16_t qs[32];   ///< Grid indices
+        uint8_t scales[8]; ///< Per-block scales
+        static constexpr size_t BLOCK_SIZE = 256;
+    };
+    static_assert(sizeof(IQ2_XSBlock) == 74, "IQ2_XSBlock must be 74 bytes");
+
+    /** @brief IQ3_XXS block: 3-bit extra-extra-small IQ (256 elements per super-block, 68 bytes) */
+    struct IQ3_XXSBlock
+    {
+        uint16_t d;        ///< FP16 scale factor
+        uint8_t qs[64];    ///< Grid indices (3 bits each, packed)
+        uint8_t scales[2]; ///< Auxiliary scales
+        static constexpr size_t BLOCK_SIZE = 256;
+    } __attribute__((packed));
+    static_assert(sizeof(IQ3_XXSBlock) == 68, "IQ3_XXSBlock must be 68 bytes");
+
+    /** @brief IQ2_S block: 2-bit small IQ (256 elements per super-block) */
+    struct IQ2_SBlock
+    {
+        uint16_t d;      ///< FP16 scale factor
+        uint16_t qh;     ///< High bits
+        uint16_t qs[32]; ///< Grid indices
+        static constexpr size_t BLOCK_SIZE = 256;
+    } __attribute__((packed));
+    static_assert(sizeof(IQ2_SBlock) == 68, "IQ2_SBlock must be 68 bytes");
+
+    /** @brief IQ3_S block: 3-bit small IQ (256 elements per super-block) */
+    struct IQ3_SBlock
+    {
+        uint16_t d;        ///< FP16 scale factor
+        uint8_t qs[96];    ///< Grid indices
+        uint8_t scales[4]; ///< Per-block scales
+        uint8_t signs[8];  ///< Sign patterns
+        static constexpr size_t BLOCK_SIZE = 256;
+    } __attribute__((packed));
+    static_assert(sizeof(IQ3_SBlock) == 110, "IQ3_SBlock must be 110 bytes");
+
+    /** @brief IQ1_S block: 1-bit small IQ (256 elements per super-block) */
+    struct IQ1_SBlock
+    {
+        uint16_t d;    ///< FP16 scale factor
+        uint8_t qs[8]; ///< Grid indices
+        uint8_t qh[8]; ///< High bits and scales
+        static constexpr size_t BLOCK_SIZE = 256;
+    } __attribute__((packed));
+    static_assert(sizeof(IQ1_SBlock) == 18, "IQ1_SBlock must be 18 bytes");
+
+    /** @brief IQ1_M block: 1-bit medium IQ (256 elements per super-block, 32 bytes) */
+    struct IQ1_MBlock
+    {
+        uint8_t qs[16];    ///< Grid indices
+        uint8_t qh[8];     ///< High bits
+        uint8_t scales[8]; ///< Per-block scales
+        static constexpr size_t BLOCK_SIZE = 256;
+    } __attribute__((packed));
+    static_assert(sizeof(IQ1_MBlock) == 32, "IQ1_MBlock must be 32 bytes");
+
     /**
      * @brief Tensor data type
      */
     enum class TensorType
     {
-        FP32,   // 32-bit float
-        BF16,   // 16-bit bfloat
-        FP16,   // 16-bit float
-        IQ4_NL, // 4-bit quantized (non-linear)
-        Q6_K,   // 6-bit quantized
-        Q8_0    // 8-bit quantized
+        FP32,    // 32-bit float
+        BF16,    // 16-bit bfloat
+        FP16,    // 16-bit float
+        IQ4_NL,  // 4-bit quantized (non-linear)
+        IQ4_XS,  // 4-bit quantized (extra-small IQ)
+        Q8_0,    // 8-bit quantized
+        Q4_0,    // 4-bit quantized
+        Q4_1,    // 4-bit quantized with min
+        Q6_K,    // 6-bit K-quant
+        Q2_K,    // 2-bit K-quant
+        Q5_K,    // 5-bit K-quant
+        Q3_K,    // 3-bit K-quant
+        IQ2_XXS, // 2-bit extra-extra-small IQ
+        IQ2_XS,  // 2-bit extra-small IQ
+        IQ3_XXS, // 3-bit extra-extra-small IQ
+        IQ2_S,   // 2-bit small IQ
+        IQ3_S,   // 3-bit small IQ
+        IQ1_S,   // 1-bit small IQ
+        IQ1_M    // 1-bit medium IQ
     };
 
     /**
@@ -112,6 +277,107 @@ namespace llaminar2
 
         bool host_dirty_;   // Host modified, needs upload
         bool device_dirty_; // Device modified, needs download
+
+        bool sync_to_device();
+        bool sync_from_device();
+    };
+
+    /**
+     * @brief FP16 tensor with optional device storage
+     *
+     * IEEE 754 half-precision (16-bit) floating point.
+     * - 1 sign bit, 5 exponent bits, 10 mantissa bits
+     * - Range: ±65,504 (narrower than FP32)
+     * - Precision: ~3-4 decimal digits
+     * - 2× memory reduction vs FP32
+     */
+    class FP16Tensor : public TensorBase
+    {
+    public:
+        explicit FP16Tensor(const std::vector<size_t> &shape);
+        FP16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &fp16_data);
+        ~FP16Tensor() override;
+
+        // TensorBase interface
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::FP16; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override; // Dequantizes to cache
+        float *mutable_data() override;     // Not supported
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // FP16-specific interface
+        const uint16_t *fp16_data() const { return host_fp16_data_.data(); }
+        void from_fp32(const float *fp32_data, size_t count);
+        void to_fp32(float *fp32_data, size_t count) const;
+
+    private:
+        std::vector<size_t> shape_;
+        int device_idx_;
+
+        std::vector<uint16_t> host_fp16_data_;     // Native FP16 storage
+        void *device_data_;                        // Device-side storage
+        mutable std::vector<float> dequant_cache_; // For data() calls
+
+        bool sync_to_device();
+        bool sync_from_device();
+    };
+
+    /**
+     * @brief BF16 tensor with optional device storage
+     *
+     * Brain Float 16 (Google's reduced-precision format).
+     * - 1 sign bit, 8 exponent bits, 7 mantissa bits
+     * - Same range as FP32 (prevents overflow/underflow)
+     * - Reduced precision (~2-3 decimal digits)
+     * - 2× memory reduction vs FP32
+     * - Hardware acceleration on Ice Lake+, Zen 4+
+     */
+    class BF16Tensor : public TensorBase
+    {
+    public:
+        explicit BF16Tensor(const std::vector<size_t> &shape);
+        BF16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &bf16_data);
+        ~BF16Tensor() override;
+
+        // TensorBase interface
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::BF16; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override; // Dequantizes to cache
+        float *mutable_data() override;     // Not supported
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // BF16-specific interface
+        const uint16_t *bf16_data() const { return host_bf16_data_.data(); }
+        void from_fp32(const float *fp32_data, size_t count);
+        void to_fp32(float *fp32_data, size_t count) const;
+
+    private:
+        std::vector<size_t> shape_;
+        int device_idx_;
+
+        std::vector<uint16_t> host_bf16_data_;     // Native BF16 storage
+        void *device_data_;                        // Device-side storage
+        mutable std::vector<float> dequant_cache_; // For data() calls
 
         bool sync_to_device();
         bool sync_from_device();
@@ -217,8 +483,629 @@ namespace llaminar2
 
 #if defined(__AVX2__)
         static void decodeBlockAVX2(const IQ4_NLBlock &block, float *output);
-        static inline void decodeBlockVectorizedAVX2(const IQ4_NLBlock &block, float *output);
+        static void decodeBlockVectorizedAVX2(const IQ4_NLBlock &block, float *output);
 #endif
+    };
+
+    // ===== Q8_0 Tensor (8-bit quantization) =====
+
+    /**
+     * @brief Q8_0 quantized tensor (8-bit uniform quantization)
+     *
+     * Block format: 32 elements per block, FP16 scale + int8[32] values
+     * Compression: 4× vs FP32
+     */
+    class Q8_0Tensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q8_0Tensor() override;
+
+        // TensorBase interface
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q8_0; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // IBlockDecoder interface
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q8_0Block::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q8_0Block &block, float *output);
+    };
+
+    // ===== Q4_0 Tensor (4-bit quantization) =====
+
+    /**
+     * @brief Q4_0 quantized tensor (4-bit uniform quantization)
+     *
+     * Block format: 32 elements per block, FP16 scale + 4-bit packed values
+     * Compression: 8× vs FP32
+     */
+    class Q4_0Tensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q4_0Tensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q4_0; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q4_0Block::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q4_0Block &block, float *output);
+    };
+
+    // ===== Q4_1 Tensor (4-bit with min) =====
+
+    /**
+     * @brief Q4_1 quantized tensor (4-bit with min offset)
+     *
+     * Block format: 32 elements per block, FP16 scale + FP16 min + 4-bit packed values
+     * Compression: ~7.1× vs FP32
+     */
+    class Q4_1Tensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q4_1Tensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q4_1; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q4_1Block::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q4_1Block &block, float *output);
+    };
+
+    // ===== K-quant Tensors =====
+
+    /**
+     * @brief Q6_K tensor (6-bit K-quant super-block)
+     */
+    class Q6_KTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q6_KTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q6_K; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q6_KBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q6_KBlock &block, float *output);
+    };
+
+    /**
+     * @brief Q2_K tensor (2-bit K-quant super-block)
+     */
+    class Q2_KTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q2_KTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q2_K; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q2_KBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q2_KBlock &block, float *output);
+    };
+
+    /**
+     * @brief Q5_K tensor (5-bit K-quant super-block)
+     */
+    class Q5_KTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q5_KTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q5_K; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q5_KBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q5_KBlock &block, float *output);
+    };
+
+    /**
+     * @brief Q3_K tensor (3-bit K-quant super-block)
+     */
+    class Q3_KTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~Q3_KTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::Q3_K; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return Q3_KBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const Q3_KBlock &block, float *output);
+    };
+
+    // ===== IQ Tensors =====
+
+    /**
+     * @brief IQ4_XS tensor (4-bit extra-small IQ)
+     */
+    class IQ4_XSTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~IQ4_XSTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::IQ4_XS; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return IQ4_XSBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const IQ4_XSBlock &block, float *output);
+    };
+
+    /**
+     * @brief IQ2_XXS tensor (2-bit extra-extra-small IQ)
+     */
+    class IQ2_XXSTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~IQ2_XXSTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::IQ2_XXS; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return IQ2_XXSBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const IQ2_XXSBlock &block, float *output);
+    };
+
+    /**
+     * @brief IQ2_XS tensor (2-bit extra-small IQ)
+     */
+    class IQ2_XSTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~IQ2_XSTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::IQ2_XS; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return IQ2_XSBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const IQ2_XSBlock &block, float *output);
+    };
+
+    /**
+     * @brief IQ3_XXS tensor (3-bit extra-extra-small IQ)
+     */
+    class IQ3_XXSTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~IQ3_XXSTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::IQ3_XXS; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return IQ3_XXSBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const IQ3_XXSBlock &block, float *output);
+    };
+
+    /**
+     * @brief IQ2_S tensor (2-bit small IQ)
+     */
+    class IQ2_STensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~IQ2_STensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::IQ2_S; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return IQ2_SBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const IQ2_SBlock &block, float *output);
+    };
+
+    /**
+     * @brief IQ3_S tensor (3-bit small IQ)
+     */
+    class IQ3_STensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~IQ3_STensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::IQ3_S; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return IQ3_SBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const IQ3_SBlock &block, float *output);
+    };
+
+    /**
+     * @brief IQ1_S tensor (1-bit small IQ)
+     */
+    class IQ1_STensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~IQ1_STensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::IQ1_S; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return IQ1_SBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const IQ1_SBlock &block, float *output);
+    };
+
+    /**
+     * @brief IQ1_M tensor (1-bit medium IQ)
+     */
+    class IQ1_MTensor : public TensorBase, public IBlockDecoder
+    {
+    public:
+        IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        ~IQ1_MTensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::IQ1_M; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return IQ1_MBlock::BLOCK_SIZE; }
+
+    private:
+        std::vector<size_t> shape_;
+        std::vector<uint8_t> raw_data_;
+        int device_idx_;
+        void *device_blocks_;
+        mutable std::vector<float> dequant_cache_;
+        static void decodeBlock(const IQ1_MBlock &block, float *output);
     };
 
 } // namespace llaminar2

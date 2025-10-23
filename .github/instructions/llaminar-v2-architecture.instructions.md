@@ -1,7 +1,8 @@
 # Llaminar V2 Architecture - Operator-Free Design
 
 *Last Updated: October 23, 2025*  
-*Architecture Version: 2.0 (Greenfield Rewrite)*
+*Architecture Version: 2.0 (Greenfield Rewrite)*  
+*Pipeline Architecture: PipelineBase inheritance with architecture-specific implementations*
 
 ## Table of Contents
 
@@ -78,7 +79,7 @@ class MPILinearOperator : public MPIKernelBase {
 **V2 Pattern** (Direct):
 ```cpp
 // Pipeline directly orchestrates kernels
-class QwenPipeline {
+class Qwen2Pipeline {
     bool forward(...) {
         // Direct kernel calls with runtime device selection
         auto device = selectDevice(tensor_size, available_gpus);
@@ -234,7 +235,11 @@ src/v2/
 │   └── RocmGemmKernel.cpp # ROCm GEMM (future)
 │
 ├── pipelines/            # Transformer pipelines
-│   └── QwenPipeline.h    # Qwen pipeline (112 lines)
+│   ├── PipelineBase.h    # Base pipeline interface (125 lines)
+│   ├── PipelineBase.cpp  # Base implementation (30 lines)
+│   └── qwen/             # Qwen-specific pipeline
+│       ├── Qwen2Pipeline.h    # Qwen 2.x pipeline (104 lines)
+│       └── Qwen2Pipeline.cpp  # Implementation (306 lines)
 │
 ├── tools/                # Benchmarks and utilities
 │   └── benchmark/        # Performance benchmarks (future)
@@ -619,40 +624,213 @@ public:
 
 ### 5.5 Pipeline Architecture (`pipelines/`)
 
-#### QwenPipeline
+**V1**: Adapter pattern wrapping pipelines in AbstractPipeline interface  
+**V2**: Base class inheritance with `PipelineBase` providing common infrastructure
 
-**File**: `src/v2/pipelines/QwenPipeline.h` (112 lines)
+#### Pipeline Class Hierarchy
 
-**Purpose**: Qwen transformer orchestration with direct kernel calls
+**Base Class** (`PipelineBase`):
+- Provides common infrastructure for all model architectures
+- MPI context management and device placement coordination
+- Weight and activation lifecycle management
+- Pure virtual methods for architecture-specific logic
+
+**Architecture-Specific Pipelines**:
+- `Qwen2Pipeline`: Qwen 2.0/2.5 models (0.5B-72B) - **implemented**
+- `Qwen3Pipeline`: Qwen 3.x models (future)
+- `Qwen3MoEPipeline`: Qwen MoE models (future)
+- `LlamaPipeline`: LLaMA 3.x models (future)
+
+#### PipelineBase Interface
+
+**File**: `src/v2/pipelines/PipelineBase.h` (125 lines)
 
 ```cpp
-class QwenPipeline {
+class PipelineBase {
 public:
-    QwenPipeline(const ModelConfig& config, MPIContext mpi_ctx);
+    // Constructor
+    PipelineBase(const std::string& model_path,
+                 std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+                 int device_idx = -1);
+
+    virtual ~PipelineBase() = default;
+
+    // ===== Public Interface =====
     
-    bool forward(
-        const std::vector<int>& token_ids,
-        TensorBase* output
-    );
+    /**
+     * @brief Forward pass (prefill or decode)
+     * @param tokens Token IDs [seq_len]
+     * @param seq_len Number of tokens
+     * @return true on success
+     */
+    virtual bool forward(const int* tokens, int seq_len) = 0;
+
+    /**
+     * @brief Get output logits (FP32)
+     * @return Logits tensor [seq_len, vocab_size]
+     */
+    virtual const float* logits() const = 0;
+
+    /**
+     * @brief Get model architecture name
+     * @return Architecture string (e.g., "qwen2", "llama")
+     */
+    virtual const char* architecture() const = 0;
+
+    // ===== Context Accessors =====
     
-private:
-    ModelConfig config_;
-    MPIContext mpi_ctx_;
-    DeviceManager& device_mgr_;
+    std::shared_ptr<MPIContext> mpi_context() const { return mpi_ctx_; }
+    int device_index() const { return device_idx_; }
+
+protected:
+    // ===== Protected Interface (derived classes implement) =====
     
-    // No operators! Direct kernel orchestration
-    bool embedding_layer(const std::vector<int>& tokens, TensorBase* out);
-    bool transformer_layer(int layer_idx, TensorBase* in, TensorBase* out);
-    bool attention_block(int layer_idx, TensorBase* in, TensorBase* out);
-    bool ffn_block(int layer_idx, TensorBase* in, TensorBase* out);
-    bool output_projection(TensorBase* in, TensorBase* logits);
+    /**
+     * @brief Load weights from GGUF file
+     * @param model_path Path to GGUF model file
+     * @return true on success
+     */
+    virtual bool load_weights(const std::string& model_path) = 0;
+
+    /**
+     * @brief Execute one transformer layer
+     * @param layer_idx Layer index (0-indexed)
+     * @param seq_len Sequence length
+     * @return true on success
+     */
+    virtual bool transformer_layer(int layer_idx, int seq_len) = 0;
+
+    // ===== Shared State =====
+    
+    std::shared_ptr<MPIContext> mpi_ctx_;  // MPI coordination
+    int device_idx_;                        // Default device (-1 = CPU)
+    std::string model_path_;                // GGUF file path
+
+    // Common model parameters (set by derived classes)
+    int n_layers_ = 0;
+    int d_model_ = 0;
+    int vocab_size_ = 0;
 };
 ```
 
-**Execution Flow**:
+#### Qwen2Pipeline Implementation
+
+**File**: `src/v2/pipelines/qwen/Qwen2Pipeline.h` (104 lines)
+
+**Purpose**: Qwen 2.x transformer with direct kernel orchestration
 
 ```cpp
-bool QwenPipeline::forward(const std::vector<int>& tokens, TensorBase* output) {
+class Qwen2Pipeline : public PipelineBase {
+public:
+    Qwen2Pipeline(const std::string& model_path,
+                  std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+                  int device_idx = -1);
+
+    ~Qwen2Pipeline() override = default;
+
+    // PipelineBase interface
+    bool forward(const int* tokens, int seq_len) override;
+    const float* logits() const override;
+    const char* architecture() const override { return "qwen2"; }
+
+    // Qwen2-specific
+    std::shared_ptr<TensorBase> get_layer_weight(int layer_idx, 
+                                                  const std::string& weight_name);
+
+protected:
+    bool load_weights(const std::string& model_path) override;
+    bool transformer_layer(int layer_idx, int seq_len) override;
+
+private:
+    // Qwen2-specific architecture parameters
+    int n_heads_ = 0;
+    int n_kv_heads_ = 0;  // GQA
+    int head_dim_ = 0;
+    int d_ff_ = 0;
+
+    // Layer weights structure
+    struct LayerWeights {
+        std::shared_ptr<TensorBase> wq, wk, wv, wo;          // Attention
+        std::shared_ptr<TensorBase> attn_norm;               // Pre-attention norm
+        std::shared_ptr<TensorBase> gate_proj, up_proj, down_proj;  // FFN
+        std::shared_ptr<TensorBase> ffn_norm;                // Pre-FFN norm
+    };
+
+    // Weights (quantized)
+    std::shared_ptr<TensorBase> embedding_table_;
+    std::vector<LayerWeights> layers_;
+    std::shared_ptr<TensorBase> final_norm_;
+    std::shared_ptr<TensorBase> lm_head_;
+
+    // Activations (FP32)
+    std::shared_ptr<FP32Tensor> current_hidden_;
+    std::shared_ptr<FP32Tensor> logits_;
+
+    // Helper methods
+    bool attention_block(const LayerWeights& layer, int seq_len);
+    bool ffn_block(const LayerWeights& layer, int seq_len);
+};
+```
+
+**Implementation Highlights**:
+
+**Constructor** (initializes and loads weights):
+
+```cpp
+Qwen2Pipeline::Qwen2Pipeline(const std::string& model_path,
+                             std::shared_ptr<MPIContext> mpi_ctx,
+                             int device_idx)
+    : PipelineBase(model_path, mpi_ctx, device_idx)
+{
+    // TODO: Read from GGUF metadata instead of hardcoding
+    n_layers_ = 24;
+    n_heads_ = 14;
+    n_kv_heads_ = 2;   // Grouped-query attention
+    head_dim_ = 64;
+    d_model_ = 896;
+    d_ff_ = 4864;
+    vocab_size_ = 151936;
+
+    if (!load_weights(model_path)) {
+        throw std::runtime_error("Failed to load weights");
+    }
+}
+```
+
+**Weight Loading**:
+
+```cpp
+bool Qwen2Pipeline::load_weights(const std::string& model_path) {
+    ModelLoader loader;
+    if (!loader.loadModel(model_path)) return false;
+
+    // Validate architecture
+    const GGUFModel& model = loader.getModel();
+    if (model.architecture != "qwen2") return false;
+
+    // Load embedding, layers, final norm, LM head
+    embedding_table_ = loader.loadTensor("token_embd.weight", device_idx_);
+    
+    layers_.resize(n_layers_);
+    for (int i = 0; i < n_layers_; ++i) {
+        std::string prefix = "blk." + std::to_string(i) + ".";
+        layers_[i].wq = loader.loadTensor(prefix + "attn_q.weight", device_idx_);
+        layers_[i].wk = loader.loadTensor(prefix + "attn_k.weight", device_idx_);
+        // ... (load all layer weights)
+    }
+
+    final_norm_ = loader.loadTensor("output_norm.weight", device_idx_);
+    lm_head_ = loader.loadTensor("output.weight", device_idx_);
+
+    return true;
+}
+```
+
+**Execution Flow** (planned):
+
+```cpp
+bool Qwen2Pipeline::forward(const int* tokens, int seq_len) {
+    // TODO: Implement
     // 1. Embedding
     auto embedded = allocateTensor({tokens.size(), config_.d_model});
     if (!embedding_layer(tokens, embedded.get())) return false;
@@ -1638,36 +1816,130 @@ TEST(QuantizedGemm, IBlockDecoderZeroOverhead) {
 
 ### Adding New Pipelines
 
-**Step 1**: Create pipeline class
+**Step 1**: Create pipeline class inheriting from PipelineBase
 
 ```cpp
-// pipelines/LlamaPipeline.h
-class LlamaPipeline {
+// pipelines/llama/LlamaPipeline.h
+#include "../PipelineBase.h"
+
+class LlamaPipeline : public PipelineBase {
 public:
-    LlamaPipeline(const ModelConfig& config, MPIContext mpi_ctx);
-    bool forward(const std::vector<int>& tokens, TensorBase* output);
+    LlamaPipeline(const std::string& model_path,
+                  std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+                  int device_idx = -1);
+
+    ~LlamaPipeline() override = default;
+
+    // PipelineBase interface
+    bool forward(const int* tokens, int seq_len) override;
+    const float* logits() const override;
+    const char* architecture() const override { return "llama"; }
+
+protected:
+    bool load_weights(const std::string& model_path) override;
+    bool transformer_layer(int layer_idx, int seq_len) override;
+
+private:
+    // LLaMA-specific architecture parameters
+    int n_heads_ = 0;
+    int head_dim_ = 0;
+    int d_ff_ = 0;
+    float rope_theta_ = 10000.0f;
+
+    // Layer weights
+    struct LayerWeights {
+        std::shared_ptr<TensorBase> wq, wk, wv, wo;
+        std::shared_ptr<TensorBase> gate_proj, up_proj, down_proj;
+        std::shared_ptr<TensorBase> attn_norm, ffn_norm;
+    };
+    
+    std::shared_ptr<TensorBase> embedding_table_;
+    std::vector<LayerWeights> layers_;
+    std::shared_ptr<TensorBase> final_norm_;
+    std::shared_ptr<TensorBase> lm_head_;
+    
+    std::shared_ptr<FP32Tensor> current_hidden_;
+    std::shared_ptr<FP32Tensor> logits_;
 };
 ```
 
-**Step 2**: Implement transformer blocks
+**Step 2**: Implement PipelineBase interface methods
 
 ```cpp
-bool LlamaPipeline::transformer_layer(int layer, TensorBase* in, TensorBase* out) {
-    // LLaMA-specific architecture
+// pipelines/llama/LlamaPipeline.cpp
+LlamaPipeline::LlamaPipeline(const std::string& model_path,
+                             std::shared_ptr<MPIContext> mpi_ctx,
+                             int device_idx)
+    : PipelineBase(model_path, mpi_ctx, device_idx)
+{
+    std::cout << "[LlamaPipeline] Initializing LLaMA pipeline\n";
+
+    // TODO: Read from GGUF metadata
+    n_layers_ = 32;
+    n_heads_ = 32;
+    head_dim_ = 128;
+    d_model_ = 4096;
+    d_ff_ = 11008;
+    vocab_size_ = 128256;
+
+    if (!load_weights(model_path)) {
+        throw std::runtime_error("Failed to load weights");
+    }
+}
+
+bool LlamaPipeline::load_weights(const std::string& model_path) {
+    ModelLoader loader;
+    if (!loader.loadModel(model_path)) return false;
+
+    const GGUFModel& model = loader.getModel();
+    if (model.architecture != "llama") {
+        std::cerr << "Architecture mismatch\n";
+        return false;
+    }
+
+    // Load embedding, layer weights, final norm, LM head
+    // (similar pattern to Qwen2Pipeline)
+    
+    return true;
+}
+
+bool LlamaPipeline::transformer_layer(int layer_idx, int seq_len) {
+    // LLaMA-specific architecture:
     // 1. RMSNorm
-    // 2. Attention with rotary embeddings
-    // 3. Residual
+    // 2. Multi-head attention with RoPE
+    // 3. Residual connection
     // 4. RMSNorm
     // 5. SwiGLU FFN
-    // 6. Residual
+    // 6. Residual connection
+    
+    const LayerWeights& layer = layers_[layer_idx];
+    
+    // Attention block
+    // ... (orchestrate kernels directly)
+    
+    // FFN block
+    // ... (orchestrate kernels directly)
+    
+    return true;
+}
+
+bool LlamaPipeline::forward(const int* tokens, int seq_len) {
+    // 1. Embedding lookup
+    // 2. For each layer: transformer_layer(i, seq_len)
+    // 3. Final norm + LM head
+    return true;
+}
+
+const float* LlamaPipeline::logits() const {
+    return logits_ ? logits_->data() : nullptr;
 }
 ```
 
-**Step 3**: Register in factory (future)
+**Step 3**: Register in factory (future - when factory is implemented)
 
 ```cpp
-PipelineFactory::registerPipeline("llama", []() {
-    return std::make_unique<LlamaPipeline>(...);
+PipelineFactory::registerPipeline("llama", [](const std::string& path, auto ctx, int dev) {
+    return std::make_unique<LlamaPipeline>(path, ctx, dev);
 });
 ```
 

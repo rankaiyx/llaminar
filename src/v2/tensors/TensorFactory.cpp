@@ -1,0 +1,213 @@
+/**
+ * @file TensorFactory.cpp
+ * @brief Factory implementation for creating tensors with NUMA-aware allocation
+ * @author David Sanftenberg
+ */
+
+#include "TensorFactory.h"
+#include <stdexcept>
+#include <sstream>
+
+#ifdef HAVE_NUMA
+#include <numa.h>
+#include <numaif.h>
+#endif
+
+namespace llaminar2
+{
+    TensorFactory::TensorFactory(const MPIContext &mpi_ctx)
+        : mpi_rank_(mpi_ctx.rank()), numa_node_(-1)
+    {
+        // Determine NUMA node for this MPI rank
+        numa_node_ = getNumaNodeForRank(mpi_rank_);
+
+        // Bind current thread to NUMA node if available
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+    }
+
+    std::unique_ptr<FP32Tensor> TensorFactory::createFP32(const std::vector<size_t> &shape)
+    {
+        // Ensure we're on the correct NUMA node
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        return std::make_unique<FP32Tensor>(shape);
+    }
+
+    std::unique_ptr<FP16Tensor> TensorFactory::createFP16(const std::vector<size_t> &shape)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        return std::make_unique<FP16Tensor>(shape);
+    }
+
+    std::unique_ptr<FP16Tensor> TensorFactory::createFP16(const std::vector<size_t> &shape,
+                                                          const std::vector<uint16_t> &fp16_data)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        return std::make_unique<FP16Tensor>(shape, fp16_data);
+    }
+
+    std::unique_ptr<BF16Tensor> TensorFactory::createBF16(const std::vector<size_t> &shape)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        return std::make_unique<BF16Tensor>(shape);
+    }
+
+    std::unique_ptr<BF16Tensor> TensorFactory::createBF16(const std::vector<size_t> &shape,
+                                                          const std::vector<uint16_t> &bf16_data)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        return std::make_unique<BF16Tensor>(shape, bf16_data);
+    }
+
+    std::unique_ptr<TensorBase> TensorFactory::createQuantized(TensorType type,
+                                                               const std::vector<size_t> &shape,
+                                                               const std::vector<uint8_t> &raw_data)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        // Create appropriate quantized tensor type
+        switch (type)
+        {
+        case TensorType::IQ4_NL:
+            return std::make_unique<IQ4_NLTensor>(shape, raw_data);
+
+        case TensorType::Q8_0:
+            return std::make_unique<Q8_0Tensor>(shape, raw_data);
+
+        case TensorType::Q4_0:
+            return std::make_unique<Q4_0Tensor>(shape, raw_data);
+
+        case TensorType::Q4_1:
+            return std::make_unique<Q4_1Tensor>(shape, raw_data);
+
+        case TensorType::Q6_K:
+            return std::make_unique<Q6_KTensor>(shape, raw_data);
+
+        case TensorType::Q2_K:
+            return std::make_unique<Q2_KTensor>(shape, raw_data);
+
+        case TensorType::Q5_K:
+            return std::make_unique<Q5_KTensor>(shape, raw_data);
+
+        case TensorType::Q3_K:
+            return std::make_unique<Q3_KTensor>(shape, raw_data);
+
+        case TensorType::IQ4_XS:
+            return std::make_unique<IQ4_XSTensor>(shape, raw_data);
+
+        case TensorType::IQ2_XXS:
+            return std::make_unique<IQ2_XXSTensor>(shape, raw_data);
+
+        case TensorType::IQ2_XS:
+            return std::make_unique<IQ2_XSTensor>(shape, raw_data);
+
+        case TensorType::IQ3_XXS:
+            return std::make_unique<IQ3_XXSTensor>(shape, raw_data);
+
+        case TensorType::IQ2_S:
+            return std::make_unique<IQ2_STensor>(shape, raw_data);
+
+        case TensorType::IQ3_S:
+            return std::make_unique<IQ3_STensor>(shape, raw_data);
+
+        case TensorType::IQ1_S:
+            return std::make_unique<IQ1_STensor>(shape, raw_data);
+
+        case TensorType::IQ1_M:
+            return std::make_unique<IQ1_MTensor>(shape, raw_data);
+
+        default:
+        {
+            std::ostringstream oss;
+            oss << "TensorFactory::createQuantized: unsupported type " << static_cast<int>(type);
+            throw std::runtime_error(oss.str());
+        }
+        }
+    }
+
+    bool TensorFactory::isNumaAvailable()
+    {
+#ifdef HAVE_NUMA
+        if (numa_available() < 0)
+        {
+            return false;
+        }
+
+        // Check if system has multiple NUMA nodes
+        int max_node = numa_max_node();
+        return max_node > 0;
+#else
+        return false;
+#endif
+    }
+
+    void TensorFactory::bindToNumaNode()
+    {
+#ifdef HAVE_NUMA
+        if (numa_node_ >= 0 && numa_available() >= 0)
+        {
+            // Bind current thread to NUMA node
+            struct bitmask *mask = numa_allocate_nodemask();
+            numa_bitmask_clearall(mask);
+            numa_bitmask_setbit(mask, numa_node_);
+
+            // Set memory binding policy for allocations
+            numa_set_membind(mask);
+
+            // Also bind CPU affinity (optional, helps with first-touch)
+            // numa_run_on_node_mask(mask);
+
+            numa_free_nodemask(mask);
+        }
+#endif
+    }
+
+    int TensorFactory::getNumaNodeForRank(int rank)
+    {
+#ifdef HAVE_NUMA
+        if (numa_available() < 0)
+        {
+            return -1;
+        }
+
+        int max_node = numa_max_node();
+        if (max_node <= 0)
+        {
+            return -1; // Only one NUMA node
+        }
+
+        // Simple round-robin mapping: rank % (max_node + 1)
+        // More sophisticated mapping could query actual CPU topology
+        return rank % (max_node + 1);
+#else
+        (void)rank; // Suppress unused parameter warning
+        return -1;
+#endif
+    }
+
+} // namespace llaminar2

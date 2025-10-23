@@ -74,7 +74,7 @@
 #include "../utils/CPUFeatures.h"
 #include "IQQuantTables.h"
 #include "../utils/DebugEnv.h"
-#include "../utils/SIMDHelpers.h"
+#include "SIMDHelpers.h"
 
 // Optional SIMD intrinsics (detected at runtime via CPUFeatures)
 #if defined(__AVX512F__)

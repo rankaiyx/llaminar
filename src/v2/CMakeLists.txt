@@ -10,9 +10,32 @@ option(HAVE_MKL "Enable Intel MKL" OFF)
 # V2 Core Library
 add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp
-    pipelines/QwenPipeline.cpp
+    loaders/ModelLoader.cpp
+    pipelines/PipelineBase.cpp
+    pipelines/qwen/Qwen2Pipeline.cpp
     tensors/FP32Tensor.cpp
+    tensors/FP16Tensor.cpp
+    tensors/BF16Tensor.cpp
+    tensors/TensorFactory.cpp
     tensors/IQ4_NLTensor.cpp
+    # Simple quantization formats (Q8_0, Q4_0, Q4_1)
+    tensors/Q8_0Tensor.cpp
+    tensors/Q4_0Tensor.cpp
+    tensors/Q4_1Tensor.cpp
+    # K-quant formats (Q6_K, Q2_K, Q5_K, Q3_K)
+    tensors/Q6_KTensor.cpp
+    tensors/Q2_KTensor.cpp
+    tensors/Q5_KTensor.cpp
+    tensors/Q3_KTensor.cpp
+    # IQ formats (IQ4_XS, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ2_S, IQ3_S, IQ1_S, IQ1_M)
+    tensors/IQ4_XSTensor.cpp
+    tensors/IQ2_XXSTensor.cpp
+    tensors/IQ2_XSTensor.cpp
+    tensors/IQ3_XXSTensor.cpp
+    tensors/IQ2_STensor.cpp
+    tensors/IQ3_STensor.cpp
+    tensors/IQ1_STensor.cpp
+    tensors/IQ1_MTensor.cpp
     kernels/cpu/QuantizedGemm.cpp
 )
 
@@ -27,6 +50,16 @@ target_compile_features(llaminar2_core PUBLIC cxx_std_17)
 # Dependencies
 find_package(MPI REQUIRED)
 # OpenBLAS already found in parent CMakeLists.txt
+
+# Try to find libnuma (optional, for NUMA-aware allocation)
+find_library(NUMA_LIBRARY NAMES numa)
+if(NUMA_LIBRARY)
+    message(STATUS "Found libnuma: ${NUMA_LIBRARY}")
+    target_compile_definitions(llaminar2_core PUBLIC HAVE_NUMA)
+    target_link_libraries(llaminar2_core PUBLIC ${NUMA_LIBRARY})
+else()
+    message(STATUS "libnuma not found - NUMA-aware allocation disabled")
+endif()
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX

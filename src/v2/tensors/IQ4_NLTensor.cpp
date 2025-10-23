@@ -11,7 +11,7 @@
 #include "FP16Utils.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/DebugEnv.h"
-#include "../utils/SIMDHelpers.h"
+#include "SIMDHelpers.h"
 #include "../backends/ComputeBackend.h"
 #include "../kernels/cpu/QuantizedGemm.h"
 #include <cstring>
