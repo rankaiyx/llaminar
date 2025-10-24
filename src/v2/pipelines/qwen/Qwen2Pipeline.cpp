@@ -359,19 +359,21 @@ namespace llaminar2
         VALIDATE_TENSOR(Q, spec_q(seq_len), "after_rope_q");
         VALIDATE_TENSOR(K, spec_kv(seq_len), "after_rope_k");
 
-        // 4. Attention computation (simplified - full GQA attention would be in a dedicated kernel)
-        // For now, we'll do a simple attention: attn_output = softmax(Q @ K^T / sqrt(head_dim)) @ V
-        // This is a placeholder - proper implementation should use ITensorAttention interface
-        
-        // Allocate attention output
+        // 4. GQA attention computation
+        // Use default PipelineBase::attention_gqa() orchestration
+        // Supports GQA (n_heads=14, n_kv_heads=2), MHA, MQA, and sliding window
         auto attn_output = std::make_shared<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)});
 
-        // TODO: Replace with proper GQA attention kernel when available
-        // For now, just copy Q to attn_output as placeholder
-        std::memcpy(attn_output->mutable_data(), Q->data(),
-                    seq_len * n_heads_ * head_dim_ * sizeof(float));
-        
+        if (!attention_gqa(
+                Q->data(), K->data(), V->data(), attn_output->mutable_data(),
+                seq_len, n_heads_, n_kv_heads_, head_dim_,
+                /*causal=*/true, /*window_size=*/-1))
+        {
+            std::cerr << "[Qwen2Pipeline] GQA attention failed\n";
+            return false;
+        }
+
         VALIDATE_TENSOR(attn_output, spec_q(seq_len), "after_attention");
 
         // 5. Output projection

@@ -118,6 +118,47 @@ namespace llaminar2
          * @return true on success, false on error
          */
         virtual bool transformer_layer(int layer_idx, int seq_len) = 0;
+
+        /**
+         * @brief Standard GQA (Grouped Query Attention) orchestration
+         *
+         * Default attention implementation supporting:
+         * - GQA: n_heads > n_kv_heads (broadcast K/V heads)
+         * - MHA: n_heads == n_kv_heads (no broadcasting)
+         * - MQA: n_kv_heads == 1 (broadcast single K/V to all Q heads)
+         * - Sliding window: Optional local attention window
+         *
+         * Handles ~95% of production models (Qwen, Llama, Mistral, Gemma, etc.).
+         * Pipelines with custom attention (e.g., DeepSeek MLA) override attention_block().
+         *
+         * Algorithm:
+         * 1. Broadcast K/V heads to match Q heads (if n_kv_heads < n_heads)
+         * 2. Compute attention scores: Q @ K^T (per-head batched GEMM)
+         * 3. Scale by 1/sqrt(head_dim)
+         * 4. Apply causal mask (optional sliding window)
+         * 5. Softmax over scores
+         * 6. Compute context: scores @ V (per-head batched GEMM)
+         * 7. Concatenate heads back to [seq_len, n_heads * head_dim]
+         *
+         * @param Q Query tensor [seq_len, n_heads * head_dim]
+         * @param K Key tensor [seq_len, n_kv_heads * head_dim]
+         * @param V Value tensor [seq_len, n_kv_heads * head_dim]
+         * @param output Output tensor [seq_len, n_heads * head_dim] (pre-allocated)
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads (GQA: ≤ n_heads)
+         * @param head_dim Dimension per head
+         * @param causal Apply causal masking for autoregressive generation
+         * @param window_size Sliding window size (-1 = full attention, ≥0 = local window)
+         * @return true on success, false on error
+         *
+         * @note Uses primitive kernels: ITensorGemm, ITensorSoftmax
+         * @note Pipelines can override attention_block() for custom attention types
+         */
+        virtual bool attention_gqa(
+            const float *Q, const float *K, const float *V, float *output,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = true, int window_size = -1);
     };
 
 } // namespace llaminar2
