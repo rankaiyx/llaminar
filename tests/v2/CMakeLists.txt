@@ -261,6 +261,19 @@ add_v2_test(V2_Unit_CPUKernels
     MPI_PROCS 1
 )
 
+# Test: TensorDimensions (Phase 3)
+add_executable(v2_test_tensor_dimensions Test__TensorDimensions.cpp)
+target_link_libraries(v2_test_tensor_dimensions 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorDimensions 
+    COMMAND v2_test_tensor_dimensions
+    LABELS "V2;Unit;TensorDimensions;Phase3"
+    MPI_PROCS 1
+)
+
 # Placeholder for additional unit test executables (to be added)
 # Example:
 # add_executable(v2_test_tensor_factory unit/test_tensor_factory.cpp)

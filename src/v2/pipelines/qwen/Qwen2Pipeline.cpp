@@ -122,11 +122,35 @@ namespace llaminar2
                       << seq_len << " x " << d_model_ << "\n";
         }
 
-        // TODO: Implement embedding lookup
-        // For now, just zero the hidden states
-        std::memset(current_hidden_->mutable_data(), 0,
-                    seq_len * d_model_ * sizeof(float));
-        std::cout << "[Qwen2Pipeline] TODO: Implement embedding lookup\n";
+        // Validate hidden state dimensions
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "hidden_allocation");
+
+        // Embedding lookup
+        auto embed_table = getEmbeddingTable();
+        if (!embed_table)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to load embedding table\n";
+            return false;
+        }
+
+        // Manual embedding lookup: hidden[i] = embed_table[tokens[i]]
+        const float *embed_data = embed_table->data();
+        float *hidden_data = current_hidden_->mutable_data();
+        for (int i = 0; i < seq_len; ++i)
+        {
+            int token_id = tokens[i];
+            if (token_id < 0 || token_id >= vocab_size_)
+            {
+                std::cerr << "[Qwen2Pipeline] Invalid token " << token_id << " at position " << i << "\n";
+                return false;
+            }
+            std::memcpy(hidden_data + i * d_model_,
+                        embed_data + token_id * d_model_,
+                        d_model_ * sizeof(float));
+        }
+
+        // Validate after embedding
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_embedding");
 
         // Process all transformer layers
         for (int i = 0; i < n_layers_; ++i)
@@ -136,10 +160,35 @@ namespace llaminar2
                 std::cerr << "[Qwen2Pipeline] Layer " << i << " failed\n";
                 return false;
             }
+
+            // Validate hidden state dimensions unchanged between layers
+            VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_layer_" + std::to_string(i));
         }
 
         // Final normalization
-        std::cout << "[Qwen2Pipeline] TODO: Implement final RMSNorm\n";
+        auto final_norm = getFinalNorm();
+        if (!final_norm)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to load final norm\n";
+            return false;
+        }
+
+        auto norm_kernel = final_norm->createRMSNorm();
+        if (!norm_kernel)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to create RMSNorm kernel\n";
+            return false;
+        }
+
+        if (!norm_kernel->apply(
+                current_hidden_->data(), final_norm->data(), current_hidden_->mutable_data(),
+                seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] Final RMSNorm failed\n";
+            return false;
+        }
+
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_final_norm");
 
         // LM head projection
         if (!logits_ || static_cast<int>(logits_->shape()[0]) != seq_len)
@@ -150,9 +199,36 @@ namespace llaminar2
                       << seq_len << " x " << vocab_size_ << "\n";
         }
 
-        std::cout << "[Qwen2Pipeline] TODO: Implement LM head projection\n";
-        std::memset(logits_->mutable_data(), 0,
-                    seq_len * vocab_size_ * sizeof(float));
+        // Validate logits dimensions
+        VALIDATE_TENSOR(logits_, spec_logits(seq_len), "logits_allocation");
+
+        auto lm_head = getLMHead();
+        if (!lm_head)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to load LM head\n";
+            return false;
+        }
+
+        auto lm_gemm = lm_head->createGemm();
+        if (!lm_gemm)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to create LM head GEMM kernel\n";
+            return false;
+        }
+
+        // LM head: logits = hidden @ lm_head^T
+        // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
+        // output: [seq_len, vocab_size]
+        if (!lm_gemm->multiply(
+                current_hidden_->data(), logits_->mutable_data(),
+                seq_len, vocab_size_, d_model_,
+                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] LM head projection failed\n";
+            return false;
+        }
+
+        VALIDATE_TENSOR(logits_, spec_logits(seq_len), "after_lm_head");
 
         return true;
     }
@@ -185,30 +261,260 @@ namespace llaminar2
 
     bool Qwen2Pipeline::attention_block(const LayerWeights &layer, int seq_len)
     {
-        std::cout << "[Qwen2Pipeline] TODO: Implement attention block\n";
+        // Validate input dimensions
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "attn_input");
+        VALIDATE_TENSOR_PTR(layer.attn_norm.get(), spec_norm_gamma(), "attn_norm_weight");
 
-        // TODO: Implement Qwen2 attention mechanism:
-        // 1. RMSNorm (attn_norm)
-        // 2. Q/K/V projections with GQA (n_heads vs n_kv_heads)
-        // 3. RoPE application (theta=10000.0 for Qwen2)
-        // 4. Attention computation (Q·K^T / sqrt(d_head), softmax, ·V)
+        // Save residual for later
+        auto residual = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)});
+        std::memcpy(residual->mutable_data(), current_hidden_->data(),
+                    seq_len * d_model_ * sizeof(float));
+
+        // 1. Pre-attention RMSNorm
+        auto norm_kernel = layer.attn_norm->createRMSNorm();
+        if (!norm_kernel ||
+            !norm_kernel->apply(
+                current_hidden_->data(), layer.attn_norm->data(), current_hidden_->mutable_data(),
+                seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] Attention norm failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_attn_norm");
+
+        // 2. Q/K/V projections
+        auto Q = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)});
+        auto K = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)});
+        auto V = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)});
+
+        auto q_gemm = layer.wq->createGemm();
+        auto k_gemm = layer.wk->createGemm();
+        auto v_gemm = layer.wv->createGemm();
+
+        if (!q_gemm || !k_gemm || !v_gemm)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to create Q/K/V GEMM kernels\n";
+            return false;
+        }
+
+        // Q = hidden @ wq^T
+        if (!q_gemm->multiply(
+                current_hidden_->data(), Q->mutable_data(),
+                seq_len, n_heads_ * head_dim_, d_model_,
+                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] Q projection failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(Q, spec_q(seq_len), "after_q_proj");
+
+        // K = hidden @ wk^T
+        if (!k_gemm->multiply(
+                current_hidden_->data(), K->mutable_data(),
+                seq_len, n_kv_heads_ * head_dim_, d_model_,
+                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] K projection failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(K, spec_kv(seq_len), "after_k_proj");
+
+        // V = hidden @ wv^T
+        if (!v_gemm->multiply(
+                current_hidden_->data(), V->mutable_data(),
+                seq_len, n_kv_heads_ * head_dim_, d_model_,
+                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] V projection failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(V, spec_kv(seq_len), "after_v_proj");
+
+        // 3. Apply RoPE to Q and K
+        std::vector<int> position_ids(seq_len);
+        for (int i = 0; i < seq_len; ++i)
+        {
+            position_ids[i] = i; // TODO: Handle incremental decode position offset
+        }
+
+        auto rope_kernel = layer.wq->createRoPE(); // Any weight can create RoPE kernel
+        if (!rope_kernel)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to create RoPE kernel\n";
+            return false;
+        }
+
+        if (!rope_kernel->apply(
+                Q->mutable_data(), K->mutable_data(), position_ids.data(),
+                seq_len, n_heads_, n_kv_heads_, head_dim_,
+                false, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] RoPE application failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(Q, spec_q(seq_len), "after_rope_q");
+        VALIDATE_TENSOR(K, spec_kv(seq_len), "after_rope_k");
+
+        // 4. Attention computation (simplified - full GQA attention would be in a dedicated kernel)
+        // For now, we'll do a simple attention: attn_output = softmax(Q @ K^T / sqrt(head_dim)) @ V
+        // This is a placeholder - proper implementation should use ITensorAttention interface
+        
+        // Allocate attention output
+        auto attn_output = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)});
+
+        // TODO: Replace with proper GQA attention kernel when available
+        // For now, just copy Q to attn_output as placeholder
+        std::memcpy(attn_output->mutable_data(), Q->data(),
+                    seq_len * n_heads_ * head_dim_ * sizeof(float));
+        
+        VALIDATE_TENSOR(attn_output, spec_q(seq_len), "after_attention");
+
         // 5. Output projection
+        auto o_gemm = layer.wo->createGemm();
+        if (!o_gemm)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to create output GEMM kernel\n";
+            return false;
+        }
+
+        // output = attn_output @ wo^T
+        auto attn_proj = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)});
+
+        if (!o_gemm->multiply(
+                attn_output->data(), attn_proj->mutable_data(),
+                seq_len, d_model_, n_heads_ * head_dim_,
+                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] Output projection failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(attn_proj, spec_hidden(seq_len), "after_attn_out_proj");
+
         // 6. Residual connection
+        for (size_t i = 0; i < seq_len * d_model_; ++i)
+        {
+            current_hidden_->mutable_data()[i] = residual->data()[i] + attn_proj->data()[i];
+        }
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_attn_residual");
 
         return true;
     }
 
     bool Qwen2Pipeline::ffn_block(const LayerWeights &layer, int seq_len)
     {
-        std::cout << "[Qwen2Pipeline] TODO: Implement FFN block\n";
+        // Validate input dimensions
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "ffn_input");
+        VALIDATE_TENSOR_PTR(layer.ffn_norm.get(), spec_norm_gamma(), "ffn_norm_weight");
 
-        // TODO: Implement Qwen2 FFN mechanism (SwiGLU):
-        // 1. RMSNorm (ffn_norm)
+        // Save residual for later
+        auto residual = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)});
+        std::memcpy(residual->mutable_data(), current_hidden_->data(),
+                    seq_len * d_model_ * sizeof(float));
+
+        // 1. Pre-FFN RMSNorm
+        auto norm_kernel = layer.ffn_norm->createRMSNorm();
+        if (!norm_kernel ||
+            !norm_kernel->apply(
+                current_hidden_->data(), layer.ffn_norm->data(), current_hidden_->mutable_data(),
+                seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] FFN norm failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_ffn_norm");
+
         // 2. Gate and up projections
-        // 3. SwiGLU activation: gate_out * silu(up_out)
-        //    where silu(x) = x * sigmoid(x)
+        auto gate = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)});
+        auto up = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)});
+
+        auto gate_gemm = layer.gate_proj->createGemm();
+        auto up_gemm = layer.up_proj->createGemm();
+
+        if (!gate_gemm || !up_gemm)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to create gate/up GEMM kernels\n";
+            return false;
+        }
+
+        // gate = hidden @ gate_proj^T
+        if (!gate_gemm->multiply(
+                current_hidden_->data(), gate->mutable_data(),
+                seq_len, d_ff_, d_model_,
+                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] Gate projection failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(gate, spec_ffn_intermediate(seq_len), "after_gate_proj");
+
+        // up = hidden @ up_proj^T
+        if (!up_gemm->multiply(
+                current_hidden_->data(), up->mutable_data(),
+                seq_len, d_ff_, d_model_,
+                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] Up projection failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(up, spec_ffn_intermediate(seq_len), "after_up_proj");
+
+        // 3. SwiGLU activation: swiglu_out = gate * silu(up)
+        auto swiglu_out = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)});
+
+        auto swiglu_kernel = layer.gate_proj->createSwiGLU();
+        if (!swiglu_kernel)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to create SwiGLU kernel\n";
+            return false;
+        }
+
+        if (!swiglu_kernel->apply(
+                gate->data(), up->data(), swiglu_out->mutable_data(),
+                seq_len, d_ff_, false, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] SwiGLU activation failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(swiglu_out, spec_ffn_intermediate(seq_len), "after_swiglu");
+
         // 4. Down projection
+        auto down_out = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)});
+
+        auto down_gemm = layer.down_proj->createGemm();
+        if (!down_gemm)
+        {
+            std::cerr << "[Qwen2Pipeline] Failed to create down GEMM kernel\n";
+            return false;
+        }
+
+        // down_out = swiglu_out @ down_proj^T
+        if (!down_gemm->multiply(
+                swiglu_out->data(), down_out->mutable_data(),
+                seq_len, d_model_, d_ff_,
+                true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_))
+        {
+            std::cerr << "[Qwen2Pipeline] Down projection failed\n";
+            return false;
+        }
+        VALIDATE_TENSOR(down_out, spec_hidden(seq_len), "after_down_proj");
+
         // 5. Residual connection
+        for (size_t i = 0; i < seq_len * d_model_; ++i)
+        {
+            current_hidden_->mutable_data()[i] = residual->data()[i] + down_out->data()[i];
+        }
+        VALIDATE_TENSOR(current_hidden_, spec_hidden(seq_len), "after_ffn_residual");
 
         return true;
     }

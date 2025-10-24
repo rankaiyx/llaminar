@@ -20,6 +20,7 @@
 #pragma once
 
 #include "../PipelineBase.h"
+#include "../TensorDimensions.h"
 
 namespace llaminar2
 {
@@ -124,6 +125,43 @@ namespace llaminar2
         // Activations (FP32, on host or device depending on device_idx)
         std::shared_ptr<FP32Tensor> current_hidden_; // [seq_len, d_model]
         std::shared_ptr<FP32Tensor> logits_;         // [seq_len, vocab_size]
+
+        // Helper methods for dimension specifications (Qwen2-specific)
+        TensorSpec spec_hidden(int seq_len) const
+        {
+            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)},
+                              "hidden[" + std::to_string(seq_len) + "," + std::to_string(d_model_) + "]");
+        }
+
+        TensorSpec spec_q(int seq_len) const
+        {
+            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)},
+                              "Q[" + std::to_string(seq_len) + "," + std::to_string(n_heads_ * head_dim_) + "]");
+        }
+
+        TensorSpec spec_kv(int seq_len) const
+        {
+            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)},
+                              "KV[" + std::to_string(seq_len) + "," + std::to_string(n_kv_heads_ * head_dim_) + "]");
+        }
+
+        TensorSpec spec_ffn_intermediate(int seq_len) const
+        {
+            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(d_ff_)},
+                              "ffn_intermediate[" + std::to_string(seq_len) + "," + std::to_string(d_ff_) + "]");
+        }
+
+        TensorSpec spec_logits(int seq_len) const
+        {
+            return TensorSpec({static_cast<size_t>(seq_len), static_cast<size_t>(vocab_size_)},
+                              "logits[" + std::to_string(seq_len) + "," + std::to_string(vocab_size_) + "]");
+        }
+
+        TensorSpec spec_norm_gamma() const
+        {
+            return TensorSpec({static_cast<size_t>(d_model_)},
+                              "norm_gamma[" + std::to_string(d_model_) + "]");
+        }
 
         // Helper methods
         bool attention_block(const LayerWeights &layer, int seq_len);
