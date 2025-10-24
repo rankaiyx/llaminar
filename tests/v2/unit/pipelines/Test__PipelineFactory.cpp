@@ -51,7 +51,6 @@ public:
     int getDeviceIdx() const { return device_idx_; }
 
 protected:
-    bool load_weights(const std::string &) override { return true; }
     bool transformer_layer(int, int) override { return true; }
 };
 

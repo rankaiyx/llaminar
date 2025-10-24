@@ -165,20 +165,34 @@ int main(int argc, char *argv[])
 
     // Parse placement strategy
     PlacementStrategy strategy = PlacementStrategy::AUTO;
-    if (args.strategy == "all-gpu") {
+    if (args.strategy == "all-gpu")
+    {
         strategy = PlacementStrategy::ALL_GPU;
-    } else if (args.strategy == "all-cpu") {
+    }
+    else if (args.strategy == "all-cpu")
+    {
         strategy = PlacementStrategy::ALL_CPU;
-    } else if (args.strategy == "layer-split") {
+    }
+    else if (args.strategy == "layer-split")
+    {
         strategy = PlacementStrategy::LAYER_SPLIT;
-    } else if (args.strategy == "memory-aware") {
+    }
+    else if (args.strategy == "memory-aware")
+    {
         strategy = PlacementStrategy::MEMORY_AWARE;
-    } else if (args.strategy == "moe-optimized") {
+    }
+    else if (args.strategy == "moe-optimized")
+    {
         strategy = PlacementStrategy::MOE_OPTIMIZED;
-    } else if (args.strategy == "custom") {
+    }
+    else if (args.strategy == "custom")
+    {
         strategy = PlacementStrategy::CUSTOM;
-    } else if (args.strategy != "auto") {
-        if (mpi_ctx->rank() == 0) {
+    }
+    else if (args.strategy != "auto")
+    {
+        if (mpi_ctx->rank() == 0)
+        {
             std::cerr << "Warning: Unknown strategy '" << args.strategy << "', using AUTO\n";
         }
     }
@@ -199,7 +213,7 @@ int main(int argc, char *argv[])
     // orch_config.gpu_split = args.gpu_split;
 
     // Create device orchestrator
-    auto device_mgr_shared = std::shared_ptr<DeviceManager>(&dm, [](DeviceManager*){});
+    auto device_mgr_shared = std::shared_ptr<DeviceManager>(&dm, [](DeviceManager *) {});
     auto orchestrator = std::make_shared<DeviceOrchestrator>(
         device_mgr_shared, mpi_ctx, orch_config);
 

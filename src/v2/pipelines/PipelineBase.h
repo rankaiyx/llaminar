@@ -109,16 +109,6 @@ namespace llaminar2
         int vocab_size_ = 0;
 
         /**
-         * @brief Load model weights from GGUF file
-         *
-         * To be implemented by derived classes based on architecture.
-         *
-         * @param model_path Path to GGUF model file
-         * @return true on success, false on error
-         */
-        virtual bool load_weights(const std::string &model_path) = 0;
-
-        /**
          * @brief Process a single transformer layer
          *
          * To be implemented by derived classes.

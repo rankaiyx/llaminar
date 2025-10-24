@@ -32,9 +32,9 @@ namespace llaminar2
      */
     enum class WeightDistributionStrategy
     {
-        REPLICATED,  ///< Full copy per rank (2x memory on 2-socket, no communication)
-        SHARDED,     ///< Partition across ranks (1x memory, Allreduce after matmul)
-        INTERLEAVED  ///< NUMA-aware global (shared memory, remote access penalty)
+        REPLICATED, ///< Full copy per rank (2x memory on 2-socket, no communication)
+        SHARDED,    ///< Partition across ranks (1x memory, Allreduce after matmul)
+        INTERLEAVED ///< NUMA-aware global (shared memory, remote access penalty)
     };
 
     /**
@@ -118,10 +118,10 @@ namespace llaminar2
          */
         std::shared_ptr<TensorBase> getInterleavedWeight(const std::string &name, int device_idx);
 
-        ModelLoader &loader_;                                               ///< GGUF loader
-        std::shared_ptr<MPIContext> mpi_ctx_;                               ///< MPI context (nullptr = single rank)
-        std::shared_ptr<WeightPlacementMap> placement_map_;                 ///< Fine-grained placement decisions
-        WeightDistributionStrategy strategy_;                               ///< Distribution strategy
+        ModelLoader &loader_;                                                ///< GGUF loader
+        std::shared_ptr<MPIContext> mpi_ctx_;                                ///< MPI context (nullptr = single rank)
+        std::shared_ptr<WeightPlacementMap> placement_map_;                  ///< Fine-grained placement decisions
+        WeightDistributionStrategy strategy_;                                ///< Distribution strategy
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_; ///< Weight cache
     };
 

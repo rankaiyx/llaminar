@@ -13,6 +13,10 @@
 
 #include "ComputeBackend.h"
 #include "../utils/DebugEnv.h"
+#include "../kernels/cpu/CPURoPEKernel.h"
+#include "../kernels/cpu/CPUSoftmaxKernel.h"
+#include "../kernels/cpu/CPURMSNormKernel.h"
+#include "../kernels/cpu/CPUSwiGLUKernel.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -592,6 +596,21 @@ namespace llaminar2
     // CPUComputeContext Implementation
     // ============================================================================
 
+    struct CPUComputeContext::Impl
+    {
+        std::unique_ptr<CPURoPEKernel> rope_kernel;
+        std::unique_ptr<CPUSoftmaxKernel> softmax_kernel;
+        std::unique_ptr<CPURMSNormKernel> rmsnorm_kernel;
+        std::unique_ptr<CPUSwiGLUKernel> swiglu_kernel;
+    };
+
+    CPUComputeContext::CPUComputeContext()
+        : pimpl_(std::make_unique<Impl>())
+    {
+    }
+
+    CPUComputeContext::~CPUComputeContext() = default;
+
     void *CPUComputeContext::allocate(size_t bytes)
     {
         return std::malloc(bytes);
@@ -610,6 +629,42 @@ namespace llaminar2
     void CPUComputeContext::copy_from_device(void *dst, const void *src, size_t bytes)
     {
         std::memcpy(dst, src, bytes); // CPU-to-CPU copy
+    }
+
+    ITensorRoPE *CPUComputeContext::get_rope_kernel()
+    {
+        if (!pimpl_->rope_kernel)
+        {
+            pimpl_->rope_kernel = std::make_unique<CPURoPEKernel>();
+        }
+        return pimpl_->rope_kernel.get();
+    }
+
+    ITensorSoftmax *CPUComputeContext::get_softmax_kernel()
+    {
+        if (!pimpl_->softmax_kernel)
+        {
+            pimpl_->softmax_kernel = std::make_unique<CPUSoftmaxKernel>();
+        }
+        return pimpl_->softmax_kernel.get();
+    }
+
+    ITensorRMSNorm *CPUComputeContext::get_rmsnorm_kernel()
+    {
+        if (!pimpl_->rmsnorm_kernel)
+        {
+            pimpl_->rmsnorm_kernel = std::make_unique<CPURMSNormKernel>();
+        }
+        return pimpl_->rmsnorm_kernel.get();
+    }
+
+    ITensorSwiGLU *CPUComputeContext::get_swiglu_kernel()
+    {
+        if (!pimpl_->swiglu_kernel)
+        {
+            pimpl_->swiglu_kernel = std::make_unique<CPUSwiGLUKernel>();
+        }
+        return pimpl_->swiglu_kernel.get();
     }
 
     // ============================================================================

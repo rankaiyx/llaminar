@@ -112,7 +112,7 @@ namespace llaminar2
 
     private:
         // Private constructor - use create() factory method
-        private:
+    private:
         /**
          * @brief Private constructor (use create() instead)
          */

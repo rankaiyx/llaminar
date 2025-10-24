@@ -102,104 +102,11 @@ namespace llaminar2
                   << n_kv_heads_ << " KV heads (GQA), " << head_dim_ << " head_dim\n";
         std::cout << "[Qwen2Pipeline] FFN: " << d_ff_ << " intermediate_size (SwiGLU)\n";
 
-        // Load model weights
-        if (!load_weights(model_path_))
-        {
-            throw std::runtime_error("Failed to load model weights from: " + model_path_);
-        }
-
-        std::cout << "[Qwen2Pipeline] Pipeline initialized successfully\n";
-    }
-
-    bool Qwen2Pipeline::load_weights(const std::string &model_path)
-    {
-        std::cout << "[Qwen2Pipeline] Loading weights from: " << model_path << "\n";
-
-        // Validate architecture from model context
-        const GGUFModel &model = model_ctx_->model();
-        if (model.architecture != "qwen2")
-        {
-            std::cerr << "[Qwen2Pipeline] Architecture mismatch: expected qwen2, got "
-                      << model.architecture << std::endl;
-            return false;
-        }
-
-        // Validate hyperparameters match metadata-derived values
-        if (model.block_count != static_cast<uint64_t>(n_layers_))
-        {
-            std::cerr << "[Qwen2Pipeline] Layer count mismatch: expected " << n_layers_
-                      << ", got " << model.block_count << std::endl;
-            return false;
-        }
-
-        std::cout << "[Qwen2Pipeline] GGUF validation passed\n";
-        std::cout << "  Architecture: " << model.architecture << "\n";
-        std::cout << "  Layers: " << model.block_count << "\n";
-        std::cout << "  Hidden size: " << model.embedding_length << "\n";
-        std::cout << "  Vocab size: " << model.vocab_size << "\n";
-
-        // Load embedding table via ModelContext (handles distribution strategy)
-        std::cout << "[Qwen2Pipeline] Loading embedding table...\n";
-        embedding_table_ = model_ctx_->getWeight("token_embd.weight", device_idx_);
-        if (!embedding_table_)
-        {
-            std::cerr << "[Qwen2Pipeline] Failed to load embedding table" << std::endl;
-            return false;
-        }
-        std::cout << "  Embedding shape: " << embedding_table_->shape()[0]
-                  << " x " << embedding_table_->shape()[1] << "\n";
-
-        // Load layer weights via ModelContext
+        // Weights are loaded lazily via getLayerWeight() and model_ctx_->getWeight()
+        // Resize layer weights vector for lazy loading
         layers_.resize(n_layers_);
-        for (int i = 0; i < n_layers_; ++i)
-        {
-            std::cout << "[Qwen2Pipeline] Loading layer " << i << " weights...\n";
-            auto &layer = layers_[i];
-            std::string prefix = "blk." + std::to_string(i) + ".";
 
-            // Attention weights
-            layer.wq = model_ctx_->getWeight(prefix + "attn_q.weight", device_idx_);
-            layer.wk = model_ctx_->getWeight(prefix + "attn_k.weight", device_idx_);
-            layer.wv = model_ctx_->getWeight(prefix + "attn_v.weight", device_idx_);
-            layer.wo = model_ctx_->getWeight(prefix + "attn_output.weight", device_idx_);
-            layer.attn_norm = model_ctx_->getWeight(prefix + "attn_norm.weight", device_idx_);
-
-            // FFN weights
-            layer.gate_proj = model_ctx_->getWeight(prefix + "ffn_gate.weight", device_idx_);
-            layer.up_proj = model_ctx_->getWeight(prefix + "ffn_up.weight", device_idx_);
-            layer.down_proj = model_ctx_->getWeight(prefix + "ffn_down.weight", device_idx_);
-            layer.ffn_norm = model_ctx_->getWeight(prefix + "ffn_norm.weight", device_idx_);
-
-            // Validate all tensors loaded
-            if (!layer.wq || !layer.wk || !layer.wv || !layer.wo || !layer.attn_norm ||
-                !layer.gate_proj || !layer.up_proj || !layer.down_proj || !layer.ffn_norm)
-            {
-                std::cerr << "[Qwen2Pipeline] Failed to load some weights for layer " << i << std::endl;
-                return false;
-            }
-
-            std::cout << "  Layer " << i << " loaded (Q: " << layer.wq->shape()[0] << "x" << layer.wq->shape()[1]
-                      << ", K: " << layer.wk->shape()[0] << "x" << layer.wk->shape()[1]
-                      << ", V: " << layer.wv->shape()[0] << "x" << layer.wv->shape()[1] << ")\n";
-        }
-
-        // Final norm and LM head
-        std::cout << "[Qwen2Pipeline] Loading final norm and LM head...\n";
-        final_norm_ = model_ctx_->getWeight("output_norm.weight", device_idx_);
-        lm_head_ = model_ctx_->getWeight("output.weight", device_idx_);
-
-        if (!final_norm_ || !lm_head_)
-        {
-            std::cerr << "[Qwen2Pipeline] Failed to load final norm or LM head" << std::endl;
-            return false;
-        }
-
-        std::cout << "[Qwen2Pipeline] Weight loading complete\n";
-        std::cout << "  Total layers: " << n_layers_ << "\n";
-        std::cout << "  Final norm shape: " << final_norm_->shape()[0] << "\n";
-        std::cout << "  LM head shape: " << lm_head_->shape()[0] << "x" << lm_head_->shape()[1] << "\n";
-
-        return true;
+        std::cout << "[Qwen2Pipeline] Pipeline initialized (weights loaded on-demand)\n";
     }
 
     bool Qwen2Pipeline::forward(const int *tokens, int seq_len)
@@ -254,7 +161,8 @@ namespace llaminar2
     {
         std::cout << "[Qwen2Pipeline] Processing layer " << layer_idx << "\n";
 
-        const auto &layer = layers_[layer_idx];
+        // Get layer weights (loaded lazily on first access)
+        auto &layer = getLayerWeights(layer_idx);
 
         // Attention block
         if (!attention_block(layer, seq_len))
@@ -313,6 +221,59 @@ namespace llaminar2
             return nullptr;
         }
         return logits_->data();
+    }
+
+    // =============================================================================
+    // Lazy Weight Accessors
+    // =============================================================================
+
+    std::shared_ptr<TensorBase> Qwen2Pipeline::getEmbeddingTable()
+    {
+        if (!embedding_table_)
+        {
+            embedding_table_ = model_ctx_->getWeight("token_embd.weight", device_idx_);
+        }
+        return embedding_table_;
+    }
+
+    std::shared_ptr<TensorBase> Qwen2Pipeline::getFinalNorm()
+    {
+        if (!final_norm_)
+        {
+            final_norm_ = model_ctx_->getWeight("output_norm.weight", device_idx_);
+        }
+        return final_norm_;
+    }
+
+    std::shared_ptr<TensorBase> Qwen2Pipeline::getLMHead()
+    {
+        if (!lm_head_)
+        {
+            lm_head_ = model_ctx_->getWeight("output.weight", device_idx_);
+        }
+        return lm_head_;
+    }
+
+    Qwen2Pipeline::LayerWeights &Qwen2Pipeline::getLayerWeights(int layer_idx)
+    {
+        auto &layer = layers_[layer_idx];
+        std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+        // Lazy load on first access
+        if (!layer.wq)
+        {
+            layer.wq = model_ctx_->getWeight(prefix + "attn_q.weight", device_idx_);
+            layer.wk = model_ctx_->getWeight(prefix + "attn_k.weight", device_idx_);
+            layer.wv = model_ctx_->getWeight(prefix + "attn_v.weight", device_idx_);
+            layer.wo = model_ctx_->getWeight(prefix + "attn_output.weight", device_idx_);
+            layer.attn_norm = model_ctx_->getWeight(prefix + "attn_norm.weight", device_idx_);
+            layer.gate_proj = model_ctx_->getWeight(prefix + "ffn_gate.weight", device_idx_);
+            layer.up_proj = model_ctx_->getWeight(prefix + "ffn_up.weight", device_idx_);
+            layer.down_proj = model_ctx_->getWeight(prefix + "ffn_down.weight", device_idx_);
+            layer.ffn_norm = model_ctx_->getWeight(prefix + "ffn_norm.weight", device_idx_);
+        }
+
+        return layer;
     }
 
     std::shared_ptr<TensorBase> Qwen2Pipeline::get_layer_weight(

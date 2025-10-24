@@ -44,6 +44,11 @@ add_library(llaminar2_core STATIC
     tensors/IQ1_STensor.cpp
     tensors/IQ1_MTensor.cpp
     kernels/cpu/QuantizedGemm.cpp
+    kernels/cpu/FP32GemmKernel.cpp
+    kernels/cpu/CPURoPEKernel.cpp
+    kernels/cpu/CPURMSNormKernel.cpp
+    kernels/cpu/CPUSoftmaxKernel.cpp
+    kernels/cpu/CPUSwiGLUKernel.cpp
     utils/ArgParser.cpp
 )
 
@@ -57,7 +62,40 @@ target_compile_features(llaminar2_core PUBLIC cxx_std_17)
 
 # Dependencies
 find_package(MPI REQUIRED)
-# OpenBLAS already found in parent CMakeLists.txt
+
+# Find OpenBLAS (required for GEMM operations)
+# When built standalone (not from parent CMakeLists.txt)
+if(NOT DEFINED OPENBLAS_LIBRARIES)
+    find_package(BLAS REQUIRED)
+    find_path(CBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas /usr/local/include)
+    if(CBLAS_INCLUDE_DIR)
+        message(STATUS "V2: Found CBLAS include: ${CBLAS_INCLUDE_DIR}")
+        target_include_directories(llaminar2_core PUBLIC ${CBLAS_INCLUDE_DIR})
+    else()
+        message(WARNING "V2: CBLAS header not found - using fallback")
+    endif()
+    set(OPENBLAS_LIBRARIES ${BLAS_LIBRARIES})
+    message(STATUS "V2: Using system BLAS: ${BLAS_LIBRARIES}")
+endif()
+
+# Find Intel MKL if enabled (optional, for BF16 GEMM acceleration)
+if(HAVE_MKL)
+    if(NOT DEFINED MKL_LIBRARIES)
+        find_package(MKL CONFIG QUIET)
+        if(MKL_FOUND)
+            message(STATUS "V2: Intel MKL found - enabling MKL backend")
+            set(MKL_INCLUDE_DIRS ${MKL_INCLUDE})
+            set(MKL_LIBRARIES MKL::MKL)
+            target_include_directories(llaminar2_core PUBLIC ${MKL_INCLUDE_DIRS})
+        else()
+            message(WARNING "V2: Intel MKL requested (HAVE_MKL=ON) but not found")
+            message(WARNING "V2: Install with: sudo apt install intel-oneapi-mkl-devel")
+            set(HAVE_MKL OFF)
+        endif()
+    else()
+        message(STATUS "V2: Using MKL from parent: ${MKL_LIBRARIES}")
+    endif()
+endif()
 
 # Try to find libnuma (optional, for NUMA-aware allocation)
 find_library(NUMA_LIBRARY NAMES numa)
@@ -73,6 +111,11 @@ target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
     ${OPENBLAS_LIBRARIES}
 )
+
+# Link MKL if available
+if(HAVE_MKL AND DEFINED MKL_LIBRARIES)
+    target_link_libraries(llaminar2_core PUBLIC ${MKL_LIBRARIES})
+endif()
 
 # Add conditional backend support
 if(HAVE_CUDA)

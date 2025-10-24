@@ -40,6 +40,20 @@ namespace llaminar2
     class Qwen2Pipeline : public PipelineBase
     {
     public:
+        // Layer weights structure (public for lazy loading accessors)
+        struct LayerWeights
+        {
+            std::shared_ptr<TensorBase> wq;        // Query projection [d_model, d_model]
+            std::shared_ptr<TensorBase> wk;        // Key projection [d_model, n_kv_heads * head_dim]
+            std::shared_ptr<TensorBase> wv;        // Value projection [d_model, n_kv_heads * head_dim]
+            std::shared_ptr<TensorBase> wo;        // Output projection [d_model, d_model]
+            std::shared_ptr<TensorBase> attn_norm; // Pre-attention norm gamma [d_model]
+            std::shared_ptr<TensorBase> gate_proj; // FFN gate projection [d_model, d_ff]
+            std::shared_ptr<TensorBase> up_proj;   // FFN up projection [d_model, d_ff]
+            std::shared_ptr<TensorBase> down_proj; // FFN down projection [d_ff, d_model]
+            std::shared_ptr<TensorBase> ffn_norm;  // Pre-FFN norm gamma [d_model]
+        };
+
         /**
          * @brief Construct Qwen2 pipeline
          *
@@ -67,9 +81,31 @@ namespace llaminar2
          */
         std::shared_ptr<TensorBase> get_layer_weight(int layer_idx, const std::string &weight_name);
 
+        /**
+         * @brief Get layer weights (lazy loaded)
+         *
+         * @param layer_idx Layer index (0-indexed)
+         * @return Reference to layer weights structure
+         */
+        LayerWeights &getLayerWeights(int layer_idx);
+
+        /**
+         * @brief Get embedding table (lazy loaded)
+         */
+        std::shared_ptr<TensorBase> getEmbeddingTable();
+
+        /**
+         * @brief Get final norm (lazy loaded)
+         */
+        std::shared_ptr<TensorBase> getFinalNorm();
+
+        /**
+         * @brief Get LM head (lazy loaded)
+         */
+        std::shared_ptr<TensorBase> getLMHead();
+
     protected:
         // PipelineBase interface
-        bool load_weights(const std::string &model_path) override;
         bool transformer_layer(int layer_idx, int seq_len) override;
 
     private:
@@ -78,20 +114,6 @@ namespace llaminar2
         int n_kv_heads_ = 0;
         int head_dim_ = 0;
         int d_ff_ = 0;
-
-        // Layer weights structure
-        struct LayerWeights
-        {
-            std::shared_ptr<TensorBase> wq;        // Query projection [d_model, d_model]
-            std::shared_ptr<TensorBase> wk;        // Key projection [d_model, n_kv_heads * head_dim]
-            std::shared_ptr<TensorBase> wv;        // Value projection [d_model, n_kv_heads * head_dim]
-            std::shared_ptr<TensorBase> wo;        // Output projection [d_model, d_model]
-            std::shared_ptr<TensorBase> attn_norm; // Pre-attention norm gamma [d_model]
-            std::shared_ptr<TensorBase> gate_proj; // FFN gate projection [d_model, d_ff]
-            std::shared_ptr<TensorBase> up_proj;   // FFN up projection [d_model, d_ff]
-            std::shared_ptr<TensorBase> down_proj; // FFN down projection [d_ff, d_model]
-            std::shared_ptr<TensorBase> ffn_norm;  // Pre-FFN norm gamma [d_model]
-        };
 
         // Weights (quantized, stay on host for CPU, uploaded to GPU for GPU backends)
         std::shared_ptr<TensorBase> embedding_table_; // [vocab_size, d_model] FP32

@@ -247,6 +247,20 @@ add_v2_test(V2_Unit_DeviceOrchestrator_Phase2
     MPI_PROCS 1
 )
 
+# Test: CPU Kernels (Phase 3)
+add_executable(v2_test_cpu_kernels Test__CPUKernels.cpp)
+target_link_libraries(v2_test_cpu_kernels 
+    llaminar2_core 
+    ${OPENBLAS_LIBRARIES}
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUKernels 
+    COMMAND v2_test_cpu_kernels
+    LABELS "V2;Unit;CPUKernels;Phase3"
+    MPI_PROCS 1
+)
+
 # Placeholder for additional unit test executables (to be added)
 # Example:
 # add_executable(v2_test_tensor_factory unit/test_tensor_factory.cpp)

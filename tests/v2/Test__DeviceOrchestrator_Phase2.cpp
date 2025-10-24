@@ -17,17 +17,19 @@ using namespace llaminar2;
 /**
  * @brief Test fixture for Phase 2 DeviceOrchestrator tests
  */
-class DeviceOrchestratorPhase2Test : public ::testing::Test {
+class DeviceOrchestratorPhase2Test : public ::testing::Test
+{
 protected:
-    void SetUp() override {
+    void SetUp() override
+    {
         // Initialize device manager
-        device_mgr_ = std::shared_ptr<DeviceManager>(&DeviceManager::instance(), [](DeviceManager*){});
+        device_mgr_ = std::shared_ptr<DeviceManager>(&DeviceManager::instance(), [](DeviceManager *) {});
         device_mgr_->initialize();
-        
+
         // Get MPI context
         mpi_ctx_ = MPIContextFactory::global();
     }
-    
+
     std::shared_ptr<DeviceManager> device_mgr_;
     std::shared_ptr<MPIContext> mpi_ctx_;
 };
@@ -36,108 +38,114 @@ protected:
 // Device Map Parsing Tests
 // ============================================================================
 
-TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapLayerRange) {
+TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapLayerRange)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
     config.device_map = "0-5:gpu:0";
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     auto rules = orchestrator.parseDeviceMapString(config.device_map);
-    
+
     ASSERT_EQ(rules.size(), 1);
     EXPECT_EQ(rules[0].type, DeviceMapRuleType::LAYER_RANGE);
     EXPECT_EQ(rules[0].start_layer, 0);
     EXPECT_EQ(rules[0].end_layer, 5);
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapMultipleRanges) {
+TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapMultipleRanges)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
     config.device_map = "0-11:gpu:0,12-23:cpu";
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     auto rules = orchestrator.parseDeviceMapString(config.device_map);
-    
+
     ASSERT_EQ(rules.size(), 2);
-    
+
     // First rule: layers 0-11 on GPU
     EXPECT_EQ(rules[0].type, DeviceMapRuleType::LAYER_RANGE);
     EXPECT_EQ(rules[0].start_layer, 0);
     EXPECT_EQ(rules[0].end_layer, 11);
-    
+
     // Second rule: layers 12-23 on CPU
     EXPECT_EQ(rules[1].type, DeviceMapRuleType::LAYER_RANGE);
     EXPECT_EQ(rules[1].start_layer, 12);
     EXPECT_EQ(rules[1].end_layer, 23);
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapPercentageFirst) {
+TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapPercentageFirst)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
     config.device_map = "first_50%:gpu:0";
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     auto rules = orchestrator.parseDeviceMapString(config.device_map);
-    
+
     ASSERT_EQ(rules.size(), 1);
     EXPECT_EQ(rules[0].type, DeviceMapRuleType::PERCENTAGE);
     EXPECT_TRUE(rules[0].is_first);
     EXPECT_FLOAT_EQ(rules[0].percentage, 50.0f);
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapPercentageLast) {
+TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapPercentageLast)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
     config.device_map = "last_25%:cpu";
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     auto rules = orchestrator.parseDeviceMapString(config.device_map);
-    
+
     ASSERT_EQ(rules.size(), 1);
     EXPECT_EQ(rules[0].type, DeviceMapRuleType::PERCENTAGE);
     EXPECT_FALSE(rules[0].is_first);
     EXPECT_FLOAT_EQ(rules[0].percentage, 25.0f);
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapPattern) {
+TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapPattern)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
     config.device_map = "*embed*:gpu:0,*experts.0*:cpu";
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     auto rules = orchestrator.parseDeviceMapString(config.device_map);
-    
+
     ASSERT_EQ(rules.size(), 2);
-    
+
     // First rule: embedding pattern on GPU
     EXPECT_EQ(rules[0].type, DeviceMapRuleType::PATTERN);
     EXPECT_EQ(rules[0].pattern, "*embed*");
-    
+
     // Second rule: expert pattern on CPU
     EXPECT_EQ(rules[1].type, DeviceMapRuleType::PATTERN);
     EXPECT_EQ(rules[1].pattern, "*experts.0*");
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapMixed) {
+TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapMixed)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
     config.device_map = "0-11:gpu:0,*embed*:gpu:0,last_20%:cpu";
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     auto rules = orchestrator.parseDeviceMapString(config.device_map);
-    
+
     ASSERT_EQ(rules.size(), 3);
     EXPECT_EQ(rules[0].type, DeviceMapRuleType::LAYER_RANGE);
     EXPECT_EQ(rules[1].type, DeviceMapRuleType::PATTERN);
@@ -148,28 +156,30 @@ TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapMixed) {
 // MEMORY_AWARE Strategy Tests
 // ============================================================================
 
-TEST_F(DeviceOrchestratorPhase2Test, MemoryAwareStrategyExplicitBudget) {
+TEST_F(DeviceOrchestratorPhase2Test, MemoryAwareStrategyExplicitBudget)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::MEMORY_AWARE;
-    config.max_gpu_memory_mb = 8192;  // 8GB budget
+    config.max_gpu_memory_mb = 8192; // 8GB budget
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     // Verify strategy is set
     EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::MEMORY_AWARE);
     EXPECT_TRUE(config.max_gpu_memory_mb.has_value());
     EXPECT_EQ(config.max_gpu_memory_mb.value(), 8192);
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, MemoryAwareStrategyNoBudgetFallsBackToAuto) {
+TEST_F(DeviceOrchestratorPhase2Test, MemoryAwareStrategyNoBudgetFallsBackToAuto)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::MEMORY_AWARE;
     // No max_gpu_memory_mb set
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::MEMORY_AWARE);
     EXPECT_FALSE(config.max_gpu_memory_mb.has_value());
 }
@@ -178,38 +188,41 @@ TEST_F(DeviceOrchestratorPhase2Test, MemoryAwareStrategyNoBudgetFallsBackToAuto)
 // MOE_OPTIMIZED Strategy Tests
 // ============================================================================
 
-TEST_F(DeviceOrchestratorPhase2Test, MoEOptimizedStrategyDefaults) {
+TEST_F(DeviceOrchestratorPhase2Test, MoEOptimizedStrategyDefaults)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::MOE_OPTIMIZED;
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::MOE_OPTIMIZED);
-    EXPECT_TRUE(config.moe_shared_experts_gpu);   // Default: shared on GPU
-    EXPECT_TRUE(config.moe_sparse_experts_cpu);   // Default: sparse on CPU
+    EXPECT_TRUE(config.moe_shared_experts_gpu); // Default: shared on GPU
+    EXPECT_TRUE(config.moe_sparse_experts_cpu); // Default: sparse on CPU
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, MoEOptimizedStrategySharedCPU) {
+TEST_F(DeviceOrchestratorPhase2Test, MoEOptimizedStrategySharedCPU)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::MOE_OPTIMIZED;
-    config.moe_shared_experts_gpu = false;  // Override: shared on CPU
+    config.moe_shared_experts_gpu = false; // Override: shared on CPU
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::MOE_OPTIMIZED);
     EXPECT_FALSE(config.moe_shared_experts_gpu);
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, MoEOptimizedStrategySparseGPU) {
+TEST_F(DeviceOrchestratorPhase2Test, MoEOptimizedStrategySparseGPU)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::MOE_OPTIMIZED;
-    config.moe_sparse_experts_cpu = false;  // Override: sparse on GPU
+    config.moe_sparse_experts_cpu = false; // Override: sparse on GPU
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::MOE_OPTIMIZED);
     EXPECT_FALSE(config.moe_sparse_experts_cpu);
 }
@@ -218,26 +231,28 @@ TEST_F(DeviceOrchestratorPhase2Test, MoEOptimizedStrategySparseGPU) {
 // CUSTOM Strategy Tests
 // ============================================================================
 
-TEST_F(DeviceOrchestratorPhase2Test, CustomStrategyEmptyMapFallsBackToAuto) {
+TEST_F(DeviceOrchestratorPhase2Test, CustomStrategyEmptyMapFallsBackToAuto)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
-    config.device_map = "";  // Empty map
+    config.device_map = ""; // Empty map
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::CUSTOM);
     EXPECT_TRUE(config.device_map.empty());
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, CustomStrategyValidMap) {
+TEST_F(DeviceOrchestratorPhase2Test, CustomStrategyValidMap)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
     config.device_map = "0-11:gpu:0,12-23:cpu";
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::CUSTOM);
     EXPECT_EQ(config.device_map, "0-11:gpu:0,12-23:cpu");
 }
@@ -246,7 +261,8 @@ TEST_F(DeviceOrchestratorPhase2Test, CustomStrategyValidMap) {
 // Integration Tests (Strategy Selection)
 // ============================================================================
 
-TEST_F(DeviceOrchestratorPhase2Test, AllPhase2StrategiesSupported) {
+TEST_F(DeviceOrchestratorPhase2Test, AllPhase2StrategiesSupported)
+{
     // MEMORY_AWARE
     {
         OrchestrationConfig config;
@@ -254,7 +270,7 @@ TEST_F(DeviceOrchestratorPhase2Test, AllPhase2StrategiesSupported) {
         DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
         EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::MEMORY_AWARE);
     }
-    
+
     // MOE_OPTIMIZED
     {
         OrchestrationConfig config;
@@ -262,7 +278,7 @@ TEST_F(DeviceOrchestratorPhase2Test, AllPhase2StrategiesSupported) {
         DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
         EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::MOE_OPTIMIZED);
     }
-    
+
     // CUSTOM
     {
         OrchestrationConfig config;
@@ -273,7 +289,8 @@ TEST_F(DeviceOrchestratorPhase2Test, AllPhase2StrategiesSupported) {
     }
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, Phase1StrategiesStillWork) {
+TEST_F(DeviceOrchestratorPhase2Test, Phase1StrategiesStillWork)
+{
     // ALL_GPU
     {
         OrchestrationConfig config;
@@ -281,7 +298,7 @@ TEST_F(DeviceOrchestratorPhase2Test, Phase1StrategiesStillWork) {
         DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
         EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::ALL_GPU);
     }
-    
+
     // ALL_CPU
     {
         OrchestrationConfig config;
@@ -289,7 +306,7 @@ TEST_F(DeviceOrchestratorPhase2Test, Phase1StrategiesStillWork) {
         DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
         EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::ALL_CPU);
     }
-    
+
     // LAYER_SPLIT
     {
         OrchestrationConfig config;
@@ -298,7 +315,7 @@ TEST_F(DeviceOrchestratorPhase2Test, Phase1StrategiesStillWork) {
         DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
         EXPECT_EQ(orchestrator.strategy(), PlacementStrategy::LAYER_SPLIT);
     }
-    
+
     // AUTO
     {
         OrchestrationConfig config;
@@ -312,30 +329,32 @@ TEST_F(DeviceOrchestratorPhase2Test, Phase1StrategiesStillWork) {
 // Edge Cases
 // ============================================================================
 
-TEST_F(DeviceOrchestratorPhase2Test, ParseInvalidDeviceMapRule) {
+TEST_F(DeviceOrchestratorPhase2Test, ParseInvalidDeviceMapRule)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
-    config.device_map = "invalid_rule";  // No colon separator
+    config.device_map = "invalid_rule"; // No colon separator
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     auto rules = orchestrator.parseDeviceMapString(config.device_map);
-    
+
     // Invalid rules are filtered out
     EXPECT_EQ(rules.size(), 0);
 }
 
-TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapWithWhitespace) {
+TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapWithWhitespace)
+{
     OrchestrationConfig config;
     config.strategy = PlacementStrategy::CUSTOM;
     config.device_map = " 0-5:gpu:0 , 6-11:cpu "; // Extra whitespace
     config.verbose = false;
-    
+
     DeviceOrchestrator orchestrator(device_mgr_, mpi_ctx_, config);
-    
+
     auto rules = orchestrator.parseDeviceMapString(config.device_map);
-    
+
     ASSERT_EQ(rules.size(), 2);
     EXPECT_EQ(rules[0].start_layer, 0);
     EXPECT_EQ(rules[0].end_layer, 5);
@@ -343,15 +362,16 @@ TEST_F(DeviceOrchestratorPhase2Test, ParseDeviceMapWithWhitespace) {
     EXPECT_EQ(rules[1].end_layer, 11);
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv)
+{
     ::testing::InitGoogleTest(&argc, argv);
-    
+
     // Initialize MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    
+
     int result = RUN_ALL_TESTS();
-    
+
     MPI_Finalize();
     return result;
 }

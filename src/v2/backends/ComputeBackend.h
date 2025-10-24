@@ -75,12 +75,22 @@ namespace llaminar2
         virtual bool supports_int8() const = 0;
     };
 
+    // Forward declarations for kernel types
+    class ITensorGemm;
+    class ITensorRoPE;
+    class ITensorSoftmax;
+    class ITensorRMSNorm;
+    class ITensorSwiGLU;
+
     /**
      * @brief CPU compute context (OpenBLAS)
      */
     class CPUComputeContext : public ComputeContext
     {
     public:
+        CPUComputeContext();
+        ~CPUComputeContext() override;
+
         void *allocate(size_t bytes) override;
         void free(void *ptr) override;
         void copy_to_device(void *dst, const void *src, size_t bytes) override;
@@ -91,6 +101,16 @@ namespace llaminar2
         bool supports_bf16() const override { return true; } // Software emulation
         bool supports_fp16() const override { return true; }
         bool supports_int8() const override { return true; }
+
+        // Kernel access (lazily created on first access)
+        ITensorRoPE *get_rope_kernel();
+        ITensorSoftmax *get_softmax_kernel();
+        ITensorRMSNorm *get_rmsnorm_kernel();
+        ITensorSwiGLU *get_swiglu_kernel();
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> pimpl_;
     };
 
 #ifdef HAVE_CUDA

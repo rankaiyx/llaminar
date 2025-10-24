@@ -47,10 +47,12 @@ namespace llaminar2
 
         // Determine device from placement map if not explicitly provided
         int target_device = device_idx;
-        if (target_device < 0 && placement_map_) {
+        if (target_device < 0 && placement_map_)
+        {
             target_device = placement_map_->getDeviceForWeight(name, layer_idx);
         }
-        if (target_device < 0) {
+        if (target_device < 0)
+        {
             target_device = 0; // Default to device 0
         }
 
