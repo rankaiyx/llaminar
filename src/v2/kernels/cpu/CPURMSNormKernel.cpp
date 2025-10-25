@@ -1,11 +1,12 @@
 /**
  * @file CPURMSNormKernel.cpp
- * @brief CPU RMSNorm kernel implementation
+ * @brief CPU RMSNorm kernel implementation (uses vectorized primitives)
  *
  * @author David Sanftenberg
  */
 
 #include "CPURMSNormKernel.h"
+#include "primitives/RMSNormPrimitives.h"
 #include <cmath>
 #include <omp.h>
 
@@ -25,27 +26,17 @@ namespace llaminar2
             return false; // CPU only
         }
 
-#pragma omp parallel for
-        for (int t = 0; t < seq_len; ++t)
-        {
-            const float *in_row = input + t * d_model;
-            float *out_row = output + t * d_model;
+        // Use vectorized primitives implementation
+        primitives::RMSNormExecOptions opts;
+        opts.allow_parallel = true;
+        opts.force_scalar = false;
+        opts.parallel_threshold_elems = 2048;
+        opts.t5_compat_mode = false;
 
-            // Compute RMS
-            float sum_sq = 0.0f;
-            for (int i = 0; i < d_model; ++i)
-            {
-                sum_sq += in_row[i] * in_row[i];
-            }
-            float rms = std::sqrt(sum_sq / d_model + eps);
-            float scale = 1.0f / rms;
-
-            // Normalize and apply gamma
-            for (int i = 0; i < d_model; ++i)
-            {
-                out_row[i] = in_row[i] * scale * gamma[i];
-            }
-        }
+        primitives::rmsnorm_fused_vectorized(
+            input, gamma, output,
+            seq_len, d_model,
+            eps, opts);
 
         return true;
     }

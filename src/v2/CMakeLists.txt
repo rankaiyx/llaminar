@@ -30,6 +30,7 @@ add_library(llaminar2_core STATIC
     tensors/FP16Tensor.cpp
     tensors/BF16Tensor.cpp
     tensors/TensorFactory.cpp
+    tensors/KVCache.cpp
     tensors/IQ4_NLTensor.cpp
     # Simple quantization formats (Q8_0, Q4_0, Q4_1)
     tensors/Q8_0Tensor.cpp
@@ -51,13 +52,23 @@ add_library(llaminar2_core STATIC
     tensors/IQ3_STensor.cpp
     tensors/IQ1_STensor.cpp
     tensors/IQ1_MTensor.cpp
+    # Vectorized primitives (ported from V1)
+    kernels/cpu/primitives/RoPEPrimitives.cpp
+    kernels/cpu/primitives/RMSNormPrimitives.cpp
+    kernels/cpu/primitives/SoftmaxPrimitives.cpp
+    # CPU kernels (use vectorized primitives)
     kernels/cpu/QuantizedGemm.cpp
     kernels/cpu/FP32GemmKernel.cpp
+    kernels/cpu/FP32StandaloneGemm.cpp
     kernels/cpu/BF16GemmKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
     kernels/cpu/CPURMSNormKernel.cpp
     kernels/cpu/CPUSoftmaxKernel.cpp
     kernels/cpu/CPUSwiGLUKernel.cpp
+    # Testing infrastructure (Phase 3a & 3b)
+    testing/MockPipeline.cpp
+    testing/AttentionTestHarness.cpp
+    testing/PerfHarness.cpp
     utils/ArgParser.cpp
 )
 

@@ -21,6 +21,7 @@
 
 #include "../PipelineBase.h"
 #include "../TensorDimensions.h"
+#include "../../tensors/KVCache.h"
 
 namespace llaminar2
 {
@@ -74,6 +75,13 @@ namespace llaminar2
         const char *architecture() const override { return "qwen2"; }
 
         /**
+         * @brief Get output logits for E2E testing/validation
+         *
+         * @return Logits tensor [seq_len, vocab_size], or nullptr if forward() not called
+         */
+        const float *getLogits() const { return logits(); }
+
+        /**
          * @brief Get specific layer weight for device placement
          *
          * @param layer_idx Layer index (0-indexed)
@@ -115,9 +123,6 @@ namespace llaminar2
 
     private:
         // Qwen2-specific architecture parameters
-        int n_heads_ = 0;
-        int n_kv_heads_ = 0;
-        int head_dim_ = 0;
         int d_ff_ = 0;
 
         // Weights (quantized, stay on host for CPU, uploaded to GPU for GPU backends)
@@ -128,10 +133,6 @@ namespace llaminar2
 
         // Activations (FP32, on host or device depending on device_idx)
         std::shared_ptr<FP32Tensor> current_hidden_; // [seq_len, d_model]
-
-        // Pre-allocated activation buffers (Phase 4.1: one pool per active device)
-        // Legacy single-device mode: activation_buffers_ = buffers_per_device_[device_idx_]
-        ActivationBuffers activation_buffers_; // Deprecated: kept for backward compat
 
         // Helper methods for dimension specifications (Qwen2-specific)
         TensorSpec spec_hidden(int seq_len) const
@@ -177,11 +178,26 @@ namespace llaminar2
         }
 
         // Helper methods
-        bool attention_block(const LayerWeights &layer, int seq_len);
+        bool attention_block(const LayerWeights &layer, int layer_idx, int seq_len);
         bool ffn_block(const LayerWeights &layer, int seq_len);
 
-        // Buffer management (legacy single-device support)
-        void allocate_activation_buffers(int max_seq_len);
+    public:
+        /**
+         * @brief Clear KV cache (reset for new sequence)
+         */
+        void clear_cache()
+        {
+            if (kv_cache_)
+            {
+                kv_cache_->clear();
+            }
+            current_position_ = 0;
+        }
+
+        /**
+         * @brief Get current cache position
+         */
+        int get_position() const { return current_position_; }
     };
 
 } // namespace llaminar2

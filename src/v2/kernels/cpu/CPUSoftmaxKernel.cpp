@@ -1,11 +1,12 @@
 /**
  * @file CPUSoftmaxKernel.cpp
- * @brief CPU Softmax kernel implementation
+ * @brief CPU Softmax kernel implementation (uses vectorized primitives)
  *
  * @author David Sanftenberg
  */
 
 #include "CPUSoftmaxKernel.h"
+#include "primitives/SoftmaxPrimitives.h"
 #include <cmath>
 #include <algorithm>
 #include <omp.h>
@@ -25,34 +26,27 @@ namespace llaminar2
             return false; // CPU only
         }
 
-#pragma omp parallel for
-        for (int r = 0; r < rows; ++r)
+        // Copy input to output if different (softmax is typically in-place)
+        if (input != output)
         {
-            const float *in_row = input + r * cols;
-            float *out_row = output + r * cols;
-
-            // Find max for numerical stability
-            float max_val = in_row[0];
-            for (int c = 1; c < cols; ++c)
-            {
-                max_val = std::max(max_val, in_row[c]);
-            }
-
-            // Compute exp and sum
-            float sum = 0.0f;
-            for (int c = 0; c < cols; ++c)
-            {
-                out_row[c] = std::exp(in_row[c] - max_val);
-                sum += out_row[c];
-            }
-
-            // Normalize
-            float inv_sum = 1.0f / sum;
-            for (int c = 0; c < cols; ++c)
-            {
-                out_row[c] *= inv_sum;
-            }
+            std::copy(input, input + rows * cols, output);
         }
+
+        // Use vectorized primitives implementation
+        primitives::SoftmaxRowArgs args;
+        args.scores = output;
+        args.rows = rows;
+        args.cols = cols;
+        args.causal = false;
+        args.scale = 1.0f;
+
+        primitives::SoftmaxExecOptions opts;
+        opts.force_scalar = false;
+        opts.fast_exp = false; // Can enable for 2-3× speedup
+        opts.parallel_elems_threshold = 8192;
+        opts.parallel_row_threshold = 4;
+
+        primitives::softmax_row_major_vectorized(args, opts);
 
         return true;
     }

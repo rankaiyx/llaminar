@@ -85,6 +85,77 @@ namespace llaminar2
         tensor_to_device_.clear();
         layer_to_device_.clear();
         pattern_to_device_.clear();
+        shared_expert_to_device_.clear();
+        local_expert_to_device_.clear();
+    }
+
+    // ========== Block-Level Convenience Methods (Phase 2) ==========
+
+    void WeightPlacementMap::setAttentionDevice(int layer_idx, int device_idx)
+    {
+        // Set all attention tensors for this layer
+        std::string base = "blk." + std::to_string(layer_idx) + ".";
+        setTensorDevice(base + "attn_q.weight", device_idx);
+        setTensorDevice(base + "attn_k.weight", device_idx);
+        setTensorDevice(base + "attn_v.weight", device_idx);
+        setTensorDevice(base + "attn_output.weight", device_idx);
+        setTensorDevice(base + "attn_norm.weight", device_idx);
+    }
+
+    int WeightPlacementMap::getAttentionDevice(int layer_idx) const
+    {
+        std::string attn_q_name = "blk." + std::to_string(layer_idx) + ".attn_q.weight";
+        return getDeviceForWeight(attn_q_name, layer_idx);
+    }
+
+    void WeightPlacementMap::setFFNDevice(int layer_idx, int device_idx)
+    {
+        // Set all FFN tensors for this layer
+        std::string base = "blk." + std::to_string(layer_idx) + ".";
+        setTensorDevice(base + "ffn_gate.weight", device_idx);
+        setTensorDevice(base + "ffn_up.weight", device_idx);
+        setTensorDevice(base + "ffn_down.weight", device_idx);
+        setTensorDevice(base + "ffn_norm.weight", device_idx);
+    }
+
+    int WeightPlacementMap::getFFNDevice(int layer_idx) const
+    {
+        std::string ffn_gate_name = "blk." + std::to_string(layer_idx) + ".ffn_gate.weight";
+        return getDeviceForWeight(ffn_gate_name, layer_idx);
+    }
+
+    // ========== MoE-Specific Methods (Phase 2) ==========
+
+    void WeightPlacementMap::setSharedExpertDevice(int expert_idx, int device_idx)
+    {
+        shared_expert_to_device_[expert_idx] = device_idx;
+
+        // Also set pattern for all tensors matching this expert
+        std::string pattern = "shared_expert." + std::to_string(expert_idx) + ".*";
+        setPatternDevice(pattern, device_idx);
+    }
+
+    int WeightPlacementMap::getSharedExpertDevice(int expert_idx) const
+    {
+        auto it = shared_expert_to_device_.find(expert_idx);
+        return (it != shared_expert_to_device_.end()) ? it->second : default_device_idx_;
+    }
+
+    void WeightPlacementMap::setLocalExpertDevice(int layer_idx, int expert_idx, int device_idx)
+    {
+        std::string key = "layer_" + std::to_string(layer_idx) + ":expert_" + std::to_string(expert_idx);
+        local_expert_to_device_[key] = device_idx;
+
+        // Also set pattern for all tensors matching this expert
+        std::string pattern = "blk." + std::to_string(layer_idx) + ".expert." + std::to_string(expert_idx) + ".*";
+        setPatternDevice(pattern, device_idx);
+    }
+
+    int WeightPlacementMap::getLocalExpertDevice(int layer_idx, int expert_idx) const
+    {
+        std::string key = "layer_" + std::to_string(layer_idx) + ":expert_" + std::to_string(expert_idx);
+        auto it = local_expert_to_device_.find(key);
+        return (it != local_expert_to_device_.end()) ? it->second : default_device_idx_;
     }
 
     int WeightPlacementMap::extractLayerIndex(const std::string &tensor_name) const

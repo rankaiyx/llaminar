@@ -1,12 +1,13 @@
 /**
  * @file CPURoPEKernel.h
- * @brief CPU implementation of rotary position embeddings
+ * @brief CPU implementation of rotary position embeddings (uses vectorized primitives)
  *
  * Optimized RoPE implementation with:
+ * - AVX2/AVX512 vectorization (8-16× speedup)
  * - Cached inverse frequencies
- * - Persistent decode state (single-token recurrence)
+ * - Persistent decode state (complex recurrence)
  * - OpenMP parallelization for prefill
- * - AVX2/AVX512 vectorization
+ * - Angle recurrence across tokens
  *
  * @author David Sanftenberg
  */
@@ -14,6 +15,7 @@
 #pragma once
 
 #include "../../tensors/TensorKernels.h"
+#include "primitives/RoPEPrimitives.h"
 #include <vector>
 #include <cmath>
 
@@ -23,7 +25,7 @@ namespace llaminar2
     /**
      * @brief CPU implementation of RoPE kernel
      *
-     * Ported from V1's optimized AttentionPrimitives implementation.
+     * Uses vectorized primitives from V1.
      */
     class CPURoPEKernel : public ITensorRoPE
     {
@@ -45,27 +47,13 @@ namespace llaminar2
             int device_idx = -1) override;
 
     private:
-        /**
-         * @brief Persistent state for single-token decode optimization
-         */
-        struct PersistentState
-        {
-            int last_pos = -1;
-            int cached_head_dim = 0;
-            float cached_freq_base = 0.f;
-            std::vector<float> cos_curr;
-            std::vector<float> sin_curr;
-            std::vector<float> cos_delta;
-            std::vector<float> sin_delta;
-        };
+        // Thread-local state for decode (uses primitives type)
+        thread_local static primitives::RoPEPersistentState tls_state_;
 
-        // Thread-local state for decode
-        thread_local static PersistentState tls_state_;
-
-        // Inverse frequency cache
+        // Inverse frequency cache (delegates to primitives)
         static const std::vector<float> &get_inv_freq_cached(int head_dim, float freq_base);
 
-        // Core rotation implementation
+        // Core rotation implementation (delegates to primitives)
         static void apply_rotation(
             float *q, float *k,
             int seq_len, int head_dim,

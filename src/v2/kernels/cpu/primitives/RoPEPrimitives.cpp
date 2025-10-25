@@ -1,0 +1,341 @@
+/**
+ * @file RoPEPrimitives.cpp
+ * @brief Vectorized RoPE implementation (ported from V1)
+ * @author David Sanftenberg
+ */
+
+#include "RoPEPrimitives.h"
+#include <cmath>
+#include <cstring>
+#include <unordered_map>
+#include <mutex>
+#include <array>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+namespace llaminar2::primitives
+{
+
+    // ============================================================================
+    // Inverse Frequency Cache
+    // ============================================================================
+
+    namespace
+    {
+        static std::unordered_map<uint64_t, std::vector<float>> g_inv_freq_cache;
+        static std::mutex g_inv_freq_mutex;
+
+        uint64_t make_cache_key(int head_dim, float freq_base)
+        {
+            uint32_t freq_bits;
+            std::memcpy(&freq_bits, &freq_base, sizeof(float));
+            return ((uint64_t)head_dim << 32) | freq_bits;
+        }
+    } // anonymous namespace
+
+    const std::vector<float> &get_inv_freq_cached(int head_dim, float freq_base)
+    {
+        uint64_t key = make_cache_key(head_dim, freq_base);
+
+        {
+            std::lock_guard<std::mutex> lock(g_inv_freq_mutex);
+            auto it = g_inv_freq_cache.find(key);
+            if (it != g_inv_freq_cache.end())
+            {
+                return it->second;
+            }
+        }
+
+        // Compute inverse frequencies
+        const int half_dim = head_dim / 2;
+        std::vector<float> inv_freq(half_dim);
+        const float log_base = std::log(freq_base);
+
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float exponent = (2.0f * i) / head_dim;
+            inv_freq[i] = std::exp(-log_base * exponent);
+        }
+
+        std::lock_guard<std::mutex> lock(g_inv_freq_mutex);
+        auto res = g_inv_freq_cache.emplace(key, std::move(inv_freq));
+        return res.first->second;
+    }
+
+    // ============================================================================
+    // Vectorized RoPE Application
+    // ============================================================================
+
+    /**
+     * @brief Apply RoPE rotation to a single head (vectorized)
+     */
+    static void apply_rope_to_head_vectorized(
+        float *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+
+#if defined(__AVX512F__)
+        // Process 16 pairs at a time
+        for (; i + 16 <= half_dim; i += 16)
+        {
+            // Compute angles for 16 pairs
+            alignas(64) float angles[16];
+            for (int lane = 0; lane < 16; ++lane)
+            {
+                angles[lane] = position * inv_freq[i + lane];
+            }
+
+            // Compute sin/cos
+            alignas(64) float cos_vals[16];
+            alignas(64) float sin_vals[16];
+            for (int lane = 0; lane < 16; ++lane)
+            {
+#if defined(__GNUC__)
+                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
+#else
+                cos_vals[lane] = std::cos(angles[lane]);
+                sin_vals[lane] = std::sin(angles[lane]);
+#endif
+            }
+
+            // Load values
+            __m512 x_first = _mm512_loadu_ps(head_ptr + i);
+            __m512 x_second = _mm512_loadu_ps(head_ptr + i + half_dim);
+            __m512 cos_vec = _mm512_loadu_ps(cos_vals);
+            __m512 sin_vec = _mm512_loadu_ps(sin_vals);
+
+            // Rotate: new_first = x_first * cos - x_second * sin
+            //         new_second = x_first * sin + x_second * cos
+            __m512 new_first = _mm512_sub_ps(
+                _mm512_mul_ps(x_first, cos_vec),
+                _mm512_mul_ps(x_second, sin_vec));
+            __m512 new_second = _mm512_add_ps(
+                _mm512_mul_ps(x_first, sin_vec),
+                _mm512_mul_ps(x_second, cos_vec));
+
+            _mm512_storeu_ps(head_ptr + i, new_first);
+            _mm512_storeu_ps(head_ptr + i + half_dim, new_second);
+        }
+#elif defined(__AVX2__)
+        // Process 8 pairs at a time
+        for (; i + 8 <= half_dim; i += 8)
+        {
+            // Compute angles
+            alignas(32) float angles[8];
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                angles[lane] = position * inv_freq[i + lane];
+            }
+
+            // Compute sin/cos
+            alignas(32) float cos_vals[8];
+            alignas(32) float sin_vals[8];
+            for (int lane = 0; lane < 8; ++lane)
+            {
+#if defined(__GNUC__)
+                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
+#else
+                cos_vals[lane] = std::cos(angles[lane]);
+                sin_vals[lane] = std::sin(angles[lane]);
+#endif
+            }
+
+            // Load and rotate
+            __m256 x_first = _mm256_loadu_ps(head_ptr + i);
+            __m256 x_second = _mm256_loadu_ps(head_ptr + i + half_dim);
+            __m256 cos_vec = _mm256_loadu_ps(cos_vals);
+            __m256 sin_vec = _mm256_loadu_ps(sin_vals);
+
+            __m256 new_first = _mm256_sub_ps(
+                _mm256_mul_ps(x_first, cos_vec),
+                _mm256_mul_ps(x_second, sin_vec));
+            __m256 new_second = _mm256_add_ps(
+                _mm256_mul_ps(x_first, sin_vec),
+                _mm256_mul_ps(x_second, cos_vec));
+
+            _mm256_storeu_ps(head_ptr + i, new_first);
+            _mm256_storeu_ps(head_ptr + i + half_dim, new_second);
+        }
+#endif
+
+        // Scalar tail
+        for (; i < half_dim; ++i)
+        {
+            float angle = position * inv_freq[i];
+#if defined(__GNUC__)
+            float sin_val, cos_val;
+            sincosf(angle, &sin_val, &cos_val);
+#else
+            float cos_val = std::cos(angle);
+            float sin_val = std::sin(angle);
+#endif
+
+            float x_first = head_ptr[i];
+            float x_second = head_ptr[i + half_dim];
+
+            head_ptr[i] = x_first * cos_val - x_second * sin_val;
+            head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
+        }
+    }
+
+    /**
+     * @brief Apply RoPE to tensor with angle recurrence (prefill optimization)
+     */
+    static void apply_rope_to_tensor_recurrence(
+        float *tensor,
+        int seq_len, int num_heads, int head_dim,
+        int n_past,
+        const std::vector<float> &inv_freq)
+    {
+        const int half_dim = head_dim / 2;
+
+        // Parallelize over (token, head) pairs
+#pragma omp parallel for collapse(2) schedule(static)
+        for (int t = 0; t < seq_len; ++t)
+        {
+            for (int h = 0; h < num_heads; ++h)
+            {
+                float *head_ptr = tensor + (t * num_heads + h) * head_dim;
+                int position = n_past + t;
+
+                // Use vectorized head rotation
+                apply_rope_to_head_vectorized(head_ptr, position, inv_freq, head_dim);
+            }
+        }
+    }
+
+    /**
+     * @brief Apply RoPE with persistent state (single-token decode optimization)
+     */
+    static void apply_rope_with_persistent_state(
+        float *q, float *k,
+        int q_heads, int k_heads, int head_dim,
+        int n_past,
+        const std::vector<float> &inv_freq,
+        RoPEPersistentState &state)
+    {
+        const int half_dim = head_dim / 2;
+        int target_pos = n_past;
+
+        // Initialize or reset if position jumped
+        if (state.last_pos == -1 || target_pos < state.last_pos)
+        {
+            state.cos_curr.resize(half_dim);
+            state.sin_curr.resize(half_dim);
+            state.cos_delta.resize(half_dim);
+            state.sin_delta.resize(half_dim);
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                const float delta = inv_freq[i];
+                state.cos_delta[i] = std::cos(delta);
+                state.sin_delta[i] = std::sin(delta);
+
+                const float ang = target_pos * inv_freq[i];
+#if defined(__GNUC__)
+                sincosf(ang, &state.sin_curr[i], &state.cos_curr[i]);
+#else
+                state.cos_curr[i] = std::cos(ang);
+                state.sin_curr[i] = std::sin(ang);
+#endif
+            }
+            state.last_pos = target_pos;
+        }
+        // Advance via complex recurrence
+        else if (target_pos > state.last_pos)
+        {
+            int steps = target_pos - state.last_pos;
+            for (int step = 0; step < steps; ++step)
+            {
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    float c = state.cos_curr[i];
+                    float s = state.sin_curr[i];
+                    float cd = state.cos_delta[i];
+                    float sd = state.sin_delta[i];
+
+                    state.cos_curr[i] = c * cd - s * sd;
+                    state.sin_curr[i] = s * cd + c * sd;
+                }
+            }
+            state.last_pos = target_pos;
+        }
+
+        // Apply rotation to all heads using cached sin/cos
+        auto apply_to_heads = [&](float *tensor, int num_heads)
+        {
+            for (int h = 0; h < num_heads; ++h)
+            {
+                float *head_ptr = tensor + h * head_dim;
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    float x_first = head_ptr[i];
+                    float x_second = head_ptr[i + half_dim];
+                    float cos_val = state.cos_curr[i];
+                    float sin_val = state.sin_curr[i];
+
+                    head_ptr[i] = x_first * cos_val - x_second * sin_val;
+                    head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
+                }
+            }
+        };
+
+        apply_to_heads(q, q_heads);
+        apply_to_heads(k, k_heads);
+    }
+
+    // ============================================================================
+    // Public API
+    // ============================================================================
+
+    void apply_rope_vectorized(
+        float *q, float *k,
+        int seq_len, int head_dim,
+        int q_heads, int k_heads,
+        int n_past, float freq_base,
+        RoPEPersistentState *persistent_state)
+    {
+        if (head_dim % 2 != 0)
+        {
+            return; // head_dim must be even
+        }
+
+        const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
+
+        // Single-token decode with persistent state
+        if (seq_len == 1 && persistent_state)
+        {
+            // Reset state if parameters changed
+            if (persistent_state->cached_head_dim != head_dim ||
+                persistent_state->cached_freq_base != freq_base)
+            {
+                persistent_state->cached_head_dim = head_dim;
+                persistent_state->cached_freq_base = freq_base;
+                persistent_state->reset();
+            }
+
+            apply_rope_with_persistent_state(
+                q, k, q_heads, k_heads, head_dim,
+                n_past, inv_freq, *persistent_state);
+        }
+        else
+        {
+            // Prefill or no persistent state: use angle recurrence
+            apply_rope_to_tensor_recurrence(q, seq_len, q_heads, head_dim, n_past, inv_freq);
+            apply_rope_to_tensor_recurrence(k, seq_len, k_heads, head_dim, n_past, inv_freq);
+        }
+    }
+
+} // namespace llaminar2::primitives

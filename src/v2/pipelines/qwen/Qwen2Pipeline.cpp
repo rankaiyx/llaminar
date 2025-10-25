@@ -113,103 +113,26 @@ namespace llaminar2
         // Resize layer weights vector for lazy loading
         layers_.resize(n_layers_);
 
-        // Phase 4.1: Discover which devices are used by this rank (uses base class method)
-        active_devices_ = discoverActiveDevices();
-        std::stringstream devices_str;
-        devices_str << "Active devices for this rank: [";
-        for (size_t i = 0; i < active_devices_.size(); ++i)
-        {
-            if (i > 0)
-                devices_str << ", ";
-            devices_str << active_devices_[i];
-        }
-        devices_str << "]";
-        LOG_INFO(devices_str.str());
+        // =============================================================================
+        // Generic Initialization (uses PipelineBase helpers)
+        // =============================================================================
 
-        // Allocate activation buffers for each active device
         // TODO: Make max_seq_len configurable (default 2048 for now)
         int max_seq_len = 2048;
 
-        if (active_devices_.size() == 1 && active_devices_[0] == device_idx_)
-        {
-            // Single-device mode: use legacy path for backward compat
-            LOG_INFO("Single-device mode (device " << device_idx_ << ")");
-            allocate_activation_buffers(max_seq_len);
-        }
-        else
-        {
-            // Multi-device mode: allocate buffer pool per device (uses base class method)
-            LOG_INFO("Multi-device mode: allocating buffers for "
-                     << active_devices_.size() << " devices");
-            for (int device_idx : active_devices_)
-            {
-                // Lazy allocation happens in getBuffersForDevice(), just ensure they exist
-                ActivationBuffers &buffers = getBuffersForDevice(device_idx);
-                LOG_INFO("  Device " << device_idx << " allocated "
-                                     << (max_seq_len * d_model_ * 4 * 9 / 1024 / 1024) << " MB");
-            }
-            // For backward compat, point activation_buffers_ to primary device
-            activation_buffers_ = buffers_per_device_[device_idx_];
-        }
+        // Phase 4.1: Device infrastructure (device discovery, buffer allocation)
+        initializeDeviceInfrastructure(max_seq_len);
+
+        // Phase 2: MPI strategy configuration (auto-select or validate)
+        configureMPIStrategy();
+
+        // Phase 3: KV cache initialization (uses attention device placement)
+        initializeKVCache(max_seq_len);
 
         LOG_INFO("Pipeline initialized (weights loaded on-demand)");
     }
 
-    void Qwen2Pipeline::allocate_activation_buffers(int max_seq_len)
-    {
-        LOG_INFO("Allocating activation buffers for max_seq_len=" << max_seq_len
-                                                                  << " on device " << device_idx_);
-
-        activation_buffers_.max_seq_len = max_seq_len;
-
-        // Residual (d_model) - allocated on pipeline's device
-        activation_buffers_.residual = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(d_model_)},
-            device_idx_);
-
-        // Attention buffers
-        activation_buffers_.Q = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(n_heads_ * head_dim_)},
-            device_idx_);
-        activation_buffers_.K = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-            device_idx_);
-        activation_buffers_.V = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-            device_idx_);
-        activation_buffers_.attn_output = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(n_heads_ * head_dim_)},
-            device_idx_);
-        activation_buffers_.attn_proj = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(d_model_)},
-            device_idx_);
-
-        // FFN buffers
-        activation_buffers_.gate = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(d_ff_)},
-            device_idx_);
-        activation_buffers_.up = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(d_ff_)},
-            device_idx_);
-        activation_buffers_.ffn_output = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_seq_len), static_cast<size_t>(d_model_)},
-            device_idx_);
-
-        size_t total_bytes = (max_seq_len * d_model_ +                // residual
-                              max_seq_len * n_heads_ * head_dim_ +    // Q
-                              max_seq_len * n_kv_heads_ * head_dim_ + // K
-                              max_seq_len * n_kv_heads_ * head_dim_ + // V
-                              max_seq_len * n_heads_ * head_dim_ +    // attn_output
-                              max_seq_len * d_model_ +                // attn_proj
-                              max_seq_len * d_ff_ +                   // gate
-                              max_seq_len * d_ff_ +                   // up
-                              max_seq_len * d_model_                  // ffn_output
-                              ) *
-                             sizeof(float);
-
-        LOG_INFO("Allocated " << (total_bytes / 1024.0 / 1024.0)
-                              << " MB of activation buffers");
-    } // =============================================================================
+    // =============================================================================
     // Multi-Device Infrastructure (implements PipelineBase abstract methods)
     // =============================================================================
 
@@ -402,6 +325,9 @@ namespace llaminar2
 
         VALIDATE_TENSOR(logits_, spec_logits(seq_len), "after_lm_head");
 
+        // Update position for next incremental decode step
+        current_position_ += seq_len;
+
         return true;
     }
 
@@ -413,7 +339,7 @@ namespace llaminar2
         auto &layer = getLayerWeights(layer_idx);
 
         // Attention block
-        if (!attention_block(layer, seq_len))
+        if (!attention_block(layer, layer_idx, seq_len))
         {
             LOG_ERROR("Attention block failed in layer " << layer_idx);
             return false;
@@ -429,7 +355,7 @@ namespace llaminar2
         return true;
     }
 
-    bool Qwen2Pipeline::attention_block(const LayerWeights &layer, int seq_len)
+    bool Qwen2Pipeline::attention_block(const LayerWeights &layer, int layer_idx, int seq_len)
     {
         // Phase 4.3: Determine execution device based on weight placement
         // All attention weights should be on same device (enforced by placement strategies)
@@ -552,8 +478,9 @@ namespace llaminar2
         VALIDATE_TENSOR(buffers.Q, spec_q(seq_len), "after_rope_q");
         VALIDATE_TENSOR(buffers.K, spec_kv(seq_len), "after_rope_k");
 
-        // 4. GQA attention computation (reuse attn_output buffer)
-        if (!attention_gqa(
+        // 4. GQA attention computation (MPI-aware)
+        // Dispatches to tensor-parallel if mpi_strategy_ == TensorParallel
+        if (!attention_gqa_mpi(
                 buffers.Q.get(), buffers.K.get(),
                 buffers.V.get(), buffers.attn_output.get(),
                 n_heads_, n_kv_heads_, head_dim_,

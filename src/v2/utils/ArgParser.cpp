@@ -6,6 +6,7 @@
  */
 
 #include "ArgParser.h"
+#include "Logger.h"
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
@@ -187,10 +188,16 @@ namespace llaminar2
                 ctx.use_mmap = false;
             }
 
-            // Verbose
+            // Verbose logging levels
+            else if (arg == "-vv" || arg == "--vverbose")
+            {
+                ctx.verbose_level = 2; // TRACE
+                ctx.verbose = true;    // Backward compat
+            }
             else if (matchesFlag(arg, "-v", "--verbose"))
             {
-                ctx.verbose = true;
+                ctx.verbose_level = 1; // DEBUG
+                ctx.verbose = true;    // Backward compat
             }
 
             else
@@ -198,6 +205,18 @@ namespace llaminar2
                 std::cerr << "Warning: Unknown argument '" << arg << "'" << std::endl;
             }
         }
+
+        // Apply verbose level to Logger (if specified via CLI)
+        // This overrides environment variable LLAMINAR_LOG_LEVEL
+        if (ctx.verbose_level == 2)
+        {
+            Logger::getInstance().setLogLevel(LogLevel::TRACE);
+        }
+        else if (ctx.verbose_level == 1)
+        {
+            Logger::getInstance().setLogLevel(LogLevel::VERBOSITY_DEBUG);
+        }
+        // else: keep default or environment-configured level
 
         return ctx;
     }
@@ -252,7 +271,8 @@ namespace llaminar2
 
         std::cout << "Other:\n";
         std::cout << "  --list-devices            List available devices and exit\n";
-        std::cout << "  -v, --verbose             Verbose logging\n";
+        std::cout << "  -v, --verbose             Verbose logging (DEBUG level)\n";
+        std::cout << "  -vv, --vverbose           Very verbose logging (TRACE level)\n";
         std::cout << "  -h, --help                Show this help\n\n";
 
         std::cout << "Examples:\n";

@@ -73,7 +73,8 @@
         "iosfwd": "cpp",
         "iostream": "cpp",
         "typeinfo": "c",
-        "span": "cpp"
+        "span": "cpp",
+        "random": "cpp"
     },
     "files.exclude": {
         "**/build/**": true,

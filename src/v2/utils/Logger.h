@@ -148,6 +148,13 @@ namespace llaminar2
     private:
         Logger() : current_level_(LogLevel::INFO)
         {
+            // Check environment variable for log level override
+            const char *level_env = std::getenv("LLAMINAR_LOG_LEVEL");
+            if (level_env)
+            {
+                current_level_ = stringToLogLevel(std::string(level_env));
+            }
+
             // Check environment variable for buffer size override
             const char *buffer_env = std::getenv("LLAMINAR_LOG_BUFFER_LINES");
             if (buffer_env)

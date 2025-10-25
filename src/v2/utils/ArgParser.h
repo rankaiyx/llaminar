@@ -54,7 +54,8 @@ namespace llaminar2
         std::string gpu_split;  // GPU split strategy: "even", "weighted", or custom ratios
 
         // Debugging/logging
-        bool verbose = false;
+        bool verbose = false;  // Deprecated: use verbose_level instead
+        int verbose_level = 0; // 0 = default (INFO), 1 = DEBUG (-v), 2 = TRACE (-vv)
         bool list_devices = false;
         bool show_help = false;
 

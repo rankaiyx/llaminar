@@ -22,6 +22,8 @@
 #include "../loaders/WeightPlacementMap.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorKernels.h"
+#include "../tensors/KVCache.h" // KV cache for autoregressive decode
+#include "MPIStrategy.h"        // MPI parallelization strategies
 #include <vector>
 #include <memory>
 #include <string>
@@ -136,10 +138,25 @@ namespace llaminar2
         // Common model parameters (set by derived classes)
         int n_layers_ = 0;
         int d_model_ = 0;
+        int n_heads_ = 0;    // Number of attention heads (needed for MPI validation)
+        int n_kv_heads_ = 0; // Number of KV heads (GQA: ≤ n_heads)
+        int head_dim_ = 0;   // Dimension per attention head
         int vocab_size_ = 0;
 
         // Common activations (used by all pipelines)
         std::shared_ptr<FP32Tensor> logits_; // [seq_len, vocab_size] output logits
+
+        // ===== MPI Parallelization Infrastructure =====
+
+        /**
+         * @brief MPI configuration for distributed execution
+         */
+        MPIConfig mpi_config_;
+
+        /**
+         * @brief Active MPI strategy (selected in constructor)
+         */
+        MPIStrategy mpi_strategy_ = MPIStrategy::None;
 
         // ===== Multi-Device Infrastructure (Phase 4) =====
 
@@ -166,6 +183,32 @@ namespace llaminar2
          * Buffers are lazily allocated on first use.
          */
         std::map<int, ActivationBuffers> buffers_per_device_;
+
+        /**
+         * @brief Legacy activation buffers (single-device mode)
+         *
+         * Deprecated: Use buffers_per_device_ for multi-device support.
+         * Points to buffers_per_device_[device_idx_] for backward compat.
+         * Initialized by initializeDeviceInfrastructure().
+         */
+        ActivationBuffers activation_buffers_;
+
+        /**
+         * @brief KV cache for autoregressive decode (Phase 3)
+         *
+         * Stores past key/value projections for incremental generation.
+         * Initialized by initializeKVCache() with per-layer device placement.
+         * Per-layer device affinity enables heterogeneous execution.
+         */
+        std::shared_ptr<KVCache> kv_cache_;
+
+        /**
+         * @brief Current position in sequence (for incremental decode)
+         *
+         * Tracks how many tokens have been processed.
+         * Reset to 0 on clear(), incremented by forward().
+         */
+        int current_position_ = 0;
 
         /**
          * @brief Get all weight names for device discovery (architecture-specific)
@@ -225,6 +268,89 @@ namespace llaminar2
          * @return Device ID (-1=CPU, >=0=GPU)
          */
         int getWeightDevice(const std::string &weight_name, int layer_idx = -1) const;
+
+        // ===== Phase 3: MoE Device Placement Helpers =====
+
+        /**
+         * @brief Detect attention device for each layer from placement map (Phase 3)
+         *
+         * Queries placement_map_->getAttentionDevice() for each layer to build
+         * a vector suitable for KVCache initialization.
+         *
+         * Uses block-level methods from Phase 2 (WeightPlacementMap enhancement).
+         * KV cache resides where attention computation happens (Q/K/V weights).
+         *
+         * @param n_layers Number of transformer layers
+         * @return Vector of device IDs, one per layer [n_layers]
+         *
+         * Example:
+         *   auto attn_devices = detectAttentionDevices(24);
+         *   kv_cache = make_shared<KVCache>(24, max_seq_len, ..., attn_devices);
+         */
+        std::vector<int> detectAttentionDevices(int n_layers) const;
+
+        /**
+         * @brief Detect FFN device for each layer from placement map (Phase 3)
+         *
+         * Queries placement_map_->getFFNDevice() for each layer.
+         * Useful for heterogeneous execution where FFN may be on different device than attention.
+         *
+         * @param n_layers Number of transformer layers
+         * @return Vector of device IDs, one per layer [n_layers]
+         */
+        std::vector<int> detectFFNDevices(int n_layers) const;
+
+        // ===== Generic Initialization (extracted from Qwen2Pipeline) =====
+
+        /**
+         * @brief Initialize device infrastructure (Phase 4.1)
+         *
+         * Generic initialization logic extracted from derived class constructors:
+         * 1. Discover active devices via placement map
+         * 2. Allocate activation buffers for each device
+         * 3. Handle single-device vs multi-device modes
+         *
+         * Must be called AFTER architecture parameters (n_layers_, d_model_, etc.) are set.
+         * Derived class must implement createBuffersForDevice() for buffer allocation.
+         *
+         * @param max_seq_len Maximum sequence length to support (e.g., 2048)
+         */
+        void initializeDeviceInfrastructure(int max_seq_len);
+
+        /**
+         * @brief Configure MPI strategy (Phase 2)
+         *
+         * Generic MPI strategy configuration extracted from derived class constructors:
+         * 1. Get default MPI config
+         * 2. Auto-select or validate user strategy
+         * 3. Log strategy and distribution info
+         *
+         * Must be called AFTER architecture parameters are set (for validation).
+         * Derived class can override logMPIStrategyInfo() for custom logging.
+         */
+        void configureMPIStrategy();
+
+        /**
+         * @brief Initialize KV cache (Phase 3)
+         *
+         * Generic KV cache initialization extracted from derived class constructors:
+         * 1. Detect attention devices per layer
+         * 2. Create KVCache with appropriate device placement
+         *
+         * Must be called AFTER n_layers_, n_kv_heads_, head_dim_ are set.
+         *
+         * @param max_seq_len Maximum sequence length for KV cache (e.g., 2048)
+         */
+        void initializeKVCache(int max_seq_len);
+
+        /**
+         * @brief Log MPI strategy info (override for custom logging)
+         *
+         * Called by configureMPIStrategy() to log strategy-specific info.
+         * Default implementation logs tensor-parallel head distribution.
+         * Derived classes can override for architecture-specific logging.
+         */
+        virtual void logMPIStrategyInfo();
 
         /**
          * @brief Prepare activation for execution on target device (Phase 4.3)
@@ -286,13 +412,129 @@ namespace llaminar2
          * @param window_size Sliding window size (-1 = full attention, ≥0 = local window)
          * @return true on success, false on error
          *
+         * @note Single-rank implementation (no MPI coordination)
+         * @note For MPI parallelization, use attention_gqa_mpi()
          * @note Uses primitive kernels: ITensorGemm, ITensorSoftmax
-         * @note Pipelines can override attention_block() for custom attention types
          */
         virtual bool attention_gqa(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal = true, int window_size = -1);
+
+        // ===== MPI-Aware Attention Methods =====
+
+        /**
+         * @brief MPI-aware attention dispatcher
+         *
+         * Dispatches to appropriate attention implementation based on MPI strategy:
+         * - MPIStrategy::None → attention_gqa() (single-rank fast path)
+         * - MPIStrategy::TensorParallel → attention_gqa_tensor_parallel()
+         * - MPIStrategy::SequenceParallel → attention_gqa_sequence_parallel()
+         *
+         * @param Q Query tensor [seq_len, n_heads * head_dim]
+         * @param K Key tensor [seq_len, n_kv_heads * head_dim]
+         * @param V Value tensor [seq_len, n_kv_heads * head_dim]
+         * @param output Output tensor [seq_len, n_heads * head_dim] (pre-allocated)
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads
+         * @param head_dim Dimension per head
+         * @param causal Apply causal masking
+         * @param window_size Sliding window size
+         * @return true on success, false on error
+         */
+        bool attention_gqa_mpi(
+            TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+            int n_heads, int n_kv_heads, int head_dim,
+            bool causal = true, int window_size = -1);
+
+        /**
+         * @brief Tensor-parallel attention implementation
+         *
+         * Distributes attention heads across MPI ranks:
+         * - Rank i computes heads [start_head, start_head + local_n_heads)
+         * - Allreduce to sum outputs from all ranks
+         *
+         * Memory: O(seq_len * local_n_heads * head_dim) per rank
+         * Communication: 1× allreduce (seq_len * n_heads * head_dim elements)
+         *
+         * @param Q Query tensor [seq_len, n_heads * head_dim]
+         * @param K Key tensor [seq_len, n_kv_heads * head_dim]
+         * @param V Value tensor [seq_len, n_kv_heads * head_dim]
+         * @param output Output tensor [seq_len, n_heads * head_dim] (pre-allocated)
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads
+         * @param head_dim Dimension per head
+         * @param causal Apply causal masking
+         * @param window_size Sliding window size
+         * @return true on success, false on error
+         *
+         * @note Requires n_heads % world_size == 0 (validated in constructor)
+         */
+        bool attention_gqa_tensor_parallel(
+            TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+            int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int window_size);
+
+        // ===== MPI Strategy Management =====
+
+        /**
+         * @brief Select optimal MPI strategy based on model architecture
+         *
+         * Heuristic:
+         * 1. Try TensorParallel if n_heads % world_size == 0
+         * 2. Try PipelineParallel if n_layers % world_size == 0
+         * 3. Fallback to None (warn user)
+         *
+         * Called during pipeline construction when auto_select=true.
+         *
+         * @return Selected strategy
+         */
+        MPIStrategy selectOptimalStrategy();
+
+        /**
+         * @brief Validate that strategy is compatible with model
+         *
+         * Checks:
+         * - TensorParallel: n_heads % world_size == 0, d_ff % world_size == 0
+         * - PipelineParallel: n_layers % world_size == 0
+         * - SequenceParallel: Always valid (can split any sequence)
+         *
+         * @param strategy Strategy to validate
+         * @return true if valid, false otherwise
+         */
+        bool validateStrategy(MPIStrategy strategy);
+
+        // ===== MPI Distribution Helpers =====
+
+        /**
+         * @brief Get attention head distribution for this rank
+         *
+         * Divides n_heads across world_size ranks as evenly as possible.
+         *
+         * @param n_heads Total number of attention heads
+         * @return {start_head, local_n_heads} for this rank
+         */
+        std::pair<size_t, size_t> getHeadDistribution(int n_heads);
+
+        /**
+         * @brief Get layer distribution for pipeline parallelism
+         *
+         * Divides n_layers across world_size ranks.
+         *
+         * @param n_layers Total number of layers
+         * @return {start_layer, local_n_layers} for this rank
+         */
+        std::pair<size_t, size_t> getLayerDistribution(int n_layers);
+
+        /**
+         * @brief Get token distribution for sequence parallelism
+         *
+         * Divides seq_len across world_size ranks.
+         *
+         * @param seq_len Total sequence length
+         * @return {start_token, local_seq_len} for this rank
+         */
+        std::pair<size_t, size_t> getTokenDistribution(int seq_len);
     };
 
 } // namespace llaminar2

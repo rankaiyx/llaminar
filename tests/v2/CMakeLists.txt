@@ -127,13 +127,22 @@ function(add_v2_test TEST_NAME)
     endif()
     
     # Create the test with mpirun wrapper
+    # Note: executables are in build_v2/tests/v2/ directory
     add_test(NAME ${TEST_NAME} COMMAND ${MPI_CMD} ${ARG_COMMAND})
     
-    # Set environment variables for optimal performance
+    # Determine default log level based on test type (Unit/Integration = DEBUG, Performance = INFO)
+    set(DEFAULT_LOG_LEVEL "DEBUG")
+    if("${ARG_LABELS}" MATCHES "Performance")
+        set(DEFAULT_LOG_LEVEL "INFO")
+    endif()
+    
+    # Set environment variables for optimal performance + logging
+    # Working directory: project root so model paths work correctly
     set_tests_properties(${TEST_NAME} PROPERTIES
         FIXTURES_REQUIRED V2_Models                    # Requires V2_Models fixture
         LABELS "${ARG_LABELS}"
-        ENVIRONMENT "OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+        ENVIRONMENT "LLAMINAR_LOG_LEVEL=${DEFAULT_LOG_LEVEL};OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
     )
 endfunction()
 
@@ -169,6 +178,36 @@ target_link_libraries(v2_test_bf16_tensor
 add_v2_test(V2_Unit_BF16Tensor 
     COMMAND v2_test_bf16_tensor
     LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM"
+)
+
+# Test: KVCache
+add_executable(v2_test_kv_cache unit/tensors/Test__KVCache.cpp)
+target_link_libraries(v2_test_kv_cache 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_KVCache 
+    COMMAND $<TARGET_FILE:v2_test_kv_cache>
+    LABELS "V2;Unit;TensorOperations;KVCache;AutoregressiveDecode"
+)
+
+# Test: WeightPlacementMap
+# WeightPlacementMap Tests (Tensor-Level Device Placement - Phase 2)
+add_executable(v2_test_weight_placement_map unit/loaders/Test__WeightPlacementMap.cpp)
+target_link_libraries(v2_test_weight_placement_map llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightPlacementMap
+    COMMAND $<TARGET_FILE:v2_test_weight_placement_map>
+    LABELS "V2;Unit;DeviceManagement;WeightPlacement;Heterogeneous;MoE"
+)
+
+# Test: PipelineBase Device Detection (Phase 3)
+# Tests pipeline integration helpers: detectAttentionDevices, detectFFNDevices
+add_executable(v2_test_pipeline_device_detection unit/pipelines/Test__PipelineBase_DeviceDetection.cpp)
+target_link_libraries(v2_test_pipeline_device_detection llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_PipelineDeviceDetection
+    COMMAND $<TARGET_FILE:v2_test_pipeline_device_detection>
+    LABELS "V2;Unit;PipelineExecution;DeviceManagement;MoE;Phase3"
 )
 
 # Test: ModelLoader
@@ -208,18 +247,6 @@ add_v2_test(V2_Unit_PipelineFactory
     LABELS "V2;Unit;PipelineExecution;Factory;Registration"
 )
 
-# Test: WeightPlacementMap
-add_executable(v2_test_weight_placement_map Test__WeightPlacementMap.cpp)
-target_link_libraries(v2_test_weight_placement_map 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_WeightPlacementMap 
-    COMMAND v2_test_weight_placement_map
-    LABELS "V2;Unit;WeightPlacement;DeviceManagement"
-)
-
 # Test: DeviceOrchestrator
 add_executable(v2_test_device_orchestrator Test__DeviceOrchestrator.cpp)
 target_link_libraries(v2_test_device_orchestrator 
@@ -243,6 +270,32 @@ target_link_libraries(v2_test_arg_parser
 add_v2_test(V2_Unit_ArgParser 
     COMMAND v2_test_arg_parser
     LABELS "V2;Unit;ArgumentParsing;CLI"
+    MPI_PROCS 1
+)
+
+# Test: Vectorized Primitives
+add_executable(v2_test_vectorized_primitives Test__VectorizedPrimitives.cpp)
+target_link_libraries(v2_test_vectorized_primitives 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_VectorizedPrimitives 
+    COMMAND v2_test_vectorized_primitives
+    LABELS "V2;Unit;Kernels;VectorizedPrimitives;RoPE;RMSNorm;Softmax;AVX512;AVX2"
+    MPI_PROCS 1
+)
+
+# Test: MPI Vectorized Attention (Phase 2 Integration)
+add_executable(v2_test_mpi_vectorized_attention Test__MPIVectorizedAttention.cpp)
+target_link_libraries(v2_test_mpi_vectorized_attention 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_MPIVectorizedAttention 
+    COMMAND v2_test_mpi_vectorized_attention
+    LABELS "V2;Integration;PipelineExecution;MPI;TensorParallel;VectorizedPrimitives;Attention"
     MPI_PROCS 1
 )
 
@@ -271,6 +324,19 @@ add_v2_test(V2_Unit_CPUKernels
     COMMAND v2_test_cpu_kernels
     LABELS "V2;Unit;Kernels;CPU;ComputeBackends"
     MPI_PROCS 1
+)
+
+# Test: MPI Tensor-Parallel Correctness (Phase 3a)
+add_executable(v2_test_mpi_tensor_parallel_correctness Test__MPITensorParallelCorrectness.cpp)
+target_link_libraries(v2_test_mpi_tensor_parallel_correctness 
+    llaminar2_core 
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_MPITensorParallelCorrectness 
+    COMMAND v2_test_mpi_tensor_parallel_correctness
+    LABELS "V2;Integration;MPI;TensorParallel;Correctness;Attention"
+    MPI_PROCS 2
 )
 
 # Test: TensorDimensions (Phase 3)
@@ -325,6 +391,22 @@ add_v2_test(V2_Unit_DeviceAwareExecution
     MPI_PROCS 1
 )
 
+# =============================================================================
+# MPI Tensor-Parallel Tests (Phase 2)
+# =============================================================================
+
+add_executable(v2_test_mpi_tensor_parallel Test__MPITensorParallel.cpp)
+target_link_libraries(v2_test_mpi_tensor_parallel 
+    llaminar2_core 
+    GTest::gtest 
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Unit_MPITensorParallel
+    COMMAND v2_test_mpi_tensor_parallel
+    LABELS "V2;Unit;MPI;TensorParallel;DistributedExecution;StrategySelection"
+    MPI_PROCS 2
+)
+
 # Placeholder for additional unit test executables (to be added)
 # Example:
 # add_executable(v2_test_tensor_factory unit/test_tensor_factory.cpp)
@@ -350,19 +432,23 @@ add_v2_test(V2_Unit_DeviceAwareExecution
 # )
 
 # =============================================================================
-# End-to-End Tests
+# End-to-End Tests (Phase 3c)
 # =============================================================================
 # Full pipeline tests with real models and inference
 # Tests complete workflows: load -> prefill -> decode -> validate output
 
-# Placeholder for e2e test executables (to be added)
-# Example:
-# add_executable(v2_test_qwen_inference e2e/test_qwen_inference.cpp)
-# target_link_libraries(v2_test_qwen_inference llaminar2_core GTest::gtest_main)
-# add_v2_test(V2_E2E_QwenInference
-#     COMMAND v2_test_qwen_inference
-#     LABELS "V2;E2E;Qwen"
-# )
+# Qwen2 E2E Correctness (single-rank vs multi-rank comparison)
+add_executable(v2_test_qwen2_e2e_correctness 
+    e2e/Test__Qwen2E2ECorrectness.cpp
+    e2e/gtest_mpi_main.cpp
+)
+target_link_libraries(v2_test_qwen2_e2e_correctness llaminar2_core GTest::gtest MPI::MPI_CXX)
+
+add_v2_test(V2_E2E_Qwen2Correctness
+    COMMAND $<TARGET_FILE:v2_test_qwen2_e2e_correctness>
+    LABELS "V2;E2E;Qwen;Correctness;Models"
+    MPI_PROCS 2
+)
 
 # =============================================================================
 # PyTorch Parity Tests
@@ -486,9 +572,10 @@ function(add_v2_perf_test TEST_NAME)
     
     # Set environment variables for optimal performance (from run_benchmark.sh)
     # Working directory: project root so model paths work correctly
+    # Performance tests default to INFO log level (less verbose than Unit/Integration)
     set_tests_properties(${TEST_NAME} PROPERTIES
         LABELS "${ARG_LABELS}"
-        ENVIRONMENT "OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+        ENVIRONMENT "LLAMINAR_LOG_LEVEL=INFO;OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
         WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
     )
     
@@ -515,12 +602,50 @@ add_v2_perf_test(V2_Perf_IQ4NL_GEMM
     MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
 )
 
-# Profiling tool: GEMM hotpath analysis
-add_executable(v2_profile_gemm_hotpath performance/profile_gemm_hotpath.cpp)
-target_link_libraries(v2_profile_gemm_hotpath llaminar2_core)
-set_target_properties(v2_profile_gemm_hotpath PROPERTIES
+# Performance Test: Qwen2 E2E Pipeline Throughput
+# Benchmarks full pipeline: model loading, prefill, decode
+# Measures tokens/sec, GFLOPS, memory usage
+add_executable(v2_perf_qwen2_e2e 
+    performance/Perf__Qwen2E2EPerformance.cpp
+    e2e/gtest_mpi_main.cpp
+)
+target_link_libraries(v2_perf_qwen2_e2e 
+    llaminar2_core 
+    GTest::gtest
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_qwen2_e2e PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
 )
+
+add_v2_perf_test(V2_Perf_Qwen2E2E
+    COMMAND v2_perf_qwen2_e2e
+    LABELS "V2;Performance;E2E;Qwen;Pipeline;Throughput;Models"
+    MPI_PROCS 2
+)
+# Performance Test: MPI Tensor-Parallel (Phase 3b)
+add_executable(v2_perf_mpi_tensor_parallel performance/Perf__MPITensorParallel.cpp)
+target_link_libraries(v2_perf_mpi_tensor_parallel 
+    llaminar2_core 
+    GTest::gtest
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_mpi_tensor_parallel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+add_v2_perf_test(V2_Perf_MPITensorParallel 
+    COMMAND v2_perf_mpi_tensor_parallel
+    LABELS "V2;Performance;MPI;TensorParallel;Attention;Speedup"
+    MPI_PROCS 2
+)
+
+# Profiling tool: GEMM hotpath analysis
+# TEMPORARILY DISABLED - needs update for IBlockDecoder interface
+# add_executable(v2_profile_gemm_hotpath performance/profile_gemm_hotpath.cpp)
+# target_link_libraries(v2_profile_gemm_hotpath llaminar2_core)
+# set_target_properties(v2_profile_gemm_hotpath PROPERTIES
+#     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+# )
 
 # Future performance tests can be added here following the same pattern:
 # Example:

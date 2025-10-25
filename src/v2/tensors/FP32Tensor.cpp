@@ -102,9 +102,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRMSNorm> FP32Tensor::createRMSNorm()
     {
-        // TODO: Implement RMSNorm kernel creation
-        std::cerr << "[FP32Tensor] createRMSNorm not yet implemented\n";
-        return nullptr;
+        // FP32 tensors use CPU RMSNorm kernel
+        return std::make_unique<CPURMSNormKernel>();
     }
 
     bool FP32Tensor::sync_to_device()
