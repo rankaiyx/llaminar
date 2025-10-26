@@ -74,9 +74,16 @@ namespace llaminar2
 
         // Panel dimensions (optimized for L1/L2 cache)
         static constexpr int MC = 256; // M panel size (L1: 256×896×4 = 896 KB for A panel)
-        static constexpr int NC = 64;  // N panel size (OPTIMIZED: 896×64×4 = 224 KB for B tile)
+        static constexpr int NC_SMALL = 64;  // N panel for large batches (better L1 locality)
+        static constexpr int NC_LARGE = 128; // N panel for small batches (better throughput)
         static constexpr int KC = 256; // K panel size (balance between reuse and working set)
         static constexpr int PREFETCH_DISTANCE = 64; // Prefetch 64 floats ahead
+        static constexpr int BATCH_SIZE_THRESHOLD = 256; // Threshold for NC selection
+        
+        // Adaptive NC selection based on batch size
+        static inline int select_NC(int m) {
+            return (m >= BATCH_SIZE_THRESHOLD) ? NC_SMALL : NC_LARGE;
+        }
 
         // Micro-kernel: C[MR×NR] += A[MR×KC] * B[KC×NR]
         void micro_kernel(

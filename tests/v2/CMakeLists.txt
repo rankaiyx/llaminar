@@ -790,6 +790,22 @@ add_v2_perf_test(V2_Perf_L1OptComparison
     MPI_PROCS 2
 )
 
+# Perf: Hybrid NC strategy validation (small vs large batch)
+add_executable(v2_perf_hybrid_nc_strategy performance/Perf__HybridNCStrategy.cpp)
+target_link_libraries(v2_perf_hybrid_nc_strategy 
+    llaminar2_core 
+    GTest::gtest
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_hybrid_nc_strategy PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+add_v2_perf_test(V2_Perf_HybridNCStrategy
+    COMMAND $<TARGET_FILE:v2_perf_hybrid_nc_strategy>
+    LABELS "V2;Performance;TensorOperations;Quantization;IQ4_NL;GEMM;CacheOptimization;AdaptiveStrategy"
+    MPI_PROCS 2
+)
+
 # Future performance tests can be added here following the same pattern:
 # Example:
 # add_executable(v2_perf_attention performance/Perf__Attention.cpp)
