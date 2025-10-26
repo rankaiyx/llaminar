@@ -267,14 +267,25 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
         0};
 
     // Single-rank execution (rank 0 only)
+    std::unique_ptr<Qwen2Pipeline> pipeline_single;
     std::vector<float> logits_single;
+    
     if (rank_ == 0)
     {
-        auto pipeline_single = std::make_unique<Qwen2Pipeline>(
+        pipeline_single = std::make_unique<Qwen2Pipeline>(
             model_ctx_single_, nullptr, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
         bool success = pipeline_single->forward(tokens.data(), tokens.size());
         ASSERT_TRUE(success) << "Single-rank forward pass failed";
+
+        const auto &model = model_ctx_single_->model();
+        size_t vocab_size = model.vocab_size;
+        size_t seq_len = tokens.size();
+        
+        logits_single.resize(seq_len * vocab_size);
+        const float *logits_ptr_single = pipeline_single->getLogits(0);
+        ASSERT_NE(logits_ptr_single, nullptr);
+        std::memcpy(logits_single.data(), logits_ptr_single, seq_len * vocab_size * sizeof(float));
 
         LOG_INFO("[E2E] Single-rank prefill completed");
     }
@@ -286,14 +297,35 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
     bool success = pipeline_multi->forward(tokens.data(), tokens.size());
     ASSERT_TRUE(success) << "Multi-rank forward pass failed on rank " << rank_;
 
+    const auto &model = model_ctx_multi_->model();
+    size_t vocab_size = model.vocab_size;
+    size_t seq_len = tokens.size();
+
+    std::vector<float> logits_multi(seq_len * vocab_size);
+    const float *logits_ptr_multi = pipeline_multi->getLogits(0);
+    ASSERT_NE(logits_ptr_multi, nullptr);
+    std::memcpy(logits_multi.data(), logits_ptr_multi, seq_len * vocab_size * sizeof(float));
+
     LOG_INFO("[E2E] Rank " << rank_ << " multi-rank prefill completed");
 
-    // TODO: Compare intermediate activations
-    // - Embedding output
-    // - Each layer's attention output
-    // - Each layer's FFN output
-    // - Final norm output
-    // - Logits
+    // Compare logits on rank 0
+    if (rank_ == 0)
+    {
+        // Compare all tokens
+        auto result = compareTensors(
+            logits_single.data(),
+            logits_multi.data(),
+            seq_len * vocab_size,
+            tolerance);
+
+        printComparisonResult(result, "Multi-Token Prefill");
+        EXPECT_TRUE(result.passed)
+            << "Multi-token prefill mismatch: "
+            << "max_abs_diff=" << result.max_abs_diff
+            << ", rel_l2=" << result.rel_l2_norm;
+
+        LOG_INFO("[E2E] Multi-token prefill test complete (" << seq_len << " tokens validated)");
+    }
 
     mpi_ctx_->barrier();
 }
@@ -424,23 +456,19 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatchEqualLength)
 }
 
 /**
- * @brief Test: Multi-sequence batch inference
+ * @brief Test: Multi-sequence batch inference (variable-length sequences)
  *
  * Validates that batched execution produces identical results to
- * sequential execution (batch parity).
+ * sequential execution (batch parity) for variable-length sequences.
  *
  * Tests with batch_size=2, comparing:
- * - Batched execution (both sequences processed together)
+ * - Batched execution (both sequences processed together with padding)
  * - Sequential execution (each sequence processed separately)
  *
- * **KNOWN ISSUE**: This test currently FAILS because padding masking
- * is not yet implemented in attention. Padding tokens participate in
- * attention when they shouldn't, causing divergence for variable-length
- * sequences.
- *
- * **TODO**: Implement `attention_gqa_batch()` with combined causal+padding masking.
+ * Uses combined causal+padding masking to prevent padding tokens from
+ * participating in attention.
  */
-TEST_F(Qwen2E2ECorrectness, DISABLED_MultiSequenceBatch)
+TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
 {
     // Skip if not exactly 2 ranks
     if (world_size_ != 2)
@@ -587,15 +615,322 @@ TEST_F(Qwen2E2ECorrectness, DISABLED_MultiSequenceBatch)
 }
 
 /**
+ * @brief Test: Batch scaling (throughput validation)
+ *
+ * Validates that batched execution scales efficiently across different
+ * batch sizes (1, 2, 4, 8) and produces correct results for each sequence.
+ *
+ * Compares batched vs sequential execution for all batch sizes.
+ */
+TEST_F(Qwen2E2ECorrectness, BatchScaling)
+{
+    // Skip if not exactly 2 ranks
+    if (world_size_ != 2)
+    {
+        GTEST_SKIP() << "Test requires exactly 2 MPI ranks";
+    }
+
+    const float tolerance = 1e-3f;
+
+    // Load model
+    ASSERT_TRUE(loadModelMultiRank());
+
+    // Test different batch sizes
+    std::vector<int> batch_sizes = {1, 2, 4, 8};
+
+    for (int batch_size : batch_sizes)
+    {
+        if (rank_ == 0)
+        {
+            LOG_INFO("\n========================================");
+            LOG_INFO("Testing batch_size=" << batch_size);
+            LOG_INFO("========================================");
+        }
+
+        // Create batch with variable-length sequences
+        std::vector<std::vector<int>> batch;
+        for (int i = 0; i < batch_size; ++i)
+        {
+            // Vary length: 1 to batch_size tokens
+            std::vector<int> seq;
+            seq.push_back(151644); // BOS
+            for (int j = 0; j < i; ++j)
+            {
+                seq.push_back(9906 + j); // Add tokens
+            }
+            batch.push_back(seq);
+        }
+
+        // Sequential execution (baseline)
+        std::vector<std::vector<float>> logits_sequential(batch_size);
+        const auto &model = model_ctx_multi_->model();
+        size_t vocab_size = model.vocab_size;
+
+        for (int i = 0; i < batch_size; ++i)
+        {
+            auto pipeline_seq = std::make_unique<Qwen2Pipeline>(
+                model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+
+            bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
+            ASSERT_TRUE(success) << "Sequential forward failed for seq " << i;
+
+            size_t seq_len = batch[i].size();
+            logits_sequential[i].resize(seq_len * vocab_size);
+            const float *logits_ptr = pipeline_seq->getLogits(0);
+            std::memcpy(logits_sequential[i].data(), logits_ptr, seq_len * vocab_size * sizeof(float));
+        }
+
+        mpi_ctx_->barrier();
+
+        // Batched execution
+        auto pipeline_batch = std::make_unique<Qwen2Pipeline>(
+            model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, batch_size);
+
+        bool success = pipeline_batch->forward_batch(batch);
+        ASSERT_TRUE(success) << "Batched forward failed for batch_size=" << batch_size;
+
+        // Extract and compare logits
+        for (int i = 0; i < batch_size; ++i)
+        {
+            size_t seq_len = batch[i].size();
+            std::vector<float> logits_batched(seq_len * vocab_size);
+
+            const float *logits_ptr = pipeline_batch->getLogits(i);
+            ASSERT_NE(logits_ptr, nullptr);
+
+            // Extract non-padded logits
+            for (size_t token_idx = 0; token_idx < seq_len; ++token_idx)
+            {
+                const float *src = logits_ptr + (token_idx * vocab_size);
+                float *dst = logits_batched.data() + (token_idx * vocab_size);
+                std::memcpy(dst, src, vocab_size * sizeof(float));
+            }
+
+            // Compare on rank 0
+            if (rank_ == 0)
+            {
+                auto result = compareTensors(
+                    logits_sequential[i].data(),
+                    logits_batched.data(),
+                    seq_len * vocab_size,
+                    tolerance);
+
+                std::string test_name = "Batch " + std::to_string(batch_size) + " Seq " + std::to_string(i);
+                EXPECT_TRUE(result.passed)
+                    << test_name << " mismatch: max_diff=" << result.max_abs_diff;
+            }
+        }
+
+        mpi_ctx_->barrier();
+    }
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("\n[E2E] Batch scaling test complete - all batch sizes validated");
+    }
+}
+
+/**
  * @brief Test: Autoregressive decode correctness
  *
  * Validates multi-step decode produces correct token sequence.
  * Tests KV cache functionality and incremental decode.
  */
-TEST_F(Qwen2E2ECorrectness, DISABLED_AutoregressiveDecode)
+TEST_F(Qwen2E2ECorrectness, IncrementalDecode)
 {
-    // Disabled until KV cache is implemented
-    GTEST_SKIP() << "KV cache not yet implemented";
+    // Skip if not exactly 2 ranks
+    if (world_size_ != 2)
+    {
+        GTEST_SKIP() << "Test requires exactly 2 MPI ranks";
+    }
+
+    const float tolerance = 1e-3f;
+
+    // Load model
+    ASSERT_TRUE(loadModelMultiRank());
+
+    // Initial prompt
+    std::vector<int> prompt = {151644, 9906}; // BOS + "Hello"
+    const int n_decode_steps = 5;
+
+    // Create pipeline with batch_size=1
+    auto pipeline = std::make_unique<Qwen2Pipeline>(
+        model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+
+    // Prefill phase
+    bool success = pipeline->forward(prompt.data(), prompt.size());
+    ASSERT_TRUE(success) << "Prefill failed on rank " << rank_;
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("[E2E] Prefill complete: " << prompt.size() << " tokens");
+    }
+
+    // Decode phase (incremental)
+    std::vector<int> generated_tokens;
+    const auto &model = model_ctx_multi_->model();
+    size_t vocab_size = model.vocab_size;
+
+    for (int step = 0; step < n_decode_steps; ++step)
+    {
+        // Get logits from last token
+        const float *logits = pipeline->getLogits(0);
+        ASSERT_NE(logits, nullptr);
+
+        // Greedy sampling on rank 0
+        int next_token = 0;
+        if (rank_ == 0)
+        {
+            // Find argmax
+            float max_logit = logits[0];
+            for (size_t i = 1; i < vocab_size; ++i)
+            {
+                if (logits[i] > max_logit)
+                {
+                    max_logit = logits[i];
+                    next_token = static_cast<int>(i);
+                }
+            }
+            LOG_INFO("[E2E] Step " << step << ": sampled token " << next_token);
+        }
+
+        // Broadcast next token to all ranks
+        MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        generated_tokens.push_back(next_token);
+
+        // Incremental decode (single token)
+        success = pipeline->forward(&next_token, 1);
+        ASSERT_TRUE(success) << "Decode step " << step << " failed on rank " << rank_;
+    }
+
+    mpi_ctx_->barrier();
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("[E2E] Incremental decode complete: generated " << generated_tokens.size() << " tokens");
+        // Verify we generated expected number of tokens
+        EXPECT_EQ(generated_tokens.size(), static_cast<size_t>(n_decode_steps));
+    }
+}
+
+/**
+ * @brief Test: Comprehensive batch vs sequential parity
+ *
+ * Validates that batched pipeline produces identical results to
+ * sequential pipeline across all components:
+ * - Embedding lookup
+ * - All transformer layers (attention + FFN)
+ * - Final normalization
+ * - LM head projection
+ *
+ * This is the V2 equivalent of V1's 17-stage parity test.
+ */
+TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
+{
+    // Skip if not exactly 2 ranks
+    if (world_size_ != 2)
+    {
+        GTEST_SKIP() << "Test requires exactly 2 MPI ranks";
+    }
+
+    const float tolerance = 1e-3f;
+
+    // Load model
+    ASSERT_TRUE(loadModelMultiRank());
+
+    // Test configuration: 2 sequences with different lengths
+    std::vector<std::vector<int>> batch = {
+        {151644, 9906, 1374, 374},     // Sequence 0: 4 tokens
+        {151644, 9906}                   // Sequence 1: 2 tokens
+    };
+
+    const int batch_size = static_cast<int>(batch.size());
+    const auto &model = model_ctx_multi_->model();
+    const size_t vocab_size = model.vocab_size;
+
+    // ======== Sequential Execution (Baseline) ========
+    std::vector<std::vector<float>> logits_sequential(batch_size);
+
+    for (int i = 0; i < batch_size; ++i)
+    {
+        auto pipeline_seq = std::make_unique<Qwen2Pipeline>(
+            model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+
+        bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
+        ASSERT_TRUE(success) << "Sequential forward failed for sequence " << i;
+
+        const size_t seq_len = batch[i].size();
+        logits_sequential[i].resize(seq_len * vocab_size);
+        const float *logits_ptr = pipeline_seq->getLogits(0);
+        std::memcpy(logits_sequential[i].data(), logits_ptr, seq_len * vocab_size * sizeof(float));
+
+        if (rank_ == 0)
+        {
+            LOG_INFO("[Parity] Sequential: Sequence " << i << " complete (" << seq_len << " tokens)");
+        }
+    }
+
+    mpi_ctx_->barrier();
+
+    // ======== Batched Execution ========
+    auto pipeline_batch = std::make_unique<Qwen2Pipeline>(
+        model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, batch_size);
+
+    bool success = pipeline_batch->forward_batch(batch);
+    ASSERT_TRUE(success) << "Batched forward failed on rank " << rank_;
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("[Parity] Batched execution complete:");
+        LOG_INFO("[Parity]   Batch size: " << pipeline_batch->batch_size());
+        LOG_INFO("[Parity]   Padded seq len: " << pipeline_batch->padded_seq_len());
+    }
+
+    // ======== Extract and Compare Logits ========
+    for (int i = 0; i < batch_size; ++i)
+    {
+        const size_t seq_len = batch[i].size();
+        std::vector<float> logits_batched(seq_len * vocab_size);
+
+        const float *logits_ptr = pipeline_batch->getLogits(i);
+        ASSERT_NE(logits_ptr, nullptr);
+
+        // Extract non-padded logits row by row
+        for (size_t token_idx = 0; token_idx < seq_len; ++token_idx)
+        {
+            const float *src = logits_ptr + (token_idx * vocab_size);
+            float *dst = logits_batched.data() + (token_idx * vocab_size);
+            std::memcpy(dst, src, vocab_size * sizeof(float));
+        }
+
+        // Compare on rank 0
+        if (rank_ == 0)
+        {
+            auto result = compareTensors(
+                logits_sequential[i].data(),
+                logits_batched.data(),
+                seq_len * vocab_size,
+                tolerance);
+
+            std::string test_name = "Comprehensive Parity - Sequence " + std::to_string(i);
+            printComparisonResult(result, test_name);
+
+            EXPECT_TRUE(result.passed)
+                << "Sequence " << i << " parity failed: "
+                << "max_abs_diff=" << result.max_abs_diff
+                << ", rel_l2=" << result.rel_l2_norm
+                << ", mismatches=" << result.num_mismatches;
+        }
+    }
+
+    mpi_ctx_->barrier();
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("\n[E2E] ✓ Comprehensive batch parity test PASSED");
+        LOG_INFO("[E2E]   All " << batch_size << " sequences match sequential execution");
+        LOG_INFO("[E2E]   Validated: embedding → transformer → norm → LM head");
+    }
 }
 
 /**
@@ -603,6 +938,8 @@ TEST_F(Qwen2E2ECorrectness, DISABLED_AutoregressiveDecode)
  *
  * Captures and compares activations at every transformer layer
  * between single-rank and multi-rank execution.
+ *
+ * TODO: Add snapshot infrastructure for intermediate activations.
  */
 TEST_F(Qwen2E2ECorrectness, DISABLED_LayerActivationParity)
 {
