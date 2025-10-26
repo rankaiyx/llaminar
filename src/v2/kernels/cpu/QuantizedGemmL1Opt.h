@@ -93,7 +93,7 @@ namespace llaminar2
 
         // Pack panels for better cache utilization
         void pack_A_panel(const float *A, float *A_packed, int m_panel, int k_panel, int lda);
-        void pack_B_panel(const float *B_decoded, float *B_packed, int k_panel, int n_panel);
+        void pack_B_panel(const float *B_decoded, float *B_packed, int k_panel, int n_panel, int ldb);
     };
 
 } // namespace llaminar2

@@ -81,7 +81,8 @@ namespace llaminar2
                     int kc_size = std::min(KC, k - kc);
 
                     // Pack B panel: KC × NC (column-major to row-major for better access)
-                    pack_B_panel(B_decoded + kc, B_packed, kc_size, nc);
+                    // Pass full K dimension as stride (ldb parameter)
+                    pack_B_panel(B_decoded + kc, B_packed, kc_size, nc, k);
 
                     // Inner loop: Iterate over M dimension (rows of C)
                     for (int ic = 0; ic < m; ic += MC)
@@ -430,17 +431,18 @@ namespace llaminar2
 
     void QuantizedGemmL1Opt::pack_B_panel(
         const float *B_decoded, float *B_packed,
-        int k_panel, int n_panel)
+        int k_panel, int n_panel, int ldb)
     {
         // Pack B from column-major to panel format with prefetching
+        // ldb is the leading dimension (column stride) of B_decoded
         for (int j = 0; j < n_panel; ++j)
         {
-            const float *B_col = B_decoded + j * k_panel;
+            const float *B_col = B_decoded + j * ldb;
             float *B_packed_col = B_packed + j * k_panel;
             
             // Prefetch next column
             if (j + 1 < n_panel) {
-                __builtin_prefetch(B_decoded + (j + 1) * k_panel, 0, 3);
+                __builtin_prefetch(B_decoded + (j + 1) * ldb, 0, 3);
             }
             
             // Manual copy with 16-element unrolling
