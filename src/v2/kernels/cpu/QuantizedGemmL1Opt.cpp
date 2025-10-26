@@ -163,17 +163,17 @@ namespace llaminar2
         __m512 c70 = _mm512_setzero_ps(), c71 = _mm512_setzero_ps(), c72 = _mm512_setzero_ps();
         __m512 c73 = _mm512_setzero_ps(), c74 = _mm512_setzero_ps(), c75 = _mm512_setzero_ps();
 
-        // Process k_panel in chunks of 32 (2x unroll for better ILP)
+        // Process k_panel in chunks of 64 (4x unroll for better IPC and reduced loop overhead)
         int p = 0;
-        for (; p + 32 <= k_panel; p += 32)
+        for (; p + 64 <= k_panel; p += 64)
         {
-            // Prefetch next iteration (2 iterations ahead)
-            if (p + 64 <= k_panel) {
-                __builtin_prefetch(A_panel + 0 * k_panel + p + 64, 0, 1);
-                __builtin_prefetch(B_panel + 0 * k_panel + p + 64, 0, 1);
+            // Prefetch next iteration (4 iterations ahead)
+            if (p + 128 <= k_panel) {
+                __builtin_prefetch(A_panel + 0 * k_panel + p + 128, 0, 1);
+                __builtin_prefetch(B_panel + 0 * k_panel + p + 128, 0, 1);
             }
             
-            // First iteration (p+0 to p+15)
+            // Iteration 1: (p+0 to p+15)
             __m512 a0 = _mm512_loadu_ps(A_panel + 0 * k_panel + p);
             __m512 a1 = _mm512_loadu_ps(A_panel + 1 * k_panel + p);
             __m512 a2 = _mm512_loadu_ps(A_panel + 2 * k_panel + p);
@@ -190,7 +190,6 @@ namespace llaminar2
             __m512 b4 = _mm512_loadu_ps(B_panel + 4 * k_panel + p);
             __m512 b5 = _mm512_loadu_ps(B_panel + 5 * k_panel + p);
             
-            // 48 FMA operations (8 rows × 6 cols)
             c00 = _mm512_fmadd_ps(a0, b0, c00); c01 = _mm512_fmadd_ps(a0, b1, c01);
             c02 = _mm512_fmadd_ps(a0, b2, c02); c03 = _mm512_fmadd_ps(a0, b3, c03);
             c04 = _mm512_fmadd_ps(a0, b4, c04); c05 = _mm512_fmadd_ps(a0, b5, c05);
@@ -223,26 +222,121 @@ namespace llaminar2
             c72 = _mm512_fmadd_ps(a7, b2, c72); c73 = _mm512_fmadd_ps(a7, b3, c73);
             c74 = _mm512_fmadd_ps(a7, b4, c74); c75 = _mm512_fmadd_ps(a7, b5, c75);
             
-            // Second iteration (p+16 to p+31) - interleave loads and FMAs for better scheduling
+            // Iteration 2: (p+16 to p+31)
             a0 = _mm512_loadu_ps(A_panel + 0 * k_panel + p + 16);
             a1 = _mm512_loadu_ps(A_panel + 1 * k_panel + p + 16);
-            b0 = _mm512_loadu_ps(B_panel + 0 * k_panel + p + 16);
-            b1 = _mm512_loadu_ps(B_panel + 1 * k_panel + p + 16);
-            
             a2 = _mm512_loadu_ps(A_panel + 2 * k_panel + p + 16);
             a3 = _mm512_loadu_ps(A_panel + 3 * k_panel + p + 16);
-            b2 = _mm512_loadu_ps(B_panel + 2 * k_panel + p + 16);
-            b3 = _mm512_loadu_ps(B_panel + 3 * k_panel + p + 16);
-            
             a4 = _mm512_loadu_ps(A_panel + 4 * k_panel + p + 16);
             a5 = _mm512_loadu_ps(A_panel + 5 * k_panel + p + 16);
-            b4 = _mm512_loadu_ps(B_panel + 4 * k_panel + p + 16);
-            b5 = _mm512_loadu_ps(B_panel + 5 * k_panel + p + 16);
-            
             a6 = _mm512_loadu_ps(A_panel + 6 * k_panel + p + 16);
             a7 = _mm512_loadu_ps(A_panel + 7 * k_panel + p + 16);
             
-            // 48 FMA operations (second iteration)
+            b0 = _mm512_loadu_ps(B_panel + 0 * k_panel + p + 16);
+            b1 = _mm512_loadu_ps(B_panel + 1 * k_panel + p + 16);
+            b2 = _mm512_loadu_ps(B_panel + 2 * k_panel + p + 16);
+            b3 = _mm512_loadu_ps(B_panel + 3 * k_panel + p + 16);
+            b4 = _mm512_loadu_ps(B_panel + 4 * k_panel + p + 16);
+            b5 = _mm512_loadu_ps(B_panel + 5 * k_panel + p + 16);
+            
+            c00 = _mm512_fmadd_ps(a0, b0, c00); c01 = _mm512_fmadd_ps(a0, b1, c01);
+            c02 = _mm512_fmadd_ps(a0, b2, c02); c03 = _mm512_fmadd_ps(a0, b3, c03);
+            c04 = _mm512_fmadd_ps(a0, b4, c04); c05 = _mm512_fmadd_ps(a0, b5, c05);
+            
+            c10 = _mm512_fmadd_ps(a1, b0, c10); c11 = _mm512_fmadd_ps(a1, b1, c11);
+            c12 = _mm512_fmadd_ps(a1, b2, c12); c13 = _mm512_fmadd_ps(a1, b3, c13);
+            c14 = _mm512_fmadd_ps(a1, b4, c14); c15 = _mm512_fmadd_ps(a1, b5, c15);
+            
+            c20 = _mm512_fmadd_ps(a2, b0, c20); c21 = _mm512_fmadd_ps(a2, b1, c21);
+            c22 = _mm512_fmadd_ps(a2, b2, c22); c23 = _mm512_fmadd_ps(a2, b3, c23);
+            c24 = _mm512_fmadd_ps(a2, b4, c24); c25 = _mm512_fmadd_ps(a2, b5, c25);
+            
+            c30 = _mm512_fmadd_ps(a3, b0, c30); c31 = _mm512_fmadd_ps(a3, b1, c31);
+            c32 = _mm512_fmadd_ps(a3, b2, c32); c33 = _mm512_fmadd_ps(a3, b3, c33);
+            c34 = _mm512_fmadd_ps(a3, b4, c34); c35 = _mm512_fmadd_ps(a3, b5, c35);
+            
+            c40 = _mm512_fmadd_ps(a4, b0, c40); c41 = _mm512_fmadd_ps(a4, b1, c41);
+            c42 = _mm512_fmadd_ps(a4, b2, c42); c43 = _mm512_fmadd_ps(a4, b3, c43);
+            c44 = _mm512_fmadd_ps(a4, b4, c44); c45 = _mm512_fmadd_ps(a4, b5, c45);
+            
+            c50 = _mm512_fmadd_ps(a5, b0, c50); c51 = _mm512_fmadd_ps(a5, b1, c51);
+            c52 = _mm512_fmadd_ps(a5, b2, c52); c53 = _mm512_fmadd_ps(a5, b3, c53);
+            c54 = _mm512_fmadd_ps(a5, b4, c54); c55 = _mm512_fmadd_ps(a5, b5, c55);
+            
+            c60 = _mm512_fmadd_ps(a6, b0, c60); c61 = _mm512_fmadd_ps(a6, b1, c61);
+            c62 = _mm512_fmadd_ps(a6, b2, c62); c63 = _mm512_fmadd_ps(a6, b3, c63);
+            c64 = _mm512_fmadd_ps(a6, b4, c64); c65 = _mm512_fmadd_ps(a6, b5, c65);
+            
+            c70 = _mm512_fmadd_ps(a7, b0, c70); c71 = _mm512_fmadd_ps(a7, b1, c71);
+            c72 = _mm512_fmadd_ps(a7, b2, c72); c73 = _mm512_fmadd_ps(a7, b3, c73);
+            c74 = _mm512_fmadd_ps(a7, b4, c74); c75 = _mm512_fmadd_ps(a7, b5, c75);
+            
+            // Iteration 3: (p+32 to p+47)
+            a0 = _mm512_loadu_ps(A_panel + 0 * k_panel + p + 32);
+            a1 = _mm512_loadu_ps(A_panel + 1 * k_panel + p + 32);
+            a2 = _mm512_loadu_ps(A_panel + 2 * k_panel + p + 32);
+            a3 = _mm512_loadu_ps(A_panel + 3 * k_panel + p + 32);
+            a4 = _mm512_loadu_ps(A_panel + 4 * k_panel + p + 32);
+            a5 = _mm512_loadu_ps(A_panel + 5 * k_panel + p + 32);
+            a6 = _mm512_loadu_ps(A_panel + 6 * k_panel + p + 32);
+            a7 = _mm512_loadu_ps(A_panel + 7 * k_panel + p + 32);
+            
+            b0 = _mm512_loadu_ps(B_panel + 0 * k_panel + p + 32);
+            b1 = _mm512_loadu_ps(B_panel + 1 * k_panel + p + 32);
+            b2 = _mm512_loadu_ps(B_panel + 2 * k_panel + p + 32);
+            b3 = _mm512_loadu_ps(B_panel + 3 * k_panel + p + 32);
+            b4 = _mm512_loadu_ps(B_panel + 4 * k_panel + p + 32);
+            b5 = _mm512_loadu_ps(B_panel + 5 * k_panel + p + 32);
+            
+            c00 = _mm512_fmadd_ps(a0, b0, c00); c01 = _mm512_fmadd_ps(a0, b1, c01);
+            c02 = _mm512_fmadd_ps(a0, b2, c02); c03 = _mm512_fmadd_ps(a0, b3, c03);
+            c04 = _mm512_fmadd_ps(a0, b4, c04); c05 = _mm512_fmadd_ps(a0, b5, c05);
+            
+            c10 = _mm512_fmadd_ps(a1, b0, c10); c11 = _mm512_fmadd_ps(a1, b1, c11);
+            c12 = _mm512_fmadd_ps(a1, b2, c12); c13 = _mm512_fmadd_ps(a1, b3, c13);
+            c14 = _mm512_fmadd_ps(a1, b4, c14); c15 = _mm512_fmadd_ps(a1, b5, c15);
+            
+            c20 = _mm512_fmadd_ps(a2, b0, c20); c21 = _mm512_fmadd_ps(a2, b1, c21);
+            c22 = _mm512_fmadd_ps(a2, b2, c22); c23 = _mm512_fmadd_ps(a2, b3, c23);
+            c24 = _mm512_fmadd_ps(a2, b4, c24); c25 = _mm512_fmadd_ps(a2, b5, c25);
+            
+            c30 = _mm512_fmadd_ps(a3, b0, c30); c31 = _mm512_fmadd_ps(a3, b1, c31);
+            c32 = _mm512_fmadd_ps(a3, b2, c32); c33 = _mm512_fmadd_ps(a3, b3, c33);
+            c34 = _mm512_fmadd_ps(a3, b4, c34); c35 = _mm512_fmadd_ps(a3, b5, c35);
+            
+            c40 = _mm512_fmadd_ps(a4, b0, c40); c41 = _mm512_fmadd_ps(a4, b1, c41);
+            c42 = _mm512_fmadd_ps(a4, b2, c42); c43 = _mm512_fmadd_ps(a4, b3, c43);
+            c44 = _mm512_fmadd_ps(a4, b4, c44); c45 = _mm512_fmadd_ps(a4, b5, c45);
+            
+            c50 = _mm512_fmadd_ps(a5, b0, c50); c51 = _mm512_fmadd_ps(a5, b1, c51);
+            c52 = _mm512_fmadd_ps(a5, b2, c52); c53 = _mm512_fmadd_ps(a5, b3, c53);
+            c54 = _mm512_fmadd_ps(a5, b4, c54); c55 = _mm512_fmadd_ps(a5, b5, c55);
+            
+            c60 = _mm512_fmadd_ps(a6, b0, c60); c61 = _mm512_fmadd_ps(a6, b1, c61);
+            c62 = _mm512_fmadd_ps(a6, b2, c62); c63 = _mm512_fmadd_ps(a6, b3, c63);
+            c64 = _mm512_fmadd_ps(a6, b4, c64); c65 = _mm512_fmadd_ps(a6, b5, c65);
+            
+            c70 = _mm512_fmadd_ps(a7, b0, c70); c71 = _mm512_fmadd_ps(a7, b1, c71);
+            c72 = _mm512_fmadd_ps(a7, b2, c72); c73 = _mm512_fmadd_ps(a7, b3, c73);
+            c74 = _mm512_fmadd_ps(a7, b4, c74); c75 = _mm512_fmadd_ps(a7, b5, c75);
+            
+            // Iteration 4: (p+48 to p+63)
+            a0 = _mm512_loadu_ps(A_panel + 0 * k_panel + p + 48);
+            a1 = _mm512_loadu_ps(A_panel + 1 * k_panel + p + 48);
+            a2 = _mm512_loadu_ps(A_panel + 2 * k_panel + p + 48);
+            a3 = _mm512_loadu_ps(A_panel + 3 * k_panel + p + 48);
+            a4 = _mm512_loadu_ps(A_panel + 4 * k_panel + p + 48);
+            a5 = _mm512_loadu_ps(A_panel + 5 * k_panel + p + 48);
+            a6 = _mm512_loadu_ps(A_panel + 6 * k_panel + p + 48);
+            a7 = _mm512_loadu_ps(A_panel + 7 * k_panel + p + 48);
+            
+            b0 = _mm512_loadu_ps(B_panel + 0 * k_panel + p + 48);
+            b1 = _mm512_loadu_ps(B_panel + 1 * k_panel + p + 48);
+            b2 = _mm512_loadu_ps(B_panel + 2 * k_panel + p + 48);
+            b3 = _mm512_loadu_ps(B_panel + 3 * k_panel + p + 48);
+            b4 = _mm512_loadu_ps(B_panel + 4 * k_panel + p + 48);
+            b5 = _mm512_loadu_ps(B_panel + 5 * k_panel + p + 48);
+            
             c00 = _mm512_fmadd_ps(a0, b0, c00); c01 = _mm512_fmadd_ps(a0, b1, c01);
             c02 = _mm512_fmadd_ps(a0, b2, c02); c03 = _mm512_fmadd_ps(a0, b3, c03);
             c04 = _mm512_fmadd_ps(a0, b4, c04); c05 = _mm512_fmadd_ps(a0, b5, c05);
@@ -276,7 +370,109 @@ namespace llaminar2
             c74 = _mm512_fmadd_ps(a7, b4, c74); c75 = _mm512_fmadd_ps(a7, b5, c75);
         }
         
-        // Handle remaining 16-element chunks
+        // Cleanup loop 1: Handle 32-element chunks (2x unroll)
+        for (; p + 32 <= k_panel; p += 32)
+        {
+            // First 16 elements
+            __m512 a0 = _mm512_loadu_ps(A_panel + 0 * k_panel + p);
+            __m512 a1 = _mm512_loadu_ps(A_panel + 1 * k_panel + p);
+            __m512 a2 = _mm512_loadu_ps(A_panel + 2 * k_panel + p);
+            __m512 a3 = _mm512_loadu_ps(A_panel + 3 * k_panel + p);
+            __m512 a4 = _mm512_loadu_ps(A_panel + 4 * k_panel + p);
+            __m512 a5 = _mm512_loadu_ps(A_panel + 5 * k_panel + p);
+            __m512 a6 = _mm512_loadu_ps(A_panel + 6 * k_panel + p);
+            __m512 a7 = _mm512_loadu_ps(A_panel + 7 * k_panel + p);
+            
+            __m512 b0 = _mm512_loadu_ps(B_panel + 0 * k_panel + p);
+            __m512 b1 = _mm512_loadu_ps(B_panel + 1 * k_panel + p);
+            __m512 b2 = _mm512_loadu_ps(B_panel + 2 * k_panel + p);
+            __m512 b3 = _mm512_loadu_ps(B_panel + 3 * k_panel + p);
+            __m512 b4 = _mm512_loadu_ps(B_panel + 4 * k_panel + p);
+            __m512 b5 = _mm512_loadu_ps(B_panel + 5 * k_panel + p);
+            
+            c00 = _mm512_fmadd_ps(a0, b0, c00); c01 = _mm512_fmadd_ps(a0, b1, c01);
+            c02 = _mm512_fmadd_ps(a0, b2, c02); c03 = _mm512_fmadd_ps(a0, b3, c03);
+            c04 = _mm512_fmadd_ps(a0, b4, c04); c05 = _mm512_fmadd_ps(a0, b5, c05);
+            
+            c10 = _mm512_fmadd_ps(a1, b0, c10); c11 = _mm512_fmadd_ps(a1, b1, c11);
+            c12 = _mm512_fmadd_ps(a1, b2, c12); c13 = _mm512_fmadd_ps(a1, b3, c13);
+            c14 = _mm512_fmadd_ps(a1, b4, c14); c15 = _mm512_fmadd_ps(a1, b5, c15);
+            
+            c20 = _mm512_fmadd_ps(a2, b0, c20); c21 = _mm512_fmadd_ps(a2, b1, c21);
+            c22 = _mm512_fmadd_ps(a2, b2, c22); c23 = _mm512_fmadd_ps(a2, b3, c23);
+            c24 = _mm512_fmadd_ps(a2, b4, c24); c25 = _mm512_fmadd_ps(a2, b5, c25);
+            
+            c30 = _mm512_fmadd_ps(a3, b0, c30); c31 = _mm512_fmadd_ps(a3, b1, c31);
+            c32 = _mm512_fmadd_ps(a3, b2, c32); c33 = _mm512_fmadd_ps(a3, b3, c33);
+            c34 = _mm512_fmadd_ps(a3, b4, c34); c35 = _mm512_fmadd_ps(a3, b5, c35);
+            
+            c40 = _mm512_fmadd_ps(a4, b0, c40); c41 = _mm512_fmadd_ps(a4, b1, c41);
+            c42 = _mm512_fmadd_ps(a4, b2, c42); c43 = _mm512_fmadd_ps(a4, b3, c43);
+            c44 = _mm512_fmadd_ps(a4, b4, c44); c45 = _mm512_fmadd_ps(a4, b5, c45);
+            
+            c50 = _mm512_fmadd_ps(a5, b0, c50); c51 = _mm512_fmadd_ps(a5, b1, c51);
+            c52 = _mm512_fmadd_ps(a5, b2, c52); c53 = _mm512_fmadd_ps(a5, b3, c53);
+            c54 = _mm512_fmadd_ps(a5, b4, c54); c55 = _mm512_fmadd_ps(a5, b5, c55);
+            
+            c60 = _mm512_fmadd_ps(a6, b0, c60); c61 = _mm512_fmadd_ps(a6, b1, c61);
+            c62 = _mm512_fmadd_ps(a6, b2, c62); c63 = _mm512_fmadd_ps(a6, b3, c63);
+            c64 = _mm512_fmadd_ps(a6, b4, c64); c65 = _mm512_fmadd_ps(a6, b5, c65);
+            
+            c70 = _mm512_fmadd_ps(a7, b0, c70); c71 = _mm512_fmadd_ps(a7, b1, c71);
+            c72 = _mm512_fmadd_ps(a7, b2, c72); c73 = _mm512_fmadd_ps(a7, b3, c73);
+            c74 = _mm512_fmadd_ps(a7, b4, c74); c75 = _mm512_fmadd_ps(a7, b5, c75);
+            
+            // Second 16 elements
+            a0 = _mm512_loadu_ps(A_panel + 0 * k_panel + p + 16);
+            a1 = _mm512_loadu_ps(A_panel + 1 * k_panel + p + 16);
+            a2 = _mm512_loadu_ps(A_panel + 2 * k_panel + p + 16);
+            a3 = _mm512_loadu_ps(A_panel + 3 * k_panel + p + 16);
+            a4 = _mm512_loadu_ps(A_panel + 4 * k_panel + p + 16);
+            a5 = _mm512_loadu_ps(A_panel + 5 * k_panel + p + 16);
+            a6 = _mm512_loadu_ps(A_panel + 6 * k_panel + p + 16);
+            a7 = _mm512_loadu_ps(A_panel + 7 * k_panel + p + 16);
+            
+            b0 = _mm512_loadu_ps(B_panel + 0 * k_panel + p + 16);
+            b1 = _mm512_loadu_ps(B_panel + 1 * k_panel + p + 16);
+            b2 = _mm512_loadu_ps(B_panel + 2 * k_panel + p + 16);
+            b3 = _mm512_loadu_ps(B_panel + 3 * k_panel + p + 16);
+            b4 = _mm512_loadu_ps(B_panel + 4 * k_panel + p + 16);
+            b5 = _mm512_loadu_ps(B_panel + 5 * k_panel + p + 16);
+            
+            c00 = _mm512_fmadd_ps(a0, b0, c00); c01 = _mm512_fmadd_ps(a0, b1, c01);
+            c02 = _mm512_fmadd_ps(a0, b2, c02); c03 = _mm512_fmadd_ps(a0, b3, c03);
+            c04 = _mm512_fmadd_ps(a0, b4, c04); c05 = _mm512_fmadd_ps(a0, b5, c05);
+            
+            c10 = _mm512_fmadd_ps(a1, b0, c10); c11 = _mm512_fmadd_ps(a1, b1, c11);
+            c12 = _mm512_fmadd_ps(a1, b2, c12); c13 = _mm512_fmadd_ps(a1, b3, c13);
+            c14 = _mm512_fmadd_ps(a1, b4, c14); c15 = _mm512_fmadd_ps(a1, b5, c15);
+            
+            c20 = _mm512_fmadd_ps(a2, b0, c20); c21 = _mm512_fmadd_ps(a2, b1, c21);
+            c22 = _mm512_fmadd_ps(a2, b2, c22); c23 = _mm512_fmadd_ps(a2, b3, c23);
+            c24 = _mm512_fmadd_ps(a2, b4, c24); c25 = _mm512_fmadd_ps(a2, b5, c25);
+            
+            c30 = _mm512_fmadd_ps(a3, b0, c30); c31 = _mm512_fmadd_ps(a3, b1, c31);
+            c32 = _mm512_fmadd_ps(a3, b2, c32); c33 = _mm512_fmadd_ps(a3, b3, c33);
+            c34 = _mm512_fmadd_ps(a3, b4, c34); c35 = _mm512_fmadd_ps(a3, b5, c35);
+            
+            c40 = _mm512_fmadd_ps(a4, b0, c40); c41 = _mm512_fmadd_ps(a4, b1, c41);
+            c42 = _mm512_fmadd_ps(a4, b2, c42); c43 = _mm512_fmadd_ps(a4, b3, c43);
+            c44 = _mm512_fmadd_ps(a4, b4, c44); c45 = _mm512_fmadd_ps(a4, b5, c45);
+            
+            c50 = _mm512_fmadd_ps(a5, b0, c50); c51 = _mm512_fmadd_ps(a5, b1, c51);
+            c52 = _mm512_fmadd_ps(a5, b2, c52); c53 = _mm512_fmadd_ps(a5, b3, c53);
+            c54 = _mm512_fmadd_ps(a5, b4, c54); c55 = _mm512_fmadd_ps(a5, b5, c55);
+            
+            c60 = _mm512_fmadd_ps(a6, b0, c60); c61 = _mm512_fmadd_ps(a6, b1, c61);
+            c62 = _mm512_fmadd_ps(a6, b2, c62); c63 = _mm512_fmadd_ps(a6, b3, c63);
+            c64 = _mm512_fmadd_ps(a6, b4, c64); c65 = _mm512_fmadd_ps(a6, b5, c65);
+            
+            c70 = _mm512_fmadd_ps(a7, b0, c70); c71 = _mm512_fmadd_ps(a7, b1, c71);
+            c72 = _mm512_fmadd_ps(a7, b2, c72); c73 = _mm512_fmadd_ps(a7, b3, c73);
+            c74 = _mm512_fmadd_ps(a7, b4, c74); c75 = _mm512_fmadd_ps(a7, b5, c75);
+        }
+        
+        // Cleanup loop 2: Handle remaining 16-element chunks
         for (; p + 16 <= k_panel; p += 16)
         {
             __m512 a0 = _mm512_loadu_ps(A_panel + 0 * k_panel + p);
