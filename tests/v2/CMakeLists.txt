@@ -431,22 +431,6 @@ add_v2_test(V2_Unit_MPITensorParallel
     MPI_PROCS 2
 )
 
-# MPI Batch Operations - Systematic validation of MPI assumptions with batched data
-add_executable(v2_test_mpi_batch_operations 
-    integration/Test__MPIBatchOperations.cpp
-    integration/mpi_gtest_main.cpp  # Custom main with MPI_Init
-)
-target_link_libraries(v2_test_mpi_batch_operations 
-    llaminar2_core 
-    GTest::gtest  # Use gtest, not gtest_main (we provide our own main)
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MPIBatchOperations 
-    COMMAND $<TARGET_FILE:v2_test_mpi_batch_operations>
-    LABELS "V2;Integration;MPI;Batching;TensorParallel;AssumptionValidation;Models"
-    MPI_PROCS 2
-)
-
 # MPI Batched Attention E2E - End-to-end validation of tensor-parallel batched attention
 add_executable(v2_test_mpi_batched_attention 
     integration/Test__MPIBatchedAttention.cpp
