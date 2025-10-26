@@ -239,7 +239,7 @@ namespace llaminar2
     /**
      * @brief Abstract tensor interface
      */
-    class TensorBase
+    class TensorBase : public std::enable_shared_from_this<TensorBase>
     {
     public:
         virtual ~TensorBase() = default;
@@ -266,6 +266,34 @@ namespace llaminar2
         virtual std::unique_ptr<ITensorSwiGLU> createSwiGLU() = 0;
         virtual std::unique_ptr<ITensorSoftmax> createSoftmax() = 0;
         virtual std::unique_ptr<ITensorRMSNorm> createRMSNorm() = 0;
+
+        // ===== Tensor View Support =====
+
+        /**
+         * @brief Check if this tensor is a view of another tensor
+         * @return true if this is a view, false if this owns its data
+         */
+        virtual bool is_view() const { return false; }
+
+        /**
+         * @brief Create a view into this tensor with a different shape
+         *
+         * Views share the underlying data buffer but present a different logical shape.
+         * Useful for:
+         * - Slicing tensors (e.g., first N tokens from pre-allocated buffer)
+         * - Reshaping without copying
+         * - Batch dimension manipulation
+         *
+         * @param new_shape The shape for the view
+         * @param offset Offset in elements from the start of this tensor's data
+         * @return Shared pointer to a view tensor, or nullptr if invalid
+         *
+         * @note The view borrows data from the parent tensor. The parent must outlive the view.
+         * @note Total elements in new_shape must not exceed available elements from offset.
+         */
+        virtual std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) = 0;
     };
 
     // Implementation: FP32Tensor.cpp
@@ -297,11 +325,32 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support
+        bool is_view() const override { return is_view_; }
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override;
+
     private:
+        // Private constructor for creating views
+        FP32Tensor(const std::vector<size_t> &shape,
+                   int device_idx,
+                   std::vector<float> *parent_data,
+                   size_t data_offset,
+                   std::shared_ptr<FP32Tensor> parent);
         std::vector<size_t> shape_;
         int device_idx_; // -1 = host, ≥0 = device index
 
-        std::vector<float> host_data_; // Always allocated
+        
+        // Ownership model:
+        // - If is_view_ == false: owns host_data_
+        // - If is_view_ == true: parent_data_ptr_ points to parent's host_data_
+        bool is_view_;
+        std::vector<float> host_data_;        // Owned data (only used when !is_view_)
+        std::vector<float> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
+        size_t view_offset_;                  // Offset into parent data (only used when is_view_)
+        std::shared_ptr<FP32Tensor> parent_;  // Keep parent alive (only used when is_view_)
+ // Always allocated
         void *device_data_;            // Allocated if device_idx ≥ 0
 
         bool host_dirty_;   // Host modified, needs upload
@@ -346,6 +395,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
 
         // FP16-specific interface
         const uint16_t *fp16_data() const { return host_fp16_data_.data(); }
@@ -401,6 +459,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         // BF16-specific interface
         const uint16_t *bf16_data() const { return host_bf16_data_.data(); }
         void from_fp32(const float *fp32_data, size_t count);
@@ -454,6 +521,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
 
         // Shape and metadata
         size_t size() const { return shape_[0] * shape_[1]; }
@@ -560,6 +636,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         // IBlockDecoder interface
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
@@ -617,6 +702,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -669,6 +763,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -718,6 +821,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -765,6 +877,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -807,6 +928,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
 
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
@@ -851,6 +981,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -894,6 +1033,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -936,6 +1084,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
 
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
@@ -982,6 +1139,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -1024,6 +1190,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
 
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
@@ -1068,6 +1243,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -1110,6 +1294,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
 
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
@@ -1154,6 +1347,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -1196,6 +1398,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
 
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
@@ -1240,6 +1451,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
 
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
+
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
         size_t decoder_rows() const override { return shape_[0]; }
@@ -1282,6 +1502,15 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+
+        // View support (not implemented - returns nullptr)
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override
+        {
+            (void)new_shape; (void)offset;
+            return nullptr; // TODO: Implement views if needed
+        }
 
         void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;

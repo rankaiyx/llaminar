@@ -427,7 +427,7 @@ namespace llaminar2
         }
 
         // DEBUG: Log position IDs for first layer
-        if (layer_idx == 0 && mpi_ctx_->rank() == 0)
+        if (layer_idx == 0 && (!mpi_ctx_ || mpi_ctx_->rank() == 0))
         {
             if (batch_size_ == 1)
             {
@@ -452,10 +452,22 @@ namespace llaminar2
         VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_rope_k");
 
         // 4. GQA attention computation (MPI-aware, batch-aware)
+        // Create views of Q/K/V buffers with actual effective_seq_len to avoid pre-allocated buffer size mismatch
+        auto Q_view = buffers.Q->create_view({static_cast<size_t>(effective_seq_len), static_cast<size_t>(n_heads_ * head_dim_)});
+        auto K_view = buffers.K->create_view({static_cast<size_t>(effective_seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)});
+        auto V_view = buffers.V->create_view({static_cast<size_t>(effective_seq_len), static_cast<size_t>(n_kv_heads_ * head_dim_)});
+        auto attn_out_view = buffers.attn_output->create_view({static_cast<size_t>(effective_seq_len), static_cast<size_t>(n_heads_ * head_dim_)});
+
+        if (!Q_view || !K_view || !V_view || !attn_out_view)
+        {
+            LOG_ERROR("[Qwen2Pipeline] Failed to create tensor views for attention");
+            return false;
+        }
+
         // Dispatches to tensor-parallel if mpi_strategy_ == TensorParallel
         VALIDATE_OP(attention_gqa_mpi(
-                        buffers.Q.get(), buffers.K.get(),
-                        buffers.V.get(), buffers.attn_output.get(),
+                        Q_view.get(), K_view.get(),
+                        V_view.get(), attn_out_view.get(),
                         n_heads_, n_kv_heads_, head_dim_,
                         /*causal=*/true, /*window_size=*/-1,
                         batch_size_, &sequence_lengths_),

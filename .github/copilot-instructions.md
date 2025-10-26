@@ -488,60 +488,6 @@ Llaminar V1 includes several specialized performance testing scripts:
   - Validates throughput improvements from batching
   - Measures memory overhead and scaling characteristics
 
-### Generic Benchmark Runner
-
-For component-level performance benchmarking, use the **generic benchmark runner** which provides canonical MPI/OpenMP configuration for any benchmark executable:
-
-**Note**: This script is primarily for V1 component benchmarks. **V2 performance tests use CTest directly** (see [V2 Performance Testing](#v2-performance-testing) below).
-
-```bash
-# Run any benchmark with optimal settings (auto-detects in build_release/)
-./run_benchmark.sh benchmark_iq4nl_gemm
-
-# With full path
-./run_benchmark.sh ./build_release/test_performance
-
-# Pass arguments (GTest filters, etc)
-./run_benchmark.sh test_batch_performance --gtest_filter='*.ThroughputScaling'
-
-# Override MPI/OpenMP settings if needed
-LLAMINAR_MPI_PROCS=4 ./run_benchmark.sh my_benchmark
-OMP_NUM_THREADS=16 ./run_benchmark.sh my_benchmark
-```
-
-**Features:**
-- **Automatic path detection**: Searches `build_release/` and `build/` directories
-- **Topology auto-detection**: Detects sockets, cores, hyperthreading
-- **Canonical settings**: Same MPI/OpenMP configuration as `run_llaminar.sh`
-- **Argument forwarding**: Passes all extra arguments to the benchmark
-- **Environment overrides**: Customize via `LLAMINAR_MPI_PROCS`, `OMP_NUM_THREADS`
-
-**Convenience Wrappers:**
-```bash
-# Specialized wrapper for IQ4_NL GEMM benchmark
-./run_iq4nl_benchmark.sh  # Delegates to run_benchmark.sh
-
-# These are equivalent:
-./run_iq4nl_benchmark.sh
-./run_benchmark.sh benchmark_iq4nl_gemm
-```
-
-**Creating New Benchmarks:**
-```bash
-# 1. Create benchmark source (e.g., tests/benchmark_my_feature.cpp)
-# 2. Add to CMakeLists.txt
-add_executable(benchmark_my_feature tests/benchmark_my_feature.cpp)
-target_link_libraries(benchmark_my_feature llaminar_core)
-
-# 3. Build it
-cmake --build build_release --target benchmark_my_feature --parallel
-
-# 4. Run with optimal settings
-./run_benchmark.sh benchmark_my_feature
-```
-
-**See also:** `BENCHMARK_RUNNER_GUIDE.md` for comprehensive documentation including usage examples, configuration details, and troubleshooting.
-
 ### Canonical Environment Variables
 
 ```bash
@@ -564,6 +510,11 @@ export OMPI_MCA_btl_openib_allow_ib=1
 
 ```bash
 # 2-socket system (most common)
+export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
+export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_THREADS=28 
+export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
+export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
+export LLAMINAR_LOG_LEVEL=DEBUG
 mpirun -np 2 --bind-to socket --map-by socket \
   --mca mpi_leave_pinned 1 \
   --mca btl_vader_single_copy_mechanism none \
@@ -611,45 +562,10 @@ Llaminar V1 has a comprehensive test suite organized into several categories:
 
 ```bash
 # All tests
-ctest --test-dir build --output-on-failure --parallel
+ctest --test-dir build_v2 -R --output-on-failure
 
-# Verbose output
-ctest --test-dir build --output-on-failure --verbose --parallel
-
-# Test status summary
-ctest --test-dir build --output-on-failure --parallel | tail -20
-
-# Smoke Tests (1.16s)
-ctest --test-dir build --output-on-failure --parallel \
-  -R "^(BasicTest|NumaTest|ModelLoaderGoldenTest|PipelineFactoryTest|DequantTest|TPPartitionSpecTest|LargeMatmulPlanTest|WeightRoleClassification|MPILinearKernelTest|MPIRMSNormKernelTest|MPIAttentionKernelTest|MPISoftmaxCorrectnessTest|RMSNormCoreCorrectness|SoftmaxCoreCorrectness|LinearOrientationCorrectnessTest)$"
-
-# Unit Tests (2m30s)
-ctest --test-dir build --output-on-failure --parallel \
-  -E "(Integration|ParityFrameworkTest|Incremental|Qwen|Prefill|.*Stress.*)"
-
-# Parity Integration (220s) (Long running, verbose test suite - use `tee` and grep details from the logfile)
-ctest --test-dir build --output-on-failure --verbose \
-  -R "(ParityFrameworkTest|AbstractPipelineParity)" 2>&1 | tee test_output.log | tail -150
-
-# Parity Integration (220s) with a GTEST filter to target only PyTorch parity tests in the suite:
-GTEST_FILTER="ParityFramework.COSMAPrefillVsPyTorch:ParityFramework.OpenBLASPrefillVsPyTorch:ParityFramework.MKLPrefillVsPyTorch:ParityFramework.TrueIncrementalDecodeVsPyTorch" ctest --test-dir build --output-on-failure --verbose -R "ParityFrameworkTest" 2>&1 | tee test_output.log | tail -150
-
-# Integration Tests (3m0s)
-ctest --test-dir build --output-on-failure --verbose \
-  -R "(Integration|Incremental|Qwen|Prefill|End2End|KVCache)"
-```
-
-### MPI Testing
-
-```bash
-# Run with 2 MPI processes (optimal for 2-socket systems)
-mpirun -np 2 ./build/llaminar
-
-# Run specific tests with MPI
-mpirun -np 2 ./build/test_cosma
-
-# DEBUGGING: Capture the backtrace of a segfault in MPI with gdb
-bash -lc 'set -m; mpirun -np 2 gdb -q --batch -ex "handle SIGUSR1 pass nostop noprint" -ex run -ex bt -ex bt full --args ./build/test_incremental_decode_parity --gtest_filter=IncrementalDecodeParity.ReplayVsIncrementalMultiRank 2>&1 | tee gdb_mpi_bt.log'
+# Just unit tests
+ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure
 ```
 
 ### Test Categories
@@ -899,44 +815,9 @@ It is possible to use the `problems` tool against a particular filename in order
 
 ### Basic GDB Setup
 
-```bash
-# Compile with debug symbols
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug
+Ensure you're working on a DEBUG build or there won't be any symbols.
 
-# Single process debugging
-gdb ./build/llaminar
-(gdb) run --verbose --print-topology
-
-# MPI debugging (attach to specific rank)
-mpirun -np 2 xterm -e gdb ./build/llaminar
-```
-
-### Debugging Segfaults
-
-```bash
-# Run with core dumps enabled
-ulimit -c unlimited
-mpirun -np 2 ./build/llaminar
-
-# Analyze core dump
-gdb ./build/llaminar core
-(gdb) bt         # Get backtrace
-(gdb) bt full    # Get full backtrace with variable values
-(gdb) info registers
-(gdb) x/10i $pc  # Examine instructions around crash
-```
-
-Use ASAN for localizing more complex double-free style issues:
-
-```bash
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-
-ASAN_OPTIONS=halt_on_error=0:detect_leaks=0 timeout 240 mpirun -np 2 ./build/<your_test> --gtest_filter=<your_test_filter>
-```
-
-Just don't forget to reconfigure cmake to disable ASAN when you're done debugging!
-
-### MPI-Specific Debugging
+### Debugging Segfaults: MPI-Specific Debugging: Getting a Backtrace for a Segfault with GDB
 
 **Recommended: GDB Command File Approach** (works in containers, no GUI needed)
 
@@ -951,14 +832,21 @@ thread apply all bt full
 quit
 EOF
 
-# 2. Run both MPI ranks under GDB with command file
+# 2. Set environment variables necessary for OMP / MPI and backend blas to work properly
+export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
+export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_THREADS=28 
+export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
+export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
+export LLAMINAR_LOG_LEVEL=DEBUG
+
+# 3. Run both MPI ranks under GDB with command file and proper OMP/MPI settings
 cd /workspaces/llaminar
 timeout 120 mpirun -np 2 \
   gdb -x /tmp/gdbcommands.txt --args \
   ./build_v2/tests/v2/v2_test_qwen2_e2e_correctness \
   --gtest_filter=Qwen2E2ECorrectness.SingleTokenInference 2>&1 | tee gdb_output.log
 
-# 3. Analyze backtrace
+# 4. Analyze backtrace
 grep -A 50 "Program received signal" gdb_output.log
 ```
 
@@ -966,12 +854,18 @@ grep -A 50 "Program received signal" gdb_output.log
 - `--args` separates GDB options from executable arguments (CRITICAL!)
 - Command file prevents blocking on debuginfod/pagination prompts
 - `thread apply all bt full` shows all threads with variables
-- Works in containers without X11/xterm
+- Works in all container environments
 - Timeout prevents infinite hangs
 
 **Alternative: Per-Rank Logging** (when backtrace differs by rank)
 
 ```bash
+export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
+export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_THREADS=28 
+export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
+export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
+export LLAMINAR_LOG_LEVEL=DEBUG
+
 # Capture separate log per MPI rank
 timeout 120 bash -c 'mpirun -np 2 bash -c "gdb -x /tmp/gdbcommands.txt --args ./build/my_test 2>&1 | tee /tmp/gdb_rank_\$OMPI_COMM_WORLD_RANK.log"'
 
@@ -980,33 +874,45 @@ grep -A 50 "Program received signal" /tmp/gdb_rank_0.log
 grep -A 50 "Program received signal" /tmp/gdb_rank_1.log
 ```
 
-**Legacy Approaches** (less reliable in containers)
+#### ASAN for more complex, double-free style segfaults
+
+Use ASAN for localizing more complex double-free style issues:
 
 ```bash
-# Debug specific MPI rank (requires multiple terminals)
-mpirun -np 2 -host localhost:1 gdb ./build/llaminar : -host localhost:1 ./build/llaminar
+cmake -B build_v2 -S . -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-# Use GDB with MPI via xterm (requires X11 forwarding)
-mpirun -np 2 xterm -hold -e gdb -ex run --args ./build/llaminar --verbose
-
-# Debugging hanging MPI programs (attach to running process)
-ps aux | grep llaminar
-gdb -p <PID>
-(gdb) bt    # Get backtrace of hanging process
+ASAN_OPTIONS=halt_on_error=0:detect_leaks=0 timeout 240 mpirun -np 2 ./build/<your_test> --gtest_filter=<your_test_filter>
 ```
+
+Just don't forget to reconfigure cmake to disable ASAN when you're done debugging!
 
 ### Common Debugging Scenarios
 
 ```bash
 # Memory issues (use with caution - slows execution significantly)
+export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
+export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_THREADS=28 
+export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
+export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
+export LLAMINAR_LOG_LEVEL=DEBUG
 mpirun -np 2 valgrind --tool=memcheck --leak-check=full ./build/llaminar
 
 # NUMA binding issues
 numactl --hardware
 numactl --show
+export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
+export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_THREADS=28 
+export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
+export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
+export LLAMINAR_LOG_LEVEL=DEBUG
 mpirun -np 2 numactl --cpubind=0 ./build/llaminar : numactl --cpubind=1 ./build/llaminar
 
 # COSMA hanging issues (use timeouts)
+export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
+export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_THREADS=28 
+export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
+export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
+export LLAMINAR_LOG_LEVEL=DEBUG
 timeout 60 mpirun -np 2 ./build/llaminar
 ```
 
@@ -1400,7 +1306,7 @@ if (success) {
 ```bash
 # Build llama.cpp with optimizations
 cd llama.cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
+cmake -B build_v2 -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_FLAGS="-march=native" \
   -DCMAKE_C_FLAGS="-march=native" \
   -DGGML_NATIVE=ON -DGGML_OPENMP=ON
@@ -1425,8 +1331,8 @@ OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=close \
 
 ```bash
 # Build Release version
-cmake -B build_release -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build_release --target test_batch_performance --parallel
+cmake -B build_v2_release -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build_v2_release --target test_batch_performance --parallel
 
 # Run with proper environment configuration
 ./run_batch_performance.sh
@@ -1612,6 +1518,11 @@ GTEST_FILTER="ParityFramework.OpenBLASPrefillVsPyTorch" \
 
 **Run:**
 ```bash
+export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
+export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_THREADS=28 
+export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
+export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
+export LLAMINAR_LOG_LEVEL=DEBUG
 mpirun -np 2 ./build/test_batch_correctness \
   --gtest_filter="BatchCorrectnessTest.BatchedAttentionStagesParity"
 ```

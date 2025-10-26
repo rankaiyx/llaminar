@@ -799,6 +799,15 @@ namespace llaminar2
         const float *V_data = V->data();
         float *output_data = output->mutable_data();
 
+        // Validate tensor data is not nullptr
+        if (!Q_data || !K_data || !V_data || !output_data)
+        {
+            LOG_ERROR("[PipelineBase] Null pointer in attention tensors: "
+                     << "Q=" << (void*)Q_data << " K=" << (void*)K_data
+                     << " V=" << (void*)V_data << " output=" << (void*)output_data);
+            return false;
+        }
+
         // 2. Broadcast K/V heads if needed (GQA)
         std::vector<float> K_broadcast;
         std::vector<float> V_broadcast;

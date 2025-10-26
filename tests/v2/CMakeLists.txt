@@ -126,9 +126,40 @@ function(add_v2_test TEST_NAME)
         list(APPEND MPI_CMD --oversubscribe)
     endif()
     
+    # E2E and Integration tests should use Release build for performance
+    # Unit tests can use Debug build for better diagnostics
+    set(USE_RELEASE_BUILD FALSE)
+    if("${ARG_LABELS}" MATCHES "E2E" OR "${ARG_LABELS}" MATCHES "Integration")
+        set(USE_RELEASE_BUILD TRUE)
+    endif()
+    
+    # Determine executable path based on build type
+    if(USE_RELEASE_BUILD)
+        # Use Release build (build_v2_release)
+        set(RELEASE_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build_v2_release")
+        list(GET ARG_COMMAND 0 EXECUTABLE_TARGET)
+        # Extract just the target name (remove any path components)
+        get_filename_component(EXECUTABLE_NAME ${EXECUTABLE_TARGET} NAME)
+        
+        # Check if this is a target file reference or direct path
+        if(EXECUTABLE_TARGET MATCHES "\\$<TARGET_FILE:")
+            # Extract target name from generator expression
+            string(REGEX REPLACE ".*TARGET_FILE:([^>]+)>.*" "\\1" TARGET_NAME "${EXECUTABLE_TARGET}")
+            set(EXECUTABLE_PATH "${RELEASE_BUILD_DIR}/tests/v2/${TARGET_NAME}")
+        else()
+            set(EXECUTABLE_PATH "${RELEASE_BUILD_DIR}/tests/v2/${EXECUTABLE_NAME}")
+        endif()
+        
+        # Replace first argument with Release build path
+        list(REMOVE_AT ARG_COMMAND 0)
+        set(FINAL_COMMAND ${EXECUTABLE_PATH} ${ARG_COMMAND})
+    else()
+        # Use Debug build (default, CMAKE_CURRENT_BINARY_DIR)
+        set(FINAL_COMMAND ${ARG_COMMAND})
+    endif()
+    
     # Create the test with mpirun wrapper
-    # Note: Use full path to executable (CMAKE_CURRENT_BINARY_DIR)
-    add_test(NAME ${TEST_NAME} COMMAND ${MPI_CMD} ${ARG_COMMAND})
+    add_test(NAME ${TEST_NAME} COMMAND ${MPI_CMD} ${FINAL_COMMAND})
     
     # Determine default log level based on test type (Unit/Integration = DEBUG, Performance = INFO)
     set(DEFAULT_LOG_LEVEL "DEBUG")
@@ -247,6 +278,33 @@ add_v2_test(V2_Unit_BatchedKVCache
     COMMAND $<TARGET_FILE:v2_test_batched_kv_cache>
     MPI_PROCS 1
     LABELS "V2;Unit;TensorOperations;Batching;KVCache;MultiSequence"
+)
+
+# Test: TensorViews (regression test for view creation)
+add_executable(v2_test_tensor_views unit/Test__TensorViews.cpp)
+target_link_libraries(v2_test_tensor_views
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorViews
+    COMMAND $<TARGET_FILE:v2_test_tensor_views>
+    MPI_PROCS 1
+    LABELS "V2;Unit;TensorOperations;Views;MemoryManagement;Regression"
+)
+
+# Test: Qwen2 Null MPI Context (regression test for null pointer crash)
+add_executable(v2_test_qwen2_null_mpi_context unit/Test__Qwen2NullMPIContext.cpp)
+target_link_libraries(v2_test_qwen2_null_mpi_context
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Qwen2NullMPIContext
+    COMMAND $<TARGET_FILE:v2_test_qwen2_null_mpi_context>
+    MPI_PROCS 1
+    LABELS "V2;Unit;PipelineExecution;Qwen;SingleRank;Regression;Models"
+    FIXTURES_REQUIRED "V2_Models"
 )
 
 # Test: BatchPaddingUtils

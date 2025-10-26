@@ -21,7 +21,8 @@ namespace llaminar2
 
     FP32Tensor::FP32Tensor(const std::vector<size_t> &shape, int device_idx)
         : shape_(shape), device_idx_(device_idx), device_data_(nullptr),
-          host_dirty_(false), device_dirty_(false)
+          host_dirty_(false), device_dirty_(false),
+          is_view_(false), parent_data_ptr_(nullptr), view_offset_(0), parent_(nullptr)
     {
         size_t count = 1;
         for (auto dim : shape)
@@ -35,6 +36,20 @@ namespace llaminar2
         {
             std::cerr << "[FP32Tensor] GPU allocation not yet implemented (device " << device_idx_ << ")\n";
         }
+    }
+
+    FP32Tensor::FP32Tensor(const std::vector<size_t> &shape,
+                           int device_idx,
+                           std::vector<float> *parent_data,
+                           size_t data_offset,
+                           std::shared_ptr<FP32Tensor> parent)
+        : shape_(shape), device_idx_(device_idx), device_data_(nullptr),
+          host_dirty_(false), device_dirty_(false),
+          is_view_(true), parent_data_ptr_(parent_data), view_offset_(data_offset),
+          parent_(parent)
+    {
+        // Views don't allocate their own host_data_
+        // They borrow from the parent via parent_data_ptr_
     }
 
     FP32Tensor::~FP32Tensor()
@@ -63,6 +78,11 @@ namespace llaminar2
     {
         // If on device, sync to host
         // TODO: Implement lazy sync when device support is added
+        
+        if (is_view_)
+        {
+            return parent_data_ptr_->data() + view_offset_;
+        }
         return host_data_.data();
     }
 
@@ -71,6 +91,11 @@ namespace llaminar2
         // Mark as dirty if on device
         // TODO: Implement dirty flag when device support is added
         host_dirty_ = true;
+        
+        if (is_view_)
+        {
+            return parent_data_ptr_->data() + view_offset_;
+        }
         return host_data_.data();
     }
 
@@ -206,6 +231,79 @@ namespace llaminar2
         // Should never reach here
         std::cerr << "[FP32Tensor::copyFrom] ERROR: Unknown transfer type\n";
         return false;
+    }
+
+    std::shared_ptr<TensorBase> FP32Tensor::create_view(
+        const std::vector<size_t> &new_shape,
+        size_t offset)
+    {
+        // Calculate total elements in the new view
+        size_t view_elements = 1;
+        for (auto dim : new_shape)
+        {
+            view_elements *= dim;
+        }
+
+        // Calculate available elements from offset
+        size_t parent_elements = 1;
+        for (auto dim : shape_)
+        {
+            parent_elements *= dim;
+        }
+
+        if (offset >= parent_elements)
+        {
+            std::cerr << "[FP32Tensor::create_view] ERROR: offset " << offset
+                      << " >= parent size " << parent_elements << "\n";
+            return nullptr;
+        }
+
+        size_t available_elements = parent_elements - offset;
+        if (view_elements > available_elements)
+        {
+            std::cerr << "[FP32Tensor::create_view] ERROR: view size " << view_elements
+                      << " > available elements " << available_elements
+                      << " (offset=" << offset << ", parent_size=" << parent_elements << ")\n";
+            return nullptr;
+        }
+
+        // Determine the actual parent tensor and data pointer
+        // If this is already a view, chain to the root parent
+        std::shared_ptr<FP32Tensor> root_parent;
+        if (is_view_) {
+            root_parent = std::dynamic_pointer_cast<FP32Tensor>(parent_);
+            if (!root_parent) {
+                std::cerr << "[FP32Tensor::create_view] ERROR: Failed to cast parent to FP32Tensor (is_view=true)\n";
+                return nullptr;
+            }
+        } else {
+            // Get a proper shared_ptr to this object (increments ref count)
+            try {
+                auto self_ptr = shared_from_this();
+                root_parent = std::dynamic_pointer_cast<FP32Tensor>(self_ptr);
+                if (!root_parent) {
+                    std::cerr << "[FP32Tensor::create_view] ERROR: Failed to cast shared_from_this to FP32Tensor\n";
+                    return nullptr;
+                }
+            } catch (const std::bad_weak_ptr& e) {
+                std::cerr << "[FP32Tensor::create_view] ERROR: shared_from_this() failed - object not managed by shared_ptr!\n";
+                std::cerr << "[FP32Tensor::create_view] Exception: " << e.what() << "\n";
+                return nullptr;
+            }
+        }
+        
+        std::vector<float> *root_data = is_view_ ? parent_data_ptr_ : &host_data_;
+        size_t root_offset = is_view_ ? (view_offset_ + offset) : offset;
+
+        // Create view using private constructor
+        auto view_tensor = std::shared_ptr<FP32Tensor>(new FP32Tensor(
+            new_shape,
+            device_idx_,
+            root_data,
+            root_offset,
+            root_parent));
+
+        return view_tensor;
     }
 
 } // namespace llaminar2
