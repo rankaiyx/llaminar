@@ -200,6 +200,18 @@ add_v2_test(V2_Unit_TensorBasics
     LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
 )
 
+# Test: FP16Tensor class
+add_executable(v2_test_fp16_tensor unit/tensors/Test__FP16Tensor.cpp)
+target_link_libraries(v2_test_fp16_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FP16Tensor 
+    COMMAND $<TARGET_FILE:v2_test_fp16_tensor>
+    LABELS "V2;Unit;TensorOperations;FP16;Quantization;ViewSupport"
+)
+
 # Test: BF16Tensor class
 add_executable(v2_test_bf16_tensor unit/tensors/Test__BF16Tensor.cpp)
 target_link_libraries(v2_test_bf16_tensor 
@@ -209,8 +221,230 @@ target_link_libraries(v2_test_bf16_tensor
 )
 add_v2_test(V2_Unit_BF16Tensor 
     COMMAND $<TARGET_FILE:v2_test_bf16_tensor>
-    LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM"
+    LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM;ViewSupport"
 )
+
+# Test: IQ4_NL Tensor Views
+add_executable(v2_test_iq4nl_views unit/tensors/Test__IQ4_NLTensor_Views.cpp)
+target_link_libraries(v2_test_iq4nl_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ4NL_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq4nl_views>
+    LABELS "V2;Unit;TensorOperations;IQ4_NL;Quantization;ViewSupport;RowSlice;IQuant"
+)
+
+# Test: IQ4_XS Tensor Views
+add_executable(v2_test_iq4xs_views unit/tensors/Test__IQ4_XSTensor_Views.cpp)
+target_link_libraries(v2_test_iq4xs_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ4_XS_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq4xs_views>
+    LABELS "V2;Unit;TensorOperations;IQ4_XS;Quantization;ViewSupport;RowSlice;IQuant"
+)
+
+# Test: IQ2_XXS Tensor Views
+add_executable(v2_test_iq2xxs_views unit/tensors/Test__IQ2_XXSTensor_Views.cpp)
+target_link_libraries(v2_test_iq2xxs_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ2_XXS_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq2xxs_views>
+    LABELS "V2;Unit;TensorOperations;IQ2_XXS;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
+)
+
+# Test: IQ2_XS Tensor Views
+add_executable(v2_test_iq2xs_views unit/tensors/Test__IQ2_XSTensor_Views.cpp)
+target_link_libraries(v2_test_iq2xs_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ2_XS_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq2xs_views>
+    LABELS "V2;Unit;TensorOperations;IQ2_XS;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
+)
+
+# Test: IQ3_XXS Tensor Views
+add_executable(v2_test_iq3xxs_views unit/tensors/Test__IQ3_XXSTensor_Views.cpp)
+target_link_libraries(v2_test_iq3xxs_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ3_XXS_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq3xxs_views>
+    LABELS "V2;Unit;TensorOperations;IQ3_XXS;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
+)
+
+# Test: IQ2_S Tensor Views
+add_executable(v2_test_iq2s_views unit/tensors/Test__IQ2_STensor_Views.cpp)
+target_link_libraries(v2_test_iq2s_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ2_S_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq2s_views>
+    LABELS "V2;Unit;TensorOperations;IQ2_S;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
+)
+
+# Test: IQ3_S Tensor Views
+add_executable(v2_test_iq3s_views unit/tensors/Test__IQ3_STensor_Views.cpp)
+target_link_libraries(v2_test_iq3s_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ3_S_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq3s_views>
+    LABELS "V2;Unit;TensorOperations;IQ3_S;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
+)
+
+# Test: IQ1_S Tensor Views
+add_executable(v2_test_iq1s_views unit/tensors/Test__IQ1_STensor_Views.cpp)
+target_link_libraries(v2_test_iq1s_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ1_S_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq1s_views>
+    LABELS "V2;Unit;TensorOperations;IQ1_S;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
+)
+
+# Test: IQ1_M Tensor Views
+add_executable(v2_test_iq1m_views unit/tensors/Test__IQ1_MTensor_Views.cpp)
+target_link_libraries(v2_test_iq1m_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ1_M_Views 
+    COMMAND $<TARGET_FILE:v2_test_iq1m_views>
+    LABELS "V2;Unit;TensorOperations;IQ1_M;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
+)
+
+# Test: Q8_0 Tensor Views
+add_executable(v2_test_q8_0_views unit/tensors/Test__Q8_0Tensor_Views.cpp)
+target_link_libraries(v2_test_q8_0_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_0_Views 
+    COMMAND $<TARGET_FILE:v2_test_q8_0_views>
+    LABELS "V2;Unit;TensorOperations;Q8_0;Quantization;ViewSupport;RowSlice"
+)
+
+# Test: Q4_0 Tensor Views
+add_executable(v2_test_q4_0_views unit/tensors/Test__Q4_0Tensor_Views.cpp)
+target_link_libraries(v2_test_q4_0_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q4_0_Views 
+    COMMAND $<TARGET_FILE:v2_test_q4_0_views>
+    LABELS "V2;Unit;TensorOperations;Q4_0;Quantization;ViewSupport;RowSlice"
+)
+
+# Test: Q4_1 Tensor Views
+add_executable(v2_test_q4_1_views unit/tensors/Test__Q4_1Tensor_Views.cpp)
+target_link_libraries(v2_test_q4_1_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q4_1_Views 
+    COMMAND $<TARGET_FILE:v2_test_q4_1_views>
+    LABELS "V2;Unit;TensorOperations;Q4_1;Quantization;ViewSupport;RowSlice"
+)
+
+# Test: Q6_K Tensor Views
+add_executable(v2_test_q6_k_views unit/tensors/Test__Q6_KTensor_Views.cpp)
+target_link_libraries(v2_test_q6_k_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q6_K_Views 
+    COMMAND $<TARGET_FILE:v2_test_q6_k_views>
+    LABELS "V2;Unit;TensorOperations;Q6_K;Quantization;ViewSupport;RowSlice;KQuant;SuperBlock"
+)
+
+# Test: Q2_K Tensor Views
+add_executable(v2_test_q2_k_views unit/tensors/Test__Q2_KTensor_Views.cpp)
+target_link_libraries(v2_test_q2_k_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q2_K_Views 
+    COMMAND $<TARGET_FILE:v2_test_q2_k_views>
+    LABELS "V2;Unit;TensorOperations;Q2_K;Quantization;ViewSupport;RowSlice;KQuant;SuperBlock"
+)
+
+# Test: Q3_K Tensor Views
+add_executable(v2_test_q3_k_views unit/tensors/Test__Q3_KTensor_Views.cpp)
+target_link_libraries(v2_test_q3_k_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q3_K_Views 
+    COMMAND $<TARGET_FILE:v2_test_q3_k_views>
+    LABELS "V2;Unit;TensorOperations;Q3_K;Quantization;ViewSupport;RowSlice;KQuant;SuperBlock"
+)
+
+# Test: Q4_K Tensor Views
+add_executable(v2_test_q4_k_views unit/tensors/Test__Q4_KTensor_Views.cpp)
+target_link_libraries(v2_test_q4_k_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q4_K_Views 
+    COMMAND $<TARGET_FILE:v2_test_q4_k_views>
+    LABELS "V2;Unit;TensorOperations;Q4_K;Quantization;ViewSupport;RowSlice;KQuant;SuperBlock"
+)
+
+# Test: Q5_K Tensor Views
+add_executable(v2_test_q5_k_views unit/tensors/Test__Q5_KTensor_Views.cpp)
+target_link_libraries(v2_test_q5_k_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_K_Views 
+    COMMAND $<TARGET_FILE:v2_test_q5_k_views>
+    LABELS "V2;Unit;TensorOperations;Q5_K;Quantization;ViewSupport;RowSlice;KQuant;SuperBlock"
+)
+
+# Test: Q8_K Tensor Views
+add_executable(v2_test_q8_k_views unit/tensors/Test__Q8_KTensor_Views.cpp)
+target_link_libraries(v2_test_q8_k_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_K_Views 
+    COMMAND $<TARGET_FILE:v2_test_q8_k_views>
+    LABELS "V2;Unit;TensorOperations;Q8_K;Quantization;ViewSupport;RowSlice;KQuant;SuperBlock"
+)
+
+# Test: Qwen2 E2E Correctness (MPI Vectorized Attention Integration)
+
+
+
+
 
 # Test: KVCache
 add_executable(v2_test_kv_cache unit/tensors/Test__KVCache.cpp)
@@ -683,6 +917,43 @@ add_v2_test(V2_Integration_MicroKernelAutoTuner
     MPI_PROCS 1
     LABELS "V2;Integration;MicroKernel;AutoTuner;GEMM;Performance"
 )
+
+# Test: Dequant Equivalency - Verify IBlockDecoder matches llama.cpp dequantization (October 2025)
+# TODO: Enable after adding llama.cpp to V2 build (currently only in V1)
+# This test directly compiles llama.cpp's dequant implementation (ggml-quants.c) to avoid library linking issues
+# add_executable(v2_test_dequant_equivalency
+#     integration/Test__DequantEquivalency.cpp
+#     # Compile llama.cpp dequant source directly
+#     ${CMAKE_CURRENT_LIST_DIR}/../../external/llama.cpp/ggml/src/ggml-quants.c
+#     ${CMAKE_CURRENT_LIST_DIR}/../../external/llama.cpp/ggml/src/ggml-cpu/quants.c
+# )
+
+# # Link against llaminar2_core and GTest
+# target_link_libraries(v2_test_dequant_equivalency
+#     llaminar2_core
+#     GTest::gtest
+#     GTest::gtest_main
+# )
+
+# # Include llama.cpp headers for GGML dequant functions
+# target_include_directories(v2_test_dequant_equivalency PRIVATE
+#     ${CMAKE_CURRENT_LIST_DIR}/../../external/llama.cpp
+#     ${CMAKE_CURRENT_LIST_DIR}/../../external/llama.cpp/ggml/include
+#     ${CMAKE_CURRENT_LIST_DIR}/../../external/llama.cpp/ggml/src
+#     ${CMAKE_CURRENT_LIST_DIR}/../../external/llama.cpp/ggml/src/ggml-cpu
+# )
+
+# # Define necessary preprocessor macros for ggml-quants compilation
+# target_compile_definitions(v2_test_dequant_equivalency PRIVATE
+#     GGML_USE_OPENMP=1
+#     GGML_USE_CPU=1
+# )
+
+# add_v2_test(V2_Integration_DequantEquivalency
+#     COMMAND $<TARGET_FILE:v2_test_dequant_equivalency>
+#     MPI_PROCS 1
+#     LABELS "V2;Integration;Quantization;IBlockDecoder;LlamaCppParity;Correctness"
+# )
 
 # Placeholder for integration test executables (to be added)
 # Example:

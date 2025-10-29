@@ -257,7 +257,7 @@ set(COSMA_WITH_GPU OFF CACHE BOOL "Disable GPU for COSMA")
 # Ensure COSMA is built with -march=native for optimal performance
 # These flags are inherited from parent project's CMAKE_C_FLAGS and CMAKE_CXX_FLAGS
 # which already include -march=native
-add_subdirectory(COSMA)
+add_subdirectory(external/COSMA)
 
 # COSMA depends on OpenBLAS when using custom BLAS backend
 if(NOT USE_SYSTEM_BLAS)
@@ -277,7 +277,7 @@ set(GGML_SYCL OFF CACHE BOOL "Disable GGML SYCL backend" FORCE)
 set(GGML_RPC OFF CACHE BOOL "Disable GGML RPC backend" FORCE)
 # Use -march=native to avoid illegal instruction errors on varying CPU architectures
 set(GGML_NATIVE ON CACHE BOOL "Enable native CPU optimizations for GGML" FORCE)
-add_subdirectory(llama.cpp)
+add_subdirectory(external/llama.cpp)
 
 
 
@@ -419,11 +419,11 @@ find_library(MVEC_LIB mvec)
     # Include directories for core library
     target_include_directories(llaminar_core PUBLIC
         ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/COSMA/src
+        ${CMAKE_SOURCE_DIR}/external/COSMA/src
         ${CBLAS_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
-        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
-        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml
+        ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml/src
+        ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml/include
+        ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml
     )
 
     # Add Intel MKL if enabled (AFTER OpenBLAS includes to avoid header conflicts)
@@ -1749,7 +1749,7 @@ target_link_libraries(test_tp_partition PRIVATE llaminar_core GTest::gtest_main 
 add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orientation diagnostic test (non-MPI critical, rank 0 does work)
     add_executable(test_embedding_orientation tests/TestEmbeddingOrientation.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_link_libraries(test_embedding_orientation PRIVATE llaminar_core llama GTest::gtest_main MPI::MPI_CXX)
-    target_include_directories(test_embedding_orientation PRIVATE ${CMAKE_SOURCE_DIR}/llama.cpp/src)
+    target_include_directories(test_embedding_orientation PRIVATE ${CMAKE_SOURCE_DIR}/external/llama.cpp/src)
     add_test(NAME EmbeddingOrientationTest COMMAND test_embedding_orientation)
 
     # Dedicated fused RMSNorm+QKV correctness test (isolates CosmaPrefillManager::fused_rmsnorm_qkv)
@@ -1783,9 +1783,9 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
     # Golden reference comparison test (ggml quant vs llaminar dequant)
     add_executable(test_dequant_golden tests/TestDequantGolden.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_include_directories(test_dequant_golden PRIVATE
-        llama.cpp/ggml/src
-        llama.cpp/ggml/include
-        llama.cpp/ggml
+        external/llama.cpp/ggml/src
+        external/llama.cpp/ggml/include
+        external/llama.cpp/ggml
     )
     target_link_libraries(test_dequant_golden llaminar_core llama)
     if(GTest_FOUND)
@@ -1800,8 +1800,8 @@ add_test(NAME TPPartitionSpecTest COMMAND test_tp_partition)    # Embedding orie
     add_executable(test_model_loader_alignment tests/TestModelLoaderAlignment.cpp $<TARGET_OBJECTS:test_logging_bootstrap>)
     target_include_directories(test_model_loader_alignment PRIVATE
         ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
-        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
+        ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml/include
+        ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml/src
     )
     target_link_libraries(test_model_loader_alignment llaminar_core llama)
     if (GTEST_FOUND)
@@ -2262,8 +2262,8 @@ if(GTEST_FOUND)
     )
     target_include_directories(test_iq4_vs_llamacpp PRIVATE
         ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/include
-        ${CMAKE_SOURCE_DIR}/llama.cpp/ggml/src
+        ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml/include
+        ${CMAKE_SOURCE_DIR}/external/llama.cpp/ggml/src
         ${GTEST_INCLUDE_DIR}
     )
     add_test(NAME IQ4VsLlamaCpp COMMAND test_iq4_vs_llamacpp)

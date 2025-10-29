@@ -1,8 +1,8 @@
 [submodule "COSMA"]
-	path = COSMA
+	path = external/COSMA
 	url = https://github.com/dbsanfte/COSMA.git
 [submodule "llama.cpp"]
-	path = llama.cpp
+	path = external/llama.cpp
 	url = https://github.com/ggerganov/llama.cpp.git
 [submodule "external/OpenBLAS"]
 	path = external/OpenBLAS
