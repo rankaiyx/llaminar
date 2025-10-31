@@ -90,6 +90,7 @@ add_library(llaminar2_core STATIC
     pipelines/PipelineBase.cpp
     pipelines/PipelineFactory.cpp
     pipelines/qwen/Qwen2Pipeline.cpp
+    pipelines/attention/GQAAttention.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
@@ -136,12 +137,14 @@ add_library(llaminar2_core STATIC
     kernels/cpu/CPURMSNormKernel.cpp
     kernels/cpu/CPUSoftmaxKernel.cpp
     kernels/cpu/CPUSwiGLUKernel.cpp
+    kernels/cpu/CPUAttention.cpp
     # Testing infrastructure (Phase 3a & 3b)
     testing/MockPipeline.cpp
     testing/AttentionTestHarness.cpp
     testing/PerfHarness.cpp
     utils/ArgParser.cpp
     utils/BatchPaddingUtils.cpp
+    utils/NUMATopology.cpp
     # Generated GEMM microkernel template instantiations (1225 total across 64 files)
     kernels/cpu/GemmMicroKernelInit.cpp
     ${MICROKERNEL_INSTANTIATION_SOURCES}

@@ -15,6 +15,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../utils/CPUFeatures.h"
+#include "../utils/NUMATopology.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
@@ -333,18 +334,105 @@ namespace llaminar2
     // DeviceManager Implementation
     // ============================================================================
 
-    void DeviceManager::initialize()
+    void DeviceManager::initialize(int local_numa_node)
     {
         devices_.clear();
         contexts_.clear();
+        local_numa_node_ = local_numa_node;
+
+        // Log NUMA filtering mode
+        if (local_numa_node >= 0)
+        {
+            LOG_INFO("[DeviceManager] Initializing with NUMA node " << local_numa_node << " filtering (MPI rank mode)");
+        }
+        else
+        {
+            LOG_INFO("[DeviceManager] Initializing without NUMA filtering (all devices visible)");
+        }
 
         // Always enumerate CPU first (device index 0)
-        devices_.push_back(enumerate_cpu_device());
+        auto cpu_dev = enumerate_cpu_device();
+        cpu_dev.numa_node = (local_numa_node >= 0) ? local_numa_node : 0;
+        devices_.push_back(cpu_dev);
 
-        // Enumerate GPUs
+        // Enumerate GPUs with optional NUMA filtering
         auto cuda_devices = enumerate_cuda_devices();
         auto rocm_devices = enumerate_rocm_devices();
         auto vulkan_devices = enumerate_vulkan_devices();
+
+        // Filter CUDA devices by NUMA affinity
+        if (local_numa_node >= 0)
+        {
+            std::vector<ComputeDevice> filtered_cuda;
+            for (auto &dev : cuda_devices)
+            {
+                auto gpu_info = NUMATopology::getCUDAGPUNUMANode(dev.device_id);
+                dev.numa_node = gpu_info.numa_node;
+
+                if (NUMATopology::isGPULocalToProcess(gpu_info.numa_node, local_numa_node))
+                {
+                    filtered_cuda.push_back(dev);
+                    LOG_INFO("[DeviceManager] Including CUDA GPU " << dev.device_id
+                                                                   << " (NUMA node " << gpu_info.numa_node << ", " << gpu_info.detection_method << ")");
+                }
+                else
+                {
+                    LOG_DEBUG("[DeviceManager] Filtering out CUDA GPU " << dev.device_id
+                                                                        << " (on NUMA node " << gpu_info.numa_node << ", process on node " << local_numa_node << ")");
+                }
+            }
+            cuda_devices = filtered_cuda;
+        }
+        else
+        {
+            // No filtering, but still populate NUMA info for logging
+            for (auto &dev : cuda_devices)
+            {
+                auto gpu_info = NUMATopology::getCUDAGPUNUMANode(dev.device_id);
+                dev.numa_node = gpu_info.numa_node;
+            }
+        }
+
+#ifdef HAVE_ROCM
+        // Filter ROCm devices by NUMA affinity
+        if (local_numa_node >= 0)
+        {
+            std::vector<ComputeDevice> filtered_rocm;
+            for (auto &dev : rocm_devices)
+            {
+                auto gpu_info = NUMATopology::getROCmGPUNUMANode(dev.device_id);
+                dev.numa_node = gpu_info.numa_node;
+
+                if (NUMATopology::isGPULocalToProcess(gpu_info.numa_node, local_numa_node))
+                {
+                    filtered_rocm.push_back(dev);
+                    LOG_INFO("[DeviceManager] Including ROCm GPU " << dev.device_id
+                                                                   << " (NUMA node " << gpu_info.numa_node << ")");
+                }
+                else
+                {
+                    LOG_DEBUG("[DeviceManager] Filtering out ROCm GPU " << dev.device_id
+                                                                        << " (on NUMA node " << gpu_info.numa_node << ")");
+                }
+            }
+            rocm_devices = filtered_rocm;
+        }
+        else
+        {
+            // No filtering, populate NUMA info
+            for (auto &dev : rocm_devices)
+            {
+                auto gpu_info = NUMATopology::getROCmGPUNUMANode(dev.device_id);
+                dev.numa_node = gpu_info.numa_node;
+            }
+        }
+#endif
+
+        // Vulkan devices: not filtered (NUMA affinity unknown)
+        for (auto &dev : vulkan_devices)
+        {
+            dev.numa_node = -1; // Unknown
+        }
 
         devices_.insert(devices_.end(), cuda_devices.begin(), cuda_devices.end());
         devices_.insert(devices_.end(), rocm_devices.begin(), rocm_devices.end());
@@ -363,6 +451,10 @@ namespace llaminar2
                 dev.type != ComputeBackendType::CPU_MKL)
             {
                 device_info += ", SM " + std::to_string(dev.compute_capability / 10) + "." + std::to_string(dev.compute_capability % 10);
+            }
+            if (dev.numa_node >= 0)
+            {
+                device_info += ", NUMA node " + std::to_string(dev.numa_node);
             }
             device_info += ")";
             LOG_INFO(device_info);

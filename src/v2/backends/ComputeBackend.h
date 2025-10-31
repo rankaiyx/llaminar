@@ -38,6 +38,7 @@ namespace llaminar2
     {
         ComputeBackendType type;
         int device_id;             // Backend-specific device ID (e.g., CUDA device 0, 1, ...)
+        int numa_node;             // NUMA node/socket affinity (-1 if unknown)
         std::string name;          // Human-readable name
         size_t total_memory_bytes; // Total device memory
         size_t free_memory_bytes;  // Free device memory (approximate)
@@ -204,6 +205,11 @@ namespace llaminar2
      * @brief Device manager singleton
      *
      * Enumerates all available compute devices and manages context creation.
+     *
+     * NUMA-Aware Filtering (Phase 1):
+     * When initialized with a specific NUMA node, only enumerates devices
+     * affine to that socket. This is critical for MPI multi-socket execution
+     * to avoid cross-socket performance penalties (40-60% slower).
      */
     class DeviceManager
     {
@@ -215,20 +221,36 @@ namespace llaminar2
         }
 
         /**
-         * @brief Initialize device manager (enumerate all devices)
+         * @brief Initialize device manager with optional NUMA filtering
          *
          * Call once at startup. Scans for:
-         * - CPU (OpenBLAS/MKL)
-         * - CUDA devices (cudaGetDeviceCount)
-         * - ROCm devices (hipGetDeviceCount)
-         * - Vulkan devices (vkEnumeratePhysicalDevices)
+         * - CPU (OpenBLAS/MKL) - always on local_numa_node
+         * - CUDA devices (cudaGetDeviceCount) - filtered by NUMA affinity
+         * - ROCm devices (hipGetDeviceCount) - filtered by NUMA affinity
+         * - Vulkan devices (vkEnumeratePhysicalDevices) - not filtered (unknown affinity)
+         *
+         * @param local_numa_node NUMA node for this process/rank (-1 = enumerate all devices)
+         *
+         * Usage:
+         *   // MPI rank bound to socket 0
+         *   dm.initialize(0);  // Only sees GPUs on socket 0
+         *
+         *   // Testing or single-socket system
+         *   dm.initialize(-1);  // Sees all devices
          */
-        void initialize();
+        void initialize(int local_numa_node = -1);
 
         /**
          * @brief Get all enumerated devices
          */
         const std::vector<ComputeDevice> &devices() const { return devices_; }
+
+        /**
+         * @brief Get local NUMA node (socket) this manager is filtering for
+         *
+         * @return NUMA node or -1 if no filtering active
+         */
+        int local_numa_node() const { return local_numa_node_; }
 
         /**
          * @brief Create context for specific device
@@ -279,6 +301,7 @@ namespace llaminar2
         std::vector<ComputeDevice> devices_;
         std::vector<std::shared_ptr<ComputeContext>> contexts_; // Cached per device
         size_t last_selected_device_ = 0;                       // Round-robin state
+        int local_numa_node_ = -1;                              // NUMA node filter (-1 = no filter)
     };
 
 } // namespace llaminar2

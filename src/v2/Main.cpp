@@ -14,6 +14,7 @@
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
 #include "utils/ArgParser.h"
+#include "utils/NUMATopology.h"
 #include "backends/ComputeBackend.h"
 #include "pipelines/PipelineFactory.h"
 #include "pipelines/PipelineConfig.h"
@@ -31,7 +32,8 @@ using namespace llaminar2;
 void list_devices()
 {
     auto &dm = DeviceManager::instance();
-    dm.initialize();
+    // List devices without NUMA filtering (show all available devices)
+    dm.initialize(-1);
 
     const auto &devices = dm.devices();
 
@@ -130,14 +132,31 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    // Initialize device manager
+    // Detect NUMA node for MPI rank
+    auto numa_info = NUMATopology::detectLocalNUMANode();
+    auto mpi_ctx = MPIContextFactory::global();
+
+    if (mpi_ctx->rank() == 0)
+    {
+        LOG_INFO("=== NUMA Topology Detection ===");
+    }
+
+    LOG_INFO("[Rank " << mpi_ctx->rank() << "] NUMA node: " << numa_info.local_numa_node
+                      << " (detection: " << numa_info.detection_method << ")");
+
+    if (!numa_info.detection_succeeded && mpi_ctx->rank() == 0)
+    {
+        LOG_WARN("NUMA detection failed, using fallback node 0. This may impact multi-socket performance.");
+    }
+
+    // Initialize device manager with NUMA-aware filtering
     auto &dm = DeviceManager::instance();
-    dm.initialize();
+    dm.initialize(numa_info.local_numa_node);
 
     // Handle list devices
     if (args.list_devices)
     {
-        if (MPIContextFactory::global()->rank() == 0)
+        if (mpi_ctx->rank() == 0)
         {
             list_devices();
         }
@@ -148,7 +167,7 @@ int main(int argc, char *argv[])
     // Validate required arguments
     if (args.model_path.empty())
     {
-        if (MPIContextFactory::global()->rank() == 0)
+        if (mpi_ctx->rank() == 0)
         {
             LOG_ERROR("Error: Model path required (-m)\n\n");
             ArgParser::printUsage(argv[0]);
@@ -164,9 +183,6 @@ int main(int argc, char *argv[])
         MPI_Finalize();
         return 1;
     }
-
-    // Get MPI context
-    auto mpi_ctx = MPIContextFactory::global();
 
     // Parse placement strategy
     PlacementStrategy strategy = PlacementStrategy::AUTO;
@@ -271,6 +287,64 @@ int main(int argc, char *argv[])
     pipeline_config.batch_size = args.batch_size;
     pipeline_config.use_mmap = args.use_mmap;
     pipeline_config.seed = args.seed;
+
+    // Parse precision mode
+    if (args.precision == "fp32")
+    {
+        pipeline_config.precision = ComputePrecision::FP32;
+    }
+    else if (args.precision == "bf16")
+    {
+        pipeline_config.precision = ComputePrecision::BF16;
+    }
+    else if (args.precision == "fp16")
+    {
+        pipeline_config.precision = ComputePrecision::FP16;
+    }
+    else if (args.precision == "int8")
+    {
+        pipeline_config.precision = ComputePrecision::INT8;
+    }
+    else if (args.precision == "auto")
+    {
+        // Auto-select based on device capabilities
+        const auto &devices = dm.devices();
+        pipeline_config.precision = selectOptimalPrecision(devices[device_idx]);
+    }
+    else
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_WARN("Unknown precision mode '" << args.precision << "', defaulting to fp32");
+        }
+        pipeline_config.precision = ComputePrecision::FP32;
+    }
+
+    // Log selected precision mode
+    if (mpi_ctx->rank() == 0)
+    {
+        const char *precision_name = "Unknown";
+        switch (pipeline_config.precision)
+        {
+        case ComputePrecision::FP32:
+            precision_name = "FP32 (full precision)";
+            break;
+        case ComputePrecision::BF16:
+            precision_name = "BF16 (brain float 16)";
+            break;
+        case ComputePrecision::FP16:
+            precision_name = "FP16 (half precision)";
+            break;
+        case ComputePrecision::INT8:
+            precision_name = "INT8 (8-bit quantization)";
+            break;
+        case ComputePrecision::AUTO:
+            precision_name = "AUTO (should have been resolved!)";
+            break;
+        }
+        LOG_INFO("Compute precision: " << precision_name);
+        LOG_INFO("");
+    }
 
     // Create pipeline using factory
     auto pipeline = PipelineFactory::instance().create(architecture, model_ctx, mpi_ctx, device_idx, pipeline_config);
