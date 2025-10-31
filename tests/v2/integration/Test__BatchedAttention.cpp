@@ -62,6 +62,9 @@ protected:
             n_kv_heads_ = 2; // GQA: 4 Q heads, 2 KV heads
             head_dim_ = 64;
             d_model_ = n_heads_ * head_dim_; // 256
+            
+            // Initialize workspace buffers and infrastructure
+            initializeInfrastructure();
         }
 
         // Required pure virtual methods (minimal stubs)

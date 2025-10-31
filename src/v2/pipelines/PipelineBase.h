@@ -266,6 +266,18 @@ namespace llaminar2
         std::map<int, ActivationBuffers> buffers_per_device_;
 
         /**
+         * @brief Attention workspace buffers (Phase 4.2 - zero-allocation hot path)
+         *
+         * Pre-allocated reusable buffers for attention computation.
+         * Eliminates per-call allocations in GQAAttention hot path.
+         * Sized for max_seq_len during initializeDeviceInfrastructure().
+         */
+        std::shared_ptr<TensorBase> attention_workspace_scores_;     // [max_heads * max_seq, max_seq]
+        std::shared_ptr<TensorBase> attention_workspace_qkv_buffer_; // [max_threads * max_seq * head_dim * 3]
+        std::shared_ptr<TensorBase> attention_workspace_context_;    // [max_threads * max_seq * head_dim]
+        std::shared_ptr<TensorBase> attention_workspace_mask_;       // [max_seq * max_seq]
+
+        /**
          * @brief Legacy activation buffers (single-device mode)
          *
          * Deprecated: Use buffers_per_device_ for multi-device support.
@@ -492,29 +504,15 @@ namespace llaminar2
         /**
          * @brief Standard GQA (Grouped Query Attention) orchestration
          *
-         * Default attention implementation supporting:
-         * - GQA: n_heads > n_kv_heads (broadcast K/V heads)
-         * - MHA: n_heads == n_kv_heads (no broadcasting)
-         * - MQA: n_kv_heads == 1 (broadcast single K/V to all Q heads)
-         * - Sliding window: Optional local attention window
+         * Convenience wrapper around GQAAttention::compute() for use in pipelines.
          *
          * Handles ~95% of production models (Qwen, Llama, Mistral, Gemma, etc.).
          * Pipelines with custom attention (e.g., DeepSeek MLA) override attention_block().
-         *
-         * Algorithm:
-         * 1. Broadcast K/V heads to match Q heads (if n_kv_heads < n_heads)
-         * 2. Compute attention scores: Q @ K^T (per-head batched GEMM)
-         * 3. Scale by 1/sqrt(head_dim)
-         * 4. Apply causal mask (optional sliding window)
-         * 5. Softmax over scores
-         * 6. Compute context: scores @ V (per-head batched GEMM)
-         * 7. Concatenate heads back to [seq_len, n_heads * head_dim]
          *
          * @param Q Query tensor [seq_len, n_heads * head_dim]
          * @param K Key tensor [seq_len, n_kv_heads * head_dim]
          * @param V Value tensor [seq_len, n_kv_heads * head_dim]
          * @param output Output tensor [seq_len, n_heads * head_dim] (pre-allocated)
-         * @param seq_len Sequence length
          * @param n_heads Number of query heads
          * @param n_kv_heads Number of key/value heads (GQA: ≤ n_heads)
          * @param head_dim Dimension per head
@@ -524,9 +522,8 @@ namespace llaminar2
          * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
          *
-         * @note Single-rank implementation (no MPI coordination)
+         * @note Delegates to GQAAttention::compute() (see pipelines/attention/GQAAttention.h)
          * @note For MPI parallelization, use attention_gqa_mpi()
-         * @note Uses primitive kernels: ITensorGemm, ITensorSoftmax
          */
         virtual bool attention_gqa(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
@@ -537,21 +534,7 @@ namespace llaminar2
         /**
          * @brief Batched grouped-query attention (GQA) with padding support
          *
-         * Computes attention for multiple sequences simultaneously:
-         *   For each batch b:
-         *     attention(Q[b], K[b], V[b]) = softmax(Q·K^T / sqrt(head_dim) + mask[b]) · V
-         *
-         * Masking:
-         * - Causal mask: Token i cannot attend to tokens j > i (if causal=true)
-         * - Padding mask: Real tokens cannot attend to padding positions
-         * - Combined mask applied before softmax
-         *
-         * Input shapes:
-         * - Q: [batch_size * seq_len, n_heads * head_dim]
-         * - K: [batch_size * seq_len, n_kv_heads * head_dim]
-         * - V: [batch_size * seq_len, n_kv_heads * head_dim]
-         * - output: [batch_size * seq_len, n_heads * head_dim]
-         * - actual_lengths: [batch_size] (actual sequence lengths, not padded)
+         * Convenience wrapper around GQAAttention::compute_batch() for use in pipelines.
          *
          * @param Q Query tensor for all batches (flattened)
          * @param K Key tensor for all batches (flattened)
@@ -567,8 +550,7 @@ namespace llaminar2
          * @param window_size Sliding window size
          * @return true on success, false on error
          *
-         * @note Single-rank implementation (no MPI coordination yet)
-         * @note For MPI parallelization, extend with attention_gqa_batch_mpi()
+         * @note Delegates to GQAAttention::compute_batch() (see pipelines/attention/GQAAttention.h)
          */
         virtual bool attention_gqa_batch(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
@@ -582,10 +564,8 @@ namespace llaminar2
         /**
          * @brief MPI-aware attention dispatcher
          *
-         * Dispatches to appropriate attention implementation based on MPI strategy:
-         * - MPIStrategy::None → attention_gqa() (single-rank fast path)
-         * - MPIStrategy::TensorParallel → attention_gqa_tensor_parallel()
-         * - MPIStrategy::SequenceParallel → attention_gqa_sequence_parallel()
+         * Convenience wrapper around GQAAttention::compute_mpi() for use in pipelines.
+         * Dispatches to appropriate implementation based on MPI strategy.
          *
          * @param Q Query tensor [seq_len, n_heads * head_dim]
          * @param K Key tensor [seq_len, n_kv_heads * head_dim]
@@ -599,6 +579,8 @@ namespace llaminar2
          * @param batch_size Number of sequences in batch (default=1 for single sequence)
          * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
+         *
+         * @note Delegates to GQAAttention::compute_mpi() (see pipelines/attention/GQAAttention.h)
          */
         bool attention_gqa_mpi(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
@@ -609,12 +591,7 @@ namespace llaminar2
         /**
          * @brief Tensor-parallel attention implementation
          *
-         * Distributes attention heads across MPI ranks:
-         * - Rank i computes heads [start_head, start_head + local_n_heads)
-         * - Allreduce to sum outputs from all ranks
-         *
-         * Memory: O(seq_len * local_n_heads * head_dim) per rank
-         * Communication: 1× allreduce (seq_len * n_heads * head_dim elements)
+         * Convenience wrapper around GQAAttention::compute_tensor_parallel() for use in pipelines.
          *
          * @param Q Query tensor [seq_len, n_heads * head_dim]
          * @param K Key tensor [seq_len, n_kv_heads * head_dim]
@@ -629,7 +606,7 @@ namespace llaminar2
          * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
          *
-         * @note Requires n_heads % world_size == 0 (validated in constructor)
+         * @note Delegates to GQAAttention::compute_tensor_parallel() (see pipelines/attention/GQAAttention.h)
          */
         bool attention_gqa_tensor_parallel(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,

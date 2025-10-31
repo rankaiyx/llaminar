@@ -28,7 +28,15 @@ namespace llaminar2
               n_kv_heads_(n_kv_heads),
               head_dim_(head_dim)
         {
-            // MPI configuration is handled by PipelineBase constructor
+            // Set architecture parameters (required before initializeInfrastructure)
+            n_layers_ = 1;
+            n_heads_ = n_heads;
+            n_kv_heads_ = n_kv_heads;
+            head_dim_ = head_dim;
+            d_model_ = n_heads * head_dim;
+            
+            // Initialize workspace buffers and infrastructure
+            initializeInfrastructure();
         }
 
         bool MockPipeline::test_attention_gqa(

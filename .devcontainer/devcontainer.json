@@ -1,6 +1,12 @@
 {
     "name": "Llaminar CMake Development",
     "dockerFile": "Dockerfile",
+    "build": {
+        "args": {
+            "INSTALL_CUDA": "true",
+            "INSTALL_ROCM": "true"
+        }
+    },
     "features": {
         "ghcr.io/devcontainers/features/git:1": {},
         "ghcr.io/devcontainers/features/github-cli:1": {},

@@ -173,6 +173,12 @@ namespace llaminar2
         throw std::runtime_error("FP16Tensor: RMSNorm not supported");
     }
 
+    std::unique_ptr<ITensorAttention> FP16Tensor::createAttention()
+    {
+        LOG_ERROR("[FP16Tensor] createAttention not supported for quantized tensors");
+        return nullptr;
+    }
+
     // ========== FP16-Specific Interface ==========
 
     void FP16Tensor::from_fp32(const float *fp32_data, size_t count)

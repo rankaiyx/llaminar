@@ -10,8 +10,28 @@
 
 #pragma once
 
+#include "backends/ComputeBackend.h"
+#include "utils/CPUFeatures.h"
+#include "utils/Logger.h"
+
 namespace llaminar2
 {
+
+    /**
+     * @brief Compute precision mode for activations
+     *
+     * Determines the precision used for attention and other compute-intensive operations.
+     * Lower precision modes reduce memory bandwidth and may accelerate computation on
+     * supported hardware, but introduce quantization error.
+     */
+    enum class ComputePrecision
+    {
+        FP32, ///< Full 32-bit floating point (default, highest accuracy)
+        BF16, ///< Brain Float 16 (7-bit mantissa, 8-bit exponent, ~2-3 decimal digits)
+        FP16, ///< IEEE Float 16 (10-bit mantissa, 5-bit exponent, ~3-4 decimal digits)
+        INT8, ///< 8-bit integer quantization (future: block floating point)
+        AUTO  ///< Automatic selection based on hardware capabilities
+    };
 
     /**
      * @brief Runtime configuration for pipeline initialization
@@ -81,6 +101,22 @@ namespace llaminar2
         int seed = -1;
 
         /**
+         * @brief Compute precision for activations
+         *
+         * Determines precision used for attention and other operations:
+         * - FP32: Full precision (default, highest accuracy)
+         * - BF16: Reduced memory bandwidth, 1.5-2× faster on Ice Lake+ CPUs
+         * - FP16: Reduced memory bandwidth, faster on ARM/mobile hardware
+         * - INT8: Future block floating point quantization
+         * - AUTO: Select based on hardware (BF16 if AMX-BF16, else FP32)
+         *
+         * Note: Lower precision reduces memory bandwidth but introduces quantization error.
+         * Attention is typically robust to BF16/FP16 (relative differences matter),
+         * but operations like softmax/RMSNorm may require FP32 for stability.
+         */
+        ComputePrecision precision = ComputePrecision::FP32;
+
+        /**
          * @brief Default constructor with standard settings
          */
         PipelineConfig() = default;
@@ -90,5 +126,126 @@ namespace llaminar2
          */
         explicit PipelineConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
     };
+
+    /**
+     * @brief Auto-select optimal compute precision for a device
+     *
+     * Selection priority (highest to lowest performance):
+     * 1. BF16: If AMX-BF16 or AVX512-BF16 available (Intel Sapphire Rapids+)
+     * 2. FP16: If AVX512-FP16 available (Intel Sapphire Rapids+, no BF16)
+     * 3. FP32: Fallback (universal compatibility)
+     *
+     * Hardware requirements:
+     * - BF16: Intel Ice Lake+ (AMX-BF16), Cooper Lake+ (AVX512-BF16)
+     * - FP16: Intel Sapphire Rapids+ (AVX512-FP16), ARM NEON (future)
+     * - FP32: All architectures
+     *
+     * Note: INT8 is not auto-selected (requires explicit opt-in)
+     *
+     * @param device Device to query for capabilities
+     * @return Recommended precision mode
+     */
+    inline ComputePrecision selectOptimalPrecision(const ComputeDevice &device)
+    {
+        switch (device.type)
+        {
+        case ComputeBackendType::CPU_OPENBLAS:
+        case ComputeBackendType::CPU_MKL:
+        {
+            // Priority 1: AMX-BF16 (Intel Sapphire Rapids+, 4th gen Xeon)
+            if (cpu_supports_amx_bf16())
+            {
+                LOG_INFO("AUTO precision: Detected AMX-BF16 → selecting BF16");
+                LOG_INFO("  Expected: 50% memory bandwidth, 1.5-2× throughput vs FP32");
+                return ComputePrecision::BF16;
+            }
+
+            // Priority 2: AVX512-BF16 (Intel Cooper Lake+, 3rd gen Xeon)
+            if (cpu_supports_avx512_bf16())
+            {
+                LOG_INFO("AUTO precision: Detected AVX512-BF16 → selecting BF16");
+                LOG_INFO("  Expected: 50% memory bandwidth, 1.3-1.8× throughput vs FP32");
+                return ComputePrecision::BF16;
+            }
+
+            // Priority 3: AVX512-FP16 (Intel Sapphire Rapids+, but no BF16?)
+            if (cpu_supports_avx512_fp16())
+            {
+                LOG_INFO("AUTO precision: Detected AVX512-FP16 → selecting FP16");
+                LOG_INFO("  Expected: 50% memory bandwidth, 1.2-1.6× throughput vs FP32");
+                return ComputePrecision::FP16;
+            }
+
+            // Fallback: FP32 (universal)
+            LOG_INFO("AUTO precision: No FP16/BF16 acceleration detected → selecting FP32");
+            LOG_INFO("  CPU: " << cpu_vendor());
+            LOG_INFO("  AVX512: " << (cpu_supports_avx512() ? "yes" : "no"));
+            LOG_INFO("  AVX2: " << (cpu_supports_avx2() ? "yes" : "no"));
+            return ComputePrecision::FP32;
+        }
+
+        case ComputeBackendType::GPU_CUDA:
+        {
+            // CUDA devices: Check hardware capabilities
+            if (device.supports_bf16)
+            {
+                LOG_INFO("AUTO precision: CUDA device supports BF16 → selecting BF16");
+                LOG_INFO("  Device: " << device.name);
+                LOG_INFO("  Expected: 50% memory bandwidth, tensor core acceleration");
+                return ComputePrecision::BF16;
+            }
+            else if (device.supports_fp16)
+            {
+                LOG_INFO("AUTO precision: CUDA device supports FP16 → selecting FP16");
+                LOG_INFO("  Device: " << device.name);
+                LOG_INFO("  Expected: 50% memory bandwidth, tensor core acceleration");
+                return ComputePrecision::FP16;
+            }
+            else
+            {
+                LOG_INFO("AUTO precision: CUDA device, no FP16/BF16 → selecting FP32");
+                LOG_INFO("  Device: " << device.name);
+                return ComputePrecision::FP32;
+            }
+        }
+
+        case ComputeBackendType::GPU_ROCM:
+        {
+            // ROCm devices: Prefer FP16 (better support than BF16 on AMD)
+            if (device.supports_fp16)
+            {
+                LOG_INFO("AUTO precision: ROCm device supports FP16 → selecting FP16");
+                LOG_INFO("  Device: " << device.name);
+                LOG_INFO("  Expected: 50% memory bandwidth, matrix core acceleration");
+                return ComputePrecision::FP16;
+            }
+            else if (device.supports_bf16)
+            {
+                LOG_INFO("AUTO precision: ROCm device supports BF16 → selecting BF16");
+                LOG_INFO("  Device: " << device.name);
+                return ComputePrecision::BF16;
+            }
+            else
+            {
+                LOG_INFO("AUTO precision: ROCm device, no FP16/BF16 → selecting FP32");
+                LOG_INFO("  Device: " << device.name);
+                return ComputePrecision::FP32;
+            }
+        }
+
+        case ComputeBackendType::GPU_VULKAN:
+        {
+            // Vulkan: Conservative FP32 for now (extension-dependent)
+            LOG_INFO("AUTO precision: Vulkan device → selecting FP32 (conservative)");
+            LOG_INFO("  Device: " << device.name);
+            LOG_INFO("  Note: FP16/BF16 support depends on extensions (not yet detected)");
+            return ComputePrecision::FP32;
+        }
+
+        default:
+            LOG_WARN("AUTO precision: Unknown device type → defaulting to FP32");
+            return ComputePrecision::FP32;
+        }
+    }
 
 } // namespace llaminar2

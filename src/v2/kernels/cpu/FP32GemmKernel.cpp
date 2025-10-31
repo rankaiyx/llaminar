@@ -105,4 +105,106 @@ namespace llaminar2
         return true;
     }
 
+    bool FP32GemmKernel::multiply_activations(
+        const float *A, const float *B, float *C,
+        int m, int n, int k,
+        bool transpose_B,
+        float alpha, float beta,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        if (device_idx != -1)
+        {
+            return false; // CPU only
+        }
+
+        // Activation-activation GEMM: C = alpha * A @ B^T + beta * C
+        // A: [m, k]
+        // B: [n, k] if transpose_B, else [k, n]
+        // C: [m, n]
+
+        if (transpose_B)
+        {
+            // B stored as [n, k], we want to compute A @ B^T
+            cblas_sgemm(
+                CblasRowMajor,
+                CblasNoTrans, CblasTrans,
+                m, n, k,
+                alpha,
+                A, k, // A is [m, k], lda = k
+                B, k, // B is [n, k], ldb = k
+                beta,
+                C, n // C is [m, n], ldc = n
+            );
+        }
+        else
+        {
+            // B stored as [k, n], we want to compute A @ B
+            cblas_sgemm(
+                CblasRowMajor,
+                CblasNoTrans, CblasNoTrans,
+                m, n, k,
+                alpha,
+                A, k, // A is [m, k], lda = k
+                B, n, // B is [k, n], ldb = n
+                beta,
+                C, n // C is [m, n], ldc = n
+            );
+        }
+
+        return true;
+    }
+
+    bool FP32GemmKernel::multiply_activations_strided(
+        const float *A, const float *B, float *C,
+        int m, int n, int k,
+        int lda, int ldb, int ldc,
+        bool transpose_B,
+        float alpha, float beta,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        if (device_idx != -1)
+        {
+            return false; // CPU only
+        }
+
+        // Strided activation-activation GEMM with custom leading dimensions
+        // Enables zero-copy multi-head attention by using strides
+        // A: [m, k] with stride lda
+        // B: [n, k] (transpose_B=true) or [k, n] (transpose_B=false) with stride ldb
+        // C: [m, n] with stride ldc
+
+        if (transpose_B)
+        {
+            // B stored as [n, k], compute A @ B^T
+            cblas_sgemm(
+                CblasRowMajor,
+                CblasNoTrans, CblasTrans,
+                m, n, k,
+                alpha,
+                A, lda, // Custom stride for A
+                B, ldb, // Custom stride for B
+                beta,
+                C, ldc // Custom stride for C
+            );
+        }
+        else
+        {
+            // B stored as [k, n], compute A @ B
+            cblas_sgemm(
+                CblasRowMajor,
+                CblasNoTrans, CblasNoTrans,
+                m, n, k,
+                alpha,
+                A, lda, // Custom stride for A
+                B, ldb, // Custom stride for B
+                beta,
+                C, ldc // Custom stride for C
+            );
+        }
+
+        return true;
+    }
+
 } // namespace llaminar2

@@ -205,6 +205,12 @@ namespace llaminar2
         throw std::runtime_error("Q8_0Tensor: RMSNorm not supported on quantized tensors");
     }
 
+    std::unique_ptr<ITensorAttention> Q8_0Tensor::createAttention()
+    {
+        LOG_ERROR("[Q8_0Tensor] createAttention not supported for quantized tensors");
+        return nullptr;
+    }
+
     std::unique_ptr<ITensorGemm> Q8_0Tensor::createGemm()
     {
         // Use generic QuantizedGemmKernel with IBlockDecoder interface

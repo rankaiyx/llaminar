@@ -1,3 +1,4 @@
+#include "../utils/Logger.h"
 /**
  * @file Q5_1Tensor.cpp
  * @brief Q5_1 quantized tensor implementation (5-bit with min offset)
@@ -136,6 +137,12 @@ namespace llaminar2
     std::unique_ptr<ITensorRMSNorm> Q5_1Tensor::createRMSNorm()
     {
         throw std::runtime_error("Q5_1Tensor::createRMSNorm not implemented");
+    }
+
+    std::unique_ptr<ITensorAttention> Q5_1Tensor::createAttention()
+    {
+        LOG_ERROR("[Q5_1Tensor] createAttention not supported for quantized tensors");
+        return nullptr;
     }
 
     std::shared_ptr<TensorBase> Q5_1Tensor::create_view(

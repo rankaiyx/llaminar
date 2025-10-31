@@ -80,8 +80,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev \
     libeigen3-dev \
     # Node.js for MCP servers (will be installed via features)
-    && apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    sudo ln -s /usr/lib/linux-tools-6.8.0-86/perf /usr/lib/linux-tools/6.14.0-33-generic/perf
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Fix perf symlink for Ubuntu 24.04 bug
+# Detect installed linux-tools version and create proper symlink
+RUN KERNEL_VERSION=$(uname -r) && \
+    INSTALLED_VERSION=$(ls -1 /usr/lib/linux-tools/ | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n1) && \
+    if [ -n "$INSTALLED_VERSION" ] && [ -n "$KERNEL_VERSION" ]; then \
+        mkdir -p /usr/lib/linux-tools/$KERNEL_VERSION && \
+        ln -sf /usr/lib/linux-tools/$INSTALLED_VERSION/perf /usr/lib/linux-tools/$KERNEL_VERSION/perf; \
+        echo "Created perf symlink: $INSTALLED_VERSION -> $KERNEL_VERSION"; \
+    fi
 
 # Build and install GoogleTest libraries (CMake find_package friendly)
 RUN cmake -S /usr/src/googletest -B /tmp/googletest-build \
@@ -93,7 +102,7 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
     wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -O cuda-keyring.deb && \
     dpkg -i cuda-keyring.deb && \
     apt-get update && \
-    apt-get -y install cuda-toolkit-12-9 && \
+    apt-get -y install cuda-toolkit-12-9 nvidia-driver-580 && \
     rm cuda-keyring.deb; \
     else \
     echo "Skipping CUDA installation"; \

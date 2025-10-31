@@ -44,6 +44,23 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
+        bool multiply_activations(
+            const float *A, const float *B, float *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        bool multiply_activations_strided(
+            const float *A, const float *B, float *C,
+            int m, int n, int k,
+            int lda, int ldb, int ldc,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
     private:
         const FP32Tensor *weight_tensor_;
     };

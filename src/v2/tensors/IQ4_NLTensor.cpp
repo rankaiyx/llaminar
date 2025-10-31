@@ -235,6 +235,12 @@ namespace llaminar2
         throw std::runtime_error("IQ4_NLTensor::createRMSNorm: not supported for quantized tensors");
     }
 
+    std::unique_ptr<ITensorAttention> IQ4_NLTensor::createAttention()
+    {
+        LOG_ERROR("[IQ4_NLTensor] createAttention not supported for quantized tensors");
+        return nullptr;
+    }
+
     // ========== Decode API ==========
 
     void IQ4_NLTensor::decode_to_fp32(float *dst) const

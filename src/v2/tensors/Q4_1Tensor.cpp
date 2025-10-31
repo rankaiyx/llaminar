@@ -328,6 +328,12 @@ namespace llaminar2
         throw std::runtime_error("Q4_1Tensor: RMSNorm not supported");
     }
 
+    std::unique_ptr<ITensorAttention> Q4_1Tensor::createAttention()
+    {
+        LOG_ERROR("[Q4_1Tensor] createAttention not supported for quantized tensors");
+        return nullptr;
+    }
+
     bool Q4_1Tensor::copyFrom(const TensorBase *src)
     {
         // Quantized tensors are read-only weights - no transfer needed

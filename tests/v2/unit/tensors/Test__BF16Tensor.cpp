@@ -637,3 +637,122 @@ TEST(Test__BF16Tensor, MultipleViews)
     EXPECT_NEAR(view2->data()[0], 60.0f, 1.0f);
     EXPECT_NEAR(view3->data()[0], 120.0f, 2.0f);
 }
+
+/**
+ * @brief Test BF16 activation-activation GEMM (Q @ K^T pattern)
+ *
+ * Tests multiply_activations with both A and B as FP32 activation buffers,
+ * converted to BF16 internally for computation.
+ */
+TEST(Test__BF16Tensor, ActivationGemmQKT)
+{
+    // Small attention-like computation: Q @ K^T
+    // Q: [4, 8] (seq_len=4, head_dim=8)
+    // K: [4, 8]
+    // scores: [4, 4]
+
+    std::vector<float> Q_data = {
+        1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f,
+        2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f,
+        3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f,
+        4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f};
+
+    std::vector<float> K_data = {
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f,
+        3.0f, 3.0f, 3.0f, 3.0f, 3.0f, 3.0f, 3.0f, 3.0f,
+        4.0f, 4.0f, 4.0f, 4.0f, 4.0f, 4.0f, 4.0f, 4.0f};
+
+    std::vector<float> scores_data(16, 0.0f);
+
+    // Create dummy BF16 tensor just to get GEMM kernel
+    auto dummy_tensor = std::make_shared<BF16Tensor>(std::vector<size_t>{1, 1});
+    auto gemm = dummy_tensor->createGemm();
+
+    // Execute: scores = Q @ K^T (transpose_B=true)
+    bool success = gemm->multiply_activations(
+        Q_data.data(), K_data.data(), scores_data.data(),
+        4, 4, 8, // m=4, n=4, k=8
+        true,    // transpose_B (K^T)
+        1.0f,    // alpha
+        0.0f,    // beta
+        nullptr, -1);
+
+    ASSERT_TRUE(success);
+
+    // Expected results (computed with FP32):
+    // scores[0,0] = Q[0] · K[0] = 1*1 + 2*1 + ... + 8*1 = 36
+    // scores[0,1] = Q[0] · K[1] = 1*2 + 2*2 + ... + 8*2 = 72
+    // scores[0,2] = Q[0] · K[2] = 1*3 + 2*3 + ... + 8*3 = 108
+    // scores[0,3] = Q[0] · K[3] = 1*4 + 2*4 + ... + 8*4 = 144
+
+    // BF16 tolerance: ~1-2% relative error for accumulated results
+    EXPECT_NEAR(scores_data[0], 36.0f, 1.0f);
+    EXPECT_NEAR(scores_data[1], 72.0f, 2.0f);
+    EXPECT_NEAR(scores_data[2], 108.0f, 3.0f);
+    EXPECT_NEAR(scores_data[3], 144.0f, 4.0f);
+}
+
+/**
+ * @brief Test BF16 strided activation GEMM (multi-head attention pattern)
+ *
+ * Tests multiply_activations_strided for zero-copy multi-head operations.
+ */
+TEST(Test__BF16Tensor, ActivationGemmStrided)
+{
+    // Simulate 2 heads, seq_len=2, head_dim=4
+    // V: [seq_len, n_heads, head_dim] = [2, 2, 4] interleaved
+    const int seq_len = 2;
+    const int n_heads = 2;
+    const int head_dim = 4;
+
+    std::vector<float> weights_data = {
+        1.0f, 0.0f, // head 0: [2, 2] contiguous
+        0.0f, 1.0f};
+
+    std::vector<float> V_data = {
+        // token 0: [head0: 1,2,3,4, head1: 5,6,7,8]
+        1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f,
+        // token 1: [head0: 2,3,4,5, head1: 6,7,8,9]
+        2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f};
+
+    std::vector<float> output_data(16, 0.0f); // [seq_len, n_heads, head_dim]
+
+    // Create dummy BF16 tensor to get GEMM kernel
+    auto dummy_tensor = std::make_shared<BF16Tensor>(std::vector<size_t>{1, 1});
+    auto gemm = dummy_tensor->createGemm();
+
+    // Process head 0 with strided GEMM
+    const float *V_h0 = V_data.data() + 0; // First element of head 0
+    float *output_h0 = output_data.data() + 0;
+
+    const int lda = seq_len;            // weights contiguous
+    const int ldb = n_heads * head_dim; // V stride between rows
+    const int ldc = n_heads * head_dim; // output stride between rows
+
+    bool success = gemm->multiply_activations_strided(
+        weights_data.data(), V_h0, output_h0,
+        seq_len, head_dim, seq_len, // m=2, n=4, k=2
+        lda, ldb, ldc,
+        false, // transpose_B=false (weights @ V)
+        1.0f,  // alpha
+        0.0f,  // beta
+        nullptr, -1);
+
+    ASSERT_TRUE(success);
+
+    // Expected for head 0:
+    // output[0,h0,:] = weights[0,:] @ V[:,h0,:] = 1.0 * V[0,h0,:] + 0.0 * V[1,h0,:] = [1,2,3,4]
+    // output[1,h0,:] = weights[1,:] @ V[:,h0,:] = 0.0 * V[0,h0,:] + 1.0 * V[1,h0,:] = [2,3,4,5]
+
+    // Check head 0 output (indices 0,1,2,3 and 8,9,10,11)
+    EXPECT_NEAR(output_data[0], 1.0f, 0.1f);
+    EXPECT_NEAR(output_data[1], 2.0f, 0.1f);
+    EXPECT_NEAR(output_data[2], 3.0f, 0.1f);
+    EXPECT_NEAR(output_data[3], 4.0f, 0.1f);
+
+    EXPECT_NEAR(output_data[8], 2.0f, 0.1f);
+    EXPECT_NEAR(output_data[9], 3.0f, 0.1f);
+    EXPECT_NEAR(output_data[10], 4.0f, 0.1f);
+    EXPECT_NEAR(output_data[11], 5.0f, 0.1f);
+}

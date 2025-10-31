@@ -130,6 +130,56 @@ namespace llaminar2
     }
 
     /**
+     * @brief Check if CPU supports AVX512-FP16
+     * @note AVX512-FP16 is supported on Intel Sapphire Rapids (4th gen Xeon) and later
+     */
+    inline bool cpu_supports_avx512_fp16()
+    {
+        if (!cpu_supports_avx512())
+            return false;
+
+        uint32_t regs[4];
+        cpuid(7, 0, regs);
+        return (regs[3] & (1 << 23)) != 0; // EDX bit 23 = AVX512_FP16
+    }
+
+    /**
+     * @brief Check if CPU supports AVX512-BF16
+     * @note AVX512-BF16 is supported on Intel Cooper Lake (3rd gen Xeon) and later
+     */
+    inline bool cpu_supports_avx512_bf16()
+    {
+        if (!cpu_supports_avx512())
+            return false;
+
+        uint32_t regs[4];
+        cpuid(7, 1, regs);
+        return (regs[0] & (1 << 5)) != 0; // EAX bit 5 = AVX512_BF16
+    }
+
+    /**
+     * @brief Check if CPU supports AMX-BF16
+     * @note AMX-BF16 is supported on Intel Sapphire Rapids (4th gen Xeon) and later
+     */
+    inline bool cpu_supports_amx_bf16()
+    {
+        uint32_t regs[4];
+        cpuid(7, 0, regs);
+        return (regs[3] & (1 << 22)) != 0; // EDX bit 22 = AMX_BF16
+    }
+
+    /**
+     * @brief Check if CPU supports AMX-INT8
+     * @note AMX-INT8 is supported on Intel Sapphire Rapids (4th gen Xeon) and later
+     */
+    inline bool cpu_supports_amx_int8()
+    {
+        uint32_t regs[4];
+        cpuid(7, 0, regs);
+        return (regs[3] & (1 << 25)) != 0; // EDX bit 25 = AMX_INT8
+    }
+
+    /**
      * @brief Detect CPU vendor
      * @return "GenuineIntel" for Intel, "AuthenticAMD" for AMD, or other vendor string
      */
@@ -171,6 +221,10 @@ namespace llaminar2
     inline bool cpu_supports_avx2() { return false; }
     inline bool cpu_supports_avx() { return false; }
     inline bool cpu_supports_sse41() { return false; }
+    inline bool cpu_supports_avx512_fp16() { return false; }
+    inline bool cpu_supports_avx512_bf16() { return false; }
+    inline bool cpu_supports_amx_bf16() { return false; }
+    inline bool cpu_supports_amx_int8() { return false; }
     inline const char *cpu_vendor() { return "Unknown"; }
     inline bool cpu_is_intel() { return false; }
 #endif

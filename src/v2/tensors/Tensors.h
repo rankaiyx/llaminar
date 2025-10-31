@@ -294,6 +294,7 @@ namespace llaminar2
         virtual std::unique_ptr<ITensorSwiGLU> createSwiGLU() = 0;
         virtual std::unique_ptr<ITensorSoftmax> createSoftmax() = 0;
         virtual std::unique_ptr<ITensorRMSNorm> createRMSNorm() = 0;
+        virtual std::unique_ptr<ITensorAttention> createAttention() = 0;
 
         // ===== Format Conversion Methods =====
 
@@ -422,6 +423,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion
         void to_fp32(float *dst) const override;
@@ -500,6 +502,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override;
@@ -586,6 +589,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override;
@@ -672,6 +676,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface - delegates to decode methods)
         void to_fp32(float *dst) const override { decode_to_fp32(dst); }
@@ -814,6 +819,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -918,6 +924,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1019,6 +1026,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1121,6 +1129,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1223,6 +1232,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1321,6 +1331,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1417,6 +1428,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1514,6 +1526,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1614,6 +1627,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1710,6 +1724,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1810,6 +1825,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1910,6 +1926,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2005,6 +2022,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2100,6 +2118,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2195,6 +2214,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2290,6 +2310,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2385,6 +2406,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2480,6 +2502,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2575,6 +2598,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }

@@ -190,6 +190,12 @@ namespace llaminar2
                     ctx.n_threads = std::stoi(val);
             }
 
+            // Compute precision
+            else if (arg == "--precision")
+            {
+                ctx.precision = getNextArg(argv, argc, i, "precision");
+            }
+
             // Memory mapping
             else if (arg == "--no-mmap")
             {
@@ -276,7 +282,13 @@ namespace llaminar2
         std::cout << "  --gpu-split STRATEGY      GPU split: even, weighted, or custom ratios\n\n";
 
         std::cout << "Performance:\n";
-        std::cout << "  --threads N               Thread count (-1 = auto)\n\n";
+        std::cout << "  --threads N               Thread count (-1 = auto)\n";
+        std::cout << "  --precision MODE          Compute precision:\n";
+        std::cout << "                              fp32  - Full 32-bit float (default)\n";
+        std::cout << "                              bf16  - Brain Float 16 (Intel Sapphire Rapids+)\n";
+        std::cout << "                              fp16  - IEEE Float 16 (ARM/mobile)\n";
+        std::cout << "                              int8  - 8-bit quantization (future)\n";
+        std::cout << "                              auto  - Hardware-based selection\n\n";
 
         std::cout << "Other:\n";
         std::cout << "  --list-devices            List available devices and exit\n";

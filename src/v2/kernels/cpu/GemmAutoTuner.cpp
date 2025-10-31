@@ -7,7 +7,7 @@
  */
 
 #include "GemmAutoTuner.h"
-#include "GemmMicroKernelAdapter.h"                // For registerAllGemmVariants
+#include "GemmMicroKernelAdapter.h"      // For registerAllGemmVariants
 #include "SmartGemmSearch.h"             // For intelligent variant filtering
 #include "../../tensors/TensorKernels.h" // For IBlockDecoder
 #include "../../utils/Logger.h"
@@ -443,6 +443,58 @@ namespace llaminar
 
                     // Delegate to auto-selected variant
                     return optimal->multiply(A, C, m, n, k, decoder_, alpha, beta);
+                }
+
+                bool multiply_activations(
+                    const float *A, const float *B, float *C,
+                    int m, int n, int k,
+                    bool transpose_B,
+                    float alpha, float beta,
+                    const llaminar2::MPIContext *mpi_ctx,
+                    int device_idx) override
+                {
+                    // TODO: Implement quantized activation-activation GEMM
+                    // For now, unsupported (quantized tensors only support weight GEMM)
+                    (void)A;
+                    (void)B;
+                    (void)C;
+                    (void)m;
+                    (void)n;
+                    (void)k;
+                    (void)transpose_B;
+                    (void)alpha;
+                    (void)beta;
+                    (void)mpi_ctx;
+                    (void)device_idx;
+                    return false;
+                }
+
+                bool multiply_activations_strided(
+                    const float *A, const float *B, float *C,
+                    int m, int n, int k,
+                    int lda, int ldb, int ldc,
+                    bool transpose_B,
+                    float alpha, float beta,
+                    const llaminar2::MPIContext *mpi_ctx,
+                    int device_idx) override
+                {
+                    // TODO: Implement quantized strided activation-activation GEMM
+                    // For now, unsupported (quantized tensors only support weight GEMM)
+                    (void)A;
+                    (void)B;
+                    (void)C;
+                    (void)m;
+                    (void)n;
+                    (void)k;
+                    (void)lda;
+                    (void)ldb;
+                    (void)ldc;
+                    (void)transpose_B;
+                    (void)alpha;
+                    (void)beta;
+                    (void)mpi_ctx;
+                    (void)device_idx;
+                    return false;
                 }
 
                 bool supports_device(int device_idx) const override
