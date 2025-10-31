@@ -2,6 +2,10 @@
  * @file MPIStager.cpp
  * @brief MPI host staging implementation
  *
+ * **Phase 3 Update**: Refactored to use IBackend interface instead of direct
+ * CUDA/ROCm headers. Eliminates header conflicts between cuda_runtime.h and
+ * hip_runtime.h.
+ *
  * @author David Sanftenberg
  */
 
@@ -10,17 +14,48 @@
 #include <cstring> // memcpy
 #include <stdexcept>
 
-// Conditional GPU includes (only when backends enabled)
+// Backend interface (no GPU headers exposed)
+#include "../backends/IBackend.h"
+
+// Conditional backend includes (separate compilation units)
 #ifdef HAVE_CUDA
-#include <cuda_runtime.h>
+#include "../backends/cuda/CUDABackend.h"
 #endif
 
 #ifdef HAVE_ROCM
-#include <hip/hip_runtime.h>
+#include "../backends/rocm/ROCmBackend.h"
 #endif
 
 namespace llaminar2
 {
+    // ========================================================================
+    // Global backend instance (initialized at first use)
+    // ========================================================================
+
+    namespace
+    {
+        IBackend *g_gpu_backend = nullptr;
+        bool g_backend_initialized = false;
+
+        IBackend *getBackend()
+        {
+            if (!g_backend_initialized)
+            {
+#ifdef HAVE_CUDA
+                g_gpu_backend = new CUDABackend();
+                LOG_INFO("[MPIStager] Initialized CUDA backend (" << g_gpu_backend->deviceCount() << " devices)");
+#elif defined(HAVE_ROCM)
+                g_gpu_backend = new ROCmBackend();
+                LOG_INFO("[MPIStager] Initialized ROCm backend (" << g_gpu_backend->deviceCount() << " devices)");
+#else
+                g_gpu_backend = nullptr;
+                LOG_DEBUG("[MPIStager] No GPU backend available (CPU-only mode)");
+#endif
+                g_backend_initialized = true;
+            }
+            return g_gpu_backend;
+        }
+    } // anonymous namespace
 
     // ========================================================================
     // Public API: FP32 staging
@@ -112,26 +147,20 @@ namespace llaminar2
             return; // CPU device - no sync needed
         }
 
-#ifdef HAVE_CUDA
-        cudaError_t err = cudaDeviceSynchronize();
-        if (err != cudaSuccess)
+        IBackend *backend = getBackend();
+        if (!backend)
         {
-            LOG_ERROR("[MPIStager] CUDA synchronize failed: " << cudaGetErrorString(err));
-            throw std::runtime_error("CUDA synchronize failed");
+            LOG_WARN("[MPIStager] synchronizeDevice called but no GPU backend available (device_id=" << device_id << ")");
+            return;
         }
-        LOG_TRACE("[MPIStager] CUDA device synchronized");
-#elif defined(HAVE_ROCM)
-        hipError_t err = hipDeviceSynchronize();
-        if (err != hipSuccess)
+
+        if (!backend->synchronize(device_id))
         {
-            LOG_ERROR("[MPIStager] HIP synchronize failed: " << hipGetErrorString(err));
-            throw std::runtime_error("HIP synchronize failed");
+            LOG_ERROR("[MPIStager] " << backend->backendName() << " synchronize failed (device " << device_id << ")");
+            throw std::runtime_error("GPU synchronize failed");
         }
-        LOG_TRACE("[MPIStager] HIP device synchronized");
-#else
-        // No GPU backends compiled - should not reach here
-        LOG_WARN("[MPIStager] synchronizeDevice called but no GPU backends available (device_id=" << device_id << ")");
-#endif
+
+        LOG_TRACE("[MPIStager] " << backend->backendName() << " device " << device_id << " synchronized");
     }
 
     // ========================================================================
@@ -153,59 +182,47 @@ namespace llaminar2
     }
 
     // ========================================================================
-    // Private: GPU memcpy wrappers
+    // Private: GPU memcpy wrappers (using backend interface)
     // ========================================================================
 
     void MPIStager::deviceToHost(float *dst, const float *src, size_t count, int device_id)
     {
-#ifdef HAVE_CUDA
-        cudaError_t err = cudaMemcpy(dst, src, count * sizeof(float), cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess)
+        IBackend *backend = getBackend();
+        if (!backend)
         {
-            LOG_ERROR("[MPIStager] CUDA D2H memcpy failed: " << cudaGetErrorString(err));
-            throw std::runtime_error("CUDA D2H memcpy failed");
+            LOG_ERROR("[MPIStager] deviceToHost called but no GPU backend available");
+            throw std::runtime_error("No GPU backend available for staging");
         }
-        LOG_TRACE("[MPIStager] CUDA D2H: copied " << count << " floats (" << (count * sizeof(float) / 1024.0 / 1024.0) << " MB)");
-#elif defined(HAVE_ROCM)
-        hipError_t err = hipMemcpy(dst, src, count * sizeof(float), hipMemcpyDeviceToHost);
-        if (err != hipSuccess)
+
+        size_t bytes = count * sizeof(float);
+        if (!backend->deviceToHost(dst, src, bytes, device_id))
         {
-            LOG_ERROR("[MPIStager] HIP D2H memcpy failed: " << hipGetErrorString(err));
-            throw std::runtime_error("HIP D2H memcpy failed");
+            LOG_ERROR("[MPIStager] " << backend->backendName() << " D2H memcpy failed (device " << device_id << ")");
+            throw std::runtime_error("GPU D2H memcpy failed");
         }
-        LOG_TRACE("[MPIStager] HIP D2H: copied " << count << " floats (" << (count * sizeof(float) / 1024.0 / 1024.0) << " MB)");
-#else
-        // No GPU backends - this should not be reached
-        (void)device_id; // Silence unused warning
-        LOG_ERROR("[MPIStager] deviceToHost called but no GPU backends available");
-        throw std::runtime_error("No GPU backends available for staging");
-#endif
+
+        LOG_TRACE("[MPIStager] " << backend->backendName() << " D2H: copied " << count << " floats ("
+                                  << (bytes / 1024.0 / 1024.0) << " MB)");
     }
 
     void MPIStager::hostToDevice(float *dst, const float *src, size_t count, int device_id)
     {
-#ifdef HAVE_CUDA
-        cudaError_t err = cudaMemcpy(dst, src, count * sizeof(float), cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
+        IBackend *backend = getBackend();
+        if (!backend)
         {
-            LOG_ERROR("[MPIStager] CUDA H2D memcpy failed: " << cudaGetErrorString(err));
-            throw std::runtime_error("CUDA H2D memcpy failed");
+            LOG_ERROR("[MPIStager] hostToDevice called but no GPU backend available");
+            throw std::runtime_error("No GPU backend available for staging");
         }
-        LOG_TRACE("[MPIStager] CUDA H2D: copied " << count << " floats (" << (count * sizeof(float) / 1024.0 / 1024.0) << " MB)");
-#elif defined(HAVE_ROCM)
-        hipError_t err = hipMemcpy(dst, src, count * sizeof(float), hipMemcpyHostToDevice);
-        if (err != hipSuccess)
+
+        size_t bytes = count * sizeof(float);
+        if (!backend->hostToDevice(dst, src, bytes, device_id))
         {
-            LOG_ERROR("[MPIStager] HIP H2D memcpy failed: " << hipGetErrorString(err));
-            throw std::runtime_error("HIP H2D memcpy failed");
+            LOG_ERROR("[MPIStager] " << backend->backendName() << " H2D memcpy failed (device " << device_id << ")");
+            throw std::runtime_error("GPU H2D memcpy failed");
         }
-        LOG_TRACE("[MPIStager] HIP H2D: copied " << count << " floats (" << (count * sizeof(float) / 1024.0 / 1024.0) << " MB)");
-#else
-        // No GPU backends - this should not be reached
-        (void)device_id; // Silence unused warning
-        LOG_ERROR("[MPIStager] hostToDevice called but no GPU backends available");
-        throw std::runtime_error("No GPU backends available for staging");
-#endif
+
+        LOG_TRACE("[MPIStager] " << backend->backendName() << " H2D: copied " << count << " floats ("
+                                  << (bytes / 1024.0 / 1024.0) << " MB)");
     }
 
 } // namespace llaminar2

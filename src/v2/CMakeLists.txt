@@ -14,12 +14,22 @@ endif()
 # Enable native CPU optimizations (AVX512/AVX2/FMA)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 
-# Backend options (temporarily disabled due to header conflicts - will enable separately)
+# Backend options (Phase 3: Separate compilation units)
 # CUDA and ROCm cannot be linked together due to type conflicts in headers
-# We'll add separate GPU kernel compilation units later
+# Mutually exclusive: choose one GPU backend or none (CPU-only)
 option(HAVE_CUDA "Enable CUDA backend" OFF)
 option(HAVE_ROCM "Enable ROCm backend" OFF)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
+
+# =============================================================================
+# GPU Backend Mutual Exclusion Check (Phase 3)
+# =============================================================================
+if(HAVE_CUDA AND HAVE_ROCM)
+    message(FATAL_ERROR "Cannot enable both CUDA and ROCm backends. Choose one:\n"
+                        "  cmake -DHAVE_CUDA=ON -DHAVE_ROCM=OFF   (NVIDIA GPUs)\n"
+                        "  cmake -DHAVE_CUDA=OFF -DHAVE_ROCM=ON   (AMD GPUs)\n"
+                        "  cmake -DHAVE_CUDA=OFF -DHAVE_ROCM=OFF  (CPU-only)")
+endif()
 
 # =============================================================================
 # CUDA Backend Configuration
@@ -72,6 +82,34 @@ if(HAVE_ROCM)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx940")  # MI300
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx1030") # Navi 21
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=gfx1100") # Navi 31
+endif()
+
+# =============================================================================
+# Backend Library Compilation (Phase 3)
+# =============================================================================
+
+# CUDA backend (separate .cu compilation unit)
+if(HAVE_CUDA)
+    add_library(cuda_backend STATIC backends/cuda/CUDABackend.cu)
+    target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(cuda_backend PUBLIC CUDA::cudart)
+    
+    # Define HAVE_CUDA for MPIStager and other consumers
+    add_compile_definitions(HAVE_CUDA)
+    
+    message(STATUS "V2: CUDA backend library configured")
+endif()
+
+# ROCm backend (separate .cpp compilation unit with HIP)
+if(HAVE_ROCM)
+    add_library(rocm_backend STATIC backends/rocm/ROCmBackend.cpp)
+    target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(rocm_backend PUBLIC hip::host)
+    
+    # Define HAVE_ROCM for MPIStager and other consumers
+    add_compile_definitions(HAVE_ROCM)
+    
+    message(STATUS "V2: ROCm backend library configured")
 endif()
 
 # Find Python3 for code generation scripts
@@ -298,8 +336,17 @@ target_link_libraries(llaminar2_core PUBLIC
 # BLAS libraries are linked above in the backend selection section
 
 # =============================================================================
-# Link CUDA backend if enabled
+# Link GPU Backend Libraries (Phase 3)
 # =============================================================================
+if(HAVE_CUDA)
+    target_link_libraries(llaminar2_core PUBLIC cuda_backend)
+    message(STATUS "V2: Linked CUDA backend library")
+endif()
+
+if(HAVE_ROCM)
+    target_link_libraries(llaminar2_core PUBLIC rocm_backend)
+    message(STATUS "V2: Linked ROCm backend library")
+endif()
 if(HAVE_CUDA)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_CUDA)
     target_include_directories(llaminar2_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})

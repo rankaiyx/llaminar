@@ -386,10 +386,10 @@ namespace llaminar2
 
         // Get NUMA node from PCIe topology
         unsigned int numa_node;
-        result = nvmlDeviceGetNumaNode(device, &numa_node);
+        result = nvmlDeviceGetNumaNodeId(device, &numa_node);  // Correct function name
         nvmlShutdown();
 
-        if (result == NVML_SUCCESS && numa_node != NVML_DEVICE_NUMA_NODE_UNKNOWN)
+        if (result == NVML_SUCCESS && numa_node != (unsigned int)-1)  // Use -1 for unknown
         {
             return static_cast<int>(numa_node);
         }

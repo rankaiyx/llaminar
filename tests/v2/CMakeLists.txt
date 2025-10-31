@@ -918,6 +918,22 @@ add_v2_test(V2_Unit_DeviceOrchestrator
     MPI_PROCS 1
 )
 
+# Test: GPU Backend Memory Allocation/Transfer (CUDA/ROCm)
+# Only build when GPU backend is enabled
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_test_gpu_backend_memory unit/Test__GPUBackendMemory.cpp)
+    target_link_libraries(v2_test_gpu_backend_memory 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_GPUBackendMemory 
+        COMMAND $<TARGET_FILE:v2_test_gpu_backend_memory>
+        LABELS "V2;Unit;GPUBackend;MemoryManagement;CUDA;ROCm;DataTransfer"
+        MPI_PROCS 1
+    )
+endif()
+
 # Test: ArgParser
 add_executable(v2_test_arg_parser Test__ArgParser.cpp)
 target_link_libraries(v2_test_arg_parser 

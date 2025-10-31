@@ -1,9 +1,18 @@
 /**
  * @file ComputeBackend.h
- * @brief Device manager and compute context interfaces
+ * @brief Device manager and compute context interfaces (LEGACY)
  *
- * Supports heterogeneous multi-GPU execution on a single MPI rank.
- * Enables mixing CUDA, ROCm, Vulkan backends simultaneously.
+ * ⚠️ DEPRECATION NOTICE (Phase 3 - October 2025):
+ * GPU contexts (CUDAComputeContext, ROCmComputeContext, VulkanComputeContext) have been
+ * disabled and replaced with IBackend architecture (see backends/IBackend.h).
+ *
+ * CPU device enumeration (DeviceManager) is still functional and used by Main.cpp.
+ * Full removal is deferred until V2 has a production-ready device manager.
+ *
+ * For GPU operations, use:
+ * - backends/IBackend.h (abstract interface)
+ * - backends/cuda/CUDABackend.h (CUDA implementation)
+ * - backends/rocm/ROCmBackend.h (ROCm implementation)
  *
  * @author David Sanftenberg
  */
@@ -117,95 +126,110 @@ namespace llaminar2
         ITensorSwiGLU *get_swiglu_kernel();
 
     private:
-        struct Impl;
-        std::unique_ptr<Impl> pimpl_;
-    };
+    struct Impl;
+    std::unique_ptr<Impl> pimpl_;
+};
+
+// ============================================================================
+// GPU Compute Contexts (DEPRECATED - Phase 3)
+// ============================================================================
+// These classes are DEPRECATED as of Phase 3. Use IBackend interface instead:
+//   - src/v2/backends/IBackend.h (abstract interface)
+//   - src/v2/backends/cuda/CUDABackend.{h,cu} (CUDA implementation)
+//   - src/v2/backends/rocm/ROCmBackend.{h,cpp} (ROCm implementation)
+//
+// The code below is kept for Main.cpp device enumeration compatibility but
+// should NOT be extended. It will be removed in Phase 4.
+// ============================================================================
+
+#if 0  // DISABLED: GPU contexts moved to IBackend (Phase 3)
 
 #ifdef HAVE_CUDA
-    /**
-     * @brief CUDA compute context
-     */
-    class CUDAComputeContext : public ComputeContext
-    {
-    public:
-        CUDAComputeContext() = default;
+/**
+ * @brief CUDA compute context (DEPRECATED - use CUDABackend)
+ */
+class CUDAComputeContext : public ComputeContext
+{
+public:
+    CUDAComputeContext() = default;
 
-        void *allocate(size_t bytes) override;
-        void free(void *ptr) override;
-        void copy_to_device(void *dst, const void *src, size_t bytes) override;
-        void copy_from_device(void *dst, const void *src, size_t bytes) override;
-        void synchronize() override;
+    void *allocate(size_t bytes) override;
+    void free(void *ptr) override;
+    void copy_to_device(void *dst, const void *src, size_t bytes) override;
+    void copy_from_device(void *dst, const void *src, size_t bytes) override;
+    void synchronize() override;
 
-        ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_CUDA; }
-        bool supports_bf16() const override { return true; } // CUDA_R_16BF
-        bool supports_fp16() const override { return true; }
-        bool supports_int8() const override { return true; }
+    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_CUDA; }
+    bool supports_bf16() const override { return true; } // CUDA_R_16BF
+    bool supports_fp16() const override { return true; }
+    bool supports_int8() const override { return true; }
 
-        // Public members for device management
-        int device_id = 0;
-        cudaStream_t stream = nullptr;
-        cublasHandle_t cublas_handle = nullptr;
-    };
+    // Public members for device management
+    int device_id = 0;
+    cudaStream_t stream = nullptr;
+    cublasHandle_t cublas_handle = nullptr;
+};
 #endif
 
 #ifdef HAVE_ROCM
-    /**
-     * @brief ROCm compute context
-     */
-    class ROCmComputeContext : public ComputeContext
-    {
-    public:
-        ROCmComputeContext() = default;
+/**
+ * @brief ROCm compute context (DEPRECATED - use ROCmBackend)
+ */
+class ROCmComputeContext : public ComputeContext
+{
+public:
+    ROCmComputeContext() = default;
 
-        void *allocate(size_t bytes) override;
-        void free(void *ptr) override;
-        void copy_to_device(void *dst, const void *src, size_t bytes) override;
-        void copy_from_device(void *dst, const void *src, size_t bytes) override;
-        void synchronize() override;
+    void *allocate(size_t bytes) override;
+    void free(void *ptr) override;
+    void copy_to_device(void *dst, const void *src, size_t bytes) override;
+    void copy_from_device(void *dst, const void *src, size_t bytes) override;
+    void synchronize() override;
 
-        ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_ROCM; }
-        bool supports_bf16() const override { return true; }
-        bool supports_fp16() const override { return true; }
-        bool supports_int8() const override { return true; }
-
-        // Public members for device management
-        int device_id = 0;
-        hipStream_t stream = nullptr;
-        hipblasHandle_t hipblas_handle = nullptr;
-    };
+    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_ROCM; }
+    bool supports_bf16() const override { return true; }
+    bool supports_fp16() const override { return true; }
+    bool supports_int8() const override { return true; }
+    // Public members for device management
+    int device_id = 0;
+    hipStream_t stream = nullptr;
+    hipblasHandle_t hipblas_handle = nullptr;
+};
 #endif
 
 #ifdef HAVE_VULKAN
-    /**
-     * @brief Vulkan compute context
-     */
-    class VulkanComputeContext : public ComputeContext
-    {
-    public:
-        VulkanComputeContext() = default;
+/**
+ * @brief Vulkan compute context (DEPRECATED - will use IBackend)
+ */
+class VulkanComputeContext : public ComputeContext
+{
+public:
+    VulkanComputeContext() = default;
 
-        void *allocate(size_t bytes) override;
-        void free(void *ptr) override;
-        void copy_to_device(void *dst, const void *src, size_t bytes) override;
-        void copy_from_device(void *dst, const void *src, size_t bytes) override;
-        void synchronize() override;
+    void *allocate(size_t bytes) override;
+    void free(void *ptr) override;
+    void copy_to_device(void *dst, const void *src, size_t bytes) override;
+    void copy_from_device(void *dst, const void *src, size_t bytes) override;
+    void synchronize() override;
 
-        ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_VULKAN; }
-        bool supports_bf16() const override { return false; } // Depends on extension
-        bool supports_fp16() const override { return true; }
-        bool supports_int8() const override { return true; }
+    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_VULKAN; }
+    bool supports_bf16() const override { return false; } // Depends on extension
+    bool supports_fp16() const override { return true; }
+    bool supports_int8() const override { return true; }
 
-        // Public members for device management
-        int device_id = 0;
-        // TODO: VkDevice, VkQueue, VkCommandPool, etc.
-    };
+    // Public members for device management
+    int device_id = 0;
+    // TODO: VkDevice, VkQueue, VkCommandPool, etc.
+};
 #endif
 
-    /**
-     * @brief Device manager singleton
-     *
-     * Enumerates all available compute devices and manages context creation.
-     *
+#endif  // #if 0 - GPU contexts disabled (Phase 3)
+
+/**
+ * @brief Device manager singleton
+ *
+ * Enumerates all available compute devices and manages context creation.
+ *
      * NUMA-Aware Filtering (Phase 1):
      * When initialized with a specific NUMA node, only enumerates devices
      * affine to that socket. This is critical for MPI multi-socket execution
