@@ -934,6 +934,50 @@ if(HAVE_CUDA OR HAVE_ROCM)
     )
 endif()
 
+# Test: CUDA IQ4_NL GEMM Kernel Correctness
+# Only build when CUDA is enabled
+if(HAVE_CUDA)
+    add_executable(v2_test_cuda_gemm unit/Test__CUDAGemm.cpp)
+    target_link_libraries(v2_test_cuda_gemm 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_CUDAGemm 
+        COMMAND $<TARGET_FILE:v2_test_cuda_gemm>
+        LABELS "V2;Unit;Kernels;GEMM;IQ4_NL;CUDA;Quantization"
+        MPI_PROCS 1
+    )
+    
+    # Test: CUDA GEMM Auto-Tuner
+    add_executable(v2_test_cuda_gemm_autotuner unit/Test__CudaGemmAutoTuner.cpp)
+    target_link_libraries(v2_test_cuda_gemm_autotuner 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_CudaGemmAutoTuner 
+        COMMAND $<TARGET_FILE:v2_test_cuda_gemm_autotuner>
+        LABELS "V2;Unit;AutoTuning;CUDA;GEMM;Performance"
+        MPI_PROCS 1
+    )
+    
+    # Test: IQ4_NL BF16 Decoder Correctness
+    # Tests BF16 decoder method for IQ4_NL quantized tensors on Ampere+ GPUs
+    add_executable(v2_test_iq4nl_bf16_decoder unit/Test__IQ4_NL_BF16_Decoder.cu)
+    target_link_libraries(v2_test_iq4nl_bf16_decoder 
+        llaminar2_core 
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_IQ4_NL_BF16_Decoder 
+        COMMAND $<TARGET_FILE:v2_test_iq4nl_bf16_decoder>
+        LABELS "V2;Unit;Kernels;IQ4_NL;BF16;CUDA;Quantization;Ampere"
+        MPI_PROCS 1
+    )
+endif()
+
 # Test: ArgParser
 add_executable(v2_test_arg_parser Test__ArgParser.cpp)
 target_link_libraries(v2_test_arg_parser 
@@ -1037,6 +1081,19 @@ target_link_libraries(v2_test_gemm_autotuner_correctness
 add_v2_test(V2_Unit_GemmAutoTunerCorrectness 
     COMMAND $<TARGET_FILE:v2_test_gemm_autotuner_correctness>
     LABELS "V2;Unit;Kernels;AutoTuning;GEMM;Correctness;AllVariants"
+    MPI_PROCS 1
+)
+
+# Test: ML-Based Tile Autotuner (Phase 3, November 2025)
+add_executable(v2_test_gemm_autotuner_ml unit/Test__GemmAutoTunerML.cpp)
+target_link_libraries(v2_test_gemm_autotuner_ml 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GemmAutoTunerML 
+    COMMAND $<TARGET_FILE:v2_test_gemm_autotuner_ml>
+    LABELS "V2;Unit;Kernels;AutoTuning;MachineLearning;TilePrediction;Phase3"
     MPI_PROCS 1
 )
 
@@ -1315,6 +1372,27 @@ add_v2_test(V2_Integration_DequantEquivalency
     LABELS "V2;Integration;Quantization;IBlockDecoder;LlamaCppParity;Correctness"
 )
 
+# Test: ML AutoTuner E2E - Validate ML-based tile predictor integration (November 2025)
+if(HAVE_CUDA)
+    add_executable(v2_test_ml_autotuner_e2e
+        integration/Test__MLAutoTunerE2E.cpp
+    )
+    
+    target_link_libraries(v2_test_ml_autotuner_e2e
+        llaminar2_core
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    
+    add_v2_test(V2_Integration_MLAutoTuner
+        COMMAND $<TARGET_FILE:v2_test_ml_autotuner_e2e>
+        MPI_PROCS 1
+        LABELS "V2;Integration;AutoTuner;MachineLearning;GEMM;Performance;Correctness"
+    )
+endif()
+
 # Placeholder for integration test executables (to be added)
 # Example:
 # add_executable(v2_test_model_loader integration/test_model_loader.cpp)
@@ -1492,6 +1570,117 @@ add_v2_perf_test(V2_Perf_IQ4NL_GEMM
     MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
 )
 
+# NOTE: Removed experimental Phase 2.7 pipelining tests
+# - Perf__CuTePipelining.cu (references non-existent CudaGemmKernelTensorCorePipelined.cuh)
+# - Perf__Phase2_7_TensorCore_Pipeline.cu (references non-existent CudaGemmKernelTensorCorePipeline.cuh)
+# These were experimental explorations of software pipelining with CuTe that are not
+# part of the current production kernel architecture.
+
+# NOTE: Removed CUDAvsGPU_GEMM performance test
+# Reason: Compared GPU against single-threaded CPU, which is not representative
+# of production performance and took 6+ minutes to run. Use V2_Perf_IQ4NL_GEMM
+# for proper multi-rank CPU benchmarks, and CUDA unit tests verify GPU correctness.
+
+# Performance Test: Phase 1 Standalone CUDA Kernel Benchmark
+# Direct baseline vs optimized kernel comparison with manual CUDA memory allocation
+# Bypasses pipeline/autotuner to measure pure kernel performance
+if(HAVE_CUDA)
+    add_executable(v2_perf_phase1_standalone performance/Perf__Phase1_Standalone.cu)
+    target_link_libraries(v2_perf_phase1_standalone
+        cuda_backend
+        GTest::gtest
+        CUDA::cudart
+    )
+    set_target_properties(v2_perf_phase1_standalone PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    
+    add_v2_perf_test(V2_Perf_Phase1_Standalone
+        COMMAND $<TARGET_FILE:v2_perf_phase1_standalone>
+        LABELS "V2;Performance;CUDA;Phase1;Standalone;GEMM"
+        MPI_PROCS 1  # Single GPU, no MPI
+    )
+    
+    # Performance Test: Phase 1 Debug - Separate configs for baseline vs optimized
+    # Tests each kernel with its own optimal configuration
+    add_executable(v2_perf_phase1_debug performance/Perf__Phase1_Debug.cu)
+    target_link_libraries(v2_perf_phase1_debug
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    set_target_properties(v2_perf_phase1_debug PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    
+    add_v2_perf_test(V2_Perf_Phase1_Debug
+        COMMAND $<TARGET_FILE:v2_perf_phase1_debug>
+        LABELS "V2;Performance;CUDA;Phase1;Debug;GEMM"
+        MPI_PROCS 1  # Single GPU, no MPI
+    )
+    
+    # Performance Test: Phase 2 Tensor Core - wmma API with FP16 compute
+    # Validates 3-4× speedup over Phase 1 using Tensor Cores
+    add_executable(v2_perf_phase2_tensorcore performance/Perf__Phase2_TensorCore.cu)
+    target_link_libraries(v2_perf_phase2_tensorcore
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    set_target_properties(v2_perf_phase2_tensorcore PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    
+    add_v2_perf_test(V2_Perf_Phase2_TensorCore
+        COMMAND $<TARGET_FILE:v2_perf_phase2_tensorcore>
+        LABELS "V2;Performance;CUDA;Phase2;TensorCore;FP32Input;GEMM"
+        MPI_PROCS 1  # Single GPU, no MPI
+    )
+    
+    # Phase 2.5: FP16 input with async copy
+    add_executable(v2_perf_phase2_5_tensorcore_fp16 performance/Perf__Phase2_5_TensorCore_FP16.cu)
+    target_link_libraries(v2_perf_phase2_5_tensorcore_fp16
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    set_target_properties(v2_perf_phase2_5_tensorcore_fp16 PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    
+    add_v2_perf_test(V2_Perf_Phase2_5_TensorCore_FP16
+        COMMAND $<TARGET_FILE:v2_perf_phase2_5_tensorcore_fp16>
+        LABELS "V2;Performance;CUDA;Phase2_5;TensorCore;FP16Input;AsyncCopy;GEMM"
+        MPI_PROCS 1  # Single GPU, no MPI
+    )
+    
+    # Phase 3: Tile size tuning sweep
+    add_executable(v2_perf_phase3_tile_sweep performance/Perf__Phase3_TileSizeSweep.cu)
+    target_link_libraries(v2_perf_phase3_tile_sweep
+        cuda_backend
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    set_target_properties(v2_perf_phase3_tile_sweep PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    
+    add_v2_perf_test(V2_Perf_Phase3_TileSizeSweep
+        COMMAND $<TARGET_FILE:v2_perf_phase3_tile_sweep>
+        LABELS "V2;Performance;CUDA;Phase3;TensorCore;TileSizeTuning;Optimization;GEMM"
+        MPI_PROCS 1  # Single GPU, no MPI
+    )
+endif()
+
 # Performance Test: 64×32 Tile Size Comparison
 # Compares V1's optimal 64×32 tile against auto-selected tiles for 1024 tokens
 add_executable(v2_perf_tile64x32_comparison performance/Perf__Tile64x32Comparison.cpp)
@@ -1531,6 +1720,102 @@ add_v2_perf_test(V2_Perf_GemmTileScaling
     LABELS "V2;Performance;GEMM;Templates;TileSize;Scaling;Phase4"
     MPI_PROCS 2  # Use 2 ranks for consistency
 )
+
+# Performance Test: CUDA GEMM Heuristic Validation (Phase 6.11)
+# Benchmarks ALL kernel variants for 0.5B/4B model matrix shapes
+# Compares heuristic ranking vs empirical performance
+# Validates auto-selection logic makes good choices
+if(HAVE_CUDA)
+    add_executable(v2_perf_cuda_heuristic_validation 
+        performance/Perf__CudaGemmHeuristicValidation.cpp
+    )
+    target_link_libraries(v2_perf_cuda_heuristic_validation 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    set_target_properties(v2_perf_cuda_heuristic_validation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+    )
+    
+    add_v2_perf_test(V2_Perf_CudaHeuristicValidation
+        COMMAND $<TARGET_FILE:v2_perf_cuda_heuristic_validation>
+        LABELS "V2;Performance;CUDA;GEMM;AutoTuning;HeuristicValidation;ModelSizes"
+        MPI_PROCS 1  # Single rank GPU benchmark
+    )
+    
+    # Custom target: Train ML heuristic from benchmark data
+    # This regenerates cuda_heuristic_weights.h in the source tree
+    # Run with: cmake --build . --target train_cuda_heuristic
+    add_custom_target(train_cuda_heuristic
+        COMMAND ${CMAKE_COMMAND} -E echo "Training ML heuristic from benchmark data..."
+        COMMAND Python3::Interpreter 
+                ${PROJECT_SOURCE_DIR}/train_cuda_heuristic.py
+                --input ${CMAKE_BINARY_DIR}/cuda_gemm_benchmark_data.csv
+                --output-dir ${CMAKE_SOURCE_DIR}/src/v2/kernels/cuda
+        COMMAND ${CMAKE_COMMAND} -E echo "Generated: src/v2/kernels/cuda/cuda_heuristic_weights.h"
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMENT "Training CUDA GEMM ML heuristic and generating C++ header"
+        VERBATIM
+    )
+    
+    # Make training depend on the benchmark executable
+    add_dependencies(train_cuda_heuristic v2_perf_cuda_heuristic_validation)
+    
+    # Optional: Auto-train after running performance test
+    # Uncomment to automatically regenerate weights when benchmark data changes
+    # add_custom_command(
+    #     OUTPUT ${CMAKE_SOURCE_DIR}/src/v2/kernels/cuda/cuda_heuristic_weights.h
+    #     COMMAND $<TARGET_FILE:v2_perf_cuda_heuristic_validation>
+    #     COMMAND Python3::Interpreter 
+    #             ${PROJECT_SOURCE_DIR}/train_cuda_heuristic.py
+    #             --input ${CMAKE_BINARY_DIR}/cuda_gemm_benchmark_data.csv
+    #             --output-dir ${CMAKE_SOURCE_DIR}/src/v2/kernels/cuda
+    #     DEPENDS v2_perf_cuda_heuristic_validation
+    #     COMMENT "Running benchmark and training ML heuristic"
+    #     VERBATIM
+    # )
+    
+    # Performance Test: Tensor Core Heuristic Validation (Phase 3+)
+    # COMPREHENSIVE benchmarking of ALL Tensor Core variants
+    # Tests 0.5B, 4B, 7B, 14B model sizes with batch sizes 1, 8, 32, 128
+    # Exports data for ML heuristic training: tensorcore_benchmark_data.csv
+    # Validates Phase 3 optimization (32×64×16 for m=32)
+    add_executable(v2_perf_tensorcore_heuristic_validation 
+        performance/Perf__TensorCoreHeuristicValidation.cpp
+    )
+    target_link_libraries(v2_perf_tensorcore_heuristic_validation 
+        llaminar2_core 
+        GTest::gtest
+    )
+    set_target_properties(v2_perf_tensorcore_heuristic_validation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+    )
+    
+    add_v2_perf_test(V2_Perf_TensorCoreHeuristicValidation
+        COMMAND $<TARGET_FILE:v2_perf_tensorcore_heuristic_validation>
+        LABELS "V2;Performance;CUDA;TensorCore;AutoTuning;HeuristicValidation;ModelSizes;Comprehensive"
+        MPI_PROCS 1  # Single rank GPU benchmark
+    )
+    
+    # Custom target: Train ML heuristic from Tensor Core benchmark data
+    # This regenerates tensorcore_heuristic_weights.h in the source tree
+    # Run with: cmake --build . --target train_tensorcore_heuristic
+    add_custom_target(train_tensorcore_heuristic
+        COMMAND ${CMAKE_COMMAND} -E echo "Training Tensor Core ML heuristic from benchmark data..."
+        COMMAND Python3::Interpreter 
+                ${PROJECT_SOURCE_DIR}/train_tensorcore_heuristic.py
+                --input ${CMAKE_BINARY_DIR}/tensorcore_benchmark_data.csv
+                --output-dir ${CMAKE_SOURCE_DIR}/src/v2/kernels/cuda
+        COMMAND ${CMAKE_COMMAND} -E echo "Generated: src/v2/kernels/cuda/tensorcore_heuristic_weights.h"
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMENT "Training Tensor Core GEMM ML heuristic and generating C++ header"
+        VERBATIM
+    )
+    
+    # Make training depend on the benchmark executable
+    add_dependencies(train_tensorcore_heuristic v2_perf_tensorcore_heuristic_validation)
+endif()
 
 # Performance Test: Qwen2 E2E Pipeline Throughput
 # Benchmarks full pipeline: model loading, prefill, decode
