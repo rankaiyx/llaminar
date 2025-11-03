@@ -950,15 +950,19 @@ if(HAVE_CUDA)
     )
     
     # Test: CUDA GEMM Auto-Tuner
-    add_executable(v2_test_cuda_gemm_autotuner unit/Test__CudaGemmAutoTuner.cpp)
+    add_executable(v2_test_cuda_gemm_autotuner unit/kernels/cuda/Test__CudaGemmAutoTuner.cpp)
+    target_include_directories(v2_test_cuda_gemm_autotuner PRIVATE
+        ${ONNXRUNTIME_INCLUDE_DIR}
+    )
     target_link_libraries(v2_test_cuda_gemm_autotuner 
-        llaminar2_core 
+        llaminar2_core
+        cuda_backend
         GTest::gtest
         GTest::gtest_main
     )
     add_v2_test(V2_Unit_CudaGemmAutoTuner 
         COMMAND $<TARGET_FILE:v2_test_cuda_gemm_autotuner>
-        LABELS "V2;Unit;AutoTuning;CUDA;GEMM;Performance"
+        LABELS "V2;Unit;AutoTuning;CUDA;GEMM;Heuristics;ConfigGeneration;CacheManagement"
         MPI_PROCS 1
     )
     
@@ -1819,6 +1823,29 @@ if(HAVE_CUDA)
     add_v2_perf_test(V2_Perf_CudaHeuristicCanary
         COMMAND $<TARGET_FILE:v2_perf_cuda_heuristic_canary>
         LABELS "V2;Performance;CUDA;GEMM;AutoTuning;HeuristicCanary;GeneralizationTest;NoTrainingData"
+        MPI_PROCS 1  # Single rank GPU benchmark
+    )
+
+    # Performance Test: Batch Prefill GFLOPS Benchmark
+    # Measures peak GFLOPS for batch prefill scenarios (Qwen 0.5B)
+    # Tests batch sizes from 1 to 1024 to find optimal throughput
+    # Useful for understanding batch scaling behavior
+    add_executable(v2_perf_batch_prefill_gflops 
+        performance/Perf__BatchPrefillGflops.cpp
+    )
+    target_link_libraries(v2_perf_batch_prefill_gflops 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    set_target_properties(v2_perf_batch_prefill_gflops PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+        EXCLUDE_FROM_ALL TRUE  # Build manually
+    )
+    
+    add_v2_perf_test(V2_Perf_BatchPrefillGflops
+        COMMAND $<TARGET_FILE:v2_perf_batch_prefill_gflops>
+        LABELS "V2;Performance;CUDA;GEMM;BatchPrefill;Throughput;Qwen"
         MPI_PROCS 1  # Single rank GPU benchmark
     )
 

@@ -489,14 +489,15 @@ namespace llaminar2
 
                 if (use_nn)
                 {
-                    // ONNX neural network heuristic: Works on ANY shape (no lookup table needed)
-                    // Trained on 0.5B/7B/72B, validated on 4B/32B, tested on 14B/235B/671B
-                    // Test R²=0.9569 (95.69% accuracy on unseen model sizes)
+                    // ONNX neural network ranking model: Works on ANY shape (no lookup table needed)
+                    // Trained on 0.5B/4B/7B, validated on 1.5B/14B/32B/72B/235B/671B
+                    // 100% top-30 hit rate on 26 unseen test cases (97,344 configs)
+                    // ⚠️  Returns ranking score, NOT GFLOPS! Use for sorting only.
 #ifdef HAVE_ONNX_RUNTIME
                     auto &nn = CudaGemmNeuralNetwork::instance();
                     if (nn.isInitialized())
                     {
-                        score = nn.predict(config, m, n, k); // Predicted GFLOPS (higher is better)
+                        score = nn.rankConfig(config, m, n, k); // Ranking score (higher = better)
                     }
                     else
                     {

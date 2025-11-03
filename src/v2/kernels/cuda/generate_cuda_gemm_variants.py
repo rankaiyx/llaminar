@@ -23,18 +23,28 @@ from typing import List, Tuple, Dict
 # Configuration Space
 # =============================================================================
 
-# Tile dimensions (shared memory constraints apply)
-TILE_M_VALUES = [16, 32, 64]
-TILE_N_VALUES = [16, 32, 64]
-TILE_K_VALUES = [32]  # Fixed for IQ4_NL block size
+# Tile dimensions - MAXIMIZED for RTX 3090 hardware capabilities
+# RTX 3090 (sm_86): 100 KB shared memory per SM, 48 KB default per block (100 KB with opt-in)
+# Max threads per block: 1024
+# Strategy: Cover full range from tiny (8×8) for small ops to huge (256×256) for max throughput
+TILE_M_VALUES = [8, 16, 32, 64, 128, 256]
+TILE_N_VALUES = [8, 16, 32, 64, 128, 256]
 
-# Thread block configuration
-BLOCK_THREADS_X_VALUES = [8, 16]
-BLOCK_THREADS_Y_VALUES = [8, 16]
+# TILE_K: Full range for different arithmetic intensity and occupancy trade-offs
+# Small (8, 16): High occupancy, low shared memory
+# Medium (24, 32): Balanced
+# Large (48, 64, 96, 128): High arithmetic intensity, may require opt-in shared memory
+TILE_K_VALUES = [8, 16, 24, 32, 48, 64, 96, 128]
+
+# Thread block configuration - expanded to support larger tiles
+# Max 1024 threads per block = 32×32
+BLOCK_THREADS_X_VALUES = [4, 8, 16, 32]
+BLOCK_THREADS_Y_VALUES = [4, 8, 16, 32]
 
 # Work items per thread (register pressure)
-WORK_ITEMS_X_VALUES = [1, 2, 4, 8]
-WORK_ITEMS_Y_VALUES = [1, 2, 4, 8]
+# Larger values (16) enable very large tiles with fewer threads
+WORK_ITEMS_X_VALUES = [1, 2, 4, 8, 16]
+WORK_ITEMS_Y_VALUES = [1, 2, 4, 8, 16]
 
 # Prefetching stages (0 = no prefetch, 1-2 = double/triple buffering)
 PREFETCH_STAGES_VALUES = [0, 1, 2]
@@ -46,7 +56,10 @@ USE_TRANSPOSE_VALUES = [False, True]
 VECTORIZE_VALUES = [1, 2, 4]
 
 # Output configuration
-NUM_FILES = 10  # Split across 10 .inc files for organization
+# PARALLELISM: More files = better nvcc parallelization
+# With 56 cores and 37,380 configs, target ~100-150 configs per file
+# This gives us ~250-370 files, ensuring all cores stay busy
+NUM_FILES = 250  # Split across 250 .inc files for maximum parallelism
 OUTPUT_DIR = "generated"
 OUTPUT_CMAKE_FILE = os.path.join(OUTPUT_DIR, "sources.cmake")
 
@@ -55,11 +68,14 @@ OUTPUT_CMAKE_FILE = os.path.join(OUTPUT_DIR, "sources.cmake")
 # =============================================================================
 
 # Shared memory limits by compute capability
-SM_70_SHARED_MEM_LIMIT = 48 * 1024  # V100 (48KB)
-SM_80_SHARED_MEM_LIMIT = 164 * 1024  # A100 (164KB)
+SM_70_SHARED_MEM_LIMIT = 48 * 1024    # V100 (48KB default)
+SM_80_SHARED_MEM_LIMIT = 164 * 1024   # A100 (164KB with opt-in)
+SM_86_SHARED_MEM_LIMIT = 100 * 1024   # RTX 3090 (100KB per SM, measured)
 
-# We target sm_70 as baseline, so use conservative limit
-SHARED_MEM_LIMIT = SM_70_SHARED_MEM_LIMIT
+# Use full hardware capability - configs > 48KB will require cudaFuncSetAttribute
+# We'll generate ALL valid configs and handle opt-in at runtime
+SHARED_MEM_LIMIT = SM_86_SHARED_MEM_LIMIT
+SHARED_MEM_DEFAULT_LIMIT = 48 * 1024  # Configs <= 48KB work without opt-in
 
 # Register file size (64K 32-bit registers per SM on sm_70)
 MAX_REGISTERS_PER_THREAD = 255
@@ -74,17 +90,23 @@ def estimate_shared_memory(tile_m: int, tile_n: int, tile_k: int,
     Estimate shared memory usage for a kernel variant.
     
     Shared memory layout:
-      - s_A[TILE_M][TILE_K] - A tile (FP32)
-      - s_B[TILE_N][TILE_K] - B tile (FP32, or transposed)
+      - s_A[TILE_M][TILE_K_PADDED] - A tile (FP32) with +1 padding
+      - s_B[TILE_N][TILE_K_PADDED] - B tile (FP32, or transposed) with +1 padding
       - Prefetch buffers multiply by (1 + prefetch_stages)
+    
+    NOTE: We add +1 padding to TILE_K to avoid shared memory bank conflicts
+    when TILE_K is a power of 2 (e.g., 32).
     
     Returns: Shared memory bytes
     """
     bytes_per_float = 4
     
-    # Base allocation
-    s_A_bytes = tile_m * tile_k * bytes_per_float
-    s_B_bytes = tile_n * tile_k * bytes_per_float
+    # Add +1 padding to avoid bank conflicts (always applied in kernel)
+    tile_k_padded = tile_k + 1
+    
+    # Base allocation with padding
+    s_A_bytes = tile_m * tile_k_padded * bytes_per_float
+    s_B_bytes = tile_n * tile_k_padded * bytes_per_float
     
     # Double/triple buffering for prefetch
     buffering_factor = 1 + prefetch_stages
@@ -300,36 +322,99 @@ def generate_file_footer() -> str:
 
 def write_variant_file(file_index: int, configs: List[Tuple], output_dir: str) -> str:
     """
-    Write a single .inc file with variant dispatches.
+    Write a single .cu file with kernel instantiations + registry.
+    Uses __attribute__((constructor)) pattern like CPU microkernel.
+    
+    Each file:
+    1. Explicitly instantiates ~150 kernel templates
+    2. Creates launcher wrapper functions
+    3. Registers launchers with CudaGemmKernelRegistry
     
     Returns: Filename
     """
-    filename = f"CudaGemmVariants_{file_index:02d}.inc"
+    filename = f"CudaGemmVariants_{file_index:02d}.cu"
     filepath = os.path.join(output_dir, filename)
     
     with open(filepath, 'w') as f:
         # Header
-        f.write(generate_file_header(file_index))
+        f.write(f"""/**
+ * @file {filename}
+ * @brief Auto-generated CUDA GEMM kernel variant instantiations (shard {file_index}/{NUM_FILES})
+ * 
+ * AUTO-GENERATED by generate_cuda_gemm_variants.py
+ * DO NOT EDIT MANUALLY
+ */
+
+#include "../CudaGemmKernelRegistry.h"
+#include "../IQ4_NL_BlockDecoder.h"
+#include <cuda_runtime.h>
+
+// Include kernel template definition (needed for implicit instantiation)
+// Note: This is safe because each .cu file compiles separately
+#include "../CudaGemmVariantsBaseline.cu"
+
+// Force-link symbol (called by CudaGemmKernelInit.cu)
+extern "C" void forceLink_CudaGemmVariants_{file_index:02d}() {{}}
+
+// Launcher wrappers + registration
+namespace llaminar2 {{
+namespace cuda {{
+
+""")
         
-        # Instantiations
+        # For each config: instantiate + create launcher + register
         for config in configs:
-            f.write(generate_config_instantiation(config))
-            f.write("\n")
+            tile_m, tile_n, tile_k, threads_m, threads_n, work_m, work_n, prefetch, transpose, vec = config
+            transpose_str = "true" if transpose else "false"
+            
+            # Unique name for this variant
+            variant_name = f"variant_{tile_m}_{tile_n}_{tile_k}_{threads_m}_{threads_n}_{work_m}_{work_n}_{prefetch}_{1 if transpose else 0}_{vec}"
+            
+            # Launcher wrapper (no explicit instantiation - template will be implicitly instantiated when called)
+            f.write(f"""// Config: {tile_m}x{tile_n}x{tile_k}, threads={threads_m}x{threads_n}, work={work_m}x{work_n}, prefetch={prefetch}, transpose={transpose}, vec={vec}
+// Launcher wrapper
+cudaError_t launch_{variant_name}(
+    const float *A, const IQ4_NLBlock *B_blocks, float *C,
+    int m, int n, int k, dim3 gridDim, dim3 blockDim, cudaStream_t stream)
+{{
+    const int num_k_blocks = k / 32;
+    IQ4_NL_Decoder<IQ4_NLBlock> decoder(B_blocks, n, num_k_blocks);
+    quantized_gemm_kernel_variant<IQ4_NL_Decoder<IQ4_NLBlock>, {tile_m}, {tile_n}, {tile_k}, 
+        {threads_m}, {threads_n}, {work_m}, {work_n}, {prefetch}, {transpose_str}, {vec}>
+        <<<gridDim, blockDim, 0, stream>>>(A, C, m, n, k, decoder);
+    return cudaGetLastError();
+}}
+
+// Auto-register with __attribute__((constructor))
+namespace {{
+    __attribute__((constructor)) void register_{variant_name}() {{
+        CudaGemmKernelRegistry::instance().register_kernel(
+            {tile_m}, {tile_n}, {tile_k}, {threads_m}, {threads_n}, {work_m}, {work_n},
+            {prefetch}, {"true" if transpose else "false"}, {vec}, &launch_{variant_name});
+    }}
+}}
+
+""")
         
-        # Footer
-        f.write(generate_file_footer())
+        # Close namespaces AFTER all variants
+        f.write("""}  // namespace cuda
+}  // namespace llaminar2
+""")
     
     return filename
 
 def write_cmake_file(filenames: List[str], output_dir: str):
-    """Generate sources.cmake - not needed for .inc files, but keep for consistency."""
-    cmake_path = os.path.join(output_dir, "sources.cmake")
+    """Generate CMakeLists.txt fragment to add all .cu files to build."""
+    cmake_path = os.path.join(output_dir, "CMakeVariantSources.txt")
     
     with open(cmake_path, 'w') as f:
         f.write("# AUTO-GENERATED by generate_cuda_gemm_variants.py\n")
-        f.write("# .inc files are #included directly in CudaGemmVariants.cu\n")
-        f.write("# No separate compilation needed\n\n")
-        f.write(f"# Generated {len(filenames)} variant include files\n")
+        f.write("# Include this file in parent CMakeLists.txt to add all variant sources\n")
+        f.write(f"# Total files: {len(filenames)} (enables {len(filenames)}-way parallel compilation)\n\n")
+        f.write("set(CUDA_GEMM_VARIANT_SOURCES\n")
+        for filename in filenames:
+            f.write(f"    kernels/cuda/generated/{filename}\n")
+        f.write(")\n")
 
 # =============================================================================
 # Main
