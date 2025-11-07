@@ -322,6 +322,32 @@ namespace llaminar2
         return true;
     }
 
+    void ModelLoader::initializeTestModel()
+    {
+        // Initialize minimal valid GGUFModel structure for testing
+        model_.version = 3;
+        model_.tensor_count = 0;
+        model_.metadata_kv_count = 0;
+        model_.alignment = 32;
+        model_.architecture = "test";
+        model_.context_length = 2048;
+        model_.embedding_length = 512;
+        model_.block_count = 1;
+        model_.head_count = 8;
+        model_.head_count_kv = 8;
+        model_.vocab_size = 1000;
+        model_.rope_theta = 10000.0f;
+        model_.data_offset = 0;
+        model_.split_count = 1;
+        model_.split_no = 0;
+        model_.split_paths.resize(1, "test.gguf");
+        model_.split_data_offsets.resize(1, 0);
+        
+        loaded_ = true; // Mark as "loaded" so tests don't try to load actual file
+        
+        LOG_DEBUG("[ModelLoader] Initialized test model (no file loaded)");
+    }
+
     std::shared_ptr<TensorBase> ModelLoader::loadTensor(const std::string &tensor_name,
                                                         int device_idx,
                                                         WeightPrecision weight_precision)

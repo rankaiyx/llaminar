@@ -210,6 +210,14 @@ namespace llaminar2
         bool loadModel(const std::string &file_path);
 
         /**
+         * @brief Initialize a minimal valid model structure for testing
+         *
+         * Creates a dummy GGUFModel with valid defaults to prevent accessing
+         * uninitialized memory in unit tests. Does not load any actual file.
+         */
+        void initializeTestModel();
+
+        /**
          * @brief Check if model has been loaded
          */
         bool isLoaded() const { return loaded_; }

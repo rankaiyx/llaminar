@@ -188,10 +188,17 @@ endfunction()
 # Find GTest (should be available from parent CMake)
 find_package(GTest REQUIRED)
 
-# Enable pipeline snapshot capture for all test builds
+# Enable pipeline snapshot capture for test builds (matches core library)
 # This compile definition enables the snapshot infrastructure in PipelineBase.
 # In release builds (without this flag), all snapshot code compiles away to NOOPs.
-add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+# CRITICAL: Must match core library definition to avoid ODR violations!
+if(CMAKE_BUILD_TYPE MATCHES "Debug")
+    add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+elseif(CMAKE_BUILD_TYPE MATCHES "E2ERelease")
+    add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+elseif(ENABLE_SNAPSHOTS)
+    add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+endif()
 
 # Test: FP32Tensor class
 add_executable(v2_test_tensor_basics unit/tensors/Test__FP32Tensor.cpp)

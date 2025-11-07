@@ -62,14 +62,38 @@ namespace llaminar2
          * @brief Create test-only model context (doesn't load actual model)
          *
          * For unit tests that need a ModelContext but don't need real model data.
+         * Initializes a minimal valid GGUFModel structure to prevent undefined behavior.
          *
          * @param model_path Dummy path (can be anything)
+         * @param mpi_ctx Optional MPI context for multi-rank tests (use nullptr for single-rank)
          * @return Shared pointer to context (always succeeds)
          */
         static std::shared_ptr<ModelContext> createForTesting(
-            const std::string &model_path = "test.gguf")
+            const std::string &model_path = "test.gguf",
+            std::shared_ptr<MPIContext> mpi_ctx = nullptr)
         {
-            return std::shared_ptr<ModelContext>(new ModelContext(model_path, nullptr));
+            // Create TensorFactory from MPI context (if provided) to prevent ModelLoader
+            // from creating internal MPI_COMM_NULL context that conflicts with test's MPI_COMM_WORLD
+            std::unique_ptr<TensorFactory> owned_factory;
+            TensorFactory *factory = nullptr;
+            if (mpi_ctx)
+            {
+                owned_factory = std::make_unique<TensorFactory>(*mpi_ctx);
+                factory = owned_factory.get();
+            }
+            
+            auto ctx = std::shared_ptr<ModelContext>(
+                new ModelContext(model_path, mpi_ctx, nullptr, factory, WeightDistributionStrategy::REPLICATED));
+            
+            // Store owned factory so it lives as long as the context
+            if (owned_factory)
+            {
+                ctx->owned_test_factory_ = std::move(owned_factory);
+            }
+            
+            // Initialize minimal valid model structure to prevent accessing uninitialized memory
+            ctx->loader_.initializeTestModel();
+            return ctx;
         }
 
         /**
@@ -125,6 +149,7 @@ namespace llaminar2
                      WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED);
 
         std::string model_path_;
+        std::unique_ptr<TensorFactory> owned_test_factory_; // For createForTesting() only - must be declared BEFORE loader_!
         ModelLoader loader_;
         std::shared_ptr<WeightManager> weight_manager_;
     };

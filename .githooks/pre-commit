@@ -62,7 +62,6 @@ echo ""
 
 # Run CTest with unit test filter
 # Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
-# Note: Tests run sequentially due to MPI context requirements
 set +e
 ctest --test-dir "$BUILD_V2_DEBUG" -R "^V2_Unit_" --output-on-failure
 UNIT_EXIT_CODE=$?
@@ -81,14 +80,14 @@ fi
 echo -e "${GREEN}✓ All unit tests passed${NC}"
 echo ""
 
-# Step 4: Run Integration Tests (Debug build)
-echo -e "${YELLOW}[4/4] Running V2 integration tests (Debug build)...${NC}"
+# Step 4: Run Integration Tests (Release build)
+echo -e "${YELLOW}[4/4] Running V2 integration tests (Release build)...${NC}"
 echo ""
 
 # Filter: ^V2_Integration_ matches all integration tests
-# Note: Tests run sequentially due to MPI context requirements
+# NOTE: Integration tests should run against optimized Release build
 set +e
-ctest --test-dir "$BUILD_V2_DEBUG" -R "^V2_Integration_" --output-on-failure
+ctest --test-dir "$BUILD_V2_RELEASE" -R "^V2_Integration_" --output-on-failure
 INTEGRATION_EXIT_CODE=$?
 set -e
 
@@ -98,13 +97,13 @@ if [ $INTEGRATION_EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
     echo -e "${GREEN}  • Debug build: OK${NC}"
     echo -e "${GREEN}  • Release build: OK${NC}"
-    echo -e "${GREEN}  • Unit tests: OK${NC}"
-    echo -e "${GREEN}  • Integration tests: OK${NC}"
+    echo -e "${GREEN}  • Unit tests (Debug): OK${NC}"
+    echo -e "${GREEN}  • Integration tests (Release): OK${NC}"
     echo ""
     echo -e "${GREEN}Proceeding with commit...${NC}"
     exit 0
 else
-    echo -e "${RED}❌ Integration tests failed (Debug).${NC}"
+    echo -e "${RED}❌ Integration tests failed (Release).${NC}"
     echo ""
     echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
     echo -e "${YELLOW}  git commit --no-verify${NC}"

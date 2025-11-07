@@ -131,10 +131,15 @@ namespace llaminar2
 
             /**
              * @brief Dummy weight names (not used in testing)
+             * 
+             * Returns a minimal set of weight names to ensure proper device
+             * discovery. Without this, discoverActiveDevices() returns an empty
+             * list which causes undefined behavior in multi-device mode.
              */
             std::vector<std::string> getAllWeightNames() const override
             {
-                return {}; // No weights in mock
+                // Return at least one dummy weight so device discovery works
+                return {"blk.0.attn_q.weight"};
             }
 
             /**
