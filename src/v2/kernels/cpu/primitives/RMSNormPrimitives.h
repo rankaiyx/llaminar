@@ -8,10 +8,12 @@
  * - Double precision accumulation for accuracy
  * - Thread-local scratch buffers
  * - T5 compatibility mode
+ * - INT32→INT8 pipeline support for full INT8 inference
  */
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace llaminar2::primitives
@@ -130,6 +132,96 @@ namespace llaminar2::primitives
         const float *src,
         const float *gamma,
         float *dst,
+        std::size_t rows,
+        std::size_t cols,
+        float epsilon,
+        RMSNormScratch &scratch,
+        const RMSNormExecOptions &opts = {});
+
+    // ========================================================================
+    // INT32 RMSNorm (for full INT8 pipelines)
+    // ========================================================================
+
+    /**
+     * @brief Compute per-row sum of squares from INT32 input (vectorized)
+     *
+     * Optimized for INT32 accumulator tensors in full INT8 pipelines.
+     * Converts INT32 to double for accumulation, maintaining high precision.
+     *
+     * @param src Input INT32 tensor [rows, cols]
+     * @param rows Number of rows
+     * @param cols Number of columns
+     * @param row_sumsq Output per-row sum of squares (length = rows)
+     * @param opts Execution options
+     */
+    void rmsnorm_compute_row_sumsq_int32_vectorized(
+        const int32_t *src,
+        std::size_t rows,
+        std::size_t cols,
+        double *row_sumsq,
+        const RMSNormExecOptions &opts = {});
+
+    /**
+     * @brief Apply RMSNorm scaling, gamma weights, and requantize to INT8
+     *
+     * Fused operation for INT32→FP32 normalization→INT8 quantization.
+     * Uses per-row dynamic scaling to fit normalized values into INT8 range.
+     *
+     * @param src Input INT32 tensor [rows, cols]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param inv Per-row inverse RMS values (FP32)
+     * @param rows Number of rows
+     * @param cols Number of columns
+     * @param dst_int8 Output INT8 tensor [rows, cols]
+     * @param dst_row_scales Output per-row INT8 scales [rows]
+     * @param opts Execution options
+     */
+    void rmsnorm_apply_int32_to_int8_vectorized(
+        const int32_t *src,
+        const float *gamma,
+        const float *inv,
+        std::size_t rows,
+        std::size_t cols,
+        int8_t *dst_int8,
+        float *dst_row_scales,
+        const RMSNormExecOptions &opts = {});
+
+    /**
+     * @brief Fused INT32 RMSNorm: INT32 input → INT8 output with requantization
+     *
+     * Complete pipeline for INT32 accumulator normalization:
+     * 1. Compute sum of squares from INT32 input
+     * 2. Calculate inverse RMS per row
+     * 3. Normalize and apply gamma weights
+     * 4. Requantize to INT8 with per-row dynamic scaling
+     *
+     * @param src Input INT32 tensor [rows, cols]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst_int8 Output INT8 tensor [rows, cols]
+     * @param dst_row_scales Output per-row INT8 scales [rows]
+     * @param rows Number of rows
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     * @param opts Execution options
+     */
+    void rmsnorm_fused_int32_to_int8_vectorized(
+        const int32_t *src,
+        const float *gamma,
+        int8_t *dst_int8,
+        float *dst_row_scales,
+        std::size_t rows,
+        std::size_t cols,
+        float epsilon,
+        const RMSNormExecOptions &opts = {});
+
+    /**
+     * @brief Fused INT32 RMSNorm with provided scratch buffer
+     */
+    void rmsnorm_fused_int32_to_int8_vectorized(
+        const int32_t *src,
+        const float *gamma,
+        int8_t *dst_int8,
+        float *dst_row_scales,
         std::size_t rows,
         std::size_t cols,
         float epsilon,

@@ -18,13 +18,14 @@
  * Key Differences from V1:
  *  - No MPI column sharding (V2 uses different distribution strategy)
  *  - No tensor caching (pipelines manage weight lifecycle)
- *  - Optional dequantization to INT8 (when --precision int8 is set)
+ *  - Optional dequantization to INT8 (when --weight-precision int8 is set)
  *  - Returns V2 TensorBase (with device affinity, ITensor interfaces)
  */
 
 #pragma once
 
-#include "../pipelines/PipelineConfig.h" // for ComputePrecision
+#include "../pipelines/PipelineConfig.h" // for WeightPrecision
+#include "../tensors/TensorFactory.h"    // for owned_factory_
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -37,7 +38,7 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
-    class TensorFactory;
+    class MPIContext;
 
     // =============================================================================
     // GGUF TYPE DEFINITIONS
@@ -219,24 +220,26 @@ namespace llaminar2
         const GGUFModel &getModel() const { return model_; }
 
         /**
-         * @brief Load tensor from GGUF file
+         * @brief Load tensor from GGUF file with new weight precision API
          * @param tensor_name Name of tensor (e.g., "token_embd.weight", "blk.0.attn_q.weight")
          * @param device_idx Device index for tensor placement (0 = CPU, 1+ = GPU)
-         * @param precision Compute precision mode (if INT8, dequantize all formats to INT8)
-         * @return Tensor with appropriate type (FP32Tensor, IQ4_NLTensor, INT8Tensor, etc.) or nullptr on error
-         *
-         * @note When precision is INT8, all quantized tensors are dequantized to INT8 format
-         *       for AVX512-VNNI (CPU) or INT8×INT8 GEMM (CUDA/CUTLASS)
-         * @note Otherwise, returns tensors in native format (quantized weights stay quantized)
-         * @note Tensor type determined by GGUF metadata (F32 → FP32Tensor, IQ4_NL → IQ4_NLTensor)
+         * @param weight_precision How to load the weight:
+         *       - NATIVE: Keep in original GGUF format (default, dequantize on-the-fly)
+         *       - CONVERT_TO_FP32: Dequantize to FP32 at load time
+         *       - CONVERT_TO_BF16: Dequantize to BF16 at load time
+         *       - CONVERT_TO_FP16: Dequantize to FP16 at load time
+         *       - CONVERT_TO_INT8: Dequantize to INT8 at load time
+         * @return Tensor with appropriate type or nullptr on error
          */
         std::shared_ptr<TensorBase> loadTensor(const std::string &tensor_name,
                                                int device_idx = 0,
-                                               ComputePrecision precision = ComputePrecision::FP32);
+                                               WeightPrecision weight_precision = WeightPrecision::CONVERT_TO_FP32);
 
     private:
-        // Tensor factory (optional, for NUMA-aware allocation)
+        // Tensor factory (created internally if not provided)
         TensorFactory *factory_;
+        std::unique_ptr<TensorFactory> owned_factory_; // Owned factory if created internally
+        std::shared_ptr<MPIContext> owned_mpi_ctx_;    // Owned MPI context for owned factory
 
         // Parsing helpers
         bool parseHeader();
@@ -254,6 +257,13 @@ namespace llaminar2
             const GGUFTensorInfo *info,
             const std::vector<size_t> &shape,
             const std::vector<uint8_t> &raw);
+
+        // FP32 dequantization (comprehensive support for all quantized formats)
+        std::shared_ptr<TensorBase> dequantizeToFP32(
+            const GGUFTensorInfo *info,
+            const std::vector<size_t> &shape,
+            const std::vector<uint8_t> &raw);
+
         void dequantizeIQ4_NLToFP32(
             const std::vector<uint8_t> &raw,
             std::vector<float> &fp32_buffer,

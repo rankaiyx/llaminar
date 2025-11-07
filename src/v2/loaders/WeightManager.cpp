@@ -15,9 +15,9 @@ namespace llaminar2
                                  std::shared_ptr<MPIContext> mpi_ctx,
                                  std::shared_ptr<WeightPlacementMap> placement_map,
                                  WeightDistributionStrategy strategy,
-                                 ComputePrecision precision)
+                                 WeightPrecision weight_precision)
         : loader_(loader), mpi_ctx_(mpi_ctx), placement_map_(placement_map),
-          strategy_(strategy), precision_(precision)
+          strategy_(strategy), weight_precision_(weight_precision)
     {
         int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
 
@@ -38,30 +38,27 @@ namespace llaminar2
             }
             LOG_INFO("[WeightManager] Initialized with strategy: " << strategy_name);
 
-            // Log precision mode
+            // Log weight precision mode
             const char *precision_name = "UNKNOWN";
-            switch (precision_)
+            switch (weight_precision_)
             {
-            case ComputePrecision::MIXED:
-                precision_name = "MIXED (weights quantized, compute FP32)";
+            case WeightPrecision::NATIVE:
+                precision_name = "NATIVE (weights in original GGUF format, dequantize on-the-fly)";
                 break;
-            case ComputePrecision::FP32:
-                precision_name = "FP32 (all weights dequantized)";
+            case WeightPrecision::CONVERT_TO_FP32:
+                precision_name = "CONVERT_TO_FP32 (all weights dequantized to FP32 at load)";
                 break;
-            case ComputePrecision::BF16:
-                precision_name = "BF16 (all weights dequantized)";
+            case WeightPrecision::CONVERT_TO_BF16:
+                precision_name = "CONVERT_TO_BF16 (all weights dequantized to BF16 at load)";
                 break;
-            case ComputePrecision::FP16:
-                precision_name = "FP16 (all weights dequantized)";
+            case WeightPrecision::CONVERT_TO_FP16:
+                precision_name = "CONVERT_TO_FP16 (all weights dequantized to FP16 at load)";
                 break;
-            case ComputePrecision::INT8:
-                precision_name = "INT8 (all weights dequantized for AVX512-VNNI/CUDA)";
-                break;
-            case ComputePrecision::AUTO:
-                precision_name = "AUTO (should have been resolved!)";
+            case WeightPrecision::CONVERT_TO_INT8:
+                precision_name = "CONVERT_TO_INT8 (all weights dequantized to INT8 at load)";
                 break;
             }
-            LOG_INFO("[WeightManager] Precision mode: " << precision_name);
+            LOG_INFO("[WeightManager] Weight precision: " << precision_name);
         }
     }
 
@@ -121,7 +118,7 @@ namespace llaminar2
         // Phase 1: Simple replication - each rank loads independently
         // No MPI coordination needed
 
-        auto tensor = loader_.loadTensor(name, device_idx, precision_);
+        auto tensor = loader_.loadTensor(name, device_idx, weight_precision_);
         if (!tensor)
         {
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;

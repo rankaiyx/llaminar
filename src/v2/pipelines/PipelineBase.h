@@ -178,6 +178,53 @@ namespace llaminar2
          */
         virtual const float *logits() const;
 
+        // ===== Snapshot Capture API (for parity testing / debugging) =====
+        // Only available when ENABLE_PIPELINE_SNAPSHOTS is defined (test builds)
+        // In release builds, all snapshot code compiles away to NOOPs
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        /**
+         * @brief Enable snapshot capture of intermediate activations
+         *
+         * When enabled, pipeline stores copies of intermediate tensors at key points
+         * (e.g., after each attention block, FFN block, normalization).
+         * Used for granular debugging and parity testing against reference implementations.
+         *
+         * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
+         * In release builds, this is a NOOP.
+         *
+         * @param output_dir Optional directory to save snapshots (empty = memory only)
+         */
+        void enableSnapshotCapture(const std::string &output_dir = "");
+
+        /**
+         * @brief Disable snapshot capture and clear stored snapshots
+         *
+         * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
+         */
+        void disableSnapshotCapture();
+
+        /**
+         * @brief Retrieve a captured snapshot by key
+         *
+         * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
+         *
+         * @param key Snapshot identifier (e.g., "layer_0_q_projection", "embedding")
+         * @param out_size Output parameter for tensor size (number of float elements)
+         * @return Pointer to snapshot data, or nullptr if key doesn't exist
+         */
+        const float *getSnapshot(const std::string &key, size_t &out_size) const;
+
+        /**
+         * @brief Get list of all captured snapshot keys
+         *
+         * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
+         *
+         * @return Vector of snapshot identifiers
+         */
+        std::vector<std::string> getSnapshotKeys() const;
+#endif // ENABLE_PIPELINE_SNAPSHOTS
+
         /**
          * @brief Get model architecture name
          *
@@ -674,6 +721,44 @@ namespace llaminar2
          * @return {start_token, local_seq_len} for this rank
          */
         std::pair<size_t, size_t> getTokenDistribution(int seq_len);
+
+        // ===== Snapshot Capture Helper (for derived classes) =====
+        // Compiles to NOOP in release builds (ENABLE_PIPELINE_SNAPSHOTS not defined)
+
+        /**
+         * @brief Capture a snapshot of an intermediate activation
+         *
+         * Derived classes call this at instrumentation points (e.g., after Q projection).
+         * If ENABLE_PIPELINE_SNAPSHOTS is defined AND capture_enabled_ is true, stores a copy.
+         * Otherwise, compiles away to a NOOP (zero overhead in release builds).
+         *
+         * @param key Snapshot identifier (e.g., "layer_5_attention_scores")
+         * @param data Pointer to tensor data (float*)
+         * @param size Number of elements in tensor
+         */
+        inline void captureSnapshot([[maybe_unused]] const std::string &key,
+                                    [[maybe_unused]] const float *data,
+                                    [[maybe_unused]] size_t size)
+        {
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+            if (snapshot_capture_enabled_)
+            {
+                snapshots_[key].assign(data, data + size);
+            }
+#endif
+            // In release builds (no ENABLE_PIPELINE_SNAPSHOTS), this is a NOOP
+            // Compiler optimizes away the entire function call
+        }
+
+    private:
+        // ===== Snapshot Storage (for parity testing / debugging) =====
+        // Only exists in test builds (ENABLE_PIPELINE_SNAPSHOTS defined)
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        bool snapshot_capture_enabled_ = false;               // Whether to capture snapshots
+        std::string snapshot_output_dir_;                     // Optional directory for saving
+        std::map<std::string, std::vector<float>> snapshots_; // In-memory snapshot storage
+#endif
     };
 
 } // namespace llaminar2

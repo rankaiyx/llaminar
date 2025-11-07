@@ -28,12 +28,13 @@ namespace llaminar2
               n_kv_heads_(n_kv_heads),
               head_dim_(head_dim)
         {
-            // Set architecture parameters (required before initializeInfrastructure)
-            n_layers_ = 1;
-            n_heads_ = n_heads;
-            n_kv_heads_ = n_kv_heads;
-            head_dim_ = head_dim;
-            d_model_ = n_heads * head_dim;
+            // Set architecture parameters in base class (REQUIRED before initializeInfrastructure)
+            // These are PipelineBase protected members that must be set before calling initializeInfrastructure()
+            PipelineBase::n_layers_ = 1;
+            PipelineBase::n_heads_ = n_heads;
+            PipelineBase::n_kv_heads_ = n_kv_heads;
+            PipelineBase::head_dim_ = head_dim;
+            PipelineBase::d_model_ = n_heads * head_dim;
 
             // Initialize workspace buffers and infrastructure
             initializeInfrastructure();

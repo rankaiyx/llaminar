@@ -457,6 +457,7 @@ add_library(llaminar2_core STATIC
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
     tensors/BF16Tensor.cpp
+    tensors/INT32Tensor.cpp
     tensors/INT8Tensor.cpp
     tensors/TensorFactory.cpp
     tensors/KVCache.cpp
@@ -497,6 +498,9 @@ add_library(llaminar2_core STATIC
     kernels/cpu/FP32StandaloneGemm.cpp
     kernels/cpu/BF16GemmKernel.cpp
     kernels/cpu/INT8GemmKernel.cpp
+    kernels/cpu/INT8AttentionKernel.cpp
+    kernels/cpu/INT8SwiGLUKernel.cpp
+    kernels/cpu/FP32AttentionKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
     kernels/cpu/CPURMSNormKernel.cpp
     kernels/cpu/CPUSoftmaxKernel.cpp
@@ -519,6 +523,21 @@ target_include_directories(llaminar2_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
+
+# Enable pipeline snapshot capture (for parity testing and debugging)
+# Always enabled in Debug builds, can be controlled via option in Release
+if(CMAKE_BUILD_TYPE MATCHES "Debug")
+    target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
+    message(STATUS "V2: Pipeline snapshot capture enabled (Debug build)")
+else()
+    option(ENABLE_SNAPSHOTS "Enable pipeline snapshot capture" OFF)
+    if(ENABLE_SNAPSHOTS)
+        target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
+        message(STATUS "V2: Pipeline snapshot capture enabled (explicit option)")
+    else()
+        message(STATUS "V2: Pipeline snapshot capture disabled (Release build, use -DENABLE_SNAPSHOTS=ON to enable)")
+    endif()
+endif()
 
 # Compile features
 target_compile_features(llaminar2_core PUBLIC cxx_std_17)

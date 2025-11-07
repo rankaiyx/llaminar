@@ -42,6 +42,7 @@ namespace llaminar2
             float *Q, float *K,
             const int *position_ids,
             int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float rope_theta = 10000.0f,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;

@@ -47,7 +47,7 @@ namespace llaminar2
          * @param placement_map Fine-grained weight placement decisions (nullptr = default all to device 0)
          * @param factory Optional TensorFactory for NUMA-aware allocation
          * @param strategy Weight distribution strategy (default: REPLICATED)
-         * @param precision Compute precision mode (affects INT8 dequantization, default: FP32)
+         * @param weight_precision Weight loading precision (affects dequantization, default: NATIVE)
          * @return Shared pointer to context, or nullptr on error
          */
         static std::shared_ptr<ModelContext> create(
@@ -56,7 +56,7 @@ namespace llaminar2
             std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
             TensorFactory *factory = nullptr,
             WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
-            ComputePrecision precision = ComputePrecision::FP32);
+            WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
         /**
          * @brief Create test-only model context (doesn't load actual model)

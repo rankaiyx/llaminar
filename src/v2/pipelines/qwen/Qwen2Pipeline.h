@@ -216,7 +216,7 @@ namespace llaminar2
 
         // Helper methods (batch-aware)
         bool attention_block(const LayerWeights &layer, int layer_idx, int effective_seq_len);
-        bool ffn_block(const LayerWeights &layer, int effective_seq_len);
+        bool ffn_block(const LayerWeights &layer, int layer_idx, int effective_seq_len);
         bool embedding_batch(const std::vector<std::vector<int>> &token_batches, TensorBase *output);
         bool lm_head_batch(TensorBase *hidden, int effective_seq_len);
 

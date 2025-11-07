@@ -97,6 +97,34 @@ namespace llaminar2
             bool transpose_B = true,
             float *A_row_scales_out = nullptr);
 
+        /**
+         * @brief INT8×INT8 GEMM with INT8 activations → INT32 output
+         *
+         * This is the core method for full INT8 pipelines where activations
+         * are already quantized to INT8 (from previous layer requantization).
+         *
+         * Flow: INT8 (prev layer) → INT8×INT8 GEMM → INT32 (next layer input)
+         *
+         * Skips FP32→INT8 quantization overhead, enabling full INT8 pipeline:
+         *   Layer N: INT8 → INT32 → RMSNorm → requant → INT8
+         *   Layer N+1: INT8 → INT32 → RMSNorm → requant → INT8
+         *
+         * @param A_int8 Input INT8 activation matrix [m, k]
+         * @param A_row_scales Per-row scales for A [m]
+         * @param C_int32 Output INT32 accumulator matrix [m, n]
+         * @param m Number of rows
+         * @param n Number of columns in output
+         * @param k Number of columns in A
+         * @param transpose_B Whether B (weight) is stored transposed
+         * @return true if successful
+         */
+        bool multiply_int8_activations_int32(
+            const int8_t *A_int8,
+            const float *A_row_scales,
+            int32_t *C_int32,
+            int m, int n, int k,
+            bool transpose_B = true);
+
     private:
         const INT8Tensor *weight_tensor_;
 

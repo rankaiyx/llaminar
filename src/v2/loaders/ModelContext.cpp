@@ -28,7 +28,7 @@ namespace llaminar2
         std::shared_ptr<WeightPlacementMap> placement_map,
         TensorFactory *factory,
         WeightDistributionStrategy strategy,
-        ComputePrecision precision)
+        WeightPrecision weight_precision)
     {
         auto ctx = std::shared_ptr<ModelContext>(
             new ModelContext(model_path, mpi_ctx, placement_map, factory, strategy));
@@ -42,7 +42,7 @@ namespace llaminar2
 
         // Create WeightManager with loaded model and placement map
         ctx->weight_manager_ = std::make_shared<WeightManager>(
-            ctx->loader_, mpi_ctx, placement_map, strategy, precision);
+            ctx->loader_, mpi_ctx, placement_map, strategy, weight_precision);
 
         return ctx;
     }

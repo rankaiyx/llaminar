@@ -41,4 +41,45 @@ namespace llaminar2
         return true;
     }
 
+    bool CPURMSNormKernel::apply_int32_to_int8(
+        const int32_t *input_int32,
+        const float *gamma,
+        int8_t *output_int8,
+        float *output_row_scales,
+        int seq_len,
+        int d_model,
+        float eps,
+        int device_idx)
+    {
+        if (device_idx != -1)
+        {
+            return false; // CPU only
+        }
+
+        if (!input_int32 || !output_int8 || !output_row_scales)
+        {
+            return false;
+        }
+
+        if (seq_len <= 0 || d_model <= 0)
+        {
+            return false;
+        }
+
+        // Use vectorized INT32→INT8 primitives
+        primitives::RMSNormExecOptions opts;
+        opts.allow_parallel = true;
+        opts.force_scalar = false;
+        opts.parallel_threshold_elems = 2048;
+        opts.t5_compat_mode = false;
+
+        primitives::rmsnorm_fused_int32_to_int8_vectorized(
+            input_int32, gamma,
+            output_int8, output_row_scales,
+            seq_len, d_model,
+            eps, opts);
+
+        return true;
+    }
+
 } // namespace llaminar2

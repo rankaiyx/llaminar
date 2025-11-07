@@ -35,7 +35,14 @@ protected:
 
     void TearDown() override
     {
-        // Cleanup if needed
+        // Ensure all ranks synchronize before cleanup
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        // Reset MPI context to avoid use-after-free during global cleanup
+        mpi_ctx_.reset();
+
+        // Final barrier to ensure clean shutdown
+        MPI_Barrier(MPI_COMM_WORLD);
     }
 
     std::shared_ptr<llaminar2::MPIContext> mpi_ctx_;
@@ -123,6 +130,9 @@ TEST_F(MPITensorParallelCorrectness, SingleToken_Correctness)
         EXPECT_LT(metrics.rel_l2_norm, 0.01)
             << "Relative L2 norm too large (should be << 1%)";
     }
+
+    // Ensure both ranks finish before test cleanup
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 /**
@@ -231,6 +241,9 @@ TEST_F(MPITensorParallelCorrectness, MultiToken_Correctness)
         EXPECT_LT(metrics.max_abs_diff, tolerance);
         EXPECT_LT(metrics.rel_l2_norm, 0.01);
     }
+
+    // Ensure both ranks finish before test cleanup
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 /**

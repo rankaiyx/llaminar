@@ -190,10 +190,16 @@ namespace llaminar2
                     ctx.n_threads = std::stoi(val);
             }
 
-            // Compute precision
-            else if (arg == "--precision")
+            // Weight loading precision
+            else if (arg == "--weight-precision" || arg == "--weight-prec")
             {
-                ctx.precision = getNextArg(argv, argc, i, "precision");
+                ctx.weight_precision = getNextArg(argv, argc, i, "weight-precision");
+            }
+
+            // Activation/accumulation precision
+            else if (arg == "--activation-precision" || arg == "--activation-prec" || arg == "--act-prec")
+            {
+                ctx.activation_precision = getNextArg(argv, argc, i, "activation-precision");
             }
 
             // Memory mapping
@@ -283,13 +289,17 @@ namespace llaminar2
 
         std::cout << "Performance:\n";
         std::cout << "  --threads N               Thread count (-1 = auto)\n";
-        std::cout << "  --precision MODE          Compute precision:\n";
-        std::cout << "                              mixed - Keep weights quantized, compute in FP32 (default)\n";
-        std::cout << "                              fp32  - Dequantize all weights to FP32 at load\n";
-        std::cout << "                              bf16  - Dequantize all weights to BF16 at load\n";
-        std::cout << "                              fp16  - Dequantize all weights to FP16 at load\n";
-        std::cout << "                              int8  - Dequantize all weights to INT8 at load\n";
-        std::cout << "                              auto  - Hardware-based selection\n\n";
+        std::cout << "  --weight-precision MODE   How weights are loaded (default: native)\n";
+        std::cout << "  --weight-prec MODE          native - Keep in GGUF format (memory-efficient)\n";
+        std::cout << "                              fp32   - Dequantize to FP32 at load\n";
+        std::cout << "                              bf16   - Dequantize to BF16 at load\n";
+        std::cout << "                              fp16   - Dequantize to FP16 at load\n";
+        std::cout << "                              int8   - Dequantize to INT8 at load\n";
+        std::cout << "  --activation-precision M  Precision for activations (default: fp32)\n";
+        std::cout << "  --activation-prec M         fp32 - 32-bit float (highest accuracy)\n";
+        std::cout << "  --act-prec M                bf16 - bfloat16 (Intel AMX, 2× faster)\n";
+        std::cout << "                              fp16 - 16-bit float (ARM/GPU)\n";
+        std::cout << "                              int8 - 8-bit integer (AVX512-VNNI)\n\n";
 
         std::cout << "Other:\n";
         std::cout << "  --list-devices            List available devices and exit\n";

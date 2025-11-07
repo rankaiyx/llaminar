@@ -582,4 +582,81 @@ namespace llaminar2
         }
     }
 
+    // =============================================================================
+    // INT8 ACTIVATIONS PATH (Full INT8 Pipeline)
+    // =============================================================================
+
+    bool INT8GemmKernel::multiply_int8_activations_int32(
+        const int8_t *A_int8,
+        const float *A_row_scales,
+        int32_t *C_int32,
+        int m, int n, int k,
+        bool transpose_B)
+    {
+        if (!weight_tensor_)
+        {
+            LOG_ERROR("[INT8GemmKernel] No weight tensor set");
+            return false;
+        }
+
+        if (!A_int8 || !A_row_scales || !C_int32)
+        {
+            LOG_ERROR("[INT8GemmKernel] Null pointer(s) in multiply_int8_activations_int32");
+            return false;
+        }
+
+        const auto &shape = weight_tensor_->shape();
+        if (shape.size() != 2)
+        {
+            LOG_ERROR("[INT8GemmKernel] Weight tensor must be 2D, got " << shape.size() << "D");
+            return false;
+        }
+
+        // Validate dimensions
+        const int expected_k = transpose_B ? shape[1] : shape[0];
+        const int expected_n = transpose_B ? shape[0] : shape[1];
+
+        if (k != expected_k || n != expected_n)
+        {
+            LOG_ERROR("[INT8GemmKernel] Dimension mismatch: "
+                      << "A=[" << m << "," << k << "], B=[" << expected_k << "," << expected_n << "], "
+                      << "transpose_B=" << transpose_B);
+            return false;
+        }
+
+        // Get INT8 weight data and column scales
+        const int8_t *B_int8 = weight_tensor_->int8_data();
+        const float *B_col_scales_ptr = weight_tensor_->col_scales();
+
+        if (!B_col_scales_ptr)
+        {
+            LOG_ERROR("[INT8GemmKernel] Weight tensor missing per-column scales");
+            return false;
+        }
+
+        try
+        {
+#ifdef HAVE_ONEDNN
+            // Direct INT8×INT8 GEMM without quantization overhead
+            // Input activations are already INT8 (from previous layer requantization)
+            gemm_int8_perchannel_flexible(
+                A_int8, A_row_scales,
+                B_int8, B_col_scales_ptr,
+                nullptr, C_int32, // C_fp32=nullptr, C_int32=C_int32
+                m, n, k,
+                transpose_B,
+                1.0f, 0.0f); // alpha, beta not used for INT32 output
+            return true;
+#else
+            LOG_ERROR("[INT8GemmKernel] multiply_int8_activations_int32 requires OneDNN (not available)");
+            return false;
+#endif
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[INT8GemmKernel] multiply_int8_activations_int32 failed: " << e.what());
+            return false;
+        }
+    }
+
 } // namespace llaminar2

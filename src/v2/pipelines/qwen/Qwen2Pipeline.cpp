@@ -27,6 +27,32 @@
 #include <set>
 #include <algorithm>
 
+// Helper macro for snapshot capture (element_count() is protected)
+#define CAPTURE_SNAPSHOT(key, tensor_ptr)                     \
+    do                                                        \
+    {                                                         \
+        const auto &_shape = (tensor_ptr)->shape();           \
+        size_t _numel = 1;                                    \
+        for (auto _dim : _shape)                              \
+            _numel *= _dim;                                   \
+        captureSnapshot((key), (tensor_ptr)->data(), _numel); \
+    } while (0)
+
+// Helper macro for snapshot capture with view (for buffers larger than actual data)
+#define CAPTURE_SNAPSHOT_VIEW(key, tensor_ptr, rows, cols)                                              \
+    do                                                                                                  \
+    {                                                                                                   \
+        auto _view = (tensor_ptr)->create_view({static_cast<size_t>(rows), static_cast<size_t>(cols)}); \
+        if (_view)                                                                                      \
+        {                                                                                               \
+            const auto &_shape = _view->shape();                                                        \
+            size_t _numel = 1;                                                                          \
+            for (auto _dim : _shape)                                                                    \
+                _numel *= _dim;                                                                         \
+            captureSnapshot((key), _view->data(), _numel);                                              \
+        }                                                                                               \
+    } while (0)
+
 namespace llaminar2
 {
 
@@ -270,6 +296,9 @@ namespace llaminar2
             return false;
         }
 
+        // Capture embedding output
+        CAPTURE_SNAPSHOT("EMBEDDING", current_hidden_.get());
+
         // Validate after embedding
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_embedding");
 
@@ -296,6 +325,9 @@ namespace llaminar2
                     "Final RMSNorm");
 
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_final_norm");
+
+        // Capture final norm output
+        CAPTURE_SNAPSHOT("FINAL_NORM", current_hidden_.get());
 
         // LM head projection (batched)
         if (!lm_head_batch(current_hidden_.get(), effective_seq_len))
@@ -328,7 +360,7 @@ namespace llaminar2
         }
 
         // FFN block
-        if (!ffn_block(layer, effective_seq_len))
+        if (!ffn_block(layer, layer_idx, effective_seq_len))
         {
             LOG_ERROR("FFN block failed in layer " << layer_idx);
             return false;
@@ -385,6 +417,10 @@ namespace llaminar2
                     "Attention norm");
         VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_attn_norm");
 
+        // Capture attention norm output (use view to get only valid data, not entire buffer)
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_ATTENTION_NORM",
+                              normalized_hidden, effective_seq_len, d_model_);
+
         // 2. Q/K/V projections (use device-appropriate buffers)
         VALIDATE_KERNEL(q_gemm, layer.wq->createGemm(), "Q GEMM kernel");
         VALIDATE_KERNEL(k_gemm, layer.wk->createGemm(), "K GEMM kernel");
@@ -398,6 +434,9 @@ namespace llaminar2
                     "Q projection");
         VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_q_proj");
 
+        // Capture Q projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_Q_PROJECTION", buffers.Q, effective_seq_len, n_heads_ * head_dim_);
+
         // K = hidden @ wk^T
         VALIDATE_OP(k_gemm->multiply(
                         normalized_hidden->data(), buffers.K->mutable_data(),
@@ -406,6 +445,9 @@ namespace llaminar2
                     "K projection");
         VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_k_proj");
 
+        // Capture K projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_K_PROJECTION", buffers.K, effective_seq_len, n_kv_heads_ * head_dim_);
+
         // V = hidden @ wv^T
         VALIDATE_OP(v_gemm->multiply(
                         normalized_hidden->data(), buffers.V->mutable_data(),
@@ -413,6 +455,9 @@ namespace llaminar2
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "V projection");
         VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
+
+        // Capture V projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_V_PROJECTION", buffers.V, effective_seq_len, n_kv_heads_ * head_dim_);
 
         // 3. Apply RoPE to Q and K
         // Position IDs for batched input (per-sequence position tracking)
@@ -443,13 +488,19 @@ namespace llaminar2
         }
 
         VALIDATE_KERNEL(rope_kernel, layer.wq->createRoPE(), "RoPE kernel"); // Any weight can create RoPE kernel
+
         VALIDATE_OP(rope_kernel->apply(
                         buffers.Q->mutable_data(), buffers.K->mutable_data(), position_ids.data(),
                         effective_seq_len, n_heads_, n_kv_heads_, head_dim_,
+                        model_ctx_->model().rope_theta,
                         false, mpi_ctx_.get(), attn_device),
                     "RoPE application");
         VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_rope_q");
         VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_rope_k");
+
+        // Capture Q and K after RoPE
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_Q_ROPE", buffers.Q, effective_seq_len, n_heads_ * head_dim_);
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_K_ROPE", buffers.K, effective_seq_len, n_kv_heads_ * head_dim_);
 
         // 4. GQA attention computation (MPI-aware, batch-aware)
         // Create views of Q/K/V buffers with actual effective_seq_len to avoid pre-allocated buffer size mismatch
@@ -465,15 +516,20 @@ namespace llaminar2
         }
 
         // Dispatches to tensor-parallel if mpi_strategy_ == TensorParallel
+        // NOTE: Using causal=false and no sequence masking to match PyTorch reference for E2E parity testing
+        // In production inference, causal=true should be used for autoregressive generation
         VALIDATE_OP(attention_gqa_mpi(
                         Q_view.get(), K_view.get(),
                         V_view.get(), attn_out_view.get(),
                         n_heads_, n_kv_heads_, head_dim_,
-                        /*causal=*/true, /*window_size=*/-1,
-                        batch_size_, &sequence_lengths_),
+                        /*causal=*/false, /*window_size=*/-1,
+                        batch_size_, nullptr), // No sequence length masking for parity testing
                     "GQA attention");
 
         VALIDATE_TENSOR_BUFFER(buffers.attn_output, spec_q(effective_seq_len), "after_attention");
+
+        // Capture attention context (before output projection)
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_ATTENTION_CONTEXT", buffers.attn_output, effective_seq_len, n_heads_ * head_dim_);
 
         // 5. Output projection (reuse attn_proj buffer)
         VALIDATE_KERNEL(o_gemm, layer.wo->createGemm(), "output GEMM kernel");
@@ -483,6 +539,9 @@ namespace llaminar2
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "Output projection");
         VALIDATE_TENSOR_BUFFER(buffers.attn_proj, spec_hidden(effective_seq_len), "after_attn_out_proj");
+
+        // Capture attention output projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_ATTENTION_OUTPUT", buffers.attn_proj, effective_seq_len, d_model_);
 
         // 6. Residual connection - write back to current_hidden_
         // Note: If multi-device, result stays on attn_device and is stored in current_hidden_
@@ -499,10 +558,13 @@ namespace llaminar2
 
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_attn_residual");
 
+        // Capture attention residual output
+        CAPTURE_SNAPSHOT("layer" + std::to_string(layer_idx) + "_ATTENTION_RESIDUAL", current_hidden_.get());
+
         return true;
     }
 
-    bool Qwen2Pipeline::ffn_block(const LayerWeights &layer, int effective_seq_len)
+    bool Qwen2Pipeline::ffn_block(const LayerWeights &layer, int layer_idx, int effective_seq_len)
     {
         // Phase 4.3: Determine execution device based on weight placement
         int ffn_device = placement_map_ ? getWeightDevice("ffn_gate", -1) : device_idx_;
@@ -545,6 +607,9 @@ namespace llaminar2
                     "FFN norm");
         VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_ffn_norm");
 
+        // Capture FFN norm output
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_NORM", normalized_hidden, effective_seq_len, d_model_);
+
         // 2. Gate and up projections (use device-appropriate buffers)
         VALIDATE_KERNEL(gate_gemm, layer.gate_proj->createGemm(), "gate GEMM kernel");
         VALIDATE_KERNEL(up_gemm, layer.up_proj->createGemm(), "up GEMM kernel");
@@ -557,6 +622,9 @@ namespace llaminar2
                     "Gate projection");
         VALIDATE_TENSOR_BUFFER(buffers.gate, spec_ffn_gate_up(effective_seq_len), "after_gate_proj");
 
+        // Capture gate projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE", buffers.gate, effective_seq_len, d_ff_);
+
         // up = hidden @ up_proj^T
         VALIDATE_OP(up_gemm->multiply(
                         normalized_hidden->data(), buffers.up->mutable_data(),
@@ -564,6 +632,9 @@ namespace llaminar2
                         true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                     "Up projection");
         VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_gate_up(effective_seq_len), "after_up_proj");
+
+        // Capture up projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_UP", buffers.up, effective_seq_len, d_ff_);
 
         // 3. SwiGLU activation (up buffer reused for output)
         VALIDATE_KERNEL(swiglu_kernel, layer.gate_proj->createSwiGLU(), "SwiGLU kernel");
@@ -573,6 +644,9 @@ namespace llaminar2
                         effective_seq_len, d_ff_, false, mpi_ctx_.get(), ffn_device),
                     "SwiGLU activation");
         VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_intermediate(effective_seq_len), "after_swiglu");
+
+        // Capture SwiGLU output
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_SWIGLU", buffers.up, effective_seq_len, d_ff_);
 
         // 4. Down projection (reuse ffn_output buffer)
         VALIDATE_KERNEL(down_gemm, layer.down_proj->createGemm(), "down GEMM kernel");
@@ -584,6 +658,9 @@ namespace llaminar2
                         true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                     "Down projection");
         VALIDATE_TENSOR_BUFFER(buffers.ffn_output, spec_hidden(effective_seq_len), "after_down_proj");
+
+        // Capture down projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_DOWN", buffers.ffn_output, effective_seq_len, d_model_);
 
         // 5. Residual connection - write back to current_hidden_
         for (size_t i = 0; i < effective_seq_len * d_model_; ++i)
@@ -598,6 +675,9 @@ namespace llaminar2
         }
 
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_ffn_residual");
+
+        // Capture FFN residual output
+        CAPTURE_SNAPSHOT("layer" + std::to_string(layer_idx) + "_FFN_RESIDUAL", current_hidden_.get());
 
         return true;
     }
@@ -642,6 +722,37 @@ namespace llaminar2
         if (!layer.wq)
         {
             layer.wq = model_ctx_->getWeight(prefix + "attn_q.weight", device_idx_);
+
+            // DEBUG: Log weight type and shape
+            if (layer.wq)
+            {
+                const auto &shape = layer.wq->shape();
+                std::string type_name;
+                switch (layer.wq->native_type())
+                {
+                case TensorType::FP32:
+                    type_name = "FP32";
+                    break;
+                case TensorType::FP16:
+                    type_name = "FP16";
+                    break;
+                case TensorType::Q4_0:
+                    type_name = "Q4_0";
+                    break;
+                case TensorType::Q6_K:
+                    type_name = "Q6_K";
+                    break;
+                case TensorType::Q8_0:
+                    type_name = "Q8_0";
+                    break;
+                default:
+                    type_name = "UNKNOWN";
+                    break;
+                }
+                LOG_INFO("[DEBUG] Layer " << layer_idx << " wq: type=" << type_name
+                                          << ", shape=[" << shape[0] << ", " << shape[1] << "]");
+            }
+
             layer.wk = model_ctx_->getWeight(prefix + "attn_k.weight", device_idx_);
             layer.wv = model_ctx_->getWeight(prefix + "attn_v.weight", device_idx_);
             layer.wo = model_ctx_->getWeight(prefix + "attn_output.weight", device_idx_);
@@ -755,6 +866,10 @@ namespace llaminar2
                     "LM head projection");
 
         VALIDATE_TENSOR(logits_buffer_, spec_logits(effective_seq_len), "after_lm_head");
+
+        // Capture LM head logits
+        CAPTURE_SNAPSHOT("LM_HEAD", logits_buffer_.get());
+
         return true;
     }
 

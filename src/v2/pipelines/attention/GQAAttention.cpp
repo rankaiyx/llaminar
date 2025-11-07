@@ -813,7 +813,7 @@ namespace llaminar2
 
     bool GQAAttention::compute_attention_scores(
         const float *Q, const float *K, float *scores,
-        int seq_len, int head_dim, ComputePrecision precision)
+        int seq_len, int head_dim, ActivationPrecision precision)
     {
         // GEMM: scores = Q @ K^T
         // Q: [seq_len, head_dim], K: [seq_len, head_dim]
@@ -822,12 +822,12 @@ namespace llaminar2
         // Select GEMM kernel based on precision
         std::unique_ptr<ITensorGemm> gemm_kernel;
 
-        if (precision == ComputePrecision::BF16)
+        if (precision == ActivationPrecision::BF16)
         {
             // Use BF16 GEMM for activation-activation multiply
             gemm_kernel = std::make_unique<BF16GemmKernel>(nullptr);
         }
-        else if (precision == ComputePrecision::FP16)
+        else if (precision == ActivationPrecision::FP16)
         {
             // FP16 support: fallback to FP32 for now (TODO: implement FP16GemmKernel)
             gemm_kernel = std::make_unique<FP32GemmKernel>(nullptr);
@@ -913,7 +913,7 @@ namespace llaminar2
 
     bool GQAAttention::compute_context_from_scores(
         const float *scores, const float *V, float *context,
-        int seq_len, int head_dim, ComputePrecision precision)
+        int seq_len, int head_dim, ActivationPrecision precision)
     {
         // GEMM: context = scores @ V
         // scores: [seq_len, seq_len], V: [seq_len, head_dim]
@@ -922,12 +922,12 @@ namespace llaminar2
         // Select GEMM kernel based on precision
         std::unique_ptr<ITensorGemm> gemm_kernel;
 
-        if (precision == ComputePrecision::BF16)
+        if (precision == ActivationPrecision::BF16)
         {
             // Use BF16 GEMM for activation-activation multiply
             gemm_kernel = std::make_unique<BF16GemmKernel>(nullptr);
         }
-        else if (precision == ComputePrecision::FP16)
+        else if (precision == ActivationPrecision::FP16)
         {
             // FP16 support: fallback to FP32 for now (TODO: implement FP16GemmKernel)
             gemm_kernel = std::make_unique<FP32GemmKernel>(nullptr);

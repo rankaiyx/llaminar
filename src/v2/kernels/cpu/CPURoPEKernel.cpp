@@ -28,6 +28,7 @@ namespace llaminar2
         float *Q, float *K,
         const int *position_ids,
         int seq_len, int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta,
         bool use_bf16,
         const MPIContext *mpi_ctx,
         int device_idx)
@@ -51,10 +52,8 @@ namespace llaminar2
         // This matches V1 behavior where position_ids isn't actually used (n_past determines base)
         int n_past = position_ids ? position_ids[0] : 0;
 
-        // Standard freq_base for Qwen/LLaMA models
-        const float freq_base = 10000.0f;
-
-        apply_rotation(Q, K, seq_len, head_dim, n_heads, n_kv_heads, n_past, freq_base);
+        // Use rope_theta from model config (Qwen2.5: 1000000.0, LLaMA: 10000.0)
+        apply_rotation(Q, K, seq_len, head_dim, n_heads, n_kv_heads, n_past, rope_theta);
 
         return true;
     }

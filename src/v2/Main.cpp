@@ -246,47 +246,66 @@ int main(int argc, char *argv[])
     pipeline_config.use_mmap = args.use_mmap;
     pipeline_config.seed = args.seed;
 
-    // Parse precision mode (MUST be done before ModelContext::create!)
-    if (args.precision == "mixed")
+    // Parse weight precision mode
+    if (args.weight_precision == "native")
     {
-        pipeline_config.precision = ComputePrecision::MIXED;
+        pipeline_config.weight_precision = WeightPrecision::NATIVE;
     }
-    else if (args.precision == "fp32")
+    else if (args.weight_precision == "fp32")
     {
-        pipeline_config.precision = ComputePrecision::FP32;
+        pipeline_config.weight_precision = WeightPrecision::CONVERT_TO_FP32;
     }
-    else if (args.precision == "bf16")
+    else if (args.weight_precision == "bf16")
     {
-        pipeline_config.precision = ComputePrecision::BF16;
+        pipeline_config.weight_precision = WeightPrecision::CONVERT_TO_BF16;
     }
-    else if (args.precision == "fp16")
+    else if (args.weight_precision == "fp16")
     {
-        pipeline_config.precision = ComputePrecision::FP16;
+        pipeline_config.weight_precision = WeightPrecision::CONVERT_TO_FP16;
     }
-    else if (args.precision == "int8")
+    else if (args.weight_precision == "int8")
     {
-        pipeline_config.precision = ComputePrecision::INT8;
-    }
-    else if (args.precision == "auto")
-    {
-        // Auto-select based on device capabilities
-        const auto &devices = dm.devices();
-        pipeline_config.precision = selectOptimalPrecision(devices[device_idx]);
+        pipeline_config.weight_precision = WeightPrecision::CONVERT_TO_INT8;
     }
     else
     {
         if (mpi_ctx->rank() == 0)
         {
-            LOG_WARN("Unknown precision mode '" << args.precision << "', defaulting to MIXED");
+            LOG_WARN("Unknown weight precision mode '" << args.weight_precision << "', defaulting to NATIVE");
         }
-        pipeline_config.precision = ComputePrecision::MIXED;
+        pipeline_config.weight_precision = WeightPrecision::NATIVE;
+    }
+
+    // Parse activation precision mode
+    if (args.activation_precision == "fp32")
+    {
+        pipeline_config.activation_precision = ActivationPrecision::FP32;
+    }
+    else if (args.activation_precision == "bf16")
+    {
+        pipeline_config.activation_precision = ActivationPrecision::BF16;
+    }
+    else if (args.activation_precision == "fp16")
+    {
+        pipeline_config.activation_precision = ActivationPrecision::FP16;
+    }
+    else if (args.activation_precision == "int8")
+    {
+        pipeline_config.activation_precision = ActivationPrecision::INT8;
+    }
+    else
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_WARN("Unknown activation precision mode '" << args.activation_precision << "', defaulting to FP32");
+        }
+        pipeline_config.activation_precision = ActivationPrecision::FP32;
     }
 
     // Create model context (loads metadata but not weights yet)
-    // NOTE: precision is passed here for INT8 dequantization at load time
     auto model_ctx = ModelContext::create(args.model_path, mpi_ctx, nullptr, nullptr,
                                           WeightDistributionStrategy::REPLICATED,
-                                          pipeline_config.precision);
+                                          pipeline_config.weight_precision);
     if (!model_ctx)
     {
         if (mpi_ctx->rank() == 0)
@@ -303,7 +322,7 @@ int main(int argc, char *argv[])
     // Re-create model context with placement map (this creates WeightManager)
     model_ctx = ModelContext::create(args.model_path, mpi_ctx, placement_map, nullptr,
                                      WeightDistributionStrategy::REPLICATED,
-                                     pipeline_config.precision);
+                                     pipeline_config.weight_precision);
     if (!model_ctx)
     {
         if (mpi_ctx->rank() == 0)
@@ -317,33 +336,48 @@ int main(int argc, char *argv[])
     const auto &model = model_ctx->model();
     std::string architecture = model_ctx->architecture();
 
-    // Log selected precision mode
+    // Log selected precision modes
     if (mpi_ctx->rank() == 0)
     {
-        const char *precision_name = "Unknown";
-        switch (pipeline_config.precision)
+        const char *weight_prec_name = "Unknown";
+        switch (pipeline_config.weight_precision)
         {
-        case ComputePrecision::MIXED:
-            precision_name = "MIXED (weights quantized, compute FP32)";
+        case WeightPrecision::NATIVE:
+            weight_prec_name = "NATIVE (keep in GGUF format)";
             break;
-        case ComputePrecision::FP32:
-            precision_name = "FP32 (all weights dequantized to FP32)";
+        case WeightPrecision::CONVERT_TO_FP32:
+            weight_prec_name = "FP32 (dequantize to FP32 at load)";
             break;
-        case ComputePrecision::BF16:
-            precision_name = "BF16 (all weights dequantized to BF16)";
+        case WeightPrecision::CONVERT_TO_BF16:
+            weight_prec_name = "BF16 (dequantize to BF16 at load)";
             break;
-        case ComputePrecision::FP16:
-            precision_name = "FP16 (all weights dequantized to FP16)";
+        case WeightPrecision::CONVERT_TO_FP16:
+            weight_prec_name = "FP16 (dequantize to FP16 at load)";
             break;
-        case ComputePrecision::INT8:
-            precision_name = "INT8 (all weights dequantized to INT8)";
-            break;
-        case ComputePrecision::AUTO:
-            precision_name = "AUTO (should have been resolved!)";
+        case WeightPrecision::CONVERT_TO_INT8:
+            weight_prec_name = "INT8 (dequantize to INT8 at load)";
             break;
         }
-        LOG_INFO("Compute precision: " << precision_name);
-        LOG_INFO("");
+
+        const char *activation_prec_name = "Unknown";
+        switch (pipeline_config.activation_precision)
+        {
+        case ActivationPrecision::FP32:
+            activation_prec_name = "FP32 (32-bit float)";
+            break;
+        case ActivationPrecision::BF16:
+            activation_prec_name = "BF16 (bfloat16)";
+            break;
+        case ActivationPrecision::FP16:
+            activation_prec_name = "FP16 (16-bit float)";
+            break;
+        case ActivationPrecision::INT8:
+            activation_prec_name = "INT8 (8-bit integer)";
+            break;
+        }
+
+        LOG_INFO("Weight precision: " << weight_prec_name);
+        LOG_INFO("Activation precision: " << activation_prec_name);
     }
 
     // Create pipeline using factory

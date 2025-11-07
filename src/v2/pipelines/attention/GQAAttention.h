@@ -39,8 +39,8 @@ namespace llaminar2
         bool causal;     // Apply causal masking for autoregressive generation
         int window_size; // Sliding window size (-1 = full attention)
 
-        // Compute precision for attention operations
-        ComputePrecision precision; // FP32, BF16, FP16 (controls GEMM precision)
+        // Activation precision for attention operations
+        ActivationPrecision precision; // FP32, BF16, FP16 (controls GEMM precision)
 
         // MPI configuration
         std::shared_ptr<MPIContext> mpi_ctx;
@@ -58,7 +58,7 @@ namespace llaminar2
         GQAAttentionConfig()
             : n_heads(0), n_kv_heads(0), head_dim(0),
               causal(true), window_size(-1),
-              precision(ComputePrecision::FP32),
+              precision(ActivationPrecision::FP32),
               mpi_ctx(nullptr), mpi_strategy(MPIStrategy::None),
               verbose_logging(false),
               workspace_scores(nullptr), workspace_qkv_buffer(nullptr),
@@ -277,12 +277,12 @@ namespace llaminar2
          * @param scores Output scores matrix (pre-allocated)
          * @param seq_len Sequence length
          * @param head_dim Dimension per head
-         * @param precision Compute precision (FP32, BF16, FP16)
+         * @param precision Activation precision (FP32, BF16, FP16)
          * @return true on success, false if GEMM fails
          */
         static bool compute_attention_scores(
             const float *Q, const float *K, float *scores,
-            int seq_len, int head_dim, ComputePrecision precision = ComputePrecision::FP32);
+            int seq_len, int head_dim, ActivationPrecision precision = ActivationPrecision::FP32);
 
         /**
          * @brief Scale attention scores by 1/sqrt(head_dim)
@@ -344,12 +344,12 @@ namespace llaminar2
          * @param context Output context matrix (pre-allocated)
          * @param seq_len Sequence length
          * @param head_dim Dimension per head
-         * @param precision Compute precision (FP32, BF16, FP16)
+         * @param precision Activation precision (FP32, BF16, FP16)
          * @return true on success, false if GEMM fails
          */
         static bool compute_context_from_scores(
             const float *scores, const float *V, float *context,
-            int seq_len, int head_dim, ComputePrecision precision = ComputePrecision::FP32);
+            int seq_len, int head_dim, ActivationPrecision precision = ActivationPrecision::FP32);
 
         /**
          * @brief Write context to strided multi-head output

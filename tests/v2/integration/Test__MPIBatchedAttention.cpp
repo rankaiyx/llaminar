@@ -152,11 +152,26 @@ TEST_F(MPIBatchedAttention, TensorParallelBatchedAttentionE2E)
     // Create pipeline (must support MPI)
     MockMPIPipeline pipeline(model_ctx_, mpi_ctx_, config_);
 
-    // Create input Q, K, V tensors: [total_tokens, d_model]
-    auto Q = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(d_model_)});
-    auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(d_model_)});
-    auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(d_model_)});
-    auto output = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(d_model_)});
+    // Create input Q, K, V tensors with correct post-projection dimensions:
+    // Q: [total_tokens, n_heads * head_dim] = [8, 14 * 64] = [8, 896]
+    // K, V: [total_tokens, n_kv_heads * head_dim] = [8, 2 * 64] = [8, 128]
+    const int q_dim = n_heads_ * head_dim_;
+    const int kv_dim = n_kv_heads_ * head_dim_;
+
+    auto Q = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(q_dim)});
+    auto K = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(kv_dim)});
+    auto V = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(kv_dim)});
+    auto output = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(q_dim)});
+
+    // DEBUG: Print tensor shapes
+    if (rank_ == 0)
+    {
+        std::cout << "[DEBUG] Created Q with shape: [" << Q->shape()[0] << ", " << Q->shape()[1] << "]" << std::endl;
+        std::cout << "[DEBUG] Created K with shape: [" << K->shape()[0] << ", " << K->shape()[1] << "]" << std::endl;
+        std::cout << "[DEBUG] Created V with shape: [" << V->shape()[0] << ", " << V->shape()[1] << "]" << std::endl;
+        std::cout << "[DEBUG] Created output with shape: [" << output->shape()[0] << ", " << output->shape()[1] << "]" << std::endl;
+        std::cout << "[DEBUG] q_dim=" << q_dim << ", kv_dim=" << kv_dim << std::endl;
+    }
 
     // Initialize with distinct patterns for each sequence
     float *Q_data = Q->mutable_data();
@@ -168,11 +183,17 @@ TEST_F(MPIBatchedAttention, TensorParallelBatchedAttentionE2E)
         int seq_id = t / seq_len_per_batch; // 0 or 1
         float seq_value = (seq_id == 0) ? 0.1f : 0.2f;
 
-        for (int d = 0; d < d_model_; ++d)
+        // Q dimensions
+        for (int d = 0; d < q_dim; ++d)
         {
-            Q_data[t * d_model_ + d] = seq_value * (1.0f + d / 1000.0f);
-            K_data[t * d_model_ + d] = seq_value * (1.0f + d / 1000.0f);
-            V_data[t * d_model_ + d] = seq_value * (1.0f + d / 500.0f);
+            Q_data[t * q_dim + d] = seq_value * (1.0f + d / 1000.0f);
+        }
+
+        // K, V dimensions (smaller than Q)
+        for (int d = 0; d < kv_dim; ++d)
+        {
+            K_data[t * kv_dim + d] = seq_value * (1.0f + d / 1000.0f);
+            V_data[t * kv_dim + d] = seq_value * (1.0f + d / 500.0f);
         }
     }
 
@@ -188,11 +209,11 @@ TEST_F(MPIBatchedAttention, TensorParallelBatchedAttentionE2E)
 
     ASSERT_TRUE(success) << "Attention failed";
 
-    // Validate output shape
+    // Validate output shape (should match Q dimensions)
     const auto &out_shape = output->shape();
     ASSERT_EQ(out_shape.size(), 2) << "Output should be 2D";
     ASSERT_EQ(out_shape[0], total_tokens) << "Output should have " << total_tokens << " tokens";
-    ASSERT_EQ(out_shape[1], d_model_) << "Output should have d_model=" << d_model_;
+    ASSERT_EQ(out_shape[1], q_dim) << "Output should have q_dim=" << q_dim;
 
     // Validate outputs are non-zero (attention computed)
     const float *out_data = output->data();
@@ -205,9 +226,9 @@ TEST_F(MPIBatchedAttention, TensorParallelBatchedAttentionE2E)
     for (int t = 0; t < total_tokens; ++t)
     {
         int seq_id = t / seq_len_per_batch;
-        for (int d = 0; d < d_model_; ++d)
+        for (int d = 0; d < q_dim; ++d)
         {
-            float val = std::abs(out_data[t * d_model_ + d]);
+            float val = std::abs(out_data[t * q_dim + d]);
             if (seq_id == 0)
             {
                 seq0_sum += val;
@@ -269,10 +290,14 @@ TEST_F(MPIBatchedAttention, BatchVsSequentialEquivalence)
     batch_config.batch_size = batch_size;
     MockMPIPipeline pipeline(model_ctx_, mpi_ctx_, batch_config);
 
-    auto Q_batch = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(d_model_)});
-    auto K_batch = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(d_model_)});
-    auto V_batch = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(d_model_)});
-    auto out_batch = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(d_model_)});
+    // Create tensors with correct post-projection dimensions
+    const int q_dim = n_heads_ * head_dim_;
+    const int kv_dim = n_kv_heads_ * head_dim_;
+
+    auto Q_batch = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(q_dim)});
+    auto K_batch = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(kv_dim)});
+    auto V_batch = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(kv_dim)});
+    auto out_batch = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(total_tokens), static_cast<size_t>(q_dim)});
 
     // Initialize: seq0 with pattern A, seq1 with pattern B
     float *Q_batch_data = Q_batch->mutable_data();
@@ -284,11 +309,15 @@ TEST_F(MPIBatchedAttention, BatchVsSequentialEquivalence)
         int seq_id = t / seq_len;
         float base = (seq_id == 0) ? 0.5f : 0.7f;
 
-        for (int d = 0; d < d_model_; ++d)
+        for (int d = 0; d < q_dim; ++d)
         {
-            Q_batch_data[t * d_model_ + d] = base * std::sin(t + d * 0.01f);
-            K_batch_data[t * d_model_ + d] = base * std::cos(t + d * 0.01f);
-            V_batch_data[t * d_model_ + d] = base * (t + d) * 0.001f;
+            Q_batch_data[t * q_dim + d] = base * std::sin(t + d * 0.01f);
+        }
+
+        for (int d = 0; d < kv_dim; ++d)
+        {
+            K_batch_data[t * kv_dim + d] = base * std::cos(t + d * 0.01f);
+            V_batch_data[t * kv_dim + d] = base * (t + d) * 0.001f;
         }
     }
 
@@ -303,15 +332,15 @@ TEST_F(MPIBatchedAttention, BatchVsSequentialEquivalence)
     seq_config.batch_size = 1;
     MockMPIPipeline pipeline_seq(model_ctx_, mpi_ctx_, seq_config);
 
-    auto Q_seq0 = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)});
-    auto K_seq0 = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)});
-    auto V_seq0 = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)});
-    auto out_seq0 = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)});
+    auto Q_seq0 = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(q_dim)});
+    auto K_seq0 = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)});
+    auto V_seq0 = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)});
+    auto out_seq0 = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(q_dim)});
 
     // Copy seq0 data
-    std::memcpy(Q_seq0->mutable_data(), Q_batch_data, seq_len * d_model_ * sizeof(float));
-    std::memcpy(K_seq0->mutable_data(), K_batch_data, seq_len * d_model_ * sizeof(float));
-    std::memcpy(V_seq0->mutable_data(), V_batch_data, seq_len * d_model_ * sizeof(float));
+    std::memcpy(Q_seq0->mutable_data(), Q_batch_data, seq_len * q_dim * sizeof(float));
+    std::memcpy(K_seq0->mutable_data(), K_batch_data, seq_len * kv_dim * sizeof(float));
+    std::memcpy(V_seq0->mutable_data(), V_batch_data, seq_len * kv_dim * sizeof(float));
 
     bool seq0_success = pipeline_seq.attention_gqa_tensor_parallel(
         Q_seq0.get(), K_seq0.get(), V_seq0.get(), out_seq0.get(),
@@ -328,10 +357,10 @@ TEST_F(MPIBatchedAttention, BatchVsSequentialEquivalence)
 
     for (int t = 0; t < seq_len; ++t)
     {
-        for (int d = 0; d < d_model_; ++d)
+        for (int d = 0; d < q_dim; ++d)
         {
-            float batch_val = batch_seq0[t * d_model_ + d];
-            float seq_val = seq_seq0[t * d_model_ + d];
+            float batch_val = batch_seq0[t * q_dim + d];
+            float seq_val = seq_seq0[t * q_dim + d];
             float diff = std::abs(batch_val - seq_val);
             max_diff = std::max(max_diff, diff);
 
@@ -350,7 +379,7 @@ TEST_F(MPIBatchedAttention, BatchVsSequentialEquivalence)
     {
         std::cout << "[Equivalence] ✓ Batch vs sequential validation:" << std::endl;
         std::cout << "              max_diff=" << max_diff << std::endl;
-        std::cout << "              mismatches=" << mismatches << "/" << (seq_len * d_model_) << std::endl;
+        std::cout << "              mismatches=" << mismatches << "/" << (seq_len * q_dim) << std::endl;
 
         if (max_diff < tolerance)
         {

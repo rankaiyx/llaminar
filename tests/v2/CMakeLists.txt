@@ -188,6 +188,11 @@ endfunction()
 # Find GTest (should be available from parent CMake)
 find_package(GTest REQUIRED)
 
+# Enable pipeline snapshot capture for all test builds
+# This compile definition enables the snapshot infrastructure in PipelineBase.
+# In release builds (without this flag), all snapshot code compiles away to NOOPs.
+add_compile_definitions(ENABLE_PIPELINE_SNAPSHOTS)
+
 # Test: FP32Tensor class
 add_executable(v2_test_tensor_basics unit/tensors/Test__FP32Tensor.cpp)
 target_link_libraries(v2_test_tensor_basics 
@@ -224,6 +229,110 @@ add_v2_test(V2_Unit_BF16Tensor
     LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM;ViewSupport"
 )
 
+# Test: INT32Tensor class (accumulator tensor for INT8 pipelines)
+add_executable(v2_test_int32_tensor unit/tensors/Test__INT32Tensor.cpp)
+target_link_libraries(v2_test_int32_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT32Tensor 
+    COMMAND $<TARGET_FILE:v2_test_int32_tensor>
+    LABELS "V2;Unit;TensorOperations;INT32;Quantization;Requantization;INT8Pipeline"
+    MPI_PROCS 1  # INT32Tensor operations are CPU-only, single rank
+)
+
+# Test: INT32 RMSNorm kernel (INT32→INT8 normalization for full INT8 pipelines)
+add_executable(v2_test_int32_rmsnorm unit/Test__INT32RMSNorm.cpp)
+target_link_libraries(v2_test_int32_rmsnorm 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT32RMSNorm 
+    COMMAND $<TARGET_FILE:v2_test_int32_rmsnorm>
+    LABELS "V2;Unit;Kernels;RMSNorm;INT32;INT8Pipeline;Quantization;AVX512;CPU"
+    MPI_PROCS 1  # RMSNorm is CPU-only, single rank
+)
+
+# Test: RoPE primitives (scalar, AVX2, AVX512 parity)
+add_executable(v2_test_rope_primitives unit/Test__RoPEPrimitives.cpp)
+target_link_libraries(v2_test_rope_primitives 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RoPEPrimitives 
+    COMMAND $<TARGET_FILE:v2_test_rope_primitives>
+    LABELS "V2;Unit;Primitives;RoPE;SIMD;AVX2;AVX512;RotaryPositionEncoding;ImplementationParity;CPU"
+    MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
+# Test: Attention parity regression tests (locks in RoPE theta, causal masking, GQA behavior)
+add_executable(v2_test_attention_parity unit/Test__AttentionParity.cpp)
+target_link_libraries(v2_test_attention_parity 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionParity 
+    COMMAND $<TARGET_FILE:v2_test_attention_parity>
+    LABELS "V2;Unit;Attention;RegressionTests;RoPE;CausalMasking;GQA;ParityTesting;CPU"
+    MPI_PROCS 1  # Single rank for unit testing
+)
+
+# Test: SwiGLU parity regression tests (locks in correct formula: gate * silu(up))
+add_executable(v2_test_swiglu_parity unit/Test__SwiGLUParity.cpp)
+target_link_libraries(v2_test_swiglu_parity 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_SwiGLUParity 
+    COMMAND $<TARGET_FILE:v2_test_swiglu_parity>
+    LABELS "V2;Unit;FFN;RegressionTests;SwiGLU;ParityTesting;CPU;Activation"
+    MPI_PROCS 1  # Single rank for unit testing
+)
+
+# Test: FP32 Attention kernel parity test against PyTorch
+add_executable(v2_test_fp32_attention_parity unit/Test__FP32AttentionParity.cpp)
+target_link_libraries(v2_test_fp32_attention_parity 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FP32AttentionParity 
+    COMMAND $<TARGET_FILE:v2_test_fp32_attention_parity>
+    LABELS "V2;Unit;Kernels;Attention;FP32;PyTorchParity;GroundTruth;MultiHead;GQA;CPU"
+    MPI_PROCS 1  # Parity test is CPU-only, single rank
+)
+
+# Test: INT8 Attention kernel (multi-head attention with INT8 Q/K/V, INT32 accumulators)
+add_executable(v2_test_int8_attention unit/Test__INT8AttentionKernel.cpp)
+target_link_libraries(v2_test_int8_attention 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT8Attention 
+    COMMAND $<TARGET_FILE:v2_test_int8_attention>
+    LABELS "V2;Unit;Kernels;Attention;INT8;INT32;INT8Pipeline;Quantization;MultiHead;CPU"
+    MPI_PROCS 1  # Attention is CPU-only, single rank
+)
+
+# Test: INT8 SwiGLU kernel (SwiGLU activation with INT8 gate/up projections)
+add_executable(v2_test_int8_swiglu unit/Test__INT8SwiGLUKernel.cpp)
+target_link_libraries(v2_test_int8_swiglu 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT8SwiGLU 
+    COMMAND $<TARGET_FILE:v2_test_int8_swiglu>
+    LABELS "V2;Unit;Kernels;SwiGLU;INT8;INT8Pipeline;Quantization;Activation;CPU"
+    MPI_PROCS 1  # SwiGLU is CPU-only, single rank
+)
+
 # Test: INT8GemmKernel (OneDNN per-channel quantization)
 add_executable(v2_test_int8_gemm unit/Test__INT8GemmKernel.cpp)
 target_link_libraries(v2_test_int8_gemm 
@@ -248,6 +357,19 @@ add_v2_test(V2_Unit_INT8GemmKernel_INT32Output
     COMMAND $<TARGET_FILE:v2_test_int8_gemm_int32>
     LABELS "V2;Unit;Kernels;INT8;Quantization;GEMM;OneDNN;CPU;INT32;Pipeline"
     MPI_PROCS 1  # INT8 GEMM is CPU-only, single rank
+)
+
+# Test: Full INT8 Pipeline (end-to-end INT8 inference)
+add_executable(v2_test_full_int8_pipeline Test__FullINT8Pipeline.cpp)
+target_link_libraries(v2_test_full_int8_pipeline 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FullINT8Pipeline 
+    COMMAND $<TARGET_FILE:v2_test_full_int8_pipeline>
+    LABELS "V2;Unit;Kernels;INT8;Quantization;GEMM;Pipeline;INT32;Requantization;EndToEnd"
+    MPI_PROCS 1  # CPU-only, single rank
 )
 
 # Test: TensorBase Conversion Interface
@@ -499,6 +621,20 @@ add_v2_test(V2_Unit_Q4_0_SIMD
     LABELS "V2;Unit;TensorOperations;Q4_0;Quantization;SIMD;AVX2;AVX512;Equivalency"
 )
 
+# Test: Q4_0 Fused Dequant+GEMM Parity
+add_executable(v2_test_q4_0_gemm_parity unit/tensors/Test__Q4_0Gemm_DequantParity.cpp)
+target_link_libraries(v2_test_q4_0_gemm_parity 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+    ${BLAS_LIBRARIES}
+)
+add_v2_test(V2_Unit_Q4_0_Gemm_DequantParity 
+    COMMAND $<TARGET_FILE:v2_test_q4_0_gemm_parity>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Kernels;GEMM;Q4_0;Quantization;DequantParity;FusedKernels"
+)
+
 # Test: Q4_1 SIMD Equivalency
 add_executable(v2_test_q4_1_simd unit/tensors/Test__Q4_1Tensor.cpp)
 target_link_libraries(v2_test_q4_1_simd 
@@ -674,12 +810,12 @@ add_v2_test(V2_Unit_PipelineDeviceDetection
 )
 
 # Test: PipelineBase Precision Mode
-# Tests ComputePrecision configuration flow through PipelineBase
+# Tests WeightPrecision and ActivationPrecision configuration flow through PipelineBase
 add_executable(v2_test_pipeline_precision_mode unit/pipelines/Test__PipelineBase_PrecisionMode.cpp)
 target_link_libraries(v2_test_pipeline_precision_mode llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_PipelinePrecisionMode
     COMMAND $<TARGET_FILE:v2_test_pipeline_precision_mode>
-    LABELS "V2;Unit;PipelineExecution;ComputePrecision;Configuration"
+    LABELS "V2;Unit;PipelineExecution;PrecisionConfiguration;WeightPrecision;ActivationPrecision"
 )
 
 # Test: ModelLoader
@@ -1913,13 +2049,36 @@ add_v2_test(V2_E2E_Qwen2Correctness
 # Ground truth validation against PyTorch reference implementation
 # Compares layer-by-layer outputs, logits, attention scores, etc.
 
-# Placeholder for parity test executables (to be added)
-# Example:
-# add_executable(v2_test_pytorch_parity pytorch_parity/test_pytorch_parity.cpp)
-# target_link_libraries(v2_test_pytorch_parity llaminar2_core GTest::gtest_main)
-# add_v2_test(V2_Parity_PyTorch
-#     COMMAND $<TARGET_FILE:v2_test_pytorch_parity>
-#     LABELS "V2;Parity;PyTorch"
+# Qwen2 FP32 Parity (PyTorch ground truth validation)
+# Requires: PyTorch snapshots generated by python/reference/generate_qwen2_pipeline_snapshots.py
+# Requires: cnpy library for NumPy .npz file loading
+find_package(ZLIB)
+if(ZLIB_FOUND)
+    # Get the workspace root (parent of src/v2)
+    get_filename_component(WORKSPACE_ROOT "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+    
+    add_executable(v2_test_qwen2_fp32_parity 
+        e2e/Test__Qwen2FP32Parity.cpp
+        ${WORKSPACE_ROOT}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_test_qwen2_fp32_parity 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_test_qwen2_fp32_parity PRIVATE 
+        ${WORKSPACE_ROOT}/external/cnpy
+    )
+    
+    add_v2_test(V2_E2E_Qwen2FP32Parity
+        COMMAND $<TARGET_FILE:v2_test_qwen2_fp32_parity>
+        LABELS "V2;E2E;Qwen;Parity;PyTorch;FP32"
+        MPI_PROCS 1
+    )
+else()
+    message(WARNING "ZLIB not found - Qwen2 FP32 parity test disabled (requires cnpy for .npz loading)")
+endif()
 # )
 
 # =============================================================================

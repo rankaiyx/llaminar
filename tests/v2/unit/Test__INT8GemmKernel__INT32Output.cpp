@@ -521,7 +521,7 @@ TEST_F(Test__INT8GemmKernel__INT32Output, INT32OutputPrecision)
 
     // Load layer 0 query projection weight (typical transformer weight matrix)
     // Shape: [n_heads * head_dim, d_model] = [896, 896] for Qwen 0.5B
-    auto weight_tensor = loader.loadTensor("blk.0.attn_q.weight", 0, ComputePrecision::FP32);
+    auto weight_tensor = loader.loadTensor("blk.0.attn_q.weight", 0, WeightPrecision::CONVERT_TO_FP32);
     if (!weight_tensor)
     {
         GTEST_SKIP() << "Failed to load blk.0.attn_q.weight from model";

@@ -61,13 +61,13 @@ namespace llaminar2
          * @param mpi_ctx MPI context for rank coordination (nullptr = single rank)
          * @param placement_map Fine-grained weight→device mapping (nullptr = default to device 0)
          * @param strategy Distribution strategy (default: REPLICATED)
-         * @param precision Compute precision mode (affects INT8 dequantization)
+         * @param weight_precision How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
          */
         WeightManager(ModelLoader &loader,
                       std::shared_ptr<MPIContext> mpi_ctx = nullptr,
                       std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
                       WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
-                      ComputePrecision precision = ComputePrecision::FP32);
+                      WeightPrecision weight_precision = WeightPrecision::CONVERT_TO_FP32);
 
         /**
          * @brief Get weight tensor by name
@@ -124,7 +124,7 @@ namespace llaminar2
         std::shared_ptr<MPIContext> mpi_ctx_;                                ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                  ///< Fine-grained placement decisions
         WeightDistributionStrategy strategy_;                                ///< Distribution strategy
-        ComputePrecision precision_;                                         ///< Compute precision (affects INT8 dequantization)
+        WeightPrecision weight_precision_;                                   ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_; ///< Weight cache
     };
 

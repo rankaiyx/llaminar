@@ -49,6 +49,9 @@ Thumbs.db
 *.tmp
 *.temp
 Testing/
+pytorch_attention*/
+pytorch_incremental*/
+pytorch_qwen*/
 **/pytorch_layer_captures/**/*
 **/pytorch_snapshots*/**/*
 **/test_pytorch*/**/*

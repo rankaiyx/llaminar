@@ -243,6 +243,7 @@ namespace llaminar2
         BF16,    // 16-bit bfloat
         FP16,    // 16-bit float
         INT8,    // 8-bit integer (dequantized for AVX512-VNNI/CUDA INT8 GEMM)
+        INT32,   // 32-bit integer accumulator (for INT8 GEMM results)
         IQ4_NL,  // 4-bit quantized (non-linear)
         IQ4_XS,  // 4-bit quantized (extra-small IQ)
         Q8_0,    // 8-bit quantized
@@ -700,7 +701,7 @@ namespace llaminar2
      * - INT8×INT8 GEMM in CUDA via CUTLASS or cuBLAS
      * - Reduced memory bandwidth vs FP32 (4× compression)
      *
-     * Use case: When --precision int8 is set, all quantized tensors
+     * Use case: When --weight-precision int8 is set, all quantized tensors
      * (IQ4_NL, Q6_K, Q8_0, etc.) are dequantized to this format at load time.
      */
     class INT8Tensor : public TensorBase
@@ -783,6 +784,108 @@ namespace llaminar2
         mutable std::vector<float> row_scales_cache_; ///< Cached per-row scales (computed on-demand)
         void *device_data_ = nullptr;
         mutable std::vector<float> dequant_cache_;
+
+        bool sync_to_device();
+        bool sync_from_device();
+    };
+
+    // Implementation: INT32Tensor.cpp
+    /**
+     * @brief INT32 accumulator tensor for full INT8 pipeline
+     *
+     * Stores INT32 accumulator results from INT8 GEMM operations.
+     * Supports requantization back to INT8 for next layer (key for full INT8 inference).
+     *
+     * Key features:
+     * - Per-row dynamic scaling for INT32→INT8 requantization
+     * - Dequantization to FP32 for final output
+     * - Optimized for CPU (no device support yet)
+     *
+     * Usage:
+     *   INT8×INT8 GEMM → INT32Tensor → requantize_to_int8() → INT8Tensor (next layer)
+     */
+    class INT32Tensor : public TensorBase
+    {
+    public:
+        explicit INT32Tensor(const std::vector<size_t> &shape);
+        INT32Tensor(const std::vector<size_t> &shape,
+                    const std::vector<int32_t> &data);
+        INT32Tensor(const std::vector<size_t> &shape,
+                    const std::vector<float> &fp32_data,
+                    float scale);
+        ~INT32Tensor() override = default;
+
+        // TensorBase interface
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::INT32; }
+
+        int device_index() const override { return device_idx_; }
+        bool set_device(int device_idx) override;
+        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
+
+        const float *data() const override; // Dequantizes to cache
+        float *mutable_data() override;     // Not supported
+
+        bool copyFrom(const TensorBase *src) override;
+
+        std::unique_ptr<ITensorGemm> createGemm() override;
+        std::unique_ptr<ITensorRoPE> createRoPE() override;
+        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
+        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
+        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
+        std::unique_ptr<ITensorAttention> createAttention() override;
+
+        // Format conversion
+        void to_fp32(float *dst) const override;
+        void to_bf16(uint16_t *dst) const override;
+        void to_fp16(uint16_t *dst) const override;
+        void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override;
+        void to_fp32_row(size_t row_idx, float *buffer) const override;
+        void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+
+        // View support (not yet implemented)
+        bool is_view() const override { return false; }
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override;
+
+        // INT32-specific interface
+        const int32_t *int32_data() const { return host_int32_data_.data(); }
+        int32_t *mutable_int32_data() { return host_int32_data_.data(); }
+        float scale() const { return scale_; }
+        void set_scale(float s) { scale_ = s; }
+
+        // Per-row scales (for INT32→INT8 requantization)
+        const float *row_scales() const { return row_scales_.empty() ? nullptr : row_scales_.data(); }
+        bool has_row_scales() const { return !row_scales_.empty(); }
+        size_t num_row_scales() const { return row_scales_.size(); }
+        void set_row_scales(const std::vector<float> &scales) { row_scales_ = scales; }
+
+        /**
+         * @brief Requantize INT32 to INT8 with per-row dynamic scaling
+         *
+         * This is the KEY function for full INT8 pipelines. Converts INT32
+         * accumulator results back to INT8 for the next layer.
+         *
+         * Per-row quantization maintains better accuracy than per-tensor:
+         * - Each row has independent dynamic range
+         * - Prevents outliers in one row from reducing precision in others
+         *
+         * @param dst_int8 Output INT8 data [m, n]
+         * @param dst_row_scales Output per-row scales [m]
+         * @return True if successful
+         */
+        bool requantize_to_int8(int8_t *dst_int8, float *dst_row_scales) const;
+
+    private:
+        std::vector<size_t> shape_;
+        int device_idx_ = -1;
+        std::vector<int32_t> host_int32_data_;
+        float scale_ = 1.0f;            ///< Global scale factor
+        std::vector<float> row_scales_; ///< Per-row scales (optional)
+        void *device_data_ = nullptr;
+        mutable std::vector<float> dequant_cache_; ///< Cached FP32 dequantization
 
         bool sync_to_device();
         bool sync_from_device();

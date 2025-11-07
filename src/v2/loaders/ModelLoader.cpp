@@ -8,6 +8,7 @@
 #include "ModelLoader.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorFactory.h"
+#include "../utils/MPIContext.h"
 #include <cstring>
 #include <iostream>
 
@@ -210,7 +211,19 @@ namespace llaminar2
     // =============================================================================
 
     ModelLoader::ModelLoader(TensorFactory *factory)
-        : factory_(factory), loaded_(false) {}
+        : factory_(factory), loaded_(false)
+    {
+        // Create default factory if none provided
+        if (!factory_)
+        {
+            // Create a single-rank MPIContext for the factory
+            // (rank=0, world_size=1, no actual MPI comm)
+            owned_mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
+            owned_factory_ = std::make_unique<TensorFactory>(*owned_mpi_ctx_);
+            factory_ = owned_factory_.get();
+            LOG_DEBUG("[ModelLoader] Created internal TensorFactory with single-rank MPI context");
+        }
+    }
 
     bool ModelLoader::loadModel(const std::string &file_path)
     {
@@ -311,7 +324,7 @@ namespace llaminar2
 
     std::shared_ptr<TensorBase> ModelLoader::loadTensor(const std::string &tensor_name,
                                                         int device_idx,
-                                                        ComputePrecision precision)
+                                                        WeightPrecision weight_precision)
     {
         if (!loaded_)
         {
@@ -378,27 +391,25 @@ namespace llaminar2
         // TODO: Use device_idx for device placement when V2 supports it
         (void)device_idx; // Suppress unused parameter warning
 
-        // PRECISION MODE HANDLING:
-        // - MIXED (default): Keep weights quantized, no dequantization
-        // - FP32/BF16/FP16/INT8: Dequantize all weights to target format at load
+        // WEIGHT PRECISION HANDLING:
+        // - NATIVE (default): Keep weights in original GGUF format, no conversion
+        // - CONVERT_TO_FP32/BF16/FP16/INT8: Convert all weights to target format at load
 
-        bool should_dequantize = (precision != ComputePrecision::MIXED) && info->isQuantized();
+        bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();
 
-        if (should_dequantize)
+        if (should_convert)
         {
-            switch (precision)
+            switch (weight_precision)
             {
-            case ComputePrecision::INT8:
+            case WeightPrecision::CONVERT_TO_INT8:
                 return dequantizeToINT8(info, shape, raw);
-            case ComputePrecision::FP32:
-                // TODO: Implement dequantizeToFP32()
-                LOG_WARN("[ModelLoader] FP32 dequantization not yet implemented, keeping quantized");
-                break;
-            case ComputePrecision::BF16:
+            case WeightPrecision::CONVERT_TO_FP32:
+                return dequantizeToFP32(info, shape, raw);
+            case WeightPrecision::CONVERT_TO_BF16:
                 // TODO: Implement dequantizeToBF16()
                 LOG_WARN("[ModelLoader] BF16 dequantization not yet implemented, keeping quantized");
                 break;
-            case ComputePrecision::FP16:
+            case WeightPrecision::CONVERT_TO_FP16:
                 // TODO: Implement dequantizeToFP16()
                 LOG_WARN("[ModelLoader] FP16 dequantization not yet implemented, keeping quantized");
                 break;
@@ -407,7 +418,7 @@ namespace llaminar2
             }
         }
 
-        // STANDARD MODE (MIXED precision): Create typed tensor based on GGUF type
+        // NATIVE MODE: Create typed tensor based on GGUF type (no conversion)
         std::shared_ptr<TensorBase> tensor;
 
         switch (info->type)
@@ -1534,6 +1545,201 @@ namespace llaminar2
         avg_scale /= static_cast<float>(num_blocks);
 
         return std::make_shared<INT8Tensor>(shape, int8_data, avg_scale);
+    }
+
+    // =============================================================================
+    // FP32 DEQUANTIZATION
+    // =============================================================================
+
+    std::shared_ptr<TensorBase> ModelLoader::dequantizeToFP32(
+        const GGUFTensorInfo *info,
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw)
+    {
+        // Calculate total elements
+        size_t total_elements = 1;
+        for (auto dim : shape)
+            total_elements *= dim;
+
+        // Allocate FP32 buffer
+        std::vector<float> fp32_data(total_elements);
+
+        // Dequantize based on tensor type
+        switch (info->type)
+        {
+        case GGUFTensorType::F32:
+            // Already FP32 - just copy
+            std::memcpy(fp32_data.data(), raw.data(), total_elements * sizeof(float));
+            break;
+
+        case GGUFTensorType::F16:
+        {
+            // FP16 -> FP32 conversion
+            // Reinterpret uint8_t raw bytes as uint16_t
+            const uint16_t *fp16_raw = reinterpret_cast<const uint16_t *>(raw.data());
+            std::vector<uint16_t> fp16_data(fp16_raw, fp16_raw + total_elements);
+            auto temp_tensor = std::make_shared<FP16Tensor>(shape, fp16_data);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q4_0:
+        {
+            auto temp_tensor = std::make_shared<Q4_0Tensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q4_1:
+        {
+            auto temp_tensor = std::make_shared<Q4_1Tensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q5_0:
+        {
+            auto temp_tensor = std::make_shared<Q5_0Tensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q5_1:
+        {
+            auto temp_tensor = std::make_shared<Q5_1Tensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q8_0:
+        {
+            auto temp_tensor = std::make_shared<Q8_0Tensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q6_K:
+        {
+            auto temp_tensor = std::make_shared<Q6_KTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q2_K:
+        {
+            auto temp_tensor = std::make_shared<Q2_KTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q3_K:
+        {
+            auto temp_tensor = std::make_shared<Q3_KTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q4_K:
+        {
+            auto temp_tensor = std::make_shared<Q4_KTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q5_K:
+        {
+            auto temp_tensor = std::make_shared<Q5_KTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::Q8_K:
+        {
+            auto temp_tensor = std::make_shared<Q8_KTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ4_NL:
+        {
+            auto temp_tensor = std::make_shared<IQ4_NLTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ4_XS:
+        {
+            auto temp_tensor = std::make_shared<IQ4_XSTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ2_XXS:
+        {
+            auto temp_tensor = std::make_shared<IQ2_XXSTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ2_XS:
+        {
+            auto temp_tensor = std::make_shared<IQ2_XSTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ3_XXS:
+        {
+            auto temp_tensor = std::make_shared<IQ3_XXSTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ2_S:
+        {
+            auto temp_tensor = std::make_shared<IQ2_STensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ3_S:
+        {
+            auto temp_tensor = std::make_shared<IQ3_STensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ1_S:
+        {
+            auto temp_tensor = std::make_shared<IQ1_STensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::IQ1_M:
+        {
+            auto temp_tensor = std::make_shared<IQ1_MTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        default:
+            LOG_ERROR("[ModelLoader] FP32 dequantization not supported for type: "
+                      << static_cast<int>(info->type));
+            return nullptr;
+        }
+
+        // Create FP32 tensor using factory (NUMA-aware allocation)
+        if (!factory_)
+        {
+            LOG_ERROR("[ModelLoader] TensorFactory is required for FP32 dequantization but is null");
+            return nullptr;
+        }
+
+        auto fp32_tensor = factory_->createFP32(shape);
+        std::memcpy(fp32_tensor->mutable_data(), fp32_data.data(), total_elements * sizeof(float));
+
+        return fp32_tensor;
     }
 
     void ModelLoader::dequantizeIQ4_NLToFP32(

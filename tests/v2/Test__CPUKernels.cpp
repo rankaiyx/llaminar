@@ -138,6 +138,7 @@ TEST_F(Test__CPUKernels, RoPEBasic)
     bool success = kernel.apply(
         Q.data(), K.data(), position_ids.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
+        10000.0f,  // rope_theta (default for LLaMA-style models)
         false, nullptr, -1);
 
     ASSERT_TRUE(success);

@@ -103,7 +103,7 @@ namespace llaminar2
         config.head_dim = head_dim;
         config.causal = causal;
         config.window_size = window_size;
-        config.precision = config_.precision; // Use pipeline's precision setting
+        config.precision = config_.activation_precision; // Use pipeline's activation precision setting
         config.mpi_ctx = mpi_ctx_;
         config.mpi_strategy = MPIStrategy::None; // Single-rank mode
         config.verbose_logging = mpi_config_.verbose_logging;
@@ -131,7 +131,7 @@ namespace llaminar2
         config.head_dim = head_dim;
         config.causal = causal;
         config.window_size = window_size;
-        config.precision = config_.precision; // Use pipeline's precision setting
+        config.precision = config_.activation_precision; // Use pipeline's activation precision setting
         config.mpi_ctx = mpi_ctx_;
         config.mpi_strategy = MPIStrategy::None; // Single-rank mode
         config.verbose_logging = mpi_config_.verbose_logging;
@@ -331,7 +331,7 @@ namespace llaminar2
         config.head_dim = head_dim;
         config.causal = causal;
         config.window_size = window_size;
-        config.precision = config_.precision; // Use pipeline's precision setting
+        config.precision = config_.activation_precision; // Use pipeline's activation precision setting
         config.mpi_ctx = mpi_ctx_;
         config.mpi_strategy = mpi_strategy_;
         config.verbose_logging = mpi_config_.verbose_logging;
@@ -358,7 +358,7 @@ namespace llaminar2
         config.head_dim = head_dim;
         config.causal = causal;
         config.window_size = window_size;
-        config.precision = config_.precision; // Use pipeline's precision setting
+        config.precision = config_.activation_precision; // Use pipeline's activation precision setting
 
         // Provide workspace buffers (zero-allocation hot path)
         config.workspace_scores = attention_workspace_scores_;
@@ -658,5 +658,51 @@ namespace llaminar2
                                           << max_seq_len << " max_seq_len, "
                                           << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim");
     }
+
+    // ===== Snapshot Capture Implementation =====
+    // Only compiled when ENABLE_PIPELINE_SNAPSHOTS is defined
+    // In release builds, these functions don't exist (callers get compile errors if used)
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+
+    void PipelineBase::enableSnapshotCapture(const std::string &output_dir)
+    {
+        snapshot_capture_enabled_ = true;
+        snapshot_output_dir_ = output_dir;
+        snapshots_.clear();
+        LOG_INFO("[PipelineBase] Snapshot capture ENABLED" << (output_dir.empty() ? " (memory only)" : " (output: " + output_dir + ")"));
+    }
+
+    void PipelineBase::disableSnapshotCapture()
+    {
+        snapshot_capture_enabled_ = false;
+        snapshots_.clear();
+        LOG_INFO("[PipelineBase] Snapshot capture DISABLED");
+    }
+
+    const float *PipelineBase::getSnapshot(const std::string &key, size_t &out_size) const
+    {
+        auto it = snapshots_.find(key);
+        if (it == snapshots_.end())
+        {
+            out_size = 0;
+            return nullptr;
+        }
+        out_size = it->second.size();
+        return it->second.data();
+    }
+
+    std::vector<std::string> PipelineBase::getSnapshotKeys() const
+    {
+        std::vector<std::string> keys;
+        keys.reserve(snapshots_.size());
+        for (const auto &pair : snapshots_)
+        {
+            keys.push_back(pair.first);
+        }
+        return keys;
+    }
+
+#endif // ENABLE_PIPELINE_SNAPSHOTS
 
 } // namespace llaminar2

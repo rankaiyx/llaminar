@@ -2,8 +2,8 @@
  * @file Test__PipelineBase_PrecisionMode.cpp
  * @brief Unit tests for PipelineBase precision mode handling
  *
- * Tests that ComputePrecision flows correctly from PipelineConfig through
- * PipelineBase to attention kernels and other operations.
+ * Tests that WeightPrecision and ActivationPrecision flow correctly from
+ * PipelineConfig through PipelineBase to attention kernels and other operations.
  *
  * Test file naming convention:
  *   File: Test__PipelineBase_PrecisionMode.cpp → Testing: PipelineBase precision handling
@@ -36,7 +36,8 @@ class MockPipelineForPrecision : public PipelineBase
 {
 public:
     // Expose protected config for testing
-    ComputePrecision getConfigPrecision() const { return config_.precision; }
+    WeightPrecision getWeightPrecision() const { return config_.weight_precision; }
+    ActivationPrecision getActivationPrecision() const { return config_.activation_precision; }
 
     // Constructor
     MockPipelineForPrecision(
@@ -86,99 +87,164 @@ protected:
 };
 
 // =============================================================================
-// PRECISION MODE CONFIGURATION TESTS
+// WEIGHT PRECISION CONFIGURATION TESTS
 // =============================================================================
 
 /**
- * @brief Test MIXED precision mode (default)
+ * @brief Test NATIVE weight precision mode (default)
  */
-TEST_F(Test__PipelineBase_PrecisionMode, MixedPrecisionDefault)
+TEST_F(Test__PipelineBase_PrecisionMode, WeightPrecision_NativeDefault)
 {
     PipelineConfig config;
-    config.precision = ComputePrecision::MIXED;
+    config.weight_precision = WeightPrecision::NATIVE;
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
 
-    // Verify precision is stored correctly
-    EXPECT_EQ(pipeline.getConfigPrecision(), ComputePrecision::MIXED);
+    // Verify weight precision is stored correctly
+    EXPECT_EQ(pipeline.getWeightPrecision(), WeightPrecision::NATIVE);
 }
-
 /**
- * @brief Test FP32 precision mode
+ * @brief Test FP32 weight precision conversion
  */
-TEST_F(Test__PipelineBase_PrecisionMode, FP32Precision)
+TEST_F(Test__PipelineBase_PrecisionMode, WeightPrecision_ConvertToFP32)
 {
     PipelineConfig config;
-    config.precision = ComputePrecision::FP32;
+    config.weight_precision = WeightPrecision::CONVERT_TO_FP32;
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
 
-    EXPECT_EQ(pipeline.getConfigPrecision(), ComputePrecision::FP32);
+    EXPECT_EQ(pipeline.getWeightPrecision(), WeightPrecision::CONVERT_TO_FP32);
 }
 
 /**
- * @brief Test BF16 precision mode
+ * @brief Test BF16 weight precision conversion
  */
-TEST_F(Test__PipelineBase_PrecisionMode, BF16Precision)
+TEST_F(Test__PipelineBase_PrecisionMode, WeightPrecision_ConvertToBF16)
 {
     PipelineConfig config;
-    config.precision = ComputePrecision::BF16;
+    config.weight_precision = WeightPrecision::CONVERT_TO_BF16;
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
 
-    EXPECT_EQ(pipeline.getConfigPrecision(), ComputePrecision::BF16);
+    EXPECT_EQ(pipeline.getWeightPrecision(), WeightPrecision::CONVERT_TO_BF16);
 }
 
 /**
- * @brief Test FP16 precision mode
+ * @brief Test INT8 weight precision conversion
  */
-TEST_F(Test__PipelineBase_PrecisionMode, FP16Precision)
+TEST_F(Test__PipelineBase_PrecisionMode, WeightPrecision_ConvertToINT8)
 {
     PipelineConfig config;
-    config.precision = ComputePrecision::FP16;
+    config.weight_precision = WeightPrecision::CONVERT_TO_INT8;
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
 
-    EXPECT_EQ(pipeline.getConfigPrecision(), ComputePrecision::FP16);
+    EXPECT_EQ(pipeline.getWeightPrecision(), WeightPrecision::CONVERT_TO_INT8);
 }
 
+// =============================================================================
+// ACTIVATION PRECISION CONFIGURATION TESTS
+// =============================================================================
+
 /**
- * @brief Test INT8 precision mode
+ * @brief Test FP32 activation precision mode (default)
  */
-TEST_F(Test__PipelineBase_PrecisionMode, INT8Precision)
+TEST_F(Test__PipelineBase_PrecisionMode, ActivationPrecision_FP32Default)
 {
     PipelineConfig config;
-    config.precision = ComputePrecision::INT8;
+    config.activation_precision = ActivationPrecision::FP32;
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
 
-    EXPECT_EQ(pipeline.getConfigPrecision(), ComputePrecision::INT8);
+    // Verify activation precision is stored correctly
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::FP32);
 }
 
 /**
- * @brief Test AUTO precision mode
+ * @brief Test BF16 activation precision mode
  */
-TEST_F(Test__PipelineBase_PrecisionMode, AutoPrecision)
+TEST_F(Test__PipelineBase_PrecisionMode, ActivationPrecision_BF16)
 {
     PipelineConfig config;
-    config.precision = ComputePrecision::AUTO;
+    config.activation_precision = ActivationPrecision::BF16;
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
 
-    EXPECT_EQ(pipeline.getConfigPrecision(), ComputePrecision::AUTO);
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::BF16);
 }
 
 /**
- * @brief Test default PipelineConfig uses MIXED precision
+ * @brief Test FP16 activation precision mode
  */
-TEST_F(Test__PipelineBase_PrecisionMode, DefaultConfigIsMixed)
+TEST_F(Test__PipelineBase_PrecisionMode, ActivationPrecision_FP16)
+{
+    PipelineConfig config;
+    config.activation_precision = ActivationPrecision::FP16;
+
+    MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
+
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::FP16);
+}
+
+/**
+ * @brief Test INT8 activation precision mode
+ */
+TEST_F(Test__PipelineBase_PrecisionMode, ActivationPrecision_INT8)
+{
+    PipelineConfig config;
+    config.activation_precision = ActivationPrecision::INT8;
+
+    MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
+
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::INT8);
+}
+
+// =============================================================================
+// COMBINED PRECISION CONFIGURATION TESTS
+// =============================================================================
+
+/**
+ * @brief Test default PipelineConfig uses NATIVE weights and FP32 activations
+ */
+TEST_F(Test__PipelineBase_PrecisionMode, DefaultConfigIsNativeAndFP32)
 {
     PipelineConfig config; // Default constructor
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
 
-    // Default should be MIXED
-    EXPECT_EQ(pipeline.getConfigPrecision(), ComputePrecision::MIXED);
+    // Default should be NATIVE weights, FP32 activations
+    EXPECT_EQ(pipeline.getWeightPrecision(), WeightPrecision::NATIVE);
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::FP32);
+}
+
+/**
+ * @brief Test typical MIXED mode: quantized weights (NATIVE) + FP32 activations
+ */
+TEST_F(Test__PipelineBase_PrecisionMode, MixedMode_NativeWeightsFP32Activations)
+{
+    PipelineConfig config;
+    config.weight_precision = WeightPrecision::NATIVE;       // Keep quantized weights
+    config.activation_precision = ActivationPrecision::FP32; // FP32 computation
+
+    MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
+
+    EXPECT_EQ(pipeline.getWeightPrecision(), WeightPrecision::NATIVE);
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::FP32);
+}
+
+/**
+ * @brief Test INT8 weights with FP32 activations (INT8 inference mode)
+ */
+TEST_F(Test__PipelineBase_PrecisionMode, INT8Weights_FP32Activations)
+{
+    PipelineConfig config;
+    config.weight_precision = WeightPrecision::CONVERT_TO_INT8;
+    config.activation_precision = ActivationPrecision::FP32;
+
+    MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
+
+    EXPECT_EQ(pipeline.getWeightPrecision(), WeightPrecision::CONVERT_TO_INT8);
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::FP32);
 }
 
 /**
@@ -187,48 +253,68 @@ TEST_F(Test__PipelineBase_PrecisionMode, DefaultConfigIsMixed)
 TEST_F(Test__PipelineBase_PrecisionMode, PrecisionPersistsThroughCopy)
 {
     PipelineConfig config1;
-    config1.precision = ComputePrecision::INT8;
+    config1.weight_precision = WeightPrecision::CONVERT_TO_INT8;
+    config1.activation_precision = ActivationPrecision::BF16;
 
     // Copy config
     PipelineConfig config2 = config1;
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config2);
 
-    // Should preserve INT8 precision
-    EXPECT_EQ(pipeline.getConfigPrecision(), ComputePrecision::INT8);
+    // Should preserve both precision settings
+    EXPECT_EQ(pipeline.getWeightPrecision(), WeightPrecision::CONVERT_TO_INT8);
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::BF16);
 }
 
 // =============================================================================
-// PRECISION MODE ENUM TESTS
-// =============================================================================
-// ENUM VALUE TESTS (standalone, don't need fixture)
+// PRECISION ENUM VALUE TESTS (standalone, don't need fixture)
 // =============================================================================
 
 /**
- * @brief Test ComputePrecision enum values
+ * @brief Test WeightPrecision enum values are distinct
  */
-TEST(ComputePrecisionEnum, EnumValues)
+TEST(WeightPrecisionEnum, EnumValuesDistinct)
 {
     // Verify enum values are distinct
-    EXPECT_NE(static_cast<int>(ComputePrecision::MIXED), static_cast<int>(ComputePrecision::FP32));
-    EXPECT_NE(static_cast<int>(ComputePrecision::MIXED), static_cast<int>(ComputePrecision::BF16));
-    EXPECT_NE(static_cast<int>(ComputePrecision::MIXED), static_cast<int>(ComputePrecision::FP16));
-    EXPECT_NE(static_cast<int>(ComputePrecision::MIXED), static_cast<int>(ComputePrecision::INT8));
-    EXPECT_NE(static_cast<int>(ComputePrecision::MIXED), static_cast<int>(ComputePrecision::AUTO));
+    EXPECT_NE(static_cast<int>(WeightPrecision::NATIVE), static_cast<int>(WeightPrecision::CONVERT_TO_FP32));
+    EXPECT_NE(static_cast<int>(WeightPrecision::NATIVE), static_cast<int>(WeightPrecision::CONVERT_TO_BF16));
+    EXPECT_NE(static_cast<int>(WeightPrecision::NATIVE), static_cast<int>(WeightPrecision::CONVERT_TO_FP16));
+    EXPECT_NE(static_cast<int>(WeightPrecision::NATIVE), static_cast<int>(WeightPrecision::CONVERT_TO_INT8));
 
-    EXPECT_NE(static_cast<int>(ComputePrecision::FP32), static_cast<int>(ComputePrecision::BF16));
-    EXPECT_NE(static_cast<int>(ComputePrecision::FP32), static_cast<int>(ComputePrecision::FP16));
-    EXPECT_NE(static_cast<int>(ComputePrecision::FP32), static_cast<int>(ComputePrecision::INT8));
-    EXPECT_NE(static_cast<int>(ComputePrecision::FP32), static_cast<int>(ComputePrecision::AUTO));
+    EXPECT_NE(static_cast<int>(WeightPrecision::CONVERT_TO_FP32), static_cast<int>(WeightPrecision::CONVERT_TO_BF16));
+    EXPECT_NE(static_cast<int>(WeightPrecision::CONVERT_TO_FP32), static_cast<int>(WeightPrecision::CONVERT_TO_INT8));
 }
 
 /**
- * @brief Test MIXED is the first enum value (for default initialization)
+ * @brief Test ActivationPrecision enum values are distinct
  */
-TEST(ComputePrecisionEnum, MixedIsFirstValue)
+TEST(ActivationPrecisionEnum, EnumValuesDistinct)
 {
-    // MIXED should be the first enum value (0) for default initialization
-    EXPECT_EQ(static_cast<int>(ComputePrecision::MIXED), 0);
+    // Verify enum values are distinct
+    EXPECT_NE(static_cast<int>(ActivationPrecision::FP32), static_cast<int>(ActivationPrecision::BF16));
+    EXPECT_NE(static_cast<int>(ActivationPrecision::FP32), static_cast<int>(ActivationPrecision::FP16));
+    EXPECT_NE(static_cast<int>(ActivationPrecision::FP32), static_cast<int>(ActivationPrecision::INT8));
+
+    EXPECT_NE(static_cast<int>(ActivationPrecision::BF16), static_cast<int>(ActivationPrecision::FP16));
+    EXPECT_NE(static_cast<int>(ActivationPrecision::BF16), static_cast<int>(ActivationPrecision::INT8));
+}
+
+/**
+ * @brief Test NATIVE is the first WeightPrecision value (for default initialization)
+ */
+TEST(WeightPrecisionEnum, NativeIsFirstValue)
+{
+    // NATIVE should be the first enum value (0) for default initialization
+    EXPECT_EQ(static_cast<int>(WeightPrecision::NATIVE), 0);
+}
+
+/**
+ * @brief Test FP32 is the first ActivationPrecision value (for default initialization)
+ */
+TEST(ActivationPrecisionEnum, FP32IsFirstValue)
+{
+    // FP32 should be the first enum value (0) for default initialization
+    EXPECT_EQ(static_cast<int>(ActivationPrecision::FP32), 0);
 }
 
 // =============================================================================

@@ -71,13 +71,54 @@ namespace llaminar2::primitives
     }
 
     // ============================================================================
-    // Vectorized RoPE Application
+    // Vectorized RoPE Application - Separated Implementations
     // ============================================================================
 
     /**
-     * @brief Apply RoPE rotation to a single head (vectorized)
+     * @brief Apply RoPE rotation to a single head (scalar implementation)
+     *
+     * This is the reference implementation used for:
+     * - Scalar-only builds
+     * - Tail processing after vectorized loops
+     * - Testing/validation
      */
-    static void apply_rope_to_head_vectorized(
+    void apply_rope_to_head_scalar(
+        float *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim,
+        int start_idx)
+    {
+        const int half_dim = head_dim / 2;
+
+        for (int i = start_idx; i < half_dim; ++i)
+        {
+            float angle = position * inv_freq[i];
+#if defined(__GNUC__)
+            float sin_val, cos_val;
+            sincosf(angle, &sin_val, &cos_val);
+#else
+            float cos_val = std::cos(angle);
+            float sin_val = std::sin(angle);
+#endif
+
+            float x_first = head_ptr[i];
+            float x_second = head_ptr[i + half_dim];
+
+            head_ptr[i] = x_first * cos_val - x_second * sin_val;
+            head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
+        }
+    }
+
+#if defined(__AVX2__)
+    /**
+     * @brief Apply RoPE rotation to a single head (AVX2 implementation)
+     *
+     * Processes 8 float pairs at a time using AVX2 intrinsics
+     *
+     * @return Number of pairs processed (always multiple of 8)
+     */
+    int apply_rope_to_head_avx2(
         float *head_ptr,
         int position,
         const std::vector<float> &inv_freq,
@@ -86,7 +127,67 @@ namespace llaminar2::primitives
         const int half_dim = head_dim / 2;
         int i = 0;
 
+        // Process 8 pairs at a time
+        for (; i + 8 <= half_dim; i += 8)
+        {
+            // Compute angles
+            alignas(32) float angles[8];
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                angles[lane] = position * inv_freq[i + lane];
+            }
+
+            // Compute sin/cos
+            alignas(32) float cos_vals[8];
+            alignas(32) float sin_vals[8];
+            for (int lane = 0; lane < 8; ++lane)
+            {
+#if defined(__GNUC__)
+                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
+#else
+                cos_vals[lane] = std::cos(angles[lane]);
+                sin_vals[lane] = std::sin(angles[lane]);
+#endif
+            }
+
+            // Load and rotate
+            __m256 x_first = _mm256_loadu_ps(head_ptr + i);
+            __m256 x_second = _mm256_loadu_ps(head_ptr + i + half_dim);
+            __m256 cos_vec = _mm256_loadu_ps(cos_vals);
+            __m256 sin_vec = _mm256_loadu_ps(sin_vals);
+
+            __m256 new_first = _mm256_sub_ps(
+                _mm256_mul_ps(x_first, cos_vec),
+                _mm256_mul_ps(x_second, sin_vec));
+            __m256 new_second = _mm256_add_ps(
+                _mm256_mul_ps(x_first, sin_vec),
+                _mm256_mul_ps(x_second, cos_vec));
+
+            _mm256_storeu_ps(head_ptr + i, new_first);
+            _mm256_storeu_ps(head_ptr + i + half_dim, new_second);
+        }
+
+        return i;
+    }
+#endif
+
 #if defined(__AVX512F__)
+    /**
+     * @brief Apply RoPE rotation to a single head (AVX512 implementation)
+     *
+     * Processes 16 float pairs at a time using AVX512 intrinsics
+     *
+     * @return Number of pairs processed (always multiple of 16)
+     */
+    int apply_rope_to_head_avx512(
+        float *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+
         // Process 16 pairs at a time
         for (; i + 16 <= half_dim; i += 16)
         {
@@ -128,66 +229,30 @@ namespace llaminar2::primitives
             _mm512_storeu_ps(head_ptr + i, new_first);
             _mm512_storeu_ps(head_ptr + i + half_dim, new_second);
         }
-#elif defined(__AVX2__)
-        // Process 8 pairs at a time
-        for (; i + 8 <= half_dim; i += 8)
-        {
-            // Compute angles
-            alignas(32) float angles[8];
-            for (int lane = 0; lane < 8; ++lane)
-            {
-                angles[lane] = position * inv_freq[i + lane];
-            }
 
-            // Compute sin/cos
-            alignas(32) float cos_vals[8];
-            alignas(32) float sin_vals[8];
-            for (int lane = 0; lane < 8; ++lane)
-            {
-#if defined(__GNUC__)
-                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
-#else
-                cos_vals[lane] = std::cos(angles[lane]);
-                sin_vals[lane] = std::sin(angles[lane]);
+        return i;
+    }
 #endif
-            }
 
-            // Load and rotate
-            __m256 x_first = _mm256_loadu_ps(head_ptr + i);
-            __m256 x_second = _mm256_loadu_ps(head_ptr + i + half_dim);
-            __m256 cos_vec = _mm256_loadu_ps(cos_vals);
-            __m256 sin_vec = _mm256_loadu_ps(sin_vals);
+    /**
+     * @brief Apply RoPE rotation to a single head (dispatches to best available implementation)
+     */
+    static void apply_rope_to_head_vectorized(
+        float *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim)
+    {
+        int processed = 0;
 
-            __m256 new_first = _mm256_sub_ps(
-                _mm256_mul_ps(x_first, cos_vec),
-                _mm256_mul_ps(x_second, sin_vec));
-            __m256 new_second = _mm256_add_ps(
-                _mm256_mul_ps(x_first, sin_vec),
-                _mm256_mul_ps(x_second, cos_vec));
-
-            _mm256_storeu_ps(head_ptr + i, new_first);
-            _mm256_storeu_ps(head_ptr + i + half_dim, new_second);
-        }
+#if defined(__AVX512F__)
+        processed = apply_rope_to_head_avx512(head_ptr, position, inv_freq, head_dim);
+#elif defined(__AVX2__)
+        processed = apply_rope_to_head_avx2(head_ptr, position, inv_freq, head_dim);
 #endif
 
         // Scalar tail
-        for (; i < half_dim; ++i)
-        {
-            float angle = position * inv_freq[i];
-#if defined(__GNUC__)
-            float sin_val, cos_val;
-            sincosf(angle, &sin_val, &cos_val);
-#else
-            float cos_val = std::cos(angle);
-            float sin_val = std::sin(angle);
-#endif
-
-            float x_first = head_ptr[i];
-            float x_second = head_ptr[i + half_dim];
-
-            head_ptr[i] = x_first * cos_val - x_second * sin_val;
-            head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
-        }
+        apply_rope_to_head_scalar(head_ptr, position, inv_freq, head_dim, processed);
     }
 
     /**

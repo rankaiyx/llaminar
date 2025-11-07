@@ -63,8 +63,11 @@ namespace llaminar2
         bool use_mmap = true;
         int n_threads = -1; // -1 = auto-detect
 
-        // Compute precision
-        std::string precision = "mixed"; // "mixed" (default), "fp32", "bf16", "fp16", "int8", "auto"
+        // Weight loading precision
+        std::string weight_precision = "native"; // "native", "fp32", "bf16", "fp16", "int8"
+
+        // Activation/accumulation precision
+        std::string activation_precision = "fp32"; // "fp32", "bf16", "fp16", "int8"
     };
 
     /**

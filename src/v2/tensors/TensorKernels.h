@@ -207,6 +207,7 @@ namespace llaminar2
          * @param n_heads Number of query heads
          * @param n_kv_heads Number of key/value heads (may be < n_heads for GQA)
          * @param head_dim Dimension per head
+         * @param rope_theta RoPE frequency base (10000.0 for LLaMA, 1000000.0 for Qwen2.5)
          * @param use_bf16 Convert to BF16 internally for computation (faster, negligible loss)
          * @param mpi_ctx MPI context (nullptr = single node)
          * @param device_idx Device index for execution (-1 = CPU, ≥0 = GPU)
@@ -217,6 +218,7 @@ namespace llaminar2
             float *Q, float *K,
             const int *position_ids,
             int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float rope_theta = 10000.0f,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;

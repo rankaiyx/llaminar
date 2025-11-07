@@ -69,4 +69,57 @@ namespace llaminar2::primitives
      */
     const std::vector<float> &get_inv_freq_cached(int head_dim, float freq_base);
 
+    // ============================================================================
+    // Individual Implementation Functions (for testing)
+    // ============================================================================
+
+    /**
+     * @brief Apply RoPE rotation using scalar implementation (reference)
+     *
+     * This is the baseline implementation that all vectorized versions must match.
+     * Used for testing and validation.
+     *
+     * @param head_ptr Pointer to head data [head_dim] (modified in-place)
+     * @param position Token position
+     * @param inv_freq Inverse frequencies [head_dim/2]
+     * @param head_dim Dimension per head (must be even)
+     * @param start_idx Starting pair index (for partial processing)
+     */
+    void apply_rope_to_head_scalar(
+        float *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim,
+        int start_idx = 0);
+
+#if defined(__AVX2__)
+    /**
+     * @brief Apply RoPE rotation using AVX2 implementation
+     *
+     * Processes 8 float pairs at a time. Tail must be handled by scalar version.
+     *
+     * @return Number of pairs processed (always multiple of 8)
+     */
+    int apply_rope_to_head_avx2(
+        float *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Apply RoPE rotation using AVX512 implementation
+     *
+     * Processes 16 float pairs at a time. Tail must be handled by scalar version.
+     *
+     * @return Number of pairs processed (always multiple of 16)
+     */
+    int apply_rope_to_head_avx512(
+        float *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim);
+#endif
+
 } // namespace llaminar2::primitives

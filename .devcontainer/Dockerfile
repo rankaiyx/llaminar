@@ -58,6 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     intel-oneapi-mkl-devel \
     # NUMA support
     libnuma-dev \
+    libhwloc-dev \
     # Google Test / gMock for unit tests
     libgtest-dev \
     libgmock-dev \
