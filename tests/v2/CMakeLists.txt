@@ -2057,25 +2057,33 @@ if(ZLIB_FOUND)
     # Get the workspace root (parent of src/v2)
     get_filename_component(WORKSPACE_ROOT "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
     
-    add_executable(v2_test_qwen2_fp32_parity 
-        e2e/Test__Qwen2FP32Parity.cpp
-        ${WORKSPACE_ROOT}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_test_qwen2_fp32_parity 
-        llaminar2_core 
-        GTest::gtest 
-        GTest::gtest_main
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_test_qwen2_fp32_parity PRIVATE 
-        ${WORKSPACE_ROOT}/external/cnpy
-    )
-    
-    add_v2_test(V2_E2E_Qwen2FP32Parity
-        COMMAND $<TARGET_FILE:v2_test_qwen2_fp32_parity>
-        LABELS "V2;E2E;Qwen;Parity;PyTorch;FP32"
-        MPI_PROCS 1
-    )
+    # E2E parity test requires ENABLE_PIPELINE_SNAPSHOTS (Debug or E2ERelease builds)
+    # Skip in standard Release builds to avoid linking errors
+    if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
+        add_executable(v2_test_qwen2_fp32_parity 
+            e2e/Test__Qwen2FP32Parity.cpp
+            ${WORKSPACE_ROOT}/external/cnpy/cnpy.cpp
+        )
+        target_link_libraries(v2_test_qwen2_fp32_parity 
+            llaminar2_core 
+            GTest::gtest 
+            GTest::gtest_main
+            ZLIB::ZLIB
+        )
+        target_include_directories(v2_test_qwen2_fp32_parity PRIVATE 
+            ${WORKSPACE_ROOT}/external/cnpy
+        )
+        
+        add_v2_test(V2_E2E_Qwen2FP32Parity
+            COMMAND $<TARGET_FILE:v2_test_qwen2_fp32_parity>
+            LABELS "V2;E2E;Qwen;Parity;PyTorch;FP32"
+            MPI_PROCS 1
+        )
+        message(STATUS "V2: E2E parity test enabled (snapshots available)")
+    else()
+        message(STATUS "V2: E2E parity test disabled (snapshots not available in Release build)")
+        message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
+    endif()
 else()
     message(WARNING "ZLIB not found - Qwen2 FP32 parity test disabled (requires cnpy for .npz loading)")
 endif()

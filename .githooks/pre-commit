@@ -62,6 +62,7 @@ echo ""
 
 # Run CTest with unit test filter
 # Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
+# Note: Tests run sequentially due to MPI context requirements
 set +e
 ctest --test-dir "$BUILD_V2_DEBUG" -R "^V2_Unit_" --output-on-failure
 UNIT_EXIT_CODE=$?
@@ -85,6 +86,7 @@ echo -e "${YELLOW}[4/4] Running V2 integration tests (Debug build)...${NC}"
 echo ""
 
 # Filter: ^V2_Integration_ matches all integration tests
+# Note: Tests run sequentially due to MPI context requirements
 set +e
 ctest --test-dir "$BUILD_V2_DEBUG" -R "^V2_Integration_" --output-on-failure
 INTEGRATION_EXIT_CODE=$?

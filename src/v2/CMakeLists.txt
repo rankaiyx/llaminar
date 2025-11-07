@@ -11,6 +11,16 @@ else()
     message(STATUS "V2: ccache not found - using direct compilation")
 endif()
 
+# Define custom build type: E2ERelease (Release + Snapshots for E2E testing)
+# Usage: cmake -DCMAKE_BUILD_TYPE=E2ERelease
+set(CMAKE_CXX_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
+set(CMAKE_C_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
+set(CMAKE_EXE_LINKER_FLAGS_E2ERELEASE "" CACHE STRING "Linker flags for E2E Release builds")
+mark_as_advanced(CMAKE_CXX_FLAGS_E2ERELEASE CMAKE_C_FLAGS_E2ERELEASE CMAKE_EXE_LINKER_FLAGS_E2ERELEASE)
+
+# Add E2ERelease to valid build types
+set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease" CACHE STRING "" FORCE)
+
 # Enable native CPU optimizations (AVX512/AVX2/FMA)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 
@@ -525,10 +535,15 @@ target_include_directories(llaminar2_core PUBLIC
 )
 
 # Enable pipeline snapshot capture (for parity testing and debugging)
-# Always enabled in Debug builds, can be controlled via option in Release
+# - Debug builds: Always enabled (development/debugging)
+# - E2ERelease builds: Always enabled (optimized E2E parity testing)
+# - Release builds: Disabled by default (performance), enable with -DENABLE_SNAPSHOTS=ON
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
     message(STATUS "V2: Pipeline snapshot capture enabled (Debug build)")
+elseif(CMAKE_BUILD_TYPE MATCHES "E2ERelease")
+    target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
+    message(STATUS "V2: Pipeline snapshot capture enabled (E2ERelease build - optimized with snapshots for E2E testing)")
 else()
     option(ENABLE_SNAPSHOTS "Enable pipeline snapshot capture" OFF)
     if(ENABLE_SNAPSHOTS)
