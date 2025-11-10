@@ -179,7 +179,7 @@ TEST_F(Test__IQ4_XSTensor_Views, ViewChaining)
 }
 
 /**
- * @brief Test IBlockDecoder interface on view
+ * @brief Test ITensorGemmTileDataProvider interface on view
  */
 TEST_F(Test__IQ4_XSTensor_Views, IBlockDecoderInterface)
 {

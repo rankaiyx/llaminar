@@ -116,23 +116,23 @@ namespace llaminar2
      */
     struct ActivationBuffers
     {
-        // Residual connections
-        std::shared_ptr<FP32Tensor> residual;
+        // Residual connections (precision set by config_.activation_precision)
+        std::shared_ptr<TensorBase> residual;
 
         // Normalization buffer (reused by attention and FFN blocks)
-        std::shared_ptr<FP32Tensor> normalized;
+        std::shared_ptr<TensorBase> normalized;
 
         // Attention buffers
-        std::shared_ptr<FP32Tensor> Q;
-        std::shared_ptr<FP32Tensor> K;
-        std::shared_ptr<FP32Tensor> V;
-        std::shared_ptr<FP32Tensor> attn_output;
-        std::shared_ptr<FP32Tensor> attn_proj;
+        std::shared_ptr<TensorBase> Q;
+        std::shared_ptr<TensorBase> K;
+        std::shared_ptr<TensorBase> V;
+        std::shared_ptr<TensorBase> attn_output;
+        std::shared_ptr<TensorBase> attn_proj;
 
         // FFN buffers
-        std::shared_ptr<FP32Tensor> gate;
-        std::shared_ptr<FP32Tensor> up;
-        std::shared_ptr<FP32Tensor> ffn_output;
+        std::shared_ptr<TensorBase> gate;
+        std::shared_ptr<TensorBase> up;
+        std::shared_ptr<TensorBase> ffn_output;
 
         int max_seq_len = 0; // Maximum sequence length these buffers support
     };

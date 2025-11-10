@@ -14,7 +14,7 @@
 #include "../utils/Logger.h"
 #include "SIMDHelpers.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/GemmAutoTuner.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #ifdef HAVE_CUDA
 #include "../kernels/cuda/CudaGemmFactory.h"
 #endif
@@ -255,31 +255,15 @@ namespace llaminar2
         }
     }
 
-    std::unique_ptr<ITensorRoPE> IQ4_NLTensor::createRoPE()
-    {
-        throw std::runtime_error("IQ4_NLTensor::createRoPE: not supported for quantized tensors");
-    }
+    
 
-    std::unique_ptr<ITensorSwiGLU> IQ4_NLTensor::createSwiGLU()
-    {
-        throw std::runtime_error("IQ4_NLTensor::createSwiGLU: not supported for quantized tensors");
-    }
+    
 
-    std::unique_ptr<ITensorSoftmax> IQ4_NLTensor::createSoftmax()
-    {
-        throw std::runtime_error("IQ4_NLTensor::createSoftmax: not supported for quantized tensors");
-    }
+    
 
-    std::unique_ptr<ITensorRMSNorm> IQ4_NLTensor::createRMSNorm()
-    {
-        throw std::runtime_error("IQ4_NLTensor::createRMSNorm: not supported for quantized tensors");
-    }
+    
 
-    std::unique_ptr<ITensorAttention> IQ4_NLTensor::createAttention()
-    {
-        LOG_ERROR("[IQ4_NLTensor] createAttention not supported for quantized tensors");
-        return nullptr;
-    }
+    
 
     // ========== Decode API ==========
 

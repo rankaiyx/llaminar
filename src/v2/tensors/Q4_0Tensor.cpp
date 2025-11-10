@@ -6,7 +6,7 @@
 
 #include "Tensors.h"
 #include "Tensors.h"
-#include "../kernels/cpu/GemmAutoTuner.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include "../kernels/cpu/CPUSwiGLUKernel.h"
 #include "../utils/CPUFeatures.h"
@@ -316,35 +316,15 @@ namespace llaminar2
         throw std::runtime_error("Q4_0Tensor::mutable_data: quantized tensors are immutable");
     }
 
-    std::unique_ptr<llaminar2::ITensorRoPE> Q4_0Tensor::createRoPE()
-    {
-        // RoPE operates on FP32 activations, not weights
-        // All tensor types can create the same CPU RoPE kernel
-        return std::make_unique<CPURoPEKernel>();
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorSwiGLU> Q4_0Tensor::createSwiGLU()
-    {
-        // SwiGLU operates on FP32 activations, not weights
-        // All tensor types can create the same CPU SwiGLU kernel
-        return std::make_unique<CPUSwiGLUKernel>();
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorSoftmax> Q4_0Tensor::createSoftmax()
-    {
-        throw std::runtime_error("Q4_0Tensor: Softmax not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorRMSNorm> Q4_0Tensor::createRMSNorm()
-    {
-        throw std::runtime_error("Q4_0Tensor: RMSNorm not supported");
-    }
+    
 
-    std::unique_ptr<ITensorAttention> Q4_0Tensor::createAttention()
-    {
-        LOG_ERROR("[Q4_0Tensor] createAttention not supported for quantized tensors");
-        return nullptr;
-    }
+    
 
     bool Q4_0Tensor::copyFrom(const TensorBase *src)
     {

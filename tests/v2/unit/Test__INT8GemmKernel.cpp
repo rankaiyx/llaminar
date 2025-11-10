@@ -1,21 +1,11 @@
 /**
  * @file Test__INT8GemmKernel.cpp
- * @brief Unit tests for INT8GemmKernel with OneDNN
- *
- * Test Coverage:
- * 1. Basic correctness against FP32 reference
- * 2. Quantization accuracy (per-row and per-column scales)
- * 3. Transpose operations
- * 4. Alpha/beta scaling
- * 5. Edge cases (small matrices, zero matrices, extreme values)
- * 6. Performance benchmarks vs FP32
- *
+ * @brief Unit tests for INT8 auto-tuned GEMM
  * @author David Sanftenberg
+ * @date 2025-11-09
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/kernels/cpu/INT8GemmKernel.h"
-#include "../../../src/v2/kernels/cpu/FP32GemmKernel.h"
 #include "../../../src/v2/tensors/Tensors.h"
 #include "../../../src/v2/utils/Logger.h"
 #include <cmath>
@@ -101,7 +91,49 @@ protected:
         return max_ref > 1e-6f ? (max_error / max_ref) : max_error;
     }
 
-    // Helper: Create INT8 weight tensor from FP32 data
+    // Helper: Quantize FP32 array to INT8 with per-row scales
+    void quantize_per_row(const float *fp32_data, int8_t *int8_data, float *row_scales, int rows, int cols)
+    {
+        for (int i = 0; i < rows; ++i)
+        {
+            // Find max absolute value in row
+            float max_abs = 0.0f;
+            for (int j = 0; j < cols; ++j)
+            {
+                max_abs = std::max(max_abs, std::fabs(fp32_data[i * cols + j]));
+            }
+
+            // Compute scale
+            float scale = (max_abs > 1e-8f) ? (max_abs / 127.0f) : 1.0f;
+            row_scales[i] = scale;
+
+            // Quantize row
+            float inv_scale = 1.0f / scale;
+            for (int j = 0; j < cols; ++j)
+            {
+                float val = fp32_data[i * cols + j] * inv_scale;
+                val = std::max(-127.0f, std::min(127.0f, val));
+                int8_data[i * cols + j] = static_cast<int8_t>(std::round(val));
+            }
+        }
+    }
+
+    // Helper: Dequantize INT32 output to FP32
+    void dequantize_int32_to_fp32(const int32_t *int32_data, float *fp32_data,
+                                  const float *A_row_scales, const float *B_col_scales,
+                                  int m, int n)
+    {
+        for (int i = 0; i < m; ++i)
+        {
+            for (int j = 0; j < n; ++j)
+            {
+                fp32_data[i * n + j] = static_cast<float>(int32_data[i * n + j]) *
+                                       A_row_scales[i] * B_col_scales[j];
+            }
+        }
+    }
+
+    // Helper: Create INT8 tensor from FP32 data with per-column quantization
     std::unique_ptr<INT8Tensor> create_int8_tensor(const float *fp32_data, int rows, int cols)
     {
         // INT8Tensor constructor with FP32 data automatically computes per-column scales for 2D tensors
@@ -121,29 +153,52 @@ TEST_F(Test__INT8GemmKernel, BasicMatrixMultiply)
     const int m = 64, n = 128, k = 96;
 
     // Create random input matrices
-    std::vector<float> A(m * k);
-    std::vector<float> B(k * n);
+    std::vector<float> A_fp32(m * k);
+    std::vector<float> B_fp32(k * n);
     std::vector<float> C_ref(m * n, 0.0f);
     std::vector<float> C_int8(m * n, 0.0f);
 
-    fill_random(A.data(), m * k, true); // Use small range for better INT8 accuracy
-    fill_random(B.data(), k * n, true);
+    fill_random(A_fp32.data(), m * k, true); // Use small range for better INT8 accuracy
+    fill_random(B_fp32.data(), k * n, true);
 
     // Compute reference with FP32
-    reference_gemm(A.data(), B.data(), C_ref.data(), m, n, k, false, 1.0f, 0.0f);
+    reference_gemm(A_fp32.data(), B_fp32.data(), C_ref.data(), m, n, k, false, 1.0f, 0.0f);
 
-    // Create INT8 weight tensor
-    auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
+    // Quantize activations to INT8
+    std::vector<int8_t> A_int8(m * k);
+    std::vector<float> A_row_scales(m);
+    quantize_per_row(A_fp32.data(), A_int8.data(), A_row_scales.data(), m, k);
 
-    // Compute with INT8 kernel
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
-    bool success = int8_kernel.multiply(
-        A.data(), C_int8.data(),
+    // Create INT8 weight tensor (B) with per-column quantization
+    auto B_int8_tensor = create_int8_tensor(B_fp32.data(), k, n);
+
+    // Get INT8 GEMM kernel
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr) << "Failed to create INT8 GEMM kernel";
+
+    // Execute INT8×INT8→INT32 GEMM
+    std::vector<int32_t> C_int32(m * n, 0);
+    bool success = int8_kernel->multiply(
+        reinterpret_cast<const float *>(A_int8.data()), // Cast int8_t* to float*
+        reinterpret_cast<float *>(C_int32.data()),      // Cast int32_t* to float*
         m, n, k,
         false, // transpose_B
         1.0f, 0.0f);
 
     ASSERT_TRUE(success) << "INT8 GEMM should succeed";
+
+    // Dequantize INT32 output to FP32
+    const float *B_col_scales = B_int8_tensor->col_scales();
+    ASSERT_NE(B_col_scales, nullptr) << "Weight tensor should have per-column scales";
+
+    dequantize_int32_to_fp32(C_int32.data(), C_int8.data(),
+                             A_row_scales.data(), B_col_scales,
+                             m, n);
+
+    // Debug output
+    std::cout << "DEBUG: C_ref[0]=" << C_ref[0] << ", C_int32[0]=" << C_int32[0]
+              << ", C_int8[0]=" << C_int8[0] << "\n";
+    std::cout << "DEBUG: k_panel=" << k << ", expected ~" << (C_ref[0] / (A_row_scales[0] * B_col_scales[0])) << "\n";
 
     // Check relative error (INT8 quantization typically <1% error for this range)
     float rel_error = compute_relative_error(C_ref.data(), C_int8.data(), m, n);
@@ -156,31 +211,48 @@ TEST_F(Test__INT8GemmKernel, TransposeB)
 {
     const int m = 32, n = 64, k = 48;
 
-    std::vector<float> A(m * k);
-    std::vector<float> B_T(n * k); // Transposed layout [n, k]
+    std::vector<float> A_fp32(m * k);
+    std::vector<float> B_T_fp32(n * k); // Transposed layout [n, k]
     std::vector<float> C_ref(m * n, 0.0f);
     std::vector<float> C_int8(m * n, 0.0f);
 
-    fill_random(A.data(), m * k, true);
-    fill_random(B_T.data(), n * k, true);
+    fill_random(A_fp32.data(), m * k, true);
+    fill_random(B_T_fp32.data(), n * k, true);
 
     // Reference with transpose_B=true
-    reference_gemm(A.data(), B_T.data(), C_ref.data(), m, n, k, true, 1.0f, 0.0f);
+    reference_gemm(A_fp32.data(), B_T_fp32.data(), C_ref.data(), m, n, k, true, 1.0f, 0.0f);
+
+    // Quantize activations to INT8
+    std::vector<int8_t> A_int8(m * k);
+    std::vector<float> A_row_scales(m);
+    quantize_per_row(A_fp32.data(), A_int8.data(), A_row_scales.data(), m, k);
 
     // Create INT8 tensor (stored as [n, k] for transpose)
-    auto B_int8_tensor = create_int8_tensor(B_T.data(), n, k);
+    auto B_int8_tensor = create_int8_tensor(B_T_fp32.data(), n, k);
 
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
-    bool success = int8_kernel.multiply(
-        A.data(), C_int8.data(),
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr) << "Failed to create INT8 GEMM kernel";
+
+    // Execute INT8×INT8→INT32 GEMM
+    std::vector<int32_t> C_int32(m * n, 0);
+    bool success = int8_kernel->multiply(
+        reinterpret_cast<const float *>(A_int8.data()),
+        reinterpret_cast<float *>(C_int32.data()),
         m, n, k,
         true, // transpose_B
         1.0f, 0.0f);
 
     ASSERT_TRUE(success);
 
+    // Dequantize INT32 output to FP32
+    const float *B_col_scales = B_int8_tensor->col_scales();
+    ASSERT_NE(B_col_scales, nullptr);
+    dequantize_int32_to_fp32(C_int32.data(), C_int8.data(),
+                             A_row_scales.data(), B_col_scales,
+                             m, n);
+
     float rel_error = compute_relative_error(C_ref.data(), C_int8.data(), m, n);
-    EXPECT_LT(rel_error, 0.03f); // Slightly higher tolerance for transpose (uses per-tensor scale)
+    EXPECT_LT(rel_error, 0.03f); // Slightly higher tolerance for transpose
 
     LOG_INFO("[Test__INT8GemmKernel] TransposeB: relative error = " << (rel_error * 100.0f) << "%");
 }
@@ -205,8 +277,10 @@ TEST_F(Test__INT8GemmKernel, AlphaScaling)
     reference_gemm(A.data(), B.data(), C_ref.data(), m, n, k, false, alpha, 0.0f);
 
     auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
-    bool success = int8_kernel.multiply(
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr);
+
+    bool success = int8_kernel->multiply(
         A.data(), C_int8.data(),
         m, n, k,
         false, alpha, 0.0f);
@@ -239,8 +313,10 @@ TEST_F(Test__INT8GemmKernel, BetaScaling)
     reference_gemm(A.data(), B.data(), C_ref.data(), m, n, k, false, alpha, beta);
 
     auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
-    bool success = int8_kernel.multiply(
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr);
+
+    bool success = int8_kernel->multiply(
         A.data(), C_int8.data(),
         m, n, k,
         false, alpha, beta);
@@ -272,8 +348,9 @@ TEST_F(Test__INT8GemmKernel, SmallMatrix)
     reference_gemm(A.data(), B.data(), C_ref.data(), m, n, k, false, 1.0f, 0.0f);
 
     auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
-    bool success = int8_kernel.multiply(
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr);
+    bool success = int8_kernel->multiply(
         A.data(), C_int8.data(),
         m, n, k,
         false, 1.0f, 0.0f);
@@ -297,8 +374,9 @@ TEST_F(Test__INT8GemmKernel, ZeroMatrix)
     fill_random(B.data(), k * n, true);
 
     auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
-    bool success = int8_kernel.multiply(
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr);
+    bool success = int8_kernel->multiply(
         A.data(), C_int8.data(),
         m, n, k,
         false, 1.0f, 0.0f);
@@ -333,8 +411,9 @@ TEST_F(Test__INT8GemmKernel, ExtremeValues)
     reference_gemm(A.data(), B.data(), C_ref.data(), m, n, k, false, 1.0f, 0.0f);
 
     auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
-    bool success = int8_kernel.multiply(
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr);
+    bool success = int8_kernel->multiply(
         A.data(), C_int8.data(),
         m, n, k,
         false, 1.0f, 0.0f);
@@ -385,8 +464,9 @@ TEST_F(Test__INT8GemmKernel, QuantizationAccuracy)
     reference_gemm(A.data(), B.data(), C_ref.data(), m, n, k, false, 1.0f, 0.0f);
 
     auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
-    bool success = int8_kernel.multiply(
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr);
+    bool success = int8_kernel->multiply(
         A.data(), C_int8.data(),
         m, n, k,
         false, 1.0f, 0.0f);
@@ -420,12 +500,13 @@ TEST_F(Test__INT8GemmKernel, PerformanceBenchmark)
 
     // Benchmark INT8
     auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr);
 
     auto start_int8 = std::chrono::high_resolution_clock::now();
     for (int run = 0; run < num_runs; ++run)
     {
-        bool success = int8_kernel.multiply(
+        bool success = int8_kernel->multiply(
             A.data(), C_int8.data(),
             m, n, k,
             false, 1.0f, 0.0f);
@@ -434,19 +515,20 @@ TEST_F(Test__INT8GemmKernel, PerformanceBenchmark)
     auto end_int8 = std::chrono::high_resolution_clock::now();
     double time_int8_ms = std::chrono::duration<double, std::milli>(end_int8 - start_int8).count() / num_runs;
 
-    // Benchmark FP32 (using OpenBLAS)
+    // Benchmark FP32 (using auto-tuned GEMM)
     auto B_fp32_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(k), static_cast<size_t>(n)});
 
     // Copy FP32 data to tensor
     float *B_fp32_data = B_fp32_tensor->mutable_data();
     std::copy(B.begin(), B.end(), B_fp32_data);
 
-    FP32GemmKernel fp32_kernel(B_fp32_tensor.get());
+    auto fp32_kernel = B_fp32_tensor->createGemm();
+    ASSERT_NE(fp32_kernel, nullptr);
 
     auto start_fp32 = std::chrono::high_resolution_clock::now();
     for (int run = 0; run < num_runs; ++run)
     {
-        bool success = fp32_kernel.multiply(
+        bool success = fp32_kernel->multiply(
             A.data(), C_fp32.data(),
             m, n, k,
             false, 1.0f, 0.0f);
@@ -506,11 +588,12 @@ TEST_F(Test__INT8GemmKernel, OneDNNPrimitiveReuse)
     fill_random(B.data(), k * n, true);
 
     auto B_int8_tensor = create_int8_tensor(B.data(), k, n);
-    INT8GemmKernel int8_kernel(B_int8_tensor.get());
+    auto int8_kernel = B_int8_tensor->createGemm();
+    ASSERT_NE(int8_kernel, nullptr);
 
     // First run (creates primitive)
     auto start_first = std::chrono::high_resolution_clock::now();
-    bool success = int8_kernel.multiply(A.data(), C.data(), m, n, k, false, 1.0f, 0.0f);
+    bool success = int8_kernel->multiply(A.data(), C.data(), m, n, k, false, 1.0f, 0.0f);
     auto end_first = std::chrono::high_resolution_clock::now();
     ASSERT_TRUE(success);
     double time_first_ms = std::chrono::duration<double, std::milli>(end_first - start_first).count();
@@ -519,7 +602,7 @@ TEST_F(Test__INT8GemmKernel, OneDNNPrimitiveReuse)
     auto start_reuse = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_iterations; ++i)
     {
-        success = int8_kernel.multiply(A.data(), C.data(), m, n, k, false, 1.0f, 0.0f);
+        success = int8_kernel->multiply(A.data(), C.data(), m, n, k, false, 1.0f, 0.0f);
         ASSERT_TRUE(success);
     }
     auto end_reuse = std::chrono::high_resolution_clock::now();

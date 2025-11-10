@@ -15,6 +15,8 @@
 #include "utils/MPIContext.h"
 #include "utils/ArgParser.h"
 #include "utils/NUMATopology.h"
+#include "utils/Tokenizer.h"
+#include "utils/Sampler.h"
 #include "backends/ComputeBackend.h"
 #include "pipelines/PipelineFactory.h"
 #include "pipelines/PipelineConfig.h"
@@ -289,9 +291,9 @@ int main(int argc, char *argv[])
     {
         pipeline_config.activation_precision = ActivationPrecision::FP16;
     }
-    else if (args.activation_precision == "int8")
+    else if (args.activation_precision == "int32")
     {
-        pipeline_config.activation_precision = ActivationPrecision::INT8;
+        pipeline_config.activation_precision = ActivationPrecision::INT32;
     }
     else
     {
@@ -371,8 +373,8 @@ int main(int argc, char *argv[])
         case ActivationPrecision::FP16:
             activation_prec_name = "FP16 (16-bit float)";
             break;
-        case ActivationPrecision::INT8:
-            activation_prec_name = "INT8 (8-bit integer)";
+        case ActivationPrecision::INT32:
+            activation_prec_name = "INT32 (32-bit integer)";
             break;
         }
 
@@ -401,42 +403,175 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // TODO: Tokenize prompt (for now, use dummy tokens)
-    std::vector<int> tokens = {1, 2, 3, 4, 5, 6, 7, 8}; // Placeholder
+    // Create tokenizer from model context (avoids re-loading the model file)
+    std::shared_ptr<ITokenizer> tokenizer;
+    try
+    {
+        tokenizer = createTokenizer(model_ctx);
+        if (!tokenizer)
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_ERROR("Failed to create tokenizer from model context");
+            }
+            MPI_Finalize();
+            return 1;
+        }
+    }
+    catch (const std::exception &e)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_ERROR("Error creating tokenizer: " << e.what());
+        }
+        MPI_Finalize();
+        return 1;
+    }
 
-    // Run inference
+    // Tokenize prompt
+    std::vector<int> tokens;
+    try
+    {
+        // Encode with BOS token for instruction-tuned models
+        tokens = tokenizer->encode(args.prompt, /*add_bos=*/true, /*add_eos=*/false);
+
+        if (tokens.empty())
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_ERROR("Tokenization resulted in empty token sequence");
+            }
+            MPI_Finalize();
+            return 1;
+        }
+
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_INFO("Tokenized prompt: " << tokens.size() << " tokens");
+        }
+    }
+    catch (const std::exception &e)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_ERROR("Error tokenizing prompt: " << e.what());
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    // Create sampler with seed for reproducibility
+    Sampler sampler(args.seed);
+    SamplingParams sampling_params;
+    sampling_params.temperature = args.temperature;
+    sampling_params.top_k = args.top_k;
+    sampling_params.top_p = args.top_p;
+    sampling_params.seed = args.seed;
+
     if (mpi_ctx->rank() == 0)
     {
-        LOG_INFO("Running inference...\n");
-        LOG_INFO("Prompt: \"" << args.prompt << "\"\n");
-        LOG_INFO("Generating " << args.n_predict << " tokens...\n\n");
+        LOG_INFO("Sampling parameters:");
+        LOG_INFO("  temperature: " << sampling_params.temperature);
+        LOG_INFO("  top_k: " << sampling_params.top_k);
+        LOG_INFO("  top_p: " << sampling_params.top_p);
+        LOG_INFO("  seed: " << sampling_params.seed);
+    }
+
+    // Run prefill inference
+    if (mpi_ctx->rank() == 0)
+    {
+        LOG_INFO("Running prefill (" << tokens.size() << " tokens)...");
     }
 
     if (!pipeline->forward(tokens.data(), tokens.size()))
     {
         if (mpi_ctx->rank() == 0)
         {
-            LOG_ERROR("Error: Forward pass failed\n");
+            LOG_ERROR("Error: Prefill forward pass failed");
         }
         MPI_Finalize();
         return 1;
     }
 
-    // Generate tokens
+    if (mpi_ctx->rank() == 0)
+    {
+        LOG_INFO("Prefill complete. Generating " << args.n_predict << " tokens...\n");
+        // Print the prompt (decoded from tokens)
+        std::string decoded_prompt = tokenizer->decode(tokens, /*remove_special=*/true);
+        std::cout << decoded_prompt << std::flush;
+    }
+
+    // Get EOS token ID for early stopping
+    int eos_token_id = tokenizer->eos_token();
+
+    // Generate tokens autoregressively
     for (int i = 0; i < args.n_predict; ++i)
     {
+        // Get logits from last forward pass
         const float *logits = pipeline->logits();
 
-        // TODO: Sample next token (for now, greedy argmax)
-        // tokens.push_back(next_token);
+        // Get vocabulary size from tokenizer
+        size_t vocab_size = tokenizer->vocab_size();
 
-        // Decode single token
-        // pipeline->forward(tokens.data() + tokens.size() - 1, 1);
+        // Convert logits to vector for sampling (only on rank 0)
+        int next_token = -1;
+        if (mpi_ctx->rank() == 0)
+        {
+            std::vector<float> logits_vec(logits, logits + vocab_size);
+
+            // Sample next token
+            try
+            {
+                next_token = sampler.sample(logits_vec, sampling_params);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("Error sampling next token: " << e.what());
+                MPI_Finalize();
+                return 1;
+            }
+
+            // Decode and print the token immediately (streaming output)
+            std::string token_text = tokenizer->decode_token(next_token);
+            std::cout << token_text << std::flush;
+
+            // Check for early stopping
+            if (next_token == eos_token_id)
+            {
+                if (args.verbose)
+                {
+                    LOG_INFO("\nGeneration stopped: EOS token encountered");
+                }
+                break;
+            }
+        }
+
+        // Broadcast next_token to all ranks for synchronized decode
+        MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+        // Check if rank 0 hit EOS
+        if (next_token == eos_token_id)
+        {
+            break;
+        }
+
+        // Forward next token through pipeline (single token decode)
+        if (!pipeline->forward(&next_token, 1))
+        {
+            if (mpi_ctx->rank() == 0)
+            {
+                LOG_ERROR("\nError: Decode forward pass failed at token " << (i + 1));
+            }
+            MPI_Finalize();
+            return 1;
+        }
     }
 
     if (mpi_ctx->rank() == 0)
     {
-        LOG_INFO("\nInference complete.\n");
+        std::cout << "\n"
+                  << std::endl; // Final newline
+        LOG_INFO("Generation complete.");
     }
 
     MPI_Finalize();

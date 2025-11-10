@@ -28,7 +28,7 @@ using namespace llaminar2;
  * This decouples GEMM testing from quantization correctness.
  * We test the GEMM kernel logic separately from IQ4_NL decoding.
  */
-class MockFP32Decoder : public llaminar2::IBlockDecoder
+class MockFP32Decoder : public llaminar2::ITensorGemmTileDataProvider
 {
 private:
     const float *data_; // FP32 tensor data [rows × cols]
@@ -294,7 +294,7 @@ protected:
         std::vector<float> C(m * n, 0.0f);
 
         // Execute the kernel
-        bool success = kernel->multiply(A.data(), C.data(), m, n, k, &decoder);
+        bool success = kernel->multiply(A.data(), C.data(), m, n, k, &decoder, false, 1.0f, 0.0f);
         ASSERT_TRUE(success) << "Kernel execution failed: " << config.id();
 
         // Compute reference result using CBLAS
@@ -539,7 +539,7 @@ TEST_F(Test__GemmAutoTunerCorrectness, NumericalStability_AllVariants)
         ASSERT_NE(kernel, nullptr);
 
         std::vector<float> C(m * n, 0.0f);
-        bool success = kernel->multiply(A.data(), C.data(), m, n, k, &decoder);
+        bool success = kernel->multiply(A.data(), C.data(), m, n, k, &decoder, false, 1.0f, 0.0f);
         ASSERT_TRUE(success);
 
         // Verify no NaN or Inf values

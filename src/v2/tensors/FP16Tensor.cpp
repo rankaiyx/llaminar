@@ -6,6 +6,13 @@
 
 #include "Tensors.h"
 #include "../utils/Logger.h"
+#include "../kernels/cpu/CPURMSNormKernel.h"
+#include "../kernels/cpu/CPURoPEKernel.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
+#include "../backends/ComputeBackend.h"
+#ifdef HAVE_CUDA
+#include "../kernels/cuda/CudaGemmFactory.h"
+#endif
 #include <cstring>
 #include <stdexcept>
 #include "SIMDHelpers.h"
@@ -36,7 +43,7 @@ namespace llaminar2
     }
 
     FP16Tensor::FP16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &fp16_data)
-        : shape_(shape), device_idx_(-1), device_data_(nullptr), host_fp16_data_(fp16_data),
+        : shape_(shape), device_idx_(-1), device_data_(nullptr), host_fp16_data_(fp16_data.size()),
           is_view_(false), parent_data_ptr_(nullptr), view_offset_(0), parent_(nullptr)
     {
         if (shape.empty())
@@ -54,12 +61,15 @@ namespace llaminar2
         {
             throw std::invalid_argument("FP16Tensor: data size mismatch");
         }
+
+        // Copy std::vector data into AlignedVector
+        std::copy(fp16_data.begin(), fp16_data.end(), host_fp16_data_.begin());
     }
 
     // Private view constructor
     FP16Tensor::FP16Tensor(const std::vector<size_t> &shape,
                            int device_idx,
-                           std::vector<uint16_t> *parent_data,
+                           AlignedVector<uint16_t> *parent_data,
                            size_t data_offset,
                            std::shared_ptr<FP16Tensor> parent)
         : shape_(shape), device_idx_(device_idx), device_data_(nullptr),
@@ -150,12 +160,51 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> FP16Tensor::createGemm()
     {
-        throw std::runtime_error("FP16Tensor: GEMM not yet implemented");
+        // Route to appropriate backend based on tensor's device placement
+        if (device_idx_ >= 0)
+        {
+            // Tensor is on a GPU device - get device type from DeviceManager
+            auto &dm = DeviceManager::instance();
+            const auto &devices = dm.devices();
+
+            if (static_cast<size_t>(device_idx_) >= devices.size())
+            {
+                LOG_ERROR("[FP16Tensor] Invalid device_idx: " << device_idx_);
+                throw std::runtime_error("FP16Tensor::createGemm: invalid device index");
+            }
+
+            const auto &device = devices[device_idx_];
+
+            // Route based on backend type
+            switch (device.type)
+            {
+#ifdef HAVE_CUDA
+            case ComputeBackendType::GPU_CUDA:
+                LOG_DEBUG("[FP16Tensor] Creating CUDA GEMM kernel for device " << device_idx_);
+                return llaminar::v2::kernels::cuda::createCudaGemm(this);
+#endif
+#ifdef HAVE_ROCM
+            case ComputeBackendType::GPU_ROCM:
+                LOG_ERROR("[FP16Tensor] ROCm GEMM not yet implemented");
+                throw std::runtime_error("ROCm GEMM not implemented");
+#endif
+            default:
+                LOG_ERROR("[FP16Tensor] Unsupported GPU backend type: " << static_cast<int>(device.type));
+                throw std::runtime_error("Unsupported GPU backend type");
+            }
+        }
+        else
+        {
+            // Tensor is on CPU - use auto-tuned CPU kernel
+            // FP16 implements ITensorGemmTileDataProvider interface (used generically for auto-tuner)
+            LOG_DEBUG("[FP16Tensor] Creating CPU GEMM kernel with auto-tuner");
+            return llaminar::v2::kernels::createAutoTunedGemm(this);
+        }
     }
 
     std::unique_ptr<ITensorRoPE> FP16Tensor::createRoPE()
     {
-        throw std::runtime_error("FP16Tensor: RoPE not supported");
+        return std::make_unique<CPURoPEKernel>();
     }
 
     std::unique_ptr<ITensorSwiGLU> FP16Tensor::createSwiGLU()
@@ -170,7 +219,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRMSNorm> FP16Tensor::createRMSNorm()
     {
-        throw std::runtime_error("FP16Tensor: RMSNorm not supported");
+        // FP16 tensors use native FP16 RMSNorm kernel (no conversion to FP32)
+        return std::make_unique<CPURMSNormKernel>();
     }
 
     std::unique_ptr<ITensorAttention> FP16Tensor::createAttention()
@@ -338,7 +388,7 @@ namespace llaminar2
             }
         }
 
-        std::vector<uint16_t> *root_data = is_view_ ? parent_data_ptr_ : &host_fp16_data_;
+        AlignedVector<uint16_t> *root_data = is_view_ ? parent_data_ptr_ : &host_fp16_data_;
         size_t root_offset = is_view_ ? (view_offset_ + offset) : offset;
 
         // Create view using private constructor
@@ -435,7 +485,7 @@ namespace llaminar2
     bool FP16Tensor::to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales) const
     {
         // FP16 → FP32 → INT8 per-channel quantization
-        // Use the generic conversion path since FP16 doesn't implement IBlockDecoder
+        // Use the generic conversion path since FP16 doesn't implement ITensorGemmTileDataProvider
 
         if (shape_.size() != 2)
         {
@@ -528,6 +578,61 @@ namespace llaminar2
         {
             buffer[i] = fp16_to_fp32(src[offset + i]);
         }
+    }
+
+    bool FP16Tensor::applyRMSNorm(
+        const float *gamma,
+        int seq_len,
+        int d_model,
+        float eps,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        auto kernel = createRMSNorm();
+        if (!kernel)
+        {
+            LOG_ERROR("[FP16Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
+            return false;
+        }
+
+        // FP16 path: apply_fp16() with FP16 buffers (in-place)
+        return kernel->apply_fp16(
+            this->fp16_data(),
+            gamma,
+            this->mutable_fp16_data(),
+            seq_len, d_model, eps,
+            device_idx);
+    }
+
+    bool FP16Tensor::applyRoPE(
+        float *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        bool use_bf16,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        auto kernel = createRoPE();
+        if (!kernel)
+        {
+            LOG_ERROR("[FP16Tensor::applyRoPE] Failed to create RoPE kernel");
+            return false;
+        }
+
+        // FP16 path: apply_fp16() with FP16 buffers
+        // Q is this tensor, K must be FP16 as well
+        // Note: K is passed as float* but should actually be FP16
+        return kernel->apply_fp16(
+            this->mutable_fp16_data(),       // Q (FP16)
+            reinterpret_cast<uint16_t *>(K), // K (FP16)
+            position_ids,
+            seq_len, n_heads, n_kv_heads, head_dim,
+            rope_theta,
+            device_idx);
     }
 
 } // namespace llaminar2

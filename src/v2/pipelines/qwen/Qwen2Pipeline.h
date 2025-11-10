@@ -163,9 +163,9 @@ namespace llaminar2
         std::shared_ptr<TensorBase> final_norm_;      // Final RMSNorm gamma [d_model]
         std::shared_ptr<TensorBase> lm_head_;         // [d_model, vocab_size] IQ4_NL
 
-        // Activations (FP32, sized for batch_size * max_seq_len)
-        std::shared_ptr<FP32Tensor> current_hidden_; // [batch_size * padded_seq_len, d_model]
-        std::shared_ptr<FP32Tensor> logits_buffer_;  // [batch_size * padded_seq_len, vocab_size]
+        // Activations (precision set by config_.activation_precision, sized for batch_size * max_seq_len)
+        std::shared_ptr<TensorBase> current_hidden_; // [batch_size * padded_seq_len, d_model]
+        std::shared_ptr<TensorBase> logits_buffer_;  // [batch_size * padded_seq_len, vocab_size]
 
         // Batched KV cache
         std::shared_ptr<BatchedKVCache> kv_cache_batched_;

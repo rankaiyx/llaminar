@@ -7,7 +7,7 @@
 
 #include "Tensors.h"
 #include "../utils/Logger.h"
-#include "../kernels/cpu/INT8GemmKernel.h"
+#include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -81,7 +81,8 @@ namespace llaminar2
         }
         else
         {
-            host_int8_data_ = data;
+            host_int8_data_.resize(data.size());
+            std::copy(data.begin(), data.end(), host_int8_data_.begin());
         }
     }
 
@@ -164,38 +165,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> INT8Tensor::createGemm()
     {
-        // CPU: AVX512-VNNI INT8 GEMM kernel
-        return std::make_unique<INT8GemmKernel>(this);
-    }
-
-    std::unique_ptr<ITensorRoPE> INT8Tensor::createRoPE()
-    {
-        LOG_ERROR("[INT8Tensor] RoPE not supported for INT8 tensors");
-        return nullptr;
-    }
-
-    std::unique_ptr<ITensorSwiGLU> INT8Tensor::createSwiGLU()
-    {
-        LOG_ERROR("[INT8Tensor] SwiGLU not supported for INT8 tensors");
-        return nullptr;
-    }
-
-    std::unique_ptr<ITensorSoftmax> INT8Tensor::createSoftmax()
-    {
-        LOG_ERROR("[INT8Tensor] Softmax not supported for INT8 tensors");
-        return nullptr;
-    }
-
-    std::unique_ptr<ITensorRMSNorm> INT8Tensor::createRMSNorm()
-    {
-        LOG_ERROR("[INT8Tensor] RMSNorm not supported for INT8 tensors");
-        return nullptr;
-    }
-
-    std::unique_ptr<ITensorAttention> INT8Tensor::createAttention()
-    {
-        LOG_ERROR("[INT8Tensor] Attention not supported for INT8 tensors");
-        return nullptr;
+        // CPU: Auto-tuned AVX512-VNNI INT8 GEMM kernel
+        // Pass this tensor as the weight tensor (B parameter)
+        return llaminar2::kernels::gemm::createINT8PackedGemm(nullptr, this);
     }
 
     void INT8Tensor::to_fp32(float *dst) const
@@ -468,6 +440,68 @@ namespace llaminar2
             LOG_WARN("[INT8Tensor] get_row_scales() called but row scales not computed during quantization");
         }
         return row_scales_cache_;
+    }
+
+    // ============================================================================
+    // ITensorGemmTileDataProvider Interface - For INT8 GEMM Kernels
+    // ============================================================================
+
+    /**
+     * @brief Decode a row of INT8 data to FP32 for GEMM computation
+     *
+     * Used by INT8PackedGemm to dequantize weight matrix rows during GEMM.
+     * Applies appropriate scaling: per-row (for transpose), per-column, or global.
+     *
+     * @param row_idx Row index in the tensor
+     * @param k_block_offset Block offset within row (currently unused - full row decoded)
+     * @param output Output buffer for dequantized FP32 data [cols elements]
+     */
+    __attribute__((always_inline)) void INT8Tensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
+    {
+        const size_t cols = shape_[1];
+        const int8_t *int8_row = host_int8_data_.data() + row_idx * cols;
+
+        // Use per-row scale if available (for transpose_B=true operations)
+        if (!row_scales_cache_.empty())
+        {
+            const float row_scale = row_scales_cache_[row_idx];
+            for (size_t i = 0; i < cols; ++i)
+            {
+                output[i] = static_cast<float>(int8_row[i]) * row_scale;
+            }
+        }
+        // Use per-column scales if available (for normal operations)
+        else if (!col_scales_.empty())
+        {
+            for (size_t i = 0; i < cols; ++i)
+            {
+                output[i] = static_cast<float>(int8_row[i]) * col_scales_[i];
+            }
+        }
+        // Fallback to global scale
+        else
+        {
+            for (size_t i = 0; i < cols; ++i)
+            {
+                output[i] = static_cast<float>(int8_row[i]) * scale_;
+            }
+        }
+    }
+
+    /**
+     * @brief Get pointer to raw INT8 data for a specific row
+     *
+     * Returns pointer to the start of a row for direct INT8 operations.
+     *
+     * @param row_idx Row index in the tensor
+     * @param k_block_offset Block offset within row (currently unused)
+     * @return Const pointer to raw INT8 data
+     */
+    __attribute__((always_inline))
+    const void *
+    INT8Tensor::get_raw_block_at(size_t row_idx, size_t k_block_offset) const
+    {
+        return host_int8_data_.data() + row_idx * shape_[1];
     }
 
 } // namespace llaminar2

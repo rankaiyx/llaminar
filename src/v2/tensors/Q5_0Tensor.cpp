@@ -7,7 +7,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/GemmAutoTuner.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/CPUFeatures.h"
 #include "FP16Utils.h"
@@ -119,31 +119,15 @@ namespace llaminar2
         return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
-    std::unique_ptr<ITensorRoPE> Q5_0Tensor::createRoPE()
-    {
-        throw std::runtime_error("Q5_0Tensor::createRoPE not implemented");
-    }
+    
 
-    std::unique_ptr<ITensorSwiGLU> Q5_0Tensor::createSwiGLU()
-    {
-        throw std::runtime_error("Q5_0Tensor::createSwiGLU not implemented");
-    }
+    
 
-    std::unique_ptr<ITensorSoftmax> Q5_0Tensor::createSoftmax()
-    {
-        throw std::runtime_error("Q5_0Tensor::createSoftmax not implemented");
-    }
+    
 
-    std::unique_ptr<ITensorRMSNorm> Q5_0Tensor::createRMSNorm()
-    {
-        throw std::runtime_error("Q5_0Tensor::createRMSNorm not implemented");
-    }
+    
 
-    std::unique_ptr<ITensorAttention> Q5_0Tensor::createAttention()
-    {
-        LOG_ERROR("[Q5_0Tensor] createAttention not supported for quantized tensors");
-        return nullptr;
-    }
+    
 
     std::shared_ptr<TensorBase> Q5_0Tensor::create_view(
         const std::vector<size_t> &new_shape,

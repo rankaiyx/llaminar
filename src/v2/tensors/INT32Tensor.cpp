@@ -7,6 +7,7 @@
 
 #include "Tensors.h"
 #include "../utils/Logger.h"
+#include "../kernels/cpu/CPURMSNormKernel.h"
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -142,7 +143,8 @@ namespace llaminar2
         }
         else
         {
-            host_int32_data_ = data;
+            host_int32_data_.resize(data.size());
+            std::copy(data.begin(), data.end(), host_int32_data_.begin());
         }
     }
 
@@ -302,9 +304,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRMSNorm> INT32Tensor::createRMSNorm()
     {
-        // TODO: Implement INT32 RMSNorm (operates on INT32, outputs INT8 via requantization)
-        LOG_ERROR("[INT32Tensor] RMSNorm not yet implemented for INT32");
-        return nullptr;
+        // INT32 tensors use INT32→INT8 RMSNorm kernel with requantization
+        return std::make_unique<CPURMSNormKernel>();
     }
 
     std::unique_ptr<ITensorAttention> INT32Tensor::createAttention()
@@ -414,6 +415,48 @@ namespace llaminar2
             m, n);
 
         return true;
+    }
+
+    bool INT32Tensor::applyRMSNorm(
+        const float *gamma,
+        int seq_len,
+        int d_model,
+        float eps,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        // NOTE: INT32→INT8 RMSNorm path requires an INT8 output tensor.
+        // The current signature doesn't support this (in-place operation).
+        //
+        // For now, log an error and return false. Future work:
+        // 1. Add applyRMSNorm() variant that accepts output tensor pointer
+        // 2. Create INT8Tensor output in pipeline before calling
+        // 3. Use kernel->apply_int32_to_int8() with proper output buffer
+        //
+        // Alternative: Convert to FP32, normalize, convert back (not ideal for full INT8 path)
+
+        LOG_ERROR("[INT32Tensor::applyRMSNorm] INT32→INT8 RMSNorm not yet supported");
+        LOG_ERROR("  Requires INT8 output tensor - signature needs extension");
+        LOG_ERROR("  For now, convert to FP32 for normalization or add INT8 output parameter");
+        return false;
+    }
+
+    bool INT32Tensor::applyRoPE(
+        float *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        bool use_bf16,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        // RoPE is an activation operation, not applicable to quantized INT32 accumulators
+        LOG_ERROR("[INT32Tensor::applyRoPE] RoPE not supported on INT32 accumulator tensors");
+        LOG_ERROR("  RoPE is an activation operation - convert to FP32 first");
+        return false;
     }
 
 } // namespace llaminar2

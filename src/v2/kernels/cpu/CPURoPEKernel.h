@@ -47,6 +47,20 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
+        bool apply_bf16(
+            uint16_t *Q_bf16, uint16_t *K_bf16,
+            const int *position_ids,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float rope_theta = 10000.0f,
+            int device_idx = -1) override;
+
+        bool apply_fp16(
+            uint16_t *Q_fp16, uint16_t *K_fp16,
+            const int *position_ids,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float rope_theta = 10000.0f,
+            int device_idx = -1) override;
+
     private:
         // Thread-local state for decode (uses primitives type)
         thread_local static primitives::RoPEPersistentState tls_state_;

@@ -429,6 +429,98 @@ TEST_F(IQ4_NL_GEMM_Perf, LargeBatch_Prefill)
 }
 
 /**
+ * @brief XLarge batch (1024 tokens) - testing for peak performance
+ */
+TEST_F(IQ4_NL_GEMM_Perf, XLargeBatch_1024)
+{
+    BenchmarkConfig config{
+        .seq_len = 1024, // XLarge batch
+        .in_features = 896,
+        .out_features = 896,
+        .warmup_iters = 3,
+        .bench_iters = 30,
+        .num_trials = 5,
+        .description = "XLarge Batch (1024 tokens, 896x896)"};
+
+    auto weight = getWeightTensor();
+
+    BenchmarkStats stats = benchmarkFP32(config, weight);
+
+    printResults(config, stats);
+
+    EXPECT_GT(stats.mean_ms, 0.0);
+}
+
+/**
+ * @brief XXLarge batch (2048 tokens) - testing for peak performance
+ */
+TEST_F(IQ4_NL_GEMM_Perf, XXLargeBatch_2048)
+{
+    BenchmarkConfig config{
+        .seq_len = 2048, // XXLarge batch
+        .in_features = 896,
+        .out_features = 896,
+        .warmup_iters = 3,
+        .bench_iters = 20,
+        .num_trials = 5,
+        .description = "XXLarge Batch (2048 tokens, 896x896)"};
+
+    auto weight = getWeightTensor();
+
+    BenchmarkStats stats = benchmarkFP32(config, weight);
+
+    printResults(config, stats);
+
+    EXPECT_GT(stats.mean_ms, 0.0);
+}
+
+/**
+ * @brief Huge batch (4096 tokens) - approaching peak throughput
+ */
+TEST_F(IQ4_NL_GEMM_Perf, HugeBatch_4096)
+{
+    BenchmarkConfig config{
+        .seq_len = 4096, // Huge batch
+        .in_features = 896,
+        .out_features = 896,
+        .warmup_iters = 2,
+        .bench_iters = 10,
+        .num_trials = 3,
+        .description = "Huge Batch (4096 tokens, 896x896)"};
+
+    auto weight = getWeightTensor();
+
+    BenchmarkStats stats = benchmarkFP32(config, weight);
+
+    printResults(config, stats);
+
+    EXPECT_GT(stats.mean_ms, 0.0);
+}
+
+/**
+ * @brief Massive batch (8192 tokens) - peak throughput test
+ */
+TEST_F(IQ4_NL_GEMM_Perf, MassiveBatch_8192)
+{
+    BenchmarkConfig config{
+        .seq_len = 8192, // Massive batch
+        .in_features = 896,
+        .out_features = 896,
+        .warmup_iters = 2,
+        .bench_iters = 5,
+        .num_trials = 3,
+        .description = "Massive Batch (8192 tokens, 896x896)"};
+
+    auto weight = getWeightTensor();
+
+    BenchmarkStats stats = benchmarkFP32(config, weight);
+
+    printResults(config, stats);
+
+    EXPECT_GT(stats.mean_ms, 0.0);
+}
+
+/**
  * @brief V1 Comparison: Q-Proj 1024 (matching V1 tile sweep test)
  *
  * V1 achieved 314 GFLOPS with 32×32 tiles, 352 GFLOPS with 64×32 tiles.

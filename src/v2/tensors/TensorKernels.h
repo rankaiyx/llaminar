@@ -17,18 +17,21 @@ namespace llaminar2
 {
 
     /**
-     * @brief Block decoder strategy interface for quantized tensors
+     * @brief Block decoder strategy interface for quantized tensors (FP32 decode path)
      *
      * Provides format-specific dequantization for block-quantized formats.
      * Implementations MUST be header-only with always_inline to ensure zero overhead
      * when called from QuantizedGemmKernel hot path.
      *
      * Supported formats: IQ4_NL, Q6_K, Q8_0, etc.
+     *
+     * NOTE: This interface decodes to FP32. For integer GEMM kernels that want
+     * raw quantized blocks, use IQuantizedTileAccessor instead.
      */
-    class IBlockDecoder
+    class ITensorGemmTileDataProvider
     {
     public:
-        virtual ~IBlockDecoder() = default;
+        virtual ~ITensorGemmTileDataProvider() = default;
 
         /**
          * @brief Decode one quantized block to FP32
@@ -56,6 +59,53 @@ namespace llaminar2
          */
         virtual size_t decoder_rows() const = 0;
         virtual size_t decoder_cols() const = 0;
+        virtual size_t block_size() const = 0;
+    };
+
+    /**
+     * @brief Raw quantized weight block accessor (integer GEMM path)
+     *
+     * Unlike ITensorGemmTileDataProvider (which decodes to FP32), this interface
+     * exposes raw quantized blocks + metadata for integer GEMM kernels that want
+     * to defer dequantization (e.g., AVX512-VNNI INT8×IQ4_NL GEMM).
+     *
+     * Rationale:
+     * - FP32 GEMM: Decode weights to FP32 → multiply with FP32 activations
+     * - INT8 GEMM: Keep weights as int8, decode on-the-fly in registers,
+     *              apply scaling to final output (fused dequant)
+     *
+     * This avoids materializing FP32 weight buffers for integer kernels.
+     */
+    class IQuantizedTileAccessor
+    {
+    public:
+        virtual ~IQuantizedTileAccessor() = default;
+
+        /**
+         * @brief Get raw pointer to quantized block (no decode)
+         *
+         * @param row_idx Row index in weight tensor
+         * @param k_block_idx Block index along K dimension
+         * @return Const pointer to raw quantized block structure
+         *
+         * Example: For IQ4_NL, returns IQ4_NLBlock* = {uint8_t qs[16], uint16_t d}
+         */
+        virtual const void *get_raw_block(size_t row_idx, size_t k_block_idx) const = 0;
+
+        /**
+         * @brief Get dequantization scale for block
+         *
+         * @param row_idx Row index
+         * @param k_block_idx Block index
+         * @return FP32 scale factor (converted from FP16 if needed)
+         */
+        virtual float get_block_scale(size_t row_idx, size_t k_block_idx) const = 0;
+
+        /**
+         * @brief Get tensor dimensions
+         */
+        virtual size_t rows() const = 0;
+        virtual size_t cols() const = 0;
         virtual size_t block_size() const = 0;
     };
 
@@ -198,7 +248,7 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Apply rotary position embeddings to Q and K
+         * @brief Apply rotary position embeddings to Q and K (FP32)
          *
          * @param Q Query tensor [seq_len, n_heads, head_dim] (modified in-place)
          * @param K Key tensor [seq_len, n_kv_heads, head_dim] (modified in-place)
@@ -222,6 +272,60 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Apply RoPE with BF16 tensors (native precision, no conversion)
+         *
+         * @param Q_bf16 Query tensor in BF16 format [seq_len, n_heads, head_dim]
+         * @param K_bf16 Key tensor in BF16 format [seq_len, n_kv_heads, head_dim]
+         * @param position_ids Position indices [seq_len]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads
+         * @param head_dim Dimension per head
+         * @param rope_theta RoPE frequency base
+         * @param device_idx Device index
+         *
+         * @return true on success, false on error
+         *
+         * @note Default implementation returns false (opt-in support)
+         */
+        virtual bool apply_bf16(
+            uint16_t *Q_bf16, uint16_t *K_bf16,
+            const int *position_ids,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float rope_theta = 10000.0f,
+            int device_idx = -1)
+        {
+            return false; // Default: not supported
+        }
+
+        /**
+         * @brief Apply RoPE with FP16 tensors (native precision, no conversion)
+         *
+         * @param Q_fp16 Query tensor in FP16 format [seq_len, n_heads, head_dim]
+         * @param K_fp16 Key tensor in FP16 format [seq_len, n_kv_heads, head_dim]
+         * @param position_ids Position indices [seq_len]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads
+         * @param head_dim Dimension per head
+         * @param rope_theta RoPE frequency base
+         * @param device_idx Device index
+         *
+         * @return true on success, false on error
+         *
+         * @note Default implementation returns false (opt-in support)
+         */
+        virtual bool apply_fp16(
+            uint16_t *Q_fp16, uint16_t *K_fp16,
+            const int *position_ids,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            float rope_theta = 10000.0f,
+            int device_idx = -1)
+        {
+            return false; // Default: not supported
+        }
     };
 
     /**
@@ -286,11 +390,11 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Apply RMS normalization
+         * @brief Apply RMS normalization (FP32)
          *
-         * @param input Input tensor [seq_len, d_model]
-         * @param gamma Scale parameter [d_model]
-         * @param output Output tensor [seq_len, d_model]
+         * @param input Input tensor [seq_len, d_model] (FP32)
+         * @param gamma Scale parameter [d_model] (FP32)
+         * @param output Output tensor [seq_len, d_model] (FP32)
          * @param seq_len Sequence length
          * @param d_model Model dimension
          * @param eps Epsilon for numerical stability
@@ -307,6 +411,119 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Apply RMS normalization (BF16 native precision)
+         *
+         * Performs RMS normalization on BF16 tensors without conversion overhead.
+         * Internally converts to FP32 for high-precision accumulation, then converts back.
+         *
+         * @param input_bf16 Input BF16 tensor [seq_len, d_model] (stored as uint16_t)
+         * @param gamma Gamma weights [d_model] (FP32)
+         * @param output_bf16 Output BF16 tensor [seq_len, d_model] (stored as uint16_t)
+         * @param seq_len Sequence length
+         * @param d_model Model dimension
+         * @param eps Epsilon for numerical stability
+         * @param device_idx Device index (-1 for CPU)
+         *
+         * @return true on success
+         */
+        virtual bool apply_bf16(
+            const uint16_t *input_bf16,
+            const float *gamma,
+            uint16_t *output_bf16,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            int device_idx = -1)
+        {
+            // Default implementation: not supported
+            (void)input_bf16;
+            (void)gamma;
+            (void)output_bf16;
+            (void)seq_len;
+            (void)d_model;
+            (void)eps;
+            (void)device_idx;
+            return false;
+        }
+
+        /**
+         * @brief Apply RMS normalization (FP16 native precision)
+         *
+         * Performs RMS normalization on FP16 tensors without conversion overhead.
+         * Internally converts to FP32 for high-precision accumulation, then converts back.
+         *
+         * @param input_fp16 Input FP16 tensor [seq_len, d_model] (stored as uint16_t)
+         * @param gamma Gamma weights [d_model] (FP32)
+         * @param output_fp16 Output FP16 tensor [seq_len, d_model] (stored as uint16_t)
+         * @param seq_len Sequence length
+         * @param d_model Model dimension
+         * @param eps Epsilon for numerical stability
+         * @param device_idx Device index (-1 for CPU)
+         *
+         * @return true on success
+         */
+        virtual bool apply_fp16(
+            const uint16_t *input_fp16,
+            const float *gamma,
+            uint16_t *output_fp16,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            int device_idx = -1)
+        {
+            // Default implementation: not supported
+            (void)input_fp16;
+            (void)gamma;
+            (void)output_fp16;
+            (void)seq_len;
+            (void)d_model;
+            (void)eps;
+            (void)device_idx;
+            return false;
+        }
+
+        /**
+         * @brief Apply RMS normalization with INT32→INT8 requantization
+         *
+         * Performs RMS normalization on INT32 accumulator tensors and
+         * requantizes output to INT8 with per-row dynamic scaling.
+         *
+         * Pipeline: INT32 input → normalize → apply gamma → requantize → INT8 output
+         *
+         * @param input_int32 Input INT32 tensor [seq_len, d_model]
+         * @param gamma Scale parameter [d_model] (FP32)
+         * @param output_int8 Output INT8 tensor [seq_len, d_model]
+         * @param output_row_scales Per-row INT8 scales [seq_len]
+         * @param seq_len Sequence length
+         * @param d_model Model dimension
+         * @param eps Epsilon for numerical stability
+         * @param device_idx Device index (-1 for CPU)
+         *
+         * @return true on success
+         */
+        virtual bool apply_int32_to_int8(
+            const int32_t *input_int32,
+            const float *gamma,
+            int8_t *output_int8,
+            float *output_row_scales,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            int device_idx = -1)
+        {
+            // Default implementation: not supported
+            (void)input_int32;
+            (void)gamma;
+            (void)output_int8;
+            (void)output_row_scales;
+            (void)seq_len;
+            (void)d_model;
+            (void)eps;
+            (void)device_idx;
+            return false;
+        }
     };
 
     /**

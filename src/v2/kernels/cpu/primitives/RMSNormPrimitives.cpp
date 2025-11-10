@@ -7,6 +7,7 @@
 #include "RMSNormPrimitives.h"
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -25,7 +26,7 @@ namespace llaminar2::primitives
     {
         inline bool want_parallel(std::size_t rows, std::size_t cols, const RMSNormExecOptions &opts)
         {
-            if (opts.force_scalar || !opts.allow_parallel)
+            if (!opts.allow_parallel)
                 return false;
 
             std::size_t elems = rows * cols;
@@ -488,6 +489,256 @@ namespace llaminar2::primitives
         }
     }
 
+    namespace
+    {
+        // ========== INT32→INT8 Helper Kernels ==========
+
+        /// INT32→FP32 normalization - Scalar path
+        __attribute__((always_inline)) inline void int32_to_fp32_normalize_scalar(
+            const int32_t *src,
+            float *dst,
+            float rms_inv,
+            const float *gamma,
+            std::size_t cols)
+        {
+            if (gamma)
+            {
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    dst[c] = static_cast<float>(src[c]) * rms_inv * gamma[c];
+                }
+            }
+            else
+            {
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    dst[c] = static_cast<float>(src[c]) * rms_inv;
+                }
+            }
+        }
+
+#if defined(__AVX512F__)
+        /// INT32→FP32 normalization - AVX512 path
+        __attribute__((always_inline)) inline void int32_to_fp32_normalize_avx512(
+            const int32_t *src,
+            float *dst,
+            float rms_inv,
+            const float *gamma,
+            std::size_t cols)
+        {
+            __m512 rms_inv_vec = _mm512_set1_ps(rms_inv);
+            std::size_t c = 0;
+
+            if (gamma)
+            {
+                for (; c + 16 <= cols; c += 16)
+                {
+                    __m512i i32_vec = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(src + c));
+                    __m512 fp32_vec = _mm512_cvtepi32_ps(i32_vec);
+                    __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+                    __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vec, rms_inv_vec), gamma_vec);
+                    _mm512_storeu_ps(dst + c, normalized);
+                }
+            }
+            else
+            {
+                for (; c + 16 <= cols; c += 16)
+                {
+                    __m512i i32_vec = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(src + c));
+                    __m512 fp32_vec = _mm512_cvtepi32_ps(i32_vec);
+                    __m512 normalized = _mm512_mul_ps(fp32_vec, rms_inv_vec);
+                    _mm512_storeu_ps(dst + c, normalized);
+                }
+            }
+
+            // Scalar tail
+            int32_to_fp32_normalize_scalar(src + c, dst + c, rms_inv, gamma ? gamma + c : nullptr, cols - c);
+        }
+
+        /// Find max absolute value - AVX512 path
+        __attribute__((always_inline)) inline float find_max_abs_avx512(const float *data, std::size_t size)
+        {
+            __m512 max_vec = _mm512_setzero_ps();
+            std::size_t i = 0;
+
+            for (; i + 16 <= size; i += 16)
+            {
+                __m512 vec = _mm512_loadu_ps(data + i);
+                __m512 abs_vec = _mm512_abs_ps(vec); // AVX512F has abs
+                max_vec = _mm512_max_ps(max_vec, abs_vec);
+            }
+
+            // Horizontal max reduction
+            float max_val = _mm512_reduce_max_ps(max_vec);
+
+            // Scalar tail
+            for (; i < size; ++i)
+            {
+                max_val = std::max(max_val, std::fabs(data[i]));
+            }
+
+            return max_val;
+        }
+
+        /// FP32→INT8 quantization - AVX512 path
+        __attribute__((always_inline)) inline void fp32_to_int8_quantize_avx512(
+            const float *src,
+            int8_t *dst,
+            float inv_scale,
+            std::size_t cols)
+        {
+            __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+            __m512 min_val = _mm512_set1_ps(-127.0f);
+            __m512 max_val = _mm512_set1_ps(127.0f);
+            std::size_t c = 0;
+
+            // Process 16 FP32 → 16 INT8 per iteration
+            for (; c + 16 <= cols; c += 16)
+            {
+                __m512 fp32_vec = _mm512_loadu_ps(src + c);
+                __m512 scaled = _mm512_mul_ps(fp32_vec, inv_scale_vec);
+
+                // Clamp to [-127, 127]
+                scaled = _mm512_max_ps(scaled, min_val);
+                scaled = _mm512_min_ps(scaled, max_val);
+
+                // Round to nearest and convert to INT32
+                __m512i i32_vec = _mm512_cvtps_epi32(scaled);
+
+                // Saturate to INT8 range (AVX512BW has efficient pack)
+                __m128i i8_vec = _mm512_cvtsepi32_epi8(i32_vec);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + c), i8_vec);
+            }
+
+            // Scalar tail
+            for (; c < cols; ++c)
+            {
+                float scaled = src[c] * inv_scale;
+                scaled = std::max(-127.0f, std::min(127.0f, scaled));
+                dst[c] = static_cast<int8_t>(std::round(scaled));
+            }
+        }
+
+#elif defined(__AVX2__)
+        /// INT32→FP32 normalization - AVX2 path
+        __attribute__((always_inline)) inline void int32_to_fp32_normalize_avx2(
+            const int32_t *src,
+            float *dst,
+            float rms_inv,
+            const float *gamma,
+            std::size_t cols)
+        {
+            __m256 rms_inv_vec = _mm256_set1_ps(rms_inv);
+            std::size_t c = 0;
+
+            if (gamma)
+            {
+                for (; c + 8 <= cols; c += 8)
+                {
+                    __m256i i32_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src + c));
+                    __m256 fp32_vec = _mm256_cvtepi32_ps(i32_vec);
+                    __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
+                    __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(fp32_vec, rms_inv_vec), gamma_vec);
+                    _mm256_storeu_ps(dst + c, normalized);
+                }
+            }
+            else
+            {
+                for (; c + 8 <= cols; c += 8)
+                {
+                    __m256i i32_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src + c));
+                    __m256 fp32_vec = _mm256_cvtepi32_ps(i32_vec);
+                    __m256 normalized = _mm256_mul_ps(fp32_vec, rms_inv_vec);
+                    _mm256_storeu_ps(dst + c, normalized);
+                }
+            }
+
+            // Scalar tail
+            int32_to_fp32_normalize_scalar(src + c, dst + c, rms_inv, gamma ? gamma + c : nullptr, cols - c);
+        }
+
+        /// Find max absolute value - AVX2 path
+        __attribute__((always_inline)) inline float find_max_abs_avx2(const float *data, std::size_t size)
+        {
+            __m256 max_vec = _mm256_setzero_ps();
+            __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+            std::size_t i = 0;
+
+            for (; i + 8 <= size; i += 8)
+            {
+                __m256 vec = _mm256_loadu_ps(data + i);
+                __m256 abs_vec = _mm256_and_ps(vec, sign_mask);
+                max_vec = _mm256_max_ps(max_vec, abs_vec);
+            }
+
+            // Horizontal max reduction
+            __m128 lo = _mm256_castps256_ps128(max_vec);
+            __m128 hi = _mm256_extractf128_ps(max_vec, 1);
+            __m128 max4 = _mm_max_ps(lo, hi);
+            __m128 shuf = _mm_movehdup_ps(max4);
+            __m128 maxs = _mm_max_ps(max4, shuf);
+            shuf = _mm_movehl_ps(shuf, maxs);
+            maxs = _mm_max_ss(maxs, shuf);
+
+            float max_val;
+            _mm_store_ss(&max_val, maxs);
+
+            // Scalar tail
+            for (; i < size; ++i)
+            {
+                max_val = std::max(max_val, std::fabs(data[i]));
+            }
+
+            return max_val;
+        }
+
+        /// FP32→INT8 quantization - AVX2 path
+        __attribute__((always_inline)) inline void fp32_to_int8_quantize_avx2(
+            const float *src,
+            int8_t *dst,
+            float inv_scale,
+            std::size_t cols)
+        {
+            __m256 inv_scale_vec = _mm256_set1_ps(inv_scale);
+            __m256 min_val = _mm256_set1_ps(-127.0f);
+            __m256 max_val = _mm256_set1_ps(127.0f);
+            std::size_t c = 0;
+
+            // Process 8 FP32 → 8 INT8 per iteration
+            for (; c + 8 <= cols; c += 8)
+            {
+                __m256 fp32_vec = _mm256_loadu_ps(src + c);
+                __m256 scaled = _mm256_mul_ps(fp32_vec, inv_scale_vec);
+
+                // Clamp to [-127, 127]
+                scaled = _mm256_max_ps(scaled, min_val);
+                scaled = _mm256_min_ps(scaled, max_val);
+
+                // Round to nearest and convert to INT32
+                __m256i i32_vec = _mm256_cvtps_epi32(scaled);
+
+                // Pack INT32 to INT8 (with saturation)
+                // AVX2 doesn't have direct INT32→INT8, need multi-step
+                __m128i i32_lo = _mm256_castsi256_si128(i32_vec);
+                __m128i i32_hi = _mm256_extracti128_si256(i32_vec, 1);
+                __m128i i16_packed = _mm_packs_epi32(i32_lo, i32_hi);
+                __m128i i8_packed = _mm_packs_epi16(i16_packed, i16_packed);
+
+                _mm_storel_epi64(reinterpret_cast<__m128i *>(dst + c), i8_packed);
+            }
+
+            // Scalar tail
+            for (; c < cols; ++c)
+            {
+                float scaled = src[c] * inv_scale;
+                scaled = std::max(-127.0f, std::min(127.0f, scaled));
+                dst[c] = static_cast<int8_t>(std::round(scaled));
+            }
+        }
+#endif
+
+    } // anonymous namespace
+
     void rmsnorm_apply_int32_to_int8_vectorized(
         const int32_t *src,
         const float *gamma,
@@ -502,7 +753,6 @@ namespace llaminar2::primitives
             return;
 
         bool parallel = want_parallel(rows, cols, opts);
-        bool has_gamma = (gamma != nullptr);
 
 #pragma omp parallel for if (parallel)
         for (long long r = 0; r < (long long)rows; ++r)
@@ -518,51 +768,51 @@ namespace llaminar2::primitives
                 continue;
             }
 
-            // Step 1: Normalize INT32 to FP32 and apply gamma
-            // We'll use thread-local buffer to avoid allocation
+            // Step 1: Normalize INT32 to FP32 and apply gamma (vectorized)
             thread_local std::vector<float> fp32_buffer;
             if (fp32_buffer.size() < cols)
                 fp32_buffer.resize(cols);
 
-            if (!has_gamma)
-            {
-#pragma omp simd
-                for (long long c = 0; c < (long long)cols; ++c)
-                {
-                    fp32_buffer[c] = (float)row_in[c] * rms_inv;
-                }
-            }
-            else
-            {
-#pragma omp simd
-                for (long long c = 0; c < (long long)cols; ++c)
-                {
-                    fp32_buffer[c] = (float)row_in[c] * rms_inv * gamma[c];
-                }
-            }
+#if defined(__AVX512F__)
+            int32_to_fp32_normalize_avx512(row_in, fp32_buffer.data(), rms_inv, gamma, cols);
+#elif defined(__AVX2__)
+            int32_to_fp32_normalize_avx2(row_in, fp32_buffer.data(), rms_inv, gamma, cols);
+#else
+            int32_to_fp32_normalize_scalar(row_in, fp32_buffer.data(), rms_inv, gamma, cols);
+#endif
 
-            // Step 2: Requantize FP32 to INT8 with per-row dynamic scaling
-            // Find max absolute value
-            float max_abs = 0.0f;
+            // Step 2: Find max absolute value (vectorized)
+            float max_abs;
+#if defined(__AVX512F__)
+            max_abs = find_max_abs_avx512(fp32_buffer.data(), cols);
+#elif defined(__AVX2__)
+            max_abs = find_max_abs_avx2(fp32_buffer.data(), cols);
+#else
+            max_abs = 0.0f;
             for (std::size_t c = 0; c < cols; ++c)
             {
                 max_abs = std::max(max_abs, std::fabs(fp32_buffer[c]));
             }
+#endif
 
             // Compute scale to fit into INT8 range [-127, 127]
             float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
             dst_row_scales[r] = scale;
 
-            // Quantize to INT8
+            // Step 3: Quantize FP32 to INT8 (vectorized)
             float inv_scale = 1.0f / scale;
-#pragma omp simd
-            for (long long c = 0; c < (long long)cols; ++c)
+#if defined(__AVX512F__)
+            fp32_to_int8_quantize_avx512(fp32_buffer.data(), row_out, inv_scale, cols);
+#elif defined(__AVX2__)
+            fp32_to_int8_quantize_avx2(fp32_buffer.data(), row_out, inv_scale, cols);
+#else
+            for (std::size_t c = 0; c < cols; ++c)
             {
                 float scaled = fp32_buffer[c] * inv_scale;
-                // Clamp to [-127, 127] and round
                 scaled = std::max(-127.0f, std::min(127.0f, scaled));
-                row_out[c] = (int8_t)std::round(scaled);
+                row_out[c] = static_cast<int8_t>(std::round(scaled));
             }
+#endif
         }
     }
 
@@ -599,6 +849,1310 @@ namespace llaminar2::primitives
         rmsnorm_compute_row_sumsq_int32_vectorized(src, rows, cols, scratch.row_sumsq.data(), opts);
         rmsnorm_compute_inv(scratch.row_sumsq.data(), rows, cols, epsilon, scratch.inv.data());
         rmsnorm_apply_int32_to_int8_vectorized(src, gamma, scratch.inv.data(), rows, cols, dst_int8, dst_row_scales, opts);
+    }
+
+    // ========================================================================
+    // FP32 Per-Row Primitives (Testable SIMD variants)
+    // ========================================================================
+
+    void rmsnorm_fused_row_scalar(
+        const float *src,
+        const float *gamma,
+        float *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares (double precision)
+        double sum_sq = 0.0;
+        for (std::size_t c = 0; c < cols; ++c)
+        {
+            double val = static_cast<double>(src[c]);
+            sum_sq += val * val;
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+
+        // Phase 3: Apply normalization
+        for (std::size_t c = 0; c < cols; ++c)
+        {
+            dst[c] = src[c] * inv_rms * gamma[c];
+        }
+    }
+
+#if defined(__AVX2__)
+    void rmsnorm_fused_row_avx2(
+        const float *src,
+        const float *gamma,
+        float *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares with AVX2
+        double sum_sq = 0.0;
+        std::size_t c = 0;
+
+        // Multi-accumulator AVX2: process 64 elements per iteration
+        __m256d dacc0 = _mm256_setzero_pd();
+        __m256d dacc1 = _mm256_setzero_pd();
+        __m256d dacc2 = _mm256_setzero_pd();
+        __m256d dacc3 = _mm256_setzero_pd();
+
+        for (; c + 64 <= cols; c += 64)
+        {
+            const float *base = src + c;
+
+            // Load 4x 16-float blocks
+            __m256 v0 = _mm256_loadu_ps(base + 0);
+            __m256 v1 = _mm256_loadu_ps(base + 8);
+            __m256 v2 = _mm256_loadu_ps(base + 16);
+            __m256 v3 = _mm256_loadu_ps(base + 24);
+            __m256 v4 = _mm256_loadu_ps(base + 32);
+            __m256 v5 = _mm256_loadu_ps(base + 40);
+            __m256 v6 = _mm256_loadu_ps(base + 48);
+            __m256 v7 = _mm256_loadu_ps(base + 56);
+
+            // Convert to double (split each 8-float into 2x 4-double)
+            __m128 lo0 = _mm256_castps256_ps128(v0);
+            __m128 hi0 = _mm256_extractf128_ps(v0, 1);
+            __m128 lo1 = _mm256_castps256_ps128(v1);
+            __m128 hi1 = _mm256_extractf128_ps(v1, 1);
+            __m128 lo2 = _mm256_castps256_ps128(v2);
+            __m128 hi2 = _mm256_extractf128_ps(v2, 1);
+            __m128 lo3 = _mm256_castps256_ps128(v3);
+            __m128 hi3 = _mm256_extractf128_ps(v3, 1);
+            __m128 lo4 = _mm256_castps256_ps128(v4);
+            __m128 hi4 = _mm256_extractf128_ps(v4, 1);
+            __m128 lo5 = _mm256_castps256_ps128(v5);
+            __m128 hi5 = _mm256_extractf128_ps(v5, 1);
+            __m128 lo6 = _mm256_castps256_ps128(v6);
+            __m128 hi6 = _mm256_extractf128_ps(v6, 1);
+            __m128 lo7 = _mm256_castps256_ps128(v7);
+            __m128 hi7 = _mm256_extractf128_ps(v7, 1);
+
+            __m256d d0 = _mm256_cvtps_pd(lo0);
+            __m256d d1 = _mm256_cvtps_pd(hi0);
+            __m256d d2 = _mm256_cvtps_pd(lo1);
+            __m256d d3 = _mm256_cvtps_pd(hi1);
+            __m256d d4 = _mm256_cvtps_pd(lo2);
+            __m256d d5 = _mm256_cvtps_pd(hi2);
+            __m256d d6 = _mm256_cvtps_pd(lo3);
+            __m256d d7 = _mm256_cvtps_pd(hi3);
+            __m256d d8 = _mm256_cvtps_pd(lo4);
+            __m256d d9 = _mm256_cvtps_pd(hi4);
+            __m256d d10 = _mm256_cvtps_pd(lo5);
+            __m256d d11 = _mm256_cvtps_pd(hi5);
+            __m256d d12 = _mm256_cvtps_pd(lo6);
+            __m256d d13 = _mm256_cvtps_pd(hi6);
+            __m256d d14 = _mm256_cvtps_pd(lo7);
+            __m256d d15 = _mm256_cvtps_pd(hi7);
+
+            // FMA: acc += d * d
+            dacc0 = _mm256_fmadd_pd(d0, d0, dacc0);
+            dacc0 = _mm256_fmadd_pd(d1, d1, dacc0);
+            dacc0 = _mm256_fmadd_pd(d2, d2, dacc0);
+            dacc0 = _mm256_fmadd_pd(d3, d3, dacc0);
+            dacc1 = _mm256_fmadd_pd(d4, d4, dacc1);
+            dacc1 = _mm256_fmadd_pd(d5, d5, dacc1);
+            dacc1 = _mm256_fmadd_pd(d6, d6, dacc1);
+            dacc1 = _mm256_fmadd_pd(d7, d7, dacc1);
+            dacc2 = _mm256_fmadd_pd(d8, d8, dacc2);
+            dacc2 = _mm256_fmadd_pd(d9, d9, dacc2);
+            dacc2 = _mm256_fmadd_pd(d10, d10, dacc2);
+            dacc2 = _mm256_fmadd_pd(d11, d11, dacc2);
+            dacc3 = _mm256_fmadd_pd(d12, d12, dacc3);
+            dacc3 = _mm256_fmadd_pd(d13, d13, dacc3);
+            dacc3 = _mm256_fmadd_pd(d14, d14, dacc3);
+            dacc3 = _mm256_fmadd_pd(d15, d15, dacc3);
+        }
+
+        // Horizontal reduction
+        __m128d h0 = _mm256_castpd256_pd128(dacc0);
+        __m128d h1 = _mm256_extractf128_pd(dacc0, 1);
+        __m128d h2 = _mm256_castpd256_pd128(dacc1);
+        __m128d h3 = _mm256_extractf128_pd(dacc1, 1);
+        __m128d h4 = _mm256_castpd256_pd128(dacc2);
+        __m128d h5 = _mm256_extractf128_pd(dacc2, 1);
+        __m128d h6 = _mm256_castpd256_pd128(dacc3);
+        __m128d h7 = _mm256_extractf128_pd(dacc3, 1);
+
+        __m128d sum01 = _mm_add_pd(h0, h1);
+        __m128d sum23 = _mm_add_pd(h2, h3);
+        __m128d sum45 = _mm_add_pd(h4, h5);
+        __m128d sum67 = _mm_add_pd(h6, h7);
+
+        __m128d sum0123 = _mm_add_pd(sum01, sum23);
+        __m128d sum4567 = _mm_add_pd(sum45, sum67);
+        __m128d sum_all = _mm_add_pd(sum0123, sum4567);
+
+        __m128d shuf = _mm_shuffle_pd(sum_all, sum_all, 1);
+        sum_all = _mm_add_pd(sum_all, shuf);
+
+        double partial[2];
+        _mm_storeu_pd(partial, sum_all);
+        sum_sq = partial[0];
+
+        // Tail: 8-element blocks
+        for (; c + 8 <= cols; c += 8)
+        {
+            __m256 v = _mm256_loadu_ps(src + c);
+            __m128 lo = _mm256_castps256_ps128(v);
+            __m128 hi = _mm256_extractf128_ps(v, 1);
+
+            __m256d d0 = _mm256_cvtps_pd(lo);
+            __m256d d1 = _mm256_cvtps_pd(hi);
+
+            __m256d sq0 = _mm256_mul_pd(d0, d0);
+            __m256d sq1 = _mm256_mul_pd(d1, d1);
+
+            __m128d h0_t = _mm256_castpd256_pd128(sq0);
+            __m128d h1_t = _mm256_extractf128_pd(sq0, 1);
+            __m128d h2_t = _mm256_castpd256_pd128(sq1);
+            __m128d h3_t = _mm256_extractf128_pd(sq1, 1);
+
+            __m128d sum_t = _mm_add_pd(_mm_add_pd(h0_t, h1_t), _mm_add_pd(h2_t, h3_t));
+            __m128d shuf_t = _mm_shuffle_pd(sum_t, sum_t, 1);
+            sum_t = _mm_add_pd(sum_t, shuf_t);
+
+            double tail_partial[2];
+            _mm_storeu_pd(tail_partial, sum_t);
+            sum_sq += tail_partial[0];
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            double val = static_cast<double>(src[c]);
+            sum_sq += val * val;
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m256 inv_rms_vec = _mm256_set1_ps(inv_rms);
+
+        // Phase 3: Apply normalization with AVX2
+        c = 0;
+        for (; c + 8 <= cols; c += 8)
+        {
+            __m256 src_vec = _mm256_loadu_ps(src + c);
+            __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
+            __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(src_vec, inv_rms_vec), gamma_vec);
+            _mm256_storeu_ps(dst + c, normalized);
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            dst[c] = src[c] * inv_rms * gamma[c];
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    void rmsnorm_fused_row_avx512(
+        const float *src,
+        const float *gamma,
+        float *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares with AVX512
+        double sum_sq = 0.0;
+        std::size_t c = 0;
+
+        // Multi-accumulator AVX512: process 64 elements per iteration
+        __m512d dacc0 = _mm512_setzero_pd();
+        __m512d dacc1 = _mm512_setzero_pd();
+        __m512d dacc2 = _mm512_setzero_pd();
+        __m512d dacc3 = _mm512_setzero_pd();
+
+        for (; c + 64 <= cols; c += 64)
+        {
+            const float *base = src + c;
+
+            // Load 4x 16-float blocks
+            __m512 v0 = _mm512_loadu_ps(base + 0);
+            __m512 v1 = _mm512_loadu_ps(base + 16);
+            __m512 v2 = _mm512_loadu_ps(base + 32);
+            __m512 v3 = _mm512_loadu_ps(base + 48);
+
+            // Convert to double (split each 16-float into 2x 8-double)
+            __m256 lo0 = _mm512_castps512_ps256(v0);
+            __m256 hi0 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(v0), 1));
+            __m256 lo1 = _mm512_castps512_ps256(v1);
+            __m256 hi1 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(v1), 1));
+            __m256 lo2 = _mm512_castps512_ps256(v2);
+            __m256 hi2 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(v2), 1));
+            __m256 lo3 = _mm512_castps512_ps256(v3);
+            __m256 hi3 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(v3), 1));
+
+            __m512d d0a = _mm512_cvtps_pd(lo0);
+            __m512d d0b = _mm512_cvtps_pd(hi0);
+            __m512d d1a = _mm512_cvtps_pd(lo1);
+            __m512d d1b = _mm512_cvtps_pd(hi1);
+            __m512d d2a = _mm512_cvtps_pd(lo2);
+            __m512d d2b = _mm512_cvtps_pd(hi2);
+            __m512d d3a = _mm512_cvtps_pd(lo3);
+            __m512d d3b = _mm512_cvtps_pd(hi3);
+
+            // FMA: acc += d * d
+            dacc0 = _mm512_fmadd_pd(d0a, d0a, dacc0);
+            dacc0 = _mm512_fmadd_pd(d0b, d0b, dacc0);
+            dacc1 = _mm512_fmadd_pd(d1a, d1a, dacc1);
+            dacc1 = _mm512_fmadd_pd(d1b, d1b, dacc1);
+            dacc2 = _mm512_fmadd_pd(d2a, d2a, dacc2);
+            dacc2 = _mm512_fmadd_pd(d2b, d2b, dacc2);
+            dacc3 = _mm512_fmadd_pd(d3a, d3a, dacc3);
+            dacc3 = _mm512_fmadd_pd(d3b, d3b, dacc3);
+        }
+
+        // Horizontal reduction
+        sum_sq += _mm512_reduce_add_pd(dacc0);
+        sum_sq += _mm512_reduce_add_pd(dacc1);
+        sum_sq += _mm512_reduce_add_pd(dacc2);
+        sum_sq += _mm512_reduce_add_pd(dacc3);
+
+        // Tail: 16-float blocks
+        for (; c + 16 <= cols; c += 16)
+        {
+            __m512 v = _mm512_loadu_ps(src + c);
+            __m256 vlo = _mm512_castps512_ps256(v);
+            __m256 vhi = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(v), 1));
+
+            __m512d d0 = _mm512_cvtps_pd(vlo);
+            __m512d d1 = _mm512_cvtps_pd(vhi);
+
+            __m512d sq0 = _mm512_mul_pd(d0, d0);
+            __m512d sq1 = _mm512_mul_pd(d1, d1);
+
+            sum_sq += _mm512_reduce_add_pd(sq0);
+            sum_sq += _mm512_reduce_add_pd(sq1);
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            double val = static_cast<double>(src[c]);
+            sum_sq += val * val;
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
+
+        // Phase 3: Apply normalization with AVX512
+        c = 0;
+        for (; c + 16 <= cols; c += 16)
+        {
+            __m512 src_vec = _mm512_loadu_ps(src + c);
+            __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+            __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(src_vec, inv_rms_vec), gamma_vec);
+            _mm512_storeu_ps(dst + c, normalized);
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            dst[c] = src[c] * inv_rms * gamma[c];
+        }
+    }
+#endif
+
+    // ========================================================================
+    // BF16 RMSNorm Implementation (Scalar/AVX2/AVX512)
+    // ========================================================================
+
+    // ========== BF16 Conversion Helpers ==========
+
+    /// Convert BF16 to FP32 (scalar)
+    __attribute__((always_inline)) static inline float bf16_to_fp32_scalar(uint16_t bf16_val)
+    {
+        uint32_t fp32_bits = static_cast<uint32_t>(bf16_val) << 16;
+        float result;
+        std::memcpy(&result, &fp32_bits, sizeof(float));
+        return result;
+    }
+
+    /// Convert FP32 to BF16 (scalar, round-to-nearest-even)
+    __attribute__((always_inline)) static inline uint16_t fp32_to_bf16_scalar(float fp32_val)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &fp32_val, sizeof(float));
+        uint32_t rounding_bias = 0x7FFF + ((bits >> 16) & 1);
+        uint32_t rounded = bits + rounding_bias;
+        return static_cast<uint16_t>(rounded >> 16);
+    }
+
+#if defined(__AVX512F__)
+    /// Convert 16 BF16 values to FP32 using AVX512
+    __attribute__((always_inline)) inline __m512 bf16_to_fp32_avx512(const uint16_t *bf16_ptr)
+    {
+        // Load 16 BF16 values (256 bits = 32 bytes)
+        __m256i bf16_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(bf16_ptr));
+
+        // Expand BF16 to FP32 by shifting left 16 bits
+        // BF16 has no mantissa in lower 16 bits, just shift
+        __m512i fp32_int = _mm512_cvtepu16_epi32(bf16_vec);
+        __m512i shifted = _mm512_slli_epi32(fp32_int, 16);
+
+        return _mm512_castsi512_ps(shifted);
+    }
+
+    /// Convert 16 FP32 values to BF16 using AVX512 (round-to-nearest-even)
+    __attribute__((always_inline)) inline void fp32_to_bf16_avx512(__m512 fp32_vec, uint16_t *bf16_ptr)
+    {
+        __m512i fp32_int = _mm512_castps_si512(fp32_vec);
+
+        // Round-to-nearest-even: bias = 0x7FFF + (bit16 & 1)
+        __m512i bits = fp32_int;
+        __m512i bit16 = _mm512_srli_epi32(bits, 16);
+        __m512i lsb = _mm512_and_si512(bit16, _mm512_set1_epi32(1));
+        __m512i bias_base = _mm512_set1_epi32(0x7FFF);
+        __m512i bias = _mm512_add_epi32(bias_base, lsb);
+        __m512i rounded = _mm512_add_epi32(bits, bias);
+        __m512i bf16_32 = _mm512_srli_epi32(rounded, 16);
+
+        // Pack to 16-bit (truncate)
+        __m256i bf16_vec = _mm512_cvtepi32_epi16(bf16_32);
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(bf16_ptr), bf16_vec);
+    }
+
+    // Exposed per-row BF16 AVX512 primitive (in same block as helpers for visibility)
+    void rmsnorm_fused_row_bf16_avx512(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares with AVX512
+        double sum_sq = 0.0;
+        std::size_t c = 0;
+
+        // Multi-accumulator for better ILP
+        __m512d acc0 = _mm512_setzero_pd();
+        __m512d acc1 = _mm512_setzero_pd();
+
+        for (; c + 32 <= cols; c += 32)
+        {
+            // Process 32 BF16 values per iteration
+            __m512 fp32_0 = bf16_to_fp32_avx512(src + c);
+            __m512 fp32_1 = bf16_to_fp32_avx512(src + c + 16);
+
+            // Convert to double and accumulate squares
+            __m256 lo0 = _mm512_castps512_ps256(fp32_0);
+            __m256 hi0 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(fp32_0), 1));
+            __m256 lo1 = _mm512_castps512_ps256(fp32_1);
+            __m256 hi1 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(fp32_1), 1));
+
+            __m512d d0 = _mm512_cvtps_pd(lo0);
+            __m512d d1 = _mm512_cvtps_pd(hi0);
+            __m512d d2 = _mm512_cvtps_pd(lo1);
+            __m512d d3 = _mm512_cvtps_pd(hi1);
+
+            acc0 = _mm512_fmadd_pd(d0, d0, acc0);
+            acc0 = _mm512_fmadd_pd(d1, d1, acc0);
+            acc1 = _mm512_fmadd_pd(d2, d2, acc1);
+            acc1 = _mm512_fmadd_pd(d3, d3, acc1);
+        }
+
+        sum_sq += _mm512_reduce_add_pd(acc0);
+        sum_sq += _mm512_reduce_add_pd(acc1);
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src[c]);
+            sum_sq += static_cast<double>(val) * static_cast<double>(val);
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
+
+        // Phase 3: Normalize and convert back with AVX512
+        c = 0;
+        for (; c + 16 <= cols; c += 16)
+        {
+            __m512 fp32_vals = bf16_to_fp32_avx512(src + c);
+            __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+            __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
+            fp32_to_bf16_avx512(normalized, dst + c);
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst[c] = fp32_to_bf16_scalar(normalized);
+        }
+    }
+#endif // __AVX512F__
+
+#if defined(__AVX2__)
+    /// Convert 8 BF16 values to FP32 using AVX2
+    __attribute__((always_inline)) inline __m256 bf16_to_fp32_avx2(const uint16_t *bf16_ptr)
+    {
+        // Load 8 BF16 values (128 bits)
+        __m128i bf16_vec = _mm_loadu_si128(reinterpret_cast<const __m128i *>(bf16_ptr));
+
+        // Expand BF16 to FP32
+        __m256i fp32_int = _mm256_cvtepu16_epi32(bf16_vec);
+        __m256i shifted = _mm256_slli_epi32(fp32_int, 16);
+
+        return _mm256_castsi256_ps(shifted);
+    }
+
+    /// Convert 8 FP32 values to BF16 using AVX2 (round-to-nearest-even)
+    __attribute__((always_inline)) inline void fp32_to_bf16_avx2(__m256 fp32_vec, uint16_t *bf16_ptr)
+    {
+        __m256i fp32_int = _mm256_castps_si256(fp32_vec);
+
+        // Round-to-nearest-even
+        __m256i bit16 = _mm256_srli_epi32(fp32_int, 16);
+        __m256i lsb = _mm256_and_si256(bit16, _mm256_set1_epi32(1));
+        __m256i bias = _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb);
+        __m256i rounded = _mm256_add_epi32(fp32_int, bias);
+        __m256i bf16_32 = _mm256_srli_epi32(rounded, 16);
+
+        // Pack to 16-bit
+        __m256i permuted = _mm256_shuffle_epi8(bf16_32,
+                                               _mm256_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1,
+                                                                0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1));
+        __m128i lo = _mm256_castsi256_si128(permuted);
+        __m128i hi = _mm256_extracti128_si256(permuted, 1);
+        __m128i packed = _mm_unpacklo_epi64(lo, hi);
+
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(bf16_ptr), packed);
+    }
+
+    // Exposed per-row BF16 AVX2 primitive (in same block as helpers for visibility)
+    void rmsnorm_fused_row_bf16_avx2(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares with AVX2
+        float sum_sq_f = 0.0f;
+        std::size_t c = 0;
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        for (; c + 16 <= cols; c += 16)
+        {
+            __m256 fp32_0 = bf16_to_fp32_avx2(src + c);
+            __m256 fp32_1 = bf16_to_fp32_avx2(src + c + 8);
+
+            acc0 = _mm256_fmadd_ps(fp32_0, fp32_0, acc0);
+            acc1 = _mm256_fmadd_ps(fp32_1, fp32_1, acc1);
+        }
+
+        // Horizontal reduction
+        __m256 acc_combined = _mm256_add_ps(acc0, acc1);
+        __m128 lo = _mm256_castps256_ps128(acc_combined);
+        __m128 hi = _mm256_extractf128_ps(acc_combined, 1);
+        __m128 sum4 = _mm_add_ps(lo, hi);
+        __m128 shuf = _mm_movehdup_ps(sum4);
+        __m128 sums = _mm_add_ps(sum4, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        _mm_store_ss(&sum_sq_f, sums);
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src[c]);
+            sum_sq_f += val * val;
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(sum_sq_f / cols + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m256 inv_rms_vec = _mm256_set1_ps(inv_rms);
+
+        // Phase 3: Normalize and convert back
+        c = 0;
+        for (; c + 8 <= cols; c += 8)
+        {
+            __m256 fp32_vals = bf16_to_fp32_avx2(src + c);
+            __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
+            __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
+            fp32_to_bf16_avx2(normalized, dst + c);
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst[c] = fp32_to_bf16_scalar(normalized);
+        }
+    }
+#endif
+
+    // ========== BF16 RMSNorm Kernels ==========
+
+    /// BF16 RMSNorm row kernel - Scalar path
+    __attribute__((always_inline)) inline void bf16_rmsnorm_row_scalar(
+        const uint16_t *src_row,
+        const float *gamma,
+        uint16_t *dst_row,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares
+        double sum_sq = 0.0;
+        for (std::size_t c = 0; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src_row[c]);
+            sum_sq += static_cast<double>(val) * static_cast<double>(val);
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+
+        // Phase 3: Normalize and convert back
+        for (std::size_t c = 0; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src_row[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst_row[c] = fp32_to_bf16_scalar(normalized);
+        }
+    }
+
+#if defined(__AVX512F__)
+    /// BF16 RMSNorm row kernel - AVX512 path
+    __attribute__((always_inline)) inline void bf16_rmsnorm_row_avx512(
+        const uint16_t *src_row,
+        const float *gamma,
+        uint16_t *dst_row,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares with AVX512
+        double sum_sq = 0.0;
+        std::size_t c = 0;
+
+        // Multi-accumulator for better ILP
+        __m512d acc0 = _mm512_setzero_pd();
+        __m512d acc1 = _mm512_setzero_pd();
+
+        for (; c + 32 <= cols; c += 32)
+        {
+            // Process 32 BF16 values per iteration
+            __m512 fp32_0 = bf16_to_fp32_avx512(src_row + c);
+            __m512 fp32_1 = bf16_to_fp32_avx512(src_row + c + 16);
+
+            // Convert to double and accumulate squares
+            __m256 lo0 = _mm512_castps512_ps256(fp32_0);
+            __m256 hi0 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(fp32_0), 1));
+            __m256 lo1 = _mm512_castps512_ps256(fp32_1);
+            __m256 hi1 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(fp32_1), 1));
+
+            __m512d d0 = _mm512_cvtps_pd(lo0);
+            __m512d d1 = _mm512_cvtps_pd(hi0);
+            __m512d d2 = _mm512_cvtps_pd(lo1);
+            __m512d d3 = _mm512_cvtps_pd(hi1);
+
+            acc0 = _mm512_fmadd_pd(d0, d0, acc0);
+            acc0 = _mm512_fmadd_pd(d1, d1, acc0);
+            acc1 = _mm512_fmadd_pd(d2, d2, acc1);
+            acc1 = _mm512_fmadd_pd(d3, d3, acc1);
+        }
+
+        sum_sq += _mm512_reduce_add_pd(acc0);
+        sum_sq += _mm512_reduce_add_pd(acc1);
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src_row[c]);
+            sum_sq += static_cast<double>(val) * static_cast<double>(val);
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
+
+        // Phase 3: Normalize and convert back with AVX512
+        c = 0;
+        for (; c + 16 <= cols; c += 16)
+        {
+            __m512 fp32_vals = bf16_to_fp32_avx512(src_row + c);
+            __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+            __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
+            fp32_to_bf16_avx512(normalized, dst_row + c);
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src_row[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst_row[c] = fp32_to_bf16_scalar(normalized);
+        }
+    }
+#elif defined(__AVX2__)
+    /// BF16 RMSNorm row kernel - AVX2 path
+    __attribute__((always_inline)) inline void bf16_rmsnorm_row_avx2(
+        const uint16_t *src_row,
+        const float *gamma,
+        uint16_t *dst_row,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares with AVX2
+        float sum_sq_f = 0.0f;
+        std::size_t c = 0;
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        for (; c + 16 <= cols; c += 16)
+        {
+            __m256 fp32_0 = bf16_to_fp32_avx2(src_row + c);
+            __m256 fp32_1 = bf16_to_fp32_avx2(src_row + c + 8);
+
+            acc0 = _mm256_fmadd_ps(fp32_0, fp32_0, acc0);
+            acc1 = _mm256_fmadd_ps(fp32_1, fp32_1, acc1);
+        }
+
+        // Horizontal reduction
+        __m256 acc_combined = _mm256_add_ps(acc0, acc1);
+        __m128 lo = _mm256_castps256_ps128(acc_combined);
+        __m128 hi = _mm256_extractf128_ps(acc_combined, 1);
+        __m128 sum4 = _mm_add_ps(lo, hi);
+        __m128 shuf = _mm_movehdup_ps(sum4);
+        __m128 sums = _mm_add_ps(sum4, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        _mm_store_ss(&sum_sq_f, sums);
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src_row[c]);
+            sum_sq_f += val * val;
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(sum_sq_f / cols + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m256 inv_rms_vec = _mm256_set1_ps(inv_rms);
+
+        // Phase 3: Normalize and convert back
+        c = 0;
+        for (; c + 8 <= cols; c += 8)
+        {
+            __m256 fp32_vals = bf16_to_fp32_avx2(src_row + c);
+            __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
+            __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
+            fp32_to_bf16_avx2(normalized, dst_row + c);
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src_row[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst_row[c] = fp32_to_bf16_scalar(normalized);
+        }
+    }
+#endif
+
+    // ========== BF16 Per-Row Primitives (Exposed for Testing) ==========
+
+    void rmsnorm_fused_row_bf16_scalar(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares
+        double sum_sq = 0.0;
+        for (std::size_t c = 0; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src[c]);
+            sum_sq += static_cast<double>(val) * static_cast<double>(val);
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+
+        // Phase 3: Normalize and convert back
+        for (std::size_t c = 0; c < cols; ++c)
+        {
+            float val = bf16_to_fp32_scalar(src[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst[c] = fp32_to_bf16_scalar(normalized);
+        }
+    }
+
+    void rmsnorm_fused_bf16_vectorized(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t rows,
+        std::size_t cols,
+        float epsilon,
+        const RMSNormExecOptions &opts)
+    {
+        const bool parallel = want_parallel(rows, cols, opts);
+
+#pragma omp parallel for if (parallel) schedule(static)
+        for (std::size_t r = 0; r < rows; ++r)
+        {
+            const uint16_t *src_row = src + r * cols;
+            uint16_t *dst_row = dst + r * cols;
+
+#if defined(__AVX512F__)
+            bf16_rmsnorm_row_avx512(src_row, gamma, dst_row, cols, epsilon);
+#elif defined(__AVX2__)
+            bf16_rmsnorm_row_avx2(src_row, gamma, dst_row, cols, epsilon);
+#else
+            bf16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+#endif
+        }
+    }
+
+    // ========================================================================
+    // FP16 RMSNorm Implementation (Scalar/AVX2/AVX512)
+    // ========================================================================
+
+    namespace
+    {
+        // ========== FP16 Conversion Helpers ==========
+
+        /// Convert FP16 to FP32 (scalar, IEEE 754 compliant)
+        __attribute__((always_inline)) inline float fp16_to_fp32_scalar(uint16_t h)
+        {
+            uint32_t sign = (h & 0x8000U) << 16;
+            uint32_t exp = (h & 0x7C00U) >> 10;
+            uint32_t mantissa = h & 0x03FFU;
+
+            uint32_t fp32_bits;
+            if (exp == 0)
+            {
+                if (mantissa == 0)
+                {
+                    fp32_bits = sign; // Zero
+                }
+                else
+                {
+                    // Denormal: normalize
+                    exp = 1;
+                    while ((mantissa & 0x0400U) == 0)
+                    {
+                        mantissa <<= 1;
+                        exp--;
+                    }
+                    mantissa &= 0x03FFU;
+                    fp32_bits = sign | ((exp + (127 - 15)) << 23) | (mantissa << 13);
+                }
+            }
+            else if (exp == 0x1F)
+            {
+                // Inf or NaN
+                fp32_bits = sign | 0x7F800000U | (mantissa << 13);
+            }
+            else
+            {
+                // Normalized
+                fp32_bits = sign | ((exp + (127 - 15)) << 23) | (mantissa << 13);
+            }
+
+            float result;
+            std::memcpy(&result, &fp32_bits, sizeof(float));
+            return result;
+        }
+
+        /// Convert FP32 to FP16 (scalar, IEEE 754 compliant with rounding)
+        __attribute__((always_inline)) inline uint16_t fp32_to_fp16_scalar(float f)
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &f, sizeof(float));
+
+            uint32_t sign = (bits >> 16) & 0x8000U;
+            int32_t exp = ((bits >> 23) & 0xFFU) - 127 + 15;
+            uint32_t mantissa = (bits >> 13) & 0x03FFU;
+
+            if (exp <= 0)
+            {
+                if (exp < -10)
+                {
+                    return sign; // Underflow to zero
+                }
+                // Denormal
+                mantissa |= 0x0400U;
+                mantissa >>= (1 - exp);
+                return sign | mantissa;
+            }
+            else if (exp >= 0x1F)
+            {
+                return sign | 0x7C00U; // Overflow to infinity
+            }
+            else
+            {
+                return sign | (exp << 10) | mantissa;
+            }
+        }
+
+#if defined(__AVX512F__) && defined(__AVX512FP16__)
+        /// Convert 16 FP16 values to FP32 using AVX512FP16 (hardware conversion)
+        __attribute__((always_inline)) inline __m512 fp16_to_fp32_avx512fp16(const uint16_t *fp16_ptr)
+        {
+            __m256h fp16_vec = _mm256_loadu_ph(reinterpret_cast<const void *>(fp16_ptr));
+            return _mm512_cvtph_ps(fp16_vec);
+        }
+
+        /// Convert 16 FP32 values to FP16 using AVX512FP16 (hardware conversion)
+        __attribute__((always_inline)) inline void fp32_to_fp16_avx512fp16(__m512 fp32_vec, uint16_t *fp16_ptr)
+        {
+            __m256h fp16_vec = _mm512_cvtps_ph(fp32_vec, _MM_FROUND_TO_NEAREST_INT);
+            _mm256_storeu_ph(reinterpret_cast<void *>(fp16_ptr), fp16_vec);
+        }
+#elif defined(__AVX512F__)
+        /// Convert 16 FP16 values to FP32 using AVX512F (no FP16 hardware)
+        __attribute__((always_inline)) inline __m512 fp16_to_fp32_avx512(const uint16_t *fp16_ptr)
+        {
+            // Load 16 FP16 values
+            __m256i fp16_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(fp16_ptr));
+
+            // Use _mm512_cvtph_ps for conversion (available in AVX512F)
+            return _mm512_cvtph_ps(fp16_vec);
+        }
+
+        /// Convert 16 FP32 values to FP16 using AVX512F
+        __attribute__((always_inline)) inline void fp32_to_fp16_avx512(__m512 fp32_vec, uint16_t *fp16_ptr)
+        {
+            __m256i fp16_vec = _mm512_cvtps_ph(fp32_vec, _MM_FROUND_TO_NEAREST_INT);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(fp16_ptr), fp16_vec);
+        }
+#endif
+
+#if defined(__AVX2__) && defined(__F16C__)
+        /// Convert 8 FP16 values to FP32 using F16C
+        __attribute__((always_inline)) inline __m256 fp16_to_fp32_avx2(const uint16_t *fp16_ptr)
+        {
+            __m128i fp16_vec = _mm_loadu_si128(reinterpret_cast<const __m128i *>(fp16_ptr));
+            return _mm256_cvtph_ps(fp16_vec);
+        }
+
+        /// Convert 8 FP32 values to FP16 using F16C
+        __attribute__((always_inline)) inline void fp32_to_fp16_avx2(__m256 fp32_vec, uint16_t *fp16_ptr)
+        {
+            __m128i fp16_vec = _mm256_cvtps_ph(fp32_vec, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(fp16_ptr), fp16_vec);
+        }
+#endif
+
+        // ========== FP16 RMSNorm Kernels ==========
+
+        /// FP16 RMSNorm row kernel - Scalar path
+        __attribute__((always_inline)) inline void fp16_rmsnorm_row_scalar(
+            const uint16_t *src_row,
+            const float *gamma,
+            uint16_t *dst_row,
+            std::size_t cols,
+            float epsilon)
+        {
+            // Phase 1: Compute sum of squares
+            double sum_sq = 0.0;
+            for (std::size_t c = 0; c < cols; ++c)
+            {
+                float val = fp16_to_fp32_scalar(src_row[c]);
+                sum_sq += static_cast<double>(val) * static_cast<double>(val);
+            }
+
+            // Phase 2: Compute inverse RMS
+            float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+            float inv_rms = 1.0f / rms;
+
+            // Phase 3: Normalize and convert back
+            for (std::size_t c = 0; c < cols; ++c)
+            {
+                float val = fp16_to_fp32_scalar(src_row[c]);
+                float normalized = val * inv_rms * gamma[c];
+                dst_row[c] = fp32_to_fp16_scalar(normalized);
+            }
+        }
+
+#if defined(__AVX512F__)
+        /// FP16 RMSNorm row kernel - AVX512 path
+        __attribute__((always_inline)) inline void fp16_rmsnorm_row_avx512(
+            const uint16_t *src_row,
+            const float *gamma,
+            uint16_t *dst_row,
+            std::size_t cols,
+            float epsilon)
+        {
+            // Phase 1: Compute sum of squares with AVX512
+            double sum_sq = 0.0;
+            std::size_t c = 0;
+
+            __m512d acc0 = _mm512_setzero_pd();
+            __m512d acc1 = _mm512_setzero_pd();
+
+            for (; c + 32 <= cols; c += 32)
+            {
+                // Convert FP16 to FP32
+#if defined(__AVX512FP16__)
+                __m512 fp32_0 = fp16_to_fp32_avx512fp16(src_row + c);
+                __m512 fp32_1 = fp16_to_fp32_avx512fp16(src_row + c + 16);
+#else
+                __m512 fp32_0 = fp16_to_fp32_avx512(src_row + c);
+                __m512 fp32_1 = fp16_to_fp32_avx512(src_row + c + 16);
+#endif
+
+                // Convert to double and accumulate squares
+                __m256 lo0 = _mm512_castps512_ps256(fp32_0);
+                __m256 hi0 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(fp32_0), 1));
+                __m256 lo1 = _mm512_castps512_ps256(fp32_1);
+                __m256 hi1 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(fp32_1), 1));
+
+                __m512d d0 = _mm512_cvtps_pd(lo0);
+                __m512d d1 = _mm512_cvtps_pd(hi0);
+                __m512d d2 = _mm512_cvtps_pd(lo1);
+                __m512d d3 = _mm512_cvtps_pd(hi1);
+
+                acc0 = _mm512_fmadd_pd(d0, d0, acc0);
+                acc0 = _mm512_fmadd_pd(d1, d1, acc0);
+                acc1 = _mm512_fmadd_pd(d2, d2, acc1);
+                acc1 = _mm512_fmadd_pd(d3, d3, acc1);
+            }
+
+            sum_sq += _mm512_reduce_add_pd(acc0);
+            sum_sq += _mm512_reduce_add_pd(acc1);
+
+            // Scalar tail
+            for (; c < cols; ++c)
+            {
+                float val = fp16_to_fp32_scalar(src_row[c]);
+                sum_sq += static_cast<double>(val) * static_cast<double>(val);
+            }
+
+            // Phase 2: Compute inverse RMS
+            float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+            float inv_rms = 1.0f / rms;
+            __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
+
+            // Phase 3: Normalize and convert back
+            c = 0;
+            for (; c + 16 <= cols; c += 16)
+            {
+#if defined(__AVX512FP16__)
+                __m512 fp32_vals = fp16_to_fp32_avx512fp16(src_row + c);
+#else
+                __m512 fp32_vals = fp16_to_fp32_avx512(src_row + c);
+#endif
+                __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+                __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
+
+#if defined(__AVX512FP16__)
+                fp32_to_fp16_avx512fp16(normalized, dst_row + c);
+#else
+                fp32_to_fp16_avx512(normalized, dst_row + c);
+#endif
+            }
+
+            // Scalar tail
+            for (; c < cols; ++c)
+            {
+                float val = fp16_to_fp32_scalar(src_row[c]);
+                float normalized = val * inv_rms * gamma[c];
+                dst_row[c] = fp32_to_fp16_scalar(normalized);
+            }
+        }
+#elif defined(__AVX2__) && defined(__F16C__)
+        /// FP16 RMSNorm row kernel - AVX2+F16C path
+        __attribute__((always_inline)) inline void fp16_rmsnorm_row_avx2(
+            const uint16_t *src_row,
+            const float *gamma,
+            uint16_t *dst_row,
+            std::size_t cols,
+            float epsilon)
+        {
+            // Phase 1: Compute sum of squares with AVX2
+            float sum_sq_f = 0.0f;
+            std::size_t c = 0;
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+
+            for (; c + 16 <= cols; c += 16)
+            {
+                __m256 fp32_0 = fp16_to_fp32_avx2(src_row + c);
+                __m256 fp32_1 = fp16_to_fp32_avx2(src_row + c + 8);
+
+                acc0 = _mm256_fmadd_ps(fp32_0, fp32_0, acc0);
+                acc1 = _mm256_fmadd_ps(fp32_1, fp32_1, acc1);
+            }
+
+            // Horizontal reduction
+            __m256 acc_combined = _mm256_add_ps(acc0, acc1);
+            __m128 lo = _mm256_castps256_ps128(acc_combined);
+            __m128 hi = _mm256_extractf128_ps(acc_combined, 1);
+            __m128 sum4 = _mm_add_ps(lo, hi);
+            __m128 shuf = _mm_movehdup_ps(sum4);
+            __m128 sums = _mm_add_ps(sum4, shuf);
+            shuf = _mm_movehl_ps(shuf, sums);
+            sums = _mm_add_ss(sums, shuf);
+            _mm_store_ss(&sum_sq_f, sums);
+
+            // Scalar tail
+            for (; c < cols; ++c)
+            {
+                float val = fp16_to_fp32_scalar(src_row[c]);
+                sum_sq_f += val * val;
+            }
+
+            // Phase 2: Compute inverse RMS
+            float rms = std::sqrt(sum_sq_f / cols + epsilon);
+            float inv_rms = 1.0f / rms;
+            __m256 inv_rms_vec = _mm256_set1_ps(inv_rms);
+
+            // Phase 3: Normalize and convert back
+            c = 0;
+            for (; c + 8 <= cols; c += 8)
+            {
+                __m256 fp32_vals = fp16_to_fp32_avx2(src_row + c);
+                __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
+                __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
+                fp32_to_fp16_avx2(normalized, dst_row + c);
+            }
+
+            // Scalar tail
+            for (; c < cols; ++c)
+            {
+                float val = fp16_to_fp32_scalar(src_row[c]);
+                float normalized = val * inv_rms * gamma[c];
+                dst_row[c] = fp32_to_fp16_scalar(normalized);
+            }
+        }
+#endif
+    } // anonymous namespace
+
+    // ========== FP16 Per-Row Primitives (Exposed for Testing) ==========
+
+    void rmsnorm_fused_row_fp16_scalar(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares
+        double sum_sq = 0.0;
+        for (std::size_t c = 0; c < cols; ++c)
+        {
+            float val = fp16_to_fp32_scalar(src[c]);
+            sum_sq += static_cast<double>(val) * static_cast<double>(val);
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+
+        // Phase 3: Normalize and convert back
+        for (std::size_t c = 0; c < cols; ++c)
+        {
+            float val = fp16_to_fp32_scalar(src[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst[c] = fp32_to_fp16_scalar(normalized);
+        }
+    }
+
+#if defined(__AVX2__) && defined(__F16C__)
+    void rmsnorm_fused_row_fp16_avx2(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares with AVX2
+        float sum_sq_f = 0.0f;
+        std::size_t c = 0;
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        for (; c + 16 <= cols; c += 16)
+        {
+            __m256 fp32_0 = fp16_to_fp32_avx2(src + c);
+            __m256 fp32_1 = fp16_to_fp32_avx2(src + c + 8);
+
+            acc0 = _mm256_fmadd_ps(fp32_0, fp32_0, acc0);
+            acc1 = _mm256_fmadd_ps(fp32_1, fp32_1, acc1);
+        }
+
+        // Horizontal reduction
+        __m256 acc_combined = _mm256_add_ps(acc0, acc1);
+        __m128 lo = _mm256_castps256_ps128(acc_combined);
+        __m128 hi = _mm256_extractf128_ps(acc_combined, 1);
+        __m128 sum4 = _mm_add_ps(lo, hi);
+        __m128 shuf = _mm_movehdup_ps(sum4);
+        __m128 sums = _mm_add_ps(sum4, shuf);
+        shuf = _mm_movehl_ps(shuf, sums);
+        sums = _mm_add_ss(sums, shuf);
+        _mm_store_ss(&sum_sq_f, sums);
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = fp16_to_fp32_scalar(src[c]);
+            sum_sq_f += val * val;
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(sum_sq_f / cols + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m256 inv_rms_vec = _mm256_set1_ps(inv_rms);
+
+        // Phase 3: Normalize and convert back
+        c = 0;
+        for (; c + 8 <= cols; c += 8)
+        {
+            __m256 fp32_vals = fp16_to_fp32_avx2(src + c);
+            __m256 gamma_vec = _mm256_loadu_ps(gamma + c);
+            __m256 normalized = _mm256_mul_ps(_mm256_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
+            fp32_to_fp16_avx2(normalized, dst + c);
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = fp16_to_fp32_scalar(src[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst[c] = fp32_to_fp16_scalar(normalized);
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    void rmsnorm_fused_row_fp16_avx512(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        // Phase 1: Compute sum of squares with AVX512
+        double sum_sq = 0.0;
+        std::size_t c = 0;
+
+        __m512d acc0 = _mm512_setzero_pd();
+        __m512d acc1 = _mm512_setzero_pd();
+
+        for (; c + 32 <= cols; c += 32)
+        {
+            // Convert FP16 to FP32
+#if defined(__AVX512FP16__)
+            __m512 fp32_0 = fp16_to_fp32_avx512fp16(src + c);
+            __m512 fp32_1 = fp16_to_fp32_avx512fp16(src + c + 16);
+#else
+            __m512 fp32_0 = fp16_to_fp32_avx512(src + c);
+            __m512 fp32_1 = fp16_to_fp32_avx512(src + c + 16);
+#endif
+
+            // Convert to double and accumulate squares
+            __m256 lo0 = _mm512_castps512_ps256(fp32_0);
+            __m256 hi0 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(fp32_0), 1));
+            __m256 lo1 = _mm512_castps512_ps256(fp32_1);
+            __m256 hi1 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(fp32_1), 1));
+
+            __m512d d0 = _mm512_cvtps_pd(lo0);
+            __m512d d1 = _mm512_cvtps_pd(hi0);
+            __m512d d2 = _mm512_cvtps_pd(lo1);
+            __m512d d3 = _mm512_cvtps_pd(hi1);
+
+            acc0 = _mm512_fmadd_pd(d0, d0, acc0);
+            acc0 = _mm512_fmadd_pd(d1, d1, acc0);
+            acc1 = _mm512_fmadd_pd(d2, d2, acc1);
+            acc1 = _mm512_fmadd_pd(d3, d3, acc1);
+        }
+
+        sum_sq += _mm512_reduce_add_pd(acc0);
+        sum_sq += _mm512_reduce_add_pd(acc1);
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = fp16_to_fp32_scalar(src[c]);
+            sum_sq += static_cast<double>(val) * static_cast<double>(val);
+        }
+
+        // Phase 2: Compute inverse RMS
+        float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
+        float inv_rms = 1.0f / rms;
+        __m512 inv_rms_vec = _mm512_set1_ps(inv_rms);
+
+        // Phase 3: Normalize and convert back
+        c = 0;
+        for (; c + 16 <= cols; c += 16)
+        {
+#if defined(__AVX512FP16__)
+            __m512 fp32_vals = fp16_to_fp32_avx512fp16(src + c);
+#else
+            __m512 fp32_vals = fp16_to_fp32_avx512(src + c);
+#endif
+            __m512 gamma_vec = _mm512_loadu_ps(gamma + c);
+            __m512 normalized = _mm512_mul_ps(_mm512_mul_ps(fp32_vals, inv_rms_vec), gamma_vec);
+
+#if defined(__AVX512FP16__)
+            fp32_to_fp16_avx512fp16(normalized, dst + c);
+#else
+            fp32_to_fp16_avx512(normalized, dst + c);
+#endif
+        }
+
+        // Scalar tail
+        for (; c < cols; ++c)
+        {
+            float val = fp16_to_fp32_scalar(src[c]);
+            float normalized = val * inv_rms * gamma[c];
+            dst[c] = fp32_to_fp16_scalar(normalized);
+        }
+    }
+#endif
+
+    void rmsnorm_fused_fp16_vectorized(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t rows,
+        std::size_t cols,
+        float epsilon,
+        const RMSNormExecOptions &opts)
+    {
+        const bool parallel = want_parallel(rows, cols, opts);
+
+#pragma omp parallel for if (parallel) schedule(static)
+        for (std::size_t r = 0; r < rows; ++r)
+        {
+            const uint16_t *src_row = src + r * cols;
+            uint16_t *dst_row = dst + r * cols;
+
+#if defined(__AVX512F__)
+            fp16_rmsnorm_row_avx512(src_row, gamma, dst_row, cols, epsilon);
+#elif defined(__AVX2__) && defined(__F16C__)
+            fp16_rmsnorm_row_avx2(src_row, gamma, dst_row, cols, epsilon);
+#else
+            fp16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
+#endif
+        }
     }
 
 } // namespace llaminar2::primitives

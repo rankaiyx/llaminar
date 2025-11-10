@@ -64,7 +64,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdint>
-#include <stdexcept>
+#include <stdexpr>
 #include <algorithm>
 
 // V2 utilities (minimal portable implementations)
@@ -75,6 +75,7 @@
 #include "IQQuantTables.h"
 #include "../utils/DebugEnv.h"
 #include "SIMDHelpers.h"
+#include "AlignedVector.h"
 
 // Optional SIMD intrinsics (detected at runtime via CPUFeatures)
 #if defined(__AVX512F__)
@@ -407,8 +408,8 @@ namespace llaminar2
         ITensorGemm *createGemmRaw();
 
     private:
-        std::vector<size_t> shape_;     ///< Tensor dimensions (2D: [rows, cols])
-        std::vector<uint8_t> raw_data_; ///< Raw quantized data (IQ4_NL blocks)
+        std::vector<size_t> shape_;       ///< Tensor dimensions (2D: [rows, cols])
+        AlignedVector<uint8_t> raw_data_; ///< Raw quantized data (IQ4_NL blocks) - 64-byte aligned for SIMD
 
 #if defined(__AVX512F__)
         /**

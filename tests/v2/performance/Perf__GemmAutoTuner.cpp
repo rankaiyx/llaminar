@@ -15,7 +15,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/tensors/TensorKernels.h" // For IBlockDecoder interface
+#include "../../../src/v2/tensors/TensorKernels.h" // For ITensorGemmTileDataProvider interface
 #include "../../../src/v2/kernels/cpu/GemmAutoTuner.h"
 #include "../../../src/v2/kernels/cpu/GemmMicroKernelAdapter.h"
 #include "../../../src/v2/utils/DebugEnv.h"
@@ -33,9 +33,9 @@ namespace
     using namespace llaminar::v2::kernels;
 
     /**
-     * @brief Mock IBlockDecoder for testing
+     * @brief Mock ITensorGemmTileDataProvider for testing
      */
-    class MockDecoder : public IBlockDecoder
+    class MockDecoder : public ITensorGemmTileDataProvider
     {
     public:
         MockDecoder(size_t rows, size_t cols, size_t bs = 32)
@@ -99,7 +99,7 @@ namespace
         IQuantizedGemmVariant *variant,
         const float *A, float *C,
         int m, int n, int k,
-        const IBlockDecoder *decoder,
+        const ITensorGemmTileDataProvider *decoder,
         int warmup_iters = 3,
         int bench_iters = 10)
     {
@@ -140,7 +140,7 @@ namespace
      */
     std::vector<VariantPerformance> manualSweep(
         int m, int n, int k,
-        const IBlockDecoder *decoder,
+        const ITensorGemmTileDataProvider *decoder,
         int warmup_iters = 3,
         int bench_iters = 10)
     {
@@ -182,7 +182,7 @@ namespace
      */
     VariantPerformance autoTunedRun(
         int m, int n, int k,
-        const IBlockDecoder *decoder,
+        const ITensorGemmTileDataProvider *decoder,
         int warmup_iters = 3,
         int bench_iters = 10)
     {

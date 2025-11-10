@@ -6,7 +6,7 @@
 
 #include "Tensors.h"
 #include "Tensors.h"
-#include "../kernels/cpu/GemmAutoTuner.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/Logger.h"
 #include <cstring>
 #include <stdexcept>
@@ -185,35 +185,19 @@ namespace llaminar2
         throw std::runtime_error("Q8_0Tensor::mutable_data: quantized tensors are immutable");
     }
 
-    std::unique_ptr<ITensorRoPE> Q8_0Tensor::createRoPE()
-    {
-        throw std::runtime_error("Q8_0Tensor: RoPE not supported on quantized tensors");
-    }
+    
 
-    std::unique_ptr<ITensorSwiGLU> Q8_0Tensor::createSwiGLU()
-    {
-        throw std::runtime_error("Q8_0Tensor: SwiGLU not supported on quantized tensors");
-    }
+    
 
-    std::unique_ptr<ITensorSoftmax> Q8_0Tensor::createSoftmax()
-    {
-        throw std::runtime_error("Q8_0Tensor: Softmax not supported on quantized tensors");
-    }
+    
 
-    std::unique_ptr<ITensorRMSNorm> Q8_0Tensor::createRMSNorm()
-    {
-        throw std::runtime_error("Q8_0Tensor: RMSNorm not supported on quantized tensors");
-    }
+    
 
-    std::unique_ptr<ITensorAttention> Q8_0Tensor::createAttention()
-    {
-        LOG_ERROR("[Q8_0Tensor] createAttention not supported for quantized tensors");
-        return nullptr;
-    }
+    
 
     std::unique_ptr<ITensorGemm> Q8_0Tensor::createGemm()
     {
-        // Use generic QuantizedGemmKernel with IBlockDecoder interface
+        // Use generic QuantizedGemmKernel with ITensorGemmTileDataProvider interface
         return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 

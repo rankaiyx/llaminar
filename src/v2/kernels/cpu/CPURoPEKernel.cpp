@@ -7,6 +7,8 @@
 
 #include "CPURoPEKernel.h"
 #include "primitives/RoPEPrimitives.h"
+#include "../../tensors/SIMDHelpers.h"
+#include "../../tensors/FP16Utils.h"
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -71,6 +73,74 @@ namespace llaminar2
             q_heads, k_heads,
             n_past, freq_base,
             (seq_len == 1) ? &tls_state_ : nullptr);
+    }
+
+    bool CPURoPEKernel::apply_bf16(
+        uint16_t *Q_bf16, uint16_t *K_bf16,
+        const int *position_ids,
+        int seq_len, int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        if (device_idx != -1)
+        {
+            return false; // CPU kernel only
+        }
+
+        if (head_dim % 2 != 0)
+        {
+            return false; // head_dim must be even
+        }
+
+        if (seq_len <= 0)
+        {
+            return true; // Nothing to do
+        }
+
+        // Use native BF16 primitives
+        int n_past = position_ids ? position_ids[0] : 0;
+        primitives::apply_rope_bf16(
+            Q_bf16, K_bf16,
+            seq_len, head_dim,
+            n_heads, n_kv_heads,
+            n_past, rope_theta,
+            (seq_len == 1) ? &tls_state_ : nullptr);
+
+        return true;
+    }
+
+    bool CPURoPEKernel::apply_fp16(
+        uint16_t *Q_fp16, uint16_t *K_fp16,
+        const int *position_ids,
+        int seq_len, int n_heads, int n_kv_heads, int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        if (device_idx != -1)
+        {
+            return false; // CPU kernel only
+        }
+
+        if (head_dim % 2 != 0)
+        {
+            return false; // head_dim must be even
+        }
+
+        if (seq_len <= 0)
+        {
+            return true; // Nothing to do
+        }
+
+        // Use native FP16 primitives
+        int n_past = position_ids ? position_ids[0] : 0;
+        primitives::apply_rope_fp16(
+            Q_fp16, K_fp16,
+            seq_len, head_dim,
+            n_heads, n_kv_heads,
+            n_past, rope_theta,
+            (seq_len == 1) ? &tls_state_ : nullptr);
+
+        return true;
     }
 
 } // namespace llaminar2

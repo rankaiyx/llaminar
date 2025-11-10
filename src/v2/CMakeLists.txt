@@ -270,7 +270,7 @@ endif()
 # OneDNN Configuration for INT8/BF16 GEMM Acceleration
 # =============================================================================
 # OneDNN provides optimized matmul primitives for:
-#   - INT8: s8s8s32 with post-ops (used by INT8GemmKernel)
+#   - INT8: s8s8s32 with post-ops (used by INT8PackedGemm)
 #   - BF16: bf16bf16f32 (used by BF16GemmKernel, replaces MKL)
 #   - FP32: Baseline handled by OpenBLAS
 if(USE_ONEDNN)
@@ -402,8 +402,8 @@ message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
 message(STATUS "V2: BLAS backend: OpenBLAS (FP32 only)")
 
 # Define GEMM script path for microkernel generation
-set(GENERATE_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generate_gemm_microkernel_instantiations.py")
-set(GENERATED_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generated/sources.cmake")
+set(GENERATE_GEMM_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/python/generate_gemm_microkernel_instantiations.py")
+set(GENERATED_SOURCES_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/generated/sources.cmake")
 
 # Check if generation is needed (script newer than output, or output doesn't exist)
 if(NOT EXISTS ${GENERATED_SOURCES_CMAKE} OR 
@@ -427,7 +427,7 @@ else()
 endif()
 
 # Include generated microkernel instantiations
-include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/generated/sources.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/kernels/cpu/gemm/generated/sources.cmake)
 
 # =============================================================================
 # llama.cpp Integration (for dequant parity testing)
@@ -499,16 +499,16 @@ add_library(llaminar2_core STATIC
     kernels/cpu/primitives/RoPEPrimitives.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp
     kernels/cpu/primitives/SoftmaxPrimitives.cpp
-    # CPU kernels and auto-tuning infrastructure
-    kernels/cpu/GemmAutoTuner.cpp         # Auto-tuner singleton + factory function
-    kernels/cpu/SmartGemmSearch.cpp       # Intelligent hierarchical search strategies
+    # CPU GEMM kernels and auto-tuning infrastructure
+    kernels/cpu/gemm/GemmAutoTuner.cpp         # Auto-tuner singleton + factory function
+    kernels/cpu/gemm/SmartGemmSearch.cpp       # Intelligent hierarchical search strategies
+    kernels/cpu/gemm/quantized/QuantizedGemm.cpp  # Auto-tuned quantized GEMM factory
     # kernels/cpu/GemmVariantGenerator.cpp  # OBSOLETE: Replaced by MicroKernelRegistry (backed up as .bak)
     # kernels/cpu/GemmVariantGenerator_Generated.cpp # OBSOLETE: Replaced by MicroKernelRegistry (backed up as .bak)
-    kernels/cpu/FP32GemmKernel.cpp
-    kernels/cpu/FP32StandaloneGemm.cpp
-    kernels/cpu/BF16GemmKernel.cpp
-    kernels/cpu/INT8GemmKernel.cpp
-    kernels/cpu/INT8AttentionKernel.cpp
+    kernels/cpu/gemm/bf16/BF16PackedGemm.cpp        # Phase 1: BF16×BF16→FP32 with auto-tuned micro-kernels
+    kernels/cpu/gemm/int8/INT8PackedGemm.cpp        # INT8×INT8→INT32 with AVX512 VNNI auto-tuned micro-kernels
+    kernels/cpu/gemm/fp16/FP16PackedGemm.cpp        # FP16×FP16→FP32 with AVX512F/AVX2+F16C auto-tuned micro-kernels
+    kernels/cpu/gemm/IntegerGemm.cpp                # Integer-domain quantized GEMM (llama.cpp strategy, AVX512-VNNI)
     kernels/cpu/INT8SwiGLUKernel.cpp
     kernels/cpu/FP32AttentionKernel.cpp
     kernels/cpu/CPURoPEKernel.cpp
@@ -516,6 +516,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/CPUSoftmaxKernel.cpp
     kernels/cpu/CPUSwiGLUKernel.cpp
     kernels/cpu/CPUAttention.cpp
+    # kernels/cpu/CPUAttentionT.cpp  # DISABLED: Uses obsolete FusedGemmSoftmax API (needs migration to TiledGemmSoftmax)
     # Testing infrastructure (Phase 3a & 3b)
     testing/MockPipeline.cpp
     testing/AttentionTestHarness.cpp
@@ -524,8 +525,10 @@ add_library(llaminar2_core STATIC
     utils/BatchPaddingUtils.cpp
     utils/NUMATopology.cpp
     utils/MPIStager.cpp
+    utils/Tokenizer.cpp
+    utils/Sampler.cpp
     # Generated GEMM microkernel template instantiations (1225 total across 64 files)
-    kernels/cpu/GemmMicroKernelInit.cpp
+    kernels/cpu/gemm/GemmMicroKernelInit.cpp
     ${MICROKERNEL_INSTANTIATION_SOURCES}
 )
 
@@ -660,6 +663,20 @@ if(USE_ONEDNN AND ONEDNN_FOUND)
     target_link_libraries(llaminar2_core PUBLIC ${ONEDNN_LIB})
     message(STATUS "V2: Linked OneDNN for INT8/BF16 GEMM acceleration")
 endif()
+
+# =============================================================================
+# llama.cpp Library (REMOVED - using native BPE tokenizer)
+# =============================================================================
+# NOTE: Previously linked llama.cpp for tokenization, but now we have
+# native BPETokenizer that reads vocabulary directly from GGUF metadata.
+# This eliminates duplicate file loading and external dependency.
+
+# If llama.cpp is needed in future for other purposes, re-enable:
+# target_link_libraries(llaminar2_core PUBLIC llama)
+# target_include_directories(llaminar2_core PUBLIC
+#     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp/include
+# )
+# message(STATUS "V2: Linked llama.cpp library for tokenization")
 
 # Main executable
 add_executable(llaminar2 Main.cpp)

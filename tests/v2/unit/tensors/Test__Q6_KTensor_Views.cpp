@@ -148,7 +148,7 @@ TEST(Q6_KTensorViews, ViewChaining)
     EXPECT_EQ(view2->shape()[1], 1024);
 }
 
-// Test 8: IBlockDecoder interface works with views
+// Test 8: ITensorGemmTileDataProvider interface works with views
 TEST(Q6_KTensorViews, IBlockDecoderInterface)
 {
     auto parent = createTestTensor(64, 512);
@@ -157,8 +157,8 @@ TEST(Q6_KTensorViews, IBlockDecoderInterface)
     auto view = parent->create_view({32, 512}, 16 * 512); // Rows 16-47
     ASSERT_NE(view, nullptr);
 
-    // Cast to IBlockDecoder
-    auto *decoder = dynamic_cast<IBlockDecoder *>(view.get());
+    // Cast to ITensorGemmTileDataProvider
+    auto *decoder = dynamic_cast<ITensorGemmTileDataProvider *>(view.get());
     ASSERT_NE(decoder, nullptr);
 
     // Verify decoder metadata

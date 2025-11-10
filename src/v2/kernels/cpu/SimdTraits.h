@@ -68,6 +68,21 @@ namespace llaminar2
                 static constexpr const char *name = "Scalar";
             };
 
+            /**
+             * @brief Tag type for AVX512 VNNI ISA selection
+             *
+             * Requirements:
+             * - __AVX512F__ and __AVX512VNNI__ must be defined
+             * - CPU must support AVX512-VNNI (Cascade Lake+, Ice Lake+, Zen 4+)
+             *
+             * Provides INT8×INT8→INT32 GEMM via _mm512_dpbusd_epi32 instruction.
+             * Used for quantized inference with 8-bit weights and activations.
+             */
+            struct AVX512VNNITag
+            {
+                static constexpr const char *name = "AVX512VNNI";
+            };
+
             // ========== SIMD TRAITS BASE TEMPLATE ==========
 
             /**
@@ -153,6 +168,142 @@ namespace llaminar2
             };
 
 #endif // __AVX512F__
+
+            // ========== AVX512 VNNI SPECIALIZATION (INT8×INT8→INT32) ==========
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+
+            /**
+             * @brief AVX512 VNNI traits for INT8×INT8→INT32 GEMM
+             *
+             * Key differences from FP32 AVX512:
+             * - VectorType: __m512i (integer) not __m512 (float)
+             * - Computes 4-way dot products via _mm512_dpbusd_epi32
+             * - Accumulators are int32, not float
+             * - No horizontal reduction (manual extraction needed)
+             *
+             * VNNI Instruction: _mm512_dpbusd_epi32(src, a, b)
+             * Computes: src[i] += a[4i+0]*b[4i+0] + a[4i+1]*b[4i+1] +
+             *                     a[4i+2]*b[4i+2] + a[4i+3]*b[4i+3]
+             *
+             * Each __m512i register holds:
+             * - 64 int8 values (input) OR
+             * - 16 int32 values (accumulator)
+             */
+            template <>
+            struct SimdTraits<AVX512VNNITag>
+            {
+                using VectorType = __m512i;              // Integer SIMD register
+                using AccumType = __m512i;               // int32 accumulator register
+                static constexpr int vector_width = 64;  // 64 int8s per __m512i
+                static constexpr int accum_width = 16;   // 16 int32s per __m512i
+                static constexpr int dot_group_size = 4; // VNNI does 4-way dot products
+                static constexpr const char *isa_name = "AVX512VNNI";
+
+                /**
+                 * @brief Return zero int32 accumulator vector
+                 */
+                static inline AccumType zero_i32()
+                {
+                    return _mm512_setzero_si512();
+                }
+
+                /**
+                 * @brief Load 64 int8 values from unaligned memory
+                 */
+                static inline VectorType load_i8(const int8_t *ptr)
+                {
+                    return _mm512_loadu_si512(reinterpret_cast<const __m512i *>(ptr));
+                }
+
+                /**
+                 * @brief Store 16 int32 values to unaligned memory
+                 */
+                static inline void store_i32(int32_t *ptr, AccumType v)
+                {
+                    _mm512_storeu_si512(reinterpret_cast<__m512i *>(ptr), v);
+                }
+
+                /**
+                 * @brief VNNI dot product: src += a · b (4-way dot products)
+                 *
+                 * Computes 16 parallel 4-element dot products:
+                 * src[i] += a[4i]*b[4i] + a[4i+1]*b[4i+1] + a[4i+2]*b[4i+2] + a[4i+3]*b[4i+3]
+                 *
+                 * @param src int32 accumulator (16 elements)
+                 * @param a int8 vector (64 elements, treated as unsigned)
+                 * @param b int8 vector (64 elements, treated as signed)
+                 * @return Updated accumulator with dot products added
+                 */
+                static inline AccumType dpbusd(AccumType src, VectorType a, VectorType b)
+                {
+                    return _mm512_dpbusd_epi32(src, a, b);
+                }
+
+                /**
+                 * @brief VNNI signed-signed dot product: src += a · b (4-way dot products, both signed)
+                 *
+                 * Uses instruction _mm512_dpbusds_epi32 which interprets BOTH a and b as signed int8.
+                 * This is required for general INT8 activation/weight GEMM where values span [-128,127].
+                 * The unsigned-signed variant (dpbusd) zero-extends the first operand and is only
+                 * numerically correct when the first operand is guaranteed non-negative.
+                 */
+                static inline AccumType dpbusds(AccumType src, VectorType a, VectorType b)
+                {
+                    return _mm512_dpbusds_epi32(src, a, b);
+                }
+
+                /**
+                 * @brief Extract int32 value at given index (0-15)
+                 */
+                static inline int32_t extract_i32(AccumType v, int index)
+                {
+                    alignas(64) int32_t tmp[16];
+                    store_i32(tmp, v);
+                    return tmp[index];
+                }
+
+                /**
+                 * @brief Convert int32 accumulator to float with dequantization
+                 *
+                 * @param v int32 accumulator vector
+                 * @param scale Scaling factor for dequantization
+                 * @param zero_point Zero point for dequantization
+                 * @return __m512 vector of 16 floats
+                 */
+                static inline __m512 cvt_i32_to_fp32_dequant(AccumType v, float scale, int32_t zero_point)
+                {
+                    // Convert int32 → float
+                    __m512 fp32 = _mm512_cvtepi32_ps(v);
+
+                    // Dequantize: (x - zero_point) * scale
+                    __m512 zp_vec = _mm512_set1_ps(static_cast<float>(zero_point));
+                    __m512 scale_vec = _mm512_set1_ps(scale);
+
+                    fp32 = _mm512_sub_ps(fp32, zp_vec);
+                    fp32 = _mm512_mul_ps(fp32, scale_vec);
+
+                    return fp32;
+                }
+
+                /**
+                 * @brief Prefetch data into L1 cache
+                 */
+                static inline void prefetch_l1(const void *ptr)
+                {
+                    _mm_prefetch(reinterpret_cast<const char *>(ptr), _MM_HINT_T0);
+                }
+
+                /**
+                 * @brief Prefetch data into L2 cache
+                 */
+                static inline void prefetch_l2(const void *ptr)
+                {
+                    _mm_prefetch(reinterpret_cast<const char *>(ptr), _MM_HINT_T1);
+                }
+            };
+
+#endif // __AVX512F__ && __AVX512VNNI__
 
             // ========== AVX2 SPECIALIZATION ==========
 

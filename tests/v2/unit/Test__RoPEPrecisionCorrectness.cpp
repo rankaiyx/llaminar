@@ -1,0 +1,712 @@
+/**
+ * @file Test__RoPEPrecisionCorrectness.cpp
+ * @brief Mathematical correctness tests for RoPE native precision primitives
+ * @author David Sanftenberg
+ *
+ * Tests verify:
+ * 1. Scalar/AVX2/AVX512 implementation parity (bit-exact for same precision)
+ * 2. Cross-precision accuracy (BF16/FP16 vs FP32 within tolerance)
+ * 3. Edge cases (various head_dim, seq_len, position values)
+ */
+
+#include <gtest/gtest.h>
+#include "../../../src/v2/kernels/cpu/primitives/RoPEPrimitives.h"
+#include "../../../src/v2/tensors/SIMDHelpers.h"
+#include "../../../src/v2/tensors/FP16Utils.h"
+#include <vector>
+#include <cmath>
+#include <random>
+#include <algorithm>
+
+namespace llaminar2::test
+{
+
+    /**
+     * @brief Test fixture for RoPE precision correctness
+     */
+    class RoPEPrecisionCorrectnessTest : public ::testing::Test
+    {
+    protected:
+        void SetUp() override
+        {
+            // Use deterministic random seed for reproducible tests
+            rng_.seed(42);
+        }
+
+        /**
+         * @brief Generate random FP32 data in range [-1, 1]
+         */
+        std::vector<float> generateRandomFP32(size_t count)
+        {
+            std::vector<float> data(count);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (size_t i = 0; i < count; ++i)
+            {
+                data[i] = dist(rng_);
+            }
+            return data;
+        }
+
+        /**
+         * @brief Convert FP32 to BF16 and back
+         */
+        std::vector<uint16_t> fp32ToBF16(const std::vector<float> &fp32)
+        {
+            std::vector<uint16_t> bf16(fp32.size());
+            for (size_t i = 0; i < fp32.size(); ++i)
+            {
+                bf16[i] = simd::fp32_to_bf16(fp32[i]);
+            }
+            return bf16;
+        }
+
+        /**
+         * @brief Convert BF16 to FP32
+         */
+        std::vector<float> bf16ToFP32(const std::vector<uint16_t> &bf16)
+        {
+            std::vector<float> fp32(bf16.size());
+            for (size_t i = 0; i < bf16.size(); ++i)
+            {
+                fp32[i] = simd::bf16_to_fp32(bf16[i]);
+            }
+            return fp32;
+        }
+
+        /**
+         * @brief Convert FP32 to FP16 and back
+         */
+        std::vector<uint16_t> fp32ToFP16(const std::vector<float> &fp32)
+        {
+            std::vector<uint16_t> fp16(fp32.size());
+            for (size_t i = 0; i < fp32.size(); ++i)
+            {
+                fp16[i] = fp32_to_fp16(fp32[i]);
+            }
+            return fp16;
+        }
+
+        /**
+         * @brief Convert FP16 to FP32
+         */
+        std::vector<float> fp16ToFP32(const std::vector<uint16_t> &fp16)
+        {
+            std::vector<float> fp32(fp16.size());
+            for (size_t i = 0; i < fp16.size(); ++i)
+            {
+                fp32[i] = fp16_to_fp32(fp16[i]);
+            }
+            return fp32;
+        }
+
+        /**
+         * @brief Compare two float vectors with tolerance
+         */
+        void expectNear(const std::vector<float> &a, const std::vector<float> &b,
+                        float abs_tol, const std::string &msg)
+        {
+            ASSERT_EQ(a.size(), b.size()) << msg << ": Size mismatch";
+
+            float max_diff = 0.0f;
+            size_t max_diff_idx = 0;
+
+            for (size_t i = 0; i < a.size(); ++i)
+            {
+                float diff = std::abs(a[i] - b[i]);
+                if (diff > max_diff)
+                {
+                    max_diff = diff;
+                    max_diff_idx = i;
+                }
+                EXPECT_NEAR(a[i], b[i], abs_tol)
+                    << msg << ": Mismatch at index " << i
+                    << " (a=" << a[i] << ", b=" << b[i] << ")";
+            }
+
+            if (max_diff > abs_tol)
+            {
+                std::cout << msg << ": Max diff = " << max_diff
+                          << " at index " << max_diff_idx
+                          << " (a=" << a[max_diff_idx] << ", b=" << b[max_diff_idx] << ")"
+                          << std::endl;
+            }
+        }
+
+        /**
+         * @brief Compare two uint16_t vectors (bit-exact)
+         */
+        void expectBitExact(const std::vector<uint16_t> &a, const std::vector<uint16_t> &b,
+                            const std::string &msg)
+        {
+            ASSERT_EQ(a.size(), b.size()) << msg << ": Size mismatch";
+
+            for (size_t i = 0; i < a.size(); ++i)
+            {
+                EXPECT_EQ(a[i], b[i])
+                    << msg << ": Mismatch at index " << i
+                    << " (a=" << a[i] << ", b=" << b[i] << ")";
+            }
+        }
+
+        std::mt19937 rng_;
+    };
+
+    // ============================================================================
+    // FP32 Implementation Parity Tests (Scalar vs AVX2 vs AVX512)
+    // ============================================================================
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FP32_ScalarVsAVX2_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        // Generate random head data
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_scalar = head_fp32;
+        auto head_avx2 = head_fp32;
+
+        // Get inverse frequencies
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        // Apply scalar variant
+        primitives::apply_rope_to_head_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+// Apply AVX2 variant + scalar tail
+#if defined(__AVX2__)
+        int processed = primitives::apply_rope_to_head_avx2(head_avx2.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx2.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx2 = head_scalar; // Fallback if no AVX2
+#endif
+
+        // Should be bit-exact (same precision, same operations)
+        expectNear(head_scalar, head_avx2, 1e-6f, "FP32 Scalar vs AVX2");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FP32_ScalarVsAVX512_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_scalar = head_fp32;
+        auto head_avx512 = head_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX512F__)
+        int processed = primitives::apply_rope_to_head_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx512.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx512 = head_scalar;
+#endif
+
+        expectNear(head_scalar, head_avx512, 1e-6f, "FP32 Scalar vs AVX512");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FP32_AVX2VsAVX512_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_avx2 = head_fp32;
+        auto head_avx512 = head_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+#if defined(__AVX2__)
+        int processed_avx2 = primitives::apply_rope_to_head_avx2(head_avx2.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx2.data(), position, inv_freq, head_dim, processed_avx2);
+#endif
+
+#if defined(__AVX512F__)
+        int processed_avx512 = primitives::apply_rope_to_head_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx512.data(), position, inv_freq, head_dim, processed_avx512);
+#else
+        head_avx512 = head_avx2;
+#endif
+
+        expectNear(head_avx2, head_avx512, 1e-6f, "FP32 AVX2 vs AVX512");
+    }
+
+    // ============================================================================
+    // BF16 Implementation Parity Tests (Scalar vs AVX2 vs AVX512)
+    // ============================================================================
+
+    TEST_F(RoPEPrecisionCorrectnessTest, BF16_ScalarVsAVX2_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        // Generate random data and convert to BF16
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_bf16 = fp32ToBF16(head_fp32);
+        auto head_scalar = head_bf16;
+        auto head_avx2 = head_bf16;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        // Apply scalar variant
+        primitives::apply_rope_to_head_bf16_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+// Apply AVX2 variant + scalar tail
+#if defined(__AVX2__)
+        int processed = primitives::apply_rope_to_head_bf16_avx2(head_avx2.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_bf16_scalar(head_avx2.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx2 = head_scalar;
+#endif
+
+        // Should be bit-exact (same precision, same operations)
+        expectBitExact(head_scalar, head_avx2, "BF16 Scalar vs AVX2");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, BF16_ScalarVsAVX512_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_bf16 = fp32ToBF16(head_fp32);
+        auto head_scalar = head_bf16;
+        auto head_avx512 = head_bf16;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_bf16_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX512F__)
+        int processed = primitives::apply_rope_to_head_bf16_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_bf16_scalar(head_avx512.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx512 = head_scalar;
+#endif
+
+        expectBitExact(head_scalar, head_avx512, "BF16 Scalar vs AVX512");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, BF16_AVX2VsAVX512_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_bf16 = fp32ToBF16(head_fp32);
+        auto head_avx2 = head_bf16;
+        auto head_avx512 = head_bf16;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+#if defined(__AVX2__)
+        int processed_avx2 = primitives::apply_rope_to_head_bf16_avx2(head_avx2.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_bf16_scalar(head_avx2.data(), position, inv_freq, head_dim, processed_avx2);
+#endif
+
+#if defined(__AVX512F__)
+        int processed_avx512 = primitives::apply_rope_to_head_bf16_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_bf16_scalar(head_avx512.data(), position, inv_freq, head_dim, processed_avx512);
+#else
+        head_avx512 = head_avx2;
+#endif
+
+        expectBitExact(head_avx2, head_avx512, "BF16 AVX2 vs AVX512");
+    }
+
+    // ============================================================================
+    // FP16 Implementation Parity Tests (Scalar vs AVX2 vs AVX512)
+    // ============================================================================
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FP16_ScalarVsAVX2_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_fp16 = fp32ToFP16(head_fp32);
+        auto head_scalar = head_fp16;
+        auto head_avx2 = head_fp16;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_fp16_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX2__)
+        int processed = primitives::apply_rope_to_head_fp16_avx2(head_avx2.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_fp16_scalar(head_avx2.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx2 = head_scalar;
+#endif
+
+        expectBitExact(head_scalar, head_avx2, "FP16 Scalar vs AVX2");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FP16_ScalarVsAVX512_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_fp16 = fp32ToFP16(head_fp32);
+        auto head_scalar = head_fp16;
+        auto head_avx512 = head_fp16;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_fp16_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX512F__)
+        int processed = primitives::apply_rope_to_head_fp16_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_fp16_scalar(head_avx512.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx512 = head_scalar;
+#endif
+
+        expectBitExact(head_scalar, head_avx512, "FP16 Scalar vs AVX512");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FP16_AVX2VsAVX512_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_fp16 = fp32ToFP16(head_fp32);
+        auto head_avx2 = head_fp16;
+        auto head_avx512 = head_fp16;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+#if defined(__AVX2__)
+        int processed_avx2 = primitives::apply_rope_to_head_fp16_avx2(head_avx2.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_fp16_scalar(head_avx2.data(), position, inv_freq, head_dim, processed_avx2);
+#endif
+
+#if defined(__AVX512F__)
+        int processed_avx512 = primitives::apply_rope_to_head_fp16_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_fp16_scalar(head_avx512.data(), position, inv_freq, head_dim, processed_avx512);
+#else
+        head_avx512 = head_avx2;
+#endif
+
+        expectBitExact(head_avx2, head_avx512, "FP16 AVX2 vs AVX512");
+    }
+
+    // ============================================================================
+    // Cross-Precision Accuracy Tests (BF16/FP16 vs FP32 Reference)
+    // ============================================================================
+
+    TEST_F(RoPEPrecisionCorrectnessTest, BF16_VsFP32_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        // Generate random FP32 data
+        auto head_fp32_orig = generateRandomFP32(head_dim);
+
+        // Create copies for each precision
+        auto head_fp32 = head_fp32_orig;
+        auto head_bf16 = fp32ToBF16(head_fp32_orig);
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        // Apply RoPE in FP32
+        primitives::apply_rope_to_head_scalar(head_fp32.data(), position, inv_freq, head_dim, 0);
+
+        // Apply RoPE in BF16
+        primitives::apply_rope_to_head_bf16_scalar(head_bf16.data(), position, inv_freq, head_dim, 0);
+
+        // Convert BF16 result to FP32 for comparison
+        auto head_bf16_as_fp32 = bf16ToFP32(head_bf16);
+
+        // BF16 has ~3 decimal digits of precision, so expect reasonable tolerance
+        // Rotation involves sin/cos which can amplify errors, so be more permissive
+        expectNear(head_fp32, head_bf16_as_fp32, 1e-2f, "BF16 vs FP32");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FP16_VsFP32_SingleHead)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32_orig = generateRandomFP32(head_dim);
+        auto head_fp32 = head_fp32_orig;
+        auto head_fp16 = fp32ToFP16(head_fp32_orig);
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_scalar(head_fp32.data(), position, inv_freq, head_dim, 0);
+        primitives::apply_rope_to_head_fp16_scalar(head_fp16.data(), position, inv_freq, head_dim, 0);
+
+        auto head_fp16_as_fp32 = fp16ToFP32(head_fp16);
+
+        // FP16 has better precision than BF16 (~3-4 decimal digits)
+        expectNear(head_fp32, head_fp16_as_fp32, 1e-3f, "FP16 vs FP32");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, INT32_NotSupported)
+    {
+        const int seq_len = 4;
+        const int head_dim = 64;
+        const int n_heads = 4;
+        const int n_kv_heads = 2;
+        const int n_past = 0;
+        const float freq_base = 10000.0f;
+
+        std::vector<int32_t> q_int32(seq_len * n_heads * head_dim, 0);
+        std::vector<int32_t> k_int32(seq_len * n_kv_heads * head_dim, 0);
+
+        // Should return false (not supported)
+        bool result = primitives::apply_rope_int32(
+            q_int32.data(), k_int32.data(),
+            seq_len, head_dim,
+            n_heads, n_kv_heads,
+            n_past, freq_base);
+
+        EXPECT_FALSE(result) << "INT32 RoPE should not be supported";
+    }
+
+    // ============================================================================
+    // Edge Case Tests (Various head_dim, positions, etc.)
+    // ============================================================================
+
+    TEST_F(RoPEPrecisionCorrectnessTest, EdgeCase_SmallHeadDim64)
+    {
+        const int head_dim = 64;
+        const int position = 3;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_scalar = head_fp32;
+        auto head_avx2 = head_fp32;
+        auto head_avx512 = head_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX2__)
+        int processed = primitives::apply_rope_to_head_avx2(head_avx2.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx2.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx2 = head_scalar;
+#endif
+
+#if defined(__AVX512F__)
+        int processed512 = primitives::apply_rope_to_head_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx512.data(), position, inv_freq, head_dim, processed512);
+#else
+        head_avx512 = head_scalar;
+#endif
+
+        expectNear(head_scalar, head_avx2, 1e-6f, "head_dim=64 Scalar vs AVX2");
+        expectNear(head_scalar, head_avx512, 1e-6f, "head_dim=64 Scalar vs AVX512");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, EdgeCase_LargeHeadDim256)
+    {
+        const int head_dim = 256;
+        const int position = 15;
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_scalar = head_fp32;
+        auto head_avx512 = head_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX512F__)
+        int processed = primitives::apply_rope_to_head_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx512.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx512 = head_scalar;
+#endif
+
+        expectNear(head_scalar, head_avx512, 1e-6f, "head_dim=256 Scalar vs AVX512");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, EdgeCase_LargePosition1024)
+    {
+        const int head_dim = 128;
+        const int position = 1024; // Large position (long context)
+        const float freq_base = 10000.0f;
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_scalar = head_fp32;
+        auto head_avx2 = head_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX2__)
+        int processed = primitives::apply_rope_to_head_avx2(head_avx2.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx2.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx2 = head_scalar;
+#endif
+
+        expectNear(head_scalar, head_avx2, 1e-6f, "position=1024 Scalar vs AVX2");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, EdgeCase_LLaMAFreqBase)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 10000.0f; // LLaMA uses 10000.0
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_scalar = head_fp32;
+        auto head_avx512 = head_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX512F__)
+        int processed = primitives::apply_rope_to_head_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx512.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx512 = head_scalar;
+#endif
+
+        expectNear(head_scalar, head_avx512, 1e-6f, "LLaMA freq_base Scalar vs AVX512");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, EdgeCase_QwenFreqBase)
+    {
+        const int head_dim = 128;
+        const int position = 7;
+        const float freq_base = 1000000.0f; // Qwen 2.5 uses 1000000.0
+
+        auto head_fp32 = generateRandomFP32(head_dim);
+        auto head_scalar = head_fp32;
+        auto head_avx512 = head_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        primitives::apply_rope_to_head_scalar(head_scalar.data(), position, inv_freq, head_dim, 0);
+
+#if defined(__AVX512F__)
+        int processed = primitives::apply_rope_to_head_avx512(head_avx512.data(), position, inv_freq, head_dim);
+        primitives::apply_rope_to_head_scalar(head_avx512.data(), position, inv_freq, head_dim, processed);
+#else
+        head_avx512 = head_scalar;
+#endif
+
+        expectNear(head_scalar, head_avx512, 1e-6f, "Qwen freq_base Scalar vs AVX512");
+    }
+
+    // ============================================================================
+    // Full Tensor Tests (Multiple heads, sequences)
+    // ============================================================================
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FullTensor_BF16_MultipleHeads)
+    {
+        const int seq_len = 4;
+        const int head_dim = 64;
+        const int q_heads = 4;
+        const int k_heads = 2; // GQA
+        const int n_past = 0;
+        const float freq_base = 10000.0f;
+
+        // Generate random Q and K tensors
+        auto q_fp32 = generateRandomFP32(seq_len * q_heads * head_dim);
+        auto k_fp32 = generateRandomFP32(seq_len * k_heads * head_dim);
+
+        // Convert to BF16
+        auto q_bf16_ref = fp32ToBF16(q_fp32);
+        auto k_bf16_ref = fp32ToBF16(k_fp32);
+        auto q_bf16_test = q_bf16_ref;
+        auto k_bf16_test = k_bf16_ref;
+
+        // Apply RoPE using vectorized (production) path
+        primitives::apply_rope_bf16(
+            q_bf16_test.data(), k_bf16_test.data(),
+            seq_len, head_dim,
+            q_heads, k_heads,
+            n_past, freq_base,
+            nullptr);
+
+        // Apply RoPE using scalar-only path (reference)
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+        for (int pos = 0; pos < seq_len; ++pos)
+        {
+            for (int h = 0; h < q_heads; ++h)
+            {
+                uint16_t *head_ptr = q_bf16_ref.data() + (pos * q_heads + h) * head_dim;
+                primitives::apply_rope_to_head_bf16_scalar(head_ptr, pos + n_past, inv_freq, head_dim, 0);
+            }
+            for (int h = 0; h < k_heads; ++h)
+            {
+                uint16_t *head_ptr = k_bf16_ref.data() + (pos * k_heads + h) * head_dim;
+                primitives::apply_rope_to_head_bf16_scalar(head_ptr, pos + n_past, inv_freq, head_dim, 0);
+            }
+        }
+
+        // Compare (should be bit-exact)
+        expectBitExact(q_bf16_ref, q_bf16_test, "BF16 Full Tensor Q");
+        expectBitExact(k_bf16_ref, k_bf16_test, "BF16 Full Tensor K");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, FullTensor_FP16_MultipleHeads)
+    {
+        const int seq_len = 4;
+        const int head_dim = 64;
+        const int q_heads = 4;
+        const int k_heads = 2;
+        const int n_past = 0;
+        const float freq_base = 10000.0f;
+
+        auto q_fp32 = generateRandomFP32(seq_len * q_heads * head_dim);
+        auto k_fp32 = generateRandomFP32(seq_len * k_heads * head_dim);
+
+        auto q_fp16_ref = fp32ToFP16(q_fp32);
+        auto k_fp16_ref = fp32ToFP16(k_fp32);
+        auto q_fp16_test = q_fp16_ref;
+        auto k_fp16_test = k_fp16_ref;
+
+        // Vectorized path
+        primitives::apply_rope_fp16(
+            q_fp16_test.data(), k_fp16_test.data(),
+            seq_len, head_dim,
+            q_heads, k_heads,
+            n_past, freq_base,
+            nullptr);
+
+        // Scalar reference
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+        for (int pos = 0; pos < seq_len; ++pos)
+        {
+            for (int h = 0; h < q_heads; ++h)
+            {
+                uint16_t *head_ptr = q_fp16_ref.data() + (pos * q_heads + h) * head_dim;
+                primitives::apply_rope_to_head_fp16_scalar(head_ptr, pos + n_past, inv_freq, head_dim, 0);
+            }
+            for (int h = 0; h < k_heads; ++h)
+            {
+                uint16_t *head_ptr = k_fp16_ref.data() + (pos * k_heads + h) * head_dim;
+                primitives::apply_rope_to_head_fp16_scalar(head_ptr, pos + n_past, inv_freq, head_dim, 0);
+            }
+        }
+
+        expectBitExact(q_fp16_ref, q_fp16_test, "FP16 Full Tensor Q");
+        expectBitExact(k_fp16_ref, k_fp16_test, "FP16 Full Tensor K");
+    }
+
+} // namespace llaminar2::test

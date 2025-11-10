@@ -187,16 +187,16 @@ TEST_F(Test__PipelineBase_PrecisionMode, ActivationPrecision_FP16)
 }
 
 /**
- * @brief Test INT8 activation precision mode
+ * @brief Test INT32 activation precision mode
  */
-TEST_F(Test__PipelineBase_PrecisionMode, ActivationPrecision_INT8)
+TEST_F(Test__PipelineBase_PrecisionMode, ActivationPrecision_INT32)
 {
     PipelineConfig config;
-    config.activation_precision = ActivationPrecision::INT8;
+    config.activation_precision = ActivationPrecision::INT32;
 
     MockPipelineForPrecision pipeline(model_ctx_, mpi_ctx_, device_idx_, placement_map_, config);
 
-    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::INT8);
+    EXPECT_EQ(pipeline.getActivationPrecision(), ActivationPrecision::INT32);
 }
 
 // =============================================================================
@@ -293,10 +293,10 @@ TEST(ActivationPrecisionEnum, EnumValuesDistinct)
     // Verify enum values are distinct
     EXPECT_NE(static_cast<int>(ActivationPrecision::FP32), static_cast<int>(ActivationPrecision::BF16));
     EXPECT_NE(static_cast<int>(ActivationPrecision::FP32), static_cast<int>(ActivationPrecision::FP16));
-    EXPECT_NE(static_cast<int>(ActivationPrecision::FP32), static_cast<int>(ActivationPrecision::INT8));
+    EXPECT_NE(static_cast<int>(ActivationPrecision::FP32), static_cast<int>(ActivationPrecision::INT32));
 
     EXPECT_NE(static_cast<int>(ActivationPrecision::BF16), static_cast<int>(ActivationPrecision::FP16));
-    EXPECT_NE(static_cast<int>(ActivationPrecision::BF16), static_cast<int>(ActivationPrecision::INT8));
+    EXPECT_NE(static_cast<int>(ActivationPrecision::BF16), static_cast<int>(ActivationPrecision::INT32));
 }
 
 /**

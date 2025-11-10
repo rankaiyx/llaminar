@@ -7,7 +7,7 @@
 #include "Tensors.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
-#include "../kernels/cpu/GemmAutoTuner.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -215,31 +215,15 @@ namespace llaminar2
         throw std::runtime_error("IQ4_XSTensor::mutable_data: quantized tensors are immutable");
     }
 
-    std::unique_ptr<llaminar2::ITensorRoPE> IQ4_XSTensor::createRoPE()
-    {
-        throw std::runtime_error("IQ4_XSTensor: RoPE not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorSwiGLU> IQ4_XSTensor::createSwiGLU()
-    {
-        throw std::runtime_error("IQ4_XSTensor: SwiGLU not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorSoftmax> IQ4_XSTensor::createSoftmax()
-    {
-        throw std::runtime_error("IQ4_XSTensor: Softmax not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorRMSNorm> IQ4_XSTensor::createRMSNorm()
-    {
-        throw std::runtime_error("IQ4_XSTensor: RMSNorm not supported");
-    }
+    
 
-    std::unique_ptr<ITensorAttention> IQ4_XSTensor::createAttention()
-    {
-        LOG_ERROR("[IQ4_XSTensor] createAttention not supported for quantized tensors");
-        return nullptr;
-    }
+    
 
     bool IQ4_XSTensor::copyFrom(const TensorBase *src)
     {

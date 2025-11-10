@@ -6,7 +6,7 @@
 
 #include "Tensors.h"
 #include "Tensors.h"
-#include "../kernels/cpu/GemmAutoTuner.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/CPUFeatures.h"
 #include <cstring>
@@ -308,31 +308,15 @@ namespace llaminar2
         throw std::runtime_error("Q4_1Tensor::mutable_data: quantized tensors are immutable");
     }
 
-    std::unique_ptr<llaminar2::ITensorRoPE> Q4_1Tensor::createRoPE()
-    {
-        throw std::runtime_error("Q4_1Tensor: RoPE not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorSwiGLU> Q4_1Tensor::createSwiGLU()
-    {
-        throw std::runtime_error("Q4_1Tensor: SwiGLU not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorSoftmax> Q4_1Tensor::createSoftmax()
-    {
-        throw std::runtime_error("Q4_1Tensor: Softmax not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorRMSNorm> Q4_1Tensor::createRMSNorm()
-    {
-        throw std::runtime_error("Q4_1Tensor: RMSNorm not supported");
-    }
+    
 
-    std::unique_ptr<ITensorAttention> Q4_1Tensor::createAttention()
-    {
-        LOG_ERROR("[Q4_1Tensor] createAttention not supported for quantized tensors");
-        return nullptr;
-    }
+    
 
     bool Q4_1Tensor::copyFrom(const TensorBase *src)
     {

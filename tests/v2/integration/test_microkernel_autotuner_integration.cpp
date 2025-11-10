@@ -27,7 +27,7 @@ using namespace llaminar::v2::kernels;
 /**
  * @brief Mock block decoder for testing
  */
-class TestBlockDecoder : public IBlockDecoder
+class TestBlockDecoder : public ITensorGemmTileDataProvider
 {
 public:
     TestBlockDecoder(size_t rows, size_t cols, size_t block_size = 32)

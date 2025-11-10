@@ -17,11 +17,11 @@ namespace llaminar2
 
     void TensorBase::to_fp32_via_blocks(float *dst) const
     {
-        // This helper is for quantized tensors that implement IBlockDecoder
-        const IBlockDecoder *decoder = dynamic_cast<const IBlockDecoder *>(this);
+        // This helper is for quantized tensors that implement ITensorGemmTileDataProvider
+        const ITensorGemmTileDataProvider *decoder = dynamic_cast<const ITensorGemmTileDataProvider *>(this);
         if (!decoder)
         {
-            throw std::runtime_error("to_fp32_via_blocks() called on non-IBlockDecoder tensor");
+            throw std::runtime_error("to_fp32_via_blocks() called on non-ITensorGemmTileDataProvider tensor");
         }
 
         const auto &shp = shape();
@@ -61,11 +61,11 @@ namespace llaminar2
                                                    float *dst_col_scales,
                                                    float *dst_row_scales) const
     {
-        // Verify this is an IBlockDecoder tensor
-        const IBlockDecoder *decoder = dynamic_cast<const IBlockDecoder *>(this);
+        // Verify this is an ITensorGemmTileDataProvider tensor
+        const ITensorGemmTileDataProvider *decoder = dynamic_cast<const ITensorGemmTileDataProvider *>(this);
         if (!decoder)
         {
-            LOG_ERROR("[TensorBase] to_int8_perchannel_via_blocks() requires IBlockDecoder interface");
+            LOG_ERROR("[TensorBase] to_int8_perchannel_via_blocks() requires ITensorGemmTileDataProvider interface");
             return false;
         }
 
@@ -158,15 +158,6 @@ namespace llaminar2
     }
 
     // ===== Template Specializations for to<T>() =====
-
-    // Forward declare helper for BF16/FP16 conversion
-    namespace simd
-    {
-        extern float bf16_to_fp32(uint16_t bf16);
-        extern float fp16_to_fp32(uint16_t fp16);
-        extern uint16_t fp32_to_bf16(float fp32);
-        extern uint16_t fp32_to_fp16(float fp32);
-    }
 
     // FP32 conversion (just call to_fp32)
     template <>

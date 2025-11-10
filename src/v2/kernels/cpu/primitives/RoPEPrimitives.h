@@ -14,6 +14,7 @@
 
 #include <vector>
 #include <cstddef>
+#include <cstdint>
 
 namespace llaminar2::primitives
 {
@@ -69,6 +70,66 @@ namespace llaminar2::primitives
      */
     const std::vector<float> &get_inv_freq_cached(int head_dim, float freq_base);
 
+    /**
+     * @brief Apply RoPE to Q and K tensors (native BF16 implementation)
+     *
+     * Operates directly on BF16 buffers without intermediate FP32 conversion.
+     * Uses vectorized BF16 operations where available (AVX512 BF16, etc.).
+     *
+     * @param q_bf16 Query tensor in BF16 format (modified in-place)
+     * @param k_bf16 Key tensor in BF16 format (modified in-place)
+     * @param seq_len Sequence length
+     * @param head_dim Dimension per head (must be even)
+     * @param q_heads Number of query heads
+     * @param k_heads Number of key heads (may differ for GQA)
+     * @param n_past Number of tokens already processed
+     * @param freq_base Base frequency for RoPE (model-specific)
+     * @param persistent_state Optional persistent state for decode optimization
+     */
+    void apply_rope_bf16(
+        uint16_t *q_bf16, uint16_t *k_bf16,
+        int seq_len, int head_dim,
+        int q_heads, int k_heads,
+        int n_past, float freq_base,
+        RoPEPersistentState *persistent_state = nullptr);
+
+    /**
+     * @brief Apply RoPE to Q and K tensors (native FP16 implementation)
+     *
+     * Operates directly on FP16 buffers without intermediate FP32 conversion.
+     * Uses vectorized FP16 operations where available (F16C, AVX512 FP16, etc.).
+     *
+     * @param q_fp16 Query tensor in FP16 format (modified in-place)
+     * @param k_fp16 Key tensor in FP16 format (modified in-place)
+     * @param seq_len Sequence length
+     * @param head_dim Dimension per head (must be even)
+     * @param q_heads Number of query heads
+     * @param k_heads Number of key heads (may differ for GQA)
+     * @param n_past Number of tokens already processed
+     * @param freq_base Base frequency for RoPE (model-specific)
+     * @param persistent_state Optional persistent state for decode optimization
+     */
+    void apply_rope_fp16(
+        uint16_t *q_fp16, uint16_t *k_fp16,
+        int seq_len, int head_dim,
+        int q_heads, int k_heads,
+        int n_past, float freq_base,
+        RoPEPersistentState *persistent_state = nullptr);
+
+    /**
+     * @brief Apply RoPE to Q and K tensors (INT32 not supported)
+     *
+     * RoPE is an activation operation and cannot be applied to quantized INT32 accumulators.
+     * This function exists for API completeness but will always fail.
+     *
+     * @return Always false (operation not supported)
+     */
+    bool apply_rope_int32(
+        int32_t *q_int32, int32_t *k_int32,
+        int seq_len, int head_dim,
+        int q_heads, int k_heads,
+        int n_past, float freq_base);
+
     // ============================================================================
     // Individual Implementation Functions (for testing)
     // ============================================================================
@@ -117,6 +178,82 @@ namespace llaminar2::primitives
      */
     int apply_rope_to_head_avx512(
         float *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim);
+#endif
+
+    // ============================================================================
+    // BF16 Native Precision Implementations (for testing)
+    // ============================================================================
+
+    /**
+     * @brief Apply RoPE rotation to a single head (BF16 scalar)
+     */
+    void apply_rope_to_head_bf16_scalar(
+        uint16_t *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim,
+        int start_idx = 0);
+
+#if defined(__AVX2__)
+    /**
+     * @brief Apply RoPE rotation to a single head (BF16 AVX2)
+     * @return Number of pairs processed (always multiple of 8)
+     */
+    int apply_rope_to_head_bf16_avx2(
+        uint16_t *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Apply RoPE rotation to a single head (BF16 AVX512)
+     * @return Number of pairs processed (always multiple of 16)
+     */
+    int apply_rope_to_head_bf16_avx512(
+        uint16_t *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim);
+#endif
+
+    // ============================================================================
+    // FP16 Native Precision Implementations (for testing)
+    // ============================================================================
+
+    /**
+     * @brief Apply RoPE rotation to a single head (FP16 scalar)
+     */
+    void apply_rope_to_head_fp16_scalar(
+        uint16_t *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim,
+        int start_idx = 0);
+
+#if defined(__AVX2__)
+    /**
+     * @brief Apply RoPE rotation to a single head (FP16 AVX2)
+     * @return Number of pairs processed (always multiple of 8)
+     */
+    int apply_rope_to_head_fp16_avx2(
+        uint16_t *head_ptr,
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Apply RoPE rotation to a single head (FP16 AVX512)
+     * @return Number of pairs processed (always multiple of 16)
+     */
+    int apply_rope_to_head_fp16_avx512(
+        uint16_t *head_ptr,
         int position,
         const std::vector<float> &inv_freq,
         int head_dim);

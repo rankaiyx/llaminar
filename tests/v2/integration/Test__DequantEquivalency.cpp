@@ -1,6 +1,6 @@
 /**
  * @file Test__DequantEquivalency.cpp
- * @brief Integration tests verifying bit-exact equivalence between Llaminar IBlockDecoder
+ * @brief Integration tests verifying bit-exact equivalence between Llaminar ITensorGemmTileDataProvider
  *        and llama.cpp dequantization routines
  *
  * Purpose: Ensure Llaminar's quantized tensor dequantization produces identical FP32
@@ -9,10 +9,10 @@
  * Test Strategy:
  * 1. Load quantized weights from GGUF files (known-good source)
  * 2. Dequantize using llama.cpp's dequantize_row_* functions
- * 3. Dequantize using Llaminar's IBlockDecoder::decode_block_at
+ * 3. Dequantize using Llaminar's ITensorGemmTileDataProvider::decode_block_at
  * 4. Compare outputs element-by-element (bit-exact or tolerance-based)
  *
- * Note: User mentioned potential transpose in IBlockDecoder - tests will verify/account for this.
+ * Note: User mentioned potential transpose in ITensorGemmTileDataProvider - tests will verify/account for this.
  *
  * @author David Sanftenberg
  */
@@ -50,7 +50,7 @@ namespace llaminar2
 
             /**
              * @brief Compare two float arrays with configurable tolerance
-             * @param llaminar Output from Llaminar IBlockDecoder
+             * @param llaminar Output from Llaminar ITensorGemmTileDataProvider
              * @param llamacpp Output from llama.cpp dequantize_row_*
              * @param count Number of elements
              * @param tolerance Absolute tolerance (default 1e-6 for FP32)
@@ -98,7 +98,7 @@ namespace llaminar2
                 if (mismatch_count > 0 && check_transpose)
                 {
                     std::cout << "\nDirect comparison failed. Checking transposed layout..." << std::endl;
-                    // TODO: Implement transpose check if IBlockDecoder actually transposes
+                    // TODO: Implement transpose check if ITensorGemmTileDataProvider actually transposes
                     // This would require knowing the matrix dimensions
                 }
 
@@ -158,7 +158,7 @@ namespace llaminar2
             // Test first row dequantization
             size_t row_idx = 0;
 
-            // Dequantize with Llaminar IBlockDecoder
+            // Dequantize with Llaminar ITensorGemmTileDataProvider
             size_t num_blocks = (cols + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
             for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
             {

@@ -175,7 +175,7 @@ TEST(Test__Q5_KTensor, IBlockDecoderInterface)
 {
     auto tensor = createTestTensor(64, 512);
 
-    // Q5_K should support IBlockDecoder interface
+    // Q5_K should support ITensorGemmTileDataProvider interface
     EXPECT_EQ(tensor->block_size(), 256); // Q5_K uses 256-element super-blocks
 
     // Test decode_block_at

@@ -248,7 +248,7 @@ TEST_F(Test__IQ4_NLTensor_Views, ViewChaining)
 }
 
 /**
- * @brief Test IBlockDecoder interface works correctly for views
+ * @brief Test ITensorGemmTileDataProvider interface works correctly for views
  */
 TEST_F(Test__IQ4_NLTensor_Views, IBlockDecoderInterface)
 {
@@ -259,7 +259,7 @@ TEST_F(Test__IQ4_NLTensor_Views, IBlockDecoderInterface)
     auto *view_iq4nl = dynamic_cast<IQ4_NLTensor *>(view.get());
     ASSERT_NE(view_iq4nl, nullptr);
 
-    // Decode first block of view using IBlockDecoder interface
+    // Decode first block of view using ITensorGemmTileDataProvider interface
     float decoded_block[IQ4_NLBlock::BLOCK_SIZE];
     view_iq4nl->decode_block_at(0, 0, decoded_block);
 
@@ -271,7 +271,7 @@ TEST_F(Test__IQ4_NLTensor_Views, IBlockDecoderInterface)
     for (size_t i = 0; i < IQ4_NLBlock::BLOCK_SIZE; ++i)
     {
         EXPECT_FLOAT_EQ(decoded_block[i], parent_block[i])
-            << "IBlockDecoder mismatch at element " << i;
+            << "ITensorGemmTileDataProvider mismatch at element " << i;
     }
 }
 

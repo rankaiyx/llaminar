@@ -81,16 +81,16 @@ namespace llaminar2
                 owned_factory = std::make_unique<TensorFactory>(*mpi_ctx);
                 factory = owned_factory.get();
             }
-            
+
             auto ctx = std::shared_ptr<ModelContext>(
                 new ModelContext(model_path, mpi_ctx, nullptr, factory, WeightDistributionStrategy::REPLICATED));
-            
+
             // Store owned factory so it lives as long as the context
             if (owned_factory)
             {
                 ctx->owned_test_factory_ = std::move(owned_factory);
             }
-            
+
             // Initialize minimal valid model structure to prevent accessing uninitialized memory
             ctx->loader_.initializeTestModel();
             return ctx;

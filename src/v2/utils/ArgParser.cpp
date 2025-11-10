@@ -296,10 +296,10 @@ namespace llaminar2
         std::cout << "                              fp16   - Dequantize to FP16 at load\n";
         std::cout << "                              int8   - Dequantize to INT8 at load\n";
         std::cout << "  --activation-precision M  Precision for activations (default: fp32)\n";
-        std::cout << "  --activation-prec M         fp32 - 32-bit float (highest accuracy)\n";
-        std::cout << "  --act-prec M                bf16 - bfloat16 (Intel AMX, 2× faster)\n";
-        std::cout << "                              fp16 - 16-bit float (ARM/GPU)\n";
-        std::cout << "                              int8 - 8-bit integer (AVX512-VNNI)\n\n";
+        std::cout << "  --activation-prec M         fp32  - 32-bit float (highest accuracy)\n";
+        std::cout << "  --act-prec M                bf16  - bfloat16 (Intel AMX, 2× faster)\n";
+        std::cout << "                              fp16  - 16-bit float (ARM/GPU)\n";
+        std::cout << "                              int32 - 32-bit integer (experimental)\n\n";
 
         std::cout << "Other:\n";
         std::cout << "  --list-devices            List available devices and exit\n";

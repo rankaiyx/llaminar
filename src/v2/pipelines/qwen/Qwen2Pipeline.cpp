@@ -18,6 +18,7 @@
 #include "../../loaders/ModelLoader.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/BatchPaddingUtils.h"
+#include "../../kernels/cpu/CPURMSNormKernel.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -194,6 +195,35 @@ namespace llaminar2
         return weight_names;
     }
 
+    // Helper: Create activation tensor with configured precision
+    namespace
+    {
+        std::shared_ptr<TensorBase> createActivationTensor(
+            const std::vector<size_t> &shape,
+            int device_idx,
+            ActivationPrecision precision)
+        {
+            switch (precision)
+            {
+            case ActivationPrecision::FP32:
+                return std::make_shared<FP32Tensor>(shape, device_idx);
+
+            case ActivationPrecision::BF16:
+                return std::make_shared<BF16Tensor>(shape);
+
+            case ActivationPrecision::FP16:
+                return std::make_shared<FP16Tensor>(shape);
+
+            case ActivationPrecision::INT32:
+                return std::make_shared<INT32Tensor>(shape);
+
+            default:
+                LOG_ERROR("Unknown activation precision, defaulting to FP32");
+                return std::make_shared<FP32Tensor>(shape, device_idx);
+            }
+        }
+    } // anonymous namespace
+
     ActivationBuffers Qwen2Pipeline::createBuffersForDevice(int device_idx, int max_seq_len)
     {
         ActivationBuffers buffers;
@@ -201,43 +231,46 @@ namespace llaminar2
         int effective_max = batch_size_ * max_seq_len;
         buffers.max_seq_len = effective_max;
 
+        // Get configured activation precision
+        auto precision = config_.activation_precision;
+
         // Residual (d_model) - sized for batch
-        buffers.residual = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-            device_idx);
+        buffers.residual = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
+            device_idx, precision);
 
         // Normalization buffer (shared across attention and FFN) - sized for batch
-        buffers.normalized = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-            device_idx);
+        buffers.normalized = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
+            device_idx, precision);
 
         // Attention buffers (Qwen-specific dimensions) - sized for batch
-        buffers.Q = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
-            device_idx);
-        buffers.K = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-            device_idx);
-        buffers.V = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-            device_idx);
-        buffers.attn_output = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
-            device_idx);
-        buffers.attn_proj = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-            device_idx);
+        buffers.Q = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
+            device_idx, precision);
+        buffers.K = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
+            device_idx, precision);
+        buffers.V = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
+            device_idx, precision);
+        buffers.attn_output = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
+            device_idx, precision);
+        buffers.attn_proj = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
+            device_idx, precision);
 
         // FFN buffers (Qwen-specific d_ff_) - sized for batch
-        buffers.gate = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
-            device_idx);
-        buffers.up = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
-            device_idx);
-        buffers.ffn_output = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-            device_idx);
+        buffers.gate = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
+            device_idx, precision);
+        buffers.up = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
+            device_idx, precision);
+        buffers.ffn_output = createActivationTensor(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
+            device_idx, precision);
 
         return buffers;
     }
@@ -279,9 +312,9 @@ namespace llaminar2
         // Allocate activation tensors if needed (sized for batch)
         if (!current_hidden_ || static_cast<int>(current_hidden_->shape()[0]) != effective_seq_len)
         {
-            current_hidden_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_model_)},
-                device_idx_);
+            current_hidden_ = createActivationTensor(
+                {static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_model_)},
+                device_idx_, config_.activation_precision);
             LOG_INFO("Allocated hidden states: "
                      << effective_seq_len << " x " << d_model_ << " on device " << device_idx_);
         }
@@ -318,10 +351,14 @@ namespace llaminar2
         // Final normalization
         auto final_norm = getFinalNorm();
         VALIDATE_POINTER(final_norm, "final norm");
-        VALIDATE_KERNEL(norm_kernel, final_norm->createRMSNorm(), "RMSNorm kernel");
-        VALIDATE_OP(norm_kernel->apply(
-                        current_hidden_->data(), final_norm->data(), current_hidden_->mutable_data(),
-                        effective_seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), device_idx_),
+
+        // Apply RMSNorm using clean tensor interface (tensor knows its own type)
+        auto *activation_tensor = dynamic_cast<IActivationTensor *>(current_hidden_.get());
+        VALIDATE_POINTER(activation_tensor, "activation tensor for RMSNorm");
+
+        VALIDATE_OP(activation_tensor->applyRMSNorm(
+                        final_norm->data(), effective_seq_len, d_model_,
+                        1e-6f, mpi_ctx_.get(), device_idx_),
                     "Final RMSNorm");
 
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_final_norm");
@@ -409,11 +446,13 @@ namespace llaminar2
         std::memcpy(normalized_hidden->mutable_data(), input_hidden->data(),
                     effective_seq_len * d_model_ * sizeof(float));
 
-        // 1. Pre-attention RMSNorm
-        VALIDATE_KERNEL(norm_kernel, layer.attn_norm->createRMSNorm(), "RMSNorm kernel");
-        VALIDATE_OP(norm_kernel->apply(
-                        normalized_hidden->data(), layer.attn_norm->data(), normalized_hidden->mutable_data(),
-                        effective_seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), attn_device),
+        // 1. Pre-attention RMSNorm - clean tensor interface
+        auto *activation_tensor = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
+        VALIDATE_POINTER(activation_tensor, "activation tensor for RMSNorm");
+
+        VALIDATE_OP(activation_tensor->applyRMSNorm(
+                        layer.attn_norm->data(), effective_seq_len, d_model_,
+                        1e-6f, mpi_ctx_.get(), attn_device),
                     "Attention norm");
         VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_attn_norm");
 
@@ -487,10 +526,12 @@ namespace llaminar2
             }
         }
 
-        VALIDATE_KERNEL(rope_kernel, layer.wq->createRoPE(), "RoPE kernel"); // Any weight can create RoPE kernel
+        // Apply RoPE using clean tensor interface (Q is the activation tensor, K is passed as parameter)
+        auto *activation_tensor_q = dynamic_cast<IActivationTensor *>(buffers.Q.get());
+        VALIDATE_POINTER(activation_tensor_q, "activation tensor for RoPE");
 
-        VALIDATE_OP(rope_kernel->apply(
-                        buffers.Q->mutable_data(), buffers.K->mutable_data(), position_ids.data(),
+        VALIDATE_OP(activation_tensor_q->applyRoPE(
+                        buffers.K->mutable_data(), position_ids.data(),
                         effective_seq_len, n_heads_, n_kv_heads_, head_dim_,
                         model_ctx_->model().rope_theta,
                         false, mpi_ctx_.get(), attn_device),
@@ -599,11 +640,13 @@ namespace llaminar2
         std::memcpy(normalized_hidden->mutable_data(), input_hidden->data(),
                     effective_seq_len * d_model_ * sizeof(float));
 
-        // 1. Pre-FFN RMSNorm
-        VALIDATE_KERNEL(norm_kernel, layer.ffn_norm->createRMSNorm(), "RMSNorm kernel");
-        VALIDATE_OP(norm_kernel->apply(
-                        normalized_hidden->data(), layer.ffn_norm->data(), normalized_hidden->mutable_data(),
-                        effective_seq_len, d_model_, 1e-6f, false, mpi_ctx_.get(), ffn_device),
+        // 1. Pre-FFN RMSNorm - clean tensor interface
+        auto *activation_tensor_norm = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
+        VALIDATE_POINTER(activation_tensor_norm, "activation tensor for FFN RMSNorm");
+
+        VALIDATE_OP(activation_tensor_norm->applyRMSNorm(
+                        layer.ffn_norm->data(), effective_seq_len, d_model_,
+                        1e-6f, mpi_ctx_.get(), ffn_device),
                     "FFN norm");
         VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_ffn_norm");
 
@@ -637,7 +680,11 @@ namespace llaminar2
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_UP", buffers.up, effective_seq_len, d_ff_);
 
         // 3. SwiGLU activation (up buffer reused for output)
-        VALIDATE_KERNEL(swiglu_kernel, layer.gate_proj->createSwiGLU(), "SwiGLU kernel");
+        // Create kernel from activation tensor (up buffer), not weight tensor
+        auto *activation_tensor_up = dynamic_cast<IActivationTensor *>(buffers.up.get());
+        VALIDATE_POINTER(activation_tensor_up, "activation tensor for SwiGLU kernel");
+        VALIDATE_KERNEL(swiglu_kernel, activation_tensor_up->createSwiGLU(), "SwiGLU kernel");
+
         VALIDATE_OP(swiglu_kernel->apply(
                         buffers.gate->data(), buffers.up->data(),
                         buffers.up->mutable_data(),
@@ -843,9 +890,9 @@ namespace llaminar2
         // Allocate logits buffer if needed
         if (!logits_buffer_ || static_cast<int>(logits_buffer_->shape()[0]) != effective_seq_len)
         {
-            logits_buffer_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
-                device_idx_);
+            logits_buffer_ = createActivationTensor(
+                {static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
+                device_idx_, config_.activation_precision);
             LOG_INFO("Allocated logits buffer: "
                      << effective_seq_len << " x " << vocab_size_ << " on device " << device_idx_);
         }

@@ -25,7 +25,6 @@ namespace llaminar2::primitives
     struct RMSNormExecOptions
     {
         bool allow_parallel = true;                  // Permit OpenMP parallelization
-        bool force_scalar = false;                   // Force scalar path (no SIMD)
         std::size_t parallel_threshold_elems = 2048; // Threshold for parallelization
         bool t5_compat_mode = false;                 // Use float32 accumulation for T5 parity
     };
@@ -139,6 +138,180 @@ namespace llaminar2::primitives
         const RMSNormExecOptions &opts = {});
 
     // ========================================================================
+    // Per-Row Primitives (Testable SIMD variants)
+    // ========================================================================
+
+    /**
+     * @brief RMSNorm per-row FP32 scalar implementation
+     *
+     * Computes RMSNorm for a single row using scalar arithmetic.
+     *
+     * @param src Input row [cols]
+     * @param gamma Gamma weights [cols]
+     * @param dst Output row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_scalar(
+        const float *src,
+        const float *gamma,
+        float *dst,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm per-row FP32 AVX2 implementation
+     *
+     * Computes RMSNorm for a single row using AVX2 vectorization.
+     * Available only when AVX2 is supported at compile time.
+     *
+     * @param src Input row [cols]
+     * @param gamma Gamma weights [cols]
+     * @param dst Output row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_avx2(
+        const float *src,
+        const float *gamma,
+        float *dst,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm per-row FP32 AVX512 implementation
+     *
+     * Computes RMSNorm for a single row using AVX512 vectorization.
+     * Available only when AVX512F is supported at compile time.
+     *
+     * @param src Input row [cols]
+     * @param gamma Gamma weights [cols]
+     * @param dst Output row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_avx512(
+        const float *src,
+        const float *gamma,
+        float *dst,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm per-row BF16 scalar implementation
+     *
+     * Computes RMSNorm for a single row using scalar arithmetic.
+     * Input/output are BF16 (stored as uint16_t), gamma is FP32.
+     *
+     * @param src Input BF16 row [cols]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst Output BF16 row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_bf16_scalar(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm per-row BF16 AVX2 implementation
+     *
+     * Computes RMSNorm for a single row using AVX2 vectorization.
+     * Input/output are BF16 (stored as uint16_t), gamma is FP32.
+     *
+     * @param src Input BF16 row [cols]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst Output BF16 row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_bf16_avx2(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm per-row BF16 AVX512 implementation
+     *
+     * Computes RMSNorm for a single row using AVX512 vectorization.
+     * Input/output are BF16 (stored as uint16_t), gamma is FP32.
+     *
+     * @param src Input BF16 row [cols]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst Output BF16 row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_bf16_avx512(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm per-row FP16 scalar implementation
+     *
+     * Computes RMSNorm for a single row using scalar arithmetic.
+     * Input/output are FP16 (stored as uint16_t), gamma is FP32.
+     *
+     * @param src Input FP16 row [cols]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst Output FP16 row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_fp16_scalar(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm per-row FP16 AVX2 implementation
+     *
+     * Computes RMSNorm for a single row using AVX2 vectorization (F16C).
+     * Input/output are FP16 (stored as uint16_t), gamma is FP32.
+     *
+     * @param src Input FP16 row [cols]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst Output FP16 row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_fp16_avx2(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon);
+
+    /**
+     * @brief RMSNorm per-row FP16 AVX512 implementation
+     *
+     * Computes RMSNorm for a single row using AVX512 vectorization.
+     * Input/output are FP16 (stored as uint16_t), gamma is FP32.
+     *
+     * @param src Input FP16 row [cols]
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst Output FP16 row [cols]
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     */
+    void rmsnorm_fused_row_fp16_avx512(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t cols,
+        float epsilon);
+
+    // ========================================================================
     // INT32 RMSNorm (for full INT8 pipelines)
     // ========================================================================
 
@@ -226,6 +399,66 @@ namespace llaminar2::primitives
         std::size_t cols,
         float epsilon,
         RMSNormScratch &scratch,
+        const RMSNormExecOptions &opts = {});
+
+    // ========================================================================
+    // BF16 RMSNorm (native bfloat16 operations)
+    // ========================================================================
+
+    /**
+     * @brief Fused RMSNorm for BF16 tensors (native precision)
+     *
+     * Performs RMSNorm directly on BF16 data without conversion to FP32:
+     * 1. Convert BF16 input to FP32 for high-precision accumulation
+     * 2. Compute RMS normalization
+     * 3. Apply gamma weights
+     * 4. Convert result back to BF16
+     *
+     * @param src Input BF16 tensor [rows, cols] (stored as uint16_t)
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst Output BF16 tensor [rows, cols] (stored as uint16_t)
+     * @param rows Number of rows
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     * @param opts Execution options
+     */
+    void rmsnorm_fused_bf16_vectorized(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t rows,
+        std::size_t cols,
+        float epsilon,
+        const RMSNormExecOptions &opts = {});
+
+    // ========================================================================
+    // FP16 RMSNorm (native float16 operations)
+    // ========================================================================
+
+    /**
+     * @brief Fused RMSNorm for FP16 tensors (native precision)
+     *
+     * Performs RMSNorm directly on FP16 data without conversion to FP32:
+     * 1. Convert FP16 input to FP32 for high-precision accumulation
+     * 2. Compute RMS normalization
+     * 3. Apply gamma weights
+     * 4. Convert result back to FP16
+     *
+     * @param src Input FP16 tensor [rows, cols] (stored as uint16_t)
+     * @param gamma Gamma weights [cols] (FP32)
+     * @param dst Output FP16 tensor [rows, cols] (stored as uint16_t)
+     * @param rows Number of rows
+     * @param cols Number of columns
+     * @param epsilon Epsilon for numerical stability
+     * @param opts Execution options
+     */
+    void rmsnorm_fused_fp16_vectorized(
+        const uint16_t *src,
+        const float *gamma,
+        uint16_t *dst,
+        std::size_t rows,
+        std::size_t cols,
+        float epsilon,
         const RMSNormExecOptions &opts = {});
 
 } // namespace llaminar2::primitives

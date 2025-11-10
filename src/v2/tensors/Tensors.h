@@ -14,6 +14,8 @@
 
 #include "TensorKernels.h"
 #include "FP16Utils.h"
+#include "SIMDHelpers.h"
+#include "AlignedVector.h"
 #include <vector>
 #include <memory>
 #include <cstddef>
@@ -267,6 +269,93 @@ namespace llaminar2
     };
 
     /**
+     * @brief Interface for activation tensors that support kernel creation
+     *
+     * Only activation tensor types (FP32, BF16, FP16, INT32) should implement this.
+     * Quantized weight tensors (IQ4_NL, Q8_0, Q6_K, etc.) do NOT implement this interface.
+     *
+     * Rationale:
+     * - Kernels operate on ACTIVATION buffers (hidden states, Q/K/V, etc.)
+     * - Kernel precision must match ACTIVATION precision, not weight precision
+     * - Creating kernels from weight tensors is architecturally incorrect
+     */
+    class IActivationTensor
+    {
+    public:
+        virtual ~IActivationTensor() = default;
+
+        // Kernel creation (only for activation operations)
+        virtual std::unique_ptr<ITensorRoPE> createRoPE() = 0;
+        virtual std::unique_ptr<ITensorSwiGLU> createSwiGLU() = 0;
+        virtual std::unique_ptr<ITensorSoftmax> createSoftmax() = 0;
+        virtual std::unique_ptr<ITensorRMSNorm> createRMSNorm() = 0;
+        virtual std::unique_ptr<ITensorAttention> createAttention() = 0;
+
+        /**
+         * @brief Apply RMSNorm in-place (native precision, no conversion overhead)
+         *
+         * Each tensor type implements this using its native precision method:
+         * - FP32Tensor: apply() with FP32 buffers
+         * - BF16Tensor: apply_bf16() with BF16 buffers
+         * - FP16Tensor: apply_fp16() with FP16 buffers
+         * - INT32Tensor: apply_int32_to_int8() with INT32→INT8 requantization
+         *
+         * @param gamma RMSNorm scale parameters [d_model] (always FP32)
+         * @param seq_len Sequence length
+         * @param d_model Model dimension
+         * @param eps Epsilon for numerical stability
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index for kernel execution
+         *
+         * @return true on success, false on failure
+         */
+        virtual bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) = 0;
+
+        /**
+         * @brief Apply rotary position embeddings in-place (native precision)
+         *
+         * Each tensor type implements this using its native precision method:
+         * - FP32Tensor: apply() with FP32 buffers
+         * - BF16Tensor: apply_bf16() with BF16 buffers (faster, negligible loss)
+         * - FP16Tensor: apply_fp16() with FP16 buffers
+         * - INT32Tensor: Not supported (RoPE is activation operation, not quantized)
+         *
+         * @param Q Query tensor (this tensor, modified in-place)
+         * @param K Key tensor (separate tensor, modified in-place)
+         * @param position_ids Position indices [seq_len] (int32)
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads (GQA support)
+         * @param head_dim Dimension per head
+         * @param rope_theta RoPE frequency base (10000.0 for LLaMA, 1000000.0 for Qwen2.5)
+         * @param use_bf16 Hint to use BF16 internally (tensor decides based on native type)
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index for kernel execution
+         *
+         * @return true on success, false on failure
+         *
+         * @note Q is this activation tensor, K is passed as parameter
+         */
+        virtual bool applyRoPE(
+            float *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta = 10000.0f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) = 0;
+    };
+
+    /**
      * @brief Abstract tensor interface
      */
     class TensorBase : public std::enable_shared_from_this<TensorBase>
@@ -291,13 +380,9 @@ namespace llaminar2
         // Device transfers (Phase 4.2)
         virtual bool copyFrom(const TensorBase *src) = 0; // Copy data from another tensor (handles device transfers)
 
-        // Kernel creation (fused operations)
+        // Kernel creation (only for weight matrices - GEMM)
+        // NOTE: RoPE, SwiGLU, Softmax, RMSNorm, Attention moved to IActivationTensor
         virtual std::unique_ptr<ITensorGemm> createGemm() = 0;
-        virtual std::unique_ptr<ITensorRoPE> createRoPE() = 0;
-        virtual std::unique_ptr<ITensorSwiGLU> createSwiGLU() = 0;
-        virtual std::unique_ptr<ITensorSoftmax> createSoftmax() = 0;
-        virtual std::unique_ptr<ITensorRMSNorm> createRMSNorm() = 0;
-        virtual std::unique_ptr<ITensorAttention> createAttention() = 0;
 
         // ===== Generic Type Conversion API =====
 
@@ -352,7 +437,7 @@ namespace llaminar2
          * @param dst_row_scales Destination for per-row scales (rows floats, optional)
          * @return true if successful, false if tensor is not 2D or conversion not supported
          *
-         * @note Uses IBlockDecoder interface to decode quantized formats directly to INT8
+         * @note Uses ITensorGemmTileDataProvider interface to decode quantized formats directly to INT8
          * @note Avoids double-quantization error (GGUF → FP32 → INT8)
          * @note For weight matrices in INT8 GEMM operations
          */
@@ -377,19 +462,19 @@ namespace llaminar2
 
     protected:
         /**
-         * @brief Helper method for quantized tensors that implement IBlockDecoder
+         * @brief Helper method for quantized tensors that implement ITensorGemmTileDataProvider
          * @param dst Destination FP32 buffer
          * @note This leverages the existing decode_block_at() method for block-quantized formats
          */
         void to_fp32_via_blocks(float *dst) const;
 
         /**
-         * @brief Helper method for quantized tensors that implement IBlockDecoder
+         * @brief Helper method for quantized tensors that implement ITensorGemmTileDataProvider
          *        Converts directly to INT8 with per-channel quantization
          * @param dst_int8 Destination INT8 buffer
          * @param dst_col_scales Destination for per-column scales
          * @param dst_row_scales Destination for per-row scales (optional)
-         * @return true if successful, false if not 2D or not IBlockDecoder
+         * @return true if successful, false if not 2D or not ITensorGemmTileDataProvider
          * @note Avoids double-quantization by decoding blocks directly to FP32 temporarily,
          *       then quantizing to INT8 with per-channel scales
          */
@@ -444,7 +529,7 @@ namespace llaminar2
     /**
      * @brief FP32 tensor with optional device storage
      */
-    class FP32Tensor : public TensorBase
+    class FP32Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
     {
     public:
         explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx = -1);
@@ -464,11 +549,33 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Device-aware copy
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // IActivationTensor interface - activation-only operations
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        bool applyRoPE(
+            float *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta = 10000.0f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
 
         // Format conversion
         void to_fp32(float *dst) const override;
@@ -485,26 +592,63 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
+        // ITensorGemmTileDataProvider interface - for GEMM kernels to use FP32 weights directly
+        // FP32 is not block-quantized, but we provide blocking for cache efficiency
+        static constexpr size_t FP32_BLOCK_SIZE = 32; // Match quantized formats for fair comparison
+
+        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
+        {
+            // Calculate starting position for this block
+            const size_t cols = shape_[1];
+            const size_t k_start = k_block_offset * FP32_BLOCK_SIZE;
+            const float *fp32_row = data() + row_idx * cols + k_start;
+
+            // Determine how many elements to copy (may be less than BLOCK_SIZE at row end)
+            const size_t elements_remaining = cols - k_start;
+            const size_t elements_to_copy = std::min(static_cast<size_t>(FP32_BLOCK_SIZE), elements_remaining);
+
+            // Copy block data (contiguous memory access)
+            std::memcpy(output, fp32_row, elements_to_copy * sizeof(float));
+
+            // Zero-pad remainder if K is not multiple of BLOCK_SIZE
+            if (elements_to_copy < FP32_BLOCK_SIZE)
+            {
+                std::memset(output + elements_to_copy, 0, (FP32_BLOCK_SIZE - elements_to_copy) * sizeof(float));
+            }
+        }
+
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
+        {
+            // Return pointer to raw FP32 data for this block
+            const size_t cols = shape_[1];
+            const size_t k_start = k_block_offset * FP32_BLOCK_SIZE;
+            return data() + row_idx * cols + k_start;
+        }
+
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return FP32_BLOCK_SIZE; }
+
     private:
         // Private constructor for creating views
         FP32Tensor(const std::vector<size_t> &shape,
                    int device_idx,
-                   std::vector<float> *parent_data,
+                   AlignedVector<float> *parent_data,
                    size_t data_offset,
                    std::shared_ptr<FP32Tensor> parent);
         std::vector<size_t> shape_;
         int device_idx_; // -1 = host, ≥0 = device index
 
         // Ownership model:
-        // - If is_view_ == false: owns host_data_
+        // - If is_view_ == false: owns host_data_ (64-byte aligned for SIMD)
         // - If is_view_ == true: parent_data_ptr_ points to parent's host_data_
         bool is_view_;
-        std::vector<float> host_data_;        // Owned data (only used when !is_view_)
-        std::vector<float> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
-        size_t view_offset_;                  // Offset into parent data (only used when is_view_)
-        std::shared_ptr<FP32Tensor> parent_;  // Keep parent alive (only used when is_view_)
-                                              // Always allocated
-        void *device_data_;                   // Allocated if device_idx ≥ 0
+        AlignedVector<float> host_data_;        // Owned data (64-byte aligned, only used when !is_view_)
+        AlignedVector<float> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
+        size_t view_offset_;                    // Offset into parent data (only used when is_view_)
+        std::shared_ptr<FP32Tensor> parent_;    // Keep parent alive (only used when is_view_)
+                                                // Always allocated
+        void *device_data_;                     // Allocated if device_idx ≥ 0
 
         bool host_dirty_;   // Host modified, needs upload
         bool device_dirty_; // Device modified, needs download
@@ -523,7 +667,7 @@ namespace llaminar2
      * - Precision: ~3-4 decimal digits
      * - 2× memory reduction vs FP32
      */
-    class FP16Tensor : public TensorBase
+    class FP16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
     {
     public:
         explicit FP16Tensor(const std::vector<size_t> &shape);
@@ -544,11 +688,33 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // IActivationTensor interface - activation-only operations
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        bool applyRoPE(
+            float *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta = 10000.0f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override;
@@ -565,8 +731,51 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
+        // ITensorGemmTileDataProvider interface - for GEMM kernels to decode FP16→FP32 on-the-fly
+        static constexpr size_t FP16_BLOCK_SIZE = 32; // Match quantized formats for cache efficiency
+
+        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
+        {
+            // Calculate starting position for this block
+            const size_t cols = shape_[1];
+            const size_t k_start = k_block_offset * FP16_BLOCK_SIZE;
+            const uint16_t *fp16_row = fp16_data() + row_idx * cols + k_start;
+
+            // Determine how many elements to convert (may be less than BLOCK_SIZE at row end)
+            const size_t elements_remaining = cols - k_start;
+            const size_t elements_to_convert = std::min(static_cast<size_t>(FP16_BLOCK_SIZE), elements_remaining);
+
+            // Convert block from FP16 to FP32
+            for (size_t i = 0; i < elements_to_convert; ++i)
+            {
+                output[i] = simd::fp16_to_fp32(fp16_row[i]);
+            }
+
+            // Zero-pad remainder if K is not multiple of BLOCK_SIZE
+            if (elements_to_convert < FP16_BLOCK_SIZE)
+            {
+                std::memset(output + elements_to_convert, 0, (FP16_BLOCK_SIZE - elements_to_convert) * sizeof(float));
+            }
+        }
+
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
+        {
+            // Return pointer to raw FP16 data for this block
+            const size_t cols = shape_[1];
+            const size_t k_start = k_block_offset * FP16_BLOCK_SIZE;
+            return fp16_data() + row_idx * cols + k_start;
+        }
+
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return FP16_BLOCK_SIZE; }
+
         // FP16-specific interface
         const uint16_t *fp16_data() const
+        {
+            return is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_fp16_data_.data();
+        }
+        uint16_t *mutable_fp16_data()
         {
             return is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_fp16_data_.data();
         }
@@ -577,7 +786,7 @@ namespace llaminar2
         // Private constructor for creating views
         FP16Tensor(const std::vector<size_t> &shape,
                    int device_idx,
-                   std::vector<uint16_t> *parent_data,
+                   AlignedVector<uint16_t> *parent_data,
                    size_t data_offset,
                    std::shared_ptr<FP16Tensor> parent);
 
@@ -585,16 +794,16 @@ namespace llaminar2
         int device_idx_;
 
         // Ownership model:
-        // - If is_view_ == false: owns host_fp16_data_
+        // - If is_view_ == false: owns host_fp16_data_ (64-byte aligned for SIMD)
         // - If is_view_ == true: parent_data_ptr_ points to parent's host_fp16_data_
         bool is_view_;
-        std::vector<uint16_t> host_fp16_data_;   // Owned data (only used when !is_view_)
-        std::vector<uint16_t> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
-        size_t view_offset_;                     // Offset into parent data (only used when is_view_)
-        std::shared_ptr<FP16Tensor> parent_;     // Keep parent alive (only used when is_view_)
+        AlignedVector<uint16_t> host_fp16_data_;   // Owned data (64-byte aligned, only used when !is_view_)
+        AlignedVector<uint16_t> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
+        size_t view_offset_;                       // Offset into parent data (only used when is_view_)
+        std::shared_ptr<FP16Tensor> parent_;       // Keep parent alive (only used when is_view_)
 
-        void *device_data_;                        // Device-side storage
-        mutable std::vector<float> dequant_cache_; // For data() calls
+        void *device_data_;                          // Device-side storage
+        mutable AlignedVector<float> dequant_cache_; // For data() calls (64-byte aligned)
 
         bool sync_to_device();
         bool sync_from_device();
@@ -611,7 +820,7 @@ namespace llaminar2
      * - 2× memory reduction vs FP32
      * - Hardware acceleration on Ice Lake+, Zen 4+
      */
-    class BF16Tensor : public TensorBase
+    class BF16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider
     {
     public:
         explicit BF16Tensor(const std::vector<size_t> &shape);
@@ -632,11 +841,33 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // IActivationTensor interface - activation-only operations
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        bool applyRoPE(
+            float *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta = 10000.0f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override;
@@ -653,8 +884,39 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
+        // ITensorGemmTileDataProvider interface - for GEMM kernels to decode BF16→FP32 on-the-fly
+        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
+        {
+            // BF16 tensors are NOT block-quantized - they're element-wise BF16 values
+            // For compatibility with micro-kernel template, treat each row as contiguous "blocks"
+            // where block_size = number of columns
+            const size_t cols = shape_[1];
+            const uint16_t *bf16_row = bf16_data() + row_idx * cols;
+
+            // Convert entire row from BF16 to FP32
+            for (size_t i = 0; i < cols; ++i)
+            {
+                output[i] = simd::bf16_to_fp32(bf16_row[i]);
+            }
+        }
+
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
+        {
+            // Return pointer to raw BF16 data for this row
+            const size_t cols = shape_[1];
+            return bf16_data() + row_idx * cols;
+        }
+
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return shape_[1]; } // Entire row is one "block"
+
         // BF16-specific interface (deprecated - use TensorBase methods instead)
         const uint16_t *bf16_data() const
+        {
+            return is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_bf16_data_.data();
+        }
+        uint16_t *mutable_bf16_data()
         {
             return is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_bf16_data_.data();
         }
@@ -665,7 +927,7 @@ namespace llaminar2
         // Private constructor for creating views
         BF16Tensor(const std::vector<size_t> &shape,
                    int device_idx,
-                   std::vector<uint16_t> *parent_data,
+                   AlignedVector<uint16_t> *parent_data,
                    size_t data_offset,
                    std::shared_ptr<BF16Tensor> parent);
 
@@ -673,23 +935,23 @@ namespace llaminar2
         int device_idx_;
 
         // Ownership model:
-        // - If is_view_ == false: owns host_bf16_data_
+        // - If is_view_ == false: owns host_bf16_data_ (64-byte aligned for SIMD)
         // - If is_view_ == true: parent_data_ptr_ points to parent's host_bf16_data_
         bool is_view_;
-        std::vector<uint16_t> host_bf16_data_;   // Owned data (only used when !is_view_)
-        std::vector<uint16_t> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
-        size_t view_offset_;                     // Offset into parent data (only used when is_view_)
-        std::shared_ptr<BF16Tensor> parent_;     // Keep parent alive (only used when is_view_)
+        AlignedVector<uint16_t> host_bf16_data_;   // Owned data (64-byte aligned, only used when !is_view_)
+        AlignedVector<uint16_t> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
+        size_t view_offset_;                       // Offset into parent data (only used when is_view_)
+        std::shared_ptr<BF16Tensor> parent_;       // Keep parent alive (only used when is_view_)
 
-        void *device_data_;                        // Device-side storage
-        mutable std::vector<float> dequant_cache_; // For data() calls
+        void *device_data_;                          // Device-side storage
+        mutable AlignedVector<float> dequant_cache_; // For data() calls (64-byte aligned)
 
         bool sync_to_device();
         bool sync_from_device();
     };
 
-    // Forward declare for IBlockDecoder
-    class IBlockDecoder;
+    // Forward declare for ITensorGemmTileDataProvider
+    class ITensorGemmTileDataProvider;
 
     // Implementation: INT8Tensor.cpp
     /**
@@ -704,7 +966,7 @@ namespace llaminar2
      * Use case: When --weight-precision int8 is set, all quantized tensors
      * (IQ4_NL, Q6_K, Q8_0, etc.) are dequantized to this format at load time.
      */
-    class INT8Tensor : public TensorBase
+    class INT8Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         explicit INT8Tensor(const std::vector<size_t> &shape);
@@ -729,11 +991,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion
         void to_fp32(float *dst) const override;
@@ -775,15 +1032,26 @@ namespace llaminar2
             row_scales_cache_.assign(scales, scales + count);
         }
 
+        // ITensorGemmTileDataProvider interface - for INT8 GEMM kernels
+        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
+
+        __attribute__((always_inline))
+        const void *
+        get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
+
+        size_t decoder_rows() const override { return shape_[0]; }
+        size_t decoder_cols() const override { return shape_[1]; }
+        size_t block_size() const override { return shape_[1]; } // Full row per block
+
     private:
         std::vector<size_t> shape_;
         int device_idx_ = -1;
-        std::vector<int8_t> host_int8_data_;
+        AlignedVector<int8_t> host_int8_data_;        // 64-byte aligned for SIMD operations
         float scale_ = 1.0f;                          ///< Global scale factor (fallback if col_scales_ empty)
         std::vector<float> col_scales_;               ///< Per-column scales (for 2D weight matrices)
         mutable std::vector<float> row_scales_cache_; ///< Cached per-row scales (computed on-demand)
         void *device_data_ = nullptr;
-        mutable std::vector<float> dequant_cache_;
+        mutable AlignedVector<float> dequant_cache_; // 64-byte aligned dequant buffer
 
         bool sync_to_device();
         bool sync_from_device();
@@ -804,7 +1072,7 @@ namespace llaminar2
      * Usage:
      *   INT8×INT8 GEMM → INT32Tensor → requantize_to_int8() → INT8Tensor (next layer)
      */
-    class INT32Tensor : public TensorBase
+    class INT32Tensor : public TensorBase, public IActivationTensor
     {
     public:
         explicit INT32Tensor(const std::vector<size_t> &shape);
@@ -829,11 +1097,33 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        // IActivationTensor interface - activation-only operations
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        bool applyRoPE(
+            float *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta = 10000.0f,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
 
         // Format conversion
         void to_fp32(float *dst) const override;
@@ -881,11 +1171,11 @@ namespace llaminar2
     private:
         std::vector<size_t> shape_;
         int device_idx_ = -1;
-        std::vector<int32_t> host_int32_data_;
-        float scale_ = 1.0f;            ///< Global scale factor
-        std::vector<float> row_scales_; ///< Per-row scales (optional)
+        AlignedVector<int32_t> host_int32_data_; // 64-byte aligned for SIMD operations
+        float scale_ = 1.0f;                     ///< Global scale factor
+        std::vector<float> row_scales_;          ///< Per-row scales (optional)
         void *device_data_ = nullptr;
-        mutable std::vector<float> dequant_cache_; ///< Cached FP32 dequantization
+        mutable AlignedVector<float> dequant_cache_; ///< Cached FP32 dequantization (64-byte aligned)
 
         bool sync_to_device();
         bool sync_from_device();
@@ -898,9 +1188,9 @@ namespace llaminar2
      * Implements non-linear 4-bit quantization with lookup table.
      * Provides both full decode and fused kernel interfaces.
      *
-     * Also implements IBlockDecoder to enable generic QuantizedGemmKernel.
+     * Also implements ITensorGemmTileDataProvider to enable generic QuantizedGemmKernel.
      */
-    class IQ4_NLTensor : public TensorBase, public IBlockDecoder
+    class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -920,11 +1210,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override; // Fused dequant+GEMM
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface - delegates to decode methods)
         void to_fp32(float *dst) const override { decode_to_fp32(dst); }
@@ -976,7 +1261,7 @@ namespace llaminar2
         const IQ4_NLBlock &get_block_at(size_t row_idx, size_t k_block_offset) const;
         void decode_tile_blocks(size_t row_start, size_t tile_n, size_t k_block_offset, float *output) const;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
@@ -1047,7 +1332,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + int8[32] values
      * Compression: 4× vs FP32
      */
-    class Q8_0Tensor : public TensorBase, public IBlockDecoder
+    class Q8_0Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1067,11 +1352,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1091,7 +1371,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
@@ -1157,7 +1437,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + 4-bit packed values
      * Compression: 8× vs FP32
      */
-    class Q4_0Tensor : public TensorBase, public IBlockDecoder
+    class Q4_0Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1176,11 +1456,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1263,7 +1538,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + FP16 min + 4-bit packed values
      * Compression: ~7.1× vs FP32
      */
-    class Q4_1Tensor : public TensorBase, public IBlockDecoder
+    class Q4_1Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1282,11 +1557,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1370,7 +1640,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~6.4× vs FP32
      */
-    class Q5_0Tensor : public TensorBase, public IBlockDecoder
+    class Q5_0Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1389,11 +1659,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1477,7 +1742,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~5.7× vs FP32
      */
-    class Q5_1Tensor : public TensorBase, public IBlockDecoder
+    class Q5_1Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1496,11 +1761,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1580,7 +1840,7 @@ namespace llaminar2
     /**
      * @brief Q6_K tensor (6-bit K-quant super-block)
      */
-    class Q6_KTensor : public TensorBase, public IBlockDecoder
+    class Q6_KTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1599,11 +1859,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1681,7 +1936,7 @@ namespace llaminar2
     /**
      * @brief Q2_K tensor (2-bit K-quant super-block)
      */
-    class Q2_KTensor : public TensorBase, public IBlockDecoder
+    class Q2_KTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1700,11 +1955,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1783,7 +2033,7 @@ namespace llaminar2
     /**
      * @brief Q5_K tensor (5-bit K-quant super-block)
      */
-    class Q5_KTensor : public TensorBase, public IBlockDecoder
+    class Q5_KTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1802,11 +2052,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1825,7 +2070,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inlined for zero overhead)
+        // ITensorGemmTileDataProvider interface (inlined for zero overhead)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
@@ -1888,7 +2133,7 @@ namespace llaminar2
     /**
      * @brief Q3_K tensor (3-bit K-quant super-block)
      */
-    class Q3_KTensor : public TensorBase, public IBlockDecoder
+    class Q3_KTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -1907,11 +2152,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -1989,7 +2229,7 @@ namespace llaminar2
     /**
      * @brief Q4_K tensor (4-bit K-quant super-block)
      */
-    class Q4_KTensor : public TensorBase, public IBlockDecoder
+    class Q4_KTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2008,11 +2248,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2031,7 +2266,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inlined for zero overhead)
+        // ITensorGemmTileDataProvider interface (inlined for zero overhead)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q4_KBlock::BLOCK_SIZE - 1) / Q4_KBlock::BLOCK_SIZE;
@@ -2094,7 +2329,7 @@ namespace llaminar2
     /**
      * @brief Q8_K tensor (8-bit K-quant super-block)
      */
-    class Q8_KTensor : public TensorBase, public IBlockDecoder
+    class Q8_KTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2113,11 +2348,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2136,7 +2366,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inlined for zero overhead)
+        // ITensorGemmTileDataProvider interface (inlined for zero overhead)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q8_KBlock::BLOCK_SIZE - 1) / Q8_KBlock::BLOCK_SIZE;
@@ -2199,7 +2429,7 @@ namespace llaminar2
     /**
      * @brief IQ4_XS tensor (4-bit extra-small IQ)
      */
-    class IQ4_XSTensor : public TensorBase, public IBlockDecoder
+    class IQ4_XSTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2218,11 +2448,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2242,7 +2467,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
@@ -2299,7 +2524,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XXS tensor (2-bit extra-extra-small IQ)
      */
-    class IQ2_XXSTensor : public TensorBase, public IBlockDecoder
+    class IQ2_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2318,11 +2543,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2342,7 +2562,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
@@ -2399,7 +2619,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XS tensor (2-bit extra-small IQ)
      */
-    class IQ2_XSTensor : public TensorBase, public IBlockDecoder
+    class IQ2_XSTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2418,11 +2638,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2442,7 +2657,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
@@ -2499,7 +2714,7 @@ namespace llaminar2
     /**
      * @brief IQ3_XXS tensor (3-bit extra-extra-small IQ)
      */
-    class IQ3_XXSTensor : public TensorBase, public IBlockDecoder
+    class IQ3_XXSTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2518,11 +2733,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2542,7 +2752,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
@@ -2599,7 +2809,7 @@ namespace llaminar2
     /**
      * @brief IQ2_S tensor (2-bit small IQ)
      */
-    class IQ2_STensor : public TensorBase, public IBlockDecoder
+    class IQ2_STensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2618,11 +2828,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2642,7 +2847,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
@@ -2699,7 +2904,7 @@ namespace llaminar2
     /**
      * @brief IQ3_S tensor (3-bit small IQ)
      */
-    class IQ3_STensor : public TensorBase, public IBlockDecoder
+    class IQ3_STensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2718,11 +2923,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2742,7 +2942,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
@@ -2799,7 +2999,7 @@ namespace llaminar2
     /**
      * @brief IQ1_S tensor (1-bit small IQ)
      */
-    class IQ1_STensor : public TensorBase, public IBlockDecoder
+    class IQ1_STensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2818,11 +3018,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2842,7 +3037,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface
+        // ITensorGemmTileDataProvider interface
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
@@ -2899,7 +3094,7 @@ namespace llaminar2
     /**
      * @brief IQ1_M tensor (1-bit medium IQ)
      */
-    class IQ1_MTensor : public TensorBase, public IBlockDecoder
+    class IQ1_MTensor : public TensorBase, public ITensorGemmTileDataProvider
     {
     public:
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
@@ -2918,11 +3113,6 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2942,7 +3132,7 @@ namespace llaminar2
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // IBlockDecoder interface (inline for zero overhead in GEMM hot path)
+        // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;

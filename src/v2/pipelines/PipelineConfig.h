@@ -65,9 +65,9 @@ namespace llaminar2
      * - Intermediate computations (softmax, RMSNorm, SwiGLU, etc.)
      *
      * This is INDEPENDENT of weight precision - you can have:
-     * - Native quantized weights (IQ4_NL) with FP32 activations
-     * - FP32 weights with BF16 activations
-     * - INT8 weights with INT8 activations
+     * - Native quantized weights (IQ4_NL) with FP32 activations (most common)
+     * - FP32 weights with BF16 activations (memory bandwidth optimization)
+     * - Quantized weights with INT32 activations (accumulation buffer for GEMM)
      * - Any combination that makes sense for your use case
      *
      * FP32 (default): All activations and accumulation in 32-bit float
@@ -86,18 +86,18 @@ namespace llaminar2
      *   - Requires careful handling of numerical stability
      *   - 2 bytes per activation element
      *
-     * INT8: All activations and accumulation in 8-bit integer
-     *   - Lowest memory usage (1 byte per element)
-     *   - Requires quantization-aware kernels throughout
-     *   - 4-8× faster on AVX512-VNNI or CUDA INT8 Tensor Cores
-     *   - Significant accuracy trade-off, needs validation
+     * INT32: All activations and accumulation in 32-bit integer
+     *   - Used as accumulation format in quantized inference pipelines
+     *   - 4 bytes per element (same as FP32)
+     *   - Prevents overflow from quantized GEMM accumulation
+     *   - Typically converted back to float for non-linear ops (softmax, RMSNorm)
      */
     enum class ActivationPrecision
     {
         FP32, ///< 32-bit float activations (default, highest accuracy)
         BF16, ///< bfloat16 activations (Intel AMX, reduced bandwidth)
         FP16, ///< 16-bit float activations (ARM/GPU optimization)
-        INT8  ///< 8-bit integer activations (AVX512-VNNI, CUDA INT8, lowest memory)
+        INT32 ///< 32-bit integer activations (for accumulation in quantized pipelines)
     };
 
     /**
@@ -194,7 +194,7 @@ namespace llaminar2
          * Examples:
          * - FP32: All activations in 32-bit float (highest accuracy)
          * - BF16: All activations in bfloat16 (Intel AMX optimization)
-         * - INT8: All activations in 8-bit integer (AVX512-VNNI/CUDA)
+         * - INT32: All activations in 32-bit integer (quantized pipeline accumulation)
          *
          * Note: Some operations (softmax, RMSNorm) may require FP32 for stability
          * even when activations are BF16/FP16. Kernels handle this internally.

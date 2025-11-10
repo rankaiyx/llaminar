@@ -262,6 +262,201 @@ add_v2_test(V2_Unit_INT32RMSNorm
     MPI_PROCS 1  # RMSNorm is CPU-only, single rank
 )
 
+# Test: RMSNorm precision variants (FP32/BF16/FP16/INT32 scalar/AVX2/AVX512 parity)
+add_executable(v2_test_rmsnorm_precision unit/Test__RMSNormPrecision.cpp)
+target_link_libraries(v2_test_rmsnorm_precision 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RMSNormPrecision 
+    COMMAND $<TARGET_FILE:v2_test_rmsnorm_precision>
+    LABELS "V2;Unit;Kernels;RMSNorm;FP32;BF16;FP16;INT32;SIMD;AVX2;AVX512;CPU;PrecisionTesting"
+    MPI_PROCS 1  # RMSNorm primitives are CPU-only, single rank
+)
+
+# Test: INT32→INT8 RMSNorm with dynamic requantization (full INT8 pipeline)
+add_executable(v2_test_rmsnorm_int32 unit/Test__RMSNormINT32.cpp)
+target_link_libraries(v2_test_rmsnorm_int32
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RMSNormINT32
+    COMMAND $<TARGET_FILE:v2_test_rmsnorm_int32>
+    LABELS "V2;Unit;Kernels;RMSNorm;INT32;INT8;Requantization;DynamicScaling;AVX512;AVX2;CPU;QuantizationAccuracy"
+    MPI_PROCS 1  # RMSNorm primitives are CPU-only, single rank
+)
+
+# Test: RMSNorm interface (demonstrates clean interface design)
+add_executable(v2_test_rmsnorm_interface unit/Test__RMSNormInterface.cpp)
+target_link_libraries(v2_test_rmsnorm_interface
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RMSNormInterface
+    COMMAND $<TARGET_FILE:v2_test_rmsnorm_interface>
+    LABELS "V2;Unit;Kernels;RMSNorm;InterfaceDesign;FP32;BF16;FP16;INT32;INT8;TypeSafety;CPU"
+    MPI_PROCS 1  # Interface tests are CPU-only, single rank
+)
+
+# Test: Softmax primitives (scalar/AVX2/AVX512 parity, cross-precision accuracy)
+add_executable(v2_test_softmax_primitives unit/Test__SoftmaxPrimitives.cpp)
+target_link_libraries(v2_test_softmax_primitives
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_SoftmaxPrimitives
+    COMMAND $<TARGET_FILE:v2_test_softmax_primitives>
+    LABELS "V2;Unit;Primitives;Softmax;FP32;BF16;FP16;SIMD;AVX2;AVX512;CPU;PrecisionTesting;NumericalStability"
+    MPI_PROCS 1  # Softmax primitives are CPU-only, single rank
+)
+
+# Test: ActivationTraits (trait dispatch to softmax primitives, GEMM, workspace allocation)
+add_executable(v2_test_activation_traits unit/Test__ActivationTraits.cpp)
+target_link_libraries(v2_test_activation_traits
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ActivationTraits
+    COMMAND $<TARGET_FILE:v2_test_activation_traits>
+    LABELS "V2;Unit;Primitives;ActivationTraits;FP32;BF16;FP16;INT32;TraitDispatch;TemplateSystem;CPU"
+    MPI_PROCS 1  # ActivationTraits tests are CPU-only, single rank
+)
+
+# Test: CPUAttentionT (template-based attention kernel)
+add_executable(v2_test_cpu_attention_t unit/Test__CPUAttentionT.cpp)
+target_link_libraries(v2_test_cpu_attention_t
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUAttentionT
+    COMMAND $<TARGET_FILE:v2_test_cpu_attention_t>
+    LABELS "V2;Unit;Kernels;Attention;FP32;TemplateKernel;CPU;MHA;GQA;CausalMasking"
+    MPI_PROCS 1  # CPUAttentionT tests are CPU-only, single rank
+)
+
+# Test: FusedGemmSoftmax (Stage 1 optimization - fused attention scores)
+add_executable(v2_test_fused_gemm_softmax unit/Test__FusedGemmSoftmax.cpp)
+target_link_libraries(v2_test_fused_gemm_softmax
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedGemmSoftmax
+    COMMAND $<TARGET_FILE:v2_test_fused_gemm_softmax>
+    LABELS "V2;Unit;Kernels;Attention;FusedKernel;CPU;CacheOptimization;MemoryEfficiency"
+    MPI_PROCS 1  # CPU-only kernel, single rank
+)
+
+# Test: BF16 SIMD Accuracy (Stage 2 - SIMD-optimized BF16 conversion)
+add_executable(v2_test_bf16_simd_accuracy unit/Test__BF16_SIMD_Accuracy.cpp)
+target_link_libraries(v2_test_bf16_simd_accuracy
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BF16_SIMD_Accuracy
+    COMMAND $<TARGET_FILE:v2_test_bf16_simd_accuracy>
+    LABELS "V2;Unit;TensorOperations;SIMD;BF16;AVX2;AVX512;Quantization;AccuracyTest"
+    MPI_PROCS 1  # CPU-only SIMD tests, single rank
+)
+
+# Test: TiledGemmSoftmax (tile-level fusion for attention scores)
+add_executable(v2_test_tiled_gemm_softmax unit/Test__TiledGemmSoftmax.cpp)
+target_link_libraries(v2_test_tiled_gemm_softmax
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TiledGemmSoftmax
+    COMMAND $<TARGET_FILE:v2_test_tiled_gemm_softmax>
+    LABELS "V2;Unit;Kernels;Attention;TileFusion;GEMM;Softmax;CacheOptimization;CPU;AVX2;AVX512"
+    MPI_PROCS 1  # CPU-only kernel, single rank
+)
+
+# Test: IntegerGemm (integer-domain quantized GEMM with AVX512-VNNI, llama.cpp strategy)
+add_executable(v2_test_integer_gemm unit/Test__IntegerGemm.cpp)
+target_link_libraries(v2_test_integer_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IntegerGemm
+    COMMAND $<TARGET_FILE:v2_test_integer_gemm>
+    LABELS "V2;Unit;Kernels;GEMM;Quantization;INT8;AVX512VNNI;IQ4_NL;Q8_0;IntegerArithmetic"
+    MPI_PROCS 1  # CPU-only VNNI kernel, single rank
+)
+
+# Test: BF16PackedGemm (auto-tuned BF16×BF16→FP32 GEMM with micro-kernels)
+add_executable(v2_test_bf16_packed_gemm unit/Test__BF16PackedGemm.cpp)
+target_link_libraries(v2_test_bf16_packed_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BF16PackedGemm
+    COMMAND $<TARGET_FILE:v2_test_bf16_packed_gemm>
+    LABELS "V2;Unit;Kernels;GEMM;BF16;AutoTuning;MicroKernels;CacheBlocking;CPU;AVX2;AVX512"
+    MPI_PROCS 1  # CPU-only kernel, single rank
+)
+
+# Test: INT8PackedGemm (auto-tuned INT8×INT8→INT32 GEMM with AVX512 VNNI)
+add_executable(v2_test_int8_packed_gemm unit/Test__INT8PackedGemm.cpp)
+target_link_libraries(v2_test_int8_packed_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT8PackedGemm
+    COMMAND $<TARGET_FILE:v2_test_int8_packed_gemm>
+    LABELS "V2;Unit;Kernels;GEMM;INT8;VNNI;AutoTuning;MicroKernels;CacheBlocking;CPU;AVX512;AVX512VNNI;Quantization"
+    MPI_PROCS 1  # CPU-only kernel, single rank
+)
+
+# Test: INT8GemmImpl (multi-ISA INT8 GEMM implementations - AVX512/AVX2/Scalar correctness)
+add_executable(v2_test_int8_gemm_impl unit/Test__INT8GemmImpl.cpp)
+target_link_libraries(v2_test_int8_gemm_impl
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_INT8GemmImpl
+    COMMAND $<TARGET_FILE:v2_test_int8_gemm_impl>
+    LABELS "V2;Unit;Kernels;GEMM;INT8;MultiISA;AVX512VNNI;AVX2;Scalar;ImplementationParity;CPU"
+    MPI_PROCS 1  # CPU-only multi-ISA test, single rank
+)
+
+# Test: FP16GemmImpl (multi-ISA FP16×FP16→FP32 GEMM implementations - AVX512F/F16C/Scalar correctness)
+add_executable(v2_test_fp16_gemm_impl unit/Test__FP16Gemm.cpp)
+target_link_libraries(v2_test_fp16_gemm_impl
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FP16GemmImpl
+    COMMAND $<TARGET_FILE:v2_test_fp16_gemm_impl>
+    LABELS "V2;Unit;Kernels;GEMM;FP16;MultiISA;AVX512F;F16C;AVX2;Scalar;ImplementationParity;CPU;HalfPrecision"
+    MPI_PROCS 1  # CPU-only multi-ISA test, single rank
+)
+
+# Test: FP16PackedGemm (autotuner integration with micro-kernel variants)
+add_executable(v2_test_fp16_packed_gemm unit/Test__FP16PackedGemm.cpp)
+target_link_libraries(v2_test_fp16_packed_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FP16PackedGemm
+    COMMAND $<TARGET_FILE:v2_test_fp16_packed_gemm>
+    LABELS "V2;Unit;Kernels;GEMM;FP16;AutoTuner;MicroKernels;CacheBlocking;PackedGEMM;CPU;HalfPrecision"
+    MPI_PROCS 1  # CPU-only autotuner test, single rank
+)
+
 # Test: RoPE primitives (scalar, AVX2, AVX512 parity)
 add_executable(v2_test_rope_primitives unit/Test__RoPEPrimitives.cpp)
 target_link_libraries(v2_test_rope_primitives 
@@ -273,6 +468,45 @@ add_v2_test(V2_Unit_RoPEPrimitives
     COMMAND $<TARGET_FILE:v2_test_rope_primitives>
     LABELS "V2;Unit;Primitives;RoPE;SIMD;AVX2;AVX512;RotaryPositionEncoding;ImplementationParity;CPU"
     MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
+# Test: RoPE precision correctness (scalar/AVX2/AVX512 parity + cross-precision accuracy)
+add_executable(v2_test_rope_precision unit/Test__RoPEPrecisionCorrectness.cpp)
+target_link_libraries(v2_test_rope_precision 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RoPEPrecisionCorrectness 
+    COMMAND $<TARGET_FILE:v2_test_rope_precision>
+    LABELS "V2;Unit;Primitives;RoPE;SIMD;AVX2;AVX512;Correctness;FP32;BF16;FP16;INT32;PrecisionTesting;CPU"
+    MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
+# Test: BPETokenizer (native tokenizer implementation)
+add_executable(v2_test_bpe_tokenizer unit/Test__BPETokenizer.cpp)
+target_link_libraries(v2_test_bpe_tokenizer 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BPETokenizer 
+    COMMAND $<TARGET_FILE:v2_test_bpe_tokenizer>
+    LABELS "V2;Unit;Tokenization;BPE;NLP;TextProcessing"
+    MPI_PROCS 1  # Tokenizer is single-rank only
+)
+
+# Test: Sampler (token sampling strategies for generation)
+add_executable(v2_test_sampler unit/Test__Sampler.cpp)
+target_link_libraries(v2_test_sampler 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Sampler 
+    COMMAND $<TARGET_FILE:v2_test_sampler>
+    LABELS "V2;Unit;Sampling;Generation;BasicFeatures;Greedy;Temperature;TopK;TopP"
+    MPI_PROCS 1  # Sampler is single-rank only
 )
 
 # Test: Attention parity regression tests (locks in RoPE theta, causal masking, GQA behavior)
@@ -1031,6 +1265,20 @@ add_v2_test(V2_Unit_Qwen2NullMPIContext
     COMMAND $<TARGET_FILE:v2_test_qwen2_null_mpi_context>
     MPI_PROCS 1
     LABELS "V2;Unit;PipelineExecution;Qwen;SingleRank;Regression;Models"
+    FIXTURES_REQUIRED "V2_Models"
+)
+
+# Test: IQ4_NL Alignment and Layout Diagnostics
+add_executable(v2_test_iq4nl_alignment_layout unit/Test__IQ4_NL_Alignment_Layout.cpp)
+target_link_libraries(v2_test_iq4nl_alignment_layout
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ4_NL_Alignment_Layout
+    COMMAND $<TARGET_FILE:v2_test_iq4nl_alignment_layout>
+    MPI_PROCS 1
+    LABELS "V2;Unit;TensorOperations;IQ4_NL;Diagnostics;Alignment;Layout;Performance"
     FIXTURES_REQUIRED "V2_Models"
 )
 
@@ -2228,6 +2476,168 @@ add_v2_perf_test(V2_Perf_IQ4NL_GEMM
     COMMAND $<TARGET_FILE:v2_perf_iq4nl_gemm>
     LABELS "V2;Performance;GEMM;IQ4_NL;Quantization;Throughput"
     MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
+)
+
+# Performance Test: IQ4_NL GEMM Implementation Comparison
+# Compares IQ4_NLQuantizedGemm (specialized) vs AutoTunedQuantizedGemm (generic)
+# Test cases: Single token, small/medium/large batch, Q-projection and FFN shapes
+# Measures: Time, GFLOPS, relative speedup between implementations
+add_executable(v2_perf_iq4nl_gemm_comparison performance/Perf__IQ4_NL_GEMM_Comparison.cpp)
+target_link_libraries(v2_perf_iq4nl_gemm_comparison 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_iq4nl_gemm_comparison PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_IQ4NL_GEMM_Comparison
+    COMMAND $<TARGET_FILE:v2_perf_iq4nl_gemm_comparison>
+    LABELS "V2;Performance;GEMM;IQ4_NL;Comparison;AutoTuner"
+    MPI_PROCS 2  # Match baseline configuration
+)
+
+# Performance Test: Fused GEMM+Softmax (Stage 1 Optimization)
+# Validates Stage 1 fusion claims: 47% memory reduction, 5-15% speedup
+# Test cases: seq_len 128/256/512/1024/2048, causal masking, Qwen 7B config
+add_executable(v2_perf_fused_gemm_softmax performance/Perf__FusedGemmSoftmax.cpp)
+target_link_libraries(v2_perf_fused_gemm_softmax 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_fused_gemm_softmax PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_FusedGemmSoftmax
+    COMMAND $<TARGET_FILE:v2_perf_fused_gemm_softmax>
+    LABELS "V2;Performance;Attention;FusedKernel;CacheOptimization;MemoryEfficiency"
+    MPI_PROCS 1  # Attention is single-rank (no MPI distribution)
+)
+
+# Performance Test: Multi-Precision GEMM (FP32/BF16/FP16/INT8)
+# Compares pure GEMM performance across all precision types (symmetric, not mixed)
+# Test cases: Small/Medium/Large batch sizes (32/128/512 tokens)
+# Measures: GFLOPS, bandwidth, conversion overhead, efficiency vs FP32 baseline
+add_executable(v2_perf_multiprecision_gemm performance/Perf__MultiPrecision_GEMM.cpp)
+target_link_libraries(v2_perf_multiprecision_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    MPI::MPI_CXX
+    OpenMP::OpenMP_CXX
+    ${BLAS_LIBRARIES}
+)
+set_target_properties(v2_perf_multiprecision_gemm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_MultiPrecisionGEMM
+    COMMAND $<TARGET_FILE:v2_perf_multiprecision_gemm>
+    LABELS "V2;Performance;GEMM;MultiPrecision;FP32;BF16;FP16;INT8;Throughput"
+    MPI_PROCS 2  # Symmetric multi-rank for MPI barrier synchronization
+)
+
+# Performance Test: BF16 Conversion Profiling (for linux perf analysis)
+# Isolates BF16 conversion overhead for detailed profiling with perf record/report/annotate
+# Tests: Pure conversion time vs GEMM time to identify bottlenecks
+add_executable(v2_perf_bf16_profile performance/Perf__BF16_Profile.cpp)
+target_link_libraries(v2_perf_bf16_profile 
+    llaminar2_core 
+    GTest::gtest
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_bf16_profile PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_BF16_Profile
+    COMMAND $<TARGET_FILE:v2_perf_bf16_profile>
+    LABELS "V2;Performance;BF16;Conversion;Profiling;Bandwidth"
+    MPI_PROCS 2  # Match production configuration
+)
+
+# Performance Test: Auto-tuned GEMM Cache Profiling
+# Micro-benchmark for auto-tuned IQ4_NL GEMM with L1/L2/L3 cache profiling
+# Test cases: Prefill batch sizes 32/128/512/1024/2048/4096 tokens
+# Profiles: Cache miss rates, IPC/CPI, memory bandwidth, GFLOPS
+# Uses: Linux perf_event_open for hardware performance counters
+add_executable(v2_perf_autotuned_gemm_cache performance/Perf__AutoTunedGemm_CacheProfiling.cpp)
+target_link_libraries(v2_perf_autotuned_gemm_cache 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_autotuned_gemm_cache PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_AutoTunedGemm_CacheProfiling
+    COMMAND $<TARGET_FILE:v2_perf_autotuned_gemm_cache>
+    LABELS "V2;Performance;GEMM;AutoTuner;CacheProfiling;L1;L2;L3;IQ4_NL;Prefill"
+    MPI_PROCS 1  # Single rank for pure performance (no MPI overhead)
+)
+
+# Performance Test: Exhaustive Autotuner Sweep
+# Tests ALL 1225 microkernel configurations to find globally optimal settings
+# Sweeps entire parameter space: ISA × MR × NR × UNROLL_K × PREFETCH_DIST
+# Goal: Bypass autotuner heuristic and find true performance ceiling
+add_executable(v2_perf_exhaustive_autotuner_sweep performance/Perf__Exhaustive_Autotuner_Sweep.cpp)
+target_link_libraries(v2_perf_exhaustive_autotuner_sweep
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_exhaustive_autotuner_sweep PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_ExhaustiveAutotunerSweep
+    COMMAND $<TARGET_FILE:v2_perf_exhaustive_autotuner_sweep>
+    LABELS "V2;Performance;GEMM;IQ4_NL;AutoTuner;Optimization;ConfigurationSweep"
+    MPI_PROCS 2  # 2 ranks to distribute workload, each with OpenMP parallelization
+)
+
+# Performance Test: CPU GEMM Heuristic Validation Suite
+# Comprehensive test suite for ML heuristic training data collection.
+# Covers all major model sizes from Qwen 0.5B to DeepSeek 671B (53 tests total).
+# Used to generate exhaustive benchmarking data for neural network training.
+add_executable(v2_perf_cpu_gemm_validation performance/Perf__CpuGemmHeuristicValidation.cpp)
+target_link_libraries(v2_perf_cpu_gemm_validation
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_cpu_gemm_validation PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_CpuGemmValidation
+    COMMAND $<TARGET_FILE:v2_perf_cpu_gemm_validation>
+    LABELS "V2;Performance;GEMM;MLHeuristic;Validation;Qwen;DeepSeek;IQ4_NL"
+    MPI_PROCS 1  # Single rank for consistent benchmarking
+)
+
+# Performance Test: BF16 Conversion Optimization (side-by-side comparison)
+# Tests baseline vs optimized BF16 conversion implementations
+# Optimizations: loop unrolling, prefetching, aligned loads, streaming stores
+add_executable(v2_perf_bf16_conversion_opt performance/Perf__BF16_Conversion_Optimization.cpp)
+target_link_libraries(v2_perf_bf16_conversion_opt 
+    llaminar2_core 
+    GTest::gtest
+    MPI::MPI_CXX
+)
+set_target_properties(v2_perf_bf16_conversion_opt PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_BF16_ConversionOpt
+    COMMAND $<TARGET_FILE:v2_perf_bf16_conversion_opt>
+    LABELS "V2;Performance;BF16;Conversion;Optimization;Bandwidth;SIMD"
+    MPI_PROCS 2  # Match production configuration
 )
 
 # NOTE: Removed experimental Phase 2.7 pipelining tests

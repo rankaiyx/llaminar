@@ -131,7 +131,7 @@ namespace llaminar2
 
             /**
              * @brief Dummy weight names (not used in testing)
-             * 
+             *
              * Returns a minimal set of weight names to ensure proper device
              * discovery. Without this, discoverActiveDevices() returns an empty
              * list which causes undefined behavior in multi-device mode.

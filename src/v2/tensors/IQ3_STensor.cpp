@@ -7,7 +7,7 @@
 #include "Tensors.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
-#include "../kernels/cpu/GemmAutoTuner.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include <cstring>
 #include <stdexcept>
 #include "../utils/Logger.h"
@@ -208,31 +208,15 @@ namespace llaminar2
         throw std::runtime_error("IQ3_STensor::mutable_data: quantized tensors are immutable");
     }
 
-    std::unique_ptr<llaminar2::ITensorRoPE> IQ3_STensor::createRoPE()
-    {
-        throw std::runtime_error("IQ3_STensor: RoPE not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorSwiGLU> IQ3_STensor::createSwiGLU()
-    {
-        throw std::runtime_error("IQ3_STensor: SwiGLU not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorSoftmax> IQ3_STensor::createSoftmax()
-    {
-        throw std::runtime_error("IQ3_STensor: Softmax not supported");
-    }
+    
 
-    std::unique_ptr<llaminar2::ITensorRMSNorm> IQ3_STensor::createRMSNorm()
-    {
-        throw std::runtime_error("IQ3_STensor: RMSNorm not supported");
-    }
+    
 
-    std::unique_ptr<ITensorAttention> IQ3_STensor::createAttention()
-    {
-        LOG_ERROR("[IQ3_STensor] createAttention not supported for quantized tensors");
-        return nullptr;
-    }
+    
 
     bool IQ3_STensor::copyFrom(const TensorBase *src)
     {

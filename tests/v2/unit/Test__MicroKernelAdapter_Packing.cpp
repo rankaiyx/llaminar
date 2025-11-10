@@ -1,7 +1,7 @@
 /**
  * @file Test__MicroKernelAdapter_Packing.cpp
  * @brief Unit tests for GemmMicroKernelAdapter packing logic
- * 
+ *
  * Tests the cache-blocked packing and decoding logic with various matrix sizes
  * to isolate potential buffer overflow or memory corruption issues.
  *
@@ -21,10 +21,10 @@ using namespace llaminar2::kernels::gemm;
 /**
  * @brief Simple test decoder for unit testing
  */
-class TestBlockDecoder : public llaminar2::IBlockDecoder
+class TestBlockDecoder : public llaminar2::ITensorGemmTileDataProvider
 {
 public:
-    TestBlockDecoder(size_t rows, size_t cols) 
+    TestBlockDecoder(size_t rows, size_t cols)
         : rows_(rows), cols_(cols), block_size_(32)
     {
         // Initialize with simple pattern for validation
@@ -35,7 +35,7 @@ public:
     {
         size_t k_start = k_block_offset * block_size_;
         size_t k_end = std::min(k_start + block_size_, cols_);
-        
+
         for (size_t k = k_start; k < k_end; ++k)
         {
             output[k - k_start] = data_[row_idx * cols_ + k];
@@ -48,9 +48,9 @@ public:
     }
 
     size_t block_size() const override { return block_size_; }
-    
+
     size_t decoder_rows() const override { return rows_; }
-    
+
     size_t decoder_cols() const override { return cols_; }
 
 private:
@@ -70,7 +70,7 @@ protected:
     {
         // Get a simple 4×2 kernel for testing
         auto &registry = MicroKernelRegistry::instance();
-        
+
         // Try to get a simple AVX512 4×2 kernel
         if (registry.has_kernel("simd::AVX512Tag", 4, 2, 8, 5))
         {
@@ -115,9 +115,9 @@ TEST_F(MicroKernelAdapterPackingTest, SmallMatrix)
 
     // Execute GEMM
     bool success = adapter.multiply(A.data(), C.data(), m, n, k, &decoder, 1.0f, 0.0f);
-    
+
     EXPECT_TRUE(success) << "GEMM should succeed for 32×896×896";
-    
+
     // Basic sanity check: output should be non-zero
     float sum = 0.0f;
     for (int i = 0; i < m * n; ++i)
@@ -148,9 +148,9 @@ TEST_F(MicroKernelAdapterPackingTest, MediumMatrix)
     std::vector<float> C(m * n, 0.0f);
 
     bool success = adapter.multiply(A.data(), C.data(), m, n, k, &decoder, 1.0f, 0.0f);
-    
+
     EXPECT_TRUE(success) << "GEMM should succeed for 512×896×896";
-    
+
     float sum = 0.0f;
     for (int i = 0; i < std::min(1000, m * n); ++i)
     {
@@ -180,9 +180,9 @@ TEST_F(MicroKernelAdapterPackingTest, LargeMatrix)
     std::vector<float> C(m * n, 0.0f);
 
     bool success = adapter.multiply(A.data(), C.data(), m, n, k, &decoder, 1.0f, 0.0f);
-    
+
     EXPECT_TRUE(success) << "GEMM should succeed for 1024×896×896";
-    
+
     float sum = 0.0f;
     for (int i = 0; i < std::min(1000, m * n); ++i)
     {
@@ -212,9 +212,9 @@ TEST_F(MicroKernelAdapterPackingTest, VeryLargeMatrix)
     std::vector<float> C(m * n, 0.0f);
 
     bool success = adapter.multiply(A.data(), C.data(), m, n, k, &decoder, 1.0f, 0.0f);
-    
+
     EXPECT_TRUE(success) << "GEMM should succeed for 2048×896×896";
-    
+
     float sum = 0.0f;
     for (int i = 0; i < std::min(1000, m * n); ++i)
     {
@@ -244,9 +244,9 @@ TEST_F(MicroKernelAdapterPackingTest, ExtremeMatrix)
     std::vector<float> C(m * n, 0.0f);
 
     bool success = adapter.multiply(A.data(), C.data(), m, n, k, &decoder, 1.0f, 0.0f);
-    
+
     EXPECT_TRUE(success) << "GEMM should succeed for 4096×896×896";
-    
+
     float sum = 0.0f;
     for (int i = 0; i < std::min(1000, m * n); ++i)
     {
@@ -262,30 +262,30 @@ TEST_F(MicroKernelAdapterPackingTest, BufferSizeCalculation)
 {
     // Test that buffer sizes are correctly calculated for cache blocking
     const int k = 896;
-    
-    struct TestCase {
+
+    struct TestCase
+    {
         int m;
         int expected_mc;
         int expected_nc;
     };
-    
+
     std::vector<TestCase> test_cases = {
-        {32, 128, 128},    // Medium micro-kernel (4×2 = 8 registers)
+        {32, 128, 128}, // Medium micro-kernel (4×2 = 8 registers)
         {512, 128, 128},
         {1024, 128, 128},
         {2048, 128, 128},
-        {4096, 128, 128}
-    };
-    
+        {4096, 128, 128}};
+
     for (const auto &tc : test_cases)
     {
         // Buffer sizes for MC=128, KC=512, NC=128
-        size_t a_packed_size = 128 * 512;  // MC × KC
-        size_t b_packed_size = 512 * 128;  // KC × NC
-        
+        size_t a_packed_size = 128 * 512; // MC × KC
+        size_t b_packed_size = 512 * 128; // KC × NC
+
         EXPECT_GT(a_packed_size, 0) << "A_packed size should be positive for m=" << tc.m;
         EXPECT_GT(b_packed_size, 0) << "B_packed size should be positive for m=" << tc.m;
-        
+
         // Verify sizes are reasonable (not excessive)
         EXPECT_LT(a_packed_size, 10000000) << "A_packed shouldn't exceed 10M floats";
         EXPECT_LT(b_packed_size, 10000000) << "B_packed shouldn't exceed 10M floats";

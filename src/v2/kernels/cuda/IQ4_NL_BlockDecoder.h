@@ -3,7 +3,8 @@
  * @brief IQ4_NL block decoder for CUDA kernels
  *
  * Provides device-side dequantization for IQ4_NL quantized tensors.
- * Implements the IBlockDecoder interface using compile-time polymorphism.
+ /**
+ * Implements the ITensorGemmTileDataProvider interface using compile-time polymorphism.
  *
  * @author David Sanftenberg
  * @date October 31, 2025

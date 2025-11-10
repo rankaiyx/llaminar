@@ -36,6 +36,56 @@ namespace llaminar2
             int device_idx = -1) override;
 
         /**
+         * @brief BF16 RMSNorm (native bfloat16 precision)
+         *
+         * Performs RMS normalization on BF16 tensors without conversion overhead.
+         * Internally converts to FP32 for high-precision accumulation, then converts back.
+         *
+         * @param input_bf16 Input BF16 tensor [seq_len, d_model] (stored as uint16_t)
+         * @param gamma Gamma weights [d_model] (FP32)
+         * @param output_bf16 Output BF16 tensor [seq_len, d_model] (stored as uint16_t)
+         * @param seq_len Sequence length
+         * @param d_model Model dimension
+         * @param eps Epsilon for numerical stability
+         * @param device_idx Device index (-1 for CPU)
+         *
+         * @return true on success
+         */
+        bool apply_bf16(
+            const uint16_t *input_bf16,
+            const float *gamma,
+            uint16_t *output_bf16,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            int device_idx = -1) override;
+
+        /**
+         * @brief FP16 RMSNorm (native float16 precision)
+         *
+         * Performs RMS normalization on FP16 tensors without conversion overhead.
+         * Internally converts to FP32 for high-precision accumulation, then converts back.
+         *
+         * @param input_fp16 Input FP16 tensor [seq_len, d_model] (stored as uint16_t)
+         * @param gamma Gamma weights [d_model] (FP32)
+         * @param output_fp16 Output FP16 tensor [seq_len, d_model] (stored as uint16_t)
+         * @param seq_len Sequence length
+         * @param d_model Model dimension
+         * @param eps Epsilon for numerical stability
+         * @param device_idx Device index (-1 for CPU)
+         *
+         * @return true on success
+         */
+        bool apply_fp16(
+            const uint16_t *input_fp16,
+            const float *gamma,
+            uint16_t *output_fp16,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            int device_idx = -1) override;
+
+        /**
          * @brief INT32 RMSNorm with INT8 output (for full INT8 pipelines)
          *
          * Performs RMS normalization on INT32 accumulator tensors and
@@ -62,7 +112,7 @@ namespace llaminar2
             int seq_len,
             int d_model,
             float eps = 1e-6f,
-            int device_idx = -1);
+            int device_idx = -1) override;
     };
 
 } // namespace llaminar2

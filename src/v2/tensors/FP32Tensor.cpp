@@ -11,11 +11,12 @@
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/FP32GemmKernel.h"
+#include "../kernels/cpu/gemm/GemmAutoTuner.h"
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
 #include "../kernels/cpu/CPUSwiGLUKernel.h"
 #include "../kernels/cpu/CPUAttention.h"
+#include "../kernels/cpu/CPURoPEKernel.h"
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
@@ -46,7 +47,7 @@ namespace llaminar2
 
     FP32Tensor::FP32Tensor(const std::vector<size_t> &shape,
                            int device_idx,
-                           std::vector<float> *parent_data,
+                           AlignedVector<float> *parent_data,
                            size_t data_offset,
                            std::shared_ptr<FP32Tensor> parent)
         : shape_(shape), device_idx_(device_idx), device_data_(nullptr),
@@ -107,14 +108,14 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> FP32Tensor::createGemm()
     {
-        return std::make_unique<FP32GemmKernel>(this);
+        // FP32 tensors use the auto-tuned GEMM kernel for optimal performance
+        // FP32Tensor implements ITensorGemmTileDataProvider with block_size() = 32
+        return llaminar::v2::kernels::createAutoTunedGemm(this);
     }
 
     std::unique_ptr<ITensorRoPE> FP32Tensor::createRoPE()
     {
-        // TODO: Implement RoPE kernel creation
-        LOG_ERROR("[FP32Tensor] createRoPE not yet implemented");
-        return nullptr;
+        return std::make_unique<CPURoPEKernel>();
     }
 
     std::unique_ptr<ITensorSwiGLU> FP32Tensor::createSwiGLU()
@@ -315,7 +316,7 @@ namespace llaminar2
             }
         }
 
-        std::vector<float> *root_data = is_view_ ? parent_data_ptr_ : &host_data_;
+        AlignedVector<float> *root_data = is_view_ ? parent_data_ptr_ : &host_data_;
         size_t root_offset = is_view_ ? (view_offset_ + offset) : offset;
 
         // Create view using private constructor
@@ -492,6 +493,64 @@ namespace llaminar2
 
         const float *src = data();
         std::memcpy(buffer, src + offset, count * sizeof(float));
+    }
+
+    bool FP32Tensor::applyRMSNorm(
+        const float *gamma,
+        int seq_len,
+        int d_model,
+        float eps,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        auto kernel = createRMSNorm();
+        if (!kernel)
+        {
+            LOG_ERROR("[FP32Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
+            return false;
+        }
+
+        // FP32 path: apply() with FP32 buffers (in-place)
+        return kernel->apply(
+            this->data(),
+            gamma,
+            this->mutable_data(),
+            seq_len, d_model, eps,
+            false, // normalize_gamma
+            mpi_ctx,
+            device_idx);
+    }
+
+    bool FP32Tensor::applyRoPE(
+        float *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        bool use_bf16,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        auto kernel = createRoPE();
+        if (!kernel)
+        {
+            LOG_ERROR("[FP32Tensor::applyRoPE] Failed to create RoPE kernel");
+            return false;
+        }
+
+        // FP32 path: apply() with FP32 buffers
+        // Q is this tensor, K is passed as parameter
+        return kernel->apply(
+            this->mutable_data(), // Q
+            K,                    // K
+            position_ids,
+            seq_len, n_heads, n_kv_heads, head_dim,
+            rope_theta,
+            use_bf16,
+            mpi_ctx,
+            device_idx);
     }
 
 } // namespace llaminar2

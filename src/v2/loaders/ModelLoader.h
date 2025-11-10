@@ -115,12 +115,16 @@ namespace llaminar2
         std::vector<uint8_t> data;
         uint64_t array_length = 0; // For ARRAY type, stores number of elements
 
+        // String array storage (for tokenizer vocabulary, merges, etc.)
+        std::vector<std::string> string_array_value;
+
         // Typed accessors
         uint32_t asUInt32() const;
         uint64_t asUInt64() const;
         float asFloat32() const;
         std::string asString() const;
         uint64_t asArrayLength() const { return array_length; }
+        const std::vector<std::string> &asStringArray() const { return string_array_value; }
     };
 
     /**
@@ -241,7 +245,7 @@ namespace llaminar2
          */
         std::shared_ptr<TensorBase> loadTensor(const std::string &tensor_name,
                                                int device_idx = 0,
-                                               WeightPrecision weight_precision = WeightPrecision::CONVERT_TO_FP32);
+                                               WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
     private:
         // Tensor factory (created internally if not provided)

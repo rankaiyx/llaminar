@@ -45,8 +45,8 @@ double benchmark_direct_decode(IQ4_NLTensor *tensor, int n, int k, int iters)
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-// Virtual decode test (IBlockDecoder interface)
-double benchmark_virtual_decode(const IBlockDecoder *decoder, int n, int k, int iters)
+// Virtual decode test (ITensorGemmTileDataProvider interface)
+double benchmark_virtual_decode(const ITensorGemmTileDataProvider *decoder, int n, int k, int iters)
 {
     const int num_k_blocks = (k + 31) / 32;
     alignas(64) float buffer[32];
@@ -137,12 +137,12 @@ int main()
     std::cout << "  Time: " << std::fixed << std::setprecision(2) << direct_time << " ms\n";
     std::cout << "  Throughput: " << direct_mblocks_per_sec << " Mblocks/sec\n\n";
 
-    // Test 2: Virtual decode (IBlockDecoder interface)
-    const IBlockDecoder *decoder = iq4_tensor;
+    // Test 2: Virtual decode (ITensorGemmTileDataProvider interface)
+    const ITensorGemmTileDataProvider *decoder = iq4_tensor;
     double virtual_time = benchmark_virtual_decode(decoder, n, k, decode_iters);
     double virtual_mblocks_per_sec = (decode_iters * n * ((k + 31) / 32)) / (virtual_time / 1000.0) / 1e6;
 
-    std::cout << "Test 2: Virtual Decode (IBlockDecoder*)\n";
+    std::cout << "Test 2: Virtual Decode (ITensorGemmTileDataProvider*)\n";
     std::cout << "  Time: " << virtual_time << " ms\n";
     std::cout << "  Throughput: " << virtual_mblocks_per_sec << " Mblocks/sec\n";
     std::cout << "  Overhead: " << std::setprecision(1) << (virtual_time / direct_time - 1.0) * 100.0 << "%\n\n";

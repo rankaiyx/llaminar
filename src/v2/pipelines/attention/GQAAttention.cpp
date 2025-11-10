@@ -10,9 +10,8 @@
 #include "../../utils/DebugAssert.h"
 #include "../../utils/MPIStager.h"
 #include "../../tensors/TensorFactory.h"
+#include "../../tensors/Tensors.h"
 #include "../../kernels/cpu/primitives/SoftmaxPrimitives.h"
-#include "../../kernels/cpu/FP32GemmKernel.h"
-#include "../../kernels/cpu/BF16GemmKernel.h"
 #include <cstring>
 #include <cmath>
 #include <sstream>
@@ -819,31 +818,35 @@ namespace llaminar2
         // Q: [seq_len, head_dim], K: [seq_len, head_dim]
         // scores: [seq_len, seq_len]
 
-        // Select GEMM kernel based on precision
-        std::unique_ptr<ITensorGemm> gemm_kernel;
-
         if (precision == ActivationPrecision::BF16)
         {
-            // Use BF16 GEMM for activation-activation multiply
-            gemm_kernel = std::make_unique<BF16GemmKernel>(nullptr);
-        }
-        else if (precision == ActivationPrecision::FP16)
-        {
-            // FP16 support: fallback to FP32 for now (TODO: implement FP16GemmKernel)
-            gemm_kernel = std::make_unique<FP32GemmKernel>(nullptr);
+            // BF16: Create temporary BF16Tensor view of K to get auto-tuned GEMM kernel
+            BF16Tensor K_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(head_dim)});
+            K_tensor.from_fp32(K, seq_len * head_dim);
+
+            auto gemm_kernel = K_tensor.createGemm();
+            return gemm_kernel->multiply(
+                Q, scores,
+                seq_len, seq_len, head_dim,
+                true,  // transpose_B (K^T)
+                1.0f,  // alpha
+                0.0f); // beta
         }
         else
         {
-            // FP32 (default)
-            gemm_kernel = std::make_unique<FP32GemmKernel>(nullptr);
-        }
+            // FP32 or FP16 (both use FP32 path with auto-tuner)
+            // Create temporary FP32Tensor view of K to get auto-tuned GEMM kernel
+            FP32Tensor K_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(head_dim)}, -1);
+            std::memcpy(K_tensor.mutable_data(), K, seq_len * head_dim * sizeof(float));
 
-        return gemm_kernel->multiply_activations(
-            Q, K, scores,
-            seq_len, seq_len, head_dim,
-            true,  // transpose_b (K^T)
-            1.0f,  // alpha
-            0.0f); // beta
+            auto gemm_kernel = K_tensor.createGemm();
+            return gemm_kernel->multiply(
+                Q, scores,
+                seq_len, seq_len, head_dim,
+                true,  // transpose_B (K^T)
+                1.0f,  // alpha
+                0.0f); // beta
+        }
     }
 
     void GQAAttention::scale_scores_inplace(
@@ -919,31 +922,35 @@ namespace llaminar2
         // scores: [seq_len, seq_len], V: [seq_len, head_dim]
         // context: [seq_len, head_dim]
 
-        // Select GEMM kernel based on precision
-        std::unique_ptr<ITensorGemm> gemm_kernel;
-
         if (precision == ActivationPrecision::BF16)
         {
-            // Use BF16 GEMM for activation-activation multiply
-            gemm_kernel = std::make_unique<BF16GemmKernel>(nullptr);
-        }
-        else if (precision == ActivationPrecision::FP16)
-        {
-            // FP16 support: fallback to FP32 for now (TODO: implement FP16GemmKernel)
-            gemm_kernel = std::make_unique<FP32GemmKernel>(nullptr);
+            // BF16: Create temporary BF16Tensor view of V to get auto-tuned GEMM kernel
+            BF16Tensor V_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(head_dim)});
+            V_tensor.from_fp32(V, seq_len * head_dim);
+
+            auto gemm_kernel = V_tensor.createGemm();
+            return gemm_kernel->multiply(
+                scores, context,
+                seq_len, head_dim, seq_len,
+                false, // no transpose
+                1.0f,  // alpha
+                0.0f); // beta
         }
         else
         {
-            // FP32 (default)
-            gemm_kernel = std::make_unique<FP32GemmKernel>(nullptr);
-        }
+            // FP32 or FP16 (both use FP32 path with auto-tuner)
+            // Create temporary FP32Tensor view of V to get auto-tuned GEMM kernel
+            FP32Tensor V_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(head_dim)}, -1);
+            std::memcpy(V_tensor.mutable_data(), V, seq_len * head_dim * sizeof(float));
 
-        return gemm_kernel->multiply_activations(
-            scores, V, context,
-            seq_len, head_dim, seq_len,
-            false, // no transpose
-            1.0f,  // alpha
-            0.0f); // beta
+            auto gemm_kernel = V_tensor.createGemm();
+            return gemm_kernel->multiply(
+                scores, context,
+                seq_len, head_dim, seq_len,
+                false, // no transpose
+                1.0f,  // alpha
+                0.0f); // beta
+        }
     }
 
     void GQAAttention::write_context_to_output(

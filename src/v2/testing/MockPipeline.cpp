@@ -20,10 +20,10 @@ namespace llaminar2
             std::shared_ptr<MPIContext> mpi_ctx)
             : PipelineBase(
                   ModelContext::createForTesting("mock_test.gguf", mpi_ctx), // Pass MPI context to avoid creating conflicting internal context
-                  mpi_ctx,                                                    // mpi_ctx
-                  -1,                                                         // device_idx (CPU)
-                  nullptr,                                                    // placement_map
-                  PipelineConfig{}),                                          // config (defaults)
+                  mpi_ctx,                                                   // mpi_ctx
+                  -1,                                                        // device_idx (CPU)
+                  nullptr,                                                   // placement_map
+                  PipelineConfig{}),                                         // config (defaults)
               n_heads_(n_heads),
               n_kv_heads_(n_kv_heads),
               head_dim_(head_dim)

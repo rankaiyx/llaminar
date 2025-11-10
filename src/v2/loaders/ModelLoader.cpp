@@ -214,6 +214,7 @@ namespace llaminar2
         : factory_(factory), loaded_(false)
     {
         // Create default factory if none provided
+        // This is only really used to simplify testing. Normally we expect a factory.
         if (!factory_)
         {
             // Create a single-rank MPIContext for the factory
@@ -221,7 +222,7 @@ namespace llaminar2
             owned_mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
             owned_factory_ = std::make_unique<TensorFactory>(*owned_mpi_ctx_);
             factory_ = owned_factory_.get();
-            LOG_DEBUG("[ModelLoader] Created internal TensorFactory with single-rank MPI context");
+            LOG_WARN("[ModelLoader] Created internal TensorFactory with single-rank MPI context (testing only!)");
         }
     }
 
@@ -342,9 +343,9 @@ namespace llaminar2
         model_.split_no = 0;
         model_.split_paths.resize(1, "test.gguf");
         model_.split_data_offsets.resize(1, 0);
-        
+
         loaded_ = true; // Mark as "loaded" so tests don't try to load actual file
-        
+
         LOG_DEBUG("[ModelLoader] Initialized test model (no file loaded)");
     }
 
@@ -842,12 +843,14 @@ namespace llaminar2
             break;
         case GGUFValueType::STRING:
             // String arrays need special handling (variable length)
-            // For now, skip them properly by reading each string
+            // Store them in string_array_value for tokenizer access
+            value.string_array_value.reserve(array_len);
             for (uint64_t i = 0; i < array_len; ++i)
             {
                 std::string str;
                 if (!readString(str))
                     return false;
+                value.string_array_value.push_back(std::move(str));
             }
             return true;
         default:

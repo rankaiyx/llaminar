@@ -61,7 +61,7 @@ double benchmark_config(
     // Warmup
     for (int i = 0; i < warmup_iters; ++i)
     {
-        variant->multiply(act_data, output->mutable_data(), m, n, k, weight.get());
+        variant->multiply(act_data, output->mutable_data(), m, n, k, weight.get(), false, 1.0f, 0.0f);
     }
 
     // Timed runs
@@ -74,7 +74,7 @@ double benchmark_config(
 
         for (int iter = 0; iter < benchmark_iters; ++iter)
         {
-            variant->multiply(act_data, output->mutable_data(), m, n, k, weight.get());
+            variant->multiply(act_data, output->mutable_data(), m, n, k, weight.get(), false, 1.0f, 0.0f);
         }
 
         auto end = std::chrono::high_resolution_clock::now();

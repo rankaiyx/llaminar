@@ -48,7 +48,7 @@ namespace
     /**
      * @brief Simple deterministic decoder for reproducible benchmarks
      */
-    class BenchmarkDecoder : public IBlockDecoder
+    class BenchmarkDecoder : public ITensorGemmTileDataProvider
     {
     public:
         BenchmarkDecoder(size_t rows, size_t cols) : rows_(rows), cols_(cols) {}

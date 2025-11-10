@@ -33,7 +33,7 @@ namespace
     /**
      * @brief Simple mock decoder for testing template kernels
      */
-    class MockDecoder : public IBlockDecoder
+    class MockDecoder : public ITensorGemmTileDataProvider
     {
     public:
         MockDecoder(size_t rows = 64, size_t cols = 256) : rows_(rows), cols_(cols) {}
@@ -87,13 +87,13 @@ namespace
             // Allocate output
             C_.resize(m_ * n_, 0.0f);
 
-            decoder_ = std::make_unique<MockDecoder>();
+            gemmTileDataProvider_ = std::make_unique<MockDecoder>();
         }
 
         int m_, n_, k_;
         std::vector<float> A_;
         std::vector<float> C_;
-        std::unique_ptr<MockDecoder> decoder_;
+        std::unique_ptr<MockDecoder> gemmTileDataProvider_;
     };
 
     // ========== COMPILATION & INSTANTIATION TESTS ==========
@@ -108,7 +108,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "AVX512 8×4 template kernel failed";
@@ -134,7 +134,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "AVX512 8×8 template kernel failed";
@@ -148,7 +148,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "AVX512 8×16 template kernel failed";
@@ -162,7 +162,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "AVX512 8×32 template kernel failed";
@@ -176,7 +176,7 @@ namespace
         // Unroll 4
         {
             using Kernel = GemmKernel<AVX512Tag, 8, 4, 4, 3>;
-            EXPECT_TRUE(Kernel::multiply(A_.data(), C_.data(), m_, n_, k_, decoder_.get(), 1.0f, 0.0f));
+            EXPECT_TRUE(Kernel::multiply(A_.data(), C_.data(), m_, n_, k_, gemmTileDataProvider_.get(), 1.0f, 0.0f));
         }
 
         std::fill(C_.begin(), C_.end(), 0.0f);
@@ -184,7 +184,7 @@ namespace
         // Unroll 16
         {
             using Kernel = GemmKernel<AVX512Tag, 8, 4, 16, 5>;
-            EXPECT_TRUE(Kernel::multiply(A_.data(), C_.data(), m_, n_, k_, decoder_.get(), 1.0f, 0.0f));
+            EXPECT_TRUE(Kernel::multiply(A_.data(), C_.data(), m_, n_, k_, gemmTileDataProvider_.get(), 1.0f, 0.0f));
         }
     }
 
@@ -199,7 +199,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "AVX2 8×4 template kernel failed";
@@ -213,7 +213,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "AVX2 8×8 template kernel failed";
@@ -227,7 +227,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "AVX2 8×16 template kernel failed";
@@ -241,7 +241,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "AVX2 8×32 template kernel failed";
@@ -257,7 +257,7 @@ namespace
         bool result = Kernel::multiply(
             A_.data(), C_.data(),
             m_, n_, k_,
-            decoder_.get(),
+            gemmTileDataProvider_.get(),
             1.0f, 0.0f);
 
         EXPECT_TRUE(result) << "Scalar 4×4 template kernel failed";
@@ -289,19 +289,19 @@ namespace
             {
             case 4:
                 result = GemmKernel<AVX512Tag, 8, 4, 8, 5>::multiply(
-                    A_.data(), C_.data(), m_, n_, k_, decoder_.get(), 1.0f, 0.0f);
+                    A_.data(), C_.data(), m_, n_, k_, gemmTileDataProvider_.get(), 1.0f, 0.0f);
                 break;
             case 8:
                 result = GemmKernel<AVX512Tag, 8, 8, 8, 5>::multiply(
-                    A_.data(), C_.data(), m_, n_, k_, decoder_.get(), 1.0f, 0.0f);
+                    A_.data(), C_.data(), m_, n_, k_, gemmTileDataProvider_.get(), 1.0f, 0.0f);
                 break;
             case 16:
                 result = GemmKernel<AVX512Tag, 8, 16, 8, 5>::multiply(
-                    A_.data(), C_.data(), m_, n_, k_, decoder_.get(), 1.0f, 0.0f);
+                    A_.data(), C_.data(), m_, n_, k_, gemmTileDataProvider_.get(), 1.0f, 0.0f);
                 break;
             case 32:
                 result = GemmKernel<AVX512Tag, 8, 32, 8, 5>::multiply(
-                    A_.data(), C_.data(), m_, n_, k_, decoder_.get(), 1.0f, 0.0f);
+                    A_.data(), C_.data(), m_, n_, k_, gemmTileDataProvider_.get(), 1.0f, 0.0f);
                 break;
             }
 

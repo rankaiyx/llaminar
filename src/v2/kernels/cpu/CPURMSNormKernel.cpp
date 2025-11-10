@@ -29,12 +29,67 @@ namespace llaminar2
         // Use vectorized primitives implementation
         primitives::RMSNormExecOptions opts;
         opts.allow_parallel = true;
-        opts.force_scalar = false;
         opts.parallel_threshold_elems = 2048;
         opts.t5_compat_mode = false;
 
         primitives::rmsnorm_fused_vectorized(
             input, gamma, output,
+            seq_len, d_model,
+            eps, opts);
+
+        return true;
+    }
+
+    bool CPURMSNormKernel::apply_bf16(
+        const uint16_t *input_bf16,
+        const float *gamma,
+        uint16_t *output_bf16,
+        int seq_len,
+        int d_model,
+        float eps,
+        int device_idx)
+    {
+        if (device_idx != -1)
+        {
+            return false; // CPU only
+        }
+
+        // Use vectorized BF16 primitives implementation
+        primitives::RMSNormExecOptions opts;
+        opts.allow_parallel = true;
+        opts.parallel_threshold_elems = 2048;
+        opts.t5_compat_mode = false;
+
+        primitives::rmsnorm_fused_bf16_vectorized(
+            input_bf16, gamma, output_bf16,
+            seq_len, d_model,
+            eps, opts);
+
+        return true;
+    }
+
+    bool CPURMSNormKernel::apply_fp16(
+        const uint16_t *input_fp16,
+        const float *gamma,
+        uint16_t *output_fp16,
+        int seq_len,
+        int d_model,
+        float eps,
+        int device_idx)
+    {
+        if (device_idx != -1)
+        {
+            return false; // CPU only
+        }
+
+        // Use vectorized FP16 primitives implementation
+        primitives::RMSNormExecOptions opts;
+        opts.allow_parallel = true;
+        opts.parallel_threshold_elems = 2048;
+        opts.t5_compat_mode = false;
+
+        primitives::rmsnorm_fused_fp16_vectorized(
+            input_fp16, gamma, output_fp16,
             seq_len, d_model,
             eps, opts);
 
@@ -69,7 +124,6 @@ namespace llaminar2
         // Use vectorized INT32→INT8 primitives
         primitives::RMSNormExecOptions opts;
         opts.allow_parallel = true;
-        opts.force_scalar = false;
         opts.parallel_threshold_elems = 2048;
         opts.t5_compat_mode = false;
 
