@@ -1055,18 +1055,16 @@ namespace llaminar2
             double t_compute_accum = 0.0;
 
             // K-loop over blocks
-            // NOTE: K-loop unrolling (4×) doesn't help because we need per-block results
             // (each block has different scales, can't accumulate across blocks in registers)
             for (int kb = 0; kb < K_blocks; ++kb)
             {
                 auto t_load_a_start = std::chrono::high_resolution_clock::now();
 
                 // OPTIMIZATION: Prefetch A blocks for next iteration
-                // Prefetch A blocks ahead (4 blocks empirically optimal)
                 // NOTE: Prefetching via IQ8_1Decodable is more complex (indirect access)
                 // For Q8_1Tensor (zero-copy), we could prefetch the decoded pointer
                 // For FP32/FP16/BF16 (on-the-fly quantization), prefetching is less useful
-                // Skipping prefetch for now - measure impact later if needed
+                // TODO: Implement prefetch
 
                 // Load A blocks via IQ8_1Decodable interface (supports all activation types)
                 __m512i a_vec[MR];

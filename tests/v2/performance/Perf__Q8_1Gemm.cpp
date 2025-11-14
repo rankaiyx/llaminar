@@ -5,6 +5,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <mpi.h>
 #include <iostream>
 #include <chrono>
 #include <iomanip>
@@ -392,6 +393,14 @@ TEST_F(Q8_1GemmPerformance, ThroughputScalingWithM)
  */
 TEST_F(Q8_1GemmPerformance, ComprehensiveParameterSweep)
 {
+    // Only run on rank 0 to avoid duplicate execution
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank != 0)
+    {
+        GTEST_SKIP() << "Skipping on rank " << rank << " (only rank 0 runs parameter sweep)";
+    }
+
     // Load Q8_0 weight tensor
     auto wq_template = loader_->loadTensor("blk.0.attn_q.weight", 0, WeightPrecision::NATIVE);
     ASSERT_NE(wq_template, nullptr);

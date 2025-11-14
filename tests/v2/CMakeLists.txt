@@ -2852,18 +2852,9 @@ set_target_properties(v2_perf_q8_1_gemm PROPERTIES
 
 add_v2_perf_test(V2_Perf_Q8_1_GEMM
     COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm>
-    LABELS "V2;Performance;GEMM;Q8_1;Quantization;Throughput;dpbusd"
-    MPI_PROCS 1  # Single rank (no MPI distribution for this kernel)
-)
-
-# Alternative non-MPI test for Q8_1 GEMM (for ComprehensiveParameterSweep)
-add_test(NAME V2_Perf_Q8_1_GEMM_NoMPI
-    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm> --gtest_filter=Q8_1GemmPerformance.ComprehensiveParameterSweep
-    WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
-)
-set_tests_properties(V2_Perf_Q8_1_GEMM_NoMPI PROPERTIES
-    LABELS "V2;Performance;GEMM;Q8_1;ParameterSweep;NoMPI"
-    ENVIRONMENT "LLAMINAR_LOG_LEVEL=INFO"
+    ARGS --gtest_filter=Q8_1GemmPerformance.ComprehensiveParameterSweep
+    LABELS "V2;Performance;GEMM;Q8_1;Quantization;Throughput;ParameterSweep"
+    MPI_PROCS 1  # Single rank (proper MPI/OMP setup for socket/thread pinning)
 )
 
 # Performance Test: Q8_0 GEMM Microkernel Size Comparison
