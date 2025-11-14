@@ -229,6 +229,141 @@ namespace llaminar2
                vendor[9] == 't' && vendor[10] == 'e' && vendor[11] == 'l';
     }
 
+    /**
+     * @brief Get L2 cache size in bytes (per core)
+     * @return L2 cache size in bytes, or 0 if unknown
+     *
+     * Uses CPUID leaf 0x04 (Intel Deterministic Cache Parameters)
+     * Iterates through cache levels to find L2 cache.
+     *
+     * For Xeon Gold 6238R: Returns 1048576 (1MB per core)
+     * Note: Total L2 per socket = 28MB (28 cores × 1MB)
+     */
+    inline uint32_t cpu_l2_cache_size()
+    {
+        static uint32_t cached_size = 0;
+        static bool detected = false;
+
+        if (detected)
+            return cached_size;
+
+        // CPUID leaf 0x04: Deterministic Cache Parameters (Intel)
+        // Iterate through cache levels (ECX = subleaf index)
+        for (uint32_t subleaf = 0; subleaf < 16; ++subleaf)
+        {
+            uint32_t regs[4];
+            cpuid(0x04, subleaf, regs);
+
+            // EAX[4:0] = Cache Type (1=Data, 2=Instruction, 3=Unified)
+            uint32_t cache_type = regs[0] & 0x1F;
+            if (cache_type == 0)
+                break; // No more cache levels
+
+            // EAX[7:5] = Cache Level (1=L1, 2=L2, 3=L3)
+            uint32_t cache_level = (regs[0] >> 5) & 0x7;
+
+            // Look for L2 cache (level 2, unified or data)
+            if (cache_level == 2 && (cache_type == 1 || cache_type == 3))
+            {
+                // Cache size = (Ways + 1) × (Partitions + 1) × (Line Size + 1) × (Sets + 1)
+                uint32_t ways = ((regs[1] >> 22) & 0x3FF) + 1;       // EBX[31:22]
+                uint32_t partitions = ((regs[1] >> 12) & 0x3FF) + 1; // EBX[21:12]
+                uint32_t line_size = (regs[1] & 0xFFF) + 1;          // EBX[11:0]
+                uint32_t sets = regs[2] + 1;                         // ECX
+
+                cached_size = ways * partitions * line_size * sets;
+                detected = true;
+                return cached_size;
+            }
+        }
+
+        // Fallback: couldn't detect, assume conservative 256KB
+        cached_size = 256 * 1024;
+        detected = true;
+        return cached_size;
+    }
+
+    /**
+     * @brief Get L3 cache size in bytes (shared across all cores)
+     * @return L3 cache size in bytes, or 0 if unknown
+     *
+     * For Xeon Gold 6238R: Returns ~39MB (shared L3)
+     */
+    inline uint32_t cpu_l3_cache_size()
+    {
+        static uint32_t cached_size = 0;
+        static bool detected = false;
+
+        if (detected)
+            return cached_size;
+
+        // CPUID leaf 0x04: Deterministic Cache Parameters (Intel)
+        for (uint32_t subleaf = 0; subleaf < 16; ++subleaf)
+        {
+            uint32_t regs[4];
+            cpuid(0x04, subleaf, regs);
+
+            uint32_t cache_type = regs[0] & 0x1F;
+            if (cache_type == 0)
+                break;
+
+            uint32_t cache_level = (regs[0] >> 5) & 0x7;
+
+            // Look for L3 cache (level 3, unified)
+            if (cache_level == 3 && (cache_type == 1 || cache_type == 3))
+            {
+                uint32_t ways = ((regs[1] >> 22) & 0x3FF) + 1;
+                uint32_t partitions = ((regs[1] >> 12) & 0x3FF) + 1;
+                uint32_t line_size = (regs[1] & 0xFFF) + 1;
+                uint32_t sets = regs[2] + 1;
+
+                cached_size = ways * partitions * line_size * sets;
+                detected = true;
+                return cached_size;
+            }
+        }
+
+        // Fallback: couldn't detect, assume conservative 8MB
+        cached_size = 8 * 1024 * 1024;
+        detected = true;
+        return cached_size;
+    }
+
+    /**
+     * @brief Get total L2 cache per socket (L2 per core × num cores)
+     * @return Total L2 cache size in bytes
+     *
+     * For Xeon Gold 6238R with 28 cores: Returns 28MB
+     * This is the actual working set available for NC blocking.
+     */
+    inline uint32_t cpu_l2_cache_total()
+    {
+        static uint32_t cached_size = 0;
+        static bool detected = false;
+
+        if (detected)
+            return cached_size;
+
+        // Get number of logical processors (hyperthreaded cores)
+        uint32_t regs[4];
+        cpuid(0x01, 0, regs);
+        uint32_t logical_processors = (regs[1] >> 16) & 0xFF; // EBX[23:16]
+
+        // For Intel with HT: divide by 2 to get physical cores
+        // For simplicity, use logical_processors as upper bound
+        uint32_t l2_per_core = cpu_l2_cache_size();
+
+        // Conservative estimate: assume half of logical processors are physical cores
+        // (covers HT case without over-estimating)
+        uint32_t estimated_physical_cores = logical_processors / 2;
+        if (estimated_physical_cores == 0)
+            estimated_physical_cores = 1;
+
+        cached_size = l2_per_core * estimated_physical_cores;
+        detected = true;
+        return cached_size;
+    }
+
 #else
     // Non-x86 platforms: no SIMD support, no vendor detection
     inline bool cpu_supports_avx512() { return false; }
@@ -242,6 +377,9 @@ namespace llaminar2
     inline bool cpu_supports_amx_int8() { return false; }
     inline const char *cpu_vendor() { return "Unknown"; }
     inline bool cpu_is_intel() { return false; }
+    inline uint32_t cpu_l2_cache_size() { return 256 * 1024; }       // Conservative 256KB
+    inline uint32_t cpu_l3_cache_size() { return 8 * 1024 * 1024; }  // Conservative 8MB
+    inline uint32_t cpu_l2_cache_total() { return 8 * 1024 * 1024; } // Conservative 8MB
 #endif
 
 } // namespace llaminar2

@@ -89,6 +89,9 @@ namespace llaminar2
         // Q8_1 GEMM compensation strategy
         bool use_sa_compensation = false; ///< Use sA-based compensation (vs sum_qs-based, experimental)
 
+        // Q8_1 GEMM microkernel variant selection
+        bool use_dense_dpbusd = false; ///< Use dense dpbusd (accumulate across K-blocks, experimental)
+
         GemmConfig()
         {
             const char *sa_comp_env = std::getenv("LLAMINAR_USE_SA_COMPENSATION");
@@ -96,12 +99,16 @@ namespace llaminar2
             {
                 use_sa_compensation = (std::atoi(sa_comp_env) != 0);
             }
-        }
-    };
 
-    /**
-     * @brief Global debug environment snapshot
-     */
+            const char *dense_env = std::getenv("LLAMINAR_USE_DENSE_DPBUSD");
+            if (dense_env)
+            {
+                use_dense_dpbusd = (std::atoi(dense_env) != 0);
+            }
+        }
+    }; /**
+        * @brief Global debug environment snapshot
+        */
     struct DebugEnv
     {
         DequantConfig dequant;

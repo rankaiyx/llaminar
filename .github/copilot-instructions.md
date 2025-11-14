@@ -13,7 +13,7 @@ Most sections in this document apply to **V1**. For V2-specific guidance, see `.
 - [Project Overview (V1)](#project-overview-v1)
 - [Build System](#build-system)
 - [Testing Guidelines (V1)](#testing-guidelines-v1)
-  - [CTest Label Best Practices](#ctest-label-best-practices)
+- [CTest Label Best Practices](#ctest-label-best-practices)
 - [Debugging with GDB](#debugging-with-gdb)
 - [Kernel Development (V1)](#kernel-development-v1)
 - [Kernel Development (V2)](#kernel-development-v2)
@@ -879,7 +879,7 @@ grep -A 50 "Program received signal" /tmp/gdb_rank_1.log
 Use ASAN for localizing more complex double-free style issues:
 
 ```bash
-cmake -B build_v2 -S . -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-g3 -O0 -fno-omit-frame-pointer -fsanitize=address" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 
 
 ASAN_OPTIONS=halt_on_error=0:detect_leaks=0 timeout 240 mpirun -np 2 ./build/<your_test> --gtest_filter=<your_test_filter>
 ```
