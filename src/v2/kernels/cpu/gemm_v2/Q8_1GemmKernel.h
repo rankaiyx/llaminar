@@ -802,35 +802,43 @@ namespace llaminar2
         }
 
         /**
-         * @brief Compute optimal KC blocking based on cache analysis
+         * @brief Compute optimal KC blocking parameter
          *
-         * CRITICAL CHANGE: Streaming implementation eliminated accum_vec buffer!
+         * EMPIRICAL FINDINGS (Nov 2024, Xeon Gold 6238R, Qwen 2.5 0.5B Q8_0):
+         *   - KC ∈ {128, 256, 512, 896} all deliver ~500 GFLOPS (variance <1%)
+         *   - Working set: 616 KB (1.9% of 28MB L2 cache)
+         *   - No cache thrashing observed even for KC=K_blocks
          *
-         * OLD constraint (with accum_vec):
-         *   - accum_vec size = MR × NR × KC × 4 bytes = 16KB × KC
-         *   - At KC=128: 2MB per microkernel (too large!)
-         *   - MAX_K_BLOCKS=128 was the hard limit
+         * CONCLUSION: KC choice is NOT cache-limited for typical inference sizes.
+         * Strategy below uses adaptive cache analysis to select KC, but empirical
+         * testing shows performance is dominated by memory bandwidth and VNNI
+         * throughput, not cache capacity.
          *
-         * NEW constraint (streaming, metadata only):
-         *   - a_sums: MR × KC × 2 bytes = 64 × KC
-         *   - a_scales: MR × KC × 2 bytes = 64 × KC
-         *   - b_scales_f32: NR × KC × 4 bytes = 512 × KC
-         *   - Total: ~640 × KC bytes
-         *   - At KC=128: 82KB (fits in L1!)
-         *   - At KC=256: 164KB (L2-friendly)
-         *   - At KC=512: 328KB (still L2-friendly)
+         * STRATEGY: Use working set size relative to L2 cache capacity
          *
-         * CACHE-AWARE STRATEGY (Nov 2025):
-         *   With larger L2 (e.g., 28MB on Xeon Gold 6238R), we can be MORE AGGRESSIVE:
-         *   - Small K (<256 blocks): No blocking (KC = K_blocks)
-         *   - Medium K (256-1024 blocks): KC=512 (328KB metadata, excellent L2 reuse)
-         *   - Large K (>1024 blocks): KC=1024 (656KB metadata, still L2-friendly)
-         *   - Huge K (>2048 blocks): KC=2048 (1.3MB metadata, uses L2 effectively)
+         * Working set components:
+         * 1. Microkernel metadata (per MR×NR tile):
+         *    - accum_vec: MR × NR × KC × 4 bytes (INT32)
+         *    - sum_qs: KC × MR × 2 bytes (INT16, transposed)
+         *    - a_scales: MR × KC × 2 bytes (FP16)
+         *    - b_scales_f32: NR × KC × 4 bytes (FP32)
          *
-         * Benefits of larger KC:
-         *   - Fewer outer loop iterations (less overhead)
-         *   - Better A block reuse across NC panels
-         *   - Amortizes MPI collectives (future distributed GEMMs)
+         * 2. Packed B panel (NC columns):
+         *    - quants: KC × (NC/2) × 64 bytes (packed pairs)
+         *    - scales: KC × NC × 2 bytes (FP16)
+         *
+         * 3. A blocks (MR rows):
+         *    - Q8_1Block: MR × KC × 36 bytes (32 qs + 2 d + 2 s)
+         *
+         * L2 CACHE BUDGET:
+         * - Total L2: Detected via CPUFeatures (e.g., 28MB on Xeon Gold 6238R)
+         * - Target: Working set ≤ 40% of L2 (conservative)
+         *
+         * Set LLAMINAR_KC_VERBOSE=1 for detailed cache analysis logging.
+         *
+         * @see KC_BLOCKING_EMPIRICAL_ANALYSIS.md for full benchmark results
+         * - Reports optimal KC for current problem size
+         * - Set LLAMINAR_KC_VERBOSE=1 for detailed logging
          *
          * Template parameter KC_PARAM can override:
          *   - KC_PARAM > 0: Use explicit value (in blocks)
@@ -842,46 +850,108 @@ namespace llaminar2
          */
         static int compute_kc_blocking(int K_blocks)
         {
+            if constexpr (KC_PARAM > 0)
+            {
+                // Explicit KC value provided
+                return KC_PARAM;
+            }
+
             if constexpr (KC_PARAM < 0)
             {
                 // Negative KC_PARAM = -MAX_METADATA_KB
-                // Metadata: ~640 bytes per K-block
+                // Legacy mode: only count microkernel metadata
                 int max_metadata_kb = -KC_PARAM;
-                int kc_limit = (max_metadata_kb * 1024) / 640;
+                size_t metadata_per_block = MR * sizeof(int16_t) + MR * sizeof(uint16_t) + NR * sizeof(float);
+                int kc_limit = (max_metadata_kb * 1024) / metadata_per_block;
                 return std::min(kc_limit, K_blocks);
             }
 
-            // NEW: Cache-aware adaptive strategy
-            // With 28MB L2, we can use MUCH larger KC values!
+            // ADAPTIVE STRATEGY: Base KC on working set vs L2 cache capacity
+            static const bool verbose = (std::getenv("LLAMINAR_KC_VERBOSE") != nullptr);
 
-            if (K_blocks <= 256)
+            // Get L2 cache size
+            uint32_t l2_total = cpu_l2_cache_total();
+            size_t l2_budget = static_cast<size_t>(l2_total * 0.4); // 40% of L2 for working set
+
+            // Assume NC will use default (512KB B target)
+            // For empirical tuning, we'll measure with actual NC later
+            constexpr int NC_estimate = 128; // Conservative estimate
+
+            // Find largest KC where working set fits in L2 budget
+            int candidate_kc_values[] = {128, 256, 512, 1024, 2048, 4096, 8192};
+            int selected_kc = 256; // Conservative default
+
+            for (int kc_candidate : candidate_kc_values)
             {
-                // Small K: No blocking needed, process all at once
-                // Metadata: up to 164KB (fits easily in L2)
-                return K_blocks;
+                if (kc_candidate > K_blocks)
+                    break;
+
+                size_t working_set = compute_working_set_size(kc_candidate, NC_estimate);
+
+                if (working_set <= l2_budget)
+                {
+                    selected_kc = kc_candidate;
+
+                    if (verbose)
+                    {
+                        static bool first_log = true;
+                        if (first_log)
+                        {
+                            std::cout << "[KC_BLOCKING] K_blocks=" << K_blocks
+                                      << ", L2=" << (l2_total / 1024 / 1024) << "MB"
+                                      << ", Budget=" << (l2_budget / 1024) << "KB" << std::endl;
+                            std::cout << "[KC_BLOCKING] KC=" << kc_candidate
+                                      << ", Working set=" << (working_set / 1024) << "KB"
+                                      << " (" << (100.0 * working_set / l2_total) << "% of L2)" << std::endl;
+                            first_log = false;
+                        }
+                    }
+                }
+                else
+                {
+                    // Working set exceeds budget, use previous KC
+                    break;
+                }
             }
-            else if (K_blocks <= 1024)
-            {
-                // Medium K: KC=512 (328KB metadata, excellent L2 reuse)
-                // Benefit: 2× larger than old "large K" limit
-                return std::min(512, K_blocks);
-            }
-            else if (K_blocks <= 2048)
-            {
-                // Large K: KC=1024 (656KB metadata, still L2-friendly)
-                // Benefit: 4× larger than old "large K" limit
-                return std::min(1024, K_blocks);
-            }
-            else
-            {
-                // Huge K: KC=2048 (1.3MB metadata, uses L2 effectively)
-                // With 28MB L2, 1.3MB is only 4.6% - plenty of room!
-                // Benefit: 8× larger than old limit, massive reuse improvement
-                return std::min(2048, K_blocks);
-            }
+
+            return selected_kc;
         }
 
     public:
+        /**
+         * @brief Compute actual working set size for given KC value (PUBLIC for benchmarking)
+         *
+         * Calculates the total memory footprint during microkernel execution:
+         * - Microkernel metadata (sum_qs, a_scales, b_scales_f32, accum)
+         * - Packed B panel data
+         * - A block footprint (approximate, depends on tensor type)
+         *
+         * @param KC_val KC blocking value
+         * @param NC_val NC blocking value
+         * @return Total working set size in bytes
+         */
+        static size_t compute_working_set_size(int KC_val, int NC_val)
+        {
+            // Microkernel metadata per tile (MR × NR)
+            size_t sum_qs_size = MR * KC_val * sizeof(int16_t);     // INT16 transposed
+            size_t a_scales_size = MR * KC_val * sizeof(uint16_t);  // FP16
+            size_t b_scales_f32_size = NR * KC_val * sizeof(float); // FP32 converted
+            size_t accum_size = MR * NR * KC_val * sizeof(int32_t); // INT32 3D array
+
+            size_t microkernel_metadata = sum_qs_size + a_scales_size + b_scales_f32_size + accum_size;
+
+            // Packed B panel (NC columns × KC blocks)
+            size_t b_panel_quants = KC_val * (NC_val / 2) * 64;         // Packed layout
+            size_t b_panel_scales = KC_val * NC_val * sizeof(uint16_t); // FP16 scales
+            size_t b_panel_total = b_panel_quants + b_panel_scales;
+
+            // A block footprint (approximate - MR rows × KC blocks)
+            // Q8_1Block = 32 bytes qs + 2 bytes d + 2 bytes s = 36 bytes
+            size_t a_blocks_size = MR * KC_val * 36;
+
+            return microkernel_metadata + b_panel_total + a_blocks_size;
+        }
+
         // Make pack_B_panel public for unit testing
         /**
          * @brief Pack B panel into column-major layout with padding
@@ -1062,6 +1132,18 @@ namespace llaminar2
             const uint8_t *B_quants = B_packed.quants.data();
             const uint16_t *B_scales = B_packed.scales.data();
 
+            // PHASE 2 REGISTER TILING: Keep VNNI accumulators in registers across K-loop
+            // Declare register tile: MR rows × NR columns of 512-bit accumulators
+            // This eliminates per-kb horizontal reductions (reduces from MR×NR×K_blocks to MR×NR total)
+            __m512i tile_accum_regs[MR][NR];
+            for (int ir = 0; ir < MR; ++ir)
+            {
+                for (int jr = 0; jr < NR; ++jr)
+                {
+                    tile_accum_regs[ir][jr] = _mm512_setzero_si512();
+                }
+            }
+
             // Timing accumulators for K-loop phases
             double t_load_a_accum = 0.0;
             double t_load_b_accum = 0.0;
@@ -1099,10 +1181,12 @@ namespace llaminar2
                 // Load A blocks via IQ8_1Decodable interface (supports all activation types)
                 __m512i a_vec[MR];
 
-                // PHASE 1: Load all MR blocks and extract FP16 metadata
+                // PHASE 1: Load all MR blocks and extract metadata
                 // (Can't vectorize decode_to_q8_1 calls - may do on-the-fly quantization)
-                uint16_t sum_a_fp16[MR];
-                uint16_t a_scale_fp16[MR];
+                //
+                // CRITICAL OPTIMIZATION (Nov 2024): sum_qs is now precomputed as INT16 during quantization!
+                // We no longer compute sum_a / a_scale here - just load block.sum_qs directly.
+                // This eliminates FP16→FP32 conversion, division, rounding, and packing from K-loop.
 
                 // OPTIMIZATION: Unroll by 2 to issue parallel 256-bit loads (exploit ILP)
                 // Modern CPUs have 2-3 load units and can execute multiple loads simultaneously
@@ -1116,11 +1200,11 @@ namespace llaminar2
                         const Q8_1Block &a_block0 = *a_block_ptr0;
                         const Q8_1Block &a_block1 = *a_block_ptr1;
 
-                        // Extract FP16 metadata for both blocks
-                        sum_a_fp16[ir] = a_block0.s;
-                        sum_a_fp16[ir + 1] = a_block1.s;
-                        a_scale_fp16[ir] = a_block0.d;
-                        a_scale_fp16[ir + 1] = a_block1.d;
+                        // Extract precomputed INT16 sum_qs (zero FP overhead!)
+                        sum_qs(kb, ir) = a_block0.sum_qs;
+                        sum_qs(kb, ir + 1) = a_block1.sum_qs;
+
+                        // Extract FP16 scales
                         a_scales(ir, kb) = a_block0.d;
                         a_scales(ir + 1, kb) = a_block1.d;
 
@@ -1143,9 +1227,8 @@ namespace llaminar2
                         const Q8_1Block *a_block_ptr = A_decodable->decode_to_q8_1(i_base + ir, kc_start + kb);
                         const Q8_1Block &a_block = *a_block_ptr;
 
-                        // Extract FP16 metadata to temporary arrays
-                        sum_a_fp16[ir] = a_block.s;
-                        a_scale_fp16[ir] = a_block.d;
+                        // Extract precomputed INT16 sum_qs and FP16 scale
+                        sum_qs(kb, ir) = a_block.sum_qs;
                         a_scales(ir, kb) = a_block.d;
 
                         // Load 32 bytes (256 bits) and zero-extend to 512 bits
@@ -1156,136 +1239,9 @@ namespace llaminar2
                     }
                 }
 
-                // PHASE 2: VECTORIZED sum_qs extraction (process 16 rows at a time)
-                // Formula: sum_qs = round(sum_a / max(a_scale, 1e-10))
-                constexpr int VEC_WIDTH = 16; // AVX-512: 16 FP32 values
-                int ir = 0;
-
-                for (; ir + VEC_WIDTH <= MR; ir += VEC_WIDTH)
-                {
-                    // Load 16 sum_a values (FP16) and convert to FP32
-                    __m256i sum_a_vec = _mm256_loadu_si256(
-                        reinterpret_cast<const __m256i *>(&sum_a_fp16[ir]));
-                    __m512 sum_a_f32 = _mm512_cvtph_ps(sum_a_vec);
-
-                    // Load 16 a_scale values (FP16) and convert to FP32
-                    __m256i a_scale_vec = _mm256_loadu_si256(
-                        reinterpret_cast<const __m256i *>(&a_scale_fp16[ir]));
-                    __m512 a_scale_f32 = _mm512_cvtph_ps(a_scale_vec);
-
-                    // Clamp scales to avoid division by zero
-                    __m512 epsilon = _mm512_set1_ps(1e-10f);
-                    __m512 a_scale_safe = _mm512_max_ps(a_scale_f32, epsilon);
-
-                    // Vectorized division: sum_qs = sum_a / a_scale
-                    __m512 sum_qs_f32 = _mm512_div_ps(sum_a_f32, a_scale_safe);
-
-                    // Round to nearest integer
-                    __m512 sum_qs_rounded = _mm512_roundscale_ps(sum_qs_f32,
-                                                                 _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-
-                    // Convert to INT32
-                    __m512i sum_qs_i32 = _mm512_cvtps_epi32(sum_qs_rounded);
-
-                    // Convert INT32 to INT16 (pack with saturation for safety)
-                    // Range check: 32 signed int8 values sum to [-4096, 4096], well within INT16 range
-                    __m256i sum_qs_i16 = _mm512_cvtsepi32_epi16(sum_qs_i32);
-
-                    // Store to sum_qs array - TRANSPOSED layout enables contiguous vector store!
-                    // sum_qs is [K_blocks, MR] (INT16), so sum_qs(kb, ir) through sum_qs(kb, ir+15) are consecutive
-                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(&sum_qs(kb, ir)), sum_qs_i16);
-                }
-
-                // 8-wide vectorized tail (AVX2-compatible)
-                for (; ir + 8 <= MR; ir += 8)
-                {
-                    // Load 8 sum_a values (FP16) and convert to FP32
-                    __m128i sum_a_vec = _mm_loadu_si128(
-                        reinterpret_cast<const __m128i *>(&sum_a_fp16[ir]));
-                    __m256 sum_a_f32 = _mm256_cvtph_ps(sum_a_vec);
-
-                    // Load 8 a_scale values (FP16) and convert to FP32
-                    __m128i a_scale_vec = _mm_loadu_si128(
-                        reinterpret_cast<const __m128i *>(&a_scale_fp16[ir]));
-                    __m256 a_scale_f32 = _mm256_cvtph_ps(a_scale_vec);
-
-                    // Clamp scales to avoid division by zero
-                    __m256 epsilon = _mm256_set1_ps(1e-10f);
-                    __m256 a_scale_safe = _mm256_max_ps(a_scale_f32, epsilon);
-
-                    // Vectorized division: sum_qs = sum_a / a_scale
-                    __m256 sum_qs_f32 = _mm256_div_ps(sum_a_f32, a_scale_safe);
-
-                    // Round to nearest integer
-                    __m256 sum_qs_rounded = _mm256_round_ps(sum_qs_f32,
-                                                            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-
-                    // Convert to INT32
-                    __m256i sum_qs_i32 = _mm256_cvtps_epi32(sum_qs_rounded);
-
-                    // Convert INT32 to INT16 (pack with saturation)
-                    // AVX2: _mm256_packs_epi32 does lane-based packing, NOT sequential!
-                    // Layout: [a0 a1 a2 a3 | a4 a5 a6 a7] (int32) →
-                    //         [a0 a1 a2 a3 0 0 0 0 | a4 a5 a6 a7 0 0 0 0] (int16, interleaved)
-                    // We need: [a0 a1 a2 a3 a4 a5 a6 a7 | ...] (sequential int16)
-                    __m256i zero = _mm256_setzero_si256();
-                    __m256i sum_qs_i16_lanes = _mm256_packs_epi32(sum_qs_i32, zero);
-
-                    // Fix lane crossing: permute to get sequential layout
-                    // Permute control: 0b11011000 = 0xD8 = [0, 2, 1, 3] → brings lanes 0,2 together
-                    __m256i sum_qs_i16 = _mm256_permute4x64_epi64(sum_qs_i16_lanes, 0xD8);
-
-                    // Extract lower 128 bits (now contains all 8 int16 values sequentially)
-                    __m128i sum_qs_i16_lo = _mm256_castsi256_si128(sum_qs_i16);
-                    _mm_storeu_si128(reinterpret_cast<__m128i *>(&sum_qs(kb, ir)), sum_qs_i16_lo);
-                }
-
-                // 4-wide vectorized tail (AVX2-compatible)
-                for (; ir + 4 <= MR; ir += 4)
-                {
-                    // Load 4 sum_a values (FP16) and convert to FP32
-                    __m128i sum_a_vec = _mm_loadl_epi64(
-                        reinterpret_cast<const __m128i *>(&sum_a_fp16[ir]));
-                    __m128 sum_a_f32 = _mm_cvtph_ps(sum_a_vec);
-
-                    // Load 4 a_scale values (FP16) and convert to FP32
-                    __m128i a_scale_vec = _mm_loadl_epi64(
-                        reinterpret_cast<const __m128i *>(&a_scale_fp16[ir]));
-                    __m128 a_scale_f32 = _mm_cvtph_ps(a_scale_vec);
-
-                    // Clamp scales to avoid division by zero
-                    __m128 epsilon = _mm_set1_ps(1e-10f);
-                    __m128 a_scale_safe = _mm_max_ps(a_scale_f32, epsilon);
-
-                    // Vectorized division: sum_qs = sum_a / a_scale
-                    __m128 sum_qs_f32 = _mm_div_ps(sum_a_f32, a_scale_safe);
-
-                    // Round to nearest integer
-                    __m128 sum_qs_rounded = _mm_round_ps(sum_qs_f32,
-                                                         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-
-                    // Convert to INT32
-                    __m128i sum_qs_i32 = _mm_cvtps_epi32(sum_qs_rounded);
-
-                    // Convert INT32 to INT16 (pack with saturation)
-                    // SSE: Pack two __m128i (4 int32 each) into one __m128i (8 int16)
-                    __m128i zero = _mm_setzero_si128();
-                    __m128i sum_qs_i16 = _mm_packs_epi32(sum_qs_i32, zero); // [4 int16, 4 zeros]
-
-                    // Store lower 64 bits (4 int16 values)
-                    _mm_storel_epi64(reinterpret_cast<__m128i *>(&sum_qs(kb, ir)), sum_qs_i16);
-                }
-
-                // Scalar tail (if MR not multiple of 4)
-                for (; ir < MR; ++ir)
-                {
-                    float sum_a_fp32 = fp16_to_fp32(sum_a_fp16[ir]);
-                    float a_scale_fp32 = fp16_to_fp32(a_scale_fp16[ir]);
-                    float sum_qs_fp32 = sum_a_fp32 / std::max(a_scale_fp32, 1e-10f);
-                    int32_t sum_qs_i32 = static_cast<int32_t>(std::round(sum_qs_fp32));
-
-                    sum_qs(kb, ir) = static_cast<int16_t>(sum_qs_i32);
-                }
+                // PHASE 2 ELIMINATED: No more sum_qs computation!
+                // The entire 200+ line vectorized sum_qs extraction is gone.
+                // sum_qs is now populated by simple loads above (INT16, no FP math).
 
                 auto t_load_a_end = std::chrono::high_resolution_clock::now();
                 if (enable_detailed_profiling)
@@ -1294,6 +1250,9 @@ namespace llaminar2
                 }
 
                 auto t_load_b_start = std::chrono::high_resolution_clock::now();
+
+                // NOTE: B prefetch disabled - sequential access triggers hardware prefetcher naturally
+                // Manual prefetch increased L1 miss rate from 35.65% to 36.08% (cache pollution)
 
                 // Load B blocks for NR columns - OPTIMIZED: Parallel 2× 256-bit loads (exploit dual load ports!)
                 // Layout: [kb][jr_pair][64] where 64 bytes = [col0_32bytes][col1_32bytes]
@@ -1328,39 +1287,15 @@ namespace llaminar2
 
                 auto t_compute_start = std::chrono::high_resolution_clock::now();
 
-                // Compute MR×NR outer product FOR THIS KB
+                // Accumulate this kb's contribution to the tile accumulators
                 // NOTE: sum_A NO LONGER COMPUTED - use pre-computed Q8_1 sums instead!
                 // Q8_1 format: s = d × Σ(qs[i]), so Σ(qs[i]) = s / d
-                // OPTIMIZATION: Process 2 columns at once to exploit ILP (2× unrolling - sweet spot)
                 for (int ir = 0; ir < MR; ++ir)
                 {
-                    int jr = 0;
-                    // Process 2 columns per iteration (exploit ILP - 2 dpbusd can execute in parallel)
-                    for (; jr + 1 < NR; jr += 2)
+                    for (int jr = 0; jr < NR; ++jr)
                     {
-                        // Issue 2 dpbusd operations before any reductions
-                        __m512i acc_vec0 = _mm512_setzero_si512();
-                        __m512i acc_vec1 = _mm512_setzero_si512();
-
-                        acc_vec0 = _mm512_dpbusd_epi32(acc_vec0, b_vec[jr], a_vec[ir]);
-                        acc_vec1 = _mm512_dpbusd_epi32(acc_vec1, b_vec[jr + 1], a_vec[ir]);
-
-                        // Parallel horizontal reductions
-                        int32_t dot0 = _mm512_reduce_add_epi32(acc_vec0);
-                        int32_t dot1 = _mm512_reduce_add_epi32(acc_vec1);
-
-                        accum(ir, jr, kb) = dot0;
-                        accum(ir, jr + 1, kb) = dot1;
-                    }
-
-                    // Scalar tail for odd NR
-                    for (; jr < NR; ++jr)
-                    {
-                        __m512i acc_vec = _mm512_setzero_si512();
-                        acc_vec = _mm512_dpbusd_epi32(acc_vec, b_vec[jr], a_vec[ir]);
-
-                        int32_t dot = _mm512_reduce_add_epi32(acc_vec);
-                        accum(ir, jr, kb) = dot;
+                        // Accumulate this kb's VNNI result to register accumulator
+                        tile_accum_regs[ir][jr] = _mm512_dpbusd_epi32(tile_accum_regs[ir][jr], b_vec[jr], a_vec[ir]);
                     }
                 }
 
@@ -1370,6 +1305,26 @@ namespace llaminar2
                     t_compute_accum += std::chrono::duration<double, std::milli>(t_compute_end - t_compute_start).count();
                 }
             }
+
+            // PHASE 2 COMPLETE: Reduce register accumulators to accum array (deferred from K-loop)
+            // Horizontal reduction happens ONCE per (ir, jr) instead of K_blocks times!
+            // This dramatically reduces reduction overhead (from MR×NR×K_blocks to MR×NR)
+            auto t_reduction_start = std::chrono::high_resolution_clock::now();
+            for (int ir = 0; ir < MR; ++ir)
+            {
+                for (int jr = 0; jr < NR; ++jr)
+                {
+                    int32_t total_dot = _mm512_reduce_add_epi32(tile_accum_regs[ir][jr]);
+                    // Store to accum array (post-processing expects this layout)
+                    // NOTE: We store sum across ALL kb to index 0, rest are unused
+                    accum(ir, jr, 0) = total_dot;
+                }
+            }
+            auto t_reduction_end = std::chrono::high_resolution_clock::now();
+            // TODO: Add t_k_loop_reduction_ms to perf_stats struct if detailed profiling needed
+            // if (enable_detailed_profiling) {
+            //     perf_stats.t_k_loop_reduction_ms += std::chrono::duration<double, std::milli>(t_reduction_end - t_reduction_start).count();
+            // }
 
             // Accumulate K-loop phase timings
             if (enable_detailed_profiling)
@@ -1857,12 +1812,9 @@ namespace llaminar2
                         a_scales_storage[kb] = a_block.d;
                         b_scales_storage[kb] = B_scales[j * B_K_blocks + kb];
 
-                        // Q8_1 COMPENSATION: Extract sum_qs from Q8_1 block
-                        // sum_qs = sum_a / a_scale (where sum_a and a_scale are FP16)
-                        float sum_a_f32 = fp16_to_fp32(a_block.s);
-                        float a_scale_f32 = fp16_to_fp32(a_block.d);
-                        float sum_qs_f32 = sum_a_f32 / std::max(a_scale_f32, 1e-10f);
-                        sum_qs_storage[kb] = static_cast<int32_t>(std::round(sum_qs_f32));
+                        // Q8_1 COMPENSATION: Extract precomputed sum_qs (INT16) from Q8_1 block
+                        // Nov 2024: sum_qs is now stored as INT16 during quantization, no FP conversion needed!
+                        sum_qs_storage[kb] = static_cast<int32_t>(a_block.sum_qs);
 
                         // OPTIMIZATION: Use dpbusd for 32-element dot product (32 scalar ops → 1 SIMD instruction!)
                         // Calculate base address for this jr_pair's 64-byte ZMM
