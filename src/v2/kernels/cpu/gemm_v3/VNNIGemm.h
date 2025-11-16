@@ -211,22 +211,154 @@ namespace llaminar2
         const int chunk_count = K_BLK / 4;             // number of 4-wide depth chunks
         ld_block_B_out = chunk_count * ld_chunk_B_out; // bytes per K block
 
+        constexpr int PREFETCH_DISTANCE = 64;
+
+        const auto make_mask = [](int cols) -> __mmask16
+        {
+            if (cols >= 16)
+            {
+                return 0xFFFF;
+            }
+            if (cols <= 0)
+            {
+                return 0;
+            }
+            return static_cast<__mmask16>((1u << cols) - 1u);
+        };
+
+        const auto transpose_store = [](const __m128i &row0,
+                                        const __m128i &row1,
+                                        const __m128i &row2,
+                                        const __m128i &row3,
+                                        int block_cols,
+                                        int8_t *dst_base)
+        {
+            const __m128i t0 = _mm_unpacklo_epi8(row0, row1);
+            const __m128i t1 = _mm_unpackhi_epi8(row0, row1);
+            const __m128i t2 = _mm_unpacklo_epi8(row2, row3);
+            const __m128i t3 = _mm_unpackhi_epi8(row2, row3);
+
+            const __m128i u0 = _mm_unpacklo_epi16(t0, t2); // cols 0-3
+            const __m128i u1 = _mm_unpackhi_epi16(t0, t2); // cols 4-7
+            const __m128i u2 = _mm_unpacklo_epi16(t1, t3); // cols 8-11
+            const __m128i u3 = _mm_unpackhi_epi16(t1, t3); // cols 12-15
+
+            if (block_cols >= 4)
+            {
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_base), u0);
+            }
+            if (block_cols >= 8)
+            {
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_base + 16), u1);
+            }
+            if (block_cols >= 12)
+            {
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_base + 32), u2);
+            }
+            if (block_cols >= 16)
+            {
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_base + 48), u3);
+            }
+        };
+
         for (int kk = 0; kk < K_BLK; kk += 4)
         {
             const int chunk_idx = kk / 4;
             int8_t *chunk_base = B_packed_panel + chunk_idx * ld_chunk_B_out;
 
-            for (int n = 0; n < nr; ++n)
+            const int8_t *lane_ptrs[4];
+            for (int lane = 0; lane < 4; ++lane)
             {
-                const int col_idx = n0 + n;
+                const int k_idx = k0 + kk + lane;
+                if (k_idx < K)
+                {
+                    lane_ptrs[lane] = B + static_cast<size_t>(k_idx) * N + n0;
+                }
+                else
+                {
+                    lane_ptrs[lane] = nullptr;
+                }
+            }
+
+            const auto prefetch_lanes = [&](int col_offset)
+            {
+                const int rel_col = col_offset + PREFETCH_DISTANCE;
+                const int absolute_col = n0 + rel_col;
+                if (rel_col < 0 || rel_col >= nr || absolute_col >= N)
+                {
+                    return;
+                }
+                for (int lane = 0; lane < 4; ++lane)
+                {
+                    if (lane_ptrs[lane])
+                    {
+                        _mm_prefetch(reinterpret_cast<const char *>(lane_ptrs[lane] + rel_col), _MM_HINT_T0);
+                    }
+                }
+            };
+
+            const auto load_lane_vec = [&](int lane, int col_offset, __mmask16 mask) -> __m128i
+            {
+                if (!lane_ptrs[lane] || mask == 0)
+                {
+                    return _mm_setzero_si128();
+                }
+                return _mm_maskz_loadu_epi8(mask, lane_ptrs[lane] + col_offset);
+            };
+
+            const auto load_rows = [&](int col_offset, int block_cols,
+                                       __m128i &row0, __m128i &row1,
+                                       __m128i &row2, __m128i &row3)
+            {
+                const int absolute_col = n0 + col_offset;
+                const int valid_cols = std::min(block_cols, std::max(0, N - absolute_col));
+                const __mmask16 col_mask = make_mask(valid_cols);
+
+                // Dual-load pairs to keep both load ports busy.
+                row0 = load_lane_vec(0, col_offset, col_mask);
+                row1 = load_lane_vec(1, col_offset, col_mask);
+                row2 = load_lane_vec(2, col_offset, col_mask);
+                row3 = load_lane_vec(3, col_offset, col_mask);
+            };
+
+            const auto store_block = [&](int col_offset, int block_cols)
+            {
+                prefetch_lanes(col_offset);
+                __m128i row0, row1, row2, row3;
+                load_rows(col_offset, block_cols, row0, row1, row2, row3);
+                int8_t *dst = chunk_base + col_offset * ld_col_B_out;
+                transpose_store(row0, row1, row2, row3, block_cols, dst);
+            };
+
+            int n = 0;
+            while (n + 15 < nr)
+            {
+                store_block(n, 16);
+                n += 16;
+            }
+
+            if (n + 7 < nr)
+            {
+                store_block(n, 8);
+                n += 8;
+            }
+
+            if (n + 3 < nr)
+            {
+                store_block(n, 4);
+                n += 4;
+            }
+
+            for (; n < nr; ++n)
+            {
                 int8_t *dst = chunk_base + n * ld_col_B_out;
+                const int absolute_col = n0 + n;
 
                 for (int lane = 0; lane < 4; ++lane)
                 {
-                    const int k_idx = k0 + kk + lane;
-                    if (col_idx < N && k_idx < K)
+                    if (lane_ptrs[lane] && absolute_col < N)
                     {
-                        dst[lane] = B[k_idx * N + col_idx];
+                        dst[lane] = lane_ptrs[lane][n];
                     }
                     else
                     {
@@ -274,7 +406,8 @@ namespace llaminar2
         const __m512i correction_scale = _mm512_set1_epi32(128);
         alignas(64) int8_t b_tail_buffer[64];
 
-        const auto load_b_vec = [&](const int8_t *chunk_base, int col_base) -> __m512i {
+        const auto load_b_vec = [&](const int8_t *chunk_base, int col_base) -> __m512i
+        {
             if (col_base >= Bp.N)
             {
                 return _mm512_setzero_si512();

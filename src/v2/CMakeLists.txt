@@ -602,7 +602,6 @@ add_library(llaminar2_core STATIC
     # Q8_1 GEMM registry init (forces linking of all instantiation shards)
     kernels/cpu/gemm_v2/Q8_1GemmKernelInit.cpp
     # VNNI GEMM (gemm_v3) - Pre-packed panel layout for maximum VNNI throughput
-    kernels/cpu/gemm_v3/VNNIGemm.cpp
     # VNNI GEMM registry init (forces linking of all instantiation shards)
     kernels/cpu/gemm_v3/VNNIGemmKernelInit.cpp
     kernels/cpu/INT8SwiGLUKernel.cpp

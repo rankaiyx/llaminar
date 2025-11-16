@@ -62,12 +62,8 @@ namespace llaminar2
         static_assert(N_R % 16 == 0, "N_R must be multiple of 16");
         static_assert(K_BLK % 4 == 0, "K_BLK must be multiple of 4");
 
-        // First-cut limitation: dimensions must be multiples of tile sizes
-        // TODO: Handle edge tiles properly
         if (M % M_R != 0 || N % N_R != 0 || K % K_BLK != 0)
         {
-            // For now, zero output and return
-            // In production, we'd handle partial tiles
             for (int i = 0; i < M; ++i)
             {
                 std::memset(C + i * ldc, 0, N * sizeof(float));
@@ -75,15 +71,13 @@ namespace llaminar2
             return;
         }
 
-        const int T = K / K_BLK; // Number of K blocks
+        const int T = K / K_BLK;
 
-        // Pack weights once for entire GEMM (B is reused across all M tiles)
         std::vector<int8_t> B_packed_storage;
         PackedB Bp;
         std::vector<float> wgt_scales;
         pack_q8_0_weights_to_vnni_format<K_BLK>(B, K, N, B_packed_storage, Bp, wgt_scales);
 
-        // Prepare bias (if null, use zeros)
         std::vector<float> bias_vec;
         const float *bias_ptr = bias;
         if (!bias)
@@ -92,13 +86,10 @@ namespace llaminar2
             bias_ptr = bias_vec.data();
         }
 
-        // Convert A to FP32 row-major (temporary for first cut)
-        // Use TensorBase conversion which all IActivationTensor implementations have
         std::vector<float> A_fp32(M * K);
         const TensorBase *A_base = dynamic_cast<const TensorBase *>(&A);
         if (!A_base)
         {
-            // Fallback: zero the output
             for (int i = 0; i < M; ++i)
             {
                 std::memset(C + i * ldc, 0, N * sizeof(float));
@@ -107,54 +98,53 @@ namespace llaminar2
         }
         A_base->to_fp32_span(0, M * K, A_fp32.data());
 
-        // Allocate scratch buffers for packed activations
-        const int K_chunks = K_BLK / 4;
-        const int num_groups = M_R / 4;
-        const int group_stride = K_chunks * 16;
-        const int A_block_bytes = num_groups * group_stride;
-        const int A_tile_total_bytes = A_block_bytes * T;
+        std::vector<int8_t> A_int8(M * K, 0);
+        std::vector<float> act_block_scales(T, 1.0f);
 
-        std::vector<int8_t> A_tile_packed(A_tile_total_bytes);
-        std::vector<float> act_scales(M_R);
-
-        // Loop over M tiles
-        for (int M0 = 0; M0 < M; M0 += M_R)
+        for (int t = 0; t < T; ++t)
         {
-            const int mr = M_R; // First-cut: assume full tiles only
+            const int k0 = t * K_BLK;
+            float max_abs = 0.0f;
 
-            // Pack A for all K blocks for this M_R tile
-            for (int t = 0; t < T; ++t)
+            for (int m = 0; m < M; ++m)
             {
-                const int k0 = t * K_BLK;
-                int8_t *A_block_tile = A_tile_packed.data() + t * A_block_bytes;
-
-                // Pack this [M_R x K_BLK] tile of A
-                pack_fp32_activations_to_4x4_grouped<M_R, K_BLK>(
-                    A_fp32.data(),
-                    M, K,
-                    M0, k0,
-                    mr, K_BLK,
-                    A_block_tile,
-                    act_scales.data());
+                const float *row = A_fp32.data() + m * K + k0;
+                for (int kk = 0; kk < K_BLK; ++kk)
+                {
+                    max_abs = std::max(max_abs, std::abs(row[kk]));
+                }
             }
 
-            // Call VNNI kernel for this M tile across all N
-            // Note: kernel handles N tiling internally
-            gemm_int8_vnni_kernel<
-                M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1,
-                64,    // PREFETCH_B_L2 (default)
-                false, // ACCUM_INT32 (false = FP32 accumulation)
-                false, // USE_L2_PREFETCH (disabled for now)
-                true   // USE_VNNI (enabled)
-                >(
-                A_tile_packed.data(),
-                Bp,
-                C + M0 * ldc, // Output pointer for this M tile
-                bias_ptr,
-                act_scales.data(),
-                wgt_scales.data(),
-                mr, N, K);
+            const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+            act_block_scales[t] = scale;
+            const float inv_scale = 1.0f / scale;
+
+            for (int m = 0; m < M; ++m)
+            {
+                const float *src_row = A_fp32.data() + m * K + k0;
+                int8_t *dst_row = A_int8.data() + m * K + k0;
+                for (int kk = 0; kk < K_BLK; ++kk)
+                {
+                    float val = src_row[kk] * inv_scale;
+                    val = std::max(-128.0f, std::min(127.0f, std::round(val)));
+                    dst_row[kk] = static_cast<int8_t>(val);
+                }
+            }
         }
+
+        gemm_int8_vnni_kernel<
+            M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1,
+            64,
+            false,
+            false,
+            true>(
+            A_int8.data(),
+            Bp,
+            C,
+            bias_ptr,
+            act_block_scales.data(),
+            wgt_scales.data(),
+            M, N, K);
     }
 
 } // namespace llaminar2

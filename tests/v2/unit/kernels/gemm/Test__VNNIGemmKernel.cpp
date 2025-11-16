@@ -1271,7 +1271,7 @@ namespace llaminar2
     /**
      * @brief Test with non-tile-aligned N dimension
      * N < N_R to test edge handling
-     * 
+     *
      * DISABLED: Triggers AddressSanitizer error - out-of-bounds read in microkernel
      * when loading B matrix with N=10 < N_R=16. Kernel needs bounds checking for
      * partial N tiles in B prefetch/load logic.
@@ -1323,7 +1323,7 @@ namespace llaminar2
 
     /**
      * @brief Test with both M and N non-tile-aligned
-     * 
+     *
      * DISABLED: Would trigger same bugs as PartialMTile + PartialNTile.
      * Re-enable after fixing partial tile handling in kernel.
      */
@@ -1440,7 +1440,7 @@ namespace llaminar2
 
         std::vector<float> act_scales(T, 1.0f);
         std::vector<float> wgt_scales(N, 1.0f);
-        
+
         std::vector<float> bias(N);
         for (int n = 0; n < N; ++n)
             bias[n] = 10.0f * (n + 1); // Non-trivial bias values
@@ -1482,7 +1482,7 @@ namespace llaminar2
 
         std::vector<int8_t> A(M * K);
         std::vector<int8_t> B_unpacked(K * N);
-        
+
         // Mix of positive and negative values
         for (size_t i = 0; i < A.size(); ++i)
             A[i] = (i % 2 == 0) ? 10 : -10;
@@ -1617,7 +1617,7 @@ namespace llaminar2
 
         std::vector<int8_t> A(M * K);
         std::vector<int8_t> B_unpacked(K * N);
-        
+
         // Alternate between min and max INT8 values
         for (size_t i = 0; i < A.size(); ++i)
             A[i] = (i % 2 == 0) ? 127 : -127;
@@ -1645,6 +1645,185 @@ namespace llaminar2
         for (int i = 0; i < M * N; ++i)
         {
             EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with K dimension not aligned to K_BLK
+     * K=130 with K_BLK=128 exercises the edge case where the last K-block
+     * has lanes that extend beyond K, triggering nullptr assignment in pack_B_panel_vnni
+     *
+     * This test packs B with UNPADDED K to exercise the lane_ptrs[lane]=nullptr path
+     */
+    TEST_F(Test__VNNIGemmKernel, NonAlignedKDimension_Small)
+    {
+        const int M = 8, N = 16, K = 130; // K not multiple of K_BLK=128
+        constexpr int M_R = 8, N_R = 16, K_BLK = 128;
+        constexpr int UNROLL_K = 1, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+
+        // Pack with UNPADDED K to trigger nullptr lanes in last chunk
+        const int T = (K + K_BLK - 1) / K_BLK; // 2 blocks (128 + partial)
+        const int K_packed = T * K_BLK;        // 256 for computation
+
+        std::mt19937 rng(42);
+        std::uniform_int_distribution<int> int8_dist(-127, 127);
+
+        std::vector<int8_t> A(M * K_packed, 0);
+        std::vector<int8_t> B_unpacked(K_packed * N, 0);
+
+        // Fill only the valid K range (0..129)
+        for (int m = 0; m < M; ++m)
+            for (int k = 0; k < K; ++k)
+                A[m * K_packed + k] = static_cast<int8_t>(int8_dist(rng));
+
+        for (int k = 0; k < K; ++k)
+            for (int n = 0; n < N; ++n)
+                B_unpacked[k * N + n] = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T, 1.0f);
+        std::vector<float> wgt_scales(N, 1.0f);
+        std::vector<float> bias(N, 0.0f);
+
+        // Pack B with ACTUAL K (not padded) to trigger nullptr for lanes beyond K
+        int ld_block, ld_chunk, ld_col;
+        const int panel_size = N * K_BLK;
+        std::vector<int8_t> B_packed(T * panel_size, 0);
+
+        for (int t = 0; t < T; ++t)
+        {
+            int8_t *panel_ptr = B_packed.data() + t * panel_size;
+            pack_B_panel_vnni<K_BLK>(
+                B_unpacked.data(), K, N, // Pass UNPADDED K=130
+                t * K_BLK, 0, N, panel_ptr,
+                ld_block, ld_chunk, ld_col);
+        }
+
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K_packed, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K_packed);
+
+        // Result should be identical since padding is zero
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i;
+        }
+    }
+
+    /**
+     * @brief Test with larger K dimension not aligned to K_BLK
+     * K=450 with K_BLK=128 (3.5 blocks) exercises multiple partial K-blocks
+     */
+    TEST_F(Test__VNNIGemmKernel, NonAlignedKDimension_Medium)
+    {
+        const int M = 16, N = 32, K = 450; // K not multiple of K_BLK=128
+        constexpr int M_R = 16, N_R = 32, K_BLK = 128;
+        constexpr int UNROLL_K = 2, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+
+        const int K_padded = ((K + K_BLK - 1) / K_BLK) * K_BLK; // 512
+        const int T = K_padded / K_BLK;
+
+        std::mt19937 rng(42);
+        std::uniform_int_distribution<int> int8_dist(-127, 127);
+
+        std::vector<int8_t> A(M * K_padded, 0);
+        std::vector<int8_t> B_unpacked(K_padded * N, 0);
+
+        for (int m = 0; m < M; ++m)
+            for (int k = 0; k < K; ++k)
+                A[m * K_padded + k] = static_cast<int8_t>(int8_dist(rng));
+
+        for (int k = 0; k < K; ++k)
+            for (int n = 0; n < N; ++n)
+                B_unpacked[k * N + n] = static_cast<int8_t>(int8_dist(rng));
+
+        std::uniform_real_distribution<float> scale_dist(0.5f, 2.0f);
+        std::vector<float> act_scales(T);
+        for (int t = 0; t < T; ++t)
+            act_scales[t] = scale_dist(rng);
+
+        std::vector<float> wgt_scales(N);
+        for (int n = 0; n < N; ++n)
+            wgt_scales[n] = scale_dist(rng);
+
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K_padded, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K_padded, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K_padded);
+
+        double rel_l2 = computeRelativeL2Error(C_ref.data(), C_test.data(), M, N);
+        EXPECT_LT(rel_l2, 0.01) << "Relative L2 error should be <1% even with non-aligned K";
+    }
+
+    /**
+     * @brief Test with N dimension requiring scalar tail in packing (exercises line 359)
+     * N=20 (not multiple of 16) with panel width causes scalar tail handling in pack_B_panel_vnni
+     * Combined with non-aligned K to trigger nullptr lane handling
+     */
+    TEST_F(Test__VNNIGemmKernel, NonAlignedKDimension_WithPartialN)
+    {
+        const int M = 8, N = 20, K = 130; // K not aligned to K_BLK, N has scalar tail in packing
+        constexpr int M_R = 8, N_R = 32, K_BLK = 128;
+        constexpr int UNROLL_K = 1, PREFETCH_B_L1 = 0, PREFETCH_B_L2 = 0;
+
+        const int K_padded = ((K + K_BLK - 1) / K_BLK) * K_BLK; // 256
+        const int T = K_padded / K_BLK;
+
+        std::mt19937 rng(42);
+        std::uniform_int_distribution<int> int8_dist(-127, 127);
+
+        std::vector<int8_t> A(M * K_padded, 0);
+        std::vector<int8_t> B_unpacked(K_padded * N, 0);
+
+        for (int m = 0; m < M; ++m)
+            for (int k = 0; k < K; ++k)
+                A[m * K_padded + k] = static_cast<int8_t>(int8_dist(rng));
+
+        for (int k = 0; k < K; ++k)
+            for (int n = 0; n < N; ++n)
+                B_unpacked[k * N + n] = static_cast<int8_t>(int8_dist(rng));
+
+        std::vector<float> act_scales(T, 1.0f);
+        std::vector<float> wgt_scales(N, 1.0f);
+        std::vector<float> bias(N, 0.0f);
+
+        int ld_block, ld_chunk, ld_col;
+        auto B_packed = packBMatrixVNNI<K_BLK>(B_unpacked.data(), K_padded, N, ld_block, ld_chunk, ld_col);
+        PackedB Bp{B_packed.data(), ld_block, ld_chunk, ld_col, N, K_BLK};
+
+        std::vector<float> C_ref(M * N, 0.0f);
+        simpleReferenceGemmINT8(A.data(), B_unpacked.data(), C_ref.data(),
+                                act_scales.data(), wgt_scales.data(), M, N, K_padded, K_BLK);
+
+        std::vector<float> C_test(M * N, 0.0f);
+        gemm_int8_vnni_kernel<M_R, N_R, K_BLK, UNROLL_K, PREFETCH_B_L1, PREFETCH_B_L2,
+                              true, true, true>(
+            A.data(), Bp, C_test.data(), bias.data(),
+            act_scales.data(), wgt_scales.data(), M, N, K_padded);
+
+        // Verify correctness with non-aligned K and partial N (scalar tail in packing)
+        for (int i = 0; i < M * N; ++i)
+        {
+            EXPECT_NEAR(C_test[i], C_ref[i], 0.5f) << "Mismatch at index " << i
+                                                   << " with non-aligned K and N dimensions";
         }
     }
 

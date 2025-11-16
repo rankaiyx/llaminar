@@ -446,7 +446,7 @@ add_v2_test(V2_Unit_VNNIGemmKernel
 )
 
 # Test: VNNIGemmAdapter (tensor adapter wrapping VNNI kernel - Q8_0 weights)
-add_executable(v2_test_vnni_gemm_adapter unit/Test__VNNIGemmAdapter.cpp)
+add_executable(v2_test_vnni_gemm_adapter unit/kernels/gemm/Test__VNNIGemmAdapter.cpp)
 target_link_libraries(v2_test_vnni_gemm_adapter
     llaminar2_core
     GTest::gtest
@@ -454,7 +454,7 @@ target_link_libraries(v2_test_vnni_gemm_adapter
 )
 add_v2_test(V2_Unit_VNNIGemmAdapter
     COMMAND $<TARGET_FILE:v2_test_vnni_gemm_adapter>
-    LABELS "V2;Unit;Kernels;GEMM;INT8;VNNI;Q8_0;TensorOperations;Quantization;SymmetricQuantization;CPU;AVX512VNNI"
+    LABELS "V2;Unit;Kernels;GEMM;INT8;VNNI;Q8_0;TensorOperations;Quantization;SymmetricQuantization;CPU;AVX512VNNI;ActivationPacking;WeightPacking;AdapterLayer"
     MPI_PROCS 1  # CPU-only adapter test, single rank
 )
 
