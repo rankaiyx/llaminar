@@ -19,6 +19,14 @@
 namespace llaminar2
 {
 
+    template <int Lane>
+    inline __m512i broadcast_row_vec(const __m128i &src)
+    {
+        static_assert(Lane >= 0 && Lane < 4, "lane must be in [0,3]");
+        return _mm512_broadcast_i32x4(
+            _mm_shuffle_epi32(src, _MM_SHUFFLE(Lane, Lane, Lane, Lane)));
+    }
+
     // Packed A layout: 4x4-grouped for VNNI
     struct PackedA
     {
@@ -32,11 +40,12 @@ namespace llaminar2
         inline int group_stride() const { return k_chunks() * 16; }
     };
 
-    // Packed B layout: Column-major K-contiguous
+    // Packed B layout: VNNI-interleaved 4-wide depth chunks
     struct PackedB
     {
         int8_t *data;
         int ld_block;
+        int ld_chunk;
         int ld_col;
         int N;
         int K_BLK;
@@ -44,6 +53,11 @@ namespace llaminar2
         inline const int8_t *block_ptr(int t) const
         {
             return data + t * ld_block;
+        }
+
+        inline const int8_t *chunk_ptr(int t, int chunk_idx) const
+        {
+            return block_ptr(t) + chunk_idx * ld_chunk;
         }
     };
 
@@ -186,319 +200,38 @@ namespace llaminar2
         int n0, int nr,
         int8_t *__restrict B_packed_panel,
         int &ld_block_B_out,
+        int &ld_chunk_B_out,
         int &ld_col_B_out)
     {
         static_assert(K_BLK % 4 == 0, "K_BLK must be multiple of 4");
 
-        // Set strides:
-        ld_col_B_out = K_BLK;
-        ld_block_B_out = nr * ld_col_B_out;
+        ld_col_B_out = 4;                              // 4 bytes per column chunk
+        ld_chunk_B_out = nr * ld_col_B_out;            // bytes between successive column chunks
+        const int chunk_count = K_BLK / 4;             // number of 4-wide depth chunks
+        ld_block_B_out = chunk_count * ld_chunk_B_out; // bytes per K block
 
-        // Process columns with unrolling for ILP (4-way)
-        int n = 0;
-        for (; n + 3 < nr; n += 4)
+        for (int kk = 0; kk < K_BLK; kk += 4)
         {
-            const bool all_valid = (n0 + n + 3 < N) && (k0 + K_BLK - 1 < K);
+            const int chunk_idx = kk / 4;
+            int8_t *chunk_base = B_packed_panel + chunk_idx * ld_chunk_B_out;
 
-            if (all_valid)
+            for (int n = 0; n < nr; ++n)
             {
-                // Fast path: All 4 columns and all K elements valid
-                for (int col = 0; col < 4; ++col)
+                const int col_idx = n0 + n;
+                int8_t *dst = chunk_base + n * ld_col_B_out;
+
+                for (int lane = 0; lane < 4; ++lane)
                 {
-                    const int col_idx = n0 + n + col;
-                    const int8_t *src_col = B + col_idx; // B[K x N], row-major
-                    int8_t *dst_col = B_packed_panel + (n + col) * ld_col_B_out;
-
-                    // Vectorized gather: process K_BLK elements
-                    // For strided access with stride N, we need scalar loop or gather
-                    // Use 64-byte chunks with AVX-512 gather when K_BLK >= 64
-                    int kk = 0;
-
-                    if constexpr (K_BLK >= 64)
+                    const int k_idx = k0 + kk + lane;
+                    if (col_idx < N && k_idx < K)
                     {
-                        // AVX-512 path: 16-element gather
-                        for (; kk + 15 < K_BLK; kk += 16)
-                        {
-                            // Build index vector for gather (offsets in bytes)
-                            alignas(64) int32_t indices[16];
-                            for (int i = 0; i < 16; ++i)
-                            {
-                                indices[i] = (k0 + kk + i) * N;
-                            }
-                            __m512i idx = _mm512_load_si512(reinterpret_cast<const __m512i *>(indices));
-
-                            // Gather 16 bytes
-                            __m128i gathered = _mm512_cvtepi32_epi8(
-                                _mm512_i32gather_epi32(idx, src_col, 1));
-                            _mm_store_si128(reinterpret_cast<__m128i *>(dst_col + kk), gathered);
-                        }
-                    }
-
-                    // AVX2 8-way gather tail
-                    for (; kk + 7 < K_BLK; kk += 8)
-                    {
-                        alignas(32) int32_t indices[8];
-                        for (int i = 0; i < 8; ++i)
-                        {
-                            indices[i] = (k0 + kk + i) * N;
-                        }
-                        __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i *>(indices));
-
-                        // Gather 8 int32, extract low bytes
-                        __m256i gathered32 = _mm256_i32gather_epi32(
-                            reinterpret_cast<const int *>(src_col), idx, 1);
-
-                        // Extract bytes: gather returns 8 x int32, we want the low byte of each
-                        // Pack 8 x int32 -> 8 x int8
-                        __m128i low128 = _mm256_castsi256_si128(gathered32);       // Extract low 4
-                        __m128i high128 = _mm256_extracti128_si256(gathered32, 1); // Extract high 4
-
-                        // Shuffle to get low bytes: 0,4,8,12 from each 128-bit lane
-                        const __m128i shuffle = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-                        __m128i low_bytes = _mm_shuffle_epi8(low128, shuffle);
-                        __m128i high_bytes = _mm_shuffle_epi8(high128, shuffle);
-
-                        // Combine: low bytes in positions 0-3, high bytes in 4-7
-                        int32_t result_low = _mm_extract_epi32(low_bytes, 0);
-                        int32_t result_high = _mm_extract_epi32(high_bytes, 0);
-
-                        *reinterpret_cast<int32_t *>(dst_col + kk) = result_low;
-                        *reinterpret_cast<int32_t *>(dst_col + kk + 4) = result_high;
-                    }
-
-                    // AVX2 4-way gather tail (vectorized with 128-bit)
-                    for (; kk + 3 < K_BLK; kk += 4)
-                    {
-                        alignas(16) int32_t indices[4];
-                        for (int i = 0; i < 4; ++i)
-                        {
-                            indices[i] = (k0 + kk + i) * N;
-                        }
-                        __m128i idx = _mm_load_si128(reinterpret_cast<const __m128i *>(indices));
-                        __m128i gathered32 = _mm_i32gather_epi32(
-                            reinterpret_cast<const int *>(src_col), idx, 1);
-
-                        // Extract low bytes: 0, 4, 8, 12
-                        const __m128i shuffle = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-                        __m128i bytes = _mm_shuffle_epi8(gathered32, shuffle);
-                        int32_t result = _mm_extract_epi32(bytes, 0);
-                        *reinterpret_cast<int32_t *>(dst_col + kk) = result;
-                    }
-
-                    // Scalar tail (1-3 elements)
-                    for (; kk < K_BLK; ++kk)
-                    {
-                        dst_col[kk] = src_col[(k0 + kk) * N];
-                    }
-                }
-            }
-            else
-            {
-                // Slow path: Boundary handling
-                for (int col = 0; col < 4; ++col)
-                {
-                    const int col_idx = n0 + n + col;
-                    int8_t *dst_col = B_packed_panel + (n + col) * ld_col_B_out;
-
-                    if (col_idx < N)
-                    {
-                        const int8_t *src_col = B + col_idx;
-
-                        // Vectorized K loop with same hierarchical pattern
-                        int kk = 0;
-
-                        // AVX-512 16-way
-                        if constexpr (K_BLK >= 64)
-                        {
-                            for (; kk + 15 < K_BLK; kk += 16)
-                            {
-                                if (k0 + kk + 15 < K)
-                                {
-                                    alignas(64) int32_t indices[16];
-                                    for (int i = 0; i < 16; ++i)
-                                    {
-                                        indices[i] = (k0 + kk + i) * N;
-                                    }
-                                    __m512i idx = _mm512_load_si512(reinterpret_cast<const __m512i *>(indices));
-                                    __m128i gathered = _mm512_cvtepi32_epi8(
-                                        _mm512_i32gather_epi32(idx, src_col, 1));
-                                    _mm_store_si128(reinterpret_cast<__m128i *>(dst_col + kk), gathered);
-                                }
-                                else
-                                {
-                                    break;
-                                }
-                            }
-                        }
-
-                        // AVX2 8-way
-                        for (; kk + 7 < K_BLK && k0 + kk + 7 < K; kk += 8)
-                        {
-                            alignas(32) int32_t indices[8];
-                            for (int i = 0; i < 8; ++i)
-                            {
-                                indices[i] = (k0 + kk + i) * N;
-                            }
-                            __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i *>(indices));
-                            __m256i gathered32 = _mm256_i32gather_epi32(
-                                reinterpret_cast<const int *>(src_col), idx, 1);
-
-                            __m128i low128 = _mm256_castsi256_si128(gathered32);
-                            __m128i high128 = _mm256_extracti128_si256(gathered32, 1);
-
-                            const __m128i shuffle = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-                            __m128i low_bytes = _mm_shuffle_epi8(low128, shuffle);
-                            __m128i high_bytes = _mm_shuffle_epi8(high128, shuffle);
-
-                            int32_t result_low = _mm_extract_epi32(low_bytes, 0);
-                            int32_t result_high = _mm_extract_epi32(high_bytes, 0);
-
-                            *reinterpret_cast<int32_t *>(dst_col + kk) = result_low;
-                            *reinterpret_cast<int32_t *>(dst_col + kk + 4) = result_high;
-                        }
-
-                        // AVX2 4-way gather (vectorized with 128-bit)
-                        for (; kk + 3 < K_BLK; kk += 4)
-                        {
-                            const int k_idx = k0 + kk;
-                            if (k_idx + 3 < K)
-                            {
-                                alignas(16) int32_t indices[4];
-                                for (int i = 0; i < 4; ++i)
-                                {
-                                    indices[i] = (k_idx + i) * N;
-                                }
-                                __m128i idx = _mm_load_si128(reinterpret_cast<const __m128i *>(indices));
-                                __m128i gathered32 = _mm_i32gather_epi32(
-                                    reinterpret_cast<const int *>(src_col), idx, 1);
-
-                                // Extract low bytes: 0, 4, 8, 12
-                                const __m128i shuffle = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-                                __m128i bytes = _mm_shuffle_epi8(gathered32, shuffle);
-                                int32_t result = _mm_extract_epi32(bytes, 0);
-                                *reinterpret_cast<int32_t *>(dst_col + kk) = result;
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-
-                        // Scalar tail
-                        for (; kk < K_BLK; ++kk)
-                        {
-                            const int k_idx = k0 + kk;
-                            dst_col[kk] = (k_idx < K) ? src_col[k_idx * N] : 0;
-                        }
+                        dst[lane] = B[k_idx * N + col_idx];
                     }
                     else
                     {
-                        std::memset(dst_col, 0, K_BLK);
+                        dst[lane] = 0;
                     }
                 }
-            }
-        }
-
-        // Tail columns (1-3 remaining)
-        for (; n < nr; ++n)
-        {
-            const int col_idx = n0 + n;
-            int8_t *dst_col = B_packed_panel + n * ld_col_B_out;
-
-            if (col_idx < N)
-            {
-                const int8_t *src_col = B + col_idx;
-
-                // Apply same hierarchical tail handling as fast path
-                int kk = 0;
-
-                // AVX-512 16-way gather (if K_BLK >= 64)
-                if constexpr (K_BLK >= 64)
-                {
-                    for (; kk + 15 < K_BLK; kk += 16)
-                    {
-                        if (k0 + kk + 15 < K)
-                        {
-                            alignas(64) int32_t indices[16];
-                            for (int i = 0; i < 16; ++i)
-                            {
-                                indices[i] = (k0 + kk + i) * N;
-                            }
-                            __m512i idx = _mm512_load_si512(reinterpret_cast<const __m512i *>(indices));
-                            __m128i gathered = _mm512_cvtepi32_epi8(
-                                _mm512_i32gather_epi32(idx, src_col, 1));
-                            _mm_store_si128(reinterpret_cast<__m128i *>(dst_col + kk), gathered);
-                        }
-                        else
-                        {
-                            break; // Boundary case, fall through to smaller chunks
-                        }
-                    }
-                }
-
-                // AVX2 8-way gather tail
-                for (; kk + 7 < K_BLK && k0 + kk + 7 < K; kk += 8)
-                {
-                    alignas(32) int32_t indices[8];
-                    for (int i = 0; i < 8; ++i)
-                    {
-                        indices[i] = (k0 + kk + i) * N;
-                    }
-                    __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i *>(indices));
-                    __m256i gathered32 = _mm256_i32gather_epi32(
-                        reinterpret_cast<const int *>(src_col), idx, 1);
-
-                    __m128i low128 = _mm256_castsi256_si128(gathered32);
-                    __m128i high128 = _mm256_extracti128_si256(gathered32, 1);
-
-                    const __m128i shuffle = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-                    __m128i low_bytes = _mm_shuffle_epi8(low128, shuffle);
-                    __m128i high_bytes = _mm_shuffle_epi8(high128, shuffle);
-
-                    int32_t result_low = _mm_extract_epi32(low_bytes, 0);
-                    int32_t result_high = _mm_extract_epi32(high_bytes, 0);
-
-                    *reinterpret_cast<int32_t *>(dst_col + kk) = result_low;
-                    *reinterpret_cast<int32_t *>(dst_col + kk + 4) = result_high;
-                }
-
-                // AVX2 4-way gather (vectorized with 128-bit)
-                for (; kk + 3 < K_BLK; kk += 4)
-                {
-                    const int k_idx = k0 + kk;
-                    if (k_idx + 3 < K)
-                    {
-                        alignas(16) int32_t indices[4];
-                        for (int i = 0; i < 4; ++i)
-                        {
-                            indices[i] = (k_idx + i) * N;
-                        }
-                        __m128i idx = _mm_load_si128(reinterpret_cast<const __m128i *>(indices));
-                        __m128i gathered32 = _mm_i32gather_epi32(
-                            reinterpret_cast<const int *>(src_col), idx, 1);
-
-                        // Extract low bytes: 0, 4, 8, 12
-                        const __m128i shuffle = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-                        __m128i bytes = _mm_shuffle_epi8(gathered32, shuffle);
-                        int32_t result = _mm_extract_epi32(bytes, 0);
-                        *reinterpret_cast<int32_t *>(dst_col + kk) = result;
-                    }
-                    else
-                    {
-                        break; // Fall through to final scalar tail
-                    }
-                }
-
-                // Scalar tail (1-3 elements)
-                for (; kk < K_BLK; ++kk)
-                {
-                    const int k_idx = k0 + kk;
-                    dst_col[kk] = (k_idx < K) ? src_col[k_idx * N] : 0;
-                }
-            }
-            else
-            {
-                std::memset(dst_col, 0, K_BLK);
             }
         }
     }
@@ -586,6 +319,7 @@ namespace llaminar2
                 if (k_off0 < K_BLK)
                 {
                     const int kk_idx0 = k_off0 / 4;
+                    const int8_t *chunk_base0 = base_B_block + kk_idx0 * Bp.ld_chunk;
 
                     // Interleave A group loads and B loads (2-way: load 1 A group, 1 B vec, repeat)
                     const int num_pairs = std::min(num_groups, N_R / 16);
@@ -596,13 +330,13 @@ namespace llaminar2
                     {
                         // Load A group 0 and B vec 0 in parallel
                         const int8_t *src_a0 = base_A_block + g * group_stride + kk_idx0 * 16;
-                        const int8_t *b_ptr0 = base_B_block + (N0 + j * 16) * Bp.ld_col + k_off0;
+                        const int8_t *b_ptr0 = chunk_base0 + (N0 + j * 16) * Bp.ld_col;
                         a_groups[0][g] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a0));
                         b_vecs_u[0][j] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr0));
 
                         // Load A group 1 and B vec 1 in parallel
                         const int8_t *src_a1 = base_A_block + (g + 1) * group_stride + kk_idx0 * 16;
-                        const int8_t *b_ptr1 = base_B_block + (N0 + (j + 1) * 16) * Bp.ld_col + k_off0;
+                        const int8_t *b_ptr1 = chunk_base0 + (N0 + (j + 1) * 16) * Bp.ld_col;
                         a_groups[0][g + 1] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a1));
                         b_vecs_u[0][j + 1] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr1));
                     }
@@ -617,7 +351,7 @@ namespace llaminar2
                     // Handle remaining B vecs
                     for (; j < N_R / 16; ++j)
                     {
-                        const int8_t *b_ptr = base_B_block + (N0 + j * 16) * Bp.ld_col + k_off0;
+                        const int8_t *b_ptr = chunk_base0 + (N0 + j * 16) * Bp.ld_col;
                         b_vecs_u[0][j] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr));
                     }
                 }
@@ -630,6 +364,7 @@ namespace llaminar2
                     if (k_off >= K_BLK)
                         break;
                     const int kk_idx = k_off / 4;
+                    const int8_t *chunk_base = base_B_block + kk_idx * Bp.ld_chunk;
 
                     // Stage loads for current u with interleaved A/B to exploit dual load ports
                     int g = 0, j = 0;
@@ -637,13 +372,13 @@ namespace llaminar2
                     {
                         // Load A group 0 and B vec 0 in parallel
                         const int8_t *src_a0 = base_A_block + g * group_stride + kk_idx * 16;
-                        const int8_t *b_ptr0 = base_B_block + (N0 + j * 16) * Bp.ld_col + k_off;
+                        const int8_t *b_ptr0 = chunk_base + (N0 + j * 16) * Bp.ld_col;
                         a_groups[u][g] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a0));
                         b_vecs_u[u][j] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr0));
 
                         // Load A group 1 and B vec 1 in parallel
                         const int8_t *src_a1 = base_A_block + (g + 1) * group_stride + kk_idx * 16;
-                        const int8_t *b_ptr1 = base_B_block + (N0 + (j + 1) * 16) * Bp.ld_col + k_off;
+                        const int8_t *b_ptr1 = chunk_base + (N0 + (j + 1) * 16) * Bp.ld_col;
                         a_groups[u][g + 1] = _mm_load_si128(reinterpret_cast<const __m128i *>(src_a1));
                         b_vecs_u[u][j + 1] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr1));
                     }
@@ -658,7 +393,7 @@ namespace llaminar2
                     // Handle remaining B vecs
                     for (; j < N_R / 16; ++j)
                     {
-                        const int8_t *b_ptr = base_B_block + (N0 + j * 16) * Bp.ld_col + k_off;
+                        const int8_t *b_ptr = chunk_base + (N0 + j * 16) * Bp.ld_col;
                         b_vecs_u[u][j] = _mm512_loadu_si512(reinterpret_cast<const void *>(b_ptr));
                     }
 
@@ -669,16 +404,19 @@ namespace llaminar2
                         for (int g = 0; g < num_groups; ++g)
                         {
                             const __m128i a32 = a_groups[prev_u][g];
-                            for (int r = 0; r < 4; ++r)
+                            const int m_base = g * 4;
+                            const __m512i a_vec0 = broadcast_row_vec<0>(a32);
+                            const __m512i a_vec1 = broadcast_row_vec<1>(a32);
+                            const __m512i a_vec2 = broadcast_row_vec<2>(a32);
+                            const __m512i a_vec3 = broadcast_row_vec<3>(a32);
+
+                            for (int j = 0; j < N_R / 16; ++j)
                             {
-                                const int m = g * 4 + r;
-                                const __m128i a_row_32 =
-                                    _mm_shuffle_epi32(a32, _MM_SHUFFLE(r, r, r, r));
-                                const __m512i a_vec = _mm512_broadcast_i32x4(a_row_32);
-                                for (int j = 0; j < N_R / 16; ++j)
-                                {
-                                    acc[m][j] = _mm512_dpbusd_epi32(acc[m][j], a_vec, b_vecs_u[prev_u][j]);
-                                }
+                                const __m512i b_vec = b_vecs_u[prev_u][j];
+                                acc[m_base + 0][j] = _mm512_dpbusd_epi32(acc[m_base + 0][j], a_vec0, b_vec);
+                                acc[m_base + 1][j] = _mm512_dpbusd_epi32(acc[m_base + 1][j], a_vec1, b_vec);
+                                acc[m_base + 2][j] = _mm512_dpbusd_epi32(acc[m_base + 2][j], a_vec2, b_vec);
+                                acc[m_base + 3][j] = _mm512_dpbusd_epi32(acc[m_base + 3][j], a_vec3, b_vec);
                             }
                         }
                     }
@@ -693,16 +431,19 @@ namespace llaminar2
                         for (int g = 0; g < num_groups; ++g)
                         {
                             const __m128i a32 = a_groups[max_u][g];
-                            for (int r = 0; r < 4; ++r)
+                            const int m_base = g * 4;
+                            const __m512i a_vec0 = broadcast_row_vec<0>(a32);
+                            const __m512i a_vec1 = broadcast_row_vec<1>(a32);
+                            const __m512i a_vec2 = broadcast_row_vec<2>(a32);
+                            const __m512i a_vec3 = broadcast_row_vec<3>(a32);
+
+                            for (int j = 0; j < N_R / 16; ++j)
                             {
-                                const int m = g * 4 + r;
-                                const __m128i a_row_32 =
-                                    _mm_shuffle_epi32(a32, _MM_SHUFFLE(r, r, r, r));
-                                const __m512i a_vec = _mm512_broadcast_i32x4(a_row_32);
-                                for (int j = 0; j < N_R / 16; ++j)
-                                {
-                                    acc[m][j] = _mm512_dpbusd_epi32(acc[m][j], a_vec, b_vecs_u[max_u][j]);
-                                }
+                                const __m512i b_vec = b_vecs_u[max_u][j];
+                                acc[m_base + 0][j] = _mm512_dpbusd_epi32(acc[m_base + 0][j], a_vec0, b_vec);
+                                acc[m_base + 1][j] = _mm512_dpbusd_epi32(acc[m_base + 1][j], a_vec1, b_vec);
+                                acc[m_base + 2][j] = _mm512_dpbusd_epi32(acc[m_base + 2][j], a_vec2, b_vec);
+                                acc[m_base + 3][j] = _mm512_dpbusd_epi32(acc[m_base + 3][j], a_vec3, b_vec);
                             }
                         }
                     }
@@ -878,7 +619,7 @@ namespace llaminar2
         const int8_t *, int, int, int, int, int, int, int8_t *);
 
     template void pack_B_panel_vnni<64>(
-        const int8_t *, int, int, int, int, int, int8_t *, int &, int &);
+        const int8_t *, int, int, int, int, int, int8_t *, int &, int &, int &);
 
     // Template instantiations are now generated by generate_vnni_gemm_instantiations.py
     // See kernels/cpu/gemm_v3/generated/VNNIGemmInstantiations_*.cpp

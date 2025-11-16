@@ -54,8 +54,10 @@ namespace llaminar2
         static_assert(K_BLK % 4 == 0, "K_BLK must be multiple of 4");
 
         const int T = (K + K_BLK - 1) / K_BLK; // Number of K blocks
-        const int ld_col = K_BLK;
-        const int ld_block = N * ld_col;
+        const int ld_col = 4;
+        const int chunk_count = K_BLK / 4;
+        const int ld_chunk = N * ld_col;
+        const int ld_block = chunk_count * ld_chunk;
 
         // Allocate storage
         B_packed_storage.resize(T * ld_block, 0);
@@ -92,36 +94,32 @@ namespace llaminar2
             const int k0 = t * K_BLK;
             int8_t *block_base = B_packed_storage.data() + t * ld_block;
 
-            for (int n = 0; n < N; ++n)
+            for (int kk = 0; kk < K_BLK; kk += 4)
             {
-                int8_t *dst_col = block_base + n * ld_col;
+                int8_t *chunk_base = block_base + (kk / 4) * ld_chunk;
 
-                for (int kk = 0; kk < K_BLK; ++kk)
+                for (int n = 0; n < N; ++n)
                 {
-                    const int k_global = k0 + kk;
+                    int8_t *dst = chunk_base + n * ld_col;
 
-                    if (k_global < K)
+                    for (int lane = 0; lane < 4; ++lane)
                     {
-                        // Determine which Q8_0 block this element belongs to
-                        const size_t q8_block_idx = k_global / block_size;
-                        const size_t offset_in_block = k_global % block_size;
+                        const int k_global = k0 + kk + lane;
 
-                        // Get the Q8_0 block for column n, K-block q8_block_idx
-                        const void *raw_block = B.get_raw_block_at(n, q8_block_idx);
-                        if (raw_block)
+                        if (k_global < K)
                         {
-                            const Q8_0Block *block = static_cast<const Q8_0Block *>(raw_block);
-                            dst_col[kk] = block->qs[offset_in_block];
+                            const size_t q8_block_idx = k_global / block_size;
+                            const size_t offset_in_block = k_global % block_size;
+                            const void *raw_block = B.get_raw_block_at(n, q8_block_idx);
+                            if (raw_block)
+                            {
+                                const Q8_0Block *block = static_cast<const Q8_0Block *>(raw_block);
+                                dst[lane] = block->qs[offset_in_block];
+                                continue;
+                            }
                         }
-                        else
-                        {
-                            dst_col[kk] = 0;
-                        }
-                    }
-                    else
-                    {
-                        // Zero-pad if K is not multiple of K_BLK
-                        dst_col[kk] = 0;
+
+                        dst[lane] = 0;
                     }
                 }
             }
@@ -130,6 +128,7 @@ namespace llaminar2
         // Fill PackedB view
         Bp.data = B_packed_storage.data();
         Bp.ld_block = ld_block;
+        Bp.ld_chunk = ld_chunk;
         Bp.ld_col = ld_col;
         Bp.N = N;
         Bp.K_BLK = K_BLK;
@@ -159,8 +158,10 @@ namespace llaminar2
         static_assert(K_BLK % 4 == 0, "K_BLK must be multiple of 4");
 
         const int T = (K + K_BLK - 1) / K_BLK;
-        const int ld_col = K_BLK;
-        const int ld_block = N * ld_col;
+        const int ld_col = 4;
+        const int chunk_count = K_BLK / 4;
+        const int ld_chunk = N * ld_col;
+        const int ld_block = chunk_count * ld_chunk;
 
         B_packed_storage.resize(T * ld_block, 0);
 
@@ -170,22 +171,25 @@ namespace llaminar2
             const int k0 = t * K_BLK;
             int8_t *block_base = B_packed_storage.data() + t * ld_block;
 
-            for (int n = 0; n < N; ++n)
+            for (int kk = 0; kk < K_BLK; kk += 4)
             {
-                int8_t *dst_col = block_base + n * ld_col;
+                int8_t *chunk_base = block_base + (kk / 4) * ld_chunk;
 
-                for (int kk = 0; kk < K_BLK; ++kk)
+                for (int n = 0; n < N; ++n)
                 {
-                    const int k_global = k0 + kk;
+                    int8_t *dst = chunk_base + n * ld_col;
 
-                    if (k_global < K)
+                    for (int lane = 0; lane < 4; ++lane)
                     {
-                        // B_int8 is row-major: B_int8[k * N + n]
-                        dst_col[kk] = B_int8[k_global * N + n];
-                    }
-                    else
-                    {
-                        dst_col[kk] = 0;
+                        const int k_global = k0 + kk + lane;
+                        if (k_global < K)
+                        {
+                            dst[lane] = B_int8[k_global * N + n];
+                        }
+                        else
+                        {
+                            dst[lane] = 0;
+                        }
                     }
                 }
             }
@@ -193,6 +197,7 @@ namespace llaminar2
 
         Bp.data = B_packed_storage.data();
         Bp.ld_block = ld_block;
+        Bp.ld_chunk = ld_chunk;
         Bp.ld_col = ld_col;
         Bp.N = N;
         Bp.K_BLK = K_BLK;

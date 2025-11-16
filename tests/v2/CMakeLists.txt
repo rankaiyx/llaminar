@@ -431,30 +431,17 @@ add_v2_test(V2_Unit_INT8PackedGemm
     MPI_PROCS 1  # CPU-only kernel, single rank
 )
 
-# Test: VNNIGemmAdapter (tensor-level adapter for VNNI GEMM with FP32 activations and Q8_0 weights)
-# Test: VNNIGemm (kernel-level VNNI GEMM correctness - direct kernel invocation)
-add_executable(v2_test_vnni_gemm unit/kernels/gemm/Test__VNNIGemm.cpp)
-target_link_libraries(v2_test_vnni_gemm
+# Test: VNNIGemmKernel (comprehensive kernel-level VNNI GEMM correctness tests)
+# Consolidated from: Test__VNNIGemm_Focused, Test__VNNIGemm_Minimal, Test__VNNIGemm_Correctness, Test__VNNIGemm
+add_executable(v2_test_vnni_gemm_kernel unit/kernels/gemm/Test__VNNIGemmKernel.cpp)
+target_link_libraries(v2_test_vnni_gemm_kernel
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_VNNIGemm
-    COMMAND $<TARGET_FILE:v2_test_vnni_gemm>
-    LABELS "V2;Unit;Kernels;GEMM;INT8;VNNI;DirectKernel;PackedLayout;AVX512VNNI;CPU"
-    MPI_PROCS 1  # CPU-only kernel test, single rank
-)
-
-# Test: VNNIGemm_Focused (focused kernel-level tests with current API)
-add_executable(v2_test_vnni_gemm_focused unit/kernels/gemm/Test__VNNIGemm_Focused.cpp)
-target_link_libraries(v2_test_vnni_gemm_focused
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_VNNIGemm_Focused
-    COMMAND $<TARGET_FILE:v2_test_vnni_gemm_focused>
-    LABELS "V2;Unit;Kernels;GEMM;INT8;VNNI;DirectKernel;PackedLayout;AVX512VNNI;CPU;CurrentAPI"
+add_v2_test(V2_Unit_VNNIGemmKernel
+    COMMAND $<TARGET_FILE:v2_test_vnni_gemm_kernel>
+    LABELS "V2;Unit;Kernels;GEMM;INT8;VNNI;DirectKernel;PackedLayout;AVX512VNNI;CPU;Correctness"
     MPI_PROCS 1  # CPU-only kernel test, single rank
 )
 

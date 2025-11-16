@@ -34,7 +34,7 @@ int main()
     const int T = K / K_BLK;
     const int nr = N; // full N panel
 
-    int ld_block_B = 0, ld_col_B = 0;
+    int ld_block_B = 0, ld_chunk_B = 0, ld_col_B = 0;
     std::vector<int8_t> B_packed_storage(T * nr * K_BLK);
 
     for (int t = 0; t < T; ++t)
@@ -46,12 +46,13 @@ int main()
             k0,
             0, nr,
             panel,
-            ld_block_B, ld_col_B);
+            ld_block_B, ld_chunk_B, ld_col_B);
     }
 
     PackedB Bp;
     Bp.data = B_packed_storage.data();
     Bp.ld_block = ld_block_B;
+    Bp.ld_chunk = ld_chunk_B;
     Bp.ld_col = ld_col_B;
     Bp.N = N;
     Bp.K_BLK = K_BLK;

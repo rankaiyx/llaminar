@@ -221,7 +221,8 @@ namespace llaminar2
         PackedB Bp;
         Bp.data = B_packed.data();
         Bp.ld_block = (K_BLK / 4) * (4 * N);
-        Bp.ld_col = 4 * N;
+        Bp.ld_chunk = 4 * N;
+        Bp.ld_col = 4;
         Bp.N = N;
         Bp.K_BLK = K_BLK;
 
@@ -300,7 +301,8 @@ namespace llaminar2
         PackedB Bp;
         Bp.data = B_packed.data();
         Bp.ld_block = (K_BLK / 4) * (4 * N);
-        Bp.ld_col = 4 * N;
+        Bp.ld_chunk = 4 * N;
+        Bp.ld_col = 4;
         Bp.N = N;
         Bp.K_BLK = K_BLK;
 
@@ -439,7 +441,8 @@ namespace llaminar2
         PackedB Bp;
         Bp.data = B_packed.data();
         Bp.ld_block = (K_BLK / 4) * (4 * N);
-        Bp.ld_col = 4 * N;
+        Bp.ld_chunk = 4 * N;
+        Bp.ld_col = 4;
         Bp.N = N;
         Bp.K_BLK = K_BLK;
         Bp.column_sums = column_sums.data();
@@ -555,7 +558,8 @@ namespace llaminar2
         PackedB Bp;
         Bp.data = B_packed.data();
         Bp.ld_block = (K_BLK / 4) * (4 * N);
-        Bp.ld_col = 4 * N;
+        Bp.ld_chunk = 4 * N;
+        Bp.ld_col = 4;
         Bp.N = N;
         Bp.K_BLK = K_BLK;
         Bp.column_sums = column_sums.data();
