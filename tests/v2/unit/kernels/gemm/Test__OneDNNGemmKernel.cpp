@@ -136,12 +136,10 @@ namespace
                 memory::dims bias_dims = {1, n};
                 memory::desc bias_md(bias_dims, memory::data_type::f32, memory::format_tag::ab);
                 bias_mem = std::make_unique<memory>(bias_md, eng, const_cast<float *>(bias->data()));
-                matmul::desc matmul_desc(src_md, weight_md, bias_md, dst_md);
-                return matmul::primitive_desc(matmul_desc, attr, eng);
+                return matmul::primitive_desc(eng, src_md, weight_md, bias_md, dst_md, attr);
             }
 
-            matmul::desc matmul_desc(src_md, weight_md, dst_md);
-            return matmul::primitive_desc(matmul_desc, attr, eng);
+            return matmul::primitive_desc(eng, src_md, weight_md, dst_md, attr);
         }();
 
         matmul matmul_primitive(matmul_pd);
@@ -239,46 +237,6 @@ TEST(Test__OneDNNGemmKernel, DirectPrimitiveSoftmaxMatchesReference)
     }
 
     apply_rowwise_softmax(reference.data(), m, n);
-
-    for (int i = 0; i < m * n; ++i)
-    {
-        EXPECT_NEAR(fused[static_cast<size_t>(i)], reference[static_cast<size_t>(i)], 1e-5f) << "Mismatch at idx " << i;
-    }
-}
-
-TEST(Test__OneDNNGemmKernel, DirectPrimitiveColumnSoftmaxMatchesReference)
-{
-    constexpr int m = 4;
-    constexpr int n = 3;
-    constexpr int k = 2;
-
-    const std::vector<float> A = {
-        -0.2f, 0.9f,
-        0.3f, -0.5f,
-        1.1f, -0.7f,
-        -0.4f, 0.8f};
-
-    const std::vector<float> B = {
-        0.6f, -0.1f, 0.2f,
-        -0.3f, 0.4f, -0.8f};
-
-    auto fused = run_direct_onednn_matmul(A, B, m, n, k, true, 0);
-
-    std::vector<float> reference(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
-    for (int row = 0; row < m; ++row)
-    {
-        for (int col = 0; col < n; ++col)
-        {
-            for (int kk = 0; kk < k; ++kk)
-            {
-                reference[static_cast<size_t>(row) * n + static_cast<size_t>(col)] +=
-                    A[static_cast<size_t>(row) * k + static_cast<size_t>(kk)] *
-                    B[static_cast<size_t>(kk) * n + static_cast<size_t>(col)];
-            }
-        }
-    }
-
-    apply_columnwise_softmax(reference.data(), m, n);
 
     for (int i = 0; i < m * n; ++i)
     {

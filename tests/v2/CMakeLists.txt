@@ -340,6 +340,19 @@ add_v2_test(V2_Unit_OneDNNGemmKernel
     MPI_PROCS 1  # OneDNN fused kernel executes on CPU only
 )
 
+# Test: OneDNN GEMM adapter (INT8 path with tensor interface)
+add_executable(v2_test_onednn_gemm_adapter unit/kernels/gemm/Test__OneDNNGemmAdapter.cpp)
+target_link_libraries(v2_test_onednn_gemm_adapter
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_OneDNNGemmAdapter
+    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_adapter>
+    LABELS "V2;Unit;Kernels;GEMM;OneDNN;INT8;Adapter;CPU"
+    MPI_PROCS 1  # Adapter operates purely on CPU tensors, single rank
+)
+
 # Test: ActivationTraits (trait dispatch to softmax primitives, GEMM, workspace allocation)
 add_executable(v2_test_activation_traits unit/Test__ActivationTraits.cpp)
 target_link_libraries(v2_test_activation_traits
@@ -2244,6 +2257,7 @@ function(add_v2_perf_test TEST_NAME)
         -x GOTO_NUM_THREADS=${CORES_PER_SOCKET}
         -x MKL_NUM_THREADS=${CORES_PER_SOCKET}
         -x MKL_DYNAMIC=false
+        -x ONEDNN_VERBOSE=0
     )
     
     # Add --oversubscribe if we have fewer sockets than MPI ranks
@@ -2276,7 +2290,7 @@ function(add_v2_perf_test TEST_NAME)
     # Performance tests default to INFO log level (less verbose than Unit/Integration)
     set_tests_properties(${TEST_NAME} PROPERTIES
         LABELS "${ARG_LABELS}"
-        ENVIRONMENT "LLAMINAR_LOG_LEVEL=INFO;OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+        ENVIRONMENT "LLAMINAR_LOG_LEVEL=INFO;OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;ONEDNN_VERBOSE=0;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
         WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/../.."
     )
     
@@ -2324,6 +2338,40 @@ set_target_properties(v2_perf_onednn_gemm_qwen_profile PROPERTIES
 add_v2_perf_test(V2_Perf_OneDNNGemm_QwenProfile
     COMMAND $<TARGET_FILE:v2_perf_onednn_gemm_qwen_profile>
     LABELS "V2;Performance;GEMM;OneDNN;FP32;Qwen;AdapterOverhead;gemm_v4"
+    MPI_PROCS 1
+)
+
+# Performance Test: Fused OneDNN matmul + softmax diagnostic
+add_executable(v2_perf_onednn_gemm_fused_softmax performance/cpu/kernels/gemm/gemm_v4/Perf__OneDNNGemm_FusedSoftmax.cpp)
+target_link_libraries(v2_perf_onednn_gemm_fused_softmax
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_onednn_gemm_fused_softmax PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_OneDNNGemm_FusedSoftmax
+    COMMAND $<TARGET_FILE:v2_perf_onednn_gemm_fused_softmax>
+    LABELS "V2;Performance;Attention;GEMM;Softmax;OneDNN;gemm_v4"
+    MPI_PROCS 1
+)
+
+# Performance Test: INT8 GEMM + streaming softmax comparison
+add_executable(v2_perf_onednn_gemm_int8_streaming_softmax performance/cpu/kernels/gemm/gemm_v4/Perf__OneDNNGemm_Int8StreamingSoftmax.cpp)
+target_link_libraries(v2_perf_onednn_gemm_int8_streaming_softmax
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+set_target_properties(v2_perf_onednn_gemm_int8_streaming_softmax PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_OneDNNGemm_Int8StreamingSoftmax
+    COMMAND $<TARGET_FILE:v2_perf_onednn_gemm_int8_streaming_softmax>
+    LABELS "V2;Performance;Attention;GEMM;Softmax;OneDNN;INT8;gemm_v4"
     MPI_PROCS 1
 )
 

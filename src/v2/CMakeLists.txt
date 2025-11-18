@@ -274,23 +274,22 @@ endif()
 #   - BF16: bf16bf16f32 (used by BF16GemmKernel, replaces MKL)
 #   - FP32: Baseline handled by OpenBLAS
 if(USE_ONEDNN)
-    # First, check if OneDNN exists in external/ and clone if needed
+    find_package(Git REQUIRED)
+
+    # First, ensure OneDNN exists in external/ and is on the expected revision
     # Note: Repository root is two levels up from src/v2
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
     set(ONEDNN_GIT_URL "https://github.com/dbsanfte/oneDNN.git")
     # Track dbsanfte fork main branch so fused softmax patches are always available
     set(ONEDNN_GIT_REF "main")
-    
-    if(NOT EXISTS "${ONEDNN_EXTERNAL_DIR}/include/oneapi/dnnl/dnnl.hpp")
-        message(STATUS "V2: OneDNN not found in external/, cloning ${ONEDNN_GIT_URL} (${ONEDNN_GIT_REF})...")
-        
-        find_package(Git REQUIRED)
-        
-        # Ensure external directory exists
+
+    if(NOT EXISTS "${REPO_ROOT}/external")
         file(MAKE_DIRECTORY ${REPO_ROOT}/external)
-        
-        # Clone OneDNN repository
+    endif()
+
+    if(NOT EXISTS "${ONEDNN_EXTERNAL_DIR}")
+        message(STATUS "V2: OneDNN not found in external/, cloning ${ONEDNN_GIT_URL} (${ONEDNN_GIT_REF})...")
         execute_process(
             COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${ONEDNN_GIT_REF}
                 ${ONEDNN_GIT_URL}
@@ -302,21 +301,48 @@ if(USE_ONEDNN)
             OUTPUT_STRIP_TRAILING_WHITESPACE
             ERROR_STRIP_TRAILING_WHITESPACE
         )
-        
+
         if(NOT GIT_CLONE_RESULT EQUAL 0)
             message(FATAL_ERROR "V2: Failed to clone OneDNN: ${GIT_CLONE_ERROR}")
         endif()
-        
+
         message(STATUS "V2: OneDNN ${ONEDNN_GIT_REF} cloned successfully")
     else()
-        message(STATUS "V2: OneDNN already exists in external/onednn")
+        message(STATUS "V2: OneDNN already present at ${ONEDNN_EXTERNAL_DIR}; leaving existing checkout untouched")
     endif()
-    
-    # Now check if OneDNN is built
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+        WORKING_DIRECTORY ${ONEDNN_EXTERNAL_DIR}
+        RESULT_VARIABLE ONEDNN_REV_PARSE_RESULT
+        OUTPUT_VARIABLE ONEDNN_COMMIT
+        ERROR_VARIABLE ONEDNN_REV_PARSE_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT ONEDNN_REV_PARSE_RESULT EQUAL 0)
+        message(FATAL_ERROR "V2: Failed to determine OneDNN commit: ${ONEDNN_REV_PARSE_ERROR}")
+    endif()
+
+    # Now check if OneDNN is built for the requested commit
     set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build")
+    set(ONEDNN_VERSION_FILE "${ONEDNN_BUILD_DIR}/.llaminar-onednn-commit")
+
+    set(ONEDNN_BUILD_COMMIT "missing")
+    if(EXISTS "${ONEDNN_VERSION_FILE}")
+        file(READ "${ONEDNN_VERSION_FILE}" ONEDNN_BUILD_COMMIT_RAW)
+        string(STRIP "${ONEDNN_BUILD_COMMIT_RAW}" ONEDNN_BUILD_COMMIT)
+    endif()
+
+    if(EXISTS "${ONEDNN_BUILD_DIR}" AND NOT ONEDNN_BUILD_COMMIT STREQUAL ONEDNN_COMMIT)
+        message(STATUS
+            "V2: OneDNN build cache (${ONEDNN_BUILD_COMMIT}) is stale vs ${ONEDNN_COMMIT}, rebuilding...")
+        file(REMOVE_RECURSE "${ONEDNN_BUILD_DIR}")
+    endif()
+
     if(NOT EXISTS "${ONEDNN_BUILD_DIR}/include/oneapi/dnnl/dnnl.hpp")
-        message(STATUS "V2: Building OneDNN (${ONEDNN_GIT_URL}@${ONEDNN_GIT_REF}) from source...")
-        
+        message(STATUS "V2: Building OneDNN (${ONEDNN_GIT_URL}@${ONEDNN_GIT_REF} @ ${ONEDNN_COMMIT}) from source...")
+
         # Configure OneDNN
         execute_process(
             COMMAND ${CMAKE_COMMAND} -B ${ONEDNN_BUILD_DIR} -S ${ONEDNN_EXTERNAL_DIR}
@@ -331,11 +357,11 @@ if(USE_ONEDNN)
             OUTPUT_VARIABLE ONEDNN_CONFIG_OUTPUT
             ERROR_VARIABLE ONEDNN_CONFIG_ERROR
         )
-        
+
         if(NOT ONEDNN_CONFIG_RESULT EQUAL 0)
             message(FATAL_ERROR "V2: Failed to configure OneDNN: ${ONEDNN_CONFIG_ERROR}")
         endif()
-        
+
         # Build OneDNN
         execute_process(
             COMMAND ${CMAKE_COMMAND} --build ${ONEDNN_BUILD_DIR} --parallel --target install
@@ -343,11 +369,13 @@ if(USE_ONEDNN)
             OUTPUT_VARIABLE ONEDNN_BUILD_OUTPUT
             ERROR_VARIABLE ONEDNN_BUILD_ERROR
         )
-        
+
         if(NOT ONEDNN_BUILD_RESULT EQUAL 0)
             message(FATAL_ERROR "V2: Failed to build OneDNN: ${ONEDNN_BUILD_ERROR}")
         endif()
-        
+
+        file(WRITE "${ONEDNN_VERSION_FILE}" "${ONEDNN_COMMIT}\n")
+
         message(STATUS "V2: OneDNN built and installed to ${ONEDNN_BUILD_DIR}")
     else()
         message(STATUS "V2: OneDNN already built in ${ONEDNN_BUILD_DIR}")

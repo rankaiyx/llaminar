@@ -8,6 +8,11 @@
  * - Fused 3-pass algorithm (max → exp+sum → normalize)
  * - Fast exp approximation (optional)
  * - Causal masking support
+ *
+ * @deprecated Legacy FP32-only entry point kept for older kernels. New code
+ *             should include `src/v2/kernels/cpu/primitives/SoftmaxPrimitives_New.h`
+ *             for the split scalar/AVX2/AVX512 implementations with FP32/BF16/FP16
+ *             support.
  */
 #pragma once
 

@@ -40,6 +40,20 @@ namespace llaminar2::primitives
 
     namespace detail
     {
+#if defined(LLAMINAR_HAVE_LIBMVEC)
+        extern "C"
+        {
+#if defined(__AVX512F__)
+            __m512 _ZGVeN16v_expf(__m512) __attribute__((weak));
+#endif
+#if defined(__AVX2__)
+            __m256 _ZGVcN8v_expf(__m256) __attribute__((weak));
+#endif
+#if defined(__SSE2__)
+            __m128 _ZGVbN4v_expf(__m128) __attribute__((weak));
+#endif
+        }
+#endif
         // BF16 ↔ FP32 conversion (manual)
         inline float bf16_to_fp32_scalar(uint16_t bf16)
         {
@@ -58,6 +72,58 @@ namespace llaminar2::primitives
             uint32_t rounded = fp32_bits + rounding_bias;
             return static_cast<uint16_t>(rounded >> 16);
         }
+
+#if defined(__SSE2__)
+        inline float hsum128(__m128 v)
+        {
+            __m128 shuf = _mm_movehdup_ps(v);
+            __m128 sums = _mm_add_ps(v, shuf);
+            shuf = _mm_movehl_ps(shuf, sums);
+            sums = _mm_add_ss(sums, shuf);
+            return _mm_cvtss_f32(sums);
+        }
+
+        inline __m128 floor_ps_compat(__m128 x)
+        {
+            __m128i truncated = _mm_cvttps_epi32(x);
+            __m128 floored = _mm_cvtepi32_ps(truncated);
+            __m128 mask = _mm_cmpgt_ps(floored, x);
+            return _mm_sub_ps(floored, _mm_and_ps(mask, _mm_set1_ps(1.0f)));
+        }
+#endif
+
+#if defined(__AVX2__)
+        inline float hsum256(__m256 v)
+        {
+            __m128 lo = _mm256_castps256_ps128(v);
+            __m128 hi = _mm256_extractf128_ps(v, 1);
+            __m128 sum = _mm_add_ps(lo, hi);
+            return hsum128(sum);
+        }
+
+        inline __m256 floor_ps_compat(__m256 x)
+        {
+            __m256i truncated = _mm256_cvttps_epi32(x);
+            __m256 floored = _mm256_cvtepi32_ps(truncated);
+            __m256 mask = _mm256_cmp_ps(floored, x, _CMP_GT_OQ);
+            return _mm256_sub_ps(floored, _mm256_and_ps(mask, _mm256_set1_ps(1.0f)));
+        }
+#endif
+
+#if defined(LLAMINAR_HAS_AVX512)
+        inline float hsum512(__m512 v)
+        {
+            return _mm512_reduce_add_ps(v);
+        }
+
+        inline __m512 floor_ps_compat(__m512 x)
+        {
+            __m512i truncated = _mm512_cvttps_epi32(x);
+            __m512 floored = _mm512_cvtepi32_ps(truncated);
+            __mmask16 mask = _mm512_cmp_ps_mask(floored, x, _CMP_GT_OQ);
+            return _mm512_mask_sub_ps(floored, mask, floored, _mm512_set1_ps(1.0f));
+        }
+#endif
 
 #if defined(LLAMINAR_HAS_F16C)
         // FP16 ↔ FP32 conversion (using F16C)
@@ -152,6 +218,168 @@ namespace llaminar2::primitives
             }
 
             return fp16;
+        }
+#endif
+
+#if defined(__SSE2__)
+        inline __m128 exp128_ps_poly(__m128 x)
+        {
+            const __m128 max_val = _mm_set1_ps(88.3762626647949f);
+            const __m128 min_val = _mm_set1_ps(-88.3762626647949f);
+            x = _mm_min_ps(x, max_val);
+            x = _mm_max_ps(x, min_val);
+
+            const __m128 log2e = _mm_set1_ps(1.44269504088896341f);
+            const __m128 half = _mm_set1_ps(0.5f);
+            __m128 fx = _mm_add_ps(_mm_mul_ps(x, log2e), half);
+            __m128 floored = floor_ps_compat(fx);
+
+            const __m128 c1 = _mm_set1_ps(0.693359375f);
+            const __m128 c2 = _mm_set1_ps(-2.12194440e-4f);
+            __m128 temp = _mm_mul_ps(floored, c1);
+            __m128 z = _mm_sub_ps(x, temp);
+            temp = _mm_mul_ps(floored, c2);
+            x = _mm_sub_ps(z, temp);
+
+            const __m128 p0 = _mm_set1_ps(1.9875691500e-4f);
+            const __m128 p1 = _mm_set1_ps(1.3981999507e-3f);
+            const __m128 p2 = _mm_set1_ps(8.3334519073e-3f);
+            const __m128 p3 = _mm_set1_ps(4.1665795894e-2f);
+            const __m128 p4 = _mm_set1_ps(1.6666665459e-1f);
+            const __m128 p5 = _mm_set1_ps(5.0000001201e-1f);
+
+            __m128 y = p0;
+            y = _mm_add_ps(_mm_mul_ps(y, x), p1);
+            y = _mm_add_ps(_mm_mul_ps(y, x), p2);
+            y = _mm_add_ps(_mm_mul_ps(y, x), p3);
+            y = _mm_add_ps(_mm_mul_ps(y, x), p4);
+            y = _mm_add_ps(_mm_mul_ps(y, x), p5);
+            y = _mm_add_ps(_mm_mul_ps(y, x), _mm_set1_ps(1.0f));
+
+            __m128i emm0 = _mm_cvttps_epi32(floored);
+            emm0 = _mm_add_epi32(emm0, _mm_set1_epi32(0x7f));
+            emm0 = _mm_slli_epi32(emm0, 23);
+            __m128 pow2n = _mm_castsi128_ps(emm0);
+            return _mm_mul_ps(y, pow2n);
+        }
+
+        inline __m128 exp128_ps(__m128 x)
+        {
+#if defined(LLAMINAR_HAVE_LIBMVEC)
+            if (_ZGVbN4v_expf)
+            {
+                return _ZGVbN4v_expf(x);
+            }
+#endif
+            return exp128_ps_poly(x);
+        }
+#endif
+
+#if defined(__AVX2__)
+        inline __m256 exp256_ps_poly(__m256 x)
+        {
+            const __m256 max_val = _mm256_set1_ps(88.3762626647949f);
+            const __m256 min_val = _mm256_set1_ps(-88.3762626647949f);
+            x = _mm256_min_ps(x, max_val);
+            x = _mm256_max_ps(x, min_val);
+
+            const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+            const __m256 half = _mm256_set1_ps(0.5f);
+            __m256 fx = _mm256_add_ps(_mm256_mul_ps(x, log2e), half);
+            __m256 floored = floor_ps_compat(fx);
+
+            const __m256 c1 = _mm256_set1_ps(0.693359375f);
+            const __m256 c2 = _mm256_set1_ps(-2.12194440e-4f);
+            __m256 temp = _mm256_mul_ps(floored, c1);
+            __m256 z = _mm256_sub_ps(x, temp);
+            temp = _mm256_mul_ps(floored, c2);
+            x = _mm256_sub_ps(z, temp);
+
+            const __m256 p0 = _mm256_set1_ps(1.9875691500e-4f);
+            const __m256 p1 = _mm256_set1_ps(1.3981999507e-3f);
+            const __m256 p2 = _mm256_set1_ps(8.3334519073e-3f);
+            const __m256 p3 = _mm256_set1_ps(4.1665795894e-2f);
+            const __m256 p4 = _mm256_set1_ps(1.6666665459e-1f);
+            const __m256 p5 = _mm256_set1_ps(5.0000001201e-1f);
+
+            __m256 y = p0;
+            y = _mm256_add_ps(_mm256_mul_ps(y, x), p1);
+            y = _mm256_add_ps(_mm256_mul_ps(y, x), p2);
+            y = _mm256_add_ps(_mm256_mul_ps(y, x), p3);
+            y = _mm256_add_ps(_mm256_mul_ps(y, x), p4);
+            y = _mm256_add_ps(_mm256_mul_ps(y, x), p5);
+            y = _mm256_add_ps(_mm256_mul_ps(y, x), _mm256_set1_ps(1.0f));
+
+            __m256i emm0 = _mm256_cvttps_epi32(floored);
+            emm0 = _mm256_add_epi32(emm0, _mm256_set1_epi32(0x7f));
+            emm0 = _mm256_slli_epi32(emm0, 23);
+            __m256 pow2n = _mm256_castsi256_ps(emm0);
+            return _mm256_mul_ps(y, pow2n);
+        }
+
+        inline __m256 exp256_ps(__m256 x)
+        {
+#if defined(LLAMINAR_HAVE_LIBMVEC)
+            if (_ZGVcN8v_expf)
+            {
+                return _ZGVcN8v_expf(x);
+            }
+#endif
+            return exp256_ps_poly(x);
+        }
+#endif
+
+#if defined(LLAMINAR_HAS_AVX512)
+        inline __m512 exp512_ps_poly(__m512 x)
+        {
+            const __m512 max_val = _mm512_set1_ps(88.3762626647949f);
+            const __m512 min_val = _mm512_set1_ps(-88.3762626647949f);
+            x = _mm512_min_ps(x, max_val);
+            x = _mm512_max_ps(x, min_val);
+
+            const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
+            const __m512 half = _mm512_set1_ps(0.5f);
+            __m512 fx = _mm512_add_ps(_mm512_mul_ps(x, log2e), half);
+            __m512 floored = floor_ps_compat(fx);
+
+            const __m512 c1 = _mm512_set1_ps(0.693359375f);
+            const __m512 c2 = _mm512_set1_ps(-2.12194440e-4f);
+            __m512 temp = _mm512_mul_ps(floored, c1);
+            __m512 z = _mm512_sub_ps(x, temp);
+            temp = _mm512_mul_ps(floored, c2);
+            x = _mm512_sub_ps(z, temp);
+
+            const __m512 p0 = _mm512_set1_ps(1.9875691500e-4f);
+            const __m512 p1 = _mm512_set1_ps(1.3981999507e-3f);
+            const __m512 p2 = _mm512_set1_ps(8.3334519073e-3f);
+            const __m512 p3 = _mm512_set1_ps(4.1665795894e-2f);
+            const __m512 p4 = _mm512_set1_ps(1.6666665459e-1f);
+            const __m512 p5 = _mm512_set1_ps(5.0000001201e-1f);
+
+            __m512 y = p0;
+            y = _mm512_add_ps(_mm512_mul_ps(y, x), p1);
+            y = _mm512_add_ps(_mm512_mul_ps(y, x), p2);
+            y = _mm512_add_ps(_mm512_mul_ps(y, x), p3);
+            y = _mm512_add_ps(_mm512_mul_ps(y, x), p4);
+            y = _mm512_add_ps(_mm512_mul_ps(y, x), p5);
+            y = _mm512_add_ps(_mm512_mul_ps(y, x), _mm512_set1_ps(1.0f));
+
+            __m512i emm0 = _mm512_cvttps_epi32(floored);
+            emm0 = _mm512_add_epi32(emm0, _mm512_set1_epi32(0x7f));
+            emm0 = _mm512_slli_epi32(emm0, 23);
+            __m512 pow2n = _mm512_castsi512_ps(emm0);
+            return _mm512_mul_ps(y, pow2n);
+        }
+
+        inline __m512 exp512_ps(__m512 x)
+        {
+#if defined(LLAMINAR_HAVE_LIBMVEC)
+            if (_ZGVeN16v_expf)
+            {
+                return _ZGVeN16v_expf(x);
+            }
+#endif
+            return exp512_ps_poly(x);
         }
 #endif
 
