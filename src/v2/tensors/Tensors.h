@@ -2,6 +2,72 @@
  * @file Tensors.h
  * @brief Minimal tensor interface with device affinity
  *
+ * ============================================================================
+ * INTERFACE HIERARCHY AND USAGE
+ * ============================================================================
+ *
+ * This file defines several key interfaces that tensor classes implement:
+ *
+ * 1. **IActivationTensor** - For mutable activation tensors
+ *    - Implemented by: FP32Tensor, FP16Tensor, BF16Tensor, INT32Tensor, Q8_1Tensor
+ *    - NOT implemented by: Quantized weight tensors (IQ4_NL, Q6_K, Q4_K, etc.)
+ *    - Usage: Pipeline casts to IActivationTensor* for RMSNorm, RoPE, SwiGLU ops
+ *    - Key methods: createRoPE(), createSwiGLU(), applyRMSNorm(), to_int8_activation_pack()
+ *
+ * 2. **ITensorGemmTileDataProvider** - Block-wise FP32 decode interface
+ *    - Implemented by: ALL tensor types (quantized weights + activation tensors)
+ *    - Usage: Generic QuantizedGemmKernel, auto-tuner, tile-based GEMM
+ *    - Key methods: decode_block_at(), block_size(), decoder_rows()/decoder_cols()
+ *    - Enables uniform GEMM kernel that works across all quantization formats
+ *
+ * 3. **IQ8_0Decodable** - On-the-fly conversion to Q8_0 symmetric quantization
+ *    - Implemented by: Quantized weight tensors + activation tensors (for testing)
+ *    - Usage: Weight caching, INT8×INT8 GEMM intermediate format
+ *    - Key method: decode_to_q8_0() - converts arbitrary quantized block → Q8_0
+ *
+ * 4. **IQ8_1Decodable** - On-the-fly conversion to Q8_1 asymmetric quantization
+ *    - Implemented by: Activation tensors only (FP32, FP16, BF16, INT32, Q8_1)
+ *    - Usage: INT8 GEMM activations (AVX512-VNNI, CUDA Tensor Cores)
+ *    - Key method: decode_to_q8_1() - quantizes activation row to Q8_1 with pre-computed sum
+ *    - Optimization: "Quantize once, use many times" for multi-head attention
+ *
+ * ============================================================================
+ * TENSOR CLASS SUMMARY
+ * ============================================================================
+ *
+ * **Activation Tensors** (implements IActivationTensor):
+ * - FP32Tensor:  32-bit float (baseline, full precision)
+ * - FP16Tensor:  IEEE 754 half-precision (2× compression, GPU-optimized)
+ * - BF16Tensor:  Brain Float 16 (2× compression, FP32 range, CPU/GPU hardware support)
+ * - INT32Tensor: 32-bit integer accumulator (INT8 GEMM pipeline intermediate)
+ * - Q8_1Tensor:  8-bit asymmetric quantization with sum (activation format)
+ *
+ * **Quantized Weight Tensors** (read-only, implements ITensorGemmTileDataProvider + IQ8_0Decodable):
+ * - IQ4_NLTensor:   4.5 bpw (7.1× compression, best 4-bit quality)
+ * - IQ4_XSTensor:   4.5 bpw (alternative 4-bit scheme)
+ * - Q8_0Tensor:     8.5 bpw (symmetric quantization)
+ * - Q4_0Tensor:     4.5 bpw (symmetric 4-bit)
+ * - Q4_1Tensor:     5.0 bpw (asymmetric 4-bit)
+ * - Q5_0Tensor:     5.5 bpw (symmetric 5-bit)
+ * - Q5_1Tensor:     6.0 bpw (asymmetric 5-bit)
+ * - Q6_KTensor:     6.6 bpw (6-bit k-quant)
+ * - Q2_KTensor:     2.6 bpw (2-bit k-quant)
+ * - Q3_KTensor:     3.4 bpw (3-bit k-quant)
+ * - Q4_KTensor:     4.5 bpw (4-bit k-quant)
+ * - Q5_KTensor:     5.5 bpw (5-bit k-quant)
+ * - Q8_KTensor:     8.5 bpw (8-bit k-quant)
+ * - IQ2_XXSTensor:  2.1 bpw (ultra-low bit 2-bit)
+ * - IQ2_XSTensor:   2.3 bpw (improved 2-bit)
+ * - IQ3_XXSTensor:  3.1 bpw (ultra-low bit 3-bit)
+ * - IQ2_STensor:    2.5 bpw (signed 2-bit)
+ * - IQ3_STensor:    3.4 bpw (signed 3-bit)
+ * - IQ1_STensor:    1.6 bpw (ultra-compressed 1-bit)
+ * - IQ1_MTensor:    1.9 bpw (modified 1-bit)
+ *
+ * **Special Tensor** (hybrid):
+ * - INT8Tensor: Dequantized 8-bit weights (4× compression vs FP32, AVX512-VNNI/CUDA INT8)
+ *               Implements ITensorGemmTileDataProvider but NOT IActivationTensor
+ *
  * Key design principles:
  * - Per-tensor device placement (not per-rank)
  * - Lazy host↔device synchronization
@@ -71,15 +137,30 @@ namespace llaminar2
     };
 
     /**
-     * @brief Interface for activation tensors that support kernel creation
+     * @brief Interface for activation tensors that support kernel creation and in-place operations
      *
-     * Only activation tensor types (FP32, BF16, FP16, INT32, Q8_1) should implement this.
-     * Quantized weight tensors (IQ4_NL, Q6_K, Q4_K, etc.) do NOT implement this interface.
+     * **Purpose**: Marks tensor types that represent mutable activation data (not read-only weights).
+     * Activation tensors can create computation kernels and support in-place transformations
+     * like RMSNorm, RoPE, SwiGLU, and Softmax.
      *
-     * Rationale:
-     * - Kernels operate on ACTIVATION buffers (hidden states, Q/K/V, etc.)
+     * **Implementors**: FP32Tensor, BF16Tensor, FP16Tensor, INT32Tensor, Q8_1Tensor
+     * **Non-implementors**: Quantized weight tensors (IQ4_NL, Q6_K, Q4_K, etc.)
+     *
+     * **Rationale**:
+     * - Kernels operate on ACTIVATION buffers (hidden states, Q/K/V, intermediate results)
      * - Kernel precision must match ACTIVATION precision, not weight precision
-     * - Creating kernels from weight tensors is architecturally incorrect
+     * - Weights are read-only and should not create kernels (architectural invariant)
+     *
+     * **Usage in pipelines**:
+     * - `Qwen2Pipeline::computeAttention()`: Casts current_hidden_ to IActivationTensor* for RMSNorm
+     * - `Qwen2Pipeline::computeFFN()`: Uses IActivationTensor* for SwiGLU operations
+     * - Allows pipeline to work with any activation precision (FP32/FP16/BF16/INT32)
+     *
+     * **Key methods**:
+     * - `createRoPE()`, `createSwiGLU()`, `createSoftmax()`, `createRMSNorm()`, `createAttention()`
+     * - `applyRMSNorm()`, `applyRoPE()`: In-place transformations
+     * - `to_int8_activation_pack()`: Per-row quantization for INT8 GEMM activations
+     * - `from_int32_with_scales()`: Dequantization from INT32 accumulator (INT8 pipeline)
      */
     class IActivationTensor
     {
@@ -185,14 +266,26 @@ namespace llaminar2
     };
 
     /**
-     * @brief Interface for tensors that can be decoded to Q8_0 format
+     * @brief Interface for tensors that can be decoded to Q8_0 format (8-bit symmetric quantization)
      *
-     * This interface is implemented by quantized tensor types (IQ4_NL, Q6_K, Q4_K, etc.)
-     * that support block-level decoding to Q8_0 format for integer GEMM operations.
+     * **Purpose**: Enables on-the-fly conversion of quantized weight tensors to Q8_0 intermediate format
+     * for integer GEMM operations (INT8×INT8 → INT32). This is used for weight caching and
+     * heterogeneous precision GEMM where weights and activations have different quantization formats.
      *
-     * Used by CachedQ8Provider to constrain which tensor types can be used with
-     * the Q8_0 weight cache, avoiding template instantiation errors for types
-     * like FP16Tensor and BF16Tensor that don't support Q8_0 decoding.
+     * **Implementors**:
+     * - Quantized weight tensors: IQ4_NL, Q6_K, Q4_K, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, etc.
+     * - Activation tensors: FP32Tensor, FP16Tensor, BF16Tensor (for testing/compatibility)
+     *
+     * **Usage**:
+     * - Weight caching systems that convert arbitrary quantized formats → Q8_0 for uniform GEMM
+     * - INT8 GEMM kernels that want standardized 8-bit weight format
+     * - `TensorBase::to_q8_0()` default implementation uses this interface
+     *
+     * **Q8_0 Format** (GGUF standard):
+     * - 32 elements per block
+     * - 1 FP16 scale per block
+     * - Symmetric quantization: value = scale * int8_value
+     * - No zero-point (always centered at 0)
      */
     class IQ8_0Decodable
     {
@@ -209,15 +302,30 @@ namespace llaminar2
     };
 
     /**
-     * @brief Interface for tensors that can be decoded to Q8_1 format
+     * @brief Interface for tensors that can be decoded to Q8_1 format (8-bit asymmetric quantization with sum)
      *
-     * This interface is implemented by activation tensor types (FP32, FP16, BF16, INT32)
-     * that support on-the-fly quantization to Q8_1 format for integer GEMM operations.
+     * **Purpose**: Enables on-the-fly quantization of activation tensors to Q8_1 intermediate format
+     * for integer GEMM operations. Q8_1 pre-computes per-block sums during quantization to eliminate
+     * expensive horizontal reductions in the GEMM inner loop.
      *
-     * Q8_1 is used as an intermediate activation format (matching CUDA pattern):
-     * - Pre-computes sum during quantization (s = d × sum(qs[i]))
-     * - Eliminates expensive horizontal reductions in GEMM K-loop
-     * - "Quantize once, use many times" amortization
+     * **Implementors**: FP32Tensor, FP16Tensor, BF16Tensor, INT32Tensor, Q8_1Tensor
+     * **Non-implementors**: Quantized weight tensors (read-only, don't support activation quantization)
+     *
+     * **Q8_1 Format** (GGUF standard):
+     * - 32 elements per block
+     * - 1 FP16 scale (d) per block
+     * - 1 FP16 sum (s = d × Σqs[i]) per block (KEY DIFFERENCE from Q8_0)
+     * - Asymmetric quantization support via sum term
+     *
+     * **Optimization Strategy** ("quantize once, use many times"):
+     * - Activation row quantized to Q8_1 once → cached in registers/L1
+     * - GEMM K-loop uses pre-computed sum → no horizontal reduction overhead
+     * - Matches CUDA llama.cpp pattern for INT8×INT8 GEMM
+     *
+     * **Usage**:
+     * - INT8 GEMM kernels (AVX512-VNNI, CUDA INT8 Tensor Cores)
+     * - OneDNN matmul with INT8 activations
+     * - Cached activation quantization for multi-head attention
      */
     class IQ8_1Decodable
     {
@@ -419,7 +527,17 @@ namespace llaminar2
 
     // Implementation: FP32Tensor.cpp
     /**
-     * @brief FP32 tensor with optional device storage
+     * @brief 32-bit floating point tensor (baseline activation format)
+     *
+     * **Interfaces implemented**:
+     * - `TensorBase`: Core tensor API (inherited)
+     * - `IActivationTensor`: Kernel creation, in-place ops (RMSNorm, RoPE, SwiGLU)
+     * - `ITensorGemmTileDataProvider`: Block-wise FP32 decode (block_size=32, identity decode)
+     * - `IQ8_0Decodable`: On-the-fly quantization to Q8_0 (for testing/compatibility)
+     * - `IQ8_1Decodable`: On-the-fly quantization to Q8_1 (for INT8 GEMM activations)
+     *
+     * **Usage**: Default activation tensor for FP32 inference pipelines. Provides baseline
+     * numerical accuracy for parity testing against PyTorch/llama.cpp.
      */
     class FP32Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
@@ -427,7 +545,7 @@ namespace llaminar2
         explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx = -1);
         ~FP32Tensor() override;
 
-        // TensorBase interface
+        // ===== TensorBase Interface =====
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::FP32; }
 
@@ -438,11 +556,11 @@ namespace llaminar2
         const float *data() const override;
         float *mutable_data() override;
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Device-aware copy
+        bool copyFrom(const TensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // IActivationTensor interface - activation-only operations
+        // ===== IActivationTensor Interface =====
         std::unique_ptr<ITensorRoPE> createRoPE() override;
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
@@ -487,16 +605,23 @@ namespace llaminar2
         void to_fp32_row(size_t row_idx, float *buffer) const override;
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
-        // View support
+        // ===== TensorBase View Support =====
         bool is_view() const override { return is_view_; }
         std::shared_ptr<TensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
-        // ITensorGemmTileDataProvider interface - for GEMM kernels to use FP32 weights directly
-        // FP32 is not block-quantized, but we provide blocking for cache efficiency
+        // ===== ITensorGemmTileDataProvider Interface =====
+        // (Used by QuantizedGemmKernel and auto-tuner for uniform tile access)
         static constexpr size_t FP32_BLOCK_SIZE = 32; // Match quantized formats for fair comparison
 
+        /**
+         * @brief Decode block to FP32 (identity operation for FP32Tensor)
+         *
+         * For FP32Tensor, this is simply a memcpy since data is already in FP32 format.
+         * Allows FP32Tensor to work with the same QuantizedGemmKernel infrastructure
+         * used by quantized formats (IQ4_NL, Q6_K, etc.).
+         */
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             // Calculate starting position for this block
@@ -530,10 +655,10 @@ namespace llaminar2
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return FP32_BLOCK_SIZE; }
 
-        // IQ8_0Decodable interface
+        // ===== IQ8_0Decodable Interface =====
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
 
-        // IQ8_1Decodable interface
+        // ===== IQ8_1Decodable Interface =====
         const Q8_1Block *decode_to_q8_1(size_t row_idx, size_t k_block_offset) const override;
 
     private:
@@ -566,13 +691,21 @@ namespace llaminar2
 
     // Implementation: FP16Tensor.cpp
     /**
-     * @brief FP16 tensor with optional device storage
+     * @brief IEEE 754 half-precision (16-bit) floating point tensor
      *
-     * IEEE 754 half-precision (16-bit) floating point.
-     * - 1 sign bit, 5 exponent bits, 10 mantissa bits
-     * - Range: ±65,504 (narrower than FP32)
-     * - Precision: ~3-4 decimal digits
-     * - 2× memory reduction vs FP32
+     * **Format**: 1 sign bit, 5 exponent bits, 10 mantissa bits
+     * **Range**: ±65,504 (narrower than FP32, risk of overflow)
+     * **Precision**: ~3-4 decimal digits
+     * **Memory**: 2× reduction vs FP32
+     *
+     * **Interfaces implemented**:
+     * - `TensorBase`: Core tensor API (inherited)
+     * - `IActivationTensor`: Kernel creation, in-place ops (RMSNorm, RoPE, SwiGLU)
+     * - `ITensorGemmTileDataProvider`: Block-wise decode to FP32 (block_size=32)
+     * - `IQ8_0Decodable`: On-the-fly quantization to Q8_0
+     * - `IQ8_1Decodable`: On-the-fly quantization to Q8_1 (for INT8 GEMM activations)
+     *
+     * **Usage**: Activation tensor for FP16 inference (2× memory savings, GPU-optimized).
      */
     class FP16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
@@ -733,14 +866,22 @@ namespace llaminar2
 
     // Implementation: BF16Tensor.cpp
     /**
-     * @brief BF16 tensor with optional device storage
+     * @brief Brain Float 16 tensor (Google's reduced-precision format)
      *
-     * Brain Float 16 (Google's reduced-precision format).
-     * - 1 sign bit, 8 exponent bits, 7 mantissa bits
-     * - Same range as FP32 (prevents overflow/underflow)
-     * - Reduced precision (~2-3 decimal digits)
-     * - 2× memory reduction vs FP32
-     * - Hardware acceleration on Ice Lake+, Zen 4+
+     * **Format**: 1 sign bit, 8 exponent bits, 7 mantissa bits
+     * **Range**: Same as FP32 (prevents overflow/underflow issues)
+     * **Precision**: ~2-3 decimal digits (lower than FP16)
+     * **Memory**: 2× reduction vs FP32
+     * **Hardware**: Accelerated on Intel Ice Lake+, AMD Zen 4+, NVIDIA Ampere+
+     *
+     * **Interfaces implemented**:
+     * - `TensorBase`: Core tensor API (inherited)
+     * - `IActivationTensor`: Kernel creation, in-place ops (RMSNorm, RoPE, SwiGLU)
+     * - `ITensorGemmTileDataProvider`: Block-wise decode to FP32 (block_size=32)
+     * - `IQ8_0Decodable`: On-the-fly quantization to Q8_0
+     * - `IQ8_1Decodable`: On-the-fly quantization to Q8_1 (for INT8 GEMM activations)
+     *
+     * **Usage**: Preferred activation tensor for CPU/GPU mixed precision (better overflow resistance than FP16).
      */
     class BF16Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IQ8_1Decodable
     {
@@ -892,16 +1033,24 @@ namespace llaminar2
 
     // Implementation: INT8Tensor.cpp
     /**
-     * @brief INT8 tensor for quantized compute (AVX512-VNNI, CUDA INT8 GEMM)
+     * @brief 8-bit signed integer tensor for quantized GEMM (AVX512-VNNI, CUDA INT8 Tensor Cores)
      *
-     * INT8Tensor stores dequantized weights as 8-bit signed integers with per-tensor
-     * scaling factors. This format enables:
-     * - AVX512-VNNI instructions on Intel CPUs (Ice Lake+)
-     * - INT8×INT8 GEMM in CUDA via CUTLASS or cuBLAS
-     * - Reduced memory bandwidth vs FP32 (4× compression)
+     * **Purpose**: Dequantized weight storage for INT8×INT8 GEMM operations.
+     * When `--weight-precision int8` is set, all quantized weight tensors (IQ4_NL, Q6_K, Q8_0, etc.)
+     * are converted to INT8Tensor at model load time.
      *
-     * Use case: When --weight-precision int8 is set, all quantized tensors
-     * (IQ4_NL, Q6_K, Q8_0, etc.) are dequantized to this format at load time.
+     * **Storage**: 8-bit signed integers + per-column and per-row scaling factors
+     * **Memory**: 4× compression vs FP32 (8 bits vs 32 bits per element)
+     *
+     * **Hardware Support**:
+     * - CPU: AVX512-VNNI (Ice Lake+), AVX2-VNNI (Alder Lake+), AMX (Sapphire Rapids+)
+     * - GPU: CUDA INT8 Tensor Cores (Turing+), cuBLAS INT8 GEMM
+     *
+     * **Interfaces implemented**:
+     * - `TensorBase`: Core tensor API (inherited)
+     * - `ITensorGemmTileDataProvider`: Block-wise decode to FP32 for mixed-precision GEMM
+     *
+     * **NOT implemented**: IActivationTensor (INT8Tensor represents weights, not activations)
      */
     class INT8Tensor : public TensorBase, public ITensorGemmTileDataProvider
     {
@@ -996,18 +1145,26 @@ namespace llaminar2
 
     // Implementation: INT32Tensor.cpp
     /**
-     * @brief INT32 accumulator tensor for full INT8 pipeline
+     * @brief 32-bit signed integer accumulator tensor for full INT8 inference pipeline
      *
-     * Stores INT32 accumulator results from INT8 GEMM operations.
-     * Supports requantization back to INT8 for next layer (key for full INT8 inference).
+     * **Purpose**: Stores INT32 accumulator results from INT8×INT8 GEMM operations.
+     * Enables full INT8 inference by supporting requantization back to INT8 activations
+     * for the next layer (avoiding expensive INT32→FP32→INT8 round-trip).
      *
-     * Key features:
-     * - Per-row dynamic scaling for INT32→INT8 requantization
-     * - Dequantization to FP32 for final output
-     * - Optimized for CPU (no device support yet)
+     * **Pipeline Flow**:
+     * 1. INT8 activation × INT8 weight → INT32 accumulator (VNNI/Tensor Core output)
+     * 2. INT32Tensor stores result with per-row scaling metadata
+     * 3. `requantize_to_int8()` → INT8 activation for next layer
+     * 4. Final layer: `to_fp32()` for logits output
      *
-     * Usage:
-     *   INT8×INT8 GEMM → INT32Tensor → requantize_to_int8() → INT8Tensor (next layer)
+     * **Interfaces implemented**:
+     * - `TensorBase`: Core tensor API (inherited)
+     * - `IActivationTensor`: Kernel creation, format conversions (treated as activation, not weight)
+     *
+     * **Key methods**:
+     * - `requantize_to_int8()`: Dynamic per-row rescaling for next layer
+     * - `from_int32_with_scales()`: Populate from raw INT32 accumulator + scale factors
+     * - `to_fp32()`: Dequantize to FP32 for final output or parity testing
      */
     class INT32Tensor : public TensorBase, public IActivationTensor
     {
@@ -1129,13 +1286,27 @@ namespace llaminar2
 
     // Implementation: IQ4_NLTensor.cpp
     /**
-     * @brief IQ4_NL quantized tensor (4.5 bpw, 7.1× compression)
+     * @brief IQ4_NL (4-bit non-linear) quantized weight tensor
      *
-     * Implements non-linear 4-bit quantization with lookup table.
-     * Provides both full decode and fused kernel interfaces.
+     * **Format**: 4.5 bits per weight (4-bit quantized values + FP16 scale)
+     * **Compression**: 7.1× vs FP32 (best quality-to-size ratio for 4-bit)
+     * **Quantization**: Non-linear lookup table optimized for LLM weight distributions
      *
-     * Also implements ITensorGemmTileDataProvider to enable generic QuantizedGemmKernel.
+     * **Block Structure** (32 elements per block):
+     * - 16 bytes: Packed 4-bit quantized values (2 values per byte)
+     * - 2 bytes: FP16 scale factor
+     * - Total: 18 bytes per 32 weights → 4.5 bits/weight
+     *
+     * **Interfaces implemented**:
+     * - `TensorBase`: Core tensor API (inherited)
+     * - `ITensorGemmTileDataProvider`: Block-wise decode to FP32 (for CPU FP32 GEMM)
+     * - `IQ8_0Decodable`: On-the-fly conversion to Q8_0 (for INT8 GEMM weight caching)
+     *
+     * **NOT implemented**: IActivationTensor (IQ4_NL is read-only weight format)
+     *
+     * **Usage**: Default quantization format for model weights (balance of size and quality).
      */
+
     class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
