@@ -1,7 +1,7 @@
 # INT8Tensor vs Q8_0Tensor for Activation Quantization
 
 **Date**: November 10, 2025  
-**Context**: CPUAttentionT expects IActivationTensor implementations. Currently no tensor implements IActivationTensor.  
+**Context**: CpuAttentionKernelT expects IActivationTensor implementations. Currently no tensor implements IActivationTensor.  
 **Question**: Should we use Q8_0Tensor or INT8Tensor for quantized activations?
 
 ---
@@ -276,12 +276,12 @@ public:
 
 ---
 
-## CPUAttentionT Template Expectations
+## CpuAttentionKernelT Template Expectations
 
-**CPUAttentionT::compute()** (CPUAttentionT.h, lines 65-95):
+**CpuAttentionKernelT::compute()** (CpuAttentionKernelT.h, lines 65-95):
 ```cpp
 template <typename TensorType>
-bool CPUAttentionT<TensorType>::compute(
+bool CpuAttentionKernelT<TensorType>::compute(
     const float *Q, const float *K, const float *V,  // Input activations
     float *output,                                    // Output activations
     ...) {
@@ -386,7 +386,7 @@ public:
     }
     
     std::unique_ptr<ITensorAttention> createAttention() override {
-        return std::make_unique<CPUAttentionT<Q8_0Tensor>>();
+        return std::make_unique<CpuAttentionKernelT<Q8_0Tensor>>();
     }
     
     bool applyRMSNorm(...) override {
@@ -474,7 +474,7 @@ struct ActivationStorageTraits<Q8_0Block> {
 | **IntegerGemm.cpp compat** | Native (Q8_0Block) | Requires conversion | **Q8_0** |
 | **llama.cpp alignment** | Exact match | Diverges | **Q8_0** |
 | **IActivationTensor fit** | Perfect (activations) | Wrong (weights) | **Q8_0** |
-| **CPUAttentionT compat** | Perfect | Poor | **Q8_0** |
+| **CpuAttentionKernelT compat** | Perfect | Poor | **Q8_0** |
 | **Memory overhead** | 1.0625 bytes/elem | 1.0625-1.125 | **TIE** |
 | **Design intent** | General quantization | Weight loading only | **Q8_0** |
 | **Complexity** | Simple (self-contained) | Complex (multiple scales) | **Q8_0** |
@@ -491,7 +491,7 @@ struct ActivationStorageTraits<Q8_0Block> {
 1. ✅ Make Q8_0Tensor implement IActivationTensor
 2. ✅ Create ActivationTraits<Q8_0Tensor> specialization
 3. ✅ Add ActivationStorageTraits<Q8_0Block> for GEMM kernels
-4. ✅ Test CPUAttentionT<Q8_0Tensor> instantiation
+4. ✅ Test CpuAttentionKernelT<Q8_0Tensor> instantiation
 
 ### ⚠️ Keep INT8Tensor for Weights Only (Or Deprecate)
 
@@ -512,12 +512,12 @@ struct ActivationStorageTraits<Q8_0Block> {
 ## Why This Matters
 
 **Current state**:
-- ❌ No tensor implements IActivationTensor (CPUAttentionT can't be instantiated!)
+- ❌ No tensor implements IActivationTensor (CpuAttentionKernelT can't be instantiated!)
 - ❌ INT8Tensor designed for weights, not activations
 - ❌ Architectural confusion (two INT8 formats with different purposes)
 
 **After fix**:
-- ✅ Q8_0Tensor implements IActivationTensor (CPUAttentionT works!)
+- ✅ Q8_0Tensor implements IActivationTensor (CpuAttentionKernelT works!)
 - ✅ Clear separation: Q8_0Tensor (activations), INT8Tensor (weights)
 - ✅ Consistent with IntegerGemm.cpp and llama.cpp
 - ✅ Optimal cache locality (block-based scales)

@@ -240,7 +240,7 @@ reduction = (baseline_mem - fused_mem) / baseline_mem;  // 50% ✅
    - Memory footprint validation
 
 ### Modified
-5. **`src/v2/kernels/cpu/CPUAttentionT.h`** (379 lines, was 389)
+5. **`src/v2/kernels/cpu/CpuAttentionKernelT.h`** (379 lines, was 389)
    - Replaced separate GEMM + softmax with `FusedGemmSoftmax`
    - Reduced from 56 lines to 41 lines (27% smaller)
 
@@ -271,10 +271,10 @@ reduction = (baseline_mem - fused_mem) / baseline_mem;  // 50% ✅
 
 ### Integration Tests: 17/17 Passing ✅
 ```
-CPUAttentionT_FP32:  9/9 tests (124 ms)
-CPUAttentionT_BF16:  6/6 tests (91 ms)
-CPUAttentionT_FP16:  1/1 tests
-CPUAttentionT_INT32: 1/1 tests
+CpuAttentionKernelT_FP32:  9/9 tests (124 ms)
+CpuAttentionKernelT_BF16:  6/6 tests (91 ms)
+CpuAttentionKernelT_FP16:  1/1 tests
+CpuAttentionKernelT_INT32: 1/1 tests
 ```
 
 ### Performance Benchmarks: 8/8 Passing ✅
@@ -347,7 +347,7 @@ ctest -R "V2_Unit_FusedGemmSoftmax" --verbose
 ./tests/v2/v2_test_fused_gemm_softmax
 
 # Integration tests (17 tests, ~220ms)
-ctest -R "V2_Unit_CPUAttentionT" --verbose
+ctest -R "V2_Unit_CpuAttentionKernelT" --verbose
 
 # Performance benchmark (8 tests, ~32s)
 ./performance/v2_perf_fused_gemm_softmax

@@ -20,6 +20,99 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        bool should_build_mask(const GQAAttentionConfig &config,
+                               int batch_size,
+                               const std::vector<int> *sequence_lengths)
+        {
+            const bool has_lengths = sequence_lengths && !sequence_lengths->empty();
+            // Only build mask if we actually need one:
+            // - Causal masking required, OR
+            // - Sliding window enabled, OR
+            // - Padding mask needed (sequence_lengths provided)
+            // NOTE: batch_size > 1 alone does NOT require a mask (equal-length batches with no padding)
+            return config.causal || config.window_size > 0 || has_lengths;
+        }
+
+        bool build_sequence_mask(TensorBase *mask_tensor,
+                                 int batch_size,
+                                 int seq_len,
+                                 const std::vector<int> *sequence_lengths,
+                                 const GQAAttentionConfig &config)
+        {
+            if (!mask_tensor)
+            {
+                LOG_ERROR("[GQAAttention] mask tensor not provided");
+                return false;
+            }
+
+            float *mask_data = mask_tensor->mutable_data();
+            if (!mask_data)
+            {
+                LOG_ERROR("[GQAAttention] mask tensor has no storage");
+                return false;
+            }
+
+            if (batch_size <= 1)
+            {
+                attention_utils::create_causal_mask(mask_data, seq_len, config.window_size);
+                return true;
+            }
+
+            // For batched attention, choose appropriate mask builder:
+            // - If sequence_lengths provided: Use combined mask (padding + optional causal)
+            // - Otherwise: Use batch causal mask (causal only)
+            if (sequence_lengths && !sequence_lengths->empty())
+            {
+                attention_utils::create_combined_batch_mask(mask_data,
+                                                            batch_size,
+                                                            seq_len,
+                                                            sequence_lengths->data(),
+                                                            config.causal,
+                                                            config.window_size);
+            }
+            else
+            {
+                // No padding, use batch causal mask (respects config.causal implicitly via window)
+                const int *seq_ptr = sequence_lengths ? sequence_lengths->data() : nullptr;
+                attention_utils::create_batch_causal_mask(mask_data,
+                                                          batch_size,
+                                                          seq_len,
+                                                          seq_ptr,
+                                                          config.window_size);
+            }
+            return true;
+        }
+
+        bool build_combined_batch_mask(TensorBase *mask_tensor,
+                                       int batch_size,
+                                       int seq_len,
+                                       const std::vector<int> &actual_lengths,
+                                       const GQAAttentionConfig &config)
+        {
+            if (!mask_tensor)
+            {
+                LOG_ERROR("[GQAAttention] mask tensor not provided");
+                return false;
+            }
+
+            float *mask_data = mask_tensor->mutable_data();
+            if (!mask_data)
+            {
+                LOG_ERROR("[GQAAttention] mask tensor has no storage");
+                return false;
+            }
+
+            attention_utils::create_combined_batch_mask(mask_data,
+                                                        batch_size,
+                                                        seq_len,
+                                                        actual_lengths.data(),
+                                                        config.causal,
+                                                        config.window_size);
+            return true;
+        }
+    } // namespace
 
     bool GQAAttention::compute(
         TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
@@ -27,157 +120,108 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
-        // 1. Validate inputs
         if (!validate_inputs(Q, K, V, output, config))
         {
             return false;
         }
 
-        // Infer seq_len from Q shape: [seq_len, n_heads * head_dim]
         const auto &q_shape = Q->shape();
-        int seq_len = static_cast<int>(q_shape[0]);
-
-        // Get tensor data pointers
-        const float *Q_data = Q->data();
-        const float *K_data = K->data();
-        const float *V_data = V->data();
-        float *output_data = output->mutable_data();
-
-        // 2. Broadcast K/V heads to match Q heads (if needed)
-        std::vector<float> K_broadcast, V_broadcast;
-        const float *K_expanded = K_data;
-        const float *V_expanded = V_data;
-
-        broadcast_kv_heads_if_needed(
-            K_data, V_data, K_broadcast, V_broadcast,
-            seq_len, config.n_heads, config.n_kv_heads, config.head_dim);
-
-        if (!K_broadcast.empty())
+        if (q_shape.empty())
         {
-            K_expanded = K_broadcast.data();
-            V_expanded = V_broadcast.data();
-        }
-
-        // Validate workspace buffers
-        if (!config.workspace_scores || !config.workspace_qkv_buffer || !config.workspace_context)
-        {
-            LOG_ERROR("[GQAAttention] compute: workspace buffers not provided");
+            LOG_ERROR("[GQAAttention] compute: Q tensor shape is empty");
             return false;
         }
 
-        float *scores = config.workspace_scores->mutable_data();
+        const int total_tokens = static_cast<int>(q_shape[0]);
+        const int effective_batch_size = (batch_size > 0) ? batch_size : 1;
 
-        // 3. Compute attention scores per head: Q @ K^T
-        // Parallelize over heads (independent operations)
-#pragma omp parallel if (config.n_heads > 1)
+        if (total_tokens % effective_batch_size != 0)
         {
-            // Thread-local extraction buffers (from workspace, partitioned per thread)
-            const int thread_id = omp_get_thread_num();
-            const size_t buf_offset = thread_id * seq_len * config.head_dim * 3;
-            float *Q_h = config.workspace_qkv_buffer->mutable_data() + buf_offset;
-            float *K_h = Q_h + seq_len * config.head_dim;
-
-#pragma omp for
-            for (int h = 0; h < config.n_heads; ++h)
-            {
-                float *scores_h = scores + h * seq_len * seq_len;
-
-                // Extract Q and K for this head
-                extract_head_data(Q_data, Q_h, seq_len, config.head_dim, config.n_heads, h, 0);
-                extract_head_data(K_expanded, K_h, seq_len, config.head_dim, config.n_heads, h, 0);
-
-                LOG_DEBUG("[GQAAttention] Head " << h << ": Q_h[0]=" << Q_h[0] << " K_h[0]=" << K_h[0]);
-
-                // GEMM: scores[h] = Q_h @ K_h^T
-                if (!compute_attention_scores(Q_h, K_h, scores_h, seq_len, config.head_dim, config.precision))
-                {
-                    LOG_ERROR("[GQAAttention] compute: Q·K^T GEMM failed for head " << h);
-                }
-
-                LOG_DEBUG("[GQAAttention] Head " << h << ": scores[0]=" << scores_h[0]);
-            }
+            LOG_ERROR("[GQAAttention] compute: total tokens (" << total_tokens
+                                                               << ") not divisible by batch size (" << effective_batch_size << ")");
+            return false;
         }
 
-        // 4. Scale scores by 1/sqrt(head_dim)
-        LOG_DEBUG("[GQAAttention] Scaling scores by 1/sqrt(" << config.head_dim << ")");
-        scale_scores_inplace(scores, config.n_heads * seq_len * seq_len, config.head_dim);
-        LOG_DEBUG("[GQAAttention] After scaling: scores[0]=" << scores[0]);
+        const int seq_len = total_tokens / effective_batch_size;
 
-        // 5. Apply causal mask (if enabled)
-        if (config.causal || sequence_lengths)
+        auto *activation_output = dynamic_cast<IActivationTensor *>(output);
+        if (!activation_output)
         {
-            LOG_DEBUG("[GQAAttention] Applying attention mask (batch_size=" << batch_size << ")");
+            LOG_ERROR("[GQAAttention] compute: output tensor does not implement IActivationTensor");
+            return false;
+        }
 
-            // Use workspace mask buffer
-            if (!config.workspace_mask)
+        auto attention_kernel = activation_output->createAttention();
+        if (!attention_kernel)
+        {
+            LOG_ERROR("[GQAAttention] compute: failed to create attention kernel");
+            return false;
+        }
+
+        TensorBase *mask_tensor = nullptr;
+        if (should_build_mask(config, effective_batch_size, sequence_lengths))
+        {
+            mask_tensor = config.workspace_mask.get();
+            if (!build_sequence_mask(mask_tensor, effective_batch_size, seq_len, sequence_lengths, config))
             {
-                LOG_ERROR("[GQAAttention] compute: workspace_mask buffer not provided");
                 return false;
             }
-            float *mask = config.workspace_mask->mutable_data();
-
-            if (batch_size == 1)
-            {
-                // Single sequence: standard causal mask
-                attention_utils::create_causal_mask(mask, seq_len, config.window_size);
-            }
-            else
-            {
-                // Batched sequences: block-diagonal causal mask with padding
-                int padded_seq_len = seq_len / batch_size;
-                const int *seq_lens_ptr = sequence_lengths ? sequence_lengths->data() : nullptr;
-                attention_utils::create_batch_causal_mask(
-                    mask, batch_size, padded_seq_len, seq_lens_ptr, config.window_size);
-            }
-
-            // Apply mask to each head separately
-#pragma omp parallel for if (config.n_heads > 1)
-            for (int h = 0; h < config.n_heads; ++h)
-            {
-                float *scores_h = scores + h * seq_len * seq_len;
-                attention_utils::apply_attention_mask(scores_h, mask, seq_len, seq_len);
-            }
-
-            LOG_DEBUG("[GQAAttention] After masking: scores[0]=" << scores[0]);
         }
 
-        // 6. Apply softmax
-        apply_softmax(scores, config.n_heads * seq_len, seq_len);
-        LOG_DEBUG("[GQAAttention] After softmax: scores[0]=" << scores[0]);
-
-        // 7. Compute context: scores @ V
-        std::memset(output_data, 0, seq_len * config.n_heads * config.head_dim * sizeof(float));
-
-#pragma omp parallel if (config.n_heads > 1)
+        // Choose correct kernel path based on batch_size
+        bool success;
+        if (effective_batch_size > 1)
         {
-            // Thread-local buffers
-            const int thread_id = omp_get_thread_num();
-            const size_t buf_offset = thread_id * seq_len * config.head_dim * 3;
-            float *V_h = config.workspace_qkv_buffer->mutable_data() + buf_offset + 2 * seq_len * config.head_dim;
-
-            const size_t ctx_offset = thread_id * seq_len * config.head_dim;
-            float *context_h = config.workspace_context->mutable_data() + ctx_offset;
-
-#pragma omp for
-            for (int h = 0; h < config.n_heads; ++h)
-            {
-                const float *scores_h = scores + h * seq_len * seq_len;
-
-                // Extract V for this head
-                extract_head_data(V_expanded, V_h, seq_len, config.head_dim, config.n_heads, h, 0);
-
-                // GEMM: context_h = scores[h] @ V_h
-                if (!compute_context_from_scores(scores_h, V_h, context_h, seq_len, config.head_dim, config.precision))
-                {
-                    LOG_ERROR("[GQAAttention] compute: scores·V GEMM failed for head " << h);
-                }
-
-                // Write context back to strided output
-                write_context_to_output(context_h, output_data, seq_len, config.head_dim, config.n_heads, h, 0);
-            }
+            // Batch path: Call compute_batch with separate batch_size and seq_len
+            success = attention_kernel->compute_batch(
+                Q->data(),
+                K->data(),
+                V->data(),
+                output->mutable_data(),
+                effective_batch_size,
+                seq_len,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                config.causal,
+                config.window_size,
+                config.workspace_scores.get(),
+                config.workspace_qkv_buffer.get(),
+                config.workspace_context.get(),
+                mask_tensor,
+                (config.precision == ActivationPrecision::BF16),
+                config.mpi_ctx.get(),
+                -1);
+        }
+        else
+        {
+            // Single sequence path: Call compute with total_tokens as seq_len
+            success = attention_kernel->compute(
+                Q->data(),
+                K->data(),
+                V->data(),
+                output->mutable_data(),
+                total_tokens,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                config.causal,
+                config.window_size,
+                config.workspace_scores.get(),
+                config.workspace_qkv_buffer.get(),
+                config.workspace_context.get(),
+                mask_tensor,
+                (config.precision == ActivationPrecision::BF16),
+                config.mpi_ctx.get(),
+                -1);
         }
 
-        return true;
+        if (!success)
+        {
+            LOG_ERROR("[GQAAttention] compute: attention kernel invocation failed");
+        }
+
+        return success;
     }
 
     bool GQAAttention::compute_batch(
@@ -186,153 +230,89 @@ namespace llaminar2
         int batch_size, int seq_len,
         const GQAAttentionConfig &config)
     {
-        // 1. Validate inputs
         if (!validate_inputs(Q, K, V, output, config))
         {
             return false;
         }
 
-        if (static_cast<int>(actual_lengths.size()) != batch_size)
+        if (batch_size <= 0)
         {
-            LOG_ERROR("[GQAAttention] compute_batch: actual_lengths size ("
-                      << actual_lengths.size() << ") != batch_size (" << batch_size << ")");
+            LOG_ERROR("[GQAAttention] compute_batch: invalid batch size " << batch_size);
             return false;
         }
 
-        // Validate tensor shapes
+        if (static_cast<int>(actual_lengths.size()) != batch_size)
+        {
+            LOG_ERROR("[GQAAttention] compute_batch: actual_lengths size (" << actual_lengths.size()
+                                                                            << ") != batch_size (" << batch_size << ")");
+            return false;
+        }
+
         const auto &q_shape = Q->shape();
+        if (q_shape.size() < 2)
+        {
+            LOG_ERROR("[GQAAttention] compute_batch: invalid Q tensor rank");
+            return false;
+        }
+
         const int total_seq_len = batch_size * seq_len;
         if (static_cast<int>(q_shape[0]) != total_seq_len)
         {
-            LOG_ERROR("[GQAAttention] compute_batch: Q shape[0] ("
-                      << q_shape[0] << ") != batch_size * seq_len (" << total_seq_len << ")");
+            LOG_ERROR("[GQAAttention] compute_batch: Q shape[0] (" << q_shape[0]
+                                                                   << ") != batch_size * seq_len (" << total_seq_len << ")");
             return false;
         }
 
-        // Get tensor data pointers
-        const float *Q_data = Q->data();
-        const float *K_data = K->data();
-        const float *V_data = V->data();
-        float *output_data = output->mutable_data();
-
-        // 2. Broadcast K/V heads to match Q heads (if needed)
-        std::vector<float> K_broadcast, V_broadcast;
-        const float *K_expanded = K_data;
-        const float *V_expanded = V_data;
-
-        broadcast_kv_heads_if_needed(
-            K_data, V_data, K_broadcast, V_broadcast,
-            total_seq_len, config.n_heads, config.n_kv_heads, config.head_dim);
-
-        if (!K_broadcast.empty())
+        auto *activation_output = dynamic_cast<IActivationTensor *>(output);
+        if (!activation_output)
         {
-            K_expanded = K_broadcast.data();
-            V_expanded = V_broadcast.data();
-        }
-
-        // Validate workspace buffers
-        if (!config.workspace_scores || !config.workspace_qkv_buffer ||
-            !config.workspace_context || !config.workspace_mask)
-        {
-            LOG_ERROR("[GQAAttention] compute_batch: workspace buffers not provided");
+            LOG_ERROR("[GQAAttention] compute_batch: output tensor does not implement IActivationTensor");
             return false;
         }
 
-        float *scores = config.workspace_scores->mutable_data();
-
-        // Create combined causal + padding mask [batch_size, seq_len, seq_len]
-        float *combined_mask = config.workspace_mask->mutable_data();
-        attention_utils::create_combined_batch_mask(
-            combined_mask, batch_size, seq_len,
-            actual_lengths.data(), config.causal, config.window_size);
-
-        // 3. Compute attention scores per batch and head: Q @ K^T
-        // Parallelize over batch×heads
-#pragma omp parallel if (batch_size * config.n_heads > 1)
+        auto attention_kernel = activation_output->createAttention();
+        if (!attention_kernel)
         {
-            // Thread-local extraction buffers
-            const int thread_id = omp_get_thread_num();
-            const size_t buf_offset = thread_id * seq_len * config.head_dim * 2;
-            float *Q_bh = config.workspace_qkv_buffer->mutable_data() + buf_offset;
-            float *K_bh = Q_bh + seq_len * config.head_dim;
+            LOG_ERROR("[GQAAttention] compute_batch: failed to create attention kernel");
+            return false;
+        }
 
-#pragma omp for collapse(2)
-            for (int b = 0; b < batch_size; ++b)
+        TensorBase *mask_tensor = nullptr;
+        if (config.causal || !actual_lengths.empty())
+        {
+            mask_tensor = config.workspace_mask.get();
+            if (!build_combined_batch_mask(mask_tensor, batch_size, seq_len, actual_lengths, config))
             {
-                for (int h = 0; h < config.n_heads; ++h)
-                {
-                    const int batch_offset = b * seq_len;
-                    float *scores_bh = scores + (b * config.n_heads + h) * seq_len * seq_len;
-
-                    // Extract Q and K for this batch and head
-                    extract_head_data(Q_data, Q_bh, seq_len, config.head_dim, config.n_heads, h, batch_offset);
-                    extract_head_data(K_expanded, K_bh, seq_len, config.head_dim, config.n_heads, h, batch_offset);
-
-                    // GEMM: scores[b,h] = Q_bh @ K_bh^T
-                    if (!compute_attention_scores(Q_bh, K_bh, scores_bh, seq_len, config.head_dim, config.precision))
-                    {
-                        LOG_ERROR("[GQAAttention] compute_batch: Q·K^T GEMM failed for batch " << b << " head " << h);
-                    }
-                }
+                return false;
             }
         }
 
-        // 4. Scale scores by 1/sqrt(head_dim)
-        scale_scores_inplace(scores, batch_size * config.n_heads * seq_len * seq_len, config.head_dim);
+        const bool success = attention_kernel->compute_batch(
+            Q->data(),
+            K->data(),
+            V->data(),
+            output->mutable_data(),
+            batch_size,
+            seq_len,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            config.causal,
+            config.window_size,
+            config.workspace_scores.get(),
+            config.workspace_qkv_buffer.get(),
+            config.workspace_context.get(),
+            mask_tensor,
+            (config.precision == ActivationPrecision::BF16),
+            config.mpi_ctx.get(),
+            -1);
 
-        // 5. Apply combined causal + padding mask
-        // Broadcast mask across heads: mask[b, seq_len, seq_len] -> all heads for batch b
-#pragma omp parallel for collapse(2) if (batch_size * config.n_heads > 1)
-        for (int b = 0; b < batch_size; ++b)
+        if (!success)
         {
-            for (int h = 0; h < config.n_heads; ++h)
-            {
-                const float *mask_b = combined_mask + b * seq_len * seq_len;
-                float *scores_bh = scores + (b * config.n_heads + h) * seq_len * seq_len;
-                attention_utils::apply_attention_mask(scores_bh, mask_b, seq_len, seq_len);
-            }
+            LOG_ERROR("[GQAAttention] compute_batch: attention kernel invocation failed");
         }
 
-        // 6. Apply softmax
-        apply_softmax(scores, batch_size * config.n_heads * seq_len, seq_len);
-
-        // 7. Compute context: scores @ V
-        std::memset(output_data, 0, total_seq_len * config.n_heads * config.head_dim * sizeof(float));
-
-#pragma omp parallel if (batch_size * config.n_heads > 1)
-        {
-            // Thread-local buffers
-            const int thread_id = omp_get_thread_num();
-            const size_t buf_offset = thread_id * seq_len * config.head_dim;
-            float *V_bh = config.workspace_qkv_buffer->mutable_data() + buf_offset;
-
-            const size_t ctx_offset = thread_id * seq_len * config.head_dim;
-            float *context_bh = config.workspace_context->mutable_data() + ctx_offset;
-
-#pragma omp for collapse(2)
-            for (int b = 0; b < batch_size; ++b)
-            {
-                for (int h = 0; h < config.n_heads; ++h)
-                {
-                    const int batch_offset = b * seq_len;
-                    const float *scores_bh = scores + (b * config.n_heads + h) * seq_len * seq_len;
-
-                    // Extract V for this batch and head
-                    extract_head_data(V_expanded, V_bh, seq_len, config.head_dim, config.n_heads, h, batch_offset);
-
-                    // GEMM: context_bh = scores[b,h] @ V_bh
-                    if (!compute_context_from_scores(scores_bh, V_bh, context_bh, seq_len, config.head_dim, config.precision))
-                    {
-                        LOG_ERROR("[GQAAttention] compute_batch: scores·V GEMM failed for batch " << b << " head " << h);
-                    }
-
-                    // Write context back to strided output
-                    write_context_to_output(context_bh, output_data, seq_len, config.head_dim, config.n_heads, h, batch_offset);
-                }
-            }
-        }
-
-        return true;
+        return success;
     }
 
     bool GQAAttention::compute_mpi(
@@ -341,36 +321,9 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
-        // Fast path: No MPI or single-rank execution
-        if (!config.mpi_ctx || config.mpi_ctx->world_size() == 1 || config.mpi_strategy == MPIStrategy::None)
-        {
-            return compute(Q, K, V, output, config, batch_size, sequence_lengths);
-        }
-
-        // Dispatch based on MPI strategy
-        switch (config.mpi_strategy)
-        {
-        case MPIStrategy::TensorParallel:
-            return compute_tensor_parallel(Q, K, V, output, config, batch_size, sequence_lengths);
-
-        case MPIStrategy::SequenceParallel:
-            // TODO: Implement sequence-parallel attention (Phase 6)
-            LOG_ERROR("[GQAAttention] SequenceParallel attention not yet implemented");
-            return false;
-
-        case MPIStrategy::PipelineParallel:
-            // Pipeline-parallel doesn't change attention (distributes layers instead)
-            return compute(Q, K, V, output, config, batch_size, sequence_lengths);
-
-        case MPIStrategy::Hybrid:
-            // TODO: Implement hybrid strategy (Phase 6)
-            LOG_ERROR("[GQAAttention] Hybrid strategy not yet implemented");
-            return false;
-
-        default:
-            LOG_ERROR("[GQAAttention] Unknown MPI strategy: " << static_cast<int>(config.mpi_strategy));
-            return false;
-        }
+        // The orchestrator now handles MPI fan-out and reuses the single-rank kernel
+        // implementation. Retain this entry point for callers that still expect it.
+        return compute(Q, K, V, output, config, batch_size, sequence_lengths);
     }
 
     bool GQAAttention::compute_tensor_parallel(
@@ -379,359 +332,8 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
-        // Validate MPI context
-        if (!config.mpi_ctx)
-        {
-            LOG_ERROR("[GQAAttention] Tensor-parallel attention requires MPI context");
-            return false;
-        }
-
-        int rank = config.mpi_ctx->rank();
-        int world_size = config.mpi_ctx->world_size();
-
-        // 1. Validate inputs
-        if (!validate_inputs(Q, K, V, output, config))
-        {
-            return false;
-        }
-
-        // Validate divisibility for tensor parallelism
-        if (config.n_heads % world_size != 0)
-        {
-            LOG_ERROR("[GQAAttention] Tensor-parallel requires n_heads (" << config.n_heads
-                                                                          << ") divisible by world_size (" << world_size << ")");
-            return false;
-        }
-
-        // Infer dimensions from Q shape and batch_size
-        const auto &q_shape = Q->shape();
-        int total_tokens = static_cast<int>(q_shape[0]);
-        int effective_batch_size = (batch_size > 0) ? batch_size : 1;
-        int seq_len = total_tokens / effective_batch_size;
-
-        if (total_tokens % effective_batch_size != 0)
-        {
-            LOG_ERROR("[GQAAttention] total_tokens (" << total_tokens
-                                                      << ") not divisible by batch_size (" << effective_batch_size << ")");
-            return false;
-        }
-
-        LOG_DEBUG("[MPI TP] Batch-aware attention: total_tokens=" << total_tokens
-                                                                  << " batch_size=" << effective_batch_size << " seq_len_per_batch=" << seq_len);
-
-        int padded_seq_len = seq_len;
-
-        // Distribute attention heads across ranks
-        auto [start_head, local_n_heads] = config.mpi_ctx->get_local_slice(static_cast<size_t>(config.n_heads));
-
-        if (config.verbose_logging && rank == 0)
-        {
-            LOG_INFO("[MPI TensorParallel] Attention: n_heads=" << config.n_heads
-                                                                << ", world_size=" << world_size << ", local_n_heads=" << local_n_heads);
-        }
-
-        if (rank == 0 || config.verbose_logging)
-        {
-            LOG_INFO("[MPI TensorParallel] Rank " << rank << "/" << world_size
-                                                  << ": Computing heads [" << start_head << ", " << (start_head + local_n_heads - 1) << "]");
-        }
-
-        // Get tensor data pointers
-        const float *Q_data = Q->data();
-        const float *K_data = K->data();
-        const float *V_data = V->data();
-        float *output_data = output->mutable_data();
-
-        if (!Q_data || !K_data || !V_data || !output_data)
-        {
-            LOG_ERROR("[GQAAttention] Null pointer in attention tensors");
-            return false;
-        }
-
-        // 2. Broadcast K/V heads to match Q heads (if needed)
-        std::vector<float> K_broadcast, V_broadcast;
-        const float *K_expanded = K_data;
-        const float *V_expanded = V_data;
-
-        broadcast_kv_heads_if_needed(
-            K_data, V_data, K_broadcast, V_broadcast,
-            total_tokens, config.n_heads, config.n_kv_heads, config.head_dim);
-
-        if (!K_broadcast.empty())
-        {
-            K_expanded = K_broadcast.data();
-            V_expanded = V_broadcast.data();
-        }
-
-        // Allocate local output buffer for this rank's heads
-        std::vector<float> local_output(total_tokens * local_n_heads * config.head_dim, 0.0f);
-
-        // Temporary scores for local heads
-        auto local_scores_tensor = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(local_n_heads * total_tokens), static_cast<size_t>(total_tokens)});
-        float *local_scores = local_scores_tensor->mutable_data();
-
-        // 3. Compute attention for local heads only
-        bool local_success = true;
-
-#pragma omp parallel for if (local_n_heads > 1)
-        for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
-        {
-            size_t global_h = start_head + local_h;
-            float *scores_h = local_scores + local_h * total_tokens * total_tokens;
-
-            // Extract Q and K for this head
-            std::vector<float> Q_h(total_tokens * config.head_dim);
-            std::vector<float> K_h(total_tokens * config.head_dim);
-
-            extract_head_data(Q_data, Q_h.data(), total_tokens, config.head_dim, config.n_heads, global_h, 0);
-            extract_head_data(K_expanded, K_h.data(), total_tokens, config.head_dim, config.n_heads, global_h, 0);
-
-            LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << " (local " << local_h << "): Q[0]=" << Q_h[0]);
-
-            // GEMM: scores[local_h] = Q_h @ K_h^T
-            bool gemm_success = compute_attention_scores(Q_h.data(), K_h.data(), scores_h, total_tokens, config.head_dim, config.precision);
-
-            if (!gemm_success)
-            {
-                LOG_ERROR("[GQAAttention] Q·K^T GEMM failed for local head " << local_h);
-                local_success = false;
-            }
-            else
-            {
-                LOG_DEBUG("[GQAAttention] Q·K^T GEMM success for local head " << local_h);
-            }
-
-            LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << ": scores[0]=" << scores_h[0]);
-        }
-
-        LOG_INFO("[GQAAttention] Rank " << rank << " local_success=" << local_success);
-
-        // Propagate GEMM failure across ranks before continuing to collectives
-        float local_ok_flag = local_success ? 1.0f : 0.0f;
-        float global_ok_flag = 0.0f;
-        config.mpi_ctx->allreduce_sum(&local_ok_flag, &global_ok_flag, 1);
-        // all ranks participated; failure if any rank reported 0
-        bool global_success = (global_ok_flag == static_cast<float>(world_size));
-        if (!global_success)
-        {
-            if (rank == 0)
-            {
-                LOG_ERROR("[GQAAttention] Aborting tensor-parallel attention due to Q·K^T GEMM failure on at least one rank");
-            }
-            return false;
-        }
-
-        // 4. Scale scores by 1/sqrt(head_dim)
-        LOG_DEBUG("[MPI TP] Rank " << rank << ": Scaling scores by 1/sqrt(" << config.head_dim << ")");
-        scale_scores_inplace(local_scores, local_n_heads * total_tokens * total_tokens, config.head_dim);
-        LOG_DEBUG("[MPI TP] Rank " << rank << " after scaling: scores[0]=" << local_scores[0]);
-
-        // 5. Apply causal mask (if enabled)
-        if (config.causal || sequence_lengths)
-        {
-            LOG_DEBUG("[MPI TP] Rank " << rank << ": Applying causal mask (batch_size=" << batch_size << ")");
-            std::vector<float> mask(total_tokens * total_tokens);
-
-            if (effective_batch_size == 1)
-            {
-                // Single sequence: standard causal mask
-                attention_utils::create_causal_mask(mask.data(), total_tokens, config.window_size);
-            }
-            else
-            {
-                // Batched sequences: block-diagonal causal mask with padding
-                const int *seq_lens_ptr = sequence_lengths ? sequence_lengths->data() : nullptr;
-                attention_utils::create_batch_causal_mask(
-                    mask.data(), effective_batch_size, padded_seq_len, seq_lens_ptr, config.window_size);
-            }
-
-            // Apply mask to local heads
-#pragma omp parallel for if (local_n_heads > 1)
-            for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
-            {
-                float *scores_h = local_scores + local_h * total_tokens * total_tokens;
-                attention_utils::apply_attention_mask(scores_h, mask.data(), total_tokens, total_tokens);
-            }
-
-            LOG_DEBUG("[MPI TP] Rank " << rank << " after masking: scores[0]=" << local_scores[0]);
-        }
-
-        // 6. Apply softmax
-        apply_softmax(local_scores, local_n_heads * total_tokens, total_tokens);
-        LOG_DEBUG("[MPI TP] Rank " << rank << " after softmax: scores[0]=" << local_scores[0]);
-
-        if (config.verbose_logging && rank == 0)
-        {
-            LOG_INFO("[MPI TensorParallel] Applied vectorized softmax to " << local_n_heads << " heads");
-        }
-
-        // 7. Compute context: scores @ V for local heads
-        std::atomic<bool> local_context_success{true};
-
-#pragma omp parallel for if (local_n_heads > 1)
-        for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
-        {
-            size_t global_h = start_head + local_h;
-            const float *scores_h = local_scores + local_h * total_tokens * total_tokens;
-
-            // Extract V for this head
-            std::vector<float> V_h(total_tokens * config.head_dim);
-            extract_head_data(V_expanded, V_h.data(), total_tokens, config.head_dim, config.n_heads, global_h, 0);
-
-            // Compute context
-            std::vector<float> context_h(total_tokens * config.head_dim);
-            if (!compute_context_from_scores(scores_h, V_h.data(), context_h.data(), total_tokens, config.head_dim, config.precision))
-            {
-                LOG_ERROR("[GQAAttention] scores·V GEMM failed for local head " << local_h);
-                local_context_success = false;
-            }
-
-            LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << ": context[0]=" << context_h[0]);
-
-            // Write to local_output buffer (contiguous for this rank's heads)
-            for (int t = 0; t < total_tokens; ++t)
-            {
-#pragma omp simd
-                for (int d = 0; d < config.head_dim; ++d)
-                {
-                    local_output[t * local_n_heads * config.head_dim + local_h * config.head_dim + d] =
-                        context_h[t * config.head_dim + d];
-                }
-            }
-        }
-
-        float local_ctx_ok = local_context_success ? 1.0f : 0.0f;
-        float global_ctx_ok = 0.0f;
-        config.mpi_ctx->allreduce_sum(&local_ctx_ok, &global_ctx_ok, 1);
-
-        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
-        {
-            LOG_DEBUG("[MPI TP] Rank " << rank << " context sync: local=" << local_ctx_ok << " global=" << global_ctx_ok);
-        }
-
-        bool global_ctx_success = (global_ctx_ok == static_cast<float>(world_size));
-        if (!global_ctx_success)
-        {
-            if (rank == 0)
-            {
-                LOG_ERROR("[GQAAttention] Aborting tensor-parallel attention due to scores·V GEMM failure on at least one rank");
-            }
-            return false;
-        }
-
-        LOG_DEBUG("[MPI TP] Rank " << rank << ": local_output[0]=" << local_output[0]);
-
-        // 8. Allreduce: Sum local outputs from all ranks
-        std::memset(output_data, 0, total_tokens * config.n_heads * config.head_dim * sizeof(float));
-
-        // Create temporary buffer for allreduce (each rank's contribution)
-        std::vector<float> send_buffer(total_tokens * config.n_heads * config.head_dim, 0.0f);
-
-        // Copy local heads to correct position in send buffer
-#pragma omp parallel for collapse(2) if (total_tokens * local_n_heads > 64)
-        for (int t = 0; t < total_tokens; ++t)
-        {
-            for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
-            {
-                size_t global_h = start_head + local_h;
-#pragma omp simd
-                for (int d = 0; d < config.head_dim; ++d)
-                {
-                    send_buffer[t * config.n_heads * config.head_dim + global_h * config.head_dim + d] =
-                        local_output[t * local_n_heads * config.head_dim + local_h * config.head_dim + d];
-                }
-            }
-        }
-
-        LOG_DEBUG("[MPI TP] Rank " << rank << ": send_buffer[0]=" << send_buffer[0]
-                                   << " (rank computes heads " << start_head << "-" << (start_head + local_n_heads - 1) << ")");
-
-        // Bounds-safe debug logging (only construct string if logging enabled)
-        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
-        {
-            const size_t buffer_size = send_buffer.size();
-            if (start_head * config.head_dim < buffer_size)
-            {
-                LOG_DEBUG("[MPI TP] Rank " << rank << ": send_buffer[" << (start_head * config.head_dim) << "]="
-                                           << send_buffer[start_head * config.head_dim] << " (first element of head " << start_head << ")");
-            }
-
-            std::ostringstream debug_msg;
-            debug_msg << "[MPI TP] Rank " << rank << " BEFORE allreduce (buffer_size=" << buffer_size << "):";
-            if (buffer_size > 100)
-                debug_msg << " send_buffer[100]=" << send_buffer[100];
-            if (buffer_size > 1000)
-                debug_msg << " send_buffer[1000]=" << send_buffer[1000];
-            if (buffer_size > 8000)
-                debug_msg << " send_buffer[8000]=" << send_buffer[8000];
-            LOG_DEBUG(debug_msg.str());
-        }
-
-        // Stage send_buffer and output to host if needed (for GPU tensors)
-        // For CPU tensors (current default), this is a no-op
-        // When GPU backends enabled, this will:
-        //   1. Copy send_buffer from GPU to host (if needed)
-        //   2. Perform MPI Allreduce on CPU
-        //   3. Copy result back to GPU output tensor
-
-        // Check if we need GPU staging (output tensor on device)
-        bool requires_staging = MPIStager::requiresStaging(output);
-
-        // For now, send_buffer is always std::vector<float> (CPU memory)
-        // But output tensor might be on GPU in the future
-
-        float *mpi_output_buffer = output_data; // Default: use output tensor directly
-        std::vector<float> host_output_staging; // Only allocated if GPU staging needed
-
-        if (requires_staging)
-        {
-            // GPU tensor case: allocate staging buffer
-            host_output_staging.resize(total_tokens * config.n_heads * config.head_dim);
-            mpi_output_buffer = host_output_staging.data();
-
-            LOG_DEBUG("[MPI TP] Rank " << rank << ": GPU staging required, using host buffer");
-        }
-
-        // Allreduce: Sum contributions from all ranks
-        // Use total_tokens (not seq_len) to cover all batches
-        config.mpi_ctx->allreduce_sum(
-            send_buffer.data(),
-            mpi_output_buffer,
-            total_tokens * config.n_heads * config.head_dim);
-
-        // Stage result back to GPU if needed
-        if (requires_staging)
-        {
-            MPIStager::toDevice(host_output_staging, output);
-            LOG_DEBUG("[MPI TP] Rank " << rank << ": Staged result back to GPU");
-        }
-
-        // Bounds-safe debug logging after allreduce (only construct string if logging enabled)
-        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
-        {
-            const size_t output_size = total_tokens * config.n_heads * config.head_dim;
-            std::ostringstream debug_msg_after;
-            debug_msg_after << "[MPI TP] Rank " << rank << " AFTER allreduce (output_size=" << output_size << "):";
-
-            // Log from the buffer that contains the result
-            const float *result_buffer = requires_staging ? host_output_staging.data() : output_data;
-            debug_msg_after << " output[0]=" << result_buffer[0];
-            if (output_size > 100)
-                debug_msg_after << " output[100]=" << result_buffer[100];
-            if (output_size > 1000)
-                debug_msg_after << " output[1000]=" << result_buffer[1000];
-            if (output_size > 8000)
-                debug_msg_after << " output[8000]=" << result_buffer[8000];
-            if (output_size > 0)
-                debug_msg_after << " output[" << (output_size - 1) << "]=" << result_buffer[output_size - 1];
-            LOG_DEBUG(debug_msg_after.str());
-        }
-
-        // 10. Barrier to ensure all ranks complete
-        config.mpi_ctx->barrier();
-
-        return true;
+        LOG_ERROR("[GQAAttention] Tensor-parallel execution is orchestrated upstream and should not invoke compute_tensor_parallel directly");
+        return false;
     }
 
     // ============================================================================

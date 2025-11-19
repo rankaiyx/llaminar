@@ -364,17 +364,30 @@ add_v2_test(V2_Unit_ActivationTraits
     MPI_PROCS 1  # ActivationTraits tests are CPU-only, single rank
 )
 
-# Test: CPUAttentionT (template-based attention kernel)
-add_executable(v2_test_cpu_attention_t unit/Test__CPUAttentionT.cpp)
-target_link_libraries(v2_test_cpu_attention_t
+# Test: CpuAttentionKernelT (template-based attention kernel)
+add_executable(v2_test_cpu_attention_kernel_t unit/Test__CpuAttentionKernelT.cpp)
+target_link_libraries(v2_test_cpu_attention_kernel_t
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_CPUAttentionT
-    COMMAND $<TARGET_FILE:v2_test_cpu_attention_t>
+add_v2_test(V2_Unit_CpuAttentionKernelT
+    COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_t>
     LABELS "V2;Unit;Kernels;Attention;FP32;TemplateKernel;CPU;MHA;GQA;CausalMasking"
-    MPI_PROCS 1  # CPUAttentionT tests are CPU-only, single rank
+    MPI_PROCS 1  # CpuAttentionKernelT tests are CPU-only, single rank
+)
+
+# Test: CpuAttentionKernelT Batch Attention (comprehensive batch testing)
+add_executable(v2_test_cpu_attention_kernel_t_batch unit/Test__CpuAttentionKernelT_Batch.cpp)
+target_link_libraries(v2_test_cpu_attention_kernel_t_batch
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CpuAttentionKernelT_Batch
+    COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_t_batch>
+    LABELS "V2;Unit;Kernels;Attention;FP32;BatchAttention;Equivalence;Independence;GQA;CausalMasking"
+    MPI_PROCS 1  # Batch attention tests are CPU-only, single rank
 )
 
 # Test: BF16 SIMD Accuracy (Stage 2 - SIMD-optimized BF16 conversion)
@@ -485,6 +498,19 @@ add_v2_test(V2_Unit_FP32AttentionParity
     COMMAND $<TARGET_FILE:v2_test_fp32_attention_parity>
     LABELS "V2;Unit;Kernels;Attention;FP32;PyTorchParity;GroundTruth;MultiHead;GQA;CPU"
     MPI_PROCS 1  # Parity test is CPU-only, single rank
+)
+
+# Test: Batch attention correctness - mask generation and batched processing
+add_executable(v2_test_batch_attention_correctness unit/Test__BatchAttentionCorrectness.cpp)
+target_link_libraries(v2_test_batch_attention_correctness 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BatchAttentionCorrectness 
+    COMMAND $<TARGET_FILE:v2_test_batch_attention_correctness>
+    LABELS "V2;Unit;Attention;BatchProcessing;MaskGeneration;PaddingMask;CausalMask;BlockDiagonal"
+    MPI_PROCS 1  # Unit test for mask utilities, single rank
 )
 
 # Test: INT8 SwiGLU kernel (SwiGLU activation with INT8 gate/up projections)
@@ -1208,15 +1234,15 @@ add_v2_test(V2_Unit_PipelineFactory
     LABELS "V2;Unit;PipelineExecution;Factory;Registration"
 )
 
-# Test: GQAAttention
-add_executable(v2_test_gqa_attention unit/pipelines/Test__GQAAttention.cpp)
-target_link_libraries(v2_test_gqa_attention 
+# Test: MpiAttentionOrchestrator
+add_executable(v2_test_mpi_attention_orchestrator unit/pipelines/Test__MpiAttentionOrchestrator.cpp)
+target_link_libraries(v2_test_mpi_attention_orchestrator 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_GQAAttention 
-    COMMAND $<TARGET_FILE:v2_test_gqa_attention>
+add_v2_test(V2_Unit_MpiAttentionOrchestrator 
+    COMMAND $<TARGET_FILE:v2_test_mpi_attention_orchestrator>
     LABELS "V2;Unit;PipelineExecution;Attention;GQA;MQA;MHA"
 )
 

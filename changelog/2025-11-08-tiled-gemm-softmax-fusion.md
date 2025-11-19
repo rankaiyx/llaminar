@@ -135,13 +135,13 @@ class TiledGemmSoftmax
 **Next Steps**:
 1. ✅ **Completed**: Basic implementation and testing
 2. 🔄 **TODO**: Debug `LargeSequence` test failure (likely buffer management issue)
-3. ⏸ **Pending**: Integration into `CPUAttentionT` (replace sequential FusedGemmSoftmax)
+3. ⏸ **Pending**: Integration into `CpuAttentionKernelT` (replace sequential FusedGemmSoftmax)
 4. ⏸ **Pending**: Benchmark vs sequential version (real performance measurement)
 5. ⏸ **Pending**: Optional: Extend GemmAutoTuner for FP32×FP32 variant selection
 
 **Integration Example**:
 ```cpp
-// In CPUAttentionT.cpp:
+// In CpuAttentionKernelT.cpp:
 #include "TiledGemmSoftmax.h"
 
 if (use_tiled_fusion && seq_len >= 128) {  // Worthwhile for medium+ sequences
@@ -213,7 +213,7 @@ Assuming:
 2. **Auto-tuning**: Integrate with GemmAutoTuner for optimal TILE_M/MR/NR selection
 3. **BF16 output**: Implement optional BF16 conversion in fusion loop
 4. **Large sequence debugging**: Fix segfault in `LargeSequence` test
-5. **Integration**: Replace sequential path in `CPUAttentionT`
+5. **Integration**: Replace sequential path in `CpuAttentionKernelT`
 6. **CUDA/ROCm**: Port tile fusion concept to GPU kernels
 
 ## References

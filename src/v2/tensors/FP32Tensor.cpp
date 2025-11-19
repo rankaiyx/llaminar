@@ -15,7 +15,7 @@
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
 #include "../kernels/cpu/CPUSwiGLUKernel.h"
-#include "../kernels/cpu/CPUAttentionT.h"
+#include "../kernels/cpu/CpuAttentionKernelT.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include <cstring>
 #include <stdexcept>
@@ -139,7 +139,7 @@ namespace llaminar2
     std::unique_ptr<ITensorAttention> FP32Tensor::createAttention()
     {
         // FP32 tensors use templated CPU attention kernel
-        return std::make_unique<CPUAttentionT<FP32Tensor>>();
+        return std::make_unique<CpuAttentionKernelT<FP32Tensor>>();
     }
 
     bool FP32Tensor::sync_to_device()

@@ -7,7 +7,7 @@
 #include "../utils/Logger.h"
 #include "../utils/DebugAssert.h"
 #include "PipelineBase.h"
-#include "attention/GQAAttention.h"
+#include "attention/MpiAttentionOrchestrator.h"
 #include "../tensors/TensorFactory.h"
 #include "../tensors/Tensors.h"
 #include <iostream>
@@ -96,8 +96,8 @@ namespace llaminar2
         bool causal, int window_size,
         int batch_size, const std::vector<int> *sequence_lengths)
     {
-        // Delegate to GQAAttention static method
-        GQAAttentionConfig config;
+        // Delegate to MpiAttentionOrchestrator static method
+        MpiAttentionConfig config;
         config.n_heads = n_heads;
         config.n_kv_heads = n_kv_heads;
         config.head_dim = head_dim;
@@ -114,7 +114,7 @@ namespace llaminar2
         config.workspace_context = attention_workspace_context_;
         config.workspace_mask = attention_workspace_mask_;
 
-        return GQAAttention::compute(Q, K, V, output, config, batch_size, sequence_lengths);
+        return MpiAttentionOrchestrator::compute(Q, K, V, output, config, batch_size, sequence_lengths);
     }
 
     bool PipelineBase::attention_gqa_batch(
@@ -124,8 +124,8 @@ namespace llaminar2
         int n_heads, int n_kv_heads, int head_dim,
         bool causal, int window_size)
     {
-        // Delegate to GQAAttention static method
-        GQAAttentionConfig config;
+        // Delegate to MpiAttentionOrchestrator static method
+        MpiAttentionConfig config;
         config.n_heads = n_heads;
         config.n_kv_heads = n_kv_heads;
         config.head_dim = head_dim;
@@ -142,7 +142,7 @@ namespace llaminar2
         config.workspace_context = attention_workspace_context_;
         config.workspace_mask = attention_workspace_mask_;
 
-        return GQAAttention::compute_batch(Q, K, V, output, actual_lengths, batch_size, seq_len, config);
+        return MpiAttentionOrchestrator::compute_batch(Q, K, V, output, actual_lengths, batch_size, seq_len, config);
     }
 
     // =============================================================================
@@ -324,8 +324,8 @@ namespace llaminar2
         bool causal, int window_size,
         int batch_size, const std::vector<int> *sequence_lengths)
     {
-        // Delegate to GQAAttention static method
-        GQAAttentionConfig config;
+        // Delegate to MpiAttentionOrchestrator static method
+        MpiAttentionConfig config;
         config.n_heads = n_heads;
         config.n_kv_heads = n_kv_heads;
         config.head_dim = head_dim;
@@ -342,7 +342,7 @@ namespace llaminar2
         config.workspace_context = attention_workspace_context_;
         config.workspace_mask = attention_workspace_mask_;
 
-        return GQAAttention::compute_mpi(Q, K, V, output, config, batch_size, sequence_lengths);
+        return MpiAttentionOrchestrator::compute_mpi(Q, K, V, output, config, batch_size, sequence_lengths);
     }
 
     bool PipelineBase::attention_gqa_tensor_parallel(
@@ -351,8 +351,8 @@ namespace llaminar2
         bool causal, int window_size,
         int batch_size, const std::vector<int> *sequence_lengths)
     {
-        // Delegate to GQAAttention static method
-        GQAAttentionConfig config;
+        // Delegate to MpiAttentionOrchestrator static method
+        MpiAttentionConfig config;
         config.n_heads = n_heads;
         config.n_kv_heads = n_kv_heads;
         config.head_dim = head_dim;
@@ -369,7 +369,7 @@ namespace llaminar2
         config.mpi_strategy = MPIStrategy::TensorParallel; // Force tensor-parallel
         config.verbose_logging = mpi_config_.verbose_logging;
 
-        return GQAAttention::compute_tensor_parallel(Q, K, V, output, config, batch_size, sequence_lengths);
+        return MpiAttentionOrchestrator::compute_tensor_parallel(Q, K, V, output, config, batch_size, sequence_lengths);
     }
 
     // =============================================================================

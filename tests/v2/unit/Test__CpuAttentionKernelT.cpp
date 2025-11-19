@@ -1,6 +1,6 @@
 /**
- * @file Test__CPUAttentionT.cpp
- * @brief Unit tests for CPUAttentionT template-based attention kernel
+ * @file Test__CpuAttentionKernelT.cpp
+ * @brief Unit tests for CpuAttentionKernelT template-based attention kernel
  * @author David Sanftenberg
  *
  * Tests:
@@ -15,7 +15,7 @@
 #include <cmath>
 #include <memory>
 
-#include "v2/kernels/cpu/CPUAttentionT.h"
+#include "v2/kernels/cpu/CpuAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
 
 using namespace llaminar2;
@@ -119,14 +119,14 @@ namespace
 // FP32Tensor Tests
 // ============================================================================
 
-TEST(CPUAttentionT_FP32, InstantiationWorks)
+TEST(CpuAttentionKernelT_FP32, InstantiationWorks)
 {
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
     EXPECT_TRUE(attention.supports_device(-1)) << "Should support CPU (device_idx=-1)";
     EXPECT_FALSE(attention.supports_device(0)) << "Should NOT support GPU";
 }
 
-TEST(CPUAttentionT_FP32, BasicAttentionComputation)
+TEST(CpuAttentionKernelT_FP32, BasicAttentionComputation)
 {
     // Small test: 2 tokens, 1 head, 4 dims
     const int seq_len = 2;
@@ -146,7 +146,7 @@ TEST(CPUAttentionT_FP32, BasicAttentionComputation)
     init_sequential(V.data(), V.size());
 
     // Create attention kernel
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     // Compute attention
     bool success = attention.compute(
@@ -162,7 +162,7 @@ TEST(CPUAttentionT_FP32, BasicAttentionComputation)
     EXPECT_TRUE(has_nonzero(output.data(), output.size())) << "Output should be non-zero";
 }
 
-TEST(CPUAttentionT_FP32, CausalMasking)
+TEST(CpuAttentionKernelT_FP32, CausalMasking)
 {
     // Test causal masking: future tokens should not affect past tokens
     const int seq_len = 4;
@@ -179,7 +179,7 @@ TEST(CPUAttentionT_FP32, CausalMasking)
     init_sequential(K.data(), K.size());
     init_sequential(V.data(), V.size());
 
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     bool success = attention.compute(
         Q.data(), K.data(), V.data(), output.data(),
@@ -196,7 +196,7 @@ TEST(CPUAttentionT_FP32, CausalMasking)
     // (Not testing exact values, just that it runs without crashing)
 }
 
-TEST(CPUAttentionT_FP32, MultiHeadAttention)
+TEST(CpuAttentionKernelT_FP32, MultiHeadAttention)
 {
     // Test with multiple heads (MHA)
     const int seq_len = 3;
@@ -213,7 +213,7 @@ TEST(CPUAttentionT_FP32, MultiHeadAttention)
     init_sequential(K.data(), K.size());
     init_sequential(V.data(), V.size());
 
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     bool success = attention.compute(
         Q.data(), K.data(), V.data(), output.data(),
@@ -226,7 +226,7 @@ TEST(CPUAttentionT_FP32, MultiHeadAttention)
     EXPECT_TRUE(has_nonzero(output.data(), output.size()));
 }
 
-TEST(CPUAttentionT_FP32, GroupedQueryAttention)
+TEST(CpuAttentionKernelT_FP32, GroupedQueryAttention)
 {
     // Test GQA: n_heads > n_kv_heads (KV broadcasting)
     const int seq_len = 2;
@@ -243,7 +243,7 @@ TEST(CPUAttentionT_FP32, GroupedQueryAttention)
     init_sequential(K.data(), K.size());
     init_sequential(V.data(), V.size());
 
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     bool success = attention.compute(
         Q.data(), K.data(), V.data(), output.data(),
@@ -256,7 +256,7 @@ TEST(CPUAttentionT_FP32, GroupedQueryAttention)
     EXPECT_TRUE(has_nonzero(output.data(), output.size()));
 }
 
-TEST(CPUAttentionT_FP32, WorkspaceProvided)
+TEST(CpuAttentionKernelT_FP32, WorkspaceProvided)
 {
     // Test with pre-allocated workspaces
     const int seq_len = 2;
@@ -278,7 +278,7 @@ TEST(CPUAttentionT_FP32, WorkspaceProvided)
     FP32Tensor buffer_workspace({static_cast<size_t>(seq_len * head_dim * 2)});
     FP32Tensor context_workspace({static_cast<size_t>(seq_len * head_dim)});
 
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     bool success = attention.compute(
         Q.data(), K.data(), V.data(), output.data(),
@@ -291,7 +291,7 @@ TEST(CPUAttentionT_FP32, WorkspaceProvided)
     EXPECT_TRUE(has_nonzero(output.data(), output.size()));
 }
 
-TEST(CPUAttentionT_FP32, InvalidDevice)
+TEST(CpuAttentionKernelT_FP32, InvalidDevice)
 {
     const int seq_len = 2;
     const int n_heads = 1;
@@ -307,7 +307,7 @@ TEST(CPUAttentionT_FP32, InvalidDevice)
     init_sequential(K.data(), K.size());
     init_sequential(V.data(), V.size());
 
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     // Try with device_idx=0 (GPU) - should fail
     bool success = attention.compute(
@@ -320,7 +320,7 @@ TEST(CPUAttentionT_FP32, InvalidDevice)
     EXPECT_FALSE(success) << "Should fail on GPU device (CPU-only kernel)";
 }
 
-TEST(CPUAttentionT_FP32, NullPointerInputs)
+TEST(CpuAttentionKernelT_FP32, NullPointerInputs)
 {
     const int seq_len = 2;
     const int n_heads = 1;
@@ -329,7 +329,7 @@ TEST(CPUAttentionT_FP32, NullPointerInputs)
 
     std::vector<float> output(seq_len * n_heads * head_dim, 0.0f);
 
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     // Null Q
     bool success = attention.compute(
@@ -342,7 +342,7 @@ TEST(CPUAttentionT_FP32, NullPointerInputs)
     EXPECT_FALSE(success) << "Should fail with null input pointers";
 }
 
-TEST(CPUAttentionT_FP32, InvalidDimensions)
+TEST(CpuAttentionKernelT_FP32, InvalidDimensions)
 {
     const int seq_len = 2;
     const int n_heads = 3;    // 3 query heads
@@ -354,7 +354,7 @@ TEST(CPUAttentionT_FP32, InvalidDimensions)
     std::vector<float> V(seq_len * n_kv_heads * head_dim);
     std::vector<float> output(seq_len * n_heads * head_dim, 0.0f);
 
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     // n_heads (3) not divisible by n_kv_heads (2) - should fail
     bool success = attention.compute(
@@ -367,7 +367,7 @@ TEST(CPUAttentionT_FP32, InvalidDimensions)
     EXPECT_FALSE(success) << "Should fail when n_heads not divisible by n_kv_heads";
 }
 
-TEST(CPUAttentionT_FP32, BatchAttentionComputation)
+TEST(CpuAttentionKernelT_FP32, BatchAttentionComputation)
 {
     // Test batch attention (2 sequences)
     const int batch_size = 2;
@@ -387,7 +387,7 @@ TEST(CPUAttentionT_FP32, BatchAttentionComputation)
     init_sequential(K.data(), K.size());
     init_sequential(V.data(), V.size());
 
-    CPUAttentionT<FP32Tensor> attention;
+    CpuAttentionKernelT<FP32Tensor> attention;
 
     bool success = attention.compute_batch(
         Q.data(), K.data(), V.data(), output.data(),
@@ -409,14 +409,14 @@ TEST(CPUAttentionT_FP32, BatchAttentionComputation)
 // 3. Input conversion: FP32 → BF16 for storage, passed as reinterpret_cast<float*>
 // 4. Workspaces are ALWAYS FP32Tensor (even for BF16 inputs)
 
-TEST(CPUAttentionT_BF16, InstantiationWorks)
+TEST(CpuAttentionKernelT_BF16, InstantiationWorks)
 {
-    CPUAttentionT<BF16Tensor> attention;
+    CpuAttentionKernelT<BF16Tensor> attention;
     EXPECT_TRUE(attention.supports_device(-1));
     EXPECT_FALSE(attention.supports_device(0)); // CPU only
 }
 
-TEST(CPUAttentionT_BF16, BasicAttentionComputation)
+TEST(CpuAttentionKernelT_BF16, BasicAttentionComputation)
 {
     // Test dimensions
     const int seq_len = 2;
@@ -444,7 +444,7 @@ TEST(CPUAttentionT_BF16, BasicAttentionComputation)
     std::vector<float> output(seq_len * n_heads * head_dim);
 
     // 4. Compute attention
-    CPUAttentionT<BF16Tensor> attention;
+    CpuAttentionKernelT<BF16Tensor> attention;
     bool success = attention.compute(
         reinterpret_cast<float *>(Q_bf16.data()), // Type-erased interface
         reinterpret_cast<float *>(K_bf16.data()),
@@ -463,7 +463,7 @@ TEST(CPUAttentionT_BF16, BasicAttentionComputation)
     EXPECT_TRUE(has_nonzero(output.data(), output.size())) << "BF16 output is all zeros";
 }
 
-TEST(CPUAttentionT_BF16, CausalMasking)
+TEST(CpuAttentionKernelT_BF16, CausalMasking)
 {
     const int seq_len = 4;
     const int n_heads = 1;
@@ -489,7 +489,7 @@ TEST(CPUAttentionT_BF16, CausalMasking)
     // FP32 output
     std::vector<float> output(seq_len * n_heads * head_dim);
 
-    CPUAttentionT<BF16Tensor> attention;
+    CpuAttentionKernelT<BF16Tensor> attention;
     bool success = attention.compute(
         reinterpret_cast<float *>(Q_bf16.data()),
         reinterpret_cast<float *>(K_bf16.data()),
@@ -508,7 +508,7 @@ TEST(CPUAttentionT_BF16, CausalMasking)
     EXPECT_TRUE(has_nonzero(output.data(), output.size())) << "BF16 causal output is all zeros";
 }
 
-TEST(CPUAttentionT_BF16, MultiHeadAttention)
+TEST(CpuAttentionKernelT_BF16, MultiHeadAttention)
 {
     const int seq_len = 3;
     const int n_heads = 2;
@@ -531,7 +531,7 @@ TEST(CPUAttentionT_BF16, MultiHeadAttention)
 
     std::vector<float> output(seq_len * n_heads * head_dim);
 
-    CPUAttentionT<BF16Tensor> attention;
+    CpuAttentionKernelT<BF16Tensor> attention;
     bool success = attention.compute(
         reinterpret_cast<float *>(Q_bf16.data()),
         reinterpret_cast<float *>(K_bf16.data()),
@@ -550,7 +550,7 @@ TEST(CPUAttentionT_BF16, MultiHeadAttention)
     EXPECT_TRUE(has_nonzero(output.data(), output.size())) << "BF16 MHA output is all zeros";
 }
 
-TEST(CPUAttentionT_BF16, GroupedQueryAttention)
+TEST(CpuAttentionKernelT_BF16, GroupedQueryAttention)
 {
     const int seq_len = 2;
     const int n_heads = 4;    // Query heads
@@ -573,7 +573,7 @@ TEST(CPUAttentionT_BF16, GroupedQueryAttention)
 
     std::vector<float> output(seq_len * n_heads * head_dim);
 
-    CPUAttentionT<BF16Tensor> attention;
+    CpuAttentionKernelT<BF16Tensor> attention;
     bool success = attention.compute(
         reinterpret_cast<float *>(Q_bf16.data()),
         reinterpret_cast<float *>(K_bf16.data()),
@@ -592,7 +592,7 @@ TEST(CPUAttentionT_BF16, GroupedQueryAttention)
     EXPECT_TRUE(has_nonzero(output.data(), output.size())) << "BF16 GQA output is all zeros";
 }
 
-TEST(CPUAttentionT_BF16, WorkspaceProvided)
+TEST(CpuAttentionKernelT_BF16, WorkspaceProvided)
 {
     const int seq_len = 2;
     const int n_heads = 1;
@@ -621,7 +621,7 @@ TEST(CPUAttentionT_BF16, WorkspaceProvided)
     auto workspace_weights = std::make_shared<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(n_heads * seq_len), static_cast<size_t>(seq_len)});
 
-    CPUAttentionT<BF16Tensor> attention;
+    CpuAttentionKernelT<BF16Tensor> attention;
     bool success = attention.compute(
         reinterpret_cast<float *>(Q_bf16.data()),
         reinterpret_cast<float *>(K_bf16.data()),
@@ -645,9 +645,9 @@ TEST(CPUAttentionT_BF16, WorkspaceProvided)
 // ============================================================================
 // NOTE: FP16 GEMM kernel not yet implemented - only test instantiation
 
-TEST(CPUAttentionT_FP16, InstantiationWorks)
+TEST(CpuAttentionKernelT_FP16, InstantiationWorks)
 {
-    CPUAttentionT<FP16Tensor> attention;
+    CpuAttentionKernelT<FP16Tensor> attention;
     EXPECT_TRUE(attention.supports_device(-1));
     EXPECT_FALSE(attention.supports_device(0)); // CPU only
 }
@@ -659,14 +659,14 @@ TEST(CPUAttentionT_FP16, InstantiationWorks)
 // Q8_1Tensor Tests
 // ============================================================================
 
-TEST(CPUAttentionT_Q8_1, InstantiationWorks)
+TEST(CpuAttentionKernelT_Q8_1, InstantiationWorks)
 {
-    CPUAttentionT<Q8_1Tensor> attention;
+    CpuAttentionKernelT<Q8_1Tensor> attention;
     EXPECT_TRUE(attention.supports_device(-1)) << "Should support CPU (device_idx=-1)";
     EXPECT_FALSE(attention.supports_device(0)) << "Should NOT support GPU";
 }
 
-TEST(CPUAttentionT_Q8_1, BasicAttentionComputation)
+TEST(CpuAttentionKernelT_Q8_1, BasicAttentionComputation)
 {
     // Small test: 2 tokens, 1 head, 32 dims (head_dim must be multiple of 32 for Q8_1 block alignment)
     const int seq_len = 2;
@@ -683,20 +683,18 @@ TEST(CPUAttentionT_Q8_1, BasicAttentionComputation)
     init_sequential(V_fp32.data(), V_fp32.size());
 
     // Helper to quantize FP32 -> Q8_1
-    auto quantize_to_q8_1 = [&](const std::vector<float> &src, std::vector<uint8_t> &dst_raw)
-    {
+    auto quantize_to_q8_1 = [&](const std::vector<float>& src, std::vector<uint8_t>& dst_raw) {
         size_t n_blocks = (src.size() + 31) / 32;
         dst_raw.resize(n_blocks * sizeof(Q8_1Block));
-
+        
         // Use FP32Tensor to perform quantization via decode_to_q8_1
         // We create a temporary FP32Tensor wrapping the data
         FP32Tensor temp_tensor({src.size() / 32, 32}); // Treat as [blocks, 32]
         std::memcpy(temp_tensor.mutable_data(), src.data(), src.size() * sizeof(float));
-
-        Q8_1Block *dst_blocks = reinterpret_cast<Q8_1Block *>(dst_raw.data());
-        for (size_t i = 0; i < n_blocks; ++i)
-        {
-            const Q8_1Block *block = temp_tensor.decode_to_q8_1(i, 0);
+        
+        Q8_1Block* dst_blocks = reinterpret_cast<Q8_1Block*>(dst_raw.data());
+        for (size_t i = 0; i < n_blocks; ++i) {
+            const Q8_1Block* block = temp_tensor.decode_to_q8_1(i, 0);
             dst_blocks[i] = *block;
         }
     };
@@ -715,20 +713,20 @@ TEST(CPUAttentionT_Q8_1, BasicAttentionComputation)
     // Allocate output (Q8_1 attention writes FP32 output)
     std::vector<float> output(seq_len * n_heads * head_dim, 0.0f);
 
-    // NOTE: CPUAttentionT::compute expects float* interface (reinterprets to ElementType* internally)
+    // NOTE: CpuAttentionKernelT::compute expects float* interface (reinterprets to ElementType* internally)
     // For Q8_1: ElementType=Q8_1Block (or similar), but we pass pointer to raw data
     // The kernel will cast it to Q8_1Block* or similar.
-    // Wait, CPUAttentionT uses Traits::ElementType.
+    // Wait, CpuAttentionKernelT uses Traits::ElementType.
     // For Q8_1Tensor, ElementType should be Q8_1Block? Or int8_t?
     // Let's check ActivationTraits for Q8_1Tensor.
     // Assuming it expects the raw data pointer cast to float* for the interface.
-
+    
     const float *Q_ptr = reinterpret_cast<const float *>(Q_raw.data());
     const float *K_ptr = reinterpret_cast<const float *>(K_raw.data());
     const float *V_ptr = reinterpret_cast<const float *>(V_raw.data());
 
     // Create attention kernel
-    CPUAttentionT<Q8_1Tensor> attention;
+    CpuAttentionKernelT<Q8_1Tensor> attention;
 
     // Compute attention
     bool success = attention.compute(

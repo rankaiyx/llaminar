@@ -88,7 +88,7 @@ namespace llaminar2
             int device_idx = -1) override;
 
     private:
-        // Helper methods (implementation details from GQAAttention)
+        // Helper methods (implementation details from MpiAttentionOrchestrator)
 
         /**
          * @brief Broadcast K/V from n_kv_heads to n_heads (for GQA/MQA)

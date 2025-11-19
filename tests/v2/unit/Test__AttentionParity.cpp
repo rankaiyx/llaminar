@@ -18,7 +18,7 @@
 #include <memory>
 #include <cmath>
 #include <algorithm>
-#include "pipelines/attention/GQAAttention.h"
+#include "pipelines/attention/MpiAttentionOrchestrator.h"
 #include "tensors/Tensors.h"
 #include "kernels/cpu/CPURoPEKernel.h"
 #include "utils/Logger.h"
@@ -168,7 +168,7 @@ namespace
     /**
      * @brief REGRESSION TEST: Causal masking must be controllable
      *
-     * Bug: GQAAttention applied causal mask when sequence_lengths != nullptr,
+     * Bug: MpiAttentionOrchestrator applied causal mask when sequence_lengths != nullptr,
      *      even when causal=false was specified
      * Fix: Only apply mask when causal=true
      * Impact: Parity tests failed because PyTorch reference has no causal mask
@@ -220,7 +220,7 @@ namespace
             std::vector<size_t>{static_cast<size_t>(small_seq * small_seq)});
 
         // Configure attention WITH causal masking
-        GQAAttentionConfig config;
+        MpiAttentionConfig config;
         config.n_heads = small_heads;
         config.n_kv_heads = small_kv_heads;
         config.head_dim = head_dim_;
@@ -231,7 +231,7 @@ namespace
         config.workspace_context = workspace_context;
         config.workspace_mask = workspace_mask;
 
-        ASSERT_TRUE(GQAAttention::compute(
+        ASSERT_TRUE(MpiAttentionOrchestrator::compute(
             Q.get(), K.get(), V.get(), output.get(),
             config, 1, nullptr))
             << "Causal attention failed";
@@ -339,7 +339,7 @@ namespace
         auto workspace_mask = std::make_shared<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(small_seq * small_seq)});
 
-        GQAAttentionConfig config;
+        MpiAttentionConfig config;
         config.n_heads = small_heads;
         config.n_kv_heads = small_kv_heads;
         config.head_dim = head_dim_;
@@ -350,9 +350,9 @@ namespace
         config.workspace_context = workspace_context;
         config.workspace_mask = workspace_mask;
 
-        // Use the main GQAAttention compute path, which routes scores·V
+        // Use the main MpiAttentionOrchestrator compute path, which routes scores·V
         // through the activation GEMM interface (supports non-transposed B).
-        ASSERT_TRUE(GQAAttention::compute(
+        ASSERT_TRUE(MpiAttentionOrchestrator::compute(
             Q.get(), K.get(), V.get(), output.get(), config, /*batch_size=*/1, /*sequence_lengths=*/nullptr))
             << "GQA attention failed";
 
@@ -493,7 +493,7 @@ namespace
         auto workspace_mask = std::make_shared<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(small_seq * small_seq)});
 
-        GQAAttentionConfig config;
+        MpiAttentionConfig config;
         config.n_heads = small_heads;
         config.n_kv_heads = small_kv_heads;
         config.head_dim = head_dim_;
@@ -504,7 +504,7 @@ namespace
         config.workspace_context = workspace_context;
         config.workspace_mask = workspace_mask;
 
-        ASSERT_TRUE(GQAAttention::compute(
+        ASSERT_TRUE(MpiAttentionOrchestrator::compute(
             Q.get(), K.get(), V.get(), output.get(), config, 1, nullptr))
             << "Attention failed";
 

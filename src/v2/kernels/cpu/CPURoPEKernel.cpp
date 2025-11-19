@@ -50,12 +50,27 @@ namespace llaminar2
             return true; // Nothing to do
         }
 
-        // For now, assume contiguous position_ids [n_past, n_past+1, ..., n_past+seq_len-1]
-        // This matches V1 behavior where position_ids isn't actually used (n_past determines base)
-        int n_past = position_ids ? position_ids[0] : 0;
+        // Apply RoPE per-token with individual positions from position_ids array
+        // This supports batched inference where sequences have independent positions
+        const int q_stride = n_heads * head_dim;
+        const int k_stride = n_kv_heads * head_dim;
 
-        // Use rope_theta from model config (Qwen2.5: 1000000.0, LLaMA: 10000.0)
-        apply_rotation(Q, K, seq_len, head_dim, n_heads, n_kv_heads, n_past, rope_theta);
+        for (int tok = 0; tok < seq_len; ++tok)
+        {
+            int position = position_ids ? position_ids[tok] : tok;
+
+            // Skip RoPE for padding tokens (position_id = -1)
+            if (position < 0)
+            {
+                continue; // Padding token - leave Q/K unrotated
+            }
+
+            float *q_token = Q + tok * q_stride;
+            float *k_token = K ? (K + tok * k_stride) : nullptr;
+
+            // Apply RoPE to single token (seq_len=1, n_past=position)
+            apply_rotation(q_token, k_token, 1, head_dim, n_heads, n_kv_heads, position, rope_theta);
+        }
 
         return true;
     }
@@ -97,14 +112,31 @@ namespace llaminar2
             return true; // Nothing to do
         }
 
-        // Use native BF16 primitives
-        int n_past = position_ids ? position_ids[0] : 0;
-        primitives::apply_rope_bf16(
-            Q_bf16, K_bf16,
-            seq_len, head_dim,
-            n_heads, n_kv_heads,
-            n_past, rope_theta,
-            (seq_len == 1) ? &tls_state_ : nullptr);
+        // Apply RoPE per-token with individual positions from position_ids array
+        const int q_stride = n_heads * head_dim;
+        const int k_stride = n_kv_heads * head_dim;
+
+        for (int tok = 0; tok < seq_len; ++tok)
+        {
+            int position = position_ids ? position_ids[tok] : tok;
+
+            // Skip RoPE for padding tokens (position_id = -1)
+            if (position < 0)
+            {
+                continue; // Padding token - leave Q/K unrotated
+            }
+
+            uint16_t *q_token = Q_bf16 + tok * q_stride;
+            uint16_t *k_token = K_bf16 ? (K_bf16 + tok * k_stride) : nullptr;
+
+            // Apply RoPE to single token (seq_len=1, n_past=position)
+            primitives::apply_rope_bf16(
+                q_token, k_token,
+                1, head_dim,
+                n_heads, n_kv_heads,
+                position, rope_theta,
+                &tls_state_); // Always use persistent state for single-token
+        }
 
         return true;
     }
@@ -131,14 +163,31 @@ namespace llaminar2
             return true; // Nothing to do
         }
 
-        // Use native FP16 primitives
-        int n_past = position_ids ? position_ids[0] : 0;
-        primitives::apply_rope_fp16(
-            Q_fp16, K_fp16,
-            seq_len, head_dim,
-            n_heads, n_kv_heads,
-            n_past, rope_theta,
-            (seq_len == 1) ? &tls_state_ : nullptr);
+        // Apply RoPE per-token with individual positions from position_ids array
+        const int q_stride = n_heads * head_dim;
+        const int k_stride = n_kv_heads * head_dim;
+
+        for (int tok = 0; tok < seq_len; ++tok)
+        {
+            int position = position_ids ? position_ids[tok] : tok;
+
+            // Skip RoPE for padding tokens (position_id = -1)
+            if (position < 0)
+            {
+                continue; // Padding token - leave Q/K unrotated
+            }
+
+            uint16_t *q_token = Q_fp16 + tok * q_stride;
+            uint16_t *k_token = K_fp16 ? (K_fp16 + tok * k_stride) : nullptr;
+
+            // Apply RoPE to single token (seq_len=1, n_past=position)
+            primitives::apply_rope_fp16(
+                q_token, k_token,
+                1, head_dim,
+                n_heads, n_kv_heads,
+                position, rope_theta,
+                &tls_state_); // Always use persistent state for single-token
+        }
 
         return true;
     }

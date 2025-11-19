@@ -599,7 +599,7 @@ struct ActivationTraits<FP32Tensor> {
 
 ### Subsequent Phases
 
-**Phase 3**: CPUAttention → CPUAttentionT<TensorType> refactor
+**Phase 3**: CPUAttention → CpuAttentionKernelT<TensorType> refactor
 - Use ActivationTraits for precision-specific operations
 - Single `compute()` implementation (template)
 - Eliminate dummy tensor pattern
@@ -610,7 +610,7 @@ struct ActivationTraits<FP32Tensor> {
 - Update FP32Tensor, BF16Tensor, FP16Tensor, INT32Tensor
 
 **Phase 5**: Tensor class implementations
-- Implement `FP32Tensor::computeAttention(Q, K, V, ...)` (delegates to CPUAttentionT<FP32Tensor>)
+- Implement `FP32Tensor::computeAttention(Q, K, V, ...)` (delegates to CpuAttentionKernelT<FP32Tensor>)
 - Same for BF16Tensor, FP16Tensor, INT32Tensor
 
 **Phase 6**: Pipeline code updates

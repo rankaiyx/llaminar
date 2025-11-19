@@ -12,7 +12,7 @@
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
-#include "../kernels/cpu/CPUAttentionT.h"
+#include "../kernels/cpu/CpuAttentionKernelT.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include <cstring>
 #include <stdexcept>
@@ -225,7 +225,7 @@ namespace llaminar2
     std::unique_ptr<ITensorAttention> BF16Tensor::createAttention()
     {
         // BF16 tensors use templated CPU attention kernel
-        return std::make_unique<CPUAttentionT<BF16Tensor>>();
+        return std::make_unique<CpuAttentionKernelT<BF16Tensor>>();
     }
 
     // ========== BF16-Specific Interface ==========

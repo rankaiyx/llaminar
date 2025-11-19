@@ -198,9 +198,9 @@ auto kernel = std::make_unique<Q8_0RMSNormKernel>();
 kernel->apply_q8_0(blocks_, gamma, seq_len, d_model, eps);
 ```
 
-**Phase 2: Template-Based Attention** (from CPUAttentionT):
+**Phase 2: Template-Based Attention** (from CpuAttentionKernelT):
 ```cpp
-// CPUAttentionT<Q8_0Tensor> with ActivationTraits specialization
+// CpuAttentionKernelT<Q8_0Tensor> with ActivationTraits specialization
 template<>
 struct ActivationTraits<Q8_0Tensor> {
     using ElementType = Q8_0Block;
@@ -244,7 +244,7 @@ cmake --build build_v2 --target llaminar2_core --parallel 4
 ### Runtime Tests (Pending)
 - ⏳ Q8_0Tensor::applyRMSNorm() functional test
 - ⏳ Q8_0Tensor::applyRoPE() functional test
-- ⏳ CPUAttentionT<Q8_0Tensor> instantiation test
+- ⏳ CpuAttentionKernelT<Q8_0Tensor> instantiation test
 - ⏳ Q8_0 activation quantization integration test
 
 ### Known Limitations
@@ -255,21 +255,21 @@ cmake --build build_v2 --target llaminar2_core --parallel 4
 
 ---
 
-## Integration with CPUAttentionT
+## Integration with CpuAttentionKernelT
 
 **Before this change**:
 ```cpp
-// CPUAttentionT<Q8_0Tensor> WOULD NOT COMPILE
+// CpuAttentionKernelT<Q8_0Tensor> WOULD NOT COMPILE
 // Q8_0Tensor did not implement IActivationTensor
 ```
 
 **After this change**:
 ```cpp
-// CPUAttentionT<Q8_0Tensor> NOW COMPILES ✅
-template class CPUAttentionT<FP32Tensor>;  // ✅ Already worked
-template class CPUAttentionT<BF16Tensor>;  // ✅ Already worked
-template class CPUAttentionT<FP16Tensor>;  // ✅ Already worked
-template class CPUAttentionT<Q8_0Tensor>;  // ✅ NOW WORKS!
+// CpuAttentionKernelT<Q8_0Tensor> NOW COMPILES ✅
+template class CpuAttentionKernelT<FP32Tensor>;  // ✅ Already worked
+template class CpuAttentionKernelT<BF16Tensor>;  // ✅ Already worked
+template class CpuAttentionKernelT<FP16Tensor>;  // ✅ Already worked
+template class CpuAttentionKernelT<Q8_0Tensor>;  // ✅ NOW WORKS!
 ```
 
 **Usage Example**:
@@ -293,7 +293,7 @@ attention->compute(Q_q8->data(), K_fp32, V_fp32, output, ...);
 2. ⏳ Implement Q8_0 requantization in `applyRMSNorm()` and `applyRoPE()`
 3. ⏳ Add `ActivationTraits<Q8_0Tensor>` specialization
 4. ⏳ Add `ActivationStorageTraits<Q8_0Block>` for GEMM kernels
-5. ⏳ Test CPUAttentionT<Q8_0Tensor> instantiation
+5. ⏳ Test CpuAttentionKernelT<Q8_0Tensor> instantiation
 
 ### Optimizations (Performance)
 6. ⏳ Implement fused Q8_0 RMSNorm kernel (avoid dequant/requant)
@@ -329,8 +329,8 @@ attention->compute(Q_q8->data(), K_fp32, V_fp32, output, ...);
 ## Summary
 
 ✅ **All activation tensor types now implement IActivationTensor**  
-✅ **Q8_0Tensor can be used with CPUAttentionT**  
+✅ **Q8_0Tensor can be used with CpuAttentionKernelT**  
 ✅ **Dequant/requant workflow functional (unoptimized)**  
 ⏳ **Fused Q8_0 kernels pending (Phase 2 optimization)**
 
-**Impact**: This completes the foundation for quantized activation support in V2, enabling CPUAttentionT to work with Q8_0 activations and setting the stage for INT8×IQ4_NL VNNI GEMM integration.
+**Impact**: This completes the foundation for quantized activation support in V2, enabling CpuAttentionKernelT to work with Q8_0 activations and setting the stage for INT8×IQ4_NL VNNI GEMM integration.

@@ -272,20 +272,23 @@ namespace llaminar2
         /**
          * @brief Create combined causal + padding mask for batched attention
          *
-         * Combines two masking constraints:
-         * 1. Causal masking: token i cannot attend to tokens j > i (future)
-         * 2. Padding masking: real tokens cannot attend to padding positions
+         * Combines multiple masking constraints:
+         * 1. Block-diagonal: Tokens from different batches never attend to each other
+         * 2. Padding masking: Real tokens cannot attend to padding positions
+         * 3. Causal masking: Token i cannot attend to tokens j > i (future) [optional]
+         * 4. Padding tokens: Cannot attend to anything (all positions masked)
          *
-         * Result: mask[batch, seq_len, seq_len]
-         * - mask[b, i, j] = 0.0    if position (b,i) can attend to position (b,j)
-         * - mask[b, i, j] = -inf   otherwise
+         * Result: mask[total_len, total_len] where total_len = batch_size * seq_len
+         * - mask[i, j] = 0.0    if token i can attend to token j
+         * - mask[i, j] = -inf   otherwise
          *
          * Masking rules:
-         * - Cross-batch masking: Always masked (batch b cannot attend to batch b')
-         * - Causal masking: Masked if j > i (cannot attend to future)
-         * - Padding masking: Masked if j >= actual_lengths[b] (padding position)
+         * - Cross-batch masking: Always masked (different batches never attend)
+         * - Padding masking: Masked if j >= actual_lengths[batch_j] (padding position)
+         * - Causal masking: Masked if j > i within same batch (cannot attend to future)
+         * - Padding tokens: Cannot attend to anything (i >= actual_lengths[batch_i])
          *
-         * @param mask Output mask [batch_size * seq_len * seq_len]
+         * @param mask Output mask [batch_size * seq_len, batch_size * seq_len] (flattened 2D)
          * @param batch_size Number of sequences in batch
          * @param seq_len Maximum sequence length
          * @param actual_lengths Actual length of each sequence [batch_size]
@@ -301,37 +304,54 @@ namespace llaminar2
             int window_size = -1)
         {
             const float neg_inf = -std::numeric_limits<float>::infinity();
+            const int total_len = batch_size * seq_len;
 
-            for (int b = 0; b < batch_size; ++b)
+// Parallelize over rows - each row's mask is independent
+#pragma omp parallel for if (total_len * total_len > 4096) schedule(static)
+            for (int i = 0; i < total_len; ++i)
             {
-                const int actual_len = actual_lengths[b];
+                const int batch_i = i / seq_len; // Which batch does token i belong to?
+                const int pos_i = i % seq_len;   // Position within that batch
 
-                for (int i = 0; i < seq_len; ++i)
+                // Get actual sequence length for this batch
+                const int actual_len_i = actual_lengths[batch_i];
+
+                // If token i is a padding token, it cannot attend to anything
+                const bool i_is_padding = (pos_i >= actual_len_i);
+
+                for (int j = 0; j < total_len; ++j)
                 {
-                    for (int j = 0; j < seq_len; ++j)
+                    const int batch_j = j / seq_len; // Which batch does token j belong to?
+                    const int pos_j = j % seq_len;   // Position within that batch
+
+                    bool can_attend = false;
+
+                    // Padding tokens cannot attend to anything
+                    if (!i_is_padding)
                     {
-                        bool can_attend = true;
-
-                        // 1. Padding mask: Cannot attend to padding positions
-                        if (j >= actual_len)
+                        // 1. Must be in same batch (block-diagonal structure)
+                        if (batch_i == batch_j)
                         {
-                            can_attend = false;
-                        }
+                            // 2. Check if token j is within valid sequence (not padding)
+                            const int actual_len_j = actual_lengths[batch_j];
+                            const bool j_is_padding = (pos_j >= actual_len_j);
 
-                        // 2. Causal mask: Cannot attend to future positions
-                        if (causal && can_attend && j > i)
-                        {
-                            can_attend = false;
+                            if (!j_is_padding)
+                            {
+                                // 3. Causal constraint: can't attend to future tokens
+                                if (!causal || pos_j <= pos_i)
+                                {
+                                    // 4. Sliding window constraint (if enabled)
+                                    if (window_size < 0 || (pos_i - pos_j < window_size))
+                                    {
+                                        can_attend = true;
+                                    }
+                                }
+                            }
                         }
-
-                        // 3. Sliding window mask (if enabled)
-                        if (window_size >= 0 && can_attend && (i - j >= window_size))
-                        {
-                            can_attend = false;
-                        }
-
-                        mask[b * seq_len * seq_len + i * seq_len + j] = can_attend ? 0.0f : neg_inf;
                     }
+
+                    mask[i * total_len + j] = can_attend ? 0.0f : neg_inf;
                 }
             }
         }

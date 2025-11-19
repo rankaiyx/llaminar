@@ -1,4 +1,4 @@
-# CPUAttentionT Q8_0Tensor Support - Implementation Summary
+# CpuAttentionKernelT Q8_0Tensor Support - Implementation Summary
 
 **Date**: January 2025  
 **Author**: GitHub Copilot (Claude) with David Sanftenberg  
@@ -6,13 +6,13 @@
 
 ## Overview
 
-Added support for Q8_0Tensor (8-bit quantized activations) to CPUAttentionT, enabling INT8 attention computation with automatic dequantization to FP32 for attention scores and softmax operations.
+Added support for Q8_0Tensor (8-bit quantized activations) to CpuAttentionKernelT, enabling INT8 attention computation with automatic dequantization to FP32 for attention scores and softmax operations.
 
 ## Changes Made
 
-### 1. CPUAttentionT Q8_0 Dequantization Support
+### 1. CpuAttentionKernelT Q8_0 Dequantization Support
 
-**File**: `src/v2/kernels/cpu/CPUAttentionT.h` (lines 278-311)
+**File**: `src/v2/kernels/cpu/CpuAttentionKernelT.h` (lines 278-311)
 
 Added Q8_0Tensor handling in `compute_typed()` method:
 
@@ -66,15 +66,15 @@ else if constexpr (std::is_same_v<TensorType, Q8_0Tensor>)
 
 ### 2. Test Suite Additions
 
-**File**: `tests/v2/unit/Test__CPUAttentionT.cpp` (lines 641-734)
+**File**: `tests/v2/unit/Test__CpuAttentionKernelT.cpp` (lines 641-734)
 
 Added 2 new test cases for Q8_0Tensor:
 
 #### Test 1: InstantiationWorks
 ```cpp
-TEST(CPUAttentionT_Q8_0, InstantiationWorks)
+TEST(CpuAttentionKernelT_Q8_0, InstantiationWorks)
 {
-    CPUAttentionT<Q8_0Tensor> attention;
+    CpuAttentionKernelT<Q8_0Tensor> attention;
     EXPECT_TRUE(attention.supports_device(-1));  // CPU only
     EXPECT_FALSE(attention.supports_device(0));  // No GPU
 }
@@ -84,7 +84,7 @@ TEST(CPUAttentionT_Q8_0, InstantiationWorks)
 
 #### Test 2: BasicAttentionComputation
 ```cpp
-TEST(CPUAttentionT_Q8_0, BasicAttentionComputation)
+TEST(CpuAttentionKernelT_Q8_0, BasicAttentionComputation)
 {
     const int seq_len = 2;
     const int n_heads = 1;
@@ -110,7 +110,7 @@ TEST(CPUAttentionT_Q8_0, BasicAttentionComputation)
     
     // 4. Run attention computation
     const float* Q_ptr = reinterpret_cast<const float*>(Q_raw.data());
-    CPUAttentionT<Q8_0Tensor> attention;
+    CpuAttentionKernelT<Q8_0Tensor> attention;
     bool success = attention.compute(Q_ptr, K_ptr, V_ptr, output.data(), ...);
     
     EXPECT_TRUE(success);
@@ -190,19 +190,19 @@ struct ActivationStorageTraits<int8_t>
 
 ```
 [==========] Running 19 tests from 5 test suites.
-[----------] 9 tests from CPUAttentionT_FP32 (125 ms total)
+[----------] 9 tests from CpuAttentionKernelT_FP32 (125 ms total)
 [  PASSED  ] 9 tests.
 
-[----------] 6 tests from CPUAttentionT_BF16 (92 ms total)
+[----------] 6 tests from CpuAttentionKernelT_BF16 (92 ms total)
 [  PASSED  ] 6 tests.
 
-[----------] 1 test from CPUAttentionT_FP16 (0 ms total)
+[----------] 1 test from CpuAttentionKernelT_FP16 (0 ms total)
 [  PASSED  ] 1 test.
 
-[----------] 1 test from CPUAttentionT_INT32 (0 ms total)
+[----------] 1 test from CpuAttentionKernelT_INT32 (0 ms total)
 [  PASSED  ] 1 test.
 
-[----------] 2 tests from CPUAttentionT_Q8_0 (35 ms total)
+[----------] 2 tests from CpuAttentionKernelT_Q8_0 (35 ms total)
 [  PASSED  ] 2 tests.
 
 [==========] 19 tests from 5 test suites ran. (240 ms total)
@@ -235,7 +235,7 @@ struct ActivationStorageTraits<int8_t>
 ## Usage Example
 
 ```cpp
-#include "v2/kernels/cpu/CPUAttentionT.h"
+#include "v2/kernels/cpu/CpuAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
 
 // Create Q8_0 quantized activations
@@ -249,7 +249,7 @@ std::vector<uint8_t> Q_raw(reinterpret_cast<uint8_t*>(Q_blocks.data()), ...);
 Q8_0Tensor Q_q8({seq_len, n_heads * head_dim}, Q_raw);
 
 // Run attention computation
-CPUAttentionT<Q8_0Tensor> attention;
+CpuAttentionKernelT<Q8_0Tensor> attention;
 const float* Q_ptr = reinterpret_cast<const float*>(Q_raw.data());
 // ... similar for K, V ...
 
@@ -344,7 +344,7 @@ struct Q8_0Block {
 - **Quantization formula**: `q[i] = round(x[i] / d)` where `d = max(|x|) / 127`
 - **Dequantization formula**: `x[i] = q[i] * d`
 
-### CPUAttentionT Precision Model
+### CpuAttentionKernelT Precision Model
 
 | Tensor Type | Input Precision | Internal Precision | Output Precision |
 |-------------|-----------------|-------------------|------------------|
@@ -370,11 +370,11 @@ struct Q8_0Block {
 
 ## Conclusion
 
-Successfully added Q8_0Tensor support to CPUAttentionT with minimal code changes (30 lines in CPUAttentionT.h, 94 lines of tests). All 19 tests passing, including 2 new Q8_0 tests. The implementation leverages existing infrastructure (ActivationTraits, Q8_0Tensor::to_fp32()) and follows established patterns (dequantize to FP32 for numerical stability).
+Successfully added Q8_0Tensor support to CpuAttentionKernelT with minimal code changes (30 lines in CpuAttentionKernelT.h, 94 lines of tests). All 19 tests passing, including 2 new Q8_0 tests. The implementation leverages existing infrastructure (ActivationTraits, Q8_0Tensor::to_fp32()) and follows established patterns (dequantize to FP32 for numerical stability).
 
 **User's Remaining Steps**: ✅ All Complete
 1. ✅ ActivationTraits<Q8_0Tensor> (already existed)
 2. ✅ ActivationStorageTraits<int8_t> (already existed)
-3. ✅ CPUAttentionT<Q8_0Tensor> instantiation (tests created and passing)
+3. ✅ CpuAttentionKernelT<Q8_0Tensor> instantiation (tests created and passing)
 
 **Next Steps**: Consider optimizations (fused dequant+attention, INT8 softmax) for production deployment.

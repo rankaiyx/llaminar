@@ -595,7 +595,7 @@ namespace llaminar2
      * @brief Attention computation kernel (multi-head, grouped-query, multi-query)
      *
      * Implementations:
-     * - CPUAttention: OpenMP multi-threaded CPU implementation (from GQAAttention)
+     * - CPUAttention: OpenMP multi-threaded CPU implementation (from MpiAttentionOrchestrator)
      * - CUDAAttention: Flash Attention 2 fused kernel (future)
      * - ROCmAttention: Composable Kernel attention (future)
      *

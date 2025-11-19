@@ -8,7 +8,7 @@
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
-#include "../kernels/cpu/CPUAttentionT.h"
+#include "../kernels/cpu/CpuAttentionKernelT.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include "../backends/ComputeBackend.h"
 #ifdef HAVE_CUDA
@@ -227,7 +227,7 @@ namespace llaminar2
     std::unique_ptr<ITensorAttention> FP16Tensor::createAttention()
     {
         // FP16 tensors use templated CPU attention kernel
-        return std::make_unique<CPUAttentionT<FP16Tensor>>();
+        return std::make_unique<CpuAttentionKernelT<FP16Tensor>>();
     }
 
     // ========== FP16-Specific Interface ==========

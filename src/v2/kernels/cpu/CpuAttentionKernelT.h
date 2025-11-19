@@ -1,5 +1,5 @@
 /**
- * @file CPUAttentionT.h
+ * @file CpuAttentionKernelT.h
  * @brief Template-based CPU attention kernel supporting all activation precisions
  *
  * Replaces CPUAttention with a precision-agnostic template implementation.
@@ -56,15 +56,15 @@ namespace llaminar2
      * - Fused attention scaling in Q@K^T GEMM alpha parameter
      */
     template <typename TensorType>
-    class CPUAttentionT : public ITensorAttention
+    class CpuAttentionKernelT : public ITensorAttention
     {
     public:
         // Infer ElementType from ActivationTraits (which knows the mapping)
         using ElementType = typename primitives::ActivationTraits<TensorType>::ElementType;
         using Traits = primitives::ActivationTraits<TensorType>;
 
-        CPUAttentionT() = default;
-        ~CPUAttentionT() override = default;
+        CpuAttentionKernelT() = default;
+        ~CpuAttentionKernelT() override = default;
 
         /**
          * @brief Check if kernel supports specific device
@@ -115,6 +115,7 @@ namespace llaminar2
             float *scores_ptr = nullptr;
             float *buffer_ptr = nullptr;
             float *context_ptr = nullptr;
+            const float *mask_ptr = nullptr;
 
             if (!workspace_scores)
             {
@@ -152,11 +153,17 @@ namespace llaminar2
                 context_ptr = workspace_context->mutable_data();
             }
 
+            if (workspace_mask)
+            {
+                mask_ptr = workspace_mask->data();
+            }
+
             return compute_typed(
                 Q_typed, K_typed, V_typed, output,
                 seq_len, n_heads, n_kv_heads, head_dim,
                 causal, window_size,
                 scores_ptr, buffer_ptr, context_ptr,
+                mask_ptr,
                 device_idx);
         }
 
@@ -181,32 +188,33 @@ namespace llaminar2
             float *scores,
             float *buffer,
             float *context,
+            const float *mask,
             int device_idx)
         {
             // Validate device
             if (device_idx != -1)
             {
-                LOG_ERROR("[CPUAttentionT] compute: device_idx must be -1 (CPU), got " << device_idx);
+                LOG_ERROR("[CpuAttentionKernelT] compute: device_idx must be -1 (CPU), got " << device_idx);
                 return false;
             }
 
             // Validate inputs
             if (!Q || !K || !V || !output)
             {
-                LOG_ERROR("[CPUAttentionT] compute: null tensor data");
+                LOG_ERROR("[CpuAttentionKernelT] compute: null tensor data");
                 return false;
             }
 
             if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0)
             {
-                LOG_ERROR("[CPUAttentionT] compute: invalid dimensions");
+                LOG_ERROR("[CpuAttentionKernelT] compute: invalid dimensions");
                 return false;
             }
 
             if (n_heads % n_kv_heads != 0)
             {
-                LOG_ERROR("[CPUAttentionT] compute: n_heads (" << n_heads
-                                                               << ") must be divisible by n_kv_heads (" << n_kv_heads << ")");
+                LOG_ERROR("[CpuAttentionKernelT] compute: n_heads (" << n_heads
+                                                                     << ") must be divisible by n_kv_heads (" << n_kv_heads << ")");
                 return false;
             }
 
@@ -329,7 +337,7 @@ namespace llaminar2
             else
             {
                 // Unknown type - should never happen with proper ActivationTraits
-                throw std::runtime_error("Unsupported tensor type for CPUAttentionT");
+                throw std::runtime_error("Unsupported tensor type for CpuAttentionKernelT");
             }
 
             // 2. Broadcast K/V heads if needed (GQA/MQA)
@@ -385,6 +393,16 @@ namespace llaminar2
                     0.0f,    // beta
                     nullptr, // mpi_ctx
                     -1);     // device_idx (CPU)
+            }
+
+            if (mask)
+            {
+#pragma omp parallel for if (n_heads > 1)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *scores_h = scores + h * seq_len * seq_len;
+                    attention_utils::apply_attention_mask(scores_h, mask, seq_len, seq_len);
+                }
             }
 
             // 3. Apply softmax with optional causal masking
@@ -455,11 +473,6 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
-            // Cast inputs to ElementType
-            const ElementType *Q_typed = reinterpret_cast<const ElementType *>(Q);
-            const ElementType *K_typed = reinterpret_cast<const ElementType *>(K);
-            const ElementType *V_typed = reinterpret_cast<const ElementType *>(V);
-
             // Allocate workspaces if not provided
             std::shared_ptr<TensorBase> scores_alloc, buffer_alloc, context_alloc;
             float *scores_ptr = nullptr;
@@ -492,40 +505,66 @@ namespace llaminar2
                 buffer_ptr = workspace_buffer->mutable_data();
             }
 
+            const float *mask_ptr = nullptr;
+            if (workspace_mask)
+            {
+                mask_ptr = workspace_mask->data();
+            }
+
+            // Cast inputs to ElementType FIRST (before any pointer arithmetic)
+            // This is CRITICAL: Q/K/V are void* in disguise, pointing to native ElementType data
+            // For FP32: ElementType=float, no-op cast
+            // For BF16: ElementType=uint16_t, must cast before arithmetic to avoid wrong stride
+            const ElementType *Q_typed = reinterpret_cast<const ElementType *>(Q);
+            const ElementType *K_typed = reinterpret_cast<const ElementType *>(K);
+            const ElementType *V_typed = reinterpret_cast<const ElementType *>(V);
+
             // Loop over batch items
             // Parallelize over batch if batch_size is large enough
             // But compute_typed already parallelizes over heads.
             // For small batch size (e.g. 1-8), sequential loop is fine.
             for (int b = 0; b < batch_size; ++b)
             {
-                // Offsets
-                // Q, K, V: [batch_size, seq_len, n_heads, head_dim] (flattened)
+                // Offsets in ELEMENT units (ElementType, not float!)
+                // Q, K, V: [batch_size, seq_len, n_heads/n_kv_heads, head_dim] (flattened)
                 // Stride per batch: seq_len * n_heads * head_dim
                 size_t q_offset = b * seq_len * n_heads * head_dim;
                 size_t k_offset = b * seq_len * n_kv_heads * head_dim;
                 size_t v_offset = b * seq_len * n_kv_heads * head_dim;
                 size_t out_offset = b * seq_len * n_heads * head_dim;
 
-                // Scores: [batch_size, n_heads, seq_len, seq_len]
+                // Scores: [batch_size, n_heads, seq_len, seq_len] (always float)
                 size_t scores_offset = b * n_heads * seq_len * seq_len;
 
-                // Buffer: [batch_size, 2, seq_len, n_heads, head_dim]
+                // Buffer: [batch_size, 2, seq_len, n_heads, head_dim] (always float)
                 size_t buffer_offset = 0;
                 if (buffer_ptr)
                 {
                     buffer_offset = b * 2 * seq_len * n_heads * head_dim;
                 }
 
+                const float *mask_slice = nullptr;
+                if (mask_ptr)
+                {
+                    mask_slice = mask_ptr + b * seq_len * seq_len;
+                }
+
+                // Pointer arithmetic in ElementType units (already cast above)
+                const ElementType *Q_slice = Q_typed + q_offset;
+                const ElementType *K_slice = K_typed + k_offset;
+                const ElementType *V_slice = V_typed + v_offset;
+
                 bool success = compute_typed(
-                    Q_typed + q_offset,
-                    K_typed + k_offset,
-                    V_typed + v_offset,
+                    Q_slice,
+                    K_slice,
+                    V_slice,
                     output + out_offset,
                     seq_len, n_heads, n_kv_heads, head_dim,
                     causal, window_size,
                     scores_ptr + scores_offset,
                     buffer_ptr ? buffer_ptr + buffer_offset : nullptr,
                     nullptr, // context not used
+                    mask_slice,
                     device_idx);
 
                 if (!success)
@@ -577,10 +616,10 @@ namespace llaminar2
     };
 
     // Explicit instantiations (zero code duplication!)
-    // These are defined in CPUAttentionT.cpp to avoid template bloat
-    extern template class CPUAttentionT<FP32Tensor>;
-    extern template class CPUAttentionT<BF16Tensor>;
-    extern template class CPUAttentionT<FP16Tensor>;
-    extern template class CPUAttentionT<INT32Tensor>;
+    // These are defined in CpuAttentionKernelT.cpp to avoid template bloat
+    extern template class CpuAttentionKernelT<FP32Tensor>;
+    extern template class CpuAttentionKernelT<BF16Tensor>;
+    extern template class CpuAttentionKernelT<FP16Tensor>;
+    extern template class CpuAttentionKernelT<INT32Tensor>;
 
 } // namespace llaminar2

@@ -316,7 +316,7 @@ namespace llaminar2
          * @brief Attention workspace buffers (Phase 4.2 - zero-allocation hot path)
          *
          * Pre-allocated reusable buffers for attention computation.
-         * Eliminates per-call allocations in GQAAttention hot path.
+         * Eliminates per-call allocations in MpiAttentionOrchestrator hot path.
          * Sized for max_seq_len during initializeDeviceInfrastructure().
          */
         std::shared_ptr<TensorBase> attention_workspace_scores_;     // [max_heads * max_seq, max_seq]
@@ -551,7 +551,7 @@ namespace llaminar2
         /**
          * @brief Standard GQA (Grouped Query Attention) orchestration
          *
-         * Convenience wrapper around GQAAttention::compute() for use in pipelines.
+         * Convenience wrapper around MpiAttentionOrchestrator::compute() for use in pipelines.
          *
          * Handles ~95% of production models (Qwen, Llama, Mistral, Gemma, etc.).
          * Pipelines with custom attention (e.g., DeepSeek MLA) override attention_block().
@@ -569,7 +569,7 @@ namespace llaminar2
          * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
          *
-         * @note Delegates to GQAAttention::compute() (see pipelines/attention/GQAAttention.h)
+         * @note Delegates to MpiAttentionOrchestrator::compute() (see pipelines/attention/MpiAttentionOrchestrator.h)
          * @note For MPI parallelization, use attention_gqa_mpi()
          */
         virtual bool attention_gqa(
@@ -581,7 +581,7 @@ namespace llaminar2
         /**
          * @brief Batched grouped-query attention (GQA) with padding support
          *
-         * Convenience wrapper around GQAAttention::compute_batch() for use in pipelines.
+         * Convenience wrapper around MpiAttentionOrchestrator::compute_batch() for use in pipelines.
          *
          * @param Q Query tensor for all batches (flattened)
          * @param K Key tensor for all batches (flattened)
@@ -597,7 +597,7 @@ namespace llaminar2
          * @param window_size Sliding window size
          * @return true on success, false on error
          *
-         * @note Delegates to GQAAttention::compute_batch() (see pipelines/attention/GQAAttention.h)
+         * @note Delegates to MpiAttentionOrchestrator::compute_batch() (see pipelines/attention/MpiAttentionOrchestrator.h)
          */
         virtual bool attention_gqa_batch(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
@@ -611,7 +611,7 @@ namespace llaminar2
         /**
          * @brief MPI-aware attention dispatcher
          *
-         * Convenience wrapper around GQAAttention::compute_mpi() for use in pipelines.
+         * Convenience wrapper around MpiAttentionOrchestrator::compute_mpi() for use in pipelines.
          * Dispatches to appropriate implementation based on MPI strategy.
          *
          * @param Q Query tensor [seq_len, n_heads * head_dim]
@@ -627,7 +627,7 @@ namespace llaminar2
          * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
          *
-         * @note Delegates to GQAAttention::compute_mpi() (see pipelines/attention/GQAAttention.h)
+         * @note Delegates to MpiAttentionOrchestrator::compute_mpi() (see pipelines/attention/MpiAttentionOrchestrator.h)
          */
         bool attention_gqa_mpi(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
@@ -638,7 +638,7 @@ namespace llaminar2
         /**
          * @brief Tensor-parallel attention implementation
          *
-         * Convenience wrapper around GQAAttention::compute_tensor_parallel() for use in pipelines.
+         * Convenience wrapper around MpiAttentionOrchestrator::compute_tensor_parallel() for use in pipelines.
          *
          * @param Q Query tensor [seq_len, n_heads * head_dim]
          * @param K Key tensor [seq_len, n_kv_heads * head_dim]
@@ -653,7 +653,7 @@ namespace llaminar2
          * @param sequence_lengths Actual lengths per sequence for padding mask (nullptr = no padding)
          * @return true on success, false on error
          *
-         * @note Delegates to GQAAttention::compute_tensor_parallel() (see pipelines/attention/GQAAttention.h)
+         * @note Delegates to MpiAttentionOrchestrator::compute_tensor_parallel() (see pipelines/attention/MpiAttentionOrchestrator.h)
          */
         bool attention_gqa_tensor_parallel(
             TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,

@@ -1078,6 +1078,14 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
+        bool from_int32_with_scales(
+            const int32_t *accum,
+            int rows,
+            int cols,
+            const float *row_scales,
+            const float *col_scales,
+            const float *bias = nullptr);
+
         // Format conversion
         void to_fp32(float *dst) const override;
         void to_bf16(uint16_t *dst) const override;
@@ -1166,7 +1174,7 @@ namespace llaminar2
      * - `from_int32_with_scales()`: Populate from raw INT32 accumulator + scale factors
      * - `to_fp32()`: Dequantize to FP32 for final output or parity testing
      */
-    class INT32Tensor : public TensorBase, public IActivationTensor
+    class INT32Tensor : public TensorBase
     {
     public:
         explicit INT32Tensor(const std::vector<size_t> &shape);
@@ -1192,41 +1200,13 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // IActivationTensor interface - activation-only operations (INT32 activations)
-        std::unique_ptr<ITensorRoPE> createRoPE() override;
-        std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
-        std::unique_ptr<ITensorSoftmax> createSoftmax() override;
-        std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
-        std::unique_ptr<ITensorAttention> createAttention() override;
-        ActivationPack to_int8_activation_pack(int rows, int cols) const override;
-
-        bool applyRMSNorm(
-            const float *gamma,
-            int seq_len,
-            int d_model,
-            float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
-
-        bool applyRoPE(
-            float *K,
-            const int *position_ids,
-            int seq_len,
-            int n_heads,
-            int n_kv_heads,
-            int head_dim,
-            float rope_theta = 10000.0f,
-            bool use_bf16 = false,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override;
-
         bool from_int32_with_scales(
             const int32_t *accum,
             int rows,
             int cols,
             const float *row_scales,
             const float *col_scales,
-            const float *bias = nullptr) override;
+            const float *bias = nullptr);
 
         // Format conversion
         void to_fp32(float *dst) const override;
@@ -1573,6 +1553,8 @@ namespace llaminar2
     class Q8_1Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_1Decodable
     {
     public:
+        using value_type = Q8_1Block;
+
         Q8_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
         ~Q8_1Tensor() override;
 

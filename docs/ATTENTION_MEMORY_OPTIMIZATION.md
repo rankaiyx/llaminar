@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-**Problem**: CPUAttentionT uses **720 MB FP32 workspaces** for Qwen 2.5 0.5B @ 512 tokens  
+**Problem**: CpuAttentionKernelT uses **720 MB FP32 workspaces** for Qwen 2.5 0.5B @ 512 tokens  
 **Root Cause**: GEMM kernels always output FP32, requiring FP32 score/weight buffers  
 **User Insight**: Softmax happens **immediately after Q@K^T GEMM** → perfect fusion candidate!
 
@@ -24,7 +24,7 @@
 
 ## Part 1: Current Architecture Analysis
 
-### Execution Flow (CPUAttentionT.h:235-295)
+### Execution Flow (CpuAttentionKernelT.h:235-295)
 
 ```cpp
 // Current implementation (3 separate passes over data):
@@ -186,7 +186,7 @@ for (int i = 0; i < m; ++i) {
 **Cons**: Many small BLAS calls (inefficient)  
 **Verdict**: **Use Option 1** (tile-based) for better BLAS efficiency
 
-### Integration with CPUAttentionT
+### Integration with CpuAttentionKernelT
 
 **Before (current)**:
 ```cpp
@@ -336,9 +336,9 @@ private:
 };
 ```
 
-**Integration into CPUAttentionT**:
+**Integration into CpuAttentionKernelT**:
 ```cpp
-// CPUAttentionT.h - replace separate GEMM + softmax
+// CpuAttentionKernelT.h - replace separate GEMM + softmax
 auto fused = std::make_unique<FusedGemmSoftmax>();
 
 #pragma omp parallel for if (n_heads > 1)
@@ -399,11 +399,11 @@ if (output_dtype == GemmOutputPrecision::BF16) {
 
 ### Phase 3: Integration and Testing
 
-**Updates to CPUAttentionT**:
+**Updates to CpuAttentionKernelT**:
 ```cpp
 template <typename TensorType, 
           GemmOutputPrecision WorkspacePrecision = GemmOutputPrecision::FP32>
-class CPUAttentionT : public ITensorAttention {
+class CpuAttentionKernelT : public ITensorAttention {
     // Workspace allocation based on precision
     std::shared_ptr<TensorBase> allocate_weights_workspace() {
         if constexpr (WorkspacePrecision == GemmOutputPrecision::BF16) {

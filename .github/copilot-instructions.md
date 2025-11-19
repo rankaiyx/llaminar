@@ -1,42 +1,43 @@
-# Llaminar Project Development Guidelines
+# Llaminar V2 Project Development Guidelines
 
-This document provides comprehensive guidelines for working with the Llaminar LLM inference engine, including build processes, debugging techniques, and kernel development best practices learned from our MPI and performance optimization work.
+This document provides practical guidelines for working with the **Llaminar V2** LLM inference engine, including build processes, testing, debugging, and kernel / MPI / attention development best practices.
 
-**⚠️ Architecture Note**: Llaminar has two parallel architectures:
-- **V1 (Production)**: `src/` - Operator-based MPI distributed inference (fully functional)
-- **V2 (Development)**: `src/v2/` - Operator-free kernel-centric design (in development)
+**Architecture Note (V2)**: The active architecture for all new development is **Llaminar V2** in `src/v2/`, an operator-free, kernel-centric design.
 
-Most sections in this document apply to **V1**. For V2-specific guidance, see `.github/instructions/llaminar-v2-architecture.instructions.md`.
+- For a **high-level architecture map** of tensors, kernels, attention, MPI orchestration, and pipelines, see:
+    - `.github/instructions/llaminar-architecture-v2.instructions.md`
+- For additional V2-specific implementation details and historical notes, see:
+    - `.github/instructions/llaminar-v2-architecture.instructions.md`
 
 ## Table of Contents
-- [Architecture Overview (V1 vs V2)](#architecture-overview-v1-vs-v2)
-- [Project Overview (V1)](#project-overview-v1)
+- [Architecture Overview](#architecture-overview)
 - [Build System](#build-system)
-- [Testing Guidelines (V1)](#testing-guidelines-v1)
+- [Testing Guidelines (V2)](#testing-guidelines-v2)
 - [CTest Label Best Practices](#ctest-label-best-practices)
 - [Debugging with GDB](#debugging-with-gdb)
-- [Kernel Development (V1)](#kernel-development-v1)
 - [Kernel Development (V2)](#kernel-development-v2)
 - [MPI Development Best Practices](#mpi-development-best-practices)
 - [Performance Optimization](#performance-optimization)
-- [COSMA vs OpenBLAS Integration (V1)](#cosma-vs-openblas-integration-v1)
 - [Code Quality Guidelines](#code-quality-guidelines)
 - [Documentation Standards](#documentation-standards)
 
-## Architecture Overview 
+## Architecture Overview
 
-### V2 Architecture (Development - `src/v2/`)
+### V2 Architecture (`src/v2/`)
 
-**Design Philosophy**: Operator-free Tensor-centric design
+**Design Philosophy**: Operator-free, tensor-centric, kernel-oriented design.
 
 **Key Characteristics**:
-- 🔄 **In Development**: Basic pipeline structure, not feature-complete
-- 🎯 **No Operator Layer**: Pipelines call kernels directly
-- 🎯 **Per-Tensor Device Affinity**: Each tensor knows its device placement
-- 🎯 **Heterogeneous Execution**: Mix CPU, CUDA, ROCm in single run
-- 🎯 **IActivationTensor / ITensorKernel Pattern**: Kernel ops are focused around the IActivationTensors which will accept computation results (GEMM, SwiGLU, RoPE, etc). Activation tensors instantiate kernels via ITensorKernel and take the weights or other activation tensors as arguments, and the kernels mutate the IActivationTensor buffer in-place.
+- 🎯 **No Operator Layer**: Pipelines orchestrate kernels directly (no `MPILinearOperator`, etc.).
+- 🎯 **Per-Tensor Device Affinity**: Each tensor knows its device placement and how to create appropriate kernels.
+- 🎯 **Heterogeneous Execution**: Designed to mix CPU, CUDA, ROCm, etc. within a single run via device backends.
+- 🎯 **IActivationTensor / ITensor* Pattern**: Activation tensors expose narrow interfaces (`ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.) and kernels mutate activation buffers in-place.
 
-**See Also**: `.github/instructions/llaminar-v2-architecture.instructions.md` for comprehensive V2 documentation.
+The high-level flow is:
+
+> **Pipeline** → chooses **devices** → allocates **tensors** → tensors create **kernels** via `ITensor*` interfaces → kernels operate on local buffers. Any MPI/multi-rank work is coordinated by small **orchestrators**, not kernels.
+
+See `.github/instructions/llaminar-architecture-v2.instructions.md` for a full-stack walkthrough.
 
 ---
 
@@ -58,8 +59,8 @@ cmake --build build_v2_release --parallel
 ```
 
 **V2 Build Targets**:
-- `llaminar2_core`: Core V2 library
-- `llaminar2`: V2 executable (minimal functionality)
+- `llaminar2_core`: Core V2 library (linked by tests and tools)
+- `llaminar2`: V2 executable (minimal functionality / device listing)
 
 ## Canonical Runtime Configuration
 
@@ -217,12 +218,10 @@ export LLAMINAR_LOG_LEVEL=DEBUG
 mpirun -np 2 --bind-to socket --map-by socket \
   --mca mpi_leave_pinned 1 \
   --mca btl_vader_single_copy_mechanism none \
-  --report-bindings ./build/llaminar
+  --report-bindings ./build_v2/src/v2/llaminar2
 ```
 
-## Testing Guidelines (V1)
-
-**Note**: This section describes V1 testing infrastructure. V2 testing infrastructure is documented separately below.
+## Testing Guidelines (V2)
 
 ### V2 Testing Conventions
 
@@ -251,7 +250,7 @@ Llaminar V2 has a comprehensive test suite organized into several categories:
 - **Pytorch Parity - Python project sources**: See `python/reference/` in the workspace.
 - **Comprehensive documentation**: See `docs/v2/SNAPSHOT_FRAMEWORK_DESIGN.md`
 
-### Running Tests
+### Running Tests (V2)
 
 ```bash
 # All tests
@@ -541,7 +540,7 @@ export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_i
 export LLAMINAR_LOG_LEVEL=DEBUG
 
 # Capture separate log per MPI rank
-timeout 120 bash -c 'mpirun -np 2 bash -c "gdb -x /tmp/gdbcommands.txt --args ./build/my_test 2>&1 | tee /tmp/gdb_rank_\$OMPI_COMM_WORLD_RANK.log"'
+timeout 120 bash -c 'mpirun -np 2 bash -c "gdb -x /tmp/gdbcommands.txt --args ./build_v2/tests/v2/v2_test_my_feature 2>&1 | tee /tmp/gdb_rank_\$OMPI_COMM_WORLD_RANK.log"'
 
 # Then examine rank-specific backtraces
 grep -A 50 "Program received signal" /tmp/gdb_rank_0.log
@@ -555,7 +554,7 @@ Use ASAN for localizing more complex double-free style issues:
 ```bash
 cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-g3 -O0 -fno-omit-frame-pointer -fsanitize=address" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 
 
-ASAN_OPTIONS=halt_on_error=0:detect_leaks=0 timeout 240 mpirun -np 2 ./build/<your_test> --gtest_filter=<your_test_filter>
+ASAN_OPTIONS=halt_on_error=0:detect_leaks=0 timeout 240 mpirun -np 2 ./build_v2/tests/v2/<your_test> --gtest_filter=<your_test_filter>
 ```
 
 Just don't forget to reconfigure cmake to disable ASAN when you're done debugging!
@@ -569,7 +568,7 @@ export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_TH
 export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
 export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
 export LLAMINAR_LOG_LEVEL=DEBUG
-mpirun -np 2 valgrind --tool=memcheck --leak-check=full ./build/llaminar
+mpirun -np 2 valgrind --tool=memcheck --leak-check=full ./build_v2/tests/v2/v2_test_my_feature
 
 # NUMA binding issues
 numactl --hardware
@@ -579,7 +578,7 @@ export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_TH
 export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
 export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
 export LLAMINAR_LOG_LEVEL=DEBUG
-mpirun -np 2 numactl --cpubind=0 ./build/llaminar : numactl --cpubind=1 ./build/llaminar
+mpirun -np 2 numactl --cpubind=0 ./build_v2_release/src/v2/llaminar2 : numactl --cpubind=1 ./build_v2_release/src/v2/llaminar2
 
 # COSMA hanging issues (use timeouts)
 export OMP_NUM_THREADS=28 OMP_PLACES=sockets OMP_PROC_BIND=close OMP_NESTED=false OMP_DYNAMIC=false 
@@ -587,97 +586,12 @@ export KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=0 OPENBLAS_NUM_TH
 export GOTO_NUM_THREADS=28 MKL_NUM_THREADS=28 MKL_DYNAMIC=false OMPI_MCA_mpi_leave_pinned=1
 export OMPI_MCA_btl_vader_single_copy_mechanism=none OMPI_MCA_btl_openib_allow_ib=1
 export LLAMINAR_LOG_LEVEL=DEBUG
-timeout 60 mpirun -np 2 ./build/llaminar
-```
-
-## Kernel Development (V1)
-
-**Note**: This section describes V1 operator-based kernel development. For V2's operator-free approach, see [Kernel Development (V2)](#kernel-development-v2).
-
-### Kernel Base Classes
-
-All V1 kernels should inherit from appropriate base classes:
-```cpp
-// For MPI-aware kernels
-class MyKernel : public MPIKernelBase {
-public:
-    bool execute(const std::vector<std::shared_ptr<TensorBase>>& inputs,
-                std::vector<std::shared_ptr<TensorBase>>& outputs) override;
-};
-
-// For simple kernels
-// Historical example (pre-MPI refactor). All production kernels now derive from MPIKernelBase.
-class SimpleKernel : public KernelBase {
-    // Similar interface without MPI context
-};
-```
-
-### Tensor Integration
-
-Use the hybrid tensor system appropriately:
-```cpp
-// Automatic tensor selection based on size and MPI context
-auto tensor = TensorFactory::create_auto({1024, 1024});
-
-// Explicit tensor types
-auto simple = TensorFactory::create_simple({512, 512});
-auto cosma = TensorFactory::create_cosma({2048, 2048}, "operation_name", mpi_rank);
-
-// Legacy compatibility
-std::shared_ptr<Tensor> legacy = std::make_shared<Tensor>({256, 256});
-auto upgraded = TensorFactory::from_tensor(legacy);
-```
-
-**NUMA Considerations:**
-- SimpleTensor automatically applies NUMA first-touch for allocations ≥128KB
-- No code changes needed - optimization is transparent
-- Controlled via `LLAMINAR_NUMA_FIRST_TOUCH` environment variable
-- Most beneficial for:
-  - K/V cache tensors (96MB-4GB)
-  - Large activation buffers
-  - Intermediate computation results
-
-**When Adding New Tensor Allocations:**
-1. Use SimpleTensor for standard row-major tensors
-2. First-touch happens automatically if size ≥128KB
-3. Verify with `LLAMINAR_NUMA_VERIFY_LOCALITY=1` during testing
-4. For custom allocations, follow SimpleTensor::numaFirstTouch pattern
-
-### Error Handling Patterns
-
-```cpp
-bool MyKernel::execute(const std::vector<std::shared_ptr<TensorBase>>& inputs,
-                      std::vector<std::shared_ptr<TensorBase>>& outputs) {
-    try {
-        // Validate inputs
-        if (inputs.size() != expected_input_count) {
-            LOG_ERROR("Invalid input count: " << inputs.size());
-            return false;
-        }
-        
-        // Check tensor dimensions
-        const auto& input_shape = inputs[0]->shape();
-        if (input_shape.size() != 2) {
-            LOG_ERROR("Expected 2D tensor, got " << input_shape.size() << "D");
-            return false;
-        }
-        
-        // Perform computation
-        // ... implementation ...
-        
-        LOG_DEBUG("Kernel execution successful");
-        return true;
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR("Kernel execution failed: " << e.what());
-        return false;
-    }
-}
+timeout 60 mpirun -np 2 ./build_v2_release/src/v2/llaminar2
 ```
 
 ## Kernel Development (V2)
 
-**Purpose**: V2 kernel development follows the **operator-free design** with direct pipeline orchestration and the **IBlockDecoder strategy pattern** for quantized tensors.
+**Purpose**: V2 kernel development follows the **operator-free design** with direct pipeline orchestration and the **ITensorGemmTileDataProvider strategy pattern** for quantized tensors.
 
 ### Core V2 Principles
 
@@ -686,28 +600,28 @@ bool MyKernel::execute(const std::vector<std::shared_ptr<TensorBase>>& inputs,
 3. **Strategy Pattern**: Generic kernels + format-specific decode strategies
 4. **ITensor Interfaces**: `ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.
 
-### IBlockDecoder Strategy Pattern
+### ITensorGemmTileDataProvider Strategy Pattern
 
 **Problem**: Quantized tensors (IQ4_NL, Q6_K, Q8_0) need format-specific decode logic, but we want a **single generic GEMM kernel**.
 
-**Solution**: IBlockDecoder interface + QuantizedGemmKernel
+**Solution**: ITensorGemmTileDataProvider interface + QuantizedGemmKernel
 
 ```cpp
 // src/v2/tensors/TensorKernels.h
-class IBlockDecoder {
+class ITensorGemmTileDataProvider {
 public:
     __attribute__((always_inline))
     virtual void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const = 0;
     
-    __attribute__((always_inline))
     virtual const void* get_raw_block_at(size_t row_idx, size_t k_block_offset) const = 0;
     
-    __attribute__((always_inline))
+    virtual size_t decoder_rows() const = 0;
+    virtual size_t decoder_cols() const = 0;
     virtual size_t block_size() const = 0;
 };
 
 // src/v2/tensors/Tensors.h
-class IQ4_NLTensor : public TensorBase, public IBlockDecoder {
+class IQ4_NLTensor : public TensorBase, public ITensorGemmTileDataProvider {
     // Inline implementation for zero overhead
     void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const override {
         const IQ4_NLBlock& block = blocks_[row_idx * blocks_per_row_ + k_block_offset];
@@ -715,15 +629,17 @@ class IQ4_NLTensor : public TensorBase, public IBlockDecoder {
     }
     
     size_t block_size() const override { return 32; }  // IQ4_NL: 32 elements/block
+    size_t decoder_rows() const override { return rows_; }
+    size_t decoder_cols() const override { return cols_; }
     
-    std::unique_ptr<ITensorGemm> createGemm() const override {
-        return std::make_unique<QuantizedGemmKernel>(this);  // Generic kernel
+    std::unique_ptr<ITensorGemm> createGemm(const MPIContext& mpi_ctx, int device_idx) const override {
+        return std::make_unique<QuantizedGemmKernel>(this, mpi_ctx, device_idx);
     }
 };
 
 // src/v2/kernels/cpu/QuantizedGemm.h
 class QuantizedGemmKernel : public ITensorGemm {
-    const IBlockDecoder* decoder_;  // Strategy interface
+    const ITensorGemmTileDataProvider* decoder_;  // Strategy interface
     
     bool multiply(...) override {
         // Generic implementation works for all quantized formats
@@ -736,13 +652,13 @@ class QuantizedGemmKernel : public ITensorGemm {
 **Benefits**:
 - ✅ **Code Reuse**: ~350 lines generic kernel vs ~1000 lines per format
 - ✅ **Zero Overhead**: `always_inline` eliminates virtual dispatch
-- ✅ **Extensibility**: New formats just implement IBlockDecoder
+- ✅ **Extensibility**: New formats just implement ITensorGemmTileDataProvider
 
 ### Adding New Quantized Formats (V2)
 
 ```cpp
-// tensors/Q6_KTensor.h
-class Q6_KTensor : public TensorBase, public IBlockDecoder {
+// src/v2/tensors/Q6_KTensor.h
+class Q6_KTensor : public TensorBase, public ITensorGemmTileDataProvider {
 public:
     void decode_block_at(size_t row_idx, size_t k_block_offset, float* output) const override {
         const Q6_KBlock& block = blocks_[row_idx * blocks_per_row_ + k_block_offset];
@@ -750,9 +666,11 @@ public:
     }
     
     size_t block_size() const override { return 256; }  // Q6_K: 256 elements/block
+    size_t decoder_rows() const override { return rows_; }
+    size_t decoder_cols() const override { return cols_; }
     
-    std::unique_ptr<ITensorGemm> createGemm() const override {
-        return std::make_unique<QuantizedGemmKernel>(this);  // Reuse generic kernel!
+    std::unique_ptr<ITensorGemm> createGemm(const MPIContext& mpi_ctx, int device_idx) const override {
+        return std::make_unique<QuantizedGemmKernel>(this, mpi_ctx, device_idx);  // Reuse generic kernel!
     }
     
 private:
@@ -764,43 +682,74 @@ private:
 
 ### V2 Kernel Interface Design
 
-All V2 kernels implement ITensor* interfaces:
+All V2 kernels implement ITensor* interfaces and receive MPIContext + device_idx:
 
 ```cpp
 // src/v2/tensors/TensorKernels.h
 class ITensorGemm {
 public:
-    virtual bool multiply(const float* A, float* C, int m, int n, int k, ...) = 0;
+    virtual ~ITensorGemm() = default;
+    virtual bool multiply(
+        const float* A,        // Activation matrix (m × k)
+        float* C,              // Output matrix (m × n)
+        int m, int n, int k,
+        float alpha = 1.0f, float beta = 0.0f
+    ) = 0;
 };
 
 class ITensorAttention {
 public:
-    virtual bool execute(const TensorBase* Q, const TensorBase* K, 
-                        const TensorBase* V, TensorBase* output, ...) = 0;
+    virtual ~ITensorAttention() = default;
+    virtual bool compute(
+        TensorBase* Q, TensorBase* K, TensorBase* V,
+        TensorBase* output,
+        const AttentionWorkspace& workspace,
+        const AttentionConfig& config
+    ) = 0;
 };
 
 class ITensorRoPE {
 public:
-    virtual bool execute(TensorBase* tensor, const RoPEParams& params) = 0;
+    virtual ~ITensorRoPE() = default;
+    virtual bool apply(
+        TensorBase* tensor,
+        int seq_len, int head_dim,
+        int pos_offset, float theta_base
+    ) = 0;
 };
 ```
 
-**Key Difference from V1**: No MPI context in kernel interfaces (handled by pipeline)
+**Design Principles**:
+- Kernels receive `MPIContext` and `device_idx` at construction (from tensor factory methods)
+- No global state - all context passed explicitly
+- Activation tensors implement `IActivationTensor` with `createGemm()`, `createAttention()`, `createRoPE()` factory methods
 
 ### V2 Pipeline Orchestration
 
 ```cpp
-// src/v2/pipelines/QwenPipeline.cpp
-bool QwenPipeline::attention_block(int layer, TensorBase* in, TensorBase* out) {
-    // Direct kernel calls (no operators!)
-    auto device = device_mgr_.selectDevice(in->size_bytes(), OperationType::ATTENTION);
-    auto gemm = device->getGemmKernel();
-    auto rope = device->getRoPEKernel();
+// src/v2/pipelines/qwen/Qwen2Pipeline.cpp
+bool Qwen2Pipeline::attention_block(const LayerWeights& layer, int layer_idx, int effective_seq_len) {
+    // Determine execution device based on weight placement
+    int attn_device = placement_map_ ? getWeightDevice("attn_q", -1) : device_idx_;
     
-    auto Q = allocateTensor({seq_len, d_model});
-    gemm->execute(in, weights_.wq[layer], Q.get(), {});  // Q projection
+    // Get device-appropriate buffers (pre-allocated, no hot-path allocation!)
+    auto& buffers = placement_map_ ? getBuffersForDevice(attn_device) : activation_buffers_;
     
-    rope->execute(Q.get(), {.seq_offset = 0, .theta_base = 10000.0f});
+    // Pre-attention RMSNorm via IActivationTensor interface
+    auto* activation_tensor = dynamic_cast<IActivationTensor*>(buffers.normalized.get());
+    VALIDATE_OP(activation_tensor->applyRMSNorm(
+        layer.attn_norm->data(), effective_seq_len, d_model_, rms_norm_eps_
+    ));
+    
+    // Attention computation via MpiAttentionOrchestrator → GQAAttention → ITensorAttention
+    VALIDATE_OP(mpi_attention_orchestrator_->compute(
+        buffers.normalized.get(),  // Input
+        layer.wq.get(), layer.wk.get(), layer.wv.get(), layer.wo.get(),  // Weights
+        kv_cache_.get(), layer_idx, effective_seq_len,
+        buffers.attn_output.get()  // Output
+    ));
+    
+    // Residual connection (using pre-allocated buffers)
     // ... etc
 }
 ```
@@ -855,29 +804,29 @@ MPI_Allreduce(local_result, global_result, work_size, MPI_FLOAT, MPI_SUM, MPI_CO
 
 **Critical Rule**: All allocations ≥128KB on hot paths (K/V cache, activations, weights) MUST use NUMA first-touch initialization.
 
-**SimpleTensor Pattern** (src/tensors/SimpleTensor.h):
+**V2 Activation Buffer Pattern** (src/v2/pipelines/qwen/Qwen2Pipeline.cpp):
 ```cpp
-void resize(const std::vector<size_t>& new_shape) {
-    size_t new_size = 1;
-    for (auto dim : new_shape) new_size *= dim;
+// Pre-allocate buffers once during pipeline initialization
+void Qwen2Pipeline::allocate_activation_buffers(int max_seq_len, int device_idx) {
+    auto& buffers = activation_buffers_;
+    buffers.max_seq_len = max_seq_len;
     
-    data_.resize(new_size);
-    shape_ = new_shape;
+    // Allocate with device affinity
+    buffers.residual = TensorFactory::create_fp32(
+        {static_cast<size_t>(max_seq_len), d_model_}, device_idx
+    );
+    buffers.normalized = TensorFactory::create_fp32(
+        {static_cast<size_t>(max_seq_len), d_model_}, device_idx
+    );
+    // ... etc
     
-    // NUMA first-touch for large tensors
-    if (debugEnv().loader.numa_first_touch) {
-        numaFirstTouch(data_.data(), new_size);
-    }
-}
-
-static void numaFirstTouch(float* data, size_t count) {
-    constexpr size_t THRESHOLD = 128 * 1024 / sizeof(float);  // 128KB
-    if (count < THRESHOLD) return;
-    
+    // NUMA first-touch initialization (OpenMP parallel init)
+    // Each thread touches its portion → local NUMA placement
     #pragma omp parallel for
-    for (size_t i = 0; i < count; ++i) {
-        data[i] = 0.0f;
+    for (size_t i = 0; i < buffers.residual->numel(); ++i) {
+        buffers.residual->mutable_data()[i] = 0.0f;
     }
+    // ... repeat for all buffers
 }
 ```
 
@@ -890,7 +839,7 @@ static void numaFirstTouch(float* data, size_t count) {
 **Configuration:**
 - Control: `debugEnv().loader.numa_first_touch` (default: true)
 - Verification: `debugEnv().loader.numa_verify_locality` (diagnostic logging)
-- Threshold: 128KB (consistent across ModelLoader and SimpleTensor)
+- Threshold: 128KB (V2 tensor allocations)
 
 **Performance Impact:**
 - Small models (≤1B): +1-3%
@@ -986,17 +935,27 @@ try {
 ### Testing New Features
 
 ```cpp
-// Always add corresponding tests
-TEST_CASE("MyNewKernel basic functionality") {
-    auto kernel = std::make_unique<MyNewKernel>();
-    auto input = TensorFactory::create_simple({32, 32});
-    auto output = TensorFactory::create_simple({32, 32});
+// Always add corresponding tests (V2 uses GTest)
+// File: tests/v2/unit/Test__MyNewKernel.cpp
+TEST(Test__MyNewKernel, BasicFunctionality) {
+    MPIContext mpi_ctx(0);  // Rank 0
+    int device_idx = 0;     // CPU device
     
-    std::vector<std::shared_ptr<TensorBase>> inputs = {input};
-    std::vector<std::shared_ptr<TensorBase>> outputs = {output};
+    // Create tensors via factory
+    auto input = TensorFactory::create_fp32({32, 32}, device_idx);
+    auto output = TensorFactory::create_fp32({32, 32}, device_idx);
     
-    REQUIRE(kernel->execute(inputs, outputs));
-    // Validate outputs...
+    // Create kernel via tensor interface
+    auto* activation = dynamic_cast<IActivationTensor*>(input.get());
+    ASSERT_NE(activation, nullptr);
+    auto kernel = activation->createMyKernel(mpi_ctx, device_idx);
+    
+    // Execute and validate
+    ASSERT_TRUE(kernel->execute(output.get(), /* ... */));
+    
+    // Validate outputs
+    const float* out_data = output->data();
+    EXPECT_NEAR(out_data[0], expected_value, 1e-5f);
 }
 ```
 
@@ -1004,8 +963,8 @@ TEST_CASE("MyNewKernel basic functionality") {
 
 All new or refactored code on hot paths (kernels, matmul selection, attention assembly, tensor partition loops) MUST avoid direct `std::getenv` calls. Instead:
 
-1. Add any new environment flag/knob to the structured snapshot in `src/utils/DebugEnv.h` inside the appropriate group (or create one).
-2. Parse it once in `src/utils/DebugEnv.cpp` (lazy static initialization already provided) and expose typed fields.
+1. Add any new environment flag/knob to the structured snapshot in `src/v2/utils/DebugEnv.h` inside the appropriate group (or create one).
+2. Parse it once in `src/v2/utils/DebugEnv.cpp` (lazy static initialization already provided) and expose typed fields.
 3. Consume via `const auto &snap = debugEnv();` then reference `snap.<group>.<field>`.
 
 Rationale:
@@ -1028,7 +987,7 @@ const auto &env = debugEnv();
 if (env.attention.micro_trace && rank == 0) { ... }
 ```
 
-Do NOT add another ad-hoc snapshot facility; extend the existing one. If grouping is unclear, prefer adding a new subgroup struct within `src/utils/DebugEnv.h` rather than mixing unrelated flags.
+Do NOT add another ad-hoc snapshot facility; extend the existing one. If grouping is unclear, prefer adding a new subgroup struct within `src/v2/utils/DebugEnv.h` rather than mixing unrelated flags.
 
 
 ## Documentation Standards
@@ -1039,76 +998,15 @@ All files and functions should be documented with the Doxygen format for readabi
 
 ## Debug / Instrumentation Environment Variables
 
-Use these to control verbosity, backend selection, and validation when working on kernels and distributed execution:
+Llaminar uses a "DebugEnv" singleton that loads all environment variables at startup and exposes them to classes at runtime. This avoids heavy getEnv() calls.
+
+For a full list of environment variables available, check 
 
 | Variable | Description | Default / Activation | Primary Scope |
 |----------|-------------|----------------------|---------------|
 | `LLAMINAR_DEQUANT_STATS` | Logs per-tensor dequant stats (min/max/mean/sample). | Disabled unless set to non-zero. | Quantized tensor loading |
-| `LLAMINAR_DEQUANT_ANOMALIES` | Emits warnings for anomalous Q6_K (and future) values (NaN/Inf/huge). | Disabled unless set. | Dequant safety diagnostics |
-| `LLAMINAR_QUANT_OUTPUT_BF16` | Enable BF16 activation storage (Phase 5). | 0 (off) | Activation memory optimization |
-| `LLAMINAR_FORCE_FP32_RMSNORM` | Force FP32 for RMSNorm (safety-first). | 1 (on, force FP32) | Numerical stability |
-| `LLAMINAR_ALLOW_BF16_RMSNORM` | Allow BF16 RMSNorm (experimental). | 0 (off) | Numerical stability |
-| `LLAMINAR_FORCE_FP32_SOFTMAX` | Force FP32 for Softmax. | 1 (on, force FP32) | Numerical stability |
-| `LLAMINAR_ALLOW_BF16_SOFTMAX` | Allow BF16 Softmax (experimental). | 0 (off) | Numerical stability |
-| `LLAMINAR_FORCE_FP32_LOGITS` | Force FP32 for logits output. | 1 (on, force FP32) | Output precision |
-| `LLAMINAR_COSMA_PREFILL_THRESHOLD` | Sequence length threshold to switch to COSMA prefill path. | 4096 | Prefill path gating |
-| `ADAPTIVE_DISABLE_COSMA` | Force all operations down OpenBLAS/adaptive local path. | Unset (COSMA enabled when threshold met) | Backend selection override |
-| `LLAMINAR_COSMA_MAX_RESIDENT_MB` | Soft memory budget for COSMA working set; fallback if exceeded. | 2048 | Memory safety / preflight |
-| `LLAMINAR_COSMA_VALIDATE_TILE` | If >0, performs small tile OpenBLAS vs COSMA correctness spot-check (relative L2). | 0 (off) | Debug validation |
-| `LLAMINAR_COSMA_LOG_LEVEL` | Verbosity for COSMA prefill instrumentation (`trace`..`error`). | info | Prefill diagnostics |
 | `OMP_NUM_THREADS` / `OMP_PLACES` / `OMP_PROC_BIND` | Governs OpenMP thread placement & counts (run script sets). | Auto-set by `run_llaminar.sh` | Threading performance |
-| `KMP_AFFINITY` / `KMP_BLOCKTIME` | Fine tuning for Intel OpenMP runtime responsiveness. | Script default | Latency tuning |
 
-### Usage Patterns
-
-```bash
-# Rich dequant + anomaly diagnostics
-export LLAMINAR_DEQUANT_STATS=1
-export LLAMINAR_DEQUANT_ANOMALIES=1
-
-# Enable BF16 activation storage (Phase 5)
-export LLAMINAR_QUANT_OUTPUT_BF16=1
-export LLAMINAR_FORCE_FP32_RMSNORM=0     # Must explicitly disable force flag
-export LLAMINAR_ALLOW_BF16_RMSNORM=1     # Then enable BF16 support
-
-# NOTE: FORCE_FP32 and ALLOW_BF16 flags are INDEPENDENT (not mutually exclusive)
-# To enable BF16 for an operation, you must:
-#   1. Set ALLOW_BF16_<operation>=1
-#   2. Set FORCE_FP32_<operation>=0
-# Both conditions must be true for BF16 to be used.
-
-# Force baseline path (skip COSMA) for A/B perf comparison
-export ADAPTIVE_DISABLE_COSMA=1
-
-# Lower threshold to test COSMA with shorter prompts
-export LLAMINAR_COSMA_PREFILL_THRESHOLD=1024
-```
-
-Keep heavy validation (stats, validate tiles) off for performance benchmarks.
-
-
-```cpp
-/**
- * @brief Performs distributed matrix multiplication with adaptive backend selection
- * 
- * @param A Input matrix A (m×k)
- * @param B Input matrix B (k×n)  
- * @param C Output matrix C (m×n)
- * @param m Number of rows in A and C
- * @param n Number of columns in B and C
- * @param k Number of columns in A and rows in B
- * @param is_prefill Whether this is a prefill operation (affects backend selection)
- * 
- * @return true if operation succeeded, false otherwise
- * 
- * @note This function automatically selects between OpenBLAS and COSMA based on
- *       operation size and MPI context. Small operations use single-threaded OpenBLAS,
- *       medium operations use multi-threaded OpenBLAS, and large prefill operations
- *       may use distributed computation.
- */
-bool adaptiveMatMul(const float* A, const float* B, float* C,
-                   int m, int n, int k, bool is_prefill = false);
-```
 
 ## Common Pitfalls and Solutions
 
@@ -1144,92 +1042,24 @@ This project emphasizes production reliability over peak theoretical performance
 
 When in doubt, prioritize correctness and reliability over raw performance.
 
-## Extended COSMA Execution & Test Debug Controls (Addendum)
-
-This addendum documents additional environment toggles and watchdog policies added after the primary guidelines were authored. They refine control over distributed GEMM path selection, correctness validation, and hang mitigation.
-
-### Path Selection & Forcing
-| Variable | Purpose | Default / Activation | Notes |
-|----------|---------|----------------------|-------|
-| `LLAMINAR_COSMA_FORCE_DIRECT` | Force direct COSMA distributed multiply path, bypassing fast/replicated heuristic. | Unset (0) | Use to stress-test COSMA on marginal sizes. |
-| `LLAMINAR_COSMA_DIRECT_THRESHOLD_OPS` | Volume (m*n*k) threshold for auto-direct path when not forced. | Internal tuned default | Adjust only during tuning experiments. |
-| `LLAMINAR_COSMA_FAST_PATH_THRESHOLD` | Volume below which replicated OpenBLAS + broadcast fast path is used. | Internal constant | Keeps tiny ops off COSMA. |
-| `LLAMINAR_COSMA_FORCE_REPLICATED` | Force always replicated execution even when large. | Unset | Isolate COSMA issues by comparison. |
-| `LLAMINAR_COSMA_FORCE_REPLICATED_DIAG` | Replicated path + extra diagnostics. | Unset | Superset of FORCE_REPLICATED. |
-| `ADAPTIVE_DISABLE_COSMA` | Disable COSMA entirely (already documented). | Unset | Highest precedence bypass. |
-| `LLAMINAR_COSMA_FORCE_DISTRIBUTED_ACT` | Force COSMA activation allocation even when fast path would skip. | Unset | Useful for tests needing distributed elementwise views. |
-
-### Correctness / Validation
-| Variable | Purpose | Notes |
-|----------|---------|-------|
-| `LLAMINAR_COSMA_COMPARE_REPLICATED` | Execute a full replicated OpenBLAS reference after direct COSMA and compare rel L2 + max abs. | High cost; not for perf runs. |
-| `LLAMINAR_COSMA_VALIDATE_TILE` | Small tile OpenBLAS check (existing). | Prefer before full replicate compare. |
-| `LLAMINAR_COSMA_FAST_UNVERIFIED` | Skip validations for fast path ops. | Use to reduce overhead with confidence. |
-| `LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE` | Attempt automatic orientation correction if mismatch detected. | Logs a warning when used. |
-| `LLAMINAR_COSMA_DEBUG_RECON` | Verbose gather / ownership normalization logs. | Aids debugging reconstruction anomalies. |
-
-### Allocation / Memory Safety
-| Variable | Purpose | Notes |
-|----------|---------|-------|
-| `LLAMINAR_COSMA_MAX_RESIDENT_MB` | Single-allocation soft guard (existing). | Now also interacts with small-op allocation skip. |
-
-### Structural / Small Matrix Diagnostics
-| Variable | Purpose | Notes |
-|----------|---------|-------|
-| `LLAMINAR_COSMA_DUMP_SMALL` | Dump structural info for small fast-path matrices. | Per-rank concise summary. |
-
-### Dequant & Fused Path Controls (Recap)
-| Variable | Purpose | Notes |
-|----------|---------|-------|
-| `LLAMINAR_COSMA_DISABLE_FUSED_DEQUANT` | Disable fused quantized weight dequant+population. | Debug fallback. |
-
-### Test Watchdog & Timeout Policy
-All COSMA-associated tests have an external 60s CTest timeout. Internally, watchdog threads enforce earlier detection:
-
-| Variable | Purpose | Behavior |
-|----------|---------|----------|
-| `LLAMINAR_COSMA_TEST_PHASE_TIMEOUT_MS` | Per-phase soft limit (stream, matmul, recon). | Warns / stack capture if exceeded (hard cap). |
-| `LLAMINAR_COSMA_TEST_INTERNAL_TIMEOUT_MS` | Global internal watchdog for the whole test. | Aborts with per-rank stack dump. |
-| `LLAMINAR_SKIP_MPI_IN_SINGLE_TEST` | Avoid multi-rank collectives in single-rank mode. | Bypasses MPI collectives safely. |
-| `LLAMINAR_COSMA_TEST_TRACE` | Escalate verbosity for COSMA tests to trace. | Any non-empty value. |
-
-### Recommended Debug Flows
-1. Fast path validation: `LLAMINAR_COSMA_VALIDATE_TILE=64` + multi-rank small test.
-2. Direct path correctness: `LLAMINAR_COSMA_FORCE_DIRECT=1 LLAMINAR_COSMA_COMPARE_REPLICATED=1`.
-3. Reconstruction tracing: `LLAMINAR_COSMA_DEBUG_RECON=1 LLAMINAR_COSMA_TEST_TRACE=1`.
-4. Orientation suspicion: enable `LLAMINAR_COSMA_AUTO_FIX_TRANSPOSE` plus replicated compare for before/after diff.
-
-Disable heavy validation & trace logging prior to performance measurement to ensure representative timing.
-
 ## Documentation and Project Resources
 
 ### Key Documentation Files
 
 **Developer Guidelines:**
-- **`.github/copilot-instructions.md`** (this file): Comprehensive development guidelines for V1 and V2
-- **`.github/instructions/llaminar-v2-architecture.instructions.md`**: Complete V2 architecture documentation
-- **`.github/instructions/parity-test-framework.instructions.md`**: V1 parity testing guide
+- **`.github/copilot-instructions.md`** (this file): Comprehensive V2 development guidelines
+- **`.github/instructions/llaminar-architecture-v2.instructions.md`**: High-level V2 architecture map
+- **`.github/instructions/llaminar-v2-architecture.instructions.md`**: Detailed V2 implementation notes
 
-**Performance and Benchmarking:**
-- `./run_llaminar.sh`: Canonical V1 launcher with optimal MPI/OpenMP settings (RELEASE mode: `build_release/`)
-- `./run_llaminar_debug.sh`: V1 debug version of the above launcher (DEBUG mode: `build/`)
-- `./run_batch_performance.sh`: V1 batch vs sequential performance comparison
-- `./run_pytorch_parity_test.sh`: V1 PyTorch parity testing with metrics
-- `./run_performance_demo.sh`: V1 production-style adaptive matmul demo
+**V2 Build Targets:**
+- `build_v2/`: Debug build (for development, `CMAKE_BUILD_TYPE=Debug`)
+- `build_v2_release/`: Release build (for benchmarking, `CMAKE_BUILD_TYPE=Release`)
+- `build_v2/src/v2/llaminar2`: V2 executable (device enumeration)
+- `build_v2/tests/v2/`: V2 test executables
 
 **Model Support:**
-- **V1**: Qwen 2.5 family (0.5B-72B), LLaMA 3.x (prototype)
-- **V2**: Basic infrastructure only (not production-ready)
+- **V2**: Qwen 2.5 family (0.5B-72B)
 - **Quantization**: Q4_0, Q6_K, Q8_0, IQ4_NL, F16, F32
-
-**Key Source Directories (V1):**
-- `src/`: Core V1 inference engine
-- `src/operators/`: MPI-aware transformer operators
-- `src/tensors/`: Hybrid tensor system (SimpleTensor, COSMATensor)
-- `src/backends/`: Backend implementations (OpenBLAS, COSMA, CUDA/ROCm stubs)
-- `src/weights/`: Weight loading and verification
-- `src/utils/`: Utilities (logging, performance tracing, environment config)
-- `tests/`: Comprehensive test suite (unit, integration, parity)
 
 **Key Source Directories (V2):**
 - `src/v2/`: V2 operator-free architecture
@@ -1262,43 +1092,12 @@ When we write documentation and changelogs at the end of our work runs:
    - `changelog/YYYY-MM-DD-session-summary.md`
    - Include: objectives, discoveries, outcomes, remaining work
 
-### Project Status (October 2025)
-
-**V1 Production Ready:**
-- ✅ Sequential Qwen inference (0.5B-72B)
-- ✅ Multi-rank MPI distribution
-- ✅ OpenBLAS backend (all sizes)
-- ✅ Intel MKL backend (BF16 quantized inference)
-- ✅ COSMA backend (large prefill ≥8K tokens)
-- ✅ NUMA-aware memory allocation
-- ✅ PyTorch parity tests (prefill + decode)
-- ✅ Batch attention parity (17/17 stages)
-
-**V1 In Progress:**
-- 🔄 Batch pipeline full validation (attention ✅, FFN/LM head ✅)
-- 🔄 LLaMA adapter completion
-- 🔄 CUDA/ROCm backend integration
-
-**V2 Development Status:**
-- ✅ Basic infrastructure (tensors, kernels, backends)
-- ✅ IQ4_NL quantized tensor with IBlockDecoder pattern
-- ✅ Generic QuantizedGemmKernel (335-451 GFLOPS)
-- ✅ FP32/BF16 tensor types
-- ✅ Device enumeration (CPU, CUDA, ROCm, Vulkan stubs)
-- ❌ Full pipeline implementation (incomplete)
-- ❌ MPI distribution (not yet ported)
-- ❌ Production testing (not validated)
-
-**Deprecated/Experimental:**
-- 🧪 Graph-based execution (V1, deprecated, may be removed)
-- 🧪 Adaptive transformer pipeline (V1, experimental)
-
 ### Getting Help
 
 **Common issues:**
 1. **MPI hangs**: Check barriers around collective operations, verify all ranks participate
 2. **Numerical divergence**: Run parity tests to identify diverging stage
-3. **Performance issues**: Profile with `run_batch_performance.sh`, check OpenMP thread settings
+3. **Performance issues**: Use `--benchmark` mode with `./run_llaminar.sh`, check OpenMP thread settings
 4. **Memory errors**: Enable NUMA verification, check first-touch allocation
 5. **Build errors**: Clean build directory, verify dependencies (OpenBLAS, MPI, ScaLAPACK)
 

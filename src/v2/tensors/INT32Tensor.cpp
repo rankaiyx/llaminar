@@ -9,7 +9,7 @@
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
-#include "../kernels/cpu/CPUAttentionT.h"
+#include "../kernels/cpu/CpuAttentionKernelT.h"
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -286,49 +286,9 @@ namespace llaminar2
         return nullptr;
     }
 
-    std::unique_ptr<ITensorRoPE> INT32Tensor::createRoPE()
-    {
-        LOG_ERROR("[INT32Tensor] RoPE not supported for INT32");
-        return nullptr;
-    }
-
-    std::unique_ptr<ITensorSwiGLU> INT32Tensor::createSwiGLU()
-    {
-        LOG_ERROR("[INT32Tensor] SwiGLU not supported for INT32");
-        return nullptr;
-    }
-
-    std::unique_ptr<ITensorSoftmax> INT32Tensor::createSoftmax()
-    {
-        LOG_ERROR("[INT32Tensor] Softmax not supported for INT32");
-        return nullptr;
-    }
-
-    std::unique_ptr<ITensorRMSNorm> INT32Tensor::createRMSNorm()
-    {
-        // INT32 tensors use INT32→INT8 RMSNorm kernel with requantization
-        return std::make_unique<CPURMSNormKernel>();
-    }
-
-    std::unique_ptr<ITensorAttention> INT32Tensor::createAttention()
-    {
-        // INT32 tensors use templated CPU attention kernel
-        return std::make_unique<CPUAttentionT<INT32Tensor>>();
-    }
-
     // =============================================================================
     // FORMAT CONVERSION
     // =============================================================================
-
-    void INT32Tensor::to_fp32(float *dst) const
-    {
-        size_t count = 1;
-        for (auto dim : shape_)
-        {
-            count *= dim;
-        }
-        dequantizeINT32ToFP32(host_int32_data_.data(), dst, scale_, count);
-    }
 
     bool INT32Tensor::from_int32_with_scales(
         const int32_t *accum,
@@ -352,6 +312,7 @@ namespace llaminar2
             LOG_ERROR("[INT32Tensor::from_int32_with_scales] tensor must be 2D, got " << shape_.size() << "D");
             return false;
         }
+
         if (static_cast<int>(shape_[0]) != rows || static_cast<int>(shape_[1]) != cols)
         {
             LOG_ERROR("[INT32Tensor::from_int32_with_scales] shape mismatch: tensor=[" << shape_[0]
@@ -359,10 +320,10 @@ namespace llaminar2
             return false;
         }
 
-        const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-        std::memcpy(host_int32_data_.data(), accum, total * sizeof(int32_t));
+        const size_t count = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        std::memcpy(host_int32_data_.data(), accum, count * sizeof(int32_t));
 
-        if (row_scales)
+        if (row_scales && rows > 0)
         {
             row_scales_.assign(row_scales, row_scales + rows);
         }
@@ -371,8 +332,19 @@ namespace llaminar2
             row_scales_.clear();
         }
 
+        scale_ = 1.0f;
         dequant_cache_.clear();
         return true;
+    }
+
+    void INT32Tensor::to_fp32(float *dst) const
+    {
+        size_t count = 1;
+        for (auto dim : shape_)
+        {
+            count *= dim;
+        }
+        dequantizeINT32ToFP32(host_int32_data_.data(), dst, scale_, count);
     }
 
     void INT32Tensor::to_bf16(uint16_t *dst) const
@@ -432,11 +404,6 @@ namespace llaminar2
         dequantizeINT32ToFP32(host_int32_data_.data() + offset, buffer, scale_, count);
     }
 
-    ActivationPack INT32Tensor::to_int8_activation_pack(int rows, int cols) const
-    {
-        return pack_activation_rows_to_int8(rows, cols);
-    }
-
     std::shared_ptr<TensorBase> INT32Tensor::create_view(
         const std::vector<size_t> &new_shape,
         size_t offset)
@@ -467,48 +434,6 @@ namespace llaminar2
             m, n);
 
         return true;
-    }
-
-    bool INT32Tensor::applyRMSNorm(
-        const float *gamma,
-        int seq_len,
-        int d_model,
-        float eps,
-        const MPIContext *mpi_ctx,
-        int device_idx)
-    {
-        // NOTE: INT32→INT8 RMSNorm path requires an INT8 output tensor.
-        // The current signature doesn't support this (in-place operation).
-        //
-        // For now, log an error and return false. Future work:
-        // 1. Add applyRMSNorm() variant that accepts output tensor pointer
-        // 2. Create INT8Tensor output in pipeline before calling
-        // 3. Use kernel->apply_int32_to_int8() with proper output buffer
-        //
-        // Alternative: Convert to FP32, normalize, convert back (not ideal for full INT8 path)
-
-        LOG_ERROR("[INT32Tensor::applyRMSNorm] INT32→INT8 RMSNorm not yet supported");
-        LOG_ERROR("  Requires INT8 output tensor - signature needs extension");
-        LOG_ERROR("  For now, convert to FP32 for normalization or add INT8 output parameter");
-        return false;
-    }
-
-    bool INT32Tensor::applyRoPE(
-        float *K,
-        const int *position_ids,
-        int seq_len,
-        int n_heads,
-        int n_kv_heads,
-        int head_dim,
-        float rope_theta,
-        bool use_bf16,
-        const MPIContext *mpi_ctx,
-        int device_idx)
-    {
-        // RoPE is an activation operation, not applicable to quantized INT32 accumulators
-        LOG_ERROR("[INT32Tensor::applyRoPE] RoPE not supported on INT32 accumulator tensors");
-        LOG_ERROR("  RoPE is an activation operation - convert to FP32 first");
-        return false;
     }
 
 } // namespace llaminar2

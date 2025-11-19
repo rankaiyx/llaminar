@@ -16,7 +16,7 @@ Finalized architectural design for V2 Attention refactoring with **result-tensor
 2. ✅ **Tensor Class Disambiguation** (FP32Tensor, BF16Tensor, FP16Tensor, INT32Tensor)
 3. ✅ **Full INT32 Attention Support** (for INT8 quantized pipelines)
 4. ✅ **Result-Tensor Pattern** (result.computeOp(inputs...) instead of factories)
-5. ✅ **Template-Based Implementation** (CPUAttentionT<TensorType> eliminates code duplication)
+5. ✅ **Template-Based Implementation** (CpuAttentionKernelT<TensorType> eliminates code duplication)
 
 ---
 
@@ -96,7 +96,7 @@ output.computeAttention(Q, K, V, ...);  // output = attention(Q, K, V) (writes t
  * @tparam TensorType Tensor class (FP32Tensor, BF16Tensor, FP16Tensor, INT32Tensor)
  */
 template<typename TensorType>
-class CPUAttentionT : public ITensorAttention
+class CpuAttentionKernelT : public ITensorAttention
 {
 public:
     using ElementType = typename TensorType::value_type;  // float, uint16_t, int32_t
@@ -115,10 +115,10 @@ private:
 };
 
 // Explicit instantiations (4 types)
-template class CPUAttentionT<FP32Tensor>;   // ElementType = float
-template class CPUAttentionT<BF16Tensor>;   // ElementType = uint16_t
-template class CPUAttentionT<FP16Tensor>;   // ElementType = uint16_t (disambiguated!)
-template class CPUAttentionT<INT32Tensor>;  // ElementType = int32_t
+template class CpuAttentionKernelT<FP32Tensor>;   // ElementType = float
+template class CpuAttentionKernelT<BF16Tensor>;   // ElementType = uint16_t
+template class CpuAttentionKernelT<FP16Tensor>;   // ElementType = uint16_t (disambiguated!)
+template class CpuAttentionKernelT<INT32Tensor>;  // ElementType = int32_t
 ```
 
 ### 3. ActivationTraits Pattern
@@ -431,24 +431,24 @@ bool Qwen2Pipeline::attention_block(int layer, TensorBase *input, TensorBase *ou
 
 ---
 
-### Phase 3: Refactor CPUAttention → CPUAttentionT<TensorType>
+### Phase 3: Refactor CPUAttention → CpuAttentionKernelT<TensorType>
 
 **Files to modify:**
 - `src/v2/kernels/cpu/CPUAttention.h`
 - `src/v2/kernels/cpu/CPUAttention.cpp`
 
 **Changes:**
-1. Rename `CPUAttention` → `CPUAttentionT<TensorType>`
+1. Rename `CPUAttention` → `CpuAttentionKernelT<TensorType>`
 2. Replace `float *` with `ElementType *`
 3. Use `ActivationTraits<TensorType>` for precision-specific ops
 4. Template all helper methods
 5. Remove ALL dummy tensor creation
 6. Add explicit instantiations:
    ```cpp
-   template class CPUAttentionT<FP32Tensor>;
-   template class CPUAttentionT<BF16Tensor>;
-   template class CPUAttentionT<FP16Tensor>;
-   template class CPUAttentionT<INT32Tensor>;
+   template class CpuAttentionKernelT<FP32Tensor>;
+   template class CpuAttentionKernelT<BF16Tensor>;
+   template class CpuAttentionKernelT<FP16Tensor>;
+   template class CpuAttentionKernelT<INT32Tensor>;
    ```
 
 ---
@@ -483,7 +483,7 @@ bool FP32Tensor::computeAttention(
     bool causal, ...)
 {
     // Create kernel matching this tensor's precision
-    auto kernel = this->createAttention();  // Returns CPUAttentionT<FP32Tensor>
+    auto kernel = this->createAttention();  // Returns CpuAttentionKernelT<FP32Tensor>
     
     // Execute: writes to this->mutable_data()
     return kernel->compute(
@@ -593,7 +593,7 @@ bool FP32Tensor::computeAttention(
 
 **Next session deliverable:**
 - `changelog/YYYY-MM-DD-v2-attention-phase1-softmax-primitives.md` - Softmax implementation
-- `changelog/YYYY-MM-DD-v2-attention-phase3-template-implementation.md` - CPUAttentionT refactor
+- `changelog/YYYY-MM-DD-v2-attention-phase3-template-implementation.md` - CpuAttentionKernelT refactor
 - `changelog/YYYY-MM-DD-v2-attention-complete.md` - Final session summary
 
 ---

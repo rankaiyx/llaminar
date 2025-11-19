@@ -709,4 +709,176 @@ namespace llaminar2::test
         expectBitExact(k_fp16_ref, k_fp16_test, "FP16 Full Tensor K");
     }
 
+    // ============================================================================
+    // Non-Contiguous Position IDs (Batched Inference)
+    // ============================================================================
+
+    TEST_F(RoPEPrecisionCorrectnessTest, NonContiguousPositionIDs_TwoSequences)
+    {
+        // CRITICAL TEST: Validates RoPE works with non-contiguous position IDs
+        // Scenario: Batched inference with 2 independent sequences
+        //   Sequence 0: tokens at positions [0, 1]
+        //   Sequence 1: tokens at positions [0, 1]
+        //   Flattened layout: [seq0_tok0, seq0_tok1, seq1_tok0, seq1_tok1]
+        //   Position IDs: [0, 1, 0, 1] (non-contiguous!)
+        //
+        // Expected: Each sequence should get RoPE applied independently with its own positions
+
+        const int batch_size = 2;
+        const int seq_len_per_batch = 2;
+        const int total_tokens = batch_size * seq_len_per_batch;
+        const int head_dim = 64;
+        const int q_heads = 2;
+        const int k_heads = 2;
+        const float freq_base = 10000.0f;
+
+        // Generate random data for both sequences
+        auto q_fp32 = generateRandomFP32(total_tokens * q_heads * head_dim);
+        auto k_fp32 = generateRandomFP32(total_tokens * k_heads * head_dim);
+
+        // Non-contiguous position IDs: [0, 1, 0, 1] for 2 sequences of length 2
+        std::vector<int> position_ids = {0, 1, 0, 1};
+
+        // Reference: Process each sequence separately with its own positions
+        auto q_ref = q_fp32;
+        auto k_ref = k_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        // Sequence 0: tokens 0-1, positions 0-1
+        for (int tok = 0; tok < seq_len_per_batch; ++tok)
+        {
+            int position = position_ids[tok];
+            for (int h = 0; h < q_heads; ++h)
+            {
+                float *head_ptr = q_ref.data() + (tok * q_heads + h) * head_dim;
+                primitives::apply_rope_to_head_scalar(head_ptr, position, inv_freq, head_dim, 0);
+            }
+            for (int h = 0; h < k_heads; ++h)
+            {
+                float *head_ptr = k_ref.data() + (tok * k_heads + h) * head_dim;
+                primitives::apply_rope_to_head_scalar(head_ptr, position, inv_freq, head_dim, 0);
+            }
+        }
+
+        // Sequence 1: tokens 2-3, positions 0-1 (independent!)
+        for (int tok = 0; tok < seq_len_per_batch; ++tok)
+        {
+            int global_tok = seq_len_per_batch + tok;
+            int position = position_ids[global_tok];
+            for (int h = 0; h < q_heads; ++h)
+            {
+                float *head_ptr = q_ref.data() + (global_tok * q_heads + h) * head_dim;
+                primitives::apply_rope_to_head_scalar(head_ptr, position, inv_freq, head_dim, 0);
+            }
+            for (int h = 0; h < k_heads; ++h)
+            {
+                float *head_ptr = k_ref.data() + (global_tok * k_heads + h) * head_dim;
+                primitives::apply_rope_to_head_scalar(head_ptr, position, inv_freq, head_dim, 0);
+            }
+        }
+
+        // Test: Apply RoPE with position_ids array (this is what we're implementing!)
+        auto q_test = q_fp32;
+        auto k_test = k_fp32;
+
+        // TODO: After refactoring, this will be a single call:
+        //   primitives::apply_rope_vectorized(q_test.data(), k_test.data(),
+        //       total_tokens, head_dim, q_heads, k_heads, position_ids.data(), freq_base, nullptr);
+        //
+        // For now, manually apply per-token to test expected behavior
+        for (int tok = 0; tok < total_tokens; ++tok)
+        {
+            int position = position_ids[tok];
+
+            // Apply to Q heads for this token
+            float *q_token = q_test.data() + tok * q_heads * head_dim;
+            primitives::apply_rope_vectorized(
+                q_token, nullptr,        // Only Q for this token
+                1, head_dim, q_heads, 0, // seq_len=1, k_heads=0 (no K)
+                position, freq_base, nullptr);
+
+            // Apply to K heads for this token
+            float *k_token = k_test.data() + tok * k_heads * head_dim;
+            primitives::apply_rope_vectorized(
+                nullptr, k_token,        // Only K for this token
+                1, head_dim, 0, k_heads, // seq_len=1, q_heads=0 (no Q)
+                position, freq_base, nullptr);
+        }
+
+        // Compare: Should match reference when per-token positions are correctly applied
+        expectNear(q_ref, q_test, 1e-5f, "Non-contiguous Q");
+        expectNear(k_ref, k_test, 1e-5f, "Non-contiguous K");
+    }
+
+    TEST_F(RoPEPrecisionCorrectnessTest, NonContiguousPositionIDs_VariableSequenceLengths)
+    {
+        // Advanced test: Batched inference with DIFFERENT sequence lengths
+        // Sequence 0: 1 token at position 5 (continuing from previous context)
+        // Sequence 1: 3 tokens at positions [0, 1, 2] (new sequence)
+        // Flattened: [seq0_tok0, seq1_tok0, seq1_tok1, seq1_tok2]
+        // Position IDs: [5, 0, 1, 2] (highly non-contiguous!)
+
+        const int total_tokens = 4;
+        const int head_dim = 64;
+        const int q_heads = 2;
+        const int k_heads = 2;
+        const float freq_base = 10000.0f;
+
+        auto q_fp32 = generateRandomFP32(total_tokens * q_heads * head_dim);
+        auto k_fp32 = generateRandomFP32(total_tokens * k_heads * head_dim);
+
+        // Non-contiguous position IDs: [5, 0, 1, 2]
+        std::vector<int> position_ids = {5, 0, 1, 2};
+
+        // Reference: Apply per-token positions
+        auto q_ref = q_fp32;
+        auto k_ref = k_fp32;
+
+        const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+        for (int tok = 0; tok < total_tokens; ++tok)
+        {
+            int position = position_ids[tok];
+            for (int h = 0; h < q_heads; ++h)
+            {
+                float *head_ptr = q_ref.data() + (tok * q_heads + h) * head_dim;
+                primitives::apply_rope_to_head_scalar(head_ptr, position, inv_freq, head_dim, 0);
+            }
+            for (int h = 0; h < k_heads; ++h)
+            {
+                float *head_ptr = k_ref.data() + (tok * k_heads + h) * head_dim;
+                primitives::apply_rope_to_head_scalar(head_ptr, position, inv_freq, head_dim, 0);
+            }
+        }
+
+        // Test: Apply with position_ids array
+        auto q_test = q_fp32;
+        auto k_test = k_fp32;
+
+        // TODO: After refactoring, this will be a single call with position_ids array
+        // For now, manually apply per-token to test expected behavior
+        for (int tok = 0; tok < total_tokens; ++tok)
+        {
+            int position = position_ids[tok];
+
+            // Apply to Q heads for this token
+            float *q_token = q_test.data() + tok * q_heads * head_dim;
+            primitives::apply_rope_vectorized(
+                q_token, nullptr,
+                1, head_dim, q_heads, 0,
+                position, freq_base, nullptr);
+
+            // Apply to K heads for this token
+            float *k_token = k_test.data() + tok * k_heads * head_dim;
+            primitives::apply_rope_vectorized(
+                nullptr, k_token,
+                1, head_dim, 0, k_heads,
+                position, freq_base, nullptr);
+        }
+
+        expectNear(q_ref, q_test, 1e-5f, "Variable length Q");
+        expectNear(k_ref, k_test, 1e-5f, "Variable length K");
+    }
+
 } // namespace llaminar2::test

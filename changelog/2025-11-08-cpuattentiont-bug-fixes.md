@@ -1,4 +1,4 @@
-# CPUAttentionT Critical Bug Fixes - Quick Reference
+# CpuAttentionKernelT Critical Bug Fixes - Quick Reference
 
 **Date**: November 8, 2025  
 **Impact**: 🔴 **CRITICAL** - Segfaults, heap corruption, buffer overflows  
@@ -8,9 +8,9 @@
 
 | Bug # | Type | Severity | Impact | Fixed Line |
 |-------|------|----------|--------|------------|
-| 1 | Output pointer type mismatch | 🔴 CRITICAL | Segfault, buffer overflow | `CPUAttentionT.h:110` |
-| 2 | KV broadcast buffer size | 🔴 CRITICAL | Heap corruption, GQA crash | `CPUAttentionT.h:217` |
-| 3 | memset size calculation | 🟡 MEDIUM | Uninitialized memory | `CPUAttentionT.h:292` |
+| 1 | Output pointer type mismatch | 🔴 CRITICAL | Segfault, buffer overflow | `CpuAttentionKernelT.h:110` |
+| 2 | KV broadcast buffer size | 🔴 CRITICAL | Heap corruption, GQA crash | `CpuAttentionKernelT.h:217` |
+| 3 | memset size calculation | 🟡 MEDIUM | Uninitialized memory | `CpuAttentionKernelT.h:292` |
 
 ## Bug #1: Output Pointer Type Mismatch
 
@@ -232,7 +232,7 @@ const int head_dim = 4;
 
 ## Quick Fix Checklist
 
-When adding new precision types to CPUAttentionT:
+When adding new precision types to CpuAttentionKernelT:
 
 - [ ] ✅ **Output** stays `float*` (never cast to ElementType*)
 - [ ] ✅ **Broadcast buffers** are `std::vector<float>` (not ElementType)
@@ -244,8 +244,8 @@ When adding new precision types to CPUAttentionT:
 ## Related Files
 
 **Fixed Files**:
-- `src/v2/kernels/cpu/CPUAttentionT.h` - Template implementation
-- `tests/v2/unit/Test__CPUAttentionT.cpp` - BF16/FP16/INT32 tests
+- `src/v2/kernels/cpu/CpuAttentionKernelT.h` - Template implementation
+- `tests/v2/unit/Test__CpuAttentionKernelT.cpp` - BF16/FP16/INT32 tests
 
 **Documentation**:
 - `changelog/2025-11-08-phase3b-bf16-testing-complete.md` - Full session log
@@ -255,13 +255,13 @@ When adding new precision types to CPUAttentionT:
 
 ```bash
 # Build tests
-cmake --build build_v2 --target v2_test_cpu_attention_t --parallel
+cmake --build build_v2 --target v2_test_cpu_attention_kernel_t --parallel
 
 # Run all tests (should show 17/17 passing)
-./build_v2/tests/v2/v2_test_cpu_attention_t
+./build_v2/tests/v2/v2_test_cpu_attention_kernel_t
 
 # Run just BF16 GQA test (critical for Bug #2)
-./build_v2/tests/v2/v2_test_cpu_attention_t --gtest_filter="CPUAttentionT_BF16.GroupedQueryAttention"
+./build_v2/tests/v2/v2_test_cpu_attention_kernel_t --gtest_filter="CpuAttentionKernelT_BF16.GroupedQueryAttention"
 
 # Expected output:
 # [==========] Running 17 tests from 4 test suites.
@@ -271,6 +271,6 @@ cmake --build build_v2 --target v2_test_cpu_attention_t --parallel
 ## References
 
 - **Issue Tracker**: N/A (discovered during development)
-- **Original Implementation**: Phase 3 (CPUAttentionT template)
+- **Original Implementation**: Phase 3 (CpuAttentionKernelT template)
 - **Bug Discovery Session**: Phase 3b (BF16 testing)
 - **Commits**: See git log for 2025-11-08

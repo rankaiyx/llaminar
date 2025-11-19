@@ -1,4 +1,4 @@
-# Phase 3 Complete: CPUAttentionT Template-Based Attention Kernel
+# Phase 3 Complete: CpuAttentionKernelT Template-Based Attention Kernel
 
 **Date**: 2025-11-07  
 **Status**: ✅ **COMPLETE** - 9/9 tests passing  
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Successfully refactored CPUAttention from hardcoded precision (float*) to template-based CPUAttentionT<TensorType> design. **Eliminates dummy tensor creation** and integrates with Phase 2's ActivationTraits system for precision-agnostic kernel dispatch.
+Successfully refactored CPUAttention from hardcoded precision (float*) to template-based CpuAttentionKernelT<TensorType> design. **Eliminates dummy tensor creation** and integrates with Phase 2's ActivationTraits system for precision-agnostic kernel dispatch.
 
 ### Key Achievement
 
@@ -25,7 +25,7 @@ if (use_bf16) {
 }
 ```
 
-**After (CPUAttentionT.h line 202)**:
+**After (CpuAttentionKernelT.h line 202)**:
 ```cpp
 auto gemm = Traits::create_activation_gemm();  // ✅ Direct creation, no dummy tensor!
 ```
@@ -36,29 +36,29 @@ auto gemm = Traits::create_activation_gemm();  // ✅ Direct creation, no dummy 
 
 ### Files Created
 
-1. **src/v2/kernels/cpu/CPUAttentionT.h** (428 lines)
-   - Template class `CPUAttentionT<TensorType>`
+1. **src/v2/kernels/cpu/CpuAttentionKernelT.h** (428 lines)
+   - Template class `CpuAttentionKernelT<TensorType>`
    - Public interface: `compute(const float*, ...)` - ITensorAttention override
    - Private implementation: `compute_typed(const ElementType*, ...)` - type-safe logic
    - Helper: `broadcast_kv(const ElementType*, ...)` - GQA broadcasting
    - Explicit instantiation declarations (extern template)
 
-2. **src/v2/kernels/cpu/CPUAttentionT.cpp** (20 lines)
+2. **src/v2/kernels/cpu/CpuAttentionKernelT.cpp** (20 lines)
    - Explicit template instantiations for FP32Tensor, BF16Tensor, FP16Tensor, INT32Tensor
    - Single compilation unit (reduces build time)
 
-3. **tests/v2/unit/Test__CPUAttentionT.cpp** (335 lines)
-   - 9 test cases for CPUAttentionT<FP32Tensor>
+3. **tests/v2/unit/Test__CpuAttentionKernelT.cpp** (335 lines)
+   - 9 test cases for CpuAttentionKernelT<FP32Tensor>
    - Coverage: instantiation, basic computation, causal masking, MHA, GQA, workspaces, error handling
    - Test utilities: `init_sequential()`, `has_nonzero()`
 
 ### Files Modified
 
 1. **src/v2/CMakeLists.txt** (1 line added)
-   - Line 519: Added `kernels/cpu/CPUAttentionT.cpp` to llaminar2_core sources
+   - Line 519: Added `kernels/cpu/CpuAttentionKernelT.cpp` to llaminar2_core sources
 
 2. **tests/v2/CMakeLists.txt** (13 lines added)
-   - Lines 309-321: Added v2_test_cpu_attention_t test target
+   - Lines 309-321: Added v2_test_cpu_attention_kernel_t test target
    - Labels: V2, Unit, Kernels, Attention, FP32, TemplateKernel, CPU, MHA, GQA, CausalMasking
    - MPI: Single rank (CPU-only)
 
@@ -70,7 +70,7 @@ auto gemm = Traits::create_activation_gemm();  // ✅ Direct creation, no dummy 
 
 ```cpp
 template <typename TensorType>
-class CPUAttentionT : public ITensorAttention {
+class CpuAttentionKernelT : public ITensorAttention {
 public:
     using ElementType = typename ActivationTraits<TensorType>::ElementType;
     using Traits = ActivationTraits<TensorType>;
@@ -226,9 +226,9 @@ gemm->multiply_activations_strided(
 
 **Error**:
 ```
-error: 'bool CPUAttentionT<FP32Tensor>::compute(const float*, ...)' 
+error: 'bool CpuAttentionKernelT<FP32Tensor>::compute(const float*, ...)' 
        cannot be overloaded with 
-       'bool CPUAttentionT<FP32Tensor>::compute(const ElementType*, ...)'
+       'bool CpuAttentionKernelT<FP32Tensor>::compute(const ElementType*, ...)'
 ```
 
 **Problem**: For FP32Tensor, both signatures resolve to `const float*`
@@ -255,7 +255,7 @@ bool compute_typed(const ElementType *Q, ...) { ... }
 
 **Fix**: Moved to end of class, proper public/private separation:
 ```cpp
-class CPUAttentionT {
+class CpuAttentionKernelT {
 public:
     // Interface methods first
     bool compute(...) override;
@@ -279,8 +279,8 @@ private:
 
 ### Test Suite Structure
 
-**File**: tests/v2/unit/Test__CPUAttentionT.cpp  
-**Suite**: CPUAttentionT_FP32  
+**File**: tests/v2/unit/Test__CpuAttentionKernelT.cpp  
+**Suite**: CpuAttentionKernelT_FP32  
 **Status**: ✅ 9/9 passing  
 
 ### Test Cases
@@ -324,7 +324,7 @@ private:
    - **Status**: ✅ PASS
 
 7. **InvalidDevice**
-   - device_idx=0 should fail (CPUAttentionT is CPU-only)
+   - device_idx=0 should fail (CpuAttentionKernelT is CPU-only)
    - Validates error message: "device_idx must be -1 (CPU), got 0"
    - **Duration**: <1ms
    - **Status**: ✅ PASS
@@ -358,7 +358,7 @@ private:
 - ⏸ INT32Tensor (Phase 3b)
 
 **Missing Coverage** (Phase 3b):
-- ⏸ Parity test: CPUAttentionT<FP32Tensor> vs CPUAttention (exact match)
+- ⏸ Parity test: CpuAttentionKernelT<FP32Tensor> vs CPUAttention (exact match)
 - ⏸ Cross-precision parity (FP32 ground truth vs BF16/FP16/INT32)
 - ⏸ Performance benchmarks (GEMM kernel efficiency)
 - ⏸ Edge cases (seq_len=1, head_dim=1, very large sequences)
@@ -370,7 +370,7 @@ private:
 ### CMake Configuration
 
 **Target**: llaminar2_core  
-**Source**: src/v2/kernels/cpu/CPUAttentionT.cpp  
+**Source**: src/v2/kernels/cpu/CpuAttentionKernelT.cpp  
 **Dependencies**: ActivationTraits, Softmax primitives, ITensorGemm  
 
 **Build Command**:
@@ -382,46 +382,46 @@ cmake --build build_v2 --target llaminar2_core --parallel
 
 ### Test Integration
 
-**Target**: v2_test_cpu_attention_t  
-**Source**: tests/v2/unit/Test__CPUAttentionT.cpp  
+**Target**: v2_test_cpu_attention_kernel_t  
+**Source**: tests/v2/unit/Test__CpuAttentionKernelT.cpp  
 **Labels**: V2, Unit, Kernels, Attention, FP32, TemplateKernel, CPU, MHA, GQA, CausalMasking  
 **MPI Procs**: 1 (CPU-only, single rank)  
 
 **Test Commands**:
 ```bash
 # Direct execution
-./build_v2/tests/v2/v2_test_cpu_attention_t
+./build_v2/tests/v2/v2_test_cpu_attention_kernel_t
 
 # Via CTest
-ctest -R "V2_Unit_CPUAttentionT" --verbose
+ctest -R "V2_Unit_CpuAttentionKernelT" --verbose
 
 # Filter specific tests
-./build_v2/tests/v2/v2_test_cpu_attention_t --gtest_filter="CPUAttentionT_FP32.MultiHeadAttention"
+./build_v2/tests/v2/v2_test_cpu_attention_kernel_t --gtest_filter="CpuAttentionKernelT_FP32.MultiHeadAttention"
 ```
 
 **Results**:
 ```
 [==========] Running 9 tests from 1 test suite.
-[----------] 9 tests from CPUAttentionT_FP32
-[ RUN      ] CPUAttentionT_FP32.InstantiationWorks
-[       OK ] CPUAttentionT_FP32.InstantiationWorks (0 ms)
-[ RUN      ] CPUAttentionT_FP32.BasicAttentionComputation
-[       OK ] CPUAttentionT_FP32.BasicAttentionComputation (23 ms)
-[ RUN      ] CPUAttentionT_FP32.CausalMasking
-[       OK ] CPUAttentionT_FP32.CausalMasking (29 ms)
-[ RUN      ] CPUAttentionT_FP32.MultiHeadAttention
-[       OK ] CPUAttentionT_FP32.MultiHeadAttention (63 ms)
-[ RUN      ] CPUAttentionT_FP32.GroupedQueryAttention
-[       OK ] CPUAttentionT_FP32.GroupedQueryAttention (17 ms)
-[ RUN      ] CPUAttentionT_FP32.WorkspaceProvided
-[       OK ] CPUAttentionT_FP32.WorkspaceProvided (8 ms)
-[ RUN      ] CPUAttentionT_FP32.InvalidDevice
-[       OK ] CPUAttentionT_FP32.InvalidDevice (0 ms)
-[ RUN      ] CPUAttentionT_FP32.NullPointerInputs
-[       OK ] CPUAttentionT_FP32.NullPointerInputs (0 ms)
-[ RUN      ] CPUAttentionT_FP32.InvalidDimensions
-[       OK ] CPUAttentionT_FP32.InvalidDimensions (0 ms)
-[----------] 9 tests from CPUAttentionT_FP32 (142 ms total)
+[----------] 9 tests from CpuAttentionKernelT_FP32
+[ RUN      ] CpuAttentionKernelT_FP32.InstantiationWorks
+[       OK ] CpuAttentionKernelT_FP32.InstantiationWorks (0 ms)
+[ RUN      ] CpuAttentionKernelT_FP32.BasicAttentionComputation
+[       OK ] CpuAttentionKernelT_FP32.BasicAttentionComputation (23 ms)
+[ RUN      ] CpuAttentionKernelT_FP32.CausalMasking
+[       OK ] CpuAttentionKernelT_FP32.CausalMasking (29 ms)
+[ RUN      ] CpuAttentionKernelT_FP32.MultiHeadAttention
+[       OK ] CpuAttentionKernelT_FP32.MultiHeadAttention (63 ms)
+[ RUN      ] CpuAttentionKernelT_FP32.GroupedQueryAttention
+[       OK ] CpuAttentionKernelT_FP32.GroupedQueryAttention (17 ms)
+[ RUN      ] CpuAttentionKernelT_FP32.WorkspaceProvided
+[       OK ] CpuAttentionKernelT_FP32.WorkspaceProvided (8 ms)
+[ RUN      ] CpuAttentionKernelT_FP32.InvalidDevice
+[       OK ] CpuAttentionKernelT_FP32.InvalidDevice (0 ms)
+[ RUN      ] CpuAttentionKernelT_FP32.NullPointerInputs
+[       OK ] CpuAttentionKernelT_FP32.NullPointerInputs (0 ms)
+[ RUN      ] CpuAttentionKernelT_FP32.InvalidDimensions
+[       OK ] CpuAttentionKernelT_FP32.InvalidDimensions (0 ms)
+[----------] 9 tests from CpuAttentionKernelT_FP32 (142 ms total)
 
 [==========] 9 tests from 1 test suite ran. (142 ms total)
 [  PASSED  ] 9 tests.
@@ -465,7 +465,7 @@ ctest -R "V2_Unit_CPUAttentionT" --verbose
 - Dummy tensor creation (3 instances)
 - Hardcoded `float*` pointers
 
-**After (CPUAttentionT.h + CPUAttentionT.cpp)**:
+**After (CpuAttentionKernelT.h + CpuAttentionKernelT.cpp)**:
 - 448 lines total (428 header + 20 impl)
 - Single implementation for FP32/BF16/FP16/INT32
 - Zero dummy tensors
@@ -498,7 +498,7 @@ auto gemm = Traits::create_activation_gemm();  // Zero heap allocation
 
 **After**: Adding FP16 support requires:
 1. Implement `ActivationTraits<FP16Tensor>` specialization
-2. Add explicit instantiation: `template class CPUAttentionT<FP16Tensor>;`
+2. Add explicit instantiation: `template class CpuAttentionKernelT<FP16Tensor>;`
 3. Test FP16Tensor (logic automatically works)
 
 **Maintenance Reduction**: ~80% (single code path vs 4 duplicated paths)
@@ -511,7 +511,7 @@ auto gemm = Traits::create_activation_gemm();  // Zero heap allocation
 
 ```cpp
 template <typename TensorType>
-bool CPUAttentionT<TensorType>::compute_typed(...) {
+bool CpuAttentionKernelT<TensorType>::compute_typed(...) {
     using Traits = ActivationTraits<TensorType>;
     
     // 1. Workspace allocation (no dummy tensor!)
@@ -557,14 +557,14 @@ bool CPUAttentionT<TensorType>::compute_typed(...) {
 **Goal**: Extend test coverage to all precision types
 
 **Tasks**:
-- Create `CPUAttentionT_BF16` test suite (9 tests mirrored from FP32)
-- Create `CPUAttentionT_FP16` test suite (9 tests)
-- Create `CPUAttentionT_INT32` test suite (2 tests: InstantiationWorks, InvalidGemm)
+- Create `CpuAttentionKernelT_BF16` test suite (9 tests mirrored from FP32)
+- Create `CpuAttentionKernelT_FP16` test suite (9 tests)
+- Create `CpuAttentionKernelT_INT32` test suite (2 tests: InstantiationWorks, InvalidGemm)
 - Adjust tolerances: BF16 (5e-3), FP16 (5e-4), INT32 (N/A)
 
 **Expected Result**: 27 total tests (9 FP32 + 9 BF16 + 9 FP16 + 2 INT32)
 
-### 2. Parity Test: CPUAttentionT<FP32> vs CPUAttention
+### 2. Parity Test: CpuAttentionKernelT<FP32> vs CPUAttention
 
 **Goal**: Prove template refactor is bit-identical to original implementation
 
@@ -581,7 +581,7 @@ TEST(CPUAttentionParity, FP32Identical) {
     original.compute(Q.data(), K.data(), V.data(), output_orig.data(), ...);
     
     // Run template implementation
-    CPUAttentionT<FP32Tensor> templated;
+    CpuAttentionKernelT<FP32Tensor> templated;
     std::vector<float> output_tmpl(seq_len * n_heads * head_dim);
     templated.compute(Q.data(), K.data(), V.data(), output_tmpl.data(), ...);
     
@@ -602,12 +602,12 @@ TEST(CPUAttentionParity, FP32Identical) {
 ```cpp
 TEST(CPUAttentionParity, BF16VsFP32) {
     // Run FP32 (ground truth)
-    CPUAttentionT<FP32Tensor> fp32_kernel;
+    CpuAttentionKernelT<FP32Tensor> fp32_kernel;
     std::vector<float> output_fp32(size);
     fp32_kernel.compute(..., output_fp32.data(), ...);
     
     // Run BF16
-    CPUAttentionT<BF16Tensor> bf16_kernel;
+    CpuAttentionKernelT<BF16Tensor> bf16_kernel;
     std::vector<uint16_t> output_bf16(size);
     bf16_kernel.compute(..., reinterpret_cast<float*>(output_bf16.data()), ...);
     
@@ -754,9 +754,9 @@ TEST(CPUAttentionParity, BF16VsFP32) {
 - `ATTENTION_REFACTOR_PLAN.md`
 
 **Implementation Files**:
-- `src/v2/kernels/cpu/CPUAttentionT.h`
-- `src/v2/kernels/cpu/CPUAttentionT.cpp`
-- `tests/v2/unit/Test__CPUAttentionT.cpp`
+- `src/v2/kernels/cpu/CpuAttentionKernelT.h`
+- `src/v2/kernels/cpu/CpuAttentionKernelT.cpp`
+- `tests/v2/unit/Test__CpuAttentionKernelT.cpp`
 
 **Related Phases**:
 - Phase 1: `changelog/2025-11-06-v2-phase1-softmax-primitives-complete.md`
@@ -765,17 +765,17 @@ TEST(CPUAttentionParity, BF16VsFP32) {
 **Test Results**:
 ```bash
 # Run full suite
-ctest -R "V2_Unit_CPUAttentionT" --verbose
+ctest -R "V2_Unit_CpuAttentionKernelT" --verbose
 
 # Run specific test
-./build_v2/tests/v2/v2_test_cpu_attention_t --gtest_filter="CPUAttentionT_FP32.MultiHeadAttention"
+./build_v2/tests/v2/v2_test_cpu_attention_kernel_t --gtest_filter="CpuAttentionKernelT_FP32.MultiHeadAttention"
 ```
 
 ---
 
 ## Conclusion
 
-✅ **Phase 3 Complete**: CPUAttentionT template-based kernel successfully implemented, tested, and integrated.
+✅ **Phase 3 Complete**: CpuAttentionKernelT template-based kernel successfully implemented, tested, and integrated.
 
 **Key Achievements**:
 1. ✅ Eliminated dummy tensor creation (primary objective)

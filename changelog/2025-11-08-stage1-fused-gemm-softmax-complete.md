@@ -14,7 +14,7 @@ Implemented **Stage 1** of the attention memory optimization plan: fused GEMM+So
 **Results**:
 - ✅ **Kernel implementation**: `FusedGemmSoftmax` class (335 lines)
 - ✅ **Correctness validation**: 12/12 tests passing (exact parity with reference)
-- ✅ **Integration**: CPUAttentionT updated (17/17 tests still passing)
+- ✅ **Integration**: CpuAttentionKernelT updated (17/17 tests still passing)
 - ✅ **Memory savings**: Eliminates 14.7 MB scores buffer per attention layer
 - ✅ **Cache efficiency**: Scores stay in L2 cache (128 KB tiles vs 14 MB full matrix)
 
@@ -225,11 +225,11 @@ TEST(FusedGemmSoftmax, BasicComputation) {
 
 ---
 
-## Integration with CPUAttentionT
+## Integration with CpuAttentionKernelT
 
 ### Files Modified
 
-#### 1. `src/v2/kernels/cpu/CPUAttentionT.h`
+#### 1. `src/v2/kernels/cpu/CpuAttentionKernelT.h`
 
 **Changes**:
 1. Added include: `#include "FusedGemmSoftmax.h"`
@@ -273,10 +273,10 @@ for (int h = 0; h < n_heads; ++h) {
 [==========] Running 17 tests from 4 test suites.
 [  PASSED  ] 17 tests (216 ms total)
 
-CPUAttentionT_FP32:  9/9 tests (124 ms)
-CPUAttentionT_BF16:  6/6 tests (91 ms)
-CPUAttentionT_FP16:  1/1 tests (0 ms)
-CPUAttentionT_INT32: 1/1 tests (0 ms)
+CpuAttentionKernelT_FP32:  9/9 tests (124 ms)
+CpuAttentionKernelT_BF16:  6/6 tests (91 ms)
+CpuAttentionKernelT_FP16:  1/1 tests (0 ms)
+CpuAttentionKernelT_INT32: 1/1 tests (0 ms)
 ```
 
 **Validation**:
@@ -364,7 +364,7 @@ CausalMasking:      max_rel_diff=0, max_abs_diff=0 (EXACT)
 VariousTileSizes:   max_rel_diff=0, max_abs_diff=0 (ALL EXACT)
 ```
 
-**CPUAttentionT Integration**:
+**CpuAttentionKernelT Integration**:
 ```
 FP32 tests:  9/9 passing (exact match vs baseline)
 BF16 tests:  6/6 passing (exact match vs baseline)
@@ -386,13 +386,13 @@ BF16 tests:  6/6 passing (exact match vs baseline)
 
 **src/v2/CMakeLists.txt**:
 ```cmake
-# Added line 520 (after CPUAttentionT.cpp):
+# Added line 520 (after CpuAttentionKernelT.cpp):
 kernels/cpu/FusedGemmSoftmax.cpp  # Fused GEMM+Softmax for attention (Stage 1)
 ```
 
 **tests/v2/CMakeLists.txt**:
 ```cmake
-# Added after v2_test_cpu_attention_t (lines 342-353):
+# Added after v2_test_cpu_attention_kernel_t (lines 342-353):
 add_executable(v2_test_fused_gemm_softmax unit/Test__FusedGemmSoftmax.cpp)
 target_link_libraries(v2_test_fused_gemm_softmax
     llaminar2_core
@@ -441,27 +441,27 @@ Breakdown:
   InvalidDimensions:         0 ms ✅ Error handling
 ```
 
-**CPUAttentionT Integration Tests**:
+**CpuAttentionKernelT Integration Tests**:
 ```
 [==========] Running 17 tests from 4 test suites.
 [  PASSED  ] 17 tests (216 ms total)
 
-CPUAttentionT_FP32:  9/9 tests (124 ms)
+CpuAttentionKernelT_FP32:  9/9 tests (124 ms)
   ✅ BasicAttentionComputation
   ✅ CausalMasking
   ✅ MultiHeadAttention (8 heads)
   ✅ GroupedQueryAttention (4 query / 2 KV heads)
   ✅ WorkspaceProvided
 
-CPUAttentionT_BF16:  6/6 tests (91 ms)
+CpuAttentionKernelT_BF16:  6/6 tests (91 ms)
   ✅ BasicAttentionComputation
   ✅ CausalMasking
   ✅ MultiHeadAttention
   ✅ GroupedQueryAttention
   ✅ WorkspaceProvided
 
-CPUAttentionT_FP16:  1/1 tests (0 ms)
-CPUAttentionT_INT32: 1/1 tests (0 ms)
+CpuAttentionKernelT_FP16:  1/1 tests (0 ms)
+CpuAttentionKernelT_INT32: 1/1 tests (0 ms)
 ```
 
 ### Coverage Analysis
@@ -565,7 +565,7 @@ if (!Q || !K || !weights) {
 
 ### 3. Backward Compatibility
 
-**Result**: CPUAttentionT integration preserved all 17/17 tests
+**Result**: CpuAttentionKernelT integration preserved all 17/17 tests
 - No test updates needed
 - No numerical changes
 - No API changes
@@ -643,7 +643,7 @@ bool FusedGemmSoftmax::execute(
 
 **Source Files** (Stage 1):
 - `src/v2/kernels/cpu/FusedGemmSoftmax.{h,cpp}` - Fused kernel implementation
-- `src/v2/kernels/cpu/CPUAttentionT.h` - Integration point
+- `src/v2/kernels/cpu/CpuAttentionKernelT.h` - Integration point
 - `tests/v2/unit/Test__FusedGemmSoftmax.cpp` - Correctness tests
 
 **Build Files**:
@@ -659,7 +659,7 @@ bool FusedGemmSoftmax::execute(
 **Achievements**:
 - ✅ Implemented tile-based fused GEMM+Softmax kernel (335 lines)
 - ✅ 12/12 correctness tests passing (exact numerical parity)
-- ✅ Integrated into CPUAttentionT (17/17 tests still passing)
+- ✅ Integrated into CpuAttentionKernelT (17/17 tests still passing)
 - ✅ **47% memory reduction** (750 MB → 396 MB for Qwen 2.5 0.5B)
 - ✅ **Zero precision loss** (exact match with reference)
 - ✅ **Zero breaking changes** (backward compatible)

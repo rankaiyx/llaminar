@@ -1,6 +1,6 @@
 /**
- * @file Test__GQAAttention.cpp
- * @brief Comprehensive unit tests for GQAAttention helpers and overall flow
+ * @file Test__MpiAttentionOrchestrator.cpp
+ * @brief Comprehensive unit tests for MpiAttentionOrchestrator helpers and overall flow
  * @author David Sanftenberg
  *
  * Tests both individual helper functions and integrated attention flow:
@@ -11,7 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "v2/pipelines/attention/GQAAttention.h"
+#include "v2/pipelines/attention/MpiAttentionOrchestrator.h"
 #include "v2/tensors/Tensors.h"
 #include <memory>
 #include <vector>
@@ -23,9 +23,9 @@
 using namespace llaminar2;
 
 /**
- * @brief Test fixture for GQAAttention unit tests
+ * @brief Test fixture for MpiAttentionOrchestrator unit tests
  */
-class GQAAttentionTest : public ::testing::Test
+class MpiAttentionOrchestratorTest : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -134,7 +134,7 @@ protected:
      * @param max_heads Maximum number of heads
      * @param head_dim Head dimension
      */
-    void allocateWorkspaces(GQAAttentionConfig &config, int max_seq_len, int max_heads, int head_dim)
+    void allocateWorkspaces(MpiAttentionConfig &config, int max_seq_len, int max_heads, int head_dim)
     {
         // Get number of OpenMP threads that will be used
         int num_threads = 1;
@@ -175,81 +175,81 @@ protected:
 // validate_inputs() Tests
 // ============================================================================
 
-TEST_F(GQAAttentionTest, ValidateInputs_ValidConfig)
+TEST_F(MpiAttentionOrchestratorTest, ValidateInputs_ValidConfig)
 {
     auto Q = createRandomTensor({(size_t)seq_len_, (size_t)d_model_});
     auto K = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
     auto V = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
     auto output = createFilledTensor({(size_t)seq_len_, (size_t)d_model_}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads_;
     config.n_kv_heads = n_kv_heads_;
     config.head_dim = head_dim_;
 
-    EXPECT_TRUE(GQAAttention::validate_inputs(
+    EXPECT_TRUE(MpiAttentionOrchestrator::validate_inputs(
         Q.get(), K.get(), V.get(), output.get(), config))
         << "Valid inputs should pass validation";
 }
 
-TEST_F(GQAAttentionTest, ValidateInputs_NullInputs)
+TEST_F(MpiAttentionOrchestratorTest, ValidateInputs_NullInputs)
 {
     auto Q = createRandomTensor({(size_t)seq_len_, (size_t)d_model_});
     auto K = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
     auto V = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads_;
     config.n_kv_heads = n_kv_heads_;
     config.head_dim = head_dim_;
 
-    EXPECT_FALSE(GQAAttention::validate_inputs(
+    EXPECT_FALSE(MpiAttentionOrchestrator::validate_inputs(
         nullptr, K.get(), V.get(), Q.get(), config))
         << "Null Q should fail validation";
 
-    EXPECT_FALSE(GQAAttention::validate_inputs(
+    EXPECT_FALSE(MpiAttentionOrchestrator::validate_inputs(
         Q.get(), nullptr, V.get(), Q.get(), config))
         << "Null K should fail validation";
 
-    EXPECT_FALSE(GQAAttention::validate_inputs(
+    EXPECT_FALSE(MpiAttentionOrchestrator::validate_inputs(
         Q.get(), K.get(), nullptr, Q.get(), config))
         << "Null V should fail validation";
 
-    EXPECT_FALSE(GQAAttention::validate_inputs(
+    EXPECT_FALSE(MpiAttentionOrchestrator::validate_inputs(
         Q.get(), K.get(), V.get(), nullptr, config))
         << "Null output should fail validation";
 }
 
-TEST_F(GQAAttentionTest, ValidateInputs_HeadDivisibility)
+TEST_F(MpiAttentionOrchestratorTest, ValidateInputs_HeadDivisibility)
 {
     auto Q = createRandomTensor({(size_t)seq_len_, (size_t)d_model_});
     auto K = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
     auto V = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
     auto output = createFilledTensor({(size_t)seq_len_, (size_t)d_model_}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = 5; // Not divisible by n_kv_heads = 2
     config.n_kv_heads = 2;
     config.head_dim = head_dim_;
 
-    EXPECT_FALSE(GQAAttention::validate_inputs(
+    EXPECT_FALSE(MpiAttentionOrchestrator::validate_inputs(
         Q.get(), K.get(), V.get(), output.get(), config))
         << "n_heads not divisible by n_kv_heads should fail";
 }
 
-TEST_F(GQAAttentionTest, ValidateInputs_DimensionMismatch)
+TEST_F(MpiAttentionOrchestratorTest, ValidateInputs_DimensionMismatch)
 {
     auto Q = createRandomTensor({(size_t)seq_len_, (size_t)(d_model_ + 10)}); // Wrong d_model
     auto K = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
     auto V = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
     auto output = createFilledTensor({(size_t)seq_len_, (size_t)d_model_}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads_;
     config.n_kv_heads = n_kv_heads_;
     config.head_dim = head_dim_;
 
-    EXPECT_FALSE(GQAAttention::validate_inputs(
+    EXPECT_FALSE(MpiAttentionOrchestrator::validate_inputs(
         Q.get(), K.get(), V.get(), output.get(), config))
         << "Q dimension mismatch should fail";
 }
@@ -258,7 +258,7 @@ TEST_F(GQAAttentionTest, ValidateInputs_DimensionMismatch)
 // broadcast_kv_heads_if_needed() Tests
 // ============================================================================
 
-TEST_F(GQAAttentionTest, BroadcastKVHeads_GQA)
+TEST_F(MpiAttentionOrchestratorTest, BroadcastKVHeads_GQA)
 {
     // GQA: 2 KV heads, 4 Q heads (each KV head broadcasts to 2 Q heads)
     int seq_len = 4;
@@ -277,7 +277,7 @@ TEST_F(GQAAttentionTest, BroadcastKVHeads_GQA)
     }
 
     std::vector<float> K_out, V_out;
-    GQAAttention::broadcast_kv_heads_if_needed(
+    MpiAttentionOrchestrator::broadcast_kv_heads_if_needed(
         K_in.data(), V_in.data(), K_out, V_out,
         seq_len, n_heads, n_kv_heads, head_dim);
 
@@ -299,7 +299,7 @@ TEST_F(GQAAttentionTest, BroadcastKVHeads_GQA)
     }
 }
 
-TEST_F(GQAAttentionTest, BroadcastKVHeads_MQA)
+TEST_F(MpiAttentionOrchestratorTest, BroadcastKVHeads_MQA)
 {
     // MQA: 1 KV head, 4 Q heads (single KV head broadcasts to all Q heads)
     int seq_len = 4;
@@ -313,7 +313,7 @@ TEST_F(GQAAttentionTest, BroadcastKVHeads_MQA)
     std::fill(V_in.begin(), V_in.end(), 99.0f);
 
     std::vector<float> K_out, V_out;
-    GQAAttention::broadcast_kv_heads_if_needed(
+    MpiAttentionOrchestrator::broadcast_kv_heads_if_needed(
         K_in.data(), V_in.data(), K_out, V_out,
         seq_len, n_heads, n_kv_heads, head_dim);
 
@@ -333,7 +333,7 @@ TEST_F(GQAAttentionTest, BroadcastKVHeads_MQA)
     }
 }
 
-TEST_F(GQAAttentionTest, BroadcastKVHeads_MHA)
+TEST_F(MpiAttentionOrchestratorTest, BroadcastKVHeads_MHA)
 {
     // MHA: n_kv_heads == n_heads (no broadcasting needed)
     int seq_len = 4;
@@ -347,7 +347,7 @@ TEST_F(GQAAttentionTest, BroadcastKVHeads_MHA)
     std::iota(V_in.begin(), V_in.end(), 1000.0f);
 
     std::vector<float> K_out, V_out;
-    GQAAttention::broadcast_kv_heads_if_needed(
+    MpiAttentionOrchestrator::broadcast_kv_heads_if_needed(
         K_in.data(), V_in.data(), K_out, V_out,
         seq_len, n_heads, n_kv_heads, head_dim);
 
@@ -360,7 +360,7 @@ TEST_F(GQAAttentionTest, BroadcastKVHeads_MHA)
 // extract_head_data() and write_context_to_output() Tests
 // ============================================================================
 
-TEST_F(GQAAttentionTest, ExtractHead_SingleHead)
+TEST_F(MpiAttentionOrchestratorTest, ExtractHead_SingleHead)
 {
     int seq_len = 4;
     int n_heads = 3;
@@ -375,7 +375,7 @@ TEST_F(GQAAttentionTest, ExtractHead_SingleHead)
 
     // Extract head 1
     std::vector<float> contiguous(seq_len * head_dim);
-    GQAAttention::extract_head_data(
+    MpiAttentionOrchestrator::extract_head_data(
         strided.data(), contiguous.data(),
         seq_len, head_dim, n_heads, 1 /*head_idx*/);
 
@@ -391,7 +391,7 @@ TEST_F(GQAAttentionTest, ExtractHead_SingleHead)
     }
 }
 
-TEST_F(GQAAttentionTest, ExtractAndWriteRoundTrip)
+TEST_F(MpiAttentionOrchestratorTest, ExtractAndWriteRoundTrip)
 {
     int seq_len = 4;
     int n_heads = 2;
@@ -403,13 +403,13 @@ TEST_F(GQAAttentionTest, ExtractAndWriteRoundTrip)
 
     // Extract head 0
     std::vector<float> contiguous(seq_len * head_dim);
-    GQAAttention::extract_head_data(
+    MpiAttentionOrchestrator::extract_head_data(
         original.data(), contiguous.data(),
         seq_len, head_dim, n_heads, 0);
 
     // Write back to strided
     std::vector<float> reconstructed(seq_len * n_heads * head_dim, -999.0f);
-    GQAAttention::write_context_to_output(
+    MpiAttentionOrchestrator::write_context_to_output(
         contiguous.data(), reconstructed.data(),
         seq_len, head_dim, n_heads, 0);
 
@@ -429,7 +429,7 @@ TEST_F(GQAAttentionTest, ExtractAndWriteRoundTrip)
 // scale_scores_inplace() Tests
 // ============================================================================
 
-TEST_F(GQAAttentionTest, ScaleScores_Correctness)
+TEST_F(MpiAttentionOrchestratorTest, ScaleScores_Correctness)
 {
     int head_dim = 64;
     int size = 16;
@@ -438,7 +438,7 @@ TEST_F(GQAAttentionTest, ScaleScores_Correctness)
     std::vector<float> scores(size);
     std::fill(scores.begin(), scores.end(), 8.0f);
 
-    GQAAttention::scale_scores_inplace(scores.data(), size, head_dim);
+    MpiAttentionOrchestrator::scale_scores_inplace(scores.data(), size, head_dim);
 
     for (int i = 0; i < size; ++i)
     {
@@ -446,7 +446,7 @@ TEST_F(GQAAttentionTest, ScaleScores_Correctness)
     }
 }
 
-TEST_F(GQAAttentionTest, ScaleScores_DifferentHeadDims)
+TEST_F(MpiAttentionOrchestratorTest, ScaleScores_DifferentHeadDims)
 {
     std::vector<int> head_dims = {32, 64, 128};
 
@@ -455,7 +455,7 @@ TEST_F(GQAAttentionTest, ScaleScores_DifferentHeadDims)
         float expected_scale = 1.0f / std::sqrt((float)head_dim);
         std::vector<float> scores(10, 1.0f);
 
-        GQAAttention::scale_scores_inplace(scores.data(), 10, head_dim);
+        MpiAttentionOrchestrator::scale_scores_inplace(scores.data(), 10, head_dim);
 
         for (float val : scores)
         {
@@ -469,13 +469,13 @@ TEST_F(GQAAttentionTest, ScaleScores_DifferentHeadDims)
 // apply_attention_mask() Tests
 // ============================================================================
 
-TEST_F(GQAAttentionTest, ApplyMask_Causal)
+TEST_F(MpiAttentionOrchestratorTest, ApplyMask_Causal)
 {
     int seq_len = 4;
     std::vector<float> scores(seq_len * seq_len);
     std::fill(scores.begin(), scores.end(), 1.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = 1;
     config.head_dim = 64;
 
@@ -483,7 +483,7 @@ TEST_F(GQAAttentionTest, ApplyMask_Causal)
     config.workspace_mask = std::make_shared<FP32Tensor>(
         std::vector<size_t>{(size_t)seq_len, (size_t)seq_len});
 
-    GQAAttention::apply_attention_mask(
+    MpiAttentionOrchestrator::apply_attention_mask(
         scores.data(), seq_len, 1 /*batch_size*/,
         nullptr /*seq_lengths*/, true /*causal*/, -1 /*window_size*/, config);
 
@@ -516,14 +516,14 @@ TEST_F(GQAAttentionTest, ApplyMask_Causal)
 // apply_softmax() Tests
 // ============================================================================
 
-TEST_F(GQAAttentionTest, ApplySoftmax_UniformRow)
+TEST_F(MpiAttentionOrchestratorTest, ApplySoftmax_UniformRow)
 {
     int rows = 1;
     int cols = 4;
     std::vector<float> scores(rows * cols);
     std::fill(scores.begin(), scores.end(), 1.0f); // All same value
 
-    GQAAttention::apply_softmax(scores.data(), rows, cols);
+    MpiAttentionOrchestrator::apply_softmax(scores.data(), rows, cols);
 
     // Uniform input → uniform output (1/cols)
     for (int i = 0; i < cols; ++i)
@@ -537,7 +537,7 @@ TEST_F(GQAAttentionTest, ApplySoftmax_UniformRow)
     EXPECT_NEAR(sum, 1.0f, 1e-5f) << "Softmax row should sum to 1.0";
 }
 
-TEST_F(GQAAttentionTest, ApplySoftmax_MultipleRows)
+TEST_F(MpiAttentionOrchestratorTest, ApplySoftmax_MultipleRows)
 {
     int rows = 3;
     int cols = 4;
@@ -552,7 +552,7 @@ TEST_F(GQAAttentionTest, ApplySoftmax_MultipleRows)
         }
     }
 
-    GQAAttention::apply_softmax(scores.data(), rows, cols);
+    MpiAttentionOrchestrator::apply_softmax(scores.data(), rows, cols);
 
     // Verify each row sums to 1.0
     for (int r = 0; r < rows; ++r)
@@ -567,13 +567,13 @@ TEST_F(GQAAttentionTest, ApplySoftmax_MultipleRows)
     }
 }
 
-TEST_F(GQAAttentionTest, ApplySoftmax_WithMasking)
+TEST_F(MpiAttentionOrchestratorTest, ApplySoftmax_WithMasking)
 {
     int rows = 1;
     int cols = 4;
     std::vector<float> scores = {1.0f, 2.0f, -std::numeric_limits<float>::infinity(), 3.0f};
 
-    GQAAttention::apply_softmax(scores.data(), rows, cols);
+    MpiAttentionOrchestrator::apply_softmax(scores.data(), rows, cols);
 
     // Masked position should be zero
     EXPECT_FLOAT_EQ(scores[2], 0.0f) << "Masked position should be 0 after softmax";
@@ -587,7 +587,7 @@ TEST_F(GQAAttentionTest, ApplySoftmax_WithMasking)
 // compute_attention_scores() and compute_context_from_scores() Tests
 // ============================================================================
 
-TEST_F(GQAAttentionTest, ComputeScores_Identity)
+TEST_F(MpiAttentionOrchestratorTest, ComputeScores_Identity)
 {
     int seq_len = 4;
     int head_dim = 8;
@@ -604,7 +604,7 @@ TEST_F(GQAAttentionTest, ComputeScores_Identity)
     }
 
     std::vector<float> scores(seq_len * seq_len);
-    bool success = GQAAttention::compute_attention_scores(
+    bool success = MpiAttentionOrchestrator::compute_attention_scores(
         Q.data(), K.data(), scores.data(), seq_len, head_dim);
 
     EXPECT_TRUE(success);
@@ -628,7 +628,7 @@ TEST_F(GQAAttentionTest, ComputeScores_Identity)
     }
 }
 
-TEST_F(GQAAttentionTest, ComputeContext_Identity)
+TEST_F(MpiAttentionOrchestratorTest, ComputeContext_Identity)
 {
     int seq_len = 4;
     int head_dim = 8;
@@ -647,7 +647,7 @@ TEST_F(GQAAttentionTest, ComputeContext_Identity)
     }
 
     std::vector<float> context(seq_len * head_dim);
-    bool success = GQAAttention::compute_context_from_scores(
+    bool success = MpiAttentionOrchestrator::compute_context_from_scores(
         scores.data(), V.data(), context.data(), seq_len, head_dim);
 
     EXPECT_TRUE(success);
@@ -663,7 +663,7 @@ TEST_F(GQAAttentionTest, ComputeContext_Identity)
     }
 }
 
-TEST_F(GQAAttentionTest, ComputeContext_UniformAttention)
+TEST_F(MpiAttentionOrchestratorTest, ComputeContext_UniformAttention)
 {
     int seq_len = 4;
     int head_dim = 8;
@@ -682,7 +682,7 @@ TEST_F(GQAAttentionTest, ComputeContext_UniformAttention)
     }
 
     std::vector<float> context(seq_len * head_dim);
-    GQAAttention::compute_context_from_scores(
+    MpiAttentionOrchestrator::compute_context_from_scores(
         scores.data(), V.data(), context.data(), seq_len, head_dim);
 
     // With uniform attention, context should be average of all V
@@ -701,7 +701,7 @@ TEST_F(GQAAttentionTest, ComputeContext_UniformAttention)
 // Integration Tests: Full Attention Flow
 // ============================================================================
 
-TEST_F(GQAAttentionTest, FullAttention_SingleHead_Correctness)
+TEST_F(MpiAttentionOrchestratorTest, FullAttention_SingleHead_Correctness)
 {
     // Simple single-head attention to verify full pipeline
     int seq_len = 4;
@@ -713,7 +713,7 @@ TEST_F(GQAAttentionTest, FullAttention_SingleHead_Correctness)
     auto V = createRandomTensor({(size_t)seq_len, (size_t)head_dim});
     auto output = createFilledTensor({(size_t)seq_len, (size_t)head_dim}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads;
     config.n_kv_heads = n_heads;
     config.head_dim = head_dim;
@@ -722,7 +722,7 @@ TEST_F(GQAAttentionTest, FullAttention_SingleHead_Correctness)
     // Allocate workspace buffers
     allocateWorkspaces(config, seq_len, n_heads, head_dim);
 
-    bool success = GQAAttention::compute(Q.get(), K.get(), V.get(), output.get(), config);
+    bool success = MpiAttentionOrchestrator::compute(Q.get(), K.get(), V.get(), output.get(), config);
 
     EXPECT_TRUE(success) << "Single-head attention should succeed";
 
@@ -746,7 +746,7 @@ TEST_F(GQAAttentionTest, FullAttention_SingleHead_Correctness)
     EXPECT_TRUE(has_nonzero) << "Output should have non-zero values";
 }
 
-TEST_F(GQAAttentionTest, FullAttention_MHA_Correctness)
+TEST_F(MpiAttentionOrchestratorTest, FullAttention_MHA_Correctness)
 {
     // Multi-head attention (MHA: n_heads == n_kv_heads)
     auto Q = createRandomTensor({(size_t)seq_len_, (size_t)d_model_});
@@ -754,7 +754,7 @@ TEST_F(GQAAttentionTest, FullAttention_MHA_Correctness)
     auto V = createRandomTensor({(size_t)seq_len_, (size_t)d_model_});
     auto output = createFilledTensor({(size_t)seq_len_, (size_t)d_model_}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads_;
     config.n_kv_heads = n_heads_; // MHA
     config.head_dim = head_dim_;
@@ -763,12 +763,12 @@ TEST_F(GQAAttentionTest, FullAttention_MHA_Correctness)
     // Allocate workspace buffers
     allocateWorkspaces(config, seq_len_, n_heads_, head_dim_);
 
-    bool success = GQAAttention::compute(Q.get(), K.get(), V.get(), output.get(), config);
+    bool success = MpiAttentionOrchestrator::compute(Q.get(), K.get(), V.get(), output.get(), config);
 
     EXPECT_TRUE(success) << "MHA should succeed";
 }
 
-TEST_F(GQAAttentionTest, FullAttention_GQA_Correctness)
+TEST_F(MpiAttentionOrchestratorTest, FullAttention_GQA_Correctness)
 {
     // Grouped-query attention (GQA: n_kv_heads < n_heads)
     auto Q = createRandomTensor({(size_t)seq_len_, (size_t)d_model_});
@@ -776,7 +776,7 @@ TEST_F(GQAAttentionTest, FullAttention_GQA_Correctness)
     auto V = createRandomTensor({(size_t)seq_len_, (size_t)(n_kv_heads_ * head_dim_)});
     auto output = createFilledTensor({(size_t)seq_len_, (size_t)d_model_}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads_;
     config.n_kv_heads = n_kv_heads_; // GQA
     config.head_dim = head_dim_;
@@ -785,12 +785,12 @@ TEST_F(GQAAttentionTest, FullAttention_GQA_Correctness)
     // Allocate workspace buffers
     allocateWorkspaces(config, seq_len_, n_heads_, head_dim_);
 
-    bool success = GQAAttention::compute(Q.get(), K.get(), V.get(), output.get(), config);
+    bool success = MpiAttentionOrchestrator::compute(Q.get(), K.get(), V.get(), output.get(), config);
 
     EXPECT_TRUE(success) << "GQA should succeed";
 }
 
-TEST_F(GQAAttentionTest, FullAttention_MQA_Correctness)
+TEST_F(MpiAttentionOrchestratorTest, FullAttention_MQA_Correctness)
 {
     // Multi-query attention (MQA: n_kv_heads = 1)
     auto Q = createRandomTensor({(size_t)seq_len_, (size_t)d_model_});
@@ -798,7 +798,7 @@ TEST_F(GQAAttentionTest, FullAttention_MQA_Correctness)
     auto V = createRandomTensor({(size_t)seq_len_, (size_t)head_dim_});
     auto output = createFilledTensor({(size_t)seq_len_, (size_t)d_model_}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads_;
     config.n_kv_heads = 1; // MQA
     config.head_dim = head_dim_;
@@ -807,12 +807,12 @@ TEST_F(GQAAttentionTest, FullAttention_MQA_Correctness)
     // Allocate workspace buffers
     allocateWorkspaces(config, seq_len_, n_heads_, head_dim_);
 
-    bool success = GQAAttention::compute(Q.get(), K.get(), V.get(), output.get(), config);
+    bool success = MpiAttentionOrchestrator::compute(Q.get(), K.get(), V.get(), output.get(), config);
 
     EXPECT_TRUE(success) << "MQA should succeed";
 }
 
-TEST_F(GQAAttentionTest, FullAttention_CausalMask)
+TEST_F(MpiAttentionOrchestratorTest, FullAttention_CausalMask)
 {
     // Test causal masking in full attention
     int seq_len = 4;
@@ -837,7 +837,7 @@ TEST_F(GQAAttentionTest, FullAttention_CausalMask)
         V_data[t * head_dim + 0] = (float)t; // Distinctive value per token
     }
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads;
     config.n_kv_heads = n_heads;
     config.head_dim = head_dim;
@@ -846,7 +846,7 @@ TEST_F(GQAAttentionTest, FullAttention_CausalMask)
     // Allocate workspace buffers
     allocateWorkspaces(config, seq_len, n_heads, head_dim);
 
-    bool success = GQAAttention::compute(Q.get(), K.get(), V.get(), output.get(), config);
+    bool success = MpiAttentionOrchestrator::compute(Q.get(), K.get(), V.get(), output.get(), config);
 
     EXPECT_TRUE(success);
 
@@ -870,7 +870,7 @@ TEST_F(GQAAttentionTest, FullAttention_CausalMask)
     EXPECT_LT(out_data[3 * head_dim + 0], 4.0f) << "Token 3 attention should be reasonable";
 }
 
-TEST_F(GQAAttentionTest, FullAttention_BatchMode)
+TEST_F(MpiAttentionOrchestratorTest, FullAttention_BatchMode)
 {
     // Test batched attention
     int batch_size = 2;
@@ -888,7 +888,7 @@ TEST_F(GQAAttentionTest, FullAttention_BatchMode)
     // Actual lengths (no padding for this test)
     std::vector<int> actual_lengths = {seq_len, seq_len};
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads;
     config.n_kv_heads = n_heads;
     config.head_dim = head_dim;
@@ -897,7 +897,7 @@ TEST_F(GQAAttentionTest, FullAttention_BatchMode)
     // Allocate workspace buffers (use batch_size * seq_len for batched mode)
     allocateWorkspaces(config, batch_size * seq_len, n_heads, head_dim);
 
-    bool success = GQAAttention::compute_batch(
+    bool success = MpiAttentionOrchestrator::compute_batch(
         Q.get(), K.get(), V.get(), output.get(),
         actual_lengths, batch_size, seq_len, config);
 
@@ -908,7 +908,7 @@ TEST_F(GQAAttentionTest, FullAttention_BatchMode)
 // Edge Case Tests
 // ============================================================================
 
-TEST_F(GQAAttentionTest, EdgeCase_SingleToken)
+TEST_F(MpiAttentionOrchestratorTest, EdgeCase_SingleToken)
 {
     // Single token sequence (seq_len = 1)
     int seq_len = 1;
@@ -921,7 +921,7 @@ TEST_F(GQAAttentionTest, EdgeCase_SingleToken)
     auto V = createRandomTensor({(size_t)seq_len, (size_t)d_model});
     auto output = createFilledTensor({(size_t)seq_len, (size_t)d_model}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads;
     config.n_kv_heads = n_heads;
     config.head_dim = head_dim;
@@ -930,12 +930,12 @@ TEST_F(GQAAttentionTest, EdgeCase_SingleToken)
     // Allocate workspace buffers
     allocateWorkspaces(config, seq_len, n_heads, head_dim);
 
-    bool success = GQAAttention::compute(Q.get(), K.get(), V.get(), output.get(), config);
+    bool success = MpiAttentionOrchestrator::compute(Q.get(), K.get(), V.get(), output.get(), config);
 
     EXPECT_TRUE(success) << "Single token should work";
 }
 
-TEST_F(GQAAttentionTest, EdgeCase_LargeSequence)
+TEST_F(MpiAttentionOrchestratorTest, EdgeCase_LargeSequence)
 {
     // Large sequence to test memory allocation
     int seq_len = 512;
@@ -948,7 +948,7 @@ TEST_F(GQAAttentionTest, EdgeCase_LargeSequence)
     auto V = createRandomTensor({(size_t)seq_len, (size_t)d_model});
     auto output = createFilledTensor({(size_t)seq_len, (size_t)d_model}, 0.0f);
 
-    GQAAttentionConfig config;
+    MpiAttentionConfig config;
     config.n_heads = n_heads;
     config.n_kv_heads = n_heads;
     config.head_dim = head_dim;
@@ -957,12 +957,12 @@ TEST_F(GQAAttentionTest, EdgeCase_LargeSequence)
     // Allocate workspace buffers
     allocateWorkspaces(config, seq_len, n_heads, head_dim);
 
-    bool success = GQAAttention::compute(Q.get(), K.get(), V.get(), output.get(), config);
+    bool success = MpiAttentionOrchestrator::compute(Q.get(), K.get(), V.get(), output.get(), config);
 
     EXPECT_TRUE(success) << "Large sequence (512 tokens) should work";
 }
 
-TEST_F(GQAAttentionTest, EdgeCase_ZeroHead)
+TEST_F(MpiAttentionOrchestratorTest, EdgeCase_ZeroHead)
 {
     // Verify extraction/writing works for head 0
     int seq_len = 4;
@@ -973,7 +973,7 @@ TEST_F(GQAAttentionTest, EdgeCase_ZeroHead)
     std::iota(strided.begin(), strided.end(), 0.0f);
 
     std::vector<float> contiguous(seq_len * head_dim);
-    GQAAttention::extract_head_data(
+    MpiAttentionOrchestrator::extract_head_data(
         strided.data(), contiguous.data(),
         seq_len, head_dim, n_heads, 0 /*head_idx*/);
 
@@ -988,7 +988,7 @@ TEST_F(GQAAttentionTest, EdgeCase_ZeroHead)
     }
 }
 
-TEST_F(GQAAttentionTest, EdgeCase_LastHead)
+TEST_F(MpiAttentionOrchestratorTest, EdgeCase_LastHead)
 {
     // Verify extraction/writing works for last head
     int seq_len = 4;
@@ -999,7 +999,7 @@ TEST_F(GQAAttentionTest, EdgeCase_LastHead)
     std::iota(strided.begin(), strided.end(), 0.0f);
 
     std::vector<float> contiguous(seq_len * head_dim);
-    GQAAttention::extract_head_data(
+    MpiAttentionOrchestrator::extract_head_data(
         strided.data(), contiguous.data(),
         seq_len, head_dim, n_heads, n_heads - 1 /*last head*/);
 

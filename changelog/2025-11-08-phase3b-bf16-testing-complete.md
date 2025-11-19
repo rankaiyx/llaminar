@@ -1,11 +1,11 @@
-# Phase 3b: Extended CPUAttentionT Testing - COMPLETE
+# Phase 3b: Extended CpuAttentionKernelT Testing - COMPLETE
 
 **Date**: November 8, 2025  
 **Status**: ✅ **COMPLETE** - All FP32 and BF16 tests passing (17/17)
 
 ## Summary
 
-Successfully completed Phase 3b by adding comprehensive BF16 testing for `CPUAttentionT` template. During implementation, discovered and fixed **3 critical bugs** in the template that were causing segmentation faults and heap corruption for BF16/FP16 precision variants.
+Successfully completed Phase 3b by adding comprehensive BF16 testing for `CpuAttentionKernelT` template. During implementation, discovered and fixed **3 critical bugs** in the template that were causing segmentation faults and heap corruption for BF16/FP16 precision variants.
 
 ## Test Results
 
@@ -49,7 +49,7 @@ Successfully completed Phase 3b by adding comprehensive BF16 testing for `CPUAtt
 
 ### Bug #1: Output Pointer Type Mismatch
 
-**File**: `src/v2/kernels/cpu/CPUAttentionT.h:110`
+**File**: `src/v2/kernels/cpu/CpuAttentionKernelT.h:110`
 
 **Problem**:
 ```cpp
@@ -88,16 +88,16 @@ bool compute_typed(
 ```
 
 **Changed Files**:
-- `CPUAttentionT.h:110` - Removed output cast in `compute()`
-- `CPUAttentionT.h:131` - Changed `compute_typed()` signature to `float *output`
-- `CPUAttentionT.h:286` - Changed `output_h` type to `float*`
-- `CPUAttentionT.h:300` - Removed cast when passing to GEMM
+- `CpuAttentionKernelT.h:110` - Removed output cast in `compute()`
+- `CpuAttentionKernelT.h:131` - Changed `compute_typed()` signature to `float *output`
+- `CpuAttentionKernelT.h:286` - Changed `output_h` type to `float*`
+- `CpuAttentionKernelT.h:300` - Removed cast when passing to GEMM
 
 ---
 
 ### Bug #2: KV Broadcast Buffer Size Mismatch
 
-**File**: `src/v2/kernels/cpu/CPUAttentionT.h:217`
+**File**: `src/v2/kernels/cpu/CpuAttentionKernelT.h:217`
 
 **Problem**:
 ```cpp
@@ -152,15 +152,15 @@ if (n_heads != n_kv_heads) {
 ```
 
 **Changed Files**:
-- `CPUAttentionT.h:217-237` - Changed broadcast buffers to `std::vector<float>`
-- `CPUAttentionT.h:252` - Updated K_h type to `const float*`
-- `CPUAttentionT.h:302` - Updated V_h type to `const float*`
+- `CpuAttentionKernelT.h:217-237` - Changed broadcast buffers to `std::vector<float>`
+- `CpuAttentionKernelT.h:252` - Updated K_h type to `const float*`
+- `CpuAttentionKernelT.h:302` - Updated V_h type to `const float*`
 
 ---
 
 ### Bug #3: Output memset Size Calculation
 
-**File**: `src/v2/kernels/cpu/CPUAttentionT.h:276`
+**File**: `src/v2/kernels/cpu/CpuAttentionKernelT.h:276`
 
 **Problem**:
 ```cpp
@@ -187,7 +187,7 @@ std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
 ```
 
 **Changed Files**:
-- `CPUAttentionT.h:292` - Changed `sizeof(ElementType)` → `sizeof(float)`
+- `CpuAttentionKernelT.h:292` - Changed `sizeof(ElementType)` → `sizeof(float)`
 
 ---
 
@@ -232,7 +232,7 @@ init_sequential_bf16(Q_bf16.data(), Q_bf16.size());
 std::vector<float> output(seq_len * n_heads * head_dim);
 
 // 4. Call with type-erased interface
-CPUAttentionT<BF16Tensor> attention;
+CpuAttentionKernelT<BF16Tensor> attention;
 bool success = attention.compute(
     reinterpret_cast<float*>(Q_bf16.data()),  // BF16→float* cast for interface
     ...,
@@ -245,14 +245,14 @@ bool success = attention.compute(
 ### Modified Files
 
 **Source Code**:
-1. `src/v2/kernels/cpu/CPUAttentionT.h` (370→389 lines)
+1. `src/v2/kernels/cpu/CpuAttentionKernelT.h` (370→389 lines)
    - Fixed output pointer handling (removed ElementType cast)
    - Fixed KV broadcast buffers (ElementType→float)
    - Fixed memset size calculation (sizeof(ElementType)→sizeof(float))
    - Added extensive comments documenting FP32 output requirement
 
 **Test Code**:
-2. `tests/v2/unit/Test__CPUAttentionT.cpp` (385→~670 lines)
+2. `tests/v2/unit/Test__CpuAttentionKernelT.cpp` (385→~670 lines)
    - Added 6 BF16 tests (InstantiationWorks, BasicAttentionComputation, CausalMasking, MultiHeadAttention, GroupedQueryAttention, WorkspaceProvided)
    - Updated FP16 tests (removed computation tests until FP16GemmKernel implemented)
    - Added INT32 instantiation test
@@ -298,7 +298,7 @@ Phase 3b is now **COMPLETE**. Ready to proceed with Phase 4:
 **Blocking Dependencies**:
 - ✅ Phase 1 (Softmax primitives): COMPLETE
 - ✅ Phase 2 (ActivationTraits): COMPLETE
-- ✅ Phase 3 (CPUAttentionT core): COMPLETE
+- ✅ Phase 3 (CpuAttentionKernelT core): COMPLETE
 - ✅ Phase 3b (Extended testing): **COMPLETE** ← **WE ARE HERE**
 
 ### Future Work (Beyond Phase 4)
@@ -310,7 +310,7 @@ Phase 3b is now **COMPLETE**. Ready to proceed with Phase 4:
 - Estimated effort: 4-6 hours
 
 **Parity Testing**:
-- Compare `CPUAttentionT<FP32Tensor>` vs original `CPUAttention`
+- Compare `CpuAttentionKernelT<FP32Tensor>` vs original `CPUAttention`
 - Validate bit-exact match for FP32
 - Validate numerical similarity for BF16 (within tolerance)
 - Estimated effort: 2-3 hours
@@ -340,7 +340,7 @@ Phase 3b is now **COMPLETE**. Ready to proceed with Phase 4:
 
 ## Conclusion
 
-Phase 3b successfully extended CPUAttentionT testing to BF16 precision, uncovering and fixing **3 critical memory corruption bugs** in the template implementation. All tests now pass (17/17, 100%), validating:
+Phase 3b successfully extended CpuAttentionKernelT testing to BF16 precision, uncovering and fixing **3 critical memory corruption bugs** in the template implementation. All tests now pass (17/17, 100%), validating:
 
 ✅ Template instantiation for FP32/BF16/FP16/INT32  
 ✅ BF16 attention computation (all variants)  

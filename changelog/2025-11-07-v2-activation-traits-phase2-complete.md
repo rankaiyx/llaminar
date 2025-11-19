@@ -67,7 +67,7 @@ struct ActivationTraits<FP32Tensor>
     static std::unique_ptr<ITensorGemm> create_activation_gemm()
     {
         FP32Tensor temp({1, 1});
-        return temp.createGemm();  // Temporary until CPUAttentionT refactor
+        return temp.createGemm();  // Temporary until CpuAttentionKernelT refactor
     }
 
     static std::shared_ptr<TensorBase> allocate_workspace(
@@ -414,10 +414,10 @@ cd build_v2 && ctest -R "V2_Unit_ActivationTraits" --verbose
 
 **Solution**: ActivationTraits template with specializations
 
-**Usage in CPUAttentionT** (Phase 3):
+**Usage in CpuAttentionKernelT** (Phase 3):
 ```cpp
 template<typename TensorType>
-class CPUAttentionT : public ITensorAttention {
+class CpuAttentionKernelT : public ITensorAttention {
     using ElementType = typename TensorType::value_type;
     using Traits = ActivationTraits<TensorType>;
     
@@ -484,7 +484,7 @@ ActivationTraits<FP16Tensor>::apply_softmax(scores, rows, cols, causal, scale)
 **Validation Chain**:
 1. Phase 1 tests: Softmax primitives correct (26/26 passing)
 2. Phase 2 tests: Traits dispatch correctly (16/16 passing)
-3. **Result**: CPUAttentionT can trust trait softmax calls (Phase 3)
+3. **Result**: CpuAttentionKernelT can trust trait softmax calls (Phase 3)
 
 ### 4. INT32 Conversion Strategy
 
@@ -570,7 +570,7 @@ auto workspace = Traits::allocate_workspace({seq_len, n_heads, head_dim});
 
 ```cpp
 template<typename TensorType>
-class CPUAttentionT : public ITensorAttention {
+class CpuAttentionKernelT : public ITensorAttention {
     using ElementType = typename TensorType::value_type;
     using Traits = ActivationTraits<TensorType>;
     
@@ -598,10 +598,10 @@ class CPUAttentionT : public ITensorAttention {
 };
 
 // Explicit instantiations (zero code duplication!)
-template class CPUAttentionT<FP32Tensor>;
-template class CPUAttentionT<BF16Tensor>;
-template class CPUAttentionT<FP16Tensor>;
-template class CPUAttentionT<INT32Tensor>;
+template class CpuAttentionKernelT<FP32Tensor>;
+template class CpuAttentionKernelT<BF16Tensor>;
+template class CpuAttentionKernelT<FP16Tensor>;
+template class CpuAttentionKernelT<INT32Tensor>;
 ```
 
 **Key Benefits**:
@@ -620,18 +620,18 @@ attention->compute(Q, K, V, output, ...);
 
 // After (result-tensor pattern with traits):
 FP32Tensor output({seq_len, n_heads, head_dim});
-output.computeAttention(Q, K, V, ...);  // Uses CPUAttentionT<FP32Tensor> + ActivationTraits<FP32Tensor>
+output.computeAttention(Q, K, V, ...);  // Uses CpuAttentionKernelT<FP32Tensor> + ActivationTraits<FP32Tensor>
 ```
 
 **Implementation** (Phase 5):
 ```cpp
 bool FP32Tensor::computeAttention(const float *Q, const float *K, const float *V, ...) {
-    CPUAttentionT<FP32Tensor> kernel;
+    CpuAttentionKernelT<FP32Tensor> kernel;
     return kernel.compute(Q, K, V, this->data(), ...);
 }
 ```
 
-**ActivationTraits Role**: Provides softmax, GEMM, workspace allocation to CPUAttentionT
+**ActivationTraits Role**: Provides softmax, GEMM, workspace allocation to CpuAttentionKernelT
 
 ---
 
@@ -671,19 +671,19 @@ bool FP32Tensor::computeAttention(const float *Q, const float *K, const float *V
 
 ### Objective
 
-Refactor CPUAttention to template-based CPUAttentionT<TensorType>, eliminating:
+Refactor CPUAttention to template-based CpuAttentionKernelT<TensorType>, eliminating:
 - ❌ Dummy tensor creation (heap allocation just for kernel access)
 - ❌ Hardcoded FP32 types (float pointers, FP32Tensor workspaces)
 - ❌ Code duplication (would need 4 copies without templates)
 
 ### Implementation Plan
 
-**File**: `src/v2/kernels/cpu/CPUAttentionT.h` (new file)
+**File**: `src/v2/kernels/cpu/CpuAttentionKernelT.h` (new file)
 
 **Template Kernel**:
 ```cpp
 template<typename TensorType>
-class CPUAttentionT : public ITensorAttention {
+class CpuAttentionKernelT : public ITensorAttention {
 public:
     using ElementType = typename TensorType::value_type;
     using Traits = ActivationTraits<TensorType>;
@@ -702,12 +702,12 @@ public:
 4. Add explicit instantiations for FP32, BF16, FP16, INT32
 
 **Testing**:
-- Validate FP32 CPUAttentionT against existing CPUAttention (parity test)
+- Validate FP32 CpuAttentionKernelT against existing CPUAttention (parity test)
 - Test BF16, FP16, INT32 variants independently
 - Cross-precision parity tests (FP32 ground truth)
 
 **Success Criteria**:
-- ✅ All existing CPUAttention tests pass with CPUAttentionT<FP32Tensor>
+- ✅ All existing CPUAttention tests pass with CpuAttentionKernelT<FP32Tensor>
 - ✅ BF16, FP16, INT32 variants produce reasonable results
 - ✅ No dummy tensor creation
 - ✅ Zero code duplication
@@ -946,4 +946,4 @@ Unit                =   0.75 sec*proc (1 test)
 
 **Ready for Phase 3**: CPUAttention template refactoring can now use ActivationTraits for precision-specific operations with confidence.
 
-**Next Action**: Begin Phase 3 - Create `CPUAttentionT<TensorType>` template class using ActivationTraits for softmax, GEMM, and workspace allocation.
+**Next Action**: Begin Phase 3 - Create `CpuAttentionKernelT<TensorType>` template class using ActivationTraits for softmax, GEMM, and workspace allocation.

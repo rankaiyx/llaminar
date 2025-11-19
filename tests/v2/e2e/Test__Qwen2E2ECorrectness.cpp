@@ -489,6 +489,9 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatchEqualLength)
     mpi_ctx_->barrier();
 
     // ======== Compare Sequential vs Batched ========
+    std::vector<int> test_results(batch_size, 1);
+
+    // Rank 0: Compare all sequences
     if (rank_ == 0)
     {
         for (size_t i = 0; i < batch_size; ++i)
@@ -505,16 +508,26 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatchEqualLength)
             std::string test_name = "Batch Parity (Equal Length) - Sequence " + std::to_string(i);
             printComparisonResult(result, test_name);
 
-            EXPECT_TRUE(result.passed)
-                << "Sequence " << i << " mismatch: "
-                << "max_abs_diff=" << result.max_abs_diff
-                << ", rel_l2=" << result.rel_l2_norm;
+            test_results[i] = result.passed ? 1 : 0;
         }
+    }
 
-        LOG_INFO("[E2E] Equal-length batch test complete");
+    // Broadcast all results to all ranks
+    MPI_Bcast(test_results.data(), batch_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // All ranks check results together
+    for (size_t i = 0; i < batch_size; ++i)
+    {
+        ASSERT_EQ(test_results[i], 1)
+            << "Sequence " << i << " parity check failed on rank 0";
     }
 
     mpi_ctx_->barrier();
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("[E2E] Equal-length batch test complete");
+    }
 }
 
 /**
@@ -556,13 +569,17 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
 
     // ======== Sequential Execution (Baseline) ========
     std::vector<std::vector<float>> logits_sequential(batch_size);
+    std::vector<std::unique_ptr<Qwen2Pipeline>> pipelines_seq(batch_size);
 
     for (size_t i = 0; i < batch_size; ++i)
     {
-        auto pipeline_seq = std::make_unique<Qwen2Pipeline>(
+        pipelines_seq[i] = std::make_unique<Qwen2Pipeline>(
             model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
-        bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
+        // Enable snapshot capture for sequential baseline
+        pipelines_seq[i]->enableSnapshotCapture("/tmp/llaminar_snapshots_seq_" + std::to_string(i));
+
+        bool success = pipelines_seq[i]->forward(batch[i].data(), batch[i].size());
         local_ok = success;
         int global_success = local_ok ? 1 : 0;
         MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -573,7 +590,7 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
         size_t seq_len = batch[i].size();
 
         logits_sequential[i].resize(seq_len * vocab_size);
-        const float *logits_ptr = pipeline_seq->getLogits(0);
+        const float *logits_ptr = pipelines_seq[i]->getLogits(0);
         ASSERT_NE(logits_ptr, nullptr);
         std::memcpy(logits_sequential[i].data(), logits_ptr, seq_len * vocab_size * sizeof(float));
 
@@ -588,6 +605,9 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
     // ======== Batched Execution ========
     auto pipeline_batch = std::make_unique<Qwen2Pipeline>(
         model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/batch_size);
+
+    // Enable snapshot capture for batched execution
+    pipeline_batch->enableSnapshotCapture("/tmp/llaminar_snapshots_batch");
 
     bool success = pipeline_batch->forward_batch(batch);
     local_ok = success;
@@ -657,8 +677,12 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
     mpi_ctx_->barrier();
 
     // ======== Compare Sequential vs Batched ========
+    std::vector<int> test_results(batch_size, 1);
+
+    // Rank 0: Compare all sequences AND snapshots
     if (rank_ == 0)
     {
+        // Compare final logits
         for (size_t i = 0; i < batch_size; ++i)
         {
             size_t seq_len = batch[i].size();
@@ -673,16 +697,70 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
             std::string test_name = "Batch Parity - Sequence " + std::to_string(i);
             printComparisonResult(result, test_name);
 
-            EXPECT_TRUE(result.passed)
-                << "Sequence " << i << " mismatch: "
-                << "max_abs_diff=" << result.max_abs_diff
-                << ", rel_l2=" << result.rel_l2_norm;
+            test_results[i] = result.passed ? 1 : 0;
         }
 
-        LOG_INFO("[E2E] Multi-sequence batch test complete");
+        // Compare layer-by-layer snapshots for failing sequence (Seq1)
+        LOG_INFO("[E2E] ===== Snapshot Comparison for Seq1 =====");
+
+        // Get snapshot keys from sequential Seq1 execution
+        auto seq1_keys = pipelines_seq[1]->getSnapshotKeys();
+        LOG_INFO("[E2E] Sequential Seq1 has " << seq1_keys.size() << " snapshots");
+
+        // For each layer, compare Q_ROPE, K_ROPE, ATTENTION_CONTEXT
+        for (int layer = 0; layer < 2; ++layer) // Just first 2 layers for now
+        {
+            std::vector<std::string> keys_to_check = {
+                "layer" + std::to_string(layer) + "_Q_ROPE",
+                "layer" + std::to_string(layer) + "_K_ROPE",
+                "layer" + std::to_string(layer) + "_ATTENTION_CONTEXT"};
+
+            for (const auto &key : keys_to_check)
+            {
+                size_t seq_size = 0, batch_size_snap = 0;
+                const float *seq_data = pipelines_seq[1]->getSnapshot(key, seq_size);
+                const float *batch_data = pipeline_batch->getSnapshot(key, batch_size_snap);
+
+                if (seq_data && batch_data)
+                {
+                    // For batched execution, extract just Seq1's portion
+                    // Snapshots for batched have layout [batch_size * seq_len, feature_dim]
+                    // Seq1 starts at offset: padded_seq_len * feature_dim (after Seq0)
+                    size_t feature_dim = seq_size / batch[1].size(); // feature_dim = total / seq_len
+                    size_t batch_seq1_offset = padded_seq_len * feature_dim;
+                    const float *batch_seq1_data = batch_data + batch_seq1_offset;
+
+                    auto result = compareTensors(seq_data, batch_seq1_data, seq_size, tolerance);
+
+                    LOG_INFO("[E2E] " << key << ": max_abs_diff=" << result.max_abs_diff
+                                      << ", mean=" << result.mean_abs_diff
+                                      << ", status=" << (result.passed ? "PASS" : "FAIL"));
+                }
+                else
+                {
+                    LOG_WARN("[E2E] " << key << ": snapshot not found (seq=" << (seq_data != nullptr)
+                                      << ", batch=" << (batch_data != nullptr) << ")");
+                }
+            }
+        }
+    }
+
+    // Broadcast all results to all ranks
+    MPI_Bcast(test_results.data(), batch_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // All ranks check results together
+    for (size_t i = 0; i < batch_size; ++i)
+    {
+        ASSERT_EQ(test_results[i], 1)
+            << "Sequence " << i << " parity check failed on rank 0";
     }
 
     mpi_ctx_->barrier();
+
+    if (rank_ == 0)
+    {
+        LOG_INFO("[E2E] Multi-sequence batch test complete");
+    }
 }
 
 /**
@@ -769,11 +847,12 @@ TEST_F(Qwen2E2ECorrectness, BatchScaling)
         MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
         ASSERT_EQ(global_success, 1) << "Batched forward failed for some rank (batch_size=" << batch_size << ")";
 
-        // Extract and compare logits
+        // Extract logits for all sequences in batch
+        std::vector<std::vector<float>> logits_batched(batch_size);
         for (int i = 0; i < batch_size; ++i)
         {
             size_t seq_len = batch[i].size();
-            std::vector<float> logits_batched(seq_len * vocab_size);
+            logits_batched[i].resize(seq_len * vocab_size);
 
             const float *logits_ptr = pipeline_batch->getLogits(i);
             ASSERT_NE(logits_ptr, nullptr);
@@ -782,23 +861,41 @@ TEST_F(Qwen2E2ECorrectness, BatchScaling)
             for (size_t token_idx = 0; token_idx < seq_len; ++token_idx)
             {
                 const float *src = logits_ptr + (token_idx * vocab_size);
-                float *dst = logits_batched.data() + (token_idx * vocab_size);
+                float *dst = logits_batched[i].data() + (token_idx * vocab_size);
                 std::memcpy(dst, src, vocab_size * sizeof(float));
             }
+        }
 
-            // Compare on rank 0
-            if (rank_ == 0)
+        // Compare all sequences on rank 0
+        std::vector<int> test_results(batch_size, 1);
+        if (rank_ == 0)
+        {
+            for (int i = 0; i < batch_size; ++i)
             {
+                size_t seq_len = batch[i].size();
                 auto result = compareTensors(
                     logits_sequential[i].data(),
-                    logits_batched.data(),
+                    logits_batched[i].data(),
                     seq_len * vocab_size,
                     tolerance);
 
                 std::string test_name = "Batch " + std::to_string(batch_size) + " Seq " + std::to_string(i);
-                EXPECT_TRUE(result.passed)
-                    << test_name << " mismatch: max_diff=" << result.max_abs_diff;
+                test_results[i] = result.passed ? 1 : 0;
+                if (!result.passed)
+                {
+                    LOG_ERROR(test_name << " mismatch: max_diff=" << result.max_abs_diff);
+                }
             }
+        }
+
+        // Broadcast all results to all ranks
+        MPI_Bcast(test_results.data(), batch_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+        // All ranks check results together
+        for (int i = 0; i < batch_size; ++i)
+        {
+            ASSERT_EQ(test_results[i], 1)
+                << "Batch " << batch_size << " Seq " << i << " parity check failed on rank 0";
         }
 
         mpi_ctx_->barrier();
@@ -985,10 +1082,12 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
     }
 
     // ======== Extract and Compare Logits ========
+    // Extract logits for all sequences in batch
+    std::vector<std::vector<float>> logits_batched(batch_size);
     for (int i = 0; i < batch_size; ++i)
     {
         const size_t seq_len = batch[i].size();
-        std::vector<float> logits_batched(seq_len * vocab_size);
+        logits_batched[i].resize(seq_len * vocab_size);
 
         const float *logits_ptr = pipeline_batch->getLogits(i);
         ASSERT_NE(logits_ptr, nullptr);
@@ -997,28 +1096,39 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
         for (size_t token_idx = 0; token_idx < seq_len; ++token_idx)
         {
             const float *src = logits_ptr + (token_idx * vocab_size);
-            float *dst = logits_batched.data() + (token_idx * vocab_size);
+            float *dst = logits_batched[i].data() + (token_idx * vocab_size);
             std::memcpy(dst, src, vocab_size * sizeof(float));
         }
+    }
 
-        // Compare on rank 0
-        if (rank_ == 0)
+    // Compare all sequences on rank 0
+    std::vector<int> test_results(batch_size, 1);
+    if (rank_ == 0)
+    {
+        for (int i = 0; i < batch_size; ++i)
         {
+            const size_t seq_len = batch[i].size();
             auto result = compareTensors(
                 logits_sequential[i].data(),
-                logits_batched.data(),
+                logits_batched[i].data(),
                 seq_len * vocab_size,
                 tolerance);
 
             std::string test_name = "Comprehensive Parity - Sequence " + std::to_string(i);
             printComparisonResult(result, test_name);
 
-            EXPECT_TRUE(result.passed)
-                << "Sequence " << i << " parity failed: "
-                << "max_abs_diff=" << result.max_abs_diff
-                << ", rel_l2=" << result.rel_l2_norm
-                << ", mismatches=" << result.num_mismatches;
+            test_results[i] = result.passed ? 1 : 0;
         }
+    }
+
+    // Broadcast all results to all ranks
+    MPI_Bcast(test_results.data(), batch_size, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // All ranks check results together
+    for (int i = 0; i < batch_size; ++i)
+    {
+        ASSERT_EQ(test_results[i], 1)
+            << "Sequence " << i << " parity check failed on rank 0";
     }
 
     mpi_ctx_->barrier();

@@ -506,13 +506,23 @@ namespace llaminar2
 
         // 3. Apply RoPE to Q and K
         // Position IDs for batched input (per-sequence position tracking)
+        // CRITICAL: Only set position IDs for actual tokens, not padding
         std::vector<int> position_ids(effective_seq_len);
         for (int b = 0; b < batch_size_; ++b)
         {
+            int actual_len = (batch_size_ == 1) ? padded_seq_len_ : sequence_lengths_[b];
             for (int i = 0; i < padded_seq_len_; ++i)
             {
-                // Each sequence has independent position counter
-                position_ids[b * padded_seq_len_ + i] = current_positions_[b] + i;
+                if (i < actual_len)
+                {
+                    // Real token: use actual position
+                    position_ids[b * padded_seq_len_ + i] = current_positions_[b] + i;
+                }
+                else
+                {
+                    // Padding token: use -1 to signal "skip RoPE"
+                    position_ids[b * padded_seq_len_ + i] = -1;
+                }
             }
         }
 
@@ -571,14 +581,35 @@ namespace llaminar2
         }
 
         // Dispatches to tensor-parallel if mpi_strategy_ == TensorParallel
-        // NOTE: Using causal=false and no sequence masking to match PyTorch reference for E2E parity testing
+        // NOTE: Using causal=false to match PyTorch reference for E2E parity testing
         // In production inference, causal=true should be used for autoregressive generation
+
+        // Only pass sequence_lengths if there's actual padding (any sequence shorter than padded_seq_len)
+        // For equal-length batches, no mask is needed when causal=false
+        const std::vector<int> *seq_lens_ptr = nullptr;
+        if (batch_size_ > 1)
+        {
+            bool has_padding = false;
+            for (int b = 0; b < batch_size_; ++b)
+            {
+                if (sequence_lengths_[b] < padded_seq_len_)
+                {
+                    has_padding = true;
+                    break;
+                }
+            }
+            if (has_padding)
+            {
+                seq_lens_ptr = &sequence_lengths_;
+            }
+        }
+
         VALIDATE_OP(attention_gqa_mpi(
                         Q_view.get(), K_view.get(),
                         V_view.get(), attn_out_view.get(),
                         n_heads_, n_kv_heads_, head_dim_,
                         /*causal=*/false, /*window_size=*/-1,
-                        batch_size_, nullptr), // No sequence length masking for parity testing
+                        batch_size_, seq_lens_ptr), // Pass sequence lengths only if padding exists
                     "GQA attention");
 
         VALIDATE_TENSOR_BUFFER(buffers.attn_output, spec_q(effective_seq_len), "after_attention");

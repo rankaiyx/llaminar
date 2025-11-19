@@ -204,9 +204,9 @@ bool BF16GemmKernel::multiply_activations_strided(
 
 ---
 
-### Phase 3: Update CPUAttentionT to Use Requantization
+### Phase 3: Update CpuAttentionKernelT to Use Requantization
 
-**File**: `src/v2/kernels/cpu/CPUAttentionT.h`
+**File**: `src/v2/kernels/cpu/CpuAttentionKernelT.h`
 
 **Changes**:
 
@@ -214,7 +214,7 @@ bool BF16GemmKernel::multiply_activations_strided(
 ```cpp
 template <typename TensorType, 
           GemmOutputPrecision WorkspacePrecision = GemmOutputPrecision::FP32>
-class CPUAttentionT : public ITensorAttention {
+class CpuAttentionKernelT : public ITensorAttention {
     // ...
 };
 ```
@@ -267,7 +267,7 @@ if constexpr (WorkspacePrecision != GemmOutputPrecision::FP32) {
 
 **Files**:
 1. `tests/v2/unit/Test__BF16GemmKernel.cpp` - Test requantization correctness
-2. `tests/v2/unit/Test__CPUAttentionT.cpp` - Test attention with BF16 workspaces
+2. `tests/v2/unit/Test__CpuAttentionKernelT.cpp` - Test attention with BF16 workspaces
 
 **Test cases**:
 ```cpp
@@ -276,8 +276,8 @@ TEST(BF16GemmKernel, RequantizeToBF16) {
     // GEMM(FP32) + manual fp32_to_bf16(), within BF16 tolerance
 }
 
-TEST(CPUAttentionT_BF16, BF16WorkspacesBasicAttention) {
-    // Test: CPUAttentionT with BF16 workspaces produces similar results
+TEST(CpuAttentionKernelT_BF16, BF16WorkspacesBasicAttention) {
+    // Test: CpuAttentionKernelT with BF16 workspaces produces similar results
     // to FP32 workspaces, within BF16 tolerance (5e-3)
 }
 ```
@@ -318,7 +318,7 @@ TEST(CPUAttentionT_BF16, BF16WorkspacesBasicAttention) {
 |-------|------|--------|
 | 1. API design (enum + signatures) | 1 hour | Not started |
 | 2. BF16GemmKernel requantization | 2-3 hours | Not started |
-| 3. CPUAttentionT integration | 3-4 hours | Not started |
+| 3. CpuAttentionKernelT integration | 3-4 hours | Not started |
 | 4. Testing | 2-3 hours | Not started |
 | 5. Benchmarking | 2-3 hours | Not started |
 | **Total** | **10-14 hours** | |
