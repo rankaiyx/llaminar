@@ -491,15 +491,15 @@ namespace llaminar2
 
             // GEMM: scores[local_h] = Q_h @ K_h^T
             bool gemm_success = compute_attention_scores(Q_h.data(), K_h.data(), scores_h, total_tokens, config.head_dim, config.precision);
-            
+
             if (!gemm_success)
             {
                 LOG_ERROR("[GQAAttention] Q·K^T GEMM failed for local head " << local_h);
                 local_success = false;
             }
-            else 
+            else
             {
-                 LOG_DEBUG("[GQAAttention] Q·K^T GEMM success for local head " << local_h);
+                LOG_DEBUG("[GQAAttention] Q·K^T GEMM success for local head " << local_h);
             }
 
             LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << ": scores[0]=" << scores_h[0]);

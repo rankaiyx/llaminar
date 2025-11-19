@@ -317,10 +317,13 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
 
         logits_single.resize(seq_len * vocab_size);
         const float *logits_ptr_single = pipeline_single->getLogits(0);
-        if (logits_ptr_single) {
+        if (logits_ptr_single)
+        {
             std::memcpy(logits_single.data(), logits_ptr_single, seq_len * vocab_size * sizeof(float));
             LOG_INFO("[E2E] Single-rank prefill completed");
-        } else {
+        }
+        else
+        {
             LOG_ERROR("[E2E] Single-rank getLogits() returned null");
             single_rank_success = 0;
         }
@@ -347,7 +350,7 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
 
     std::vector<float> logits_multi(seq_len * vocab_size);
     const float *logits_ptr_multi = pipeline_multi->getLogits(0);
-    
+
     // Verify logits availability across all ranks to prevent hangs
     bool has_logits = (logits_ptr_multi != nullptr);
     int global_has_logits = has_logits ? 1 : 0;

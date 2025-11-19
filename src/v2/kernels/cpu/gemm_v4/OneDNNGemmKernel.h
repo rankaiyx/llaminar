@@ -173,7 +173,7 @@ namespace llaminar2
             catch (const dnnl::error &e)
             {
                 LOG_ERROR("OneDNN matmul failed: status=" << e.status
-                          << " message=" << e.what());
+                                                          << " message=" << e.what());
                 return false;
             }
 
@@ -217,7 +217,7 @@ namespace llaminar2
             catch (const dnnl::error &e)
             {
                 LOG_ERROR("OneDNN FP32 matmul failed: status=" << e.status
-                          << " message=" << e.what());
+                                                               << " message=" << e.what());
                 return false;
             }
             catch (const std::exception &e)
