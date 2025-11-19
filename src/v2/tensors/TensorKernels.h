@@ -163,14 +163,6 @@ namespace llaminar2
          *       Weight tensor (B) is accessed via this->tensor which has its own device_idx.
          *       If weight is on different device than activation, kernel handles transfer.
          */
-        virtual bool multiply(
-            const float *A, float *C,
-            int m, int n, int k,
-            bool transpose_B = true,
-            float alpha = 1.0f, float beta = 0.0f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) = 0;
-
         /**
          * @brief Activation-activation matrix multiplication: C = alpha * A @ B^T + beta * C
          *
@@ -282,13 +274,13 @@ namespace llaminar2
         }
 
         /**
-         * @brief Weight-tensor GEMM followed by Softmax (same signature as multiply)
+         * @brief Activation GEMM followed by Softmax.
          *
-         * Executes C = Softmax(A @ B^T) where B is the tensor bound to this kernel.
+         * Executes C = Softmax(A @ B^T) or Softmax(A @ B) depending on transpose_B.
          * Default implementation returns false so backends can opt-in gradually.
          */
         virtual bool multiply_with_softmax(
-            const float *A, float *C,
+            const float *A, const float *B, float *C,
             int m, int n, int k,
             bool transpose_B = true,
             int softmax_axis = 1,
@@ -296,6 +288,7 @@ namespace llaminar2
             int device_idx = -1)
         {
             (void)A;
+            (void)B;
             (void)C;
             (void)m;
             (void)n;

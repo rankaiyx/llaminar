@@ -15,7 +15,7 @@
 #include "../kernels/cpu/CPUSoftmaxKernel.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
 #include "../kernels/cpu/CPUSwiGLUKernel.h"
-#include "../kernels/cpu/CPUAttention.h"
+#include "../kernels/cpu/CPUAttentionT.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include <cstring>
 #include <stdexcept>
@@ -120,9 +120,7 @@ namespace llaminar2
 
     std::unique_ptr<ITensorSwiGLU> FP32Tensor::createSwiGLU()
     {
-        // TODO: Implement SwiGLU kernel creation
-        LOG_ERROR("[FP32Tensor] createSwiGLU not yet implemented");
-        return nullptr;
+        return std::make_unique<CPUSwiGLUKernel>();
     }
 
     std::unique_ptr<ITensorSoftmax> FP32Tensor::createSoftmax()
@@ -140,8 +138,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorAttention> FP32Tensor::createAttention()
     {
-        // FP32 tensors use CPU Attention kernel
-        return std::make_unique<CPUAttention>();
+        // FP32 tensors use templated CPU attention kernel
+        return std::make_unique<CPUAttentionT<FP32Tensor>>();
     }
 
     bool FP32Tensor::sync_to_device()

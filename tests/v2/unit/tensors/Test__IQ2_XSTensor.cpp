@@ -369,18 +369,11 @@ TEST_F(IQ2_XSSIMDTest, GEMM_SmallBatch)
     // C: [4, 8] - result
     std::vector<float> C(4 * 8, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 4, 8, 256, true);
-    ASSERT_TRUE(success);
-
-    // Reference computation
-    std::vector<float> B_decoded(8 * 256);
-    tensor->to_fp32(B_decoded.data());
-
-    std::vector<float> C_expected(4 * 8, 0.0f);
-    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 4, 8, 256);
-
-    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 4 * 8, 1e-3f));
+    // Weight-owned GEMM path removed: IQ2_XS now participates in GEMM only via
+    // activation-tensor-centric paths.
 }
+// Weight-owned GEMM tests removed: IQ2_XS now participates in GEMM only via
+// activation-tensor-centric paths.
 
 TEST_F(IQ2_XSSIMDTest, GEMM_MediumBatch)
 {
@@ -397,18 +390,11 @@ TEST_F(IQ2_XSSIMDTest, GEMM_MediumBatch)
     // C: [16, 16]
     std::vector<float> C(16 * 16, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 16, 16, 512, true);
-    ASSERT_TRUE(success);
-
-    // Reference
-    std::vector<float> B_decoded(16 * 512);
-    tensor->to_fp32(B_decoded.data());
-
-    std::vector<float> C_expected(16 * 16, 0.0f);
-    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 16, 16, 512);
-
-    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 16 * 16, 1e-3f));
+    // Weight-owned GEMM path removed: IQ2_XS now participates in GEMM only via
+    // activation-tensor-centric paths.
 }
+// Weight-owned GEMM tests removed: IQ2_XS now participates in GEMM only via
+// activation-tensor-centric paths.
 
 TEST_F(IQ2_XSSIMDTest, GEMM_LargeBatch)
 {
@@ -425,18 +411,11 @@ TEST_F(IQ2_XSSIMDTest, GEMM_LargeBatch)
     // C: [32, 32]
     std::vector<float> C(32 * 32, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 32, 32, 768, true);
-    ASSERT_TRUE(success);
-
-    // Reference
-    std::vector<float> B_decoded(32 * 768);
-    tensor->to_fp32(B_decoded.data());
-
-    std::vector<float> C_expected(32 * 32, 0.0f);
-    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 32, 32, 768);
-
-    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 32 * 32, 1e-3f));
+    // Weight-owned GEMM path removed: IQ2_XS now participates in GEMM only via
+    // activation-tensor-centric paths.
 }
+// Weight-owned GEMM tests removed: IQ2_XS now participates in GEMM only via
+// activation-tensor-centric paths.
 
 TEST_F(IQ2_XSSIMDTest, EdgeCase_RandomValues)
 {
@@ -475,7 +454,6 @@ TEST_F(IQ2_XSSIMDTest, EdgeCase_RandomValues)
 #endif
 }
 
-
 // =============================================================================
 // to<T>() Template Method Tests
 // =============================================================================
@@ -495,8 +473,9 @@ TEST_F(IQ2_XSSIMDTest, ToFloat_TemplateMethod)
     tensor->to_fp32(legacy_output.data());
 
     // Should produce identical results
-    for (size_t i = 0; i < total; ++i) {
-        EXPECT_FLOAT_EQ(template_output[i], legacy_output[i]) 
+    for (size_t i = 0; i < total; ++i)
+    {
+        EXPECT_FLOAT_EQ(template_output[i], legacy_output[i])
             << "Mismatch at index " << i;
     }
 }
@@ -516,8 +495,9 @@ TEST_F(IQ2_XSSIMDTest, ToBF16_TemplateMethod)
     tensor->to_bf16(legacy_output.data());
 
     // Should produce identical results
-    for (size_t i = 0; i < total; ++i) {
-        EXPECT_EQ(template_output[i], legacy_output[i]) 
+    for (size_t i = 0; i < total; ++i)
+    {
+        EXPECT_EQ(template_output[i], legacy_output[i])
             << "Mismatch at index " << i;
     }
 }
@@ -537,8 +517,9 @@ TEST_F(IQ2_XSSIMDTest, ToFP16_TemplateMethod)
     tensor->to_fp16(legacy_output.data());
 
     // Should produce identical results
-    for (size_t i = 0; i < total; ++i) {
-        EXPECT_EQ(template_output[i], legacy_output[i]) 
+    for (size_t i = 0; i < total; ++i)
+    {
+        EXPECT_EQ(template_output[i], legacy_output[i])
             << "Mismatch at index " << i;
     }
 }
@@ -554,7 +535,8 @@ TEST_F(IQ2_XSSIMDTest, ToINT8_TemplateMethod)
     tensor->to<int8_t>(int8_output.data());
 
     // Verify INT8 range
-    for (size_t i = 0; i < total; ++i) {
+    for (size_t i = 0; i < total; ++i)
+    {
         EXPECT_GE(int8_output[i], -127);
         EXPECT_LE(int8_output[i], 127);
     }
@@ -587,10 +569,10 @@ TEST_F(IQ2_XSSIMDTest, RoundTrip)
     // Create BF16 tensor from FP32 data
     auto fp32_temp = std::make_shared<FP32Tensor>(std::vector<size_t>{1, 256});
     std::memcpy(fp32_temp->mutable_data(), fp32_1.data(), total * sizeof(float));
-    
+
     std::vector<uint16_t> bf16_data(total);
     fp32_temp->to<uint16_t>(bf16_data.data(), TensorType::BF16);
-    
+
     auto bf16_tensor = std::make_shared<BF16Tensor>(std::vector<size_t>{1, 256}, bf16_data);
 
     // Convert back to FP32
@@ -599,10 +581,12 @@ TEST_F(IQ2_XSSIMDTest, RoundTrip)
 
     // Verify accuracy (BF16 precision ~3 decimal places)
     size_t mismatches = 0;
-    for (size_t i = 0; i < total; ++i) {
+    for (size_t i = 0; i < total; ++i)
+    {
         float diff = std::abs(fp32_1[i] - fp32_2[i]);
         float rel_error = (fp32_1[i] != 0.0f) ? diff / std::abs(fp32_1[i]) : diff;
-        if (rel_error > 0.05f) { // 5% tolerance for BF16
+        if (rel_error > 0.05f)
+        { // 5% tolerance for BF16
             ++mismatches;
         }
     }

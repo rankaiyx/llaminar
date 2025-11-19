@@ -347,8 +347,8 @@ TEST_F(IQ3_XXSSIMDTest, DISABLED_GEMM_SmallBatch)
     // C: [4, 8] - result
     std::vector<float> C(4 * 8, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 4, 8, 256, true);
-    ASSERT_TRUE(success);
+    // Weight-owned GEMM path removed: IQ3_XXS now participates in GEMM only via
+    // activation-tensor-centric paths.
 
     // Reference computation
     std::vector<float> B_decoded(8 * 256);
@@ -375,8 +375,8 @@ TEST_F(IQ3_XXSSIMDTest, DISABLED_GEMM_MediumBatch)
     // C: [16, 16]
     std::vector<float> C(16 * 16, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 16, 16, 512, true);
-    ASSERT_TRUE(success);
+    // Weight-owned GEMM path removed: IQ3_XXS now participates in GEMM only via
+    // activation-tensor-centric paths.
 
     // Reference
     std::vector<float> B_decoded(16 * 512);
@@ -403,8 +403,8 @@ TEST_F(IQ3_XXSSIMDTest, DISABLED_GEMM_LargeBatch)
     // C: [32, 32]
     std::vector<float> C(32 * 32, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 32, 32, 768, true);
-    ASSERT_TRUE(success);
+    // Weight-owned GEMM path removed: IQ3_XXS now participates in GEMM only via
+    // activation-tensor-centric paths.
 
     // Reference
     std::vector<float> B_decoded(32 * 768);

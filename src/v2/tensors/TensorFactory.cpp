@@ -105,6 +105,12 @@ namespace llaminar2
         case TensorType::Q4_1:
             return std::make_unique<Q4_1Tensor>(shape, raw_data);
 
+        case TensorType::Q5_0:
+            return std::make_unique<Q5_0Tensor>(shape, raw_data);
+
+        case TensorType::Q5_1:
+            return std::make_unique<Q5_1Tensor>(shape, raw_data);
+
         case TensorType::Q6_K:
             return std::make_unique<Q6_KTensor>(shape, raw_data);
 

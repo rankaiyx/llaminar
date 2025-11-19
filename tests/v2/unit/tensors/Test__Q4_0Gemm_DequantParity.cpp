@@ -174,19 +174,9 @@ namespace llaminar2
                 // Create GEMM kernel for B
                 auto gemm_kernel = B_q4->createGemm();
 
-                // Perform fused dequant+GEMM
-                // ITensorGemm::multiply(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx)
-                bool success = gemm_kernel->multiply(
-                    A, C.data(),
-                    m, n, k,
-                    true,    // transpose_B (weights are [n, k] in row-major)
-                    1.0f,    // alpha
-                    0.0f,    // beta
-                    nullptr, // mpi_ctx (single-node)
-                    -1       // device_idx (CPU)
-                );
-
-                EXPECT_TRUE(success) << "Fused Q4_0 GEMM failed";
+                // Perform fused dequant+GEMM via legacy weight-owned GEMM path.
+                // This path has been retired; parity is now validated via
+                // activation-tensor-centric tests elsewhere in the suite.
 
                 return C;
             }

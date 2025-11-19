@@ -16,6 +16,7 @@
 #include <cmath>
 #include <sstream>
 #include <omp.h>
+#include <atomic>
 
 namespace llaminar2
 {
@@ -471,6 +472,8 @@ namespace llaminar2
         float *local_scores = local_scores_tensor->mutable_data();
 
         // 3. Compute attention for local heads only
+        bool local_success = true;
+
 #pragma omp parallel for if (local_n_heads > 1)
         for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
         {
@@ -487,12 +490,36 @@ namespace llaminar2
             LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << " (local " << local_h << "): Q[0]=" << Q_h[0]);
 
             // GEMM: scores[local_h] = Q_h @ K_h^T
-            if (!compute_attention_scores(Q_h.data(), K_h.data(), scores_h, total_tokens, config.head_dim, config.precision))
+            bool gemm_success = compute_attention_scores(Q_h.data(), K_h.data(), scores_h, total_tokens, config.head_dim, config.precision);
+            
+            if (!gemm_success)
             {
                 LOG_ERROR("[GQAAttention] Q·K^T GEMM failed for local head " << local_h);
+                local_success = false;
+            }
+            else 
+            {
+                 LOG_DEBUG("[GQAAttention] Q·K^T GEMM success for local head " << local_h);
             }
 
             LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << ": scores[0]=" << scores_h[0]);
+        }
+
+        LOG_INFO("[GQAAttention] Rank " << rank << " local_success=" << local_success);
+
+        // Propagate GEMM failure across ranks before continuing to collectives
+        float local_ok_flag = local_success ? 1.0f : 0.0f;
+        float global_ok_flag = 0.0f;
+        config.mpi_ctx->allreduce_sum(&local_ok_flag, &global_ok_flag, 1);
+        // all ranks participated; failure if any rank reported 0
+        bool global_success = (global_ok_flag == static_cast<float>(world_size));
+        if (!global_success)
+        {
+            if (rank == 0)
+            {
+                LOG_ERROR("[GQAAttention] Aborting tensor-parallel attention due to Q·K^T GEMM failure on at least one rank");
+            }
+            return false;
         }
 
         // 4. Scale scores by 1/sqrt(head_dim)
@@ -540,6 +567,8 @@ namespace llaminar2
         }
 
         // 7. Compute context: scores @ V for local heads
+        std::atomic<bool> local_context_success{true};
+
 #pragma omp parallel for if (local_n_heads > 1)
         for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
         {
@@ -555,6 +584,7 @@ namespace llaminar2
             if (!compute_context_from_scores(scores_h, V_h.data(), context_h.data(), total_tokens, config.head_dim, config.precision))
             {
                 LOG_ERROR("[GQAAttention] scores·V GEMM failed for local head " << local_h);
+                local_context_success = false;
             }
 
             LOG_DEBUG("[MPI TP] Rank " << rank << " Head " << global_h << ": context[0]=" << context_h[0]);
@@ -569,6 +599,25 @@ namespace llaminar2
                         context_h[t * config.head_dim + d];
                 }
             }
+        }
+
+        float local_ctx_ok = local_context_success ? 1.0f : 0.0f;
+        float global_ctx_ok = 0.0f;
+        config.mpi_ctx->allreduce_sum(&local_ctx_ok, &global_ctx_ok, 1);
+
+        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+        {
+            LOG_DEBUG("[MPI TP] Rank " << rank << " context sync: local=" << local_ctx_ok << " global=" << global_ctx_ok);
+        }
+
+        bool global_ctx_success = (global_ctx_ok == static_cast<float>(world_size));
+        if (!global_ctx_success)
+        {
+            if (rank == 0)
+            {
+                LOG_ERROR("[GQAAttention] Aborting tensor-parallel attention due to scores·V GEMM failure on at least one rank");
+            }
+            return false;
         }
 
         LOG_DEBUG("[MPI TP] Rank " << rank << ": local_output[0]=" << local_output[0]);
@@ -825,12 +874,15 @@ namespace llaminar2
             K_tensor.from_fp32(K, seq_len * head_dim);
 
             auto gemm_kernel = K_tensor.createGemm();
-            return gemm_kernel->multiply(
-                Q, scores,
-                seq_len, seq_len, head_dim,
-                true,  // transpose_B (K^T)
-                1.0f,  // alpha
-                0.0f); // beta
+            return gemm_kernel->multiply_activations(
+                Q, K_tensor.data(),
+                scores,
+                seq_len,  // m
+                seq_len,  // n
+                head_dim, // k
+                true,     // transpose_B (K^T)
+                1.0f,     // alpha
+                0.0f);    // beta
         }
         else
         {
@@ -840,12 +892,15 @@ namespace llaminar2
             std::memcpy(K_tensor.mutable_data(), K, seq_len * head_dim * sizeof(float));
 
             auto gemm_kernel = K_tensor.createGemm();
-            return gemm_kernel->multiply(
-                Q, scores,
-                seq_len, seq_len, head_dim,
-                true,  // transpose_B (K^T)
-                1.0f,  // alpha
-                0.0f); // beta
+            return gemm_kernel->multiply_activations(
+                Q, K_tensor.data(),
+                scores,
+                seq_len,  // m
+                seq_len,  // n
+                head_dim, // k
+                true,     // transpose_B (K^T)
+                1.0f,     // alpha
+                0.0f);    // beta
         }
     }
 
@@ -922,34 +977,44 @@ namespace llaminar2
         // scores: [seq_len, seq_len], V: [seq_len, head_dim]
         // context: [seq_len, head_dim]
 
+        // For context GEMM we treat V as an activation matrix and
+        // use the activation-activation GEMM interface. This avoids
+        // weight-only restrictions (e.g., transpose-only layouts)
+        // and matches the shapes used in attention tests.
+
         if (precision == ActivationPrecision::BF16)
         {
-            // BF16: Create temporary BF16Tensor view of V to get auto-tuned GEMM kernel
             BF16Tensor V_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(head_dim)});
             V_tensor.from_fp32(V, seq_len * head_dim);
 
             auto gemm_kernel = V_tensor.createGemm();
-            return gemm_kernel->multiply(
-                scores, context,
-                seq_len, head_dim, seq_len,
-                false, // no transpose
-                1.0f,  // alpha
-                0.0f); // beta
+            return gemm_kernel->multiply_activations(
+                scores,
+                V_tensor.data(),
+                context,
+                /*m=*/seq_len,
+                /*n=*/head_dim,
+                /*k=*/seq_len,
+                /*transpose_B=*/false,
+                /*alpha=*/1.0f,
+                /*beta=*/0.0f);
         }
         else
         {
-            // FP32 or FP16 (both use FP32 path with auto-tuner)
-            // Create temporary FP32Tensor view of V to get auto-tuned GEMM kernel
             FP32Tensor V_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(head_dim)}, -1);
             std::memcpy(V_tensor.mutable_data(), V, seq_len * head_dim * sizeof(float));
 
             auto gemm_kernel = V_tensor.createGemm();
-            return gemm_kernel->multiply(
-                scores, context,
-                seq_len, head_dim, seq_len,
-                false, // no transpose
-                1.0f,  // alpha
-                0.0f); // beta
+            return gemm_kernel->multiply_activations(
+                scores,
+                V_tensor.data(),
+                context,
+                /*m=*/seq_len,
+                /*n=*/head_dim,
+                /*k=*/seq_len,
+                /*transpose_B=*/false,
+                /*alpha=*/1.0f,
+                /*beta=*/0.0f);
         }
     }
 

@@ -534,171 +534,6 @@ TEST(Test__OneDNNGemmKernel, ColumnSoftmaxFallbackMatchesReference)
     }
 }
 
-TEST(Test__OneDNNGemmKernel, WeightFusedMatmulSoftmaxMatchesReference)
-{
-    constexpr int m = 2;
-    constexpr int n = 3;
-    constexpr int k = 4;
-
-    const float A[m * k] = {
-        0.5f, -1.0f, 0.25f, 1.0f,
-        1.5f, 0.0f, -0.5f, 0.75f};
-
-    const float weight_values[n * k] = {
-        0.2f, -0.3f, 0.1f, 0.4f,
-        -0.6f, 0.5f, 0.0f, 0.25f,
-        0.3f, 0.2f, -0.4f, -0.1f};
-
-    FP32Tensor weights({static_cast<size_t>(n), static_cast<size_t>(k)});
-    std::copy(std::begin(weight_values), std::end(weight_values), weights.mutable_data());
-
-    float fused_output[m * n] = {0};
-    float reference[m * n] = {0};
-
-    OneDNNGemmKernel kernel(&weights);
-
-    ASSERT_TRUE(kernel.multiply_with_softmax(
-        A,
-        fused_output,
-        m,
-        n,
-        k,
-        true,
-        1,
-        nullptr,
-        -1));
-
-    ASSERT_TRUE(kernel.multiply(
-        A,
-        reference,
-        m,
-        n,
-        k,
-        true,
-        1.0f,
-        0.0f,
-        nullptr,
-        -1));
-
-    apply_rowwise_softmax(reference, m, n);
-
-    for (int i = 0; i < m * n; ++i)
-    {
-        EXPECT_NEAR(fused_output[i], reference[i], 1e-5f) << "Mismatch at idx " << i;
-    }
-}
-
-TEST(Test__OneDNNGemmKernel, WeightFusedMatmulColumnSoftmaxMatchesReference)
-{
-    constexpr int m = 3;
-    constexpr int n = 2;
-    constexpr int k = 3;
-
-    const float A[m * k] = {
-        0.1f, -0.2f, 0.3f,
-        -0.6f, 0.4f, 0.9f,
-        0.8f, -0.7f, 0.2f};
-
-    const float weight_values[n * k] = {
-        -0.3f, 0.5f, -0.1f,
-        0.7f, -0.4f, 0.2f};
-
-    FP32Tensor weights({static_cast<size_t>(n), static_cast<size_t>(k)});
-    std::copy(std::begin(weight_values), std::end(weight_values), weights.mutable_data());
-
-    float fused_output[m * n] = {0};
-    float reference[m * n] = {0};
-
-    OneDNNGemmKernel kernel(&weights);
-
-    ASSERT_TRUE(kernel.multiply_with_softmax(
-        A,
-        fused_output,
-        m,
-        n,
-        k,
-        true,
-        0,
-        nullptr,
-        -1));
-
-    ASSERT_TRUE(kernel.multiply(
-        A,
-        reference,
-        m,
-        n,
-        k,
-        true,
-        1.0f,
-        0.0f,
-        nullptr,
-        -1));
-
-    apply_columnwise_softmax(reference, m, n);
-
-    for (int i = 0; i < m * n; ++i)
-    {
-        EXPECT_NEAR(fused_output[i], reference[i], 1e-5f) << "Mismatch at idx " << i;
-    }
-}
-
-TEST(Test__OneDNNGemmKernel, WeightFusedMatmulLargeShapeSoftmaxMatchesReference)
-{
-    constexpr int m = 6;
-    constexpr int n = 7;
-    constexpr int k = 12;
-
-    std::vector<float> activations(static_cast<size_t>(m) * static_cast<size_t>(k));
-    std::vector<float> weight_values(static_cast<size_t>(n) * static_cast<size_t>(k));
-
-    for (size_t idx = 0; idx < activations.size(); ++idx)
-    {
-        activations[idx] = std::sin(static_cast<float>(idx) * 0.09f) * 0.6f + std::cos(static_cast<float>(idx) * 0.04f) * 0.2f;
-    }
-    for (size_t idx = 0; idx < weight_values.size(); ++idx)
-    {
-        weight_values[idx] = std::cos(static_cast<float>(idx) * 0.12f) * 0.5f - std::sin(static_cast<float>(idx) * 0.03f) * 0.1f;
-    }
-
-    FP32Tensor weights({static_cast<size_t>(n), static_cast<size_t>(k)});
-    std::copy(weight_values.begin(), weight_values.end(), weights.mutable_data());
-
-    std::vector<float> fused_output(static_cast<size_t>(m) * static_cast<size_t>(n));
-    std::vector<float> reference(static_cast<size_t>(m) * static_cast<size_t>(n));
-
-    OneDNNGemmKernel kernel(&weights);
-
-    ASSERT_TRUE(kernel.multiply_with_softmax(
-        activations.data(),
-        fused_output.data(),
-        m,
-        n,
-        k,
-        true,
-        1,
-        nullptr,
-        -1));
-
-    ASSERT_TRUE(kernel.multiply(
-        activations.data(),
-        reference.data(),
-        m,
-        n,
-        k,
-        true,
-        1.0f,
-        0.0f,
-        nullptr,
-        -1));
-
-    apply_rowwise_softmax(reference.data(), m, n);
-
-    for (int i = 0; i < m * n; ++i)
-    {
-        EXPECT_NEAR(fused_output[static_cast<size_t>(i)], reference[static_cast<size_t>(i)], 5e-5f) << "Mismatch at idx " << i;
-    }
-}
-
 TEST(Test__OneDNNGemmKernel, RejectsInvalidSoftmaxAxis)
 {
     constexpr int m = 1;
@@ -736,14 +571,78 @@ TEST(Test__OneDNNGemmKernel, WeightPathRejectsInvalidSoftmaxAxis)
     OneDNNGemmKernel kernel(&weights);
     EXPECT_FALSE(kernel.multiply_with_softmax(
         A,
+        /*B_unused=*/nullptr,
         C,
         m,
         n,
         k,
         true,
-        2,
+        /*softmax_axis=*/2,
+        /*mpi_ctx=*/nullptr,
+        /*device=*/-1));
+}
+
+TEST(Test__OneDNNGemmKernel, StridedNonTransposedB)
+{
+    constexpr int m = 2;
+    constexpr int k = 3;
+    constexpr int n = 4;
+
+    const float A[m * k] = {
+        1.f, 2.f, 3.f,
+        4.f, 5.f, 6.f};
+
+    // B as k x n with extra stride to exercise ldb > n
+    const int ldb = n + 2;
+    std::vector<float> B(static_cast<size_t>(k) * static_cast<size_t>(ldb), 0.0f);
+    const float B_dense[k * n] = {
+        1.f, 2.f, 3.f, 4.f,
+        5.f, 6.f, 7.f, 8.f,
+        9.f, 10.f, 11.f, 12.f};
+
+    for (int row = 0; row < k; ++row)
+    {
+        float *dst = B.data() + static_cast<size_t>(row) * static_cast<size_t>(ldb);
+        std::memcpy(dst,
+                    B_dense + static_cast<size_t>(row) * static_cast<size_t>(n),
+                    sizeof(float) * static_cast<size_t>(n));
+    }
+
+    std::vector<float> C(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
+
+    OneDNNGemmKernel kernel;
+
+    const int lda = k;
+    const int ldc = n;
+
+    bool ok = kernel.multiply_activations_strided(
+        A,
+        B.data(),
+        C.data(),
+        m,
+        n,
+        k,
+        lda,
+        ldb,
+        ldc,
+        /*transpose_B=*/false,
+        /*alpha=*/1.0f,
+        /*beta=*/0.0f,
         nullptr,
-        -1));
+        -1);
+
+    ASSERT_TRUE(ok);
+
+    const float expected[m * n] = {
+        1 * 1 + 2 * 5 + 3 * 9, 1 * 2 + 2 * 6 + 3 * 10,
+        1 * 3 + 2 * 7 + 3 * 11, 1 * 4 + 2 * 8 + 3 * 12,
+        4 * 1 + 5 * 5 + 6 * 9, 4 * 2 + 5 * 6 + 6 * 10,
+        4 * 3 + 5 * 7 + 6 * 11, 4 * 4 + 5 * 8 + 6 * 12};
+
+    for (int i = 0; i < m * n; ++i)
+    {
+        EXPECT_NEAR(C[static_cast<size_t>(i)], expected[i], 1e-4f) << "Mismatch at idx " << i;
+    }
 }
 
 #else // HAVE_ONEDNN

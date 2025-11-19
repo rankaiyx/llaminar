@@ -48,7 +48,7 @@ namespace llaminar2
         {
             const int heads_per_kv = n_heads / n_kv_heads;
 
-// Parallelize over sequences (outer loop)
+            // Parallelize over sequences (outer loop)
 #pragma omp parallel for if (seq_len * n_kv_heads > 512)
             for (int s = 0; s < seq_len; ++s)
             {
@@ -60,7 +60,15 @@ namespace llaminar2
                     // Broadcast to multiple Q heads: kv_out[s, kv_h*heads_per_kv + i, :]
                     for (int i = 0; i < heads_per_kv; ++i)
                     {
-                        int q_h = kv_h * heads_per_kv + i;
+                        const int q_h = kv_h * heads_per_kv + i;
+
+                        // Safety: guard against any mismatch where
+                        // n_heads is not an exact multiple of n_kv_heads.
+                        if (q_h >= n_heads)
+                        {
+                            continue;
+                        }
+
                         float *dst = kv_out + s * n_heads * head_dim + q_h * head_dim;
                         std::memcpy(dst, src, head_dim * sizeof(float));
                     }

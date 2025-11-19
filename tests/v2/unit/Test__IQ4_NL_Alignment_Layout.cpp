@@ -181,29 +181,9 @@ TEST_F(IQ4_NL_Alignment_Layout, CheckGEMMAlignment)
                                                                                                                                             : "unaligned ❌")
               << std::endl;
 
-    // Run GEMM and time it
-    auto start = std::chrono::high_resolution_clock::now();
-    bool success = gemm->multiply(A.data(), C.data(), m, n, k);
-    auto end = std::chrono::high_resolution_clock::now();
-
-    ASSERT_TRUE(success);
-
-    double ms = std::chrono::duration<double, std::milli>(end - start).count();
-    double gflops = (2.0 * m * n * k) / (ms * 1e6);
-
-    std::cout << "\nGEMM Performance:" << std::endl;
-    std::cout << "Time: " << ms << " ms" << std::endl;
-    std::cout << "Throughput: " << gflops << " GFLOPS" << std::endl;
-    std::cout << "Expected: ~350 GFLOPS (from previous high-performance runs)" << std::endl;
-
-    if (gflops < 200)
-    {
-        std::cout << "\n⚠️  WARNING: Performance is significantly degraded!" << std::endl;
-        std::cout << "    Possible causes:" << std::endl;
-        std::cout << "    1. Poor alignment (std::vector vs AlignedVector)" << std::endl;
-        std::cout << "    2. Transposed weight layout (wrong block indexing)" << std::endl;
-        std::cout << "    3. Missing SIMD optimizations (-march=native)" << std::endl;
-    }
+    // Weight-owned GEMM path removed: IQ4_NL now participates in GEMM only via
+    // activation-tensor-centric kernels. This test remains as an alignment and
+    // layout diagnostic without invoking the legacy gemm->multiply API.
 }
 
 /**
@@ -231,52 +211,9 @@ TEST_F(IQ4_NL_Alignment_Layout, CheckTransposeFlag)
 
     std::cout << "\n=== Transpose Flag Test ===" << std::endl;
 
-    // Test with transpose_B=true (default assumption)
-    auto start1 = std::chrono::high_resolution_clock::now();
-    bool success1 = gemm->multiply(A.data(), C_transpose.data(), m, n, k, true);
-    auto end1 = std::chrono::high_resolution_clock::now();
-    ASSERT_TRUE(success1);
-
-    double ms1 = std::chrono::duration<double, std::milli>(end1 - start1).count();
-    double gflops1 = (2.0 * m * n * k) / (ms1 * 1e6);
-
-    std::cout << "transpose_B=true:  " << ms1 << " ms, " << gflops1 << " GFLOPS" << std::endl;
-
-    // Test with transpose_B=false
-    auto start2 = std::chrono::high_resolution_clock::now();
-    bool success2 = gemm->multiply(A.data(), C_no_transpose.data(), m, n, k, false);
-    auto end2 = std::chrono::high_resolution_clock::now();
-
-    double ms2 = std::chrono::duration<double, std::milli>(end2 - start2).count();
-
-    std::cout << "transpose_B=false: ";
-    if (success2)
-    {
-        double gflops2 = (2.0 * m * n * k) / (ms2 * 1e6);
-        std::cout << ms2 << " ms, " << gflops2 << " GFLOPS" << std::endl;
-
-        // Compare results
-        double max_diff = 0.0;
-        for (size_t i = 0; i < C_transpose.size(); i++)
-        {
-            max_diff = std::max(max_diff, std::abs(C_transpose[i] - C_no_transpose[i]));
-        }
-        std::cout << "Max difference: " << max_diff << std::endl;
-
-        if (max_diff > 1e-3)
-        {
-            std::cout << "❌ Results differ significantly - transpose flag changes output!" << std::endl;
-        }
-        else
-        {
-            std::cout << "✅ Results match - transpose flag doesn't affect output" << std::endl;
-        }
-    }
-    else
-    {
-        std::cout << "❌ FAILED (dimension mismatch)" << std::endl;
-        std::cout << "This suggests weights ARE stored transposed and need transpose_B=true" << std::endl;
-    }
+    // Weight-owned GEMM path removed: transpose_B correctness is now validated
+    // through activation-driven GEMM tests rather than directly calling
+    // gemm->multiply on the IQ4_NL weight tensor.
 }
 
 int main(int argc, char **argv)

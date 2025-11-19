@@ -236,17 +236,25 @@ TEST_F(Test__FP32AttentionParity, AttentionScoresVsPyTorch)
     ASSERT_TRUE(load_snapshot("V_projection", pytorch_v));
     ASSERT_TRUE(load_snapshot("attention_scores", pytorch_scores));
 
-    // Extract dimensions
+    // Extract dimensions (same configuration as BasicForwardVsPyTorch)
+    ASSERT_EQ(pytorch_q.shape.size(), 3) << "Expected Q to be 3D";
+    ASSERT_EQ(pytorch_k.shape.size(), 3) << "Expected K to be 3D";
+
     int batch = pytorch_q.shape[0];
     int seq_len = pytorch_q.shape[1];
     int d_model_q = pytorch_q.shape[2];
     int d_model_k = pytorch_k.shape[2];
 
+    // Qwen 2.5 0.5B: n_heads=14, n_kv_heads=2, d_head=64
     int n_heads = 14;
     int d_head = 64;
+    int n_kv_heads = d_model_k / d_head;
 
-    // Run FP32 attention
-    FP32AttentionKernel attn(n_heads, d_head);
+    ASSERT_EQ(d_model_q, n_heads * d_head) << "Q dimension mismatch";
+    ASSERT_EQ(d_model_k, n_kv_heads * d_head) << "K dimension mismatch";
+
+    // Run FP32 attention with the same GQA configuration as BasicForwardVsPyTorch
+    FP32AttentionKernel attn(n_heads, d_head, n_kv_heads);
 
     std::vector<float> output_actual(batch * seq_len * d_model_q);
 
@@ -260,12 +268,45 @@ TEST_F(Test__FP32AttentionParity, AttentionScoresVsPyTorch)
 
     ASSERT_TRUE(success);
 
-    // Note: We don't have direct access to internal scores_buffer_
-    // This test verifies the final output includes correct score computation
-    // For deeper validation, we'd need to expose intermediate buffers or use
-    // a debug mode. For now, we rely on final output correctness.
+    // Compare per-head, per-position attention weights against PyTorch
+    // PyTorch "attention_scores" snapshot is assumed to contain the
+    // post-softmax attention weights with layout
+    //   [batch, n_heads, seq_len, seq_len]
+    ASSERT_EQ(pytorch_scores.shape.size(), 4) << "Expected attention_scores to be 4D";
+    ASSERT_EQ(pytorch_scores.shape[0], batch);
+    ASSERT_EQ(pytorch_scores.shape[1], n_heads);
+    ASSERT_EQ(pytorch_scores.shape[2], seq_len);
+    ASSERT_EQ(pytorch_scores.shape[3], seq_len);
 
-    LOG_INFO("AttentionScores test: Validated via final output correctness");
+    const float *attn_weights = attn.attention_weights_data();
+    ASSERT_NE(attn_weights, nullptr) << "Attention weights buffer is null";
+
+    std::vector<float> cpp_weights(pytorch_scores.data.size());
+
+    // Copy CPP attention weights into a contiguous vector with the same
+    // logical layout as the PyTorch snapshot: [b, h, i, j]
+    for (int b = 0; b < batch; ++b)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            for (int i = 0; i < seq_len; ++i)
+            {
+                for (int j = 0; j < seq_len; ++j)
+                {
+                    int idx = ((b * n_heads + h) * seq_len + i) * seq_len + j;
+                    cpp_weights[idx] = attn_weights[idx];
+                }
+            }
+        }
+    }
+
+    float max_abs = compute_max_abs_diff(pytorch_scores.data, cpp_weights);
+    float rel_l2 = compute_relative_l2(pytorch_scores.data, cpp_weights);
+
+    print_comparison("Attention Weights", pytorch_scores.data, cpp_weights, 1e-4f, 1e-4f);
+
+    EXPECT_LT(max_abs, 1e-4f) << "Max absolute difference in attention weights too large";
+    EXPECT_LT(rel_l2, 1e-4f) << "Relative L2 error in attention weights too large";
 }
 
 /**

@@ -282,13 +282,8 @@ TEST(ActivationTraits_FP16, SoftmaxBasicCorrectness)
 
 TEST(ActivationTraits_FP16, GemmKernelCreation)
 {
-    // FP16 GEMM not yet implemented - expect exception
-    EXPECT_THROW(
-        {
-            auto gemm = ActivationTraits<FP16Tensor>::create_activation_gemm();
-        },
-        std::runtime_error)
-        << "FP16 GEMM should throw until implemented";
+    auto gemm = ActivationTraits<FP16Tensor>::create_activation_gemm();
+    ASSERT_NE(gemm, nullptr) << "FP16 GEMM kernel creation failed";
 }
 
 TEST(ActivationTraits_FP16, WorkspaceAllocation)
@@ -397,19 +392,13 @@ TEST(ActivationTraits_CrossTrait, AllTraitsGemmCreatable)
 {
     auto fp32_gemm = ActivationTraits<FP32Tensor>::create_activation_gemm();
     auto bf16_gemm = ActivationTraits<BF16Tensor>::create_activation_gemm();
+    auto fp16_gemm = ActivationTraits<FP16Tensor>::create_activation_gemm();
     auto int32_gemm = ActivationTraits<INT32Tensor>::create_activation_gemm();
 
     EXPECT_NE(fp32_gemm, nullptr);
     EXPECT_NE(bf16_gemm, nullptr);
+    EXPECT_NE(fp16_gemm, nullptr);
     EXPECT_EQ(int32_gemm, nullptr) << "INT32 GEMM should return nullptr (output-only)";
-
-    // FP16 GEMM not yet implemented - expect exception
-    EXPECT_THROW(
-        {
-            auto fp16_gemm = ActivationTraits<FP16Tensor>::create_activation_gemm();
-        },
-        std::runtime_error)
-        << "FP16 GEMM should throw until implemented";
 }
 
 TEST(ActivationTraits_CrossTrait, AllTraitsWorkspaceAllocatable)

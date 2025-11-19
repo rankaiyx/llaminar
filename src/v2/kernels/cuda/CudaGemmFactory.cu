@@ -39,8 +39,14 @@ namespace llaminar2
     {
     public:
         virtual ~ITensorGemm() = default;
-        virtual bool multiply(const float *A, float *C, int m, int n, int k,
-                              const std::unordered_map<std::string, float> &extra_params) = 0;
+        virtual bool multiply_activations(
+            const float *A, const float *B, float *C,
+            int m, int n, int k,
+            bool transpose_B,
+            float alpha,
+            float beta,
+            const void *mpi_ctx,
+            int device_idx) = 0;
     };
 
     // Minimal tensor interface needed for implementation
@@ -113,74 +119,80 @@ namespace llaminar
                             {
                                 LOG_ERROR("[CudaGemmKernel] Tensor raw_blocks() returned null");
                                 return false;
-                            }
+                                bool multiply_activations(
+                                    const float *A, const float *B, float *C,
+                                    int m, int n, int k,
+                                    bool transpose_B,
+                                    float alpha,
+                                    float beta,
+                                    const void *mpi_ctx,
+                                    int device_idx) override
+                                    // Cast to IQ4_NL blocks
+                                    const llaminar2::cuda::IQ4_NLBlock *B_blocks =
+                                        reinterpret_cast<const llaminar2::cuda::IQ4_NLBlock *>(B_blocks_device);
 
-                            // Cast to IQ4_NL blocks
-                            const llaminar2::cuda::IQ4_NLBlock *B_blocks =
-                                reinterpret_cast<const llaminar2::cuda::IQ4_NLBlock *>(B_blocks_device);
+                                // Check if we should use optimized kernel (Phase 1)
+                                // Environment variable LLAMINAR_USE_OPTIMIZED_KERNEL=1 to enable
+                                // Default: use baseline kernel (optimized kernel still experimental)
+                                bool use_optimized = false;
+                                const char *use_opt_env = std::getenv("LLAMINAR_USE_OPTIMIZED_KERNEL");
+                                if (use_opt_env && std::atoi(use_opt_env) != 0)
+                                {
+                                    use_optimized = true;
+                                }
 
-                            // Check if we should use optimized kernel (Phase 1)
-                            // Environment variable LLAMINAR_USE_OPTIMIZED_KERNEL=1 to enable
-                            // Default: use baseline kernel (optimized kernel still experimental)
-                            bool use_optimized = false;
-                            const char *use_opt_env = std::getenv("LLAMINAR_USE_OPTIMIZED_KERNEL");
-                            if (use_opt_env && std::atoi(use_opt_env) != 0)
-                            {
-                                use_optimized = true;
-                            }
+                                cudaError_t err;
+                                if (use_optimized)
+                                {
+                                    // Phase 1 optimized kernel (coalesced, vectorized, padded)
+                                    err = llaminar2::cuda::launchIQ4NLGemmVariantOptimized(
+                                        A, B_blocks, C, m, n, k, config, nullptr);
+                                }
+                                else
+                                {
+                                    // Baseline kernel
+                                    err = llaminar2::cuda::launchIQ4NLGemmVariant(
+                                        A, B_blocks, C, m, n, k, config, nullptr);
+                                }
 
-                            cudaError_t err;
-                            if (use_optimized)
-                            {
-                                // Phase 1 optimized kernel (coalesced, vectorized, padded)
-                                err = llaminar2::cuda::launchIQ4NLGemmVariantOptimized(
-                                    A, B_blocks, C, m, n, k, config, nullptr);
-                            }
-                            else
-                            {
-                                // Baseline kernel
-                                err = llaminar2::cuda::launchIQ4NLGemmVariant(
-                                    A, B_blocks, C, m, n, k, config, nullptr);
-                            }
+                                if (err != cudaSuccess)
+                                {
+                                    LOG_ERROR("[CudaGemmKernel] Kernel launch failed: "
+                                              << cudaGetErrorString(err));
+                                    return false;
+                                }
 
-                            if (err != cudaSuccess)
+                                // Synchronize to ensure completion
+                                err = cudaDeviceSynchronize();
+                                if (err != cudaSuccess)
+                                {
+                                    LOG_ERROR("[CudaGemmKernel] Device synchronize failed: "
+                                              << cudaGetErrorString(err));
+                                    return false;
+                                }
+
+                                return true;
+                            }
+                            catch (const std::exception &e)
                             {
-                                LOG_ERROR("[CudaGemmKernel] Kernel launch failed: "
-                                          << cudaGetErrorString(err));
+                                LOG_ERROR("[CudaGemmKernel] multiply failed: " << e.what());
                                 return false;
                             }
-
-                            // Synchronize to ensure completion
-                            err = cudaDeviceSynchronize();
-                            if (err != cudaSuccess)
-                            {
-                                LOG_ERROR("[CudaGemmKernel] Device synchronize failed: "
-                                          << cudaGetErrorString(err));
-                                return false;
-                            }
-
-                            return true;
                         }
-                        catch (const std::exception &e)
-                        {
-                            LOG_ERROR("[CudaGemmKernel] multiply failed: " << e.what());
-                            return false;
-                        }
+
+                    private:
+                        const llaminar2::IQ4_NLTensor *tensor_;
+                    };
+
+                    // ========== Factory Function ==========
+
+                    std::unique_ptr<llaminar2::ITensorGemm> createCudaGemm(
+                        const llaminar2::IQ4_NLTensor *tensor)
+                    {
+                        return std::make_unique<CudaGemmKernel>(tensor);
                     }
 
-                private:
-                    const llaminar2::IQ4_NLTensor *tensor_;
-                };
-
-                // ========== Factory Function ==========
-
-                std::unique_ptr<llaminar2::ITensorGemm> createCudaGemm(
-                    const llaminar2::IQ4_NLTensor *tensor)
-                {
-                    return std::make_unique<CudaGemmKernel>(tensor);
-                }
-
-            } // namespace cuda
-        } // namespace kernels
-    } // namespace v2
-} // namespace llaminar
+                } // namespace cuda
+            } // namespace kernels
+        } // namespace v2
+    } // namespace llaminar

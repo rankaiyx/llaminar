@@ -130,10 +130,14 @@ namespace llaminar2
         // For each batch and head, compute: Q[seq_len, d_head] @ K^T[d_head, seq_len]
         // Result: scores[seq_len, seq_len] per head
         //
-        // NOTE: K is already expanded to n_heads if GQA was used, so we treat this as standard MHA
+        // K may be either already expanded to n_heads_ (standard MHA), or still have
+        // n_kv_heads_ heads when GQA is used. In forward() we only call compute_scores
+        // with an expanded K, but the FP32 parity tests use this kernel directly with
+        // full K heads (n_kv_heads_ == n_heads_). To keep the indexing correct and
+        // avoid out-of-bounds, we derive d_model_k from the configured KV head count.
 
         int d_model_q = n_heads_ * d_head_;
-        int d_model_k = n_heads_ * d_head_; // K is expanded to match Q
+        int d_model_k = n_kv_heads_ * d_head_;
 
         for (int b = 0; b < batch; ++b)
         {

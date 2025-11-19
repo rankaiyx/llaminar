@@ -169,42 +169,67 @@ TEST_F(Qwen2E2ECorrectness, SingleTokenInference)
 
     const float tolerance = 1e-3f; // Relaxed tolerance for full pipeline
 
-    // Load models
-    ASSERT_TRUE(loadModelSingleRank());
-    ASSERT_TRUE(loadModelMultiRank());
+    // Load models (propagate failures to all ranks)
+    bool local_ok = loadModelSingleRank();
+    int global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Single-rank model load failed on some rank";
+
+    local_ok = loadModelMultiRank();
+    global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Multi-rank model load failed on some rank";
 
     // Single token input
     std::vector<int> tokens = {151644}; // BOS token for Qwen 2.5
 
     // Single-rank execution (rank 0 only)
     std::vector<float> logits_single;
+    bool single_rank_success = true;
     if (rank_ == 0)
     {
         auto pipeline_single = std::make_unique<Qwen2Pipeline>(
             model_ctx_single_, nullptr, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
-        bool success = pipeline_single->forward(tokens.data(), tokens.size());
-        ASSERT_TRUE(success) << "Single-rank forward pass failed";
+        single_rank_success = pipeline_single->forward(tokens.data(), tokens.size());
 
-        // Get logits (vocabulary size)
-        const auto &model = model_ctx_single_->model();
-        size_t vocab_size = model.vocab_size;
-        logits_single.resize(vocab_size);
+        if (single_rank_success)
+        {
+            // Get logits (vocabulary size)
+            const auto &model = model_ctx_single_->model();
+            size_t vocab_size = model.vocab_size;
+            logits_single.resize(vocab_size);
 
-        // Extract logits from pipeline (seq_idx=0 for single sequence)
-        const float *logits_ptr = pipeline_single->getLogits(0);
-        ASSERT_NE(logits_ptr, nullptr) << "getLogits() returned null";
-        std::memcpy(logits_single.data(), logits_ptr, vocab_size * sizeof(float));
-
-        LOG_INFO("[E2E] Rank 0 single-rank logits extracted (" << vocab_size << " values)");
+            // Extract logits from pipeline (seq_idx=0 for single sequence)
+            const float *logits_ptr = pipeline_single->getLogits(0);
+            if (logits_ptr)
+            {
+                std::memcpy(logits_single.data(), logits_ptr, vocab_size * sizeof(float));
+                LOG_INFO("[E2E] Rank 0 single-rank logits extracted (" << vocab_size << " values)");
+            }
+            else
+            {
+                LOG_ERROR("[E2E] getLogits() returned null");
+                single_rank_success = false;
+            }
+        }
     }
+
+    // Sync success status
+    int local_success_int = single_rank_success ? 1 : 0;
+    int global_success_int = 0;
+    MPI_Allreduce(&local_success_int, &global_success_int, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_success_int, 1) << "Single-rank forward pass failed on rank 0";
 
     // Multi-rank execution (all ranks)
     auto pipeline_multi = std::make_unique<Qwen2Pipeline>(
         model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
     bool success = pipeline_multi->forward(tokens.data(), tokens.size());
-    ASSERT_TRUE(success) << "Multi-rank forward pass failed on rank " << rank_;
+    local_ok = success;
+    int global_success = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_success, 1) << "Multi-rank forward pass failed on some rank";
 
     std::vector<float> logits_multi;
     const auto &model = model_ctx_multi_->model();
@@ -251,9 +276,16 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
 
     const float tolerance = 1e-3f;
 
-    // Load models
-    ASSERT_TRUE(loadModelSingleRank());
-    ASSERT_TRUE(loadModelMultiRank());
+    // Load models (propagate failures to all ranks)
+    bool local_ok = loadModelSingleRank();
+    int global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Single-rank model load failed on some rank";
+
+    local_ok = loadModelMultiRank();
+    global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Multi-rank model load failed on some rank";
 
     // Multi-token input (8 tokens)
     std::vector<int> tokens = {
@@ -269,6 +301,7 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
     // Single-rank execution (rank 0 only)
     std::unique_ptr<Qwen2Pipeline> pipeline_single;
     std::vector<float> logits_single;
+    int single_rank_success = 0;
 
     if (rank_ == 0)
     {
@@ -276,7 +309,7 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
             model_ctx_single_, nullptr, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
         bool success = pipeline_single->forward(tokens.data(), tokens.size());
-        ASSERT_TRUE(success) << "Single-rank forward pass failed";
+        single_rank_success = success ? 1 : 0;
 
         const auto &model = model_ctx_single_->model();
         size_t vocab_size = model.vocab_size;
@@ -284,18 +317,29 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
 
         logits_single.resize(seq_len * vocab_size);
         const float *logits_ptr_single = pipeline_single->getLogits(0);
-        ASSERT_NE(logits_ptr_single, nullptr);
-        std::memcpy(logits_single.data(), logits_ptr_single, seq_len * vocab_size * sizeof(float));
-
-        LOG_INFO("[E2E] Single-rank prefill completed");
+        if (logits_ptr_single) {
+            std::memcpy(logits_single.data(), logits_ptr_single, seq_len * vocab_size * sizeof(float));
+            LOG_INFO("[E2E] Single-rank prefill completed");
+        } else {
+            LOG_ERROR("[E2E] Single-rank getLogits() returned null");
+            single_rank_success = 0;
+        }
     }
+
+    // Broadcast success from Rank 0 to ensure all ranks are synchronized
+    // and Rank 1 doesn't proceed to multi-rank execution prematurely
+    MPI_Bcast(&single_rank_success, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    ASSERT_EQ(single_rank_success, 1) << "Single-rank forward pass failed";
 
     // Multi-rank execution (all ranks)
     auto pipeline_multi = std::make_unique<Qwen2Pipeline>(
         model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
     bool success = pipeline_multi->forward(tokens.data(), tokens.size());
-    ASSERT_TRUE(success) << "Multi-rank forward pass failed on rank " << rank_;
+    local_ok = success;
+    int global_success = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_success, 1) << "Multi-rank forward pass failed on some rank";
 
     const auto &model = model_ctx_multi_->model();
     size_t vocab_size = model.vocab_size;
@@ -303,7 +347,13 @@ TEST_F(Qwen2E2ECorrectness, MultiTokenPrefill)
 
     std::vector<float> logits_multi(seq_len * vocab_size);
     const float *logits_ptr_multi = pipeline_multi->getLogits(0);
-    ASSERT_NE(logits_ptr_multi, nullptr);
+    
+    // Verify logits availability across all ranks to prevent hangs
+    bool has_logits = (logits_ptr_multi != nullptr);
+    int global_has_logits = has_logits ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_has_logits, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_has_logits, 1) << "Multi-rank getLogits() returned null on some rank";
+
     std::memcpy(logits_multi.data(), logits_ptr_multi, seq_len * vocab_size * sizeof(float));
 
     LOG_INFO("[E2E] Rank " << rank_ << " multi-rank prefill completed");
@@ -346,8 +396,11 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatchEqualLength)
 
     const float tolerance = 1e-3f;
 
-    // Load model
-    ASSERT_TRUE(loadModelMultiRank());
+    // Load model (propagate failures to all ranks)
+    bool local_ok = loadModelMultiRank();
+    int global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Multi-rank model load failed on some rank";
 
     // Define batch with 2 sequences of EQUAL length (no padding needed)
     std::vector<std::vector<int>> batch = {
@@ -366,7 +419,10 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatchEqualLength)
             model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
         bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
-        ASSERT_TRUE(success) << "Sequential forward pass failed for sequence " << i;
+        local_ok = success;
+        int global_success = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_success, 1) << "Sequential forward pass failed for some rank (sequence " << i << ")";
 
         const auto &model = model_ctx_multi_->model();
         size_t vocab_size = model.vocab_size;
@@ -390,7 +446,10 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatchEqualLength)
         model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/batch_size);
 
     bool success = pipeline_batch->forward_batch(batch);
-    ASSERT_TRUE(success) << "Batched forward pass failed on rank " << rank_;
+    local_ok = success;
+    int global_success = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_success, 1) << "Batched forward pass failed on some rank";
 
     const auto &model = model_ctx_multi_->model();
     size_t vocab_size = model.vocab_size;
@@ -478,8 +537,11 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
 
     const float tolerance = 1e-3f;
 
-    // Load model
-    ASSERT_TRUE(loadModelMultiRank());
+    // Load model (propagate failures to all ranks)
+    bool local_ok = loadModelMultiRank();
+    int global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Multi-rank model load failed on some rank";
 
     // Define batch with 2 sequences of different lengths
     std::vector<std::vector<int>> batch = {
@@ -498,7 +560,10 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
             model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
         bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
-        ASSERT_TRUE(success) << "Sequential forward pass failed for sequence " << i;
+        local_ok = success;
+        int global_success = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_success, 1) << "Sequential forward pass failed for some rank (sequence " << i << ")";
 
         const auto &model = model_ctx_multi_->model();
         size_t vocab_size = model.vocab_size;
@@ -522,7 +587,10 @@ TEST_F(Qwen2E2ECorrectness, MultiSequenceBatch)
         model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/batch_size);
 
     bool success = pipeline_batch->forward_batch(batch);
-    ASSERT_TRUE(success) << "Batched forward pass failed on rank " << rank_;
+    local_ok = success;
+    int global_success = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_success, 1) << "Batched forward pass failed on some rank";
 
     const auto &model = model_ctx_multi_->model();
     size_t vocab_size = model.vocab_size;
@@ -632,8 +700,11 @@ TEST_F(Qwen2E2ECorrectness, BatchScaling)
 
     const float tolerance = 1e-3f;
 
-    // Load model
-    ASSERT_TRUE(loadModelMultiRank());
+    // Load model (propagate failures to all ranks)
+    bool local_ok = loadModelMultiRank();
+    int global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Multi-rank model load failed on some rank";
 
     // Test different batch sizes
     std::vector<int> batch_sizes = {1, 2, 4, 8};
@@ -672,7 +743,10 @@ TEST_F(Qwen2E2ECorrectness, BatchScaling)
                 model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
             bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
-            ASSERT_TRUE(success) << "Sequential forward failed for seq " << i;
+            local_ok = success;
+            int global_success = local_ok ? 1 : 0;
+            MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+            ASSERT_EQ(global_success, 1) << "Sequential forward failed for some rank (seq " << i << ")";
 
             size_t seq_len = batch[i].size();
             logits_sequential[i].resize(seq_len * vocab_size);
@@ -687,7 +761,10 @@ TEST_F(Qwen2E2ECorrectness, BatchScaling)
             model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, batch_size);
 
         bool success = pipeline_batch->forward_batch(batch);
-        ASSERT_TRUE(success) << "Batched forward failed for batch_size=" << batch_size;
+        local_ok = success;
+        int global_success = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_success, 1) << "Batched forward failed for some rank (batch_size=" << batch_size << ")";
 
         // Extract and compare logits
         for (int i = 0; i < batch_size; ++i)
@@ -746,8 +823,11 @@ TEST_F(Qwen2E2ECorrectness, IncrementalDecode)
 
     const float tolerance = 1e-3f;
 
-    // Load model
-    ASSERT_TRUE(loadModelMultiRank());
+    // Load model (propagate failures to all ranks)
+    bool local_ok = loadModelMultiRank();
+    int global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Multi-rank model load failed on some rank";
 
     // Initial prompt
     std::vector<int> prompt = {151644, 9906}; // BOS + "Hello"
@@ -759,7 +839,10 @@ TEST_F(Qwen2E2ECorrectness, IncrementalDecode)
 
     // Prefill phase
     bool success = pipeline->forward(prompt.data(), prompt.size());
-    ASSERT_TRUE(success) << "Prefill failed on rank " << rank_;
+    local_ok = success;
+    int global_success = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_success, 1) << "Prefill failed on some rank";
 
     if (rank_ == 0)
     {
@@ -800,7 +883,10 @@ TEST_F(Qwen2E2ECorrectness, IncrementalDecode)
 
         // Incremental decode (single token)
         success = pipeline->forward(&next_token, 1);
-        ASSERT_TRUE(success) << "Decode step " << step << " failed on rank " << rank_;
+        local_ok = success;
+        global_success = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_success, 1) << "Decode step " << step << " failed on some rank";
     }
 
     mpi_ctx_->barrier();
@@ -835,8 +921,11 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
 
     const float tolerance = 1e-3f;
 
-    // Load model
-    ASSERT_TRUE(loadModelMultiRank());
+    // Load model (propagate failures to all ranks)
+    bool local_ok = loadModelMultiRank();
+    int global_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "Multi-rank model load failed on some rank";
 
     // Test configuration: 2 sequences with different lengths
     std::vector<std::vector<int>> batch = {
@@ -857,7 +946,10 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
             model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
 
         bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
-        ASSERT_TRUE(success) << "Sequential forward failed for sequence " << i;
+        local_ok = success;
+        int global_success = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_success, 1) << "Sequential forward failed for some rank (sequence " << i << ")";
 
         const size_t seq_len = batch[i].size();
         logits_sequential[i].resize(seq_len * vocab_size);
@@ -877,7 +969,10 @@ TEST_F(Qwen2E2ECorrectness, ComprehensiveBatchParity)
         model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, batch_size);
 
     bool success = pipeline_batch->forward_batch(batch);
-    ASSERT_TRUE(success) << "Batched forward failed on rank " << rank_;
+    local_ok = success;
+    int global_success = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_success, 1) << "Batched forward failed on some rank";
 
     if (rank_ == 0)
     {

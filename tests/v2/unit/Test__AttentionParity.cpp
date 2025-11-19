@@ -350,8 +350,10 @@ namespace
         config.workspace_context = workspace_context;
         config.workspace_mask = workspace_mask;
 
+        // Use the main GQAAttention compute path, which routes scores·V
+        // through the activation GEMM interface (supports non-transposed B).
         ASSERT_TRUE(GQAAttention::compute(
-            Q.get(), K.get(), V.get(), output.get(), config, 1, nullptr))
+            Q.get(), K.get(), V.get(), output.get(), config, /*batch_size=*/1, /*sequence_lengths=*/nullptr))
             << "GQA attention failed";
 
         // Verify: Heads 0,1 should use KV head 0, heads 2,3 should use KV head 1

@@ -716,13 +716,14 @@ namespace llaminar2
          * Implements ITensorGemm::multiply() with fused dequant+GEMM.
          * Ignores mpi_ctx for now (single-node optimization).
          */
-        bool multiply(const float *A, float *C,
-                      int m, int n, int k,
-                      bool transpose_B = true,
-                      float alpha = 1.0f,
-                      float beta = 0.0f,
-                      const MPIContext *mpi_ctx = nullptr,
-                      int device_idx = -1)
+        bool multiply_activations(
+            const float *A, const float *B, float *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            float alpha = 1.0f,
+            float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
         {
             // Unused in CPU-only implementation (future: use for MPI coordination)
             (void)mpi_ctx;

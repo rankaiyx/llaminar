@@ -466,8 +466,8 @@ namespace llaminar2
         VALIDATE_KERNEL(v_gemm, layer.wv->createGemm(), "V GEMM kernel");
 
         // Q = hidden @ wq^T
-        VALIDATE_OP(q_gemm->multiply(
-                        normalized_hidden->data(), buffers.Q->mutable_data(),
+        VALIDATE_OP(q_gemm->multiply_activations(
+                        normalized_hidden->data(), layer.wq->data(), buffers.Q->mutable_data(),
                         effective_seq_len, n_heads_ * head_dim_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "Q projection");
@@ -477,8 +477,8 @@ namespace llaminar2
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_Q_PROJECTION", buffers.Q, effective_seq_len, n_heads_ * head_dim_);
 
         // K = hidden @ wk^T
-        VALIDATE_OP(k_gemm->multiply(
-                        normalized_hidden->data(), buffers.K->mutable_data(),
+        VALIDATE_OP(k_gemm->multiply_activations(
+                        normalized_hidden->data(), layer.wk->data(), buffers.K->mutable_data(),
                         effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "K projection");
@@ -488,8 +488,8 @@ namespace llaminar2
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_K_PROJECTION", buffers.K, effective_seq_len, n_kv_heads_ * head_dim_);
 
         // V = hidden @ wv^T
-        VALIDATE_OP(v_gemm->multiply(
-                        normalized_hidden->data(), buffers.V->mutable_data(),
+        VALIDATE_OP(v_gemm->multiply_activations(
+                        normalized_hidden->data(), layer.wv->data(), buffers.V->mutable_data(),
                         effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "V projection");
@@ -515,10 +515,18 @@ namespace llaminar2
         {
             if (batch_size_ == 1)
             {
-                LOG_DEBUG("[RoPE Debug] Layer " << layer_idx << " (batch_size=1) position_ids: "
-                                                << "seq0=[" << position_ids[0] << "," << position_ids[1] << "]");
+                if (position_ids.size() >= 2)
+                {
+                    LOG_DEBUG("[RoPE Debug] Layer " << layer_idx << " (batch_size=1) position_ids: "
+                                                    << "seq0=[" << position_ids[0] << "," << position_ids[1] << "]");
+                }
+                else if (position_ids.size() == 1)
+                {
+                    LOG_DEBUG("[RoPE Debug] Layer " << layer_idx << " (batch_size=1) position_ids: "
+                                                    << "seq0=[" << position_ids[0] << "]");
+                }
             }
-            else if (batch_size_ == 2)
+            else if (batch_size_ == 2 && position_ids.size() >= 4)
             {
                 LOG_DEBUG("[RoPE Debug] Layer " << layer_idx << " (batch_size=2) position_ids: "
                                                 << "seq0=[" << position_ids[0] << "," << position_ids[1] << "], "
@@ -574,8 +582,8 @@ namespace llaminar2
 
         // 5. Output projection (reuse attn_proj buffer)
         VALIDATE_KERNEL(o_gemm, layer.wo->createGemm(), "output GEMM kernel");
-        VALIDATE_OP(o_gemm->multiply(
-                        buffers.attn_output->data(), buffers.attn_proj->mutable_data(),
+        VALIDATE_OP(o_gemm->multiply_activations(
+                        buffers.attn_output->data(), layer.wo->data(), buffers.attn_proj->mutable_data(),
                         effective_seq_len, d_model_, n_heads_ * head_dim_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
                     "Output projection");
@@ -658,8 +666,8 @@ namespace llaminar2
         VALIDATE_KERNEL(up_gemm, layer.up_proj->createGemm(), "up GEMM kernel");
 
         // gate = hidden @ gate_proj^T
-        VALIDATE_OP(gate_gemm->multiply(
-                        normalized_hidden->data(), buffers.gate->mutable_data(),
+        VALIDATE_OP(gate_gemm->multiply_activations(
+                        normalized_hidden->data(), layer.gate_proj->data(), buffers.gate->mutable_data(),
                         effective_seq_len, d_ff_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                     "Gate projection");
@@ -669,8 +677,8 @@ namespace llaminar2
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE", buffers.gate, effective_seq_len, d_ff_);
 
         // up = hidden @ up_proj^T
-        VALIDATE_OP(up_gemm->multiply(
-                        normalized_hidden->data(), buffers.up->mutable_data(),
+        VALIDATE_OP(up_gemm->multiply_activations(
+                        normalized_hidden->data(), layer.up_proj->data(), buffers.up->mutable_data(),
                         effective_seq_len, d_ff_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                     "Up projection");
@@ -699,8 +707,8 @@ namespace llaminar2
         VALIDATE_KERNEL(down_gemm, layer.down_proj->createGemm(), "down GEMM kernel");
 
         // ffn_output = up @ down_proj^T
-        VALIDATE_OP(down_gemm->multiply(
-                        buffers.up->data(), buffers.ffn_output->mutable_data(),
+        VALIDATE_OP(down_gemm->multiply_activations(
+                        buffers.up->data(), layer.down_proj->data(), buffers.ffn_output->mutable_data(),
                         effective_seq_len, d_model_, d_ff_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                     "Down projection");
@@ -906,8 +914,8 @@ namespace llaminar2
         // LM head: logits = hidden @ lm_head^T
         // hidden: [effective_seq_len, d_model], lm_head: [vocab_size, d_model]
         // output: [effective_seq_len, vocab_size]
-        VALIDATE_OP(lm_gemm->multiply(
-                        hidden->data(), logits_buffer_->mutable_data(),
+        VALIDATE_OP(lm_gemm->multiply_activations(
+                        hidden->data(), lm_head->data(), logits_buffer_->mutable_data(),
                         effective_seq_len, vocab_size_, d_model_,
                         true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_),
                     "LM head projection");

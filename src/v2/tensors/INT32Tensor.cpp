@@ -9,6 +9,7 @@
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
+#include "../kernels/cpu/CPUAttentionT.h"
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -311,8 +312,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorAttention> INT32Tensor::createAttention()
     {
-        LOG_ERROR("[INT32Tensor] Attention not supported for INT32");
-        return nullptr;
+        // INT32 tensors use templated CPU attention kernel
+        return std::make_unique<CPUAttentionT<INT32Tensor>>();
     }
 
     // =============================================================================

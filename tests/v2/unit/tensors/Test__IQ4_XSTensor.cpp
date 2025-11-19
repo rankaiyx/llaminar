@@ -304,17 +304,9 @@ TEST_F(IQ4_XSSIMDTest, GEMM_SmallBatch)
     // C: [4, 8] - result
     std::vector<float> C(4 * 8, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 4, 8, 256, true);
-    ASSERT_TRUE(success);
-
-    // Reference computation - use to_fp32() method
-    std::vector<float> B_decoded(8 * 256);
-    tensor->to_fp32(B_decoded.data());
-
-    std::vector<float> C_expected(4 * 8, 0.0f);
-    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 4, 8, 256);
-
-    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 4 * 8, 1e-3f));
+    // Weight-owned GEMM path removed: IQ4_XS now participates in GEMM only via
+    // activation-tensor-centric kernels. This test previously validated
+    // gemm->multiply against a reference GEMM; that path has been retired.
 }
 
 TEST_F(IQ4_XSSIMDTest, GEMM_MediumBatch)
@@ -332,17 +324,7 @@ TEST_F(IQ4_XSSIMDTest, GEMM_MediumBatch)
     // C: [16, 16]
     std::vector<float> C(16 * 16, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 16, 16, 512, true);
-    ASSERT_TRUE(success);
-
-    // Reference
-    std::vector<float> B_decoded(16 * 512);
-    tensor->to_fp32(B_decoded.data());
-
-    std::vector<float> C_expected(16 * 16, 0.0f);
-    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 16, 16, 512);
-
-    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 16 * 16, 1e-3f));
+    // Weight-owned GEMM path removed: see GEMM_SmallBatch note.
 }
 
 TEST_F(IQ4_XSSIMDTest, GEMM_LargeBatch)
@@ -360,17 +342,7 @@ TEST_F(IQ4_XSSIMDTest, GEMM_LargeBatch)
     // C: [32, 32]
     std::vector<float> C(32 * 32, 0.0f);
 
-    bool success = gemm->multiply(A.data(), C.data(), 32, 32, 768, true);
-    ASSERT_TRUE(success);
-
-    // Reference
-    std::vector<float> B_decoded(32 * 768);
-    tensor->to_fp32(B_decoded.data());
-
-    std::vector<float> C_expected(32 * 32, 0.0f);
-    referenceGEMM(A.data(), B_decoded.data(), C_expected.data(), 32, 32, 768);
-
-    EXPECT_TRUE(matricesEqual(C_expected.data(), C.data(), 32 * 32, 1e-3f));
+    // Weight-owned GEMM path removed: see GEMM_SmallBatch note.
 }
 
 TEST_F(IQ4_XSSIMDTest, EdgeCase_AllMaxNibbles)

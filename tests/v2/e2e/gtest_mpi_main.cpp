@@ -10,7 +10,8 @@
 int main(int argc, char **argv)
 {
     // Initialize MPI before GTest
-    MPI_Init(&argc, &argv);
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
     // Initialize GTest
     ::testing::InitGoogleTest(&argc, argv);

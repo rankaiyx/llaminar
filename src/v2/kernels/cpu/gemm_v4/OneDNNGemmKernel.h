@@ -122,7 +122,7 @@ namespace llaminar2
          */
         inline dnnl::engine &onednn_engine()
         {
-            static dnnl::engine engine_instance(dnnl::engine::kind::cpu, 0);
+            static thread_local dnnl::engine engine_instance(dnnl::engine::kind::cpu, 0);
             return engine_instance;
         }
 
@@ -131,7 +131,7 @@ namespace llaminar2
          */
         inline dnnl::stream &onednn_stream()
         {
-            static dnnl::stream stream_instance(onednn_engine());
+            thread_local dnnl::stream stream_instance(onednn_engine());
             return stream_instance;
         }
 
@@ -172,8 +172,8 @@ namespace llaminar2
             }
             catch (const dnnl::error &e)
             {
-                std::cerr << "OneDNN matmul failed: status=" << e.status
-                          << " message=" << e.what() << std::endl;
+                LOG_ERROR("OneDNN matmul failed: status=" << e.status
+                          << " message=" << e.what());
                 return false;
             }
 
@@ -189,6 +189,8 @@ namespace llaminar2
         {
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
+
+            // LOG_DEBUG("Entering run_onednn_fp32_matmul M=" << M << " N=" << N << " K=" << K);
 
             try
             {
@@ -214,8 +216,18 @@ namespace llaminar2
             }
             catch (const dnnl::error &e)
             {
-                std::cerr << "OneDNN FP32 matmul failed: status=" << e.status
-                          << " message=" << e.what() << std::endl;
+                LOG_ERROR("OneDNN FP32 matmul failed: status=" << e.status
+                          << " message=" << e.what());
+                return false;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("OneDNN FP32 matmul failed with std::exception: " << e.what());
+                return false;
+            }
+            catch (...)
+            {
+                LOG_ERROR("OneDNN FP32 matmul failed with unknown exception");
                 return false;
             }
 
@@ -695,77 +707,13 @@ namespace llaminar2
              * @note Weight tensor B must be bound to this kernel via constructor
              * @note Currently only supports alpha=1.0, beta=0.0, transpose_B=true
              */
-            bool multiply(const float *A, float *C,
-                          int m, int n, int k,
-                          bool transpose_B = true,
-                          float alpha = 1.0f,
-                          float beta = 0.0f,
-                          const MPIContext *mpi_ctx = nullptr,
-                          int device_idx = -1) override
-            {
-                // Validate CPU-only execution
-                if (device_idx != -1)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Only CPU execution supported (device_idx="
-                              << device_idx << ")");
-                    return false;
-                }
-
-                // Check for unsupported parameters
-                if (alpha != 1.0f || beta != 0.0f)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] alpha/beta scaling not yet supported");
-                    return false;
-                }
-
-                if (!transpose_B)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Non-transposed B not yet supported");
-                    return false;
-                }
-
-                // Validate weight tensor is bound
-                if (!weight_tensor_)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] No weight tensor bound to kernel");
-                    return false;
-                }
-
-                // Validate dimensions
-                const auto &shape = weight_tensor_->shape();
-                if (shape.size() != 2)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Weight tensor must be 2D");
-                    return false;
-                }
-
-                // Weight tensor is [N, K] for transpose_B=true (most common layout)
-                if (static_cast<int>(shape[0]) != n || static_cast<int>(shape[1]) != k)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Weight tensor shape mismatch: expected ["
-                              << n << "," << k << "], got ["
-                              << shape[0] << "," << shape[1] << "]");
-                    return false;
-                }
-
-                // Create lightweight views (no allocation or memcpy!)
-                ActivationView activation_view(A, static_cast<size_t>(m), static_cast<size_t>(k));
-                ActivationView output_view(C, static_cast<size_t>(m), static_cast<size_t>(n));
-
-                // Execute using adapter (activations quantized on-the-fly)
-                return onednn_gemm_adapter(m, n, k,
-                                           activation_view,
-                                           *weight_tensor_,
-                                           output_view,
-                                           nullptr); // No bias
-            }
-
-            bool multiply_with_softmax(const float *A, float *C,
-                                       int m, int n, int k,
-                                       bool transpose_B = true,
-                                       int softmax_axis = 1,
-                                       const MPIContext *mpi_ctx = nullptr,
-                                       int device_idx = -1) override
+            bool multiply_with_softmax(
+                const float *A, const float *B, float *C,
+                int m, int n, int k,
+                bool transpose_B = true,
+                int softmax_axis = 1,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
             {
                 (void)mpi_ctx;
 
@@ -776,17 +724,57 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!transpose_B)
+                // We historically only supported the weight-bound path with B stored
+                // transposed in the tensor. For simplicity and robustness in E2E
+                // scenarios, treat a non-transposed B pointer here as a request to use
+                // the provided activations as the RHS directly, falling back to the
+                // generic activation-activation matmul + softmax path. This avoids
+                // hard failure while preserving the existing optimised path when
+                // transpose_B == true and a bound weight tensor is available.
+                if (!transpose_B || !weight_tensor_)
                 {
-                    LOG_ERROR("[OneDNNGemmKernel] Non-transposed B not yet supported");
-                    return false;
+                    if (!transpose_B)
+                    {
+                        LOG_WARN("[OneDNNGemmKernel] multiply_with_softmax received non-transposed B; "
+                                 "falling back to activation matmul + softmax");
+                    }
+                    else
+                    {
+                        LOG_WARN("[OneDNNGemmKernel] No bound weight tensor; falling back to "
+                                 "activation matmul + softmax");
+                    }
+
+                    // Use activation-activation GEMM followed by explicit softmax.
+                    if (!multiply_activations(A, B, C, m, n, k, /*transpose_B=*/transpose_B,
+                                              /*alpha=*/1.0f, /*beta=*/0.0f,
+                                              mpi_ctx, device_idx))
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] Fallback activation matmul failed in "
+                                  "multiply_with_softmax");
+                        return false;
+                    }
+
+                    int axis = softmax_axis;
+                    if (axis < 0)
+                    {
+                        axis += 2;
+                    }
+                    if (axis != 0 && axis != 1)
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] Softmax axis must be 0, 1, or -1 (rows/cols)");
+                        return false;
+                    }
+
+                    if (!apply_softmax_inplace(C, m, n, axis))
+                    {
+                        LOG_ERROR("[OneDNNGemmKernel] Softmax application failed in fallback path");
+                        return false;
+                    }
+
+                    return true;
                 }
 
-                if (!weight_tensor_)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] No weight tensor bound to kernel");
-                    return false;
-                }
+                (void)B;
 
                 if (m <= 0 || n <= 0 || k <= 0)
                 {
@@ -863,21 +851,39 @@ namespace llaminar2
                     return false;
                 }
 
-                // Check for unsupported parameters
-                if (alpha != 1.0f || beta != 0.0f)
+                // For activation-activation, use FP32 matmul, then apply alpha/beta scaling
+                const float *rhs_ptr = prepare_rhs_for_matmul(B, n, k, transpose_B);
+
+                if (!run_onednn_fp32_matmul(A, rhs_ptr, C, m, n, k))
                 {
-                    LOG_ERROR("[OneDNNGemmKernel] alpha/beta scaling not yet supported");
                     return false;
                 }
 
-                // For activation-activation, use FP32 matmul
-                const float *rhs_ptr = prepare_rhs_for_matmul(B, n, k, transpose_B);
-                return run_onednn_fp32_matmul(A, rhs_ptr, C, m, n, k);
+                // Fast path: default alpha=1, beta=0 (no-op)
+                if (alpha == 1.0f && beta == 0.0f)
+                {
+                    return true;
+                }
+
+                const size_t total = static_cast<size_t>(m) * static_cast<size_t>(n);
+                if (beta == 0.0f)
+                {
+                    for (size_t i = 0; i < total; ++i)
+                    {
+                        C[i] *= alpha;
+                    }
+                }
+                else
+                {
+                    // General alpha/beta: C = alpha * C + beta * C_orig
+                    // Since we don't have C_orig here, we only support beta==0 for now.
+                    LOG_ERROR("[OneDNNGemmKernel] beta != 0.0f not yet supported in multiply_activations");
+                    return false;
+                }
+
+                return true;
             }
 
-            /**
-             * @brief Strided activation GEMM (not implemented yet)
-             */
             bool multiply_activations_strided(const float *A, const float *B, float *C,
                                               int m, int n, int k,
                                               int lda, int ldb, int ldc,
@@ -908,19 +914,15 @@ namespace llaminar2
                     return false;
                 }
 
-                if (alpha != 1.0f || beta != 0.0f)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] multiply_activations_strided only supports alpha=1.0, beta=0.0");
-                    return false;
-                }
-
                 // Fast path: dense row-major layout for all matrices
                 const bool a_row_major = (lda == k);
-                const bool b_row_major = (ldb == k);
+                const bool b_row_major = (ldb == (transpose_B ? k : n));
                 const bool c_row_major = (ldc == n);
 
                 if (a_row_major && b_row_major && c_row_major)
                 {
+                    // Underlying OneDNN matmul already supports arbitrary alpha/beta,
+                    // so we can delegate directly here.
                     return multiply_activations(A,
                                                 B,
                                                 C,
@@ -934,11 +936,12 @@ namespace llaminar2
                                                 device_idx);
                 }
 
-                // Fallback: copy to contiguous row-major A' and B' buffers, perform GEMM,
-                // then scatter results back to C if ldc != n.
+                // Fallback: copy to contiguous row-major A' (m×k) and B' (k×n) buffers,
+                // perform GEMM, then scatter results back to C if ldc != n.
                 std::vector<float> A_buf(static_cast<size_t>(m) * static_cast<size_t>(k));
-                std::vector<float> B_buf(static_cast<size_t>(n) * static_cast<size_t>(k));
+                std::vector<float> B_buf(static_cast<size_t>(k) * static_cast<size_t>(n));
 
+                // Pack A as row-major m×k from strided source (row-major with lda)
                 for (int row = 0; row < m; ++row)
                 {
                     const float *src = A + static_cast<size_t>(row) * static_cast<size_t>(lda);
@@ -946,11 +949,32 @@ namespace llaminar2
                     std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(k));
                 }
 
-                for (int row = 0; row < n; ++row)
+                // Pack B into contiguous row-major k×n according to transpose_B
+                // Logical layouts:
+                //  - If transpose_B == false: B is k×n with leading dimension ldb (row-major),
+                //    so source rows correspond to k and columns to n.
+                //  - If transpose_B == true: original B is n×k, but GEMM wants k×n, so we
+                //    treat the source as n rows of length k and transpose into k×n.
+                if (!transpose_B)
                 {
-                    const float *src = B + static_cast<size_t>(row) * static_cast<size_t>(ldb);
-                    float *dst = B_buf.data() + static_cast<size_t>(row) * static_cast<size_t>(k);
-                    std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(k));
+                    for (int ki = 0; ki < k; ++ki)
+                    {
+                        const float *src = B + static_cast<size_t>(ki) * static_cast<size_t>(ldb);
+                        float *dst = B_buf.data() + static_cast<size_t>(ki) * static_cast<size_t>(n);
+                        std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(n));
+                    }
+                }
+                else
+                {
+                    for (int ki = 0; ki < k; ++ki)
+                    {
+                        for (int nj = 0; nj < n; ++nj)
+                        {
+                            const float *src_row = B + static_cast<size_t>(nj) * static_cast<size_t>(ldb);
+                            B_buf[static_cast<size_t>(ki) * static_cast<size_t>(n) + static_cast<size_t>(nj)] =
+                                src_row[static_cast<size_t>(ki)];
+                        }
+                    }
                 }
 
                 // We compute into a temporary contiguous buffer if C is strided.
@@ -966,13 +990,14 @@ namespace llaminar2
                     C_target = C_tmp.data();
                 }
 
+                // We packed B as k×n row-major, so we call GEMM with transpose_B=false
                 if (!multiply_activations(A_buf.data(),
                                           B_buf.data(),
                                           C_target,
                                           m,
                                           n,
                                           k,
-                                          transpose_B,
+                                          false,
                                           alpha,
                                           beta,
                                           mpi_ctx,

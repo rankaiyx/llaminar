@@ -32,12 +32,12 @@ namespace llaminar2
             float g = gate[i];
             float u = up[i];
 
-            // SwiGLU: gate * silu(up)
+            // SwiGLU: silu(gate) * up
             // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-            float sigmoid_u = 1.0f / (1.0f + std::exp(-u));
-            float silu_u = u * sigmoid_u;
+            float sigmoid_g = 1.0f / (1.0f + std::exp(-g));
+            float silu_g = g * sigmoid_g;
 
-            output[i] = g * silu_u;
+            output[i] = silu_g * u;
         }
 
         return true;

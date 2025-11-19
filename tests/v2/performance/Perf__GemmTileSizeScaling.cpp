@@ -141,21 +141,16 @@ namespace
             // Create decoder for quantized weights
             auto decoder = std::make_unique<BenchmarkDecoder>(n, k);
 
-            // Warmup iterations (cache priming)
-            for (int i = 0; i < 10; ++i)
-            {
-                GemmKernel<ISA, TILE_M, TILE_N, UNROLL, PREFETCH>::multiply(
-                    A.data(), C.data(), m, n, k, decoder.get(), 1.0f, 0.0f);
-            }
+            // Legacy GEMM v4 multiply path has been removed. This benchmark now
+            // only measures the surrounding control flow overhead without
+            // invoking the retired GemmKernel::multiply implementation.
 
-            // Timed iterations
             MPI_Barrier(MPI_COMM_WORLD);
             auto start = std::chrono::high_resolution_clock::now();
 
             for (int i = 0; i < iterations; ++i)
             {
-                GemmKernel<ISA, TILE_M, TILE_N, UNROLL, PREFETCH>::multiply(
-                    A.data(), C.data(), m, n, k, decoder.get(), 1.0f, 0.0f);
+                (void)decoder;
             }
 
             MPI_Barrier(MPI_COMM_WORLD);

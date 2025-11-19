@@ -71,6 +71,16 @@ namespace llaminar2
             bool use_causal_mask = false,
             float eps = 1e-8f);
 
+        /**
+         * @brief Get read-only view of attention weights buffer
+         *
+         * Layout: [batch, n_heads, seq_len, seq_len]
+         *
+         * @return Pointer to internal attention weights buffer, or nullptr if
+         *         forward() has not been called yet.
+         */
+        const float *attention_weights_data() const { return attn_weights_buffer_.empty() ? nullptr : attn_weights_buffer_.data(); }
+
     private:
         /**
          * @brief Compute attention scores: Q @ K^T

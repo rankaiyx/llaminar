@@ -8,6 +8,7 @@
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
 #include "../kernels/cpu/CPURMSNormKernel.h"
+#include "../kernels/cpu/CPUAttentionT.h"
 #include "../kernels/cpu/CPURoPEKernel.h"
 #include "../backends/ComputeBackend.h"
 #ifdef HAVE_CUDA
@@ -198,7 +199,7 @@ namespace llaminar2
             // Tensor is on CPU - use auto-tuned CPU kernel
             // FP16 implements ITensorGemmTileDataProvider interface (used generically for auto-tuner)
             LOG_DEBUG("[FP16Tensor] Creating CPU GEMM kernel with auto-tuner");
-        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+            return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
         }
     }
 
@@ -225,8 +226,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorAttention> FP16Tensor::createAttention()
     {
-        LOG_ERROR("[FP16Tensor] createAttention not supported for quantized tensors");
-        return nullptr;
+        // FP16 tensors use templated CPU attention kernel
+        return std::make_unique<CPUAttentionT<FP16Tensor>>();
     }
 
     // ========== FP16-Specific Interface ==========

@@ -248,8 +248,6 @@ add_v2_test(V2_Unit_Q8_1Tensor
     LABELS "V2;Unit;TensorOperations;Q8_1;Quantization;Activations"
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
-
-# Test: INT32Tensor class (accumulator tensor for INT8 pipelines)
 add_executable(v2_test_int32_tensor unit/tensors/Test__INT32Tensor.cpp)
 target_link_libraries(v2_test_int32_tensor 
     llaminar2_core 
@@ -503,17 +501,7 @@ add_v2_test(V2_Unit_INT8SwiGLU
 )
 
 # Test: INT8GemmKernel (OneDNN per-channel quantization)
-add_executable(v2_test_int8_gemm unit/Test__INT8GemmKernel.cpp)
-target_link_libraries(v2_test_int8_gemm 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_INT8GemmKernel 
-    COMMAND $<TARGET_FILE:v2_test_int8_gemm>
-    LABELS "V2;Unit;Kernels;INT8;Quantization;GEMM;OneDNN;CPU"
-    MPI_PROCS 1  # INT8 GEMM is CPU-only, single rank
-)
+## NOTE: INT8GemmKernel test removed - depends on obsolete GEMM v4 weight-owned APIs
 
 # Test: Full INT8 Pipeline (end-to-end INT8 inference) (DISABLED - missing INT8GemmKernel.h)
 # add_executable(v2_test_full_int8_pipeline Test__FullINT8Pipeline.cpp)
@@ -547,24 +535,22 @@ target_link_libraries(v2_test_iq4nl_views
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_IQ4NL_Views 
-    COMMAND $<TARGET_FILE:v2_test_iq4nl_views>
-    LABELS "V2;Unit;TensorOperations;IQ4_NL;Quantization;ViewSupport;RowSlice;IQuant"
-)
+# NOTE: IQ4_NL GEMM/Tilesweep perf tests removed - depends on obsolete
+# GEMM v4 paths. IQ4_NL is now validated via tensor views and activation-
+# centric kernels.
 
-# Test: IQ4_XS Tensor Views
-add_executable(v2_test_iq4xs_views unit/tensors/Test__IQ4_XSTensor_Views.cpp)
-target_link_libraries(v2_test_iq4xs_views 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
 add_v2_test(V2_Unit_IQ4_XS_Views 
     COMMAND $<TARGET_FILE:v2_test_iq4xs_views>
     LABELS "V2;Unit;TensorOperations;IQ4_XS;Quantization;ViewSupport;RowSlice;IQuant"
 )
 
 # Test: IQ2_XXS Tensor Views
+add_executable(v2_test_iq4xs_views unit/tensors/Test__IQ4_XSTensor_Views.cpp)
+target_link_libraries(v2_test_iq4xs_views 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
 add_executable(v2_test_iq2xxs_views unit/tensors/Test__IQ2_XXSTensor_Views.cpp)
 target_link_libraries(v2_test_iq2xxs_views 
     llaminar2_core 
@@ -2298,24 +2284,9 @@ function(add_v2_perf_test TEST_NAME)
     # They control model loading themselves for benchmarking
 endfunction()
 
-# Performance Test: IQ4_NL Quantized GEMM
-# Benchmarks IQ4_NL quantized matrix multiplication with FP32 and BF16 activations
-# Test cases: SingleToken, SmallBatch, MediumBatch, LargeBatch (prefill)
-add_executable(v2_perf_iq4nl_gemm performance/Perf__IQ4_NL_GEMM.cpp)
-target_link_libraries(v2_perf_iq4nl_gemm 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-set_target_properties(v2_perf_iq4nl_gemm PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_IQ4NL_GEMM
-    COMMAND $<TARGET_FILE:v2_perf_iq4nl_gemm>
-    LABELS "V2;Performance;GEMM;IQ4_NL;Quantization;Throughput"
-    MPI_PROCS 2  # Match V1 baseline (2 ranks) for fair comparison
-)
+# NOTE: IQ4_NL GEMM v4 performance test removed - depended on obsolete
+# weight-owned GEMM paths; IQ4_NL is now exercised only via activation-centric
+# kernels and higher-level pipelines.
 
 # NOTE: Q8_0 Conversion performance test removed - gemm_v2 is obsolete
 
@@ -2440,26 +2411,9 @@ add_v2_perf_test(V2_Perf_BF16_Profile
 
 # NOTE: Exhaustive autotuner sweep test removed - depends on obsolete GemmAutoTuner
 
-# Performance Test: CPU GEMM Heuristic Validation Suite
-# Comprehensive test suite for ML heuristic training data collection.
-# Covers all major model sizes from Qwen 0.5B to DeepSeek 671B (53 tests total).
-# Used to generate exhaustive benchmarking data for neural network training.
-add_executable(v2_perf_cpu_gemm_validation performance/Perf__CpuGemmHeuristicValidation.cpp)
-target_link_libraries(v2_perf_cpu_gemm_validation
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-    MPI::MPI_CXX
-)
-set_target_properties(v2_perf_cpu_gemm_validation PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_CpuGemmValidation
-    COMMAND $<TARGET_FILE:v2_perf_cpu_gemm_validation>
-    LABELS "V2;Performance;GEMM;MLHeuristic;Validation;Qwen;DeepSeek;IQ4_NL"
-    MPI_PROCS 1  # Single rank for consistent benchmarking
-)
+# NOTE: CPU GEMM heuristic validation suite removed - depended on obsolete
+# GEMM v4 weight-owned APIs and has been superseded by activation-centric
+# performance tests.
 
 # Performance Test: BF16 Conversion Optimization (side-by-side comparison)
 # Tests baseline vs optimized BF16 conversion implementations
@@ -2824,22 +2778,9 @@ add_v2_perf_test(V2_Perf_MPITensorParallel
 #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
 # )
 
-# Perf: IQ4_NL GEMM tile sweep optimization
-add_executable(v2_perf_iq4nl_tile_sweep performance/Perf__IQ4_NL_TileSweep.cpp)
-target_link_libraries(v2_perf_iq4nl_tile_sweep 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-    MPI::MPI_CXX
-)
-set_target_properties(v2_perf_iq4nl_tile_sweep PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-add_v2_perf_test(V2_Perf_IQ4NL_TileSweep
-    COMMAND $<TARGET_FILE:v2_perf_iq4nl_tile_sweep>
-    LABELS "V2;Performance;TensorOperations;Quantization;IQ4_NL;GEMM;CacheOptimization"
-    MPI_PROCS 2
-)
+# NOTE: IQ4_NL GEMM tile sweep optimization perf test removed - depended on
+# obsolete GEMM v4 weight-owned APIs. IQ4_NL performance is now characterized
+# indirectly via end-to-end benchmarks.
 
 # NOTE: GemmAutoTuner and MicroKernelScaling performance tests removed - depend on obsolete gemm implementations
 

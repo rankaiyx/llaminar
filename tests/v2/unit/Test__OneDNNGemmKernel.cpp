@@ -143,12 +143,16 @@ namespace
         }
 
         OneDNNGemmKernel kernel(&weights);
-        ASSERT_TRUE(kernel.multiply(activations.data(),
-                                    output.data(),
-                                    m,
-                                    n,
-                                    k,
-                                    /*transpose_B=*/true));
+        ASSERT_TRUE(kernel.multiply_activations(activations.data(),
+                                                output.data(),
+                                                m,
+                                                n,
+                                                k,
+                                                /*transpose_B=*/true,
+                                                /*alpha=*/1.0f,
+                                                /*beta=*/0.0f,
+                                                /*mpi_ctx=*/nullptr,
+                                                /*device*/ nullptr));
 
         // Sanity: check that outputs are finite and non-zero
         for (size_t i = 0; i < output.num_elements(); ++i)
@@ -351,6 +355,79 @@ namespace
                                                         ldb,
                                                         ldc,
                                                         /*transpose_B=*/true));
+
+        for (int r = 0; r < m; ++r)
+        {
+            for (int c = 0; c < n; ++c)
+            {
+                float v_dense = C_dense[static_cast<size_t>(r) * static_cast<size_t>(n) + static_cast<size_t>(c)];
+                float v_strided = C_strided[static_cast<size_t>(r) * static_cast<size_t>(ldc) + static_cast<size_t>(c)];
+                EXPECT_NEAR(v_dense, v_strided, 1e-4f);
+            }
+        }
+    }
+
+    TEST(Test__OneDNNGemmKernel, MultiplyActivationsStridedSupportsAlphaScaling)
+    {
+        const int m = 3;
+        const int k = 4;
+        const int n = 2;
+
+        const int lda = 6;
+        const int ldb = 6;
+        const int ldc = 4;
+
+        std::vector<float> A_strided(static_cast<size_t>(m) * static_cast<size_t>(lda));
+        std::vector<float> B_strided(static_cast<size_t>(n) * static_cast<size_t>(ldb));
+        std::vector<float> C_strided(static_cast<size_t>(m) * static_cast<size_t>(ldc));
+
+        std::vector<float> A_dense(static_cast<size_t>(m) * static_cast<size_t>(k));
+        std::vector<float> B_dense(static_cast<size_t>(n) * static_cast<size_t>(k));
+        std::vector<float> C_dense(static_cast<size_t>(m) * static_cast<size_t>(n));
+
+        for (int r = 0; r < m; ++r)
+        {
+            for (int c = 0; c < k; ++c)
+            {
+                float v = 0.02f * static_cast<float>(1 + r * k + c);
+                A_dense[static_cast<size_t>(r) * static_cast<size_t>(k) + static_cast<size_t>(c)] = v;
+                A_strided[static_cast<size_t>(r) * static_cast<size_t>(lda) + static_cast<size_t>(c)] = v;
+            }
+        }
+        for (int r = 0; r < n; ++r)
+        {
+            for (int c = 0; c < k; ++c)
+            {
+                float v = -0.01f * static_cast<float>(1 + r * k + c);
+                B_dense[static_cast<size_t>(r) * static_cast<size_t>(k) + static_cast<size_t>(c)] = v;
+                B_strided[static_cast<size_t>(r) * static_cast<size_t>(ldb) + static_cast<size_t>(c)] = v;
+            }
+        }
+
+        const float alpha = 0.5f;
+
+        OneDNNGemmKernel kernel(nullptr);
+
+        ASSERT_TRUE(kernel.multiply_activations(A_dense.data(),
+                                                B_dense.data(),
+                                                C_dense.data(),
+                                                m,
+                                                n,
+                                                k,
+                                                /*transpose_B=*/true,
+                                                alpha));
+
+        ASSERT_TRUE(kernel.multiply_activations_strided(A_strided.data(),
+                                                        B_strided.data(),
+                                                        C_strided.data(),
+                                                        m,
+                                                        n,
+                                                        k,
+                                                        lda,
+                                                        ldb,
+                                                        ldc,
+                                                        /*transpose_B=*/true,
+                                                        alpha));
 
         for (int r = 0; r < m; ++r)
         {
