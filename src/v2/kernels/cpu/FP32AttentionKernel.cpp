@@ -30,12 +30,7 @@ namespace llaminar2
         bool use_causal_mask,
         float eps)
     {
-        // Validate device
-        if (device_idx_ != -1)
-        {
-            LOG_ERROR("FP32AttentionKernel only supports CPU (device_idx=-1), got " << device_idx_);
-            return false;
-        }
+        (void)device_idx_; // Device index ignored - always operates on CPU buffers
 
         // Validate pointers
         if (!q || !k || !v || !output)

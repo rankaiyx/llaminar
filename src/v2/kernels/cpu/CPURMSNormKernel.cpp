@@ -21,10 +21,9 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        if (device_idx != -1)
-        {
-            return false; // CPU only
-        }
+        // CPU kernel - device_idx parameter ignored (tensor already on CPU)
+        (void)device_idx;
+        (void)mpi_ctx;
 
         // Use vectorized primitives implementation
         primitives::RMSNormExecOptions opts;
@@ -49,10 +48,8 @@ namespace llaminar2
         float eps,
         int device_idx)
     {
-        if (device_idx != -1)
-        {
-            return false; // CPU only
-        }
+        // CPU kernel - device_idx parameter ignored (tensor already on CPU)
+        (void)device_idx;
 
         // Use vectorized BF16 primitives implementation
         primitives::RMSNormExecOptions opts;
@@ -77,10 +74,8 @@ namespace llaminar2
         float eps,
         int device_idx)
     {
-        if (device_idx != -1)
-        {
-            return false; // CPU only
-        }
+        // CPU kernel - device_idx parameter ignored (tensor already on CPU)
+        (void)device_idx;
 
         // Use vectorized FP16 primitives implementation
         primitives::RMSNormExecOptions opts;
@@ -106,10 +101,8 @@ namespace llaminar2
         float eps,
         int device_idx)
     {
-        if (device_idx != -1)
-        {
-            return false; // CPU only
-        }
+        // CPU kernel - device_idx parameter ignored (tensor already on CPU)
+        (void)device_idx;
 
         if (!input_int32 || !output_int8 || !output_row_scales)
         {

@@ -154,9 +154,9 @@ if ! [[ $MPI_PROCS =~ ^[0-9]+$ ]] || [ $MPI_PROCS -lt 1 ]; then
 fi
 
 # Validate binary exists
-if [ ! -f "./build_release/llaminar" ]; then
-    echo "Error: llaminar binary not found at ./build_release/llaminar"
-    echo "Please build the project first: cmake -B build_release -DCMAKE_BUILD_TYPE=Release && cmake --build build_release --parallel"
+if [ ! -f "./build_v2_release/llaminar2" ]; then
+    echo "Error: llaminar2 binary not found at ./build_v2_release/llaminar2"
+    echo "Please build the project first: cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release && cmake --build build_v2_release --parallel"
     exit 1
 fi
 
@@ -192,4 +192,4 @@ exec mpirun -np ${MPI_PROCS} \
     --mca mpi_leave_pinned 1 \
     --mca btl_vader_single_copy_mechanism none \
     --report-bindings \
-    ./build_release/llaminar "${BIN_ARGS[@]}"
+    ./build_v2_release/llaminar2 "${BIN_ARGS[@]}"

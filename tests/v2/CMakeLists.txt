@@ -273,6 +273,19 @@ add_v2_test(V2_Unit_INT32RMSNorm
     MPI_PROCS 1  # RMSNorm is CPU-only, single rank
 )
 
+# Test: Device index handling in CPU kernels (regression test for device_idx=0 bug)
+add_executable(v2_test_device_index_cpu_kernels unit/Test__DeviceIndexCPUKernels.cpp)
+target_link_libraries(v2_test_device_index_cpu_kernels
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceIndexCPUKernels
+    COMMAND $<TARGET_FILE:v2_test_device_index_cpu_kernels>
+    LABELS "V2;Unit;DeviceManagement;Kernels;RegressionTest;CPU"
+    MPI_PROCS 1  # CPU kernel tests, single rank
+)
+
 # Test: RMSNorm precision variants (FP32/BF16/FP16/INT32 scalar/AVX2/AVX512 parity)
 add_executable(v2_test_rmsnorm_precision unit/Test__RMSNormPrecision.cpp)
 target_link_libraries(v2_test_rmsnorm_precision 

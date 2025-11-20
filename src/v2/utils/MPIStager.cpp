@@ -136,7 +136,9 @@ namespace llaminar2
 
     bool MPIStager::requiresStaging(const TensorBase *tensor)
     {
-        return tensor && tensor->device_index() >= 0;
+        // Device index 0 = CPU (no staging needed)
+        // Device index > 0 = GPU (staging required)
+        return tensor && tensor->device_index() > 0;
     }
 
     void MPIStager::synchronizeDevice(int device_id)

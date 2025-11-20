@@ -975,13 +975,7 @@ namespace llaminar2
                 int device_idx = -1) override
             {
                 (void)mpi_ctx;
-
-                if (device_idx != -1)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Only CPU execution supported (device_idx="
-                              << device_idx << ")");
-                    return false;
-                }
+                (void)device_idx; // Device index ignored - always operates on CPU buffers
 
                 if (!transpose_B || !weight_tensor_)
                 {
@@ -1093,12 +1087,7 @@ namespace llaminar2
                                       const MPIContext *mpi_ctx = nullptr,
                                       int device_idx = -1) override
             {
-                if (device_idx != -1)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Only CPU execution supported (device_idx="
-                              << device_idx << ")");
-                    return false;
-                }
+                (void)device_idx; // Device index ignored - always operates on CPU buffers
 
                 if (!A || !B || !C)
                 {
@@ -1143,13 +1132,7 @@ namespace llaminar2
                                               int device_idx = -1) override
             {
                 (void)mpi_ctx;
-
-                if (device_idx != -1)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] multiply_activations_strided only supports CPU (device_idx="
-                              << device_idx << ")");
-                    return false;
-                }
+                (void)device_idx; // Device index ignored - always operates on CPU buffers
 
                 if (!A || !B || !C)
                 {
@@ -1414,13 +1397,7 @@ namespace llaminar2
                 ActivationFormat format_A, ActivationFormat format_B) override
             {
                 (void)mpi_ctx;
-
-                if (device_idx != -1)
-                {
-                    LOG_ERROR("[OneDNNGemmKernel] Only CPU execution supported (device_idx="
-                              << device_idx << ")");
-                    return false;
-                }
+                (void)device_idx; // Device index ignored - always operates on CPU buffers
 
                 // 1. Perform typed matmul
                 if (!multiply_activations_typed_impl(

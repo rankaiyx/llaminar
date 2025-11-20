@@ -35,10 +35,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        if (device_idx != -1)
-        {
-            return false; // CPU kernel only supports device_idx = -1
-        }
+        (void)device_idx; // Device index ignored - always operates on CPU buffers
 
         if (head_dim % 2 != 0)
         {

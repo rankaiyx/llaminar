@@ -30,12 +30,7 @@ namespace llaminar2
         int seq_len,
         int d_ff)
     {
-        // Validate device
-        if (device_idx_ != -1)
-        {
-            LOG_ERROR("INT8SwiGLUKernel only supports CPU (device_idx=-1), got " << device_idx_);
-            return false;
-        }
+        (void)device_idx_; // Device index ignored - always operates on CPU buffers
 
         // Validate pointers
         if (!gate_int8 || !gate_row_scales || !up_int8 || !up_row_scales ||

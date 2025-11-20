@@ -21,10 +21,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        if (device_idx != -1)
-        {
-            return false; // CPU only
-        }
+        (void)device_idx; // Device index ignored - always operates on CPU buffers
 
         // Copy input to output if different (softmax is typically in-place)
         if (input != output)
