@@ -2172,17 +2172,23 @@ add_v2_test(V2_Integration_DequantEquivalency
 # Tests complete workflows: load -> prefill -> decode -> validate output
 
 # Qwen2 E2E Correctness (single-rank vs multi-rank comparison)
-add_executable(v2_test_qwen2_e2e_correctness 
-    e2e/Test__Qwen2E2ECorrectness.cpp
-    e2e/gtest_mpi_main.cpp
-)
-target_link_libraries(v2_test_qwen2_e2e_correctness llaminar2_core GTest::gtest MPI::MPI_CXX)
+# Only build for Debug or E2ERelease configurations (requires ENABLE_PIPELINE_SNAPSHOTS)
+if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
+    add_executable(v2_test_qwen2_e2e_correctness 
+        e2e/Test__Qwen2E2ECorrectness.cpp
+        e2e/gtest_mpi_main.cpp
+    )
+    target_link_libraries(v2_test_qwen2_e2e_correctness llaminar2_core GTest::gtest MPI::MPI_CXX)
 
-add_v2_test(V2_E2E_Qwen2Correctness
-    COMMAND $<TARGET_FILE:v2_test_qwen2_e2e_correctness>
-    LABELS "V2;E2E;Qwen;Correctness;Models"
-    MPI_PROCS 2
-)
+    add_v2_test(V2_E2E_Qwen2Correctness
+        COMMAND $<TARGET_FILE:v2_test_qwen2_e2e_correctness>
+        LABELS "V2;E2E;Qwen;Correctness;Models"
+        MPI_PROCS 2
+    )
+else()
+    message(STATUS "V2: E2E correctness test disabled (snapshots not available in Release build)")
+    message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
+endif()
 
 # =============================================================================
 # PyTorch Parity Tests
