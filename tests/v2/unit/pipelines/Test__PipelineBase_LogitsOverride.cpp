@@ -104,8 +104,7 @@ TEST_F(PipelineBaseLogitsOverrideTest, Qwen2Pipeline_LogitsGetLogitsEquivalence)
         -1,
         nullptr,
         PipelineConfig{},
-        1
-    );
+        1);
 
     ASSERT_NE(pipeline, nullptr);
 

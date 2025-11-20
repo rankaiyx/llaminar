@@ -508,7 +508,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < args.n_predict; ++i)
     {
         LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Starting decode iteration " << i);
-        
+
         // Get logits from last forward pass
         LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Getting logits...");
         const float *logits = pipeline->logits();

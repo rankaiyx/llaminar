@@ -241,7 +241,7 @@ namespace llaminar2
                 {
                     float *scores_h = scores + h * seq_len * seq_len;
                     const ElementType *Q_h = Q + h * head_dim;
-                    
+
                     // Virtual GQA: Map head h to kv_head
                     int kv_h = h / heads_per_kv;
                     const ElementType *K_h = K + kv_h * head_dim;
@@ -270,11 +270,11 @@ namespace llaminar2
                 for (int h = 0; h < n_heads; ++h)
                 {
                     const float *weights_h = scores + h * seq_len * seq_len;
-                    
+
                     // Virtual GQA: Map head h to kv_head
                     int kv_h = h / heads_per_kv;
                     const ElementType *V_h = V + kv_h * head_dim;
-                    
+
                     float *output_h = output + h * head_dim;
 
                     const int lda = seq_len;
@@ -441,14 +441,14 @@ namespace llaminar2
 
                 // Strided Q@K^T with fused scaling
                 const float *Q_h = Q_fp32.data() + h * head_dim; // Q_fp32: already FP32
-                
+
                 // Virtual GQA: Map head h to kv_head
                 int kv_h = h / heads_per_kv;
                 const float *K_h = K_fp32.data() + kv_h * head_dim; // K_fp32: already FP32
 
-                const int lda = n_heads * head_dim; // Q: stride between rows (skip other heads)
+                const int lda = n_heads * head_dim;    // Q: stride between rows (skip other heads)
                 const int ldb = n_kv_heads * head_dim; // K: stride between rows (skip other heads)
-                const int ldc = seq_len;            // scores: contiguous [seq_len, seq_len]
+                const int ldc = seq_len;               // scores: contiguous [seq_len, seq_len]
 
                 // Strided GEMM: scores = (1/sqrt(d_k)) * Q @ K^T
                 gemm->multiply_activations_strided(
@@ -499,7 +499,7 @@ namespace llaminar2
             {
                 // NOTE: weights_h points to FP32 workspace (scores)
                 const float *weights_h = scores + h * seq_len * seq_len;
-                
+
                 // Virtual GQA: Map head h to kv_head
                 int kv_h = h / heads_per_kv;
                 const float *V_h = V_fp32.data() + kv_h * head_dim; // V_fp32 is float*
@@ -508,9 +508,9 @@ namespace llaminar2
                 float *output_h = output + h * head_dim; // First element of head h
 
                 // Strided GEMM: context = weights @ V
-                const int lda = seq_len;            // weights: contiguous [seq_len, seq_len]
+                const int lda = seq_len;               // weights: contiguous [seq_len, seq_len]
                 const int ldb = n_kv_heads * head_dim; // V: stride between rows (skip other heads)
-                const int ldc = n_heads * head_dim; // output: stride between rows
+                const int ldc = n_heads * head_dim;    // output: stride between rows
 
                 // Strided GEMM: context = weights @ V
                 gemm->multiply_activations_strided(

@@ -83,8 +83,8 @@ cmake --build build_v2_release --parallel
 ```bash
 # Run tests manually to see detailed output
 cd build_v2
-ctest -R "^V2_Unit_" --output-on-failure --verbose
-ctest -R "^V2_Integration_" --output-on-failure --verbose
+ctest -R "^V2_Unit_" --output-on-failure --verbose --parallel 
+ctest -R "^V2_Integration_" --output-on-failure --verbose --parallel
 ```
 
 ### CI/CD Integration
@@ -106,8 +106,8 @@ cmake --build build_v2_release --parallel
 ```bash
 # Run tests manually to see detailed output
 cd build_v2
-ctest -R "^V2_Unit_" --output-on-failure --verbose
-ctest -R "^V2_Integration_" --output-on-failure --verbose
+ctest -R "^V2_Unit_" --output-on-failure --verbose --parallel
+ctest -R "^V2_Integration_" --output-on-failure --verbose --parallel
 ```
 
 The hook automatically detects which build directory to use:
