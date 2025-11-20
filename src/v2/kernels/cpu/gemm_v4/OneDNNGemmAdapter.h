@@ -61,7 +61,7 @@ namespace llaminar2
         /**
          * @brief Execute FP32 matrix multiplication using OneDNN (defined in OneDNNGemmKernel.h)
          */
-        bool run_onednn_fp32_matmul(const float *A, const float *B, float *C, int M, int N, int K);
+        bool run_onednn_fp32_matmul(const float *A, const float *B, float *C, int M, int N, int K, bool transpose_B = false);
 
         // ===== Data Structures =====
 

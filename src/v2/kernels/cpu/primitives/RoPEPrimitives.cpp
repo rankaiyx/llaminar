@@ -76,6 +76,96 @@ namespace llaminar2::primitives
     // Vectorized RoPE Application - Separated Implementations
     // ============================================================================
 
+#if defined(__AVX2__)
+    /**
+     * @brief Apply RoPE rotation using cached sin/cos (AVX2)
+     */
+    void apply_rope_to_head_cached_avx2(
+        float *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+
+        for (; i + 8 <= half_dim; i += 8)
+        {
+            __m256 x_first = _mm256_loadu_ps(head_ptr + i);
+            __m256 x_second = _mm256_loadu_ps(head_ptr + i + half_dim);
+            __m256 cos_vec = _mm256_loadu_ps(cos_cache + i);
+            __m256 sin_vec = _mm256_loadu_ps(sin_cache + i);
+
+            __m256 new_first = _mm256_sub_ps(
+                _mm256_mul_ps(x_first, cos_vec),
+                _mm256_mul_ps(x_second, sin_vec));
+            __m256 new_second = _mm256_add_ps(
+                _mm256_mul_ps(x_first, sin_vec),
+                _mm256_mul_ps(x_second, cos_vec));
+
+            _mm256_storeu_ps(head_ptr + i, new_first);
+            _mm256_storeu_ps(head_ptr + i + half_dim, new_second);
+        }
+
+        // Tail
+        for (; i < half_dim; ++i)
+        {
+            float x_first = head_ptr[i];
+            float x_second = head_ptr[i + half_dim];
+            float cos_val = cos_cache[i];
+            float sin_val = sin_cache[i];
+
+            head_ptr[i] = x_first * cos_val - x_second * sin_val;
+            head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Apply RoPE rotation using cached sin/cos (AVX512)
+     */
+    void apply_rope_to_head_cached_avx512(
+        float *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+
+        for (; i + 16 <= half_dim; i += 16)
+        {
+            __m512 x_first = _mm512_loadu_ps(head_ptr + i);
+            __m512 x_second = _mm512_loadu_ps(head_ptr + i + half_dim);
+            __m512 cos_vec = _mm512_loadu_ps(cos_cache + i);
+            __m512 sin_vec = _mm512_loadu_ps(sin_cache + i);
+
+            __m512 new_first = _mm512_sub_ps(
+                _mm512_mul_ps(x_first, cos_vec),
+                _mm512_mul_ps(x_second, sin_vec));
+            __m512 new_second = _mm512_add_ps(
+                _mm512_mul_ps(x_first, sin_vec),
+                _mm512_mul_ps(x_second, cos_vec));
+
+            _mm512_storeu_ps(head_ptr + i, new_first);
+            _mm512_storeu_ps(head_ptr + i + half_dim, new_second);
+        }
+
+        // Tail
+        for (; i < half_dim; ++i)
+        {
+            float x_first = head_ptr[i];
+            float x_second = head_ptr[i + half_dim];
+            float cos_val = cos_cache[i];
+            float sin_val = sin_cache[i];
+
+            head_ptr[i] = x_first * cos_val - x_second * sin_val;
+            head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
+        }
+    }
+#endif
+
     /**
      * @brief Apply RoPE rotation to a single head (scalar implementation)
      *
@@ -259,6 +349,9 @@ namespace llaminar2::primitives
 
     /**
      * @brief Apply RoPE to tensor with angle recurrence (prefill optimization)
+     *
+     * Uses pre-computed sin/cos tables generated via recurrence to avoid
+     * expensive trigonometric calls in the hot loop.
      */
     static void apply_rope_to_tensor_recurrence(
         float *tensor,
@@ -268,17 +361,78 @@ namespace llaminar2::primitives
     {
         const int half_dim = head_dim / 2;
 
-        // Parallelize over (token, head) pairs
+        // 1. Pre-compute sin/cos tables for the whole sequence using recurrence
+        // This avoids computing sin/cos for every head and every token repeatedly
+        std::vector<float> cos_table(seq_len * half_dim);
+        std::vector<float> sin_table(seq_len * half_dim);
+
+        // Compute deltas (rotation per position step)
+        std::vector<float> cos_delta(half_dim);
+        std::vector<float> sin_delta(half_dim);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            cos_delta[i] = std::cos(inv_freq[i]);
+            sin_delta[i] = std::sin(inv_freq[i]);
+        }
+
+        // Initialize first position (n_past)
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float ang = n_past * inv_freq[i];
+#if defined(__GNUC__)
+            sincosf(ang, &sin_table[i], &cos_table[i]);
+#else
+            cos_table[i] = std::cos(ang);
+            sin_table[i] = std::sin(ang);
+#endif
+        }
+
+        // Recurrence for t > 0
+        // This is serial but extremely fast (vectorizable by compiler)
+        for (int t = 1; t < seq_len; ++t)
+        {
+            int prev_offset = (t - 1) * half_dim;
+            int curr_offset = t * half_dim;
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float c = cos_table[prev_offset + i];
+                float s = sin_table[prev_offset + i];
+                float cd = cos_delta[i];
+                float sd = sin_delta[i];
+
+                cos_table[curr_offset + i] = c * cd - s * sd;
+                sin_table[curr_offset + i] = s * cd + c * sd;
+            }
+        }
+
+        // 2. Apply rotation in parallel using cached tables
 #pragma omp parallel for collapse(2) schedule(static)
         for (int t = 0; t < seq_len; ++t)
         {
             for (int h = 0; h < num_heads; ++h)
             {
                 float *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                int position = n_past + t;
+                const float *cos_ptr = cos_table.data() + t * half_dim;
+                const float *sin_ptr = sin_table.data() + t * half_dim;
 
-                // Use vectorized head rotation
-                apply_rope_to_head_vectorized(head_ptr, position, inv_freq, head_dim);
+#if defined(__AVX512F__)
+                apply_rope_to_head_cached_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX2__)
+                apply_rope_to_head_cached_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+#else
+                // Fallback scalar implementation
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    float x_first = head_ptr[i];
+                    float x_second = head_ptr[i + half_dim];
+                    float cos_val = cos_ptr[i];
+                    float sin_val = sin_ptr[i];
+
+                    head_ptr[i] = x_first * cos_val - x_second * sin_val;
+                    head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
+                }
+#endif
             }
         }
     }
@@ -346,6 +500,11 @@ namespace llaminar2::primitives
             for (int h = 0; h < num_heads; ++h)
             {
                 float *head_ptr = tensor + h * head_dim;
+#if defined(__AVX512F__)
+                apply_rope_to_head_cached_avx512(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#elif defined(__AVX2__)
+                apply_rope_to_head_cached_avx2(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#else
                 for (int i = 0; i < half_dim; ++i)
                 {
                     float x_first = head_ptr[i];
@@ -356,6 +515,7 @@ namespace llaminar2::primitives
                     head_ptr[i] = x_first * cos_val - x_second * sin_val;
                     head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
                 }
+#endif
             }
         };
 

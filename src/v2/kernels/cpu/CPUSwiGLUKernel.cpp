@@ -6,6 +6,7 @@
  */
 
 #include "CPUSwiGLUKernel.h"
+#include "primitives/SwiGLUPrimitives.h"
 #include <cmath>
 #include <omp.h>
 
@@ -23,19 +24,8 @@ namespace llaminar2
 
         const int total_elements = seq_len * d_ff;
 
-#pragma omp parallel for
-        for (int i = 0; i < total_elements; ++i)
-        {
-            float g = gate[i];
-            float u = up[i];
-
-            // SwiGLU: gate * silu(up)
-            // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-            float sigmoid_u = 1.0f / (1.0f + std::exp(-u));
-            float silu_u = u * sigmoid_u;
-
-            output[i] = g * silu_u;
-        }
+        // Use vectorized primitives
+        primitives::compute_swiglu(gate, up, output, total_elements);
 
         return true;
     }

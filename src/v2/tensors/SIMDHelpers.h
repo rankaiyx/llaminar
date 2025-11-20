@@ -803,6 +803,7 @@ namespace llaminar2
             const float *col_scales,
             const float *bias)
         {
+#pragma omp parallel for
             for (int r = 0; r < rows; ++r)
             {
                 const float row_scale = row_scales ? row_scales[r] : 1.0f;

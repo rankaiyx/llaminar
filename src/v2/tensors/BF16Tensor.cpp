@@ -387,10 +387,16 @@ namespace llaminar2
         const size_t count = element_count();
         const uint16_t *src = bf16_data();
 
+        // Use SIMD-optimized conversion with OpenMP
+        const size_t chunk_size = 4096;
+        const size_t num_chunks = (count + chunk_size - 1) / chunk_size;
+
 #pragma omp parallel for
-        for (size_t i = 0; i < count; ++i)
+        for (size_t i = 0; i < num_chunks; ++i)
         {
-            dst[i] = simd::bf16_to_fp32(src[i]);
+            size_t start = i * chunk_size;
+            size_t current_chunk = std::min(chunk_size, count - start);
+            simd::convert_bf16_to_fp32(src + start, dst + start, current_chunk);
         }
     }
 
@@ -571,7 +577,68 @@ namespace llaminar2
 
     ActivationPack BF16Tensor::to_int8_activation_pack(int rows, int cols) const
     {
-        return pack_activation_rows_to_int8(rows, cols);
+        if (rows <= 0 || cols <= 0)
+        {
+            LOG_ERROR("[BF16Tensor] to_int8_activation_pack requires positive dimensions");
+            return {};
+        }
+
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            LOG_ERROR("[BF16Tensor] to_int8_activation_pack requires 2D tensor, got " << shp.size() << "D");
+            return {};
+        }
+        if (static_cast<size_t>(rows) > shp[0] || static_cast<size_t>(cols) != shp[1])
+        {
+            LOG_ERROR("[BF16Tensor] to_int8_activation_pack dimension mismatch: tensor is ["
+                      << shp[0] << ", " << shp[1] << "], requested " << rows << "x" << cols);
+            return {};
+        }
+
+        ActivationPack pack;
+        pack.rows = rows;
+        pack.cols = cols;
+        const size_t row_stride = static_cast<size_t>(cols);
+        const size_t total = row_stride * static_cast<size_t>(rows);
+        pack.data.resize(total);
+        pack.row_scales.resize(static_cast<size_t>(rows));
+
+        const uint16_t *src_data = bf16_data();
+
+#pragma omp parallel
+        {
+            // Per-thread buffer to avoid repeated allocations
+            std::vector<float> row_buffer(cols);
+
+#pragma omp for
+            for (int m = 0; m < rows; ++m)
+            {
+                const uint16_t *row_src = src_data + static_cast<size_t>(m) * row_stride;
+                int8_t *row_dst = pack.data.data() + static_cast<size_t>(m) * row_stride;
+
+                // Convert BF16 row to FP32
+                // Use AVX512/AVX2 optimized conversion if available
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+                simd::convert_bf16_to_fp32_avx512(row_src, row_buffer.data(), cols);
+#elif defined(__AVX2__)
+                simd::convert_bf16_to_fp32_avx2(row_src, row_buffer.data(), cols);
+#else
+                simd::convert_bf16_to_fp32_scalar(row_src, row_buffer.data(), cols);
+#endif
+
+                // Calculate max abs from FP32 buffer
+                float max_abs = simd::activation_row_max_abs(row_buffer.data(), cols);
+
+                const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+                pack.row_scales[static_cast<size_t>(m)] = scale;
+                const float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+                simd::quantize_activation_row(row_buffer.data(), cols, inv_scale, row_dst);
+            }
+        }
+
+        return pack;
     }
 
     bool BF16Tensor::applyRMSNorm(
@@ -656,23 +723,27 @@ namespace llaminar2
         }
 
         uint16_t *dst = is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_bf16_data_.data();
-        thread_local std::vector<float> row_buffer;
-        row_buffer.resize(static_cast<size_t>(cols));
 
-        for (int r = 0; r < rows; ++r)
+#pragma omp parallel
         {
-            const float row_scale = row_scales ? row_scales[r] : 1.0f;
-            const size_t offset = static_cast<size_t>(r) * static_cast<size_t>(cols);
+            std::vector<float> row_buffer(static_cast<size_t>(cols));
 
-            simd::requantize_int32_row_to_fp32(
-                accum + offset,
-                row_buffer.data(),
-                cols,
-                row_scale,
-                col_scales,
-                bias);
+#pragma omp for
+            for (int r = 0; r < rows; ++r)
+            {
+                const float row_scale = row_scales ? row_scales[r] : 1.0f;
+                const size_t offset = static_cast<size_t>(r) * static_cast<size_t>(cols);
 
-            simd::convert_fp32_to_bf16(row_buffer.data(), dst + offset, static_cast<size_t>(cols));
+                simd::requantize_int32_row_to_fp32(
+                    accum + offset,
+                    row_buffer.data(),
+                    cols,
+                    row_scale,
+                    col_scales,
+                    bias);
+
+                simd::convert_fp32_to_bf16(row_buffer.data(), dst + offset, static_cast<size_t>(cols));
+            }
         }
 
         dequant_cache_.clear();

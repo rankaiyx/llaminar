@@ -52,6 +52,42 @@ namespace llaminar2
         const int q_stride = n_heads * head_dim;
         const int k_stride = n_kv_heads * head_dim;
 
+        // Check for contiguous positions to enable optimized block processing
+        bool contiguous = true;
+        int start_pos = 0;
+
+        if (position_ids)
+        {
+            start_pos = position_ids[0];
+            // Only check if we have more than 1 token
+            if (seq_len > 1)
+            {
+                // Check contiguity
+                for (int i = 1; i < seq_len; ++i)
+                {
+                    if (position_ids[i] != start_pos + i)
+                    {
+                        contiguous = false;
+                        break;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // If position_ids is null, we assume 0, 1, 2... (standard prefill)
+            contiguous = true;
+            start_pos = 0;
+        }
+
+        // If positions are contiguous and valid (no padding), use optimized block processing
+        // This enables OpenMP parallelism in the underlying primitives
+        if (contiguous && start_pos >= 0)
+        {
+            apply_rotation(Q, K, seq_len, head_dim, n_heads, n_kv_heads, start_pos, rope_theta);
+            return true;
+        }
+
         for (int tok = 0; tok < seq_len; ++tok)
         {
             int position = position_ids ? position_ids[tok] : tok;

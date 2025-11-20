@@ -20,7 +20,7 @@
 #include "../../tensors/Tensors.h"
 #include "../../tensors/SIMDHelpers.h"
 #include "primitives/ActivationTraits.h"
-#include "primitives/SoftmaxPrimitives_New.h"
+#include "primitives/SoftmaxPrimitivesImpl.h"
 #include "../../pipelines/AttentionUtils.h"
 #include "../../utils/Logger.h"
 #include <memory>
@@ -150,7 +150,65 @@ namespace llaminar2
                 causal, window_size,
                 scores_ptr, context_ptr,
                 mask_ptr,
-                device_idx);
+                device_idx,
+                seq_len); // kv_len = seq_len for standard compute
+        }
+
+        /**
+         * @brief Compute attention with separate sequence and KV lengths (Decoding)
+         */
+        bool compute_decode(
+            const float *Q, const float *K, const float *V,
+            float *output,
+            int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_buffer = nullptr,
+            TensorBase *workspace_context = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            const ElementType *Q_typed = reinterpret_cast<const ElementType *>(Q);
+            const ElementType *K_typed = reinterpret_cast<const ElementType *>(K);
+            const ElementType *V_typed = reinterpret_cast<const ElementType *>(V);
+
+            // Allocate workspaces if not provided
+            std::shared_ptr<TensorBase> scores_alloc;
+            float *scores_ptr = nullptr;
+            float *context_ptr = nullptr;
+            const float *mask_ptr = nullptr;
+
+            if (!workspace_scores)
+            {
+                scores_alloc = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(n_heads * seq_len * kv_len)});
+                scores_ptr = scores_alloc->mutable_data();
+            }
+            else
+            {
+                scores_ptr = workspace_scores->mutable_data();
+            }
+
+            if (workspace_context)
+            {
+                context_ptr = workspace_context->mutable_data();
+            }
+
+            if (workspace_mask)
+            {
+                mask_ptr = workspace_mask->data();
+            }
+
+            return compute_typed(
+                Q_typed, K_typed, V_typed, output,
+                seq_len, n_heads, n_kv_heads, head_dim,
+                causal, window_size,
+                scores_ptr, context_ptr,
+                mask_ptr,
+                device_idx,
+                kv_len);
         }
 
     private:
@@ -158,10 +216,10 @@ namespace llaminar2
          * @brief Typed implementation of attention
          *
          * @param Q Input Q [seq_len, n_heads, head_dim]
-         * @param K Input K [seq_len, n_kv_heads, head_dim]
-         * @param V Input V [seq_len, n_kv_heads, head_dim]
+         * @param K Input K [kv_len, n_kv_heads, head_dim]
+         * @param V Input V [kv_len, n_kv_heads, head_dim]
          * @param output Output [seq_len, n_heads, head_dim] (always float*)
-         * @param scores Workspace for attention scores [n_heads, seq_len, seq_len] (FP32)
+         * @param scores Workspace for attention scores [n_heads, seq_len, kv_len] (FP32)
          * @param buffer Workspace for KV broadcast [2, seq_len, n_heads, head_dim] (FP32/BF16/etc)
          * @param context Workspace for context (unused, writes to output)
          */
@@ -174,7 +232,8 @@ namespace llaminar2
             float *scores,
             float *context,
             const float *mask,
-            int device_idx) const
+            int device_idx,
+            int kv_len) const
         {
             // Validate device
             if (device_idx != -1)
@@ -190,7 +249,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0)
+            if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0 || kv_len <= 0)
             {
                 LOG_ERROR("[CpuAttentionKernelT] compute: invalid dimensions");
                 return false;
@@ -236,55 +295,103 @@ namespace llaminar2
                     parallelize_heads = false;
                 }
 
+                // 2. Scores @ V -> Output (FP32)
+                std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
+
 #pragma omp parallel for if (parallelize_heads)
                 for (int h = 0; h < n_heads; ++h)
                 {
-                    float *scores_h = scores + h * seq_len * seq_len;
+                    // --- Step 1: Q @ K^T -> Scores ---
+                    float *scores_h = scores + h * seq_len * kv_len;
                     const ElementType *Q_h = Q + h * head_dim;
 
                     // Virtual GQA: Map head h to kv_head
                     int kv_h = h / heads_per_kv;
                     const ElementType *K_h = K + kv_h * head_dim;
 
-                    const int lda = n_heads * head_dim;
-                    const int ldb = n_kv_heads * head_dim; // Stride of K is based on n_kv_heads
-                    const int ldc = seq_len;
+                    const int lda_k = n_heads * head_dim;
+                    const int ldb_k = n_kv_heads * head_dim; // Stride of K is based on n_kv_heads
+                    const int ldc_k = kv_len;
+
+                    // Optimized path for decoding (seq_len == 1) on FP32
+                    if (seq_len == 1 && std::is_same_v<TensorType, FP32Tensor>)
+                    {
+                        if constexpr (std::is_same_v<TensorType, FP32Tensor>)
+                        {
+                            // 1. Q @ K^T
+                            for (int t = 0; t < kv_len; ++t)
+                            {
+                                const float *k_ptr = K_h + t * ldb_k;
+                                float dot = 0.0f;
+#pragma omp simd reduction(+ : dot)
+                                for (int d = 0; d < head_dim; ++d)
+                                {
+                                    dot += Q_h[d] * k_ptr[d];
+                                }
+                                scores_h[t] = dot * scale;
+                                if (mask)
+                                    scores_h[t] += mask[t];
+                            }
+
+                            // 2. Softmax (Vectorized)
+                            // Note: scale is already applied in step 1, so we pass 1.0f here.
+                            // Causal masking is also handled in step 1 via the mask add.
+                            llaminar2::primitives::softmax_row_fp32(
+                                scores_h,
+                                kv_len,
+                                false, // causal
+                                1.0f,  // scale
+                                -1     // row_idx
+                            );
+
+                            // 3. Scores @ V
+                            const float *weights_h = scores_h;
+                            const ElementType *V_h = V + kv_h * head_dim;
+                            float *output_h = output + h * head_dim;
+
+                            const int ldb_v = n_kv_heads * head_dim;
+
+                            // Initialize output to 0
+                            std::memset(output_h, 0, head_dim * sizeof(float));
+
+                            for (int t = 0; t < kv_len; ++t)
+                            {
+                                float s = weights_h[t];
+                                const float *v_ptr = V_h + t * ldb_v;
+#pragma omp simd
+                                for (int d = 0; d < head_dim; ++d)
+                                {
+                                    output_h[d] += s * v_ptr[d];
+                                }
+                            }
+                            continue; // Skip generic path
+                        }
+                    }
 
                     gemm->template multiply_with_softmax_strided_typed<ElementType, ElementType>(
                         Q_h, K_h, scores_h,
-                        seq_len, seq_len, head_dim,
-                        lda, ldb, ldc,
+                        seq_len, kv_len, head_dim,
+                        lda_k, ldb_k, ldc_k,
                         scale,
                         true, // transpose_B
                         1,    // softmax_axis
                         mask,
                         causal,
                         nullptr, -1, format);
-                }
 
-                // 2. Scores @ V -> Output (FP32)
-                std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
-
-                // Reuse parallelism strategy from Q@K^T
-#pragma omp parallel for if (parallelize_heads)
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    const float *weights_h = scores + h * seq_len * seq_len;
-
-                    // Virtual GQA: Map head h to kv_head
-                    int kv_h = h / heads_per_kv;
+                    // --- Step 2: Scores @ V -> Output ---
+                    const float *weights_h = scores_h; // Reuse scores_h
                     const ElementType *V_h = V + kv_h * head_dim;
-
                     float *output_h = output + h * head_dim;
 
-                    const int lda = seq_len;
-                    const int ldb = n_kv_heads * head_dim; // Stride of V is based on n_kv_heads
-                    const int ldc = n_heads * head_dim;
+                    const int lda_v = kv_len;
+                    const int ldb_v = n_kv_heads * head_dim; // Stride of V is based on n_kv_heads
+                    const int ldc_v = n_heads * head_dim;
 
                     gemm->template multiply_activations_strided_typed<float, ElementType>(
                         weights_h, V_h, output_h,
-                        seq_len, head_dim, seq_len,
-                        lda, ldb, ldc,
+                        seq_len, head_dim, kv_len,
+                        lda_v, ldb_v, ldc_v,
                         false, 1.0f, 0.0f, nullptr, -1, format);
                 }
 
@@ -294,8 +401,8 @@ namespace llaminar2
             // 1. Convert Q, K, V to FP32 (required for multiply_activations_strided)
             // CRITICAL: ITensorGemm::multiply_activations_strided expects float* inputs!
             std::vector<float> Q_fp32(seq_len * n_heads * head_dim);
-            std::vector<float> K_fp32(seq_len * n_kv_heads * head_dim);
-            std::vector<float> V_fp32(seq_len * n_kv_heads * head_dim);
+            std::vector<float> K_fp32(kv_len * n_kv_heads * head_dim);
+            std::vector<float> V_fp32(kv_len * n_kv_heads * head_dim);
 
             // Convert ElementType -> FP32 using type-specific conversion
             if constexpr (std::is_same_v<ElementType, float>)
@@ -647,7 +754,8 @@ namespace llaminar2
                     scores_ptr + scores_offset,
                     nullptr, // context not used
                     mask_slice,
-                    device_idx);
+                    device_idx,
+                    seq_len); // kv_len = seq_len for batch compute
 
                 if (!success)
                     return false;

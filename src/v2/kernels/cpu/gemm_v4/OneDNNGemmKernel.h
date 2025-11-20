@@ -187,7 +187,8 @@ namespace llaminar2
                                            float *C,
                                            int M,
                                            int N,
-                                           int K)
+                                           int K,
+                                           bool transpose_B)
         {
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
@@ -201,7 +202,8 @@ namespace llaminar2
                 dnnl::memory::dims dst_dims = {M, N};
 
                 auto src_md = dnnl::memory::desc(src_dims, dt::f32, tag::ab);
-                auto weight_md = dnnl::memory::desc(weight_dims, dt::f32, tag::ab);
+                // If transpose_B is true, B is stored as N x K (row-major), which corresponds to K x N (column-major)
+                auto weight_md = dnnl::memory::desc(weight_dims, dt::f32, transpose_B ? tag::ba : tag::ab);
                 auto dst_md = dnnl::memory::desc(dst_dims, dt::f32, tag::ab);
 
                 dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md);
@@ -1095,9 +1097,8 @@ namespace llaminar2
                     return false;
                 }
 
-                const float *rhs_ptr = prepare_rhs_for_matmul(B, n, k, transpose_B);
-
-                if (!run_onednn_fp32_matmul(A, rhs_ptr, C, m, n, k))
+                // Pass B directly and let OneDNN handle transposition via memory descriptors
+                if (!run_onednn_fp32_matmul(A, B, C, m, n, k, transpose_B))
                 {
                     return false;
                 }

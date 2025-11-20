@@ -342,10 +342,16 @@ namespace llaminar2
         const size_t count = element_count();
         const float *src = data();
 
+        // Use SIMD-optimized conversion with OpenMP
+        const size_t chunk_size = 4096;
+        const size_t num_chunks = (count + chunk_size - 1) / chunk_size;
+
 #pragma omp parallel for
-        for (size_t i = 0; i < count; ++i)
+        for (size_t i = 0; i < num_chunks; ++i)
         {
-            dst[i] = simd::fp32_to_bf16(src[i]);
+            size_t start = i * chunk_size;
+            size_t current_chunk = std::min(chunk_size, count - start);
+            simd::convert_fp32_to_bf16(src + start, dst + start, current_chunk);
         }
     }
 
@@ -354,10 +360,16 @@ namespace llaminar2
         const size_t count = element_count();
         const float *src = data();
 
+        // Use SIMD-optimized conversion with OpenMP
+        const size_t chunk_size = 4096;
+        const size_t num_chunks = (count + chunk_size - 1) / chunk_size;
+
 #pragma omp parallel for
-        for (size_t i = 0; i < count; ++i)
+        for (size_t i = 0; i < num_chunks; ++i)
         {
-            dst[i] = fp32_to_fp16(src[i]);
+            size_t start = i * chunk_size;
+            size_t current_chunk = std::min(chunk_size, count - start);
+            simd::convert_fp32_to_fp16(src + start, dst + start, current_chunk);
         }
     }
 
@@ -511,7 +523,52 @@ namespace llaminar2
 
     ActivationPack FP32Tensor::to_int8_activation_pack(int rows, int cols) const
     {
-        return pack_activation_rows_to_int8(rows, cols);
+        if (rows <= 0 || cols <= 0)
+        {
+            LOG_ERROR("[FP32Tensor] to_int8_activation_pack requires positive dimensions");
+            return {};
+        }
+
+        const auto &shp = shape();
+        if (shp.size() != 2)
+        {
+            LOG_ERROR("[FP32Tensor] to_int8_activation_pack requires 2D tensor, got " << shp.size() << "D");
+            return {};
+        }
+        if (static_cast<size_t>(rows) > shp[0] || static_cast<size_t>(cols) != shp[1])
+        {
+            LOG_ERROR("[FP32Tensor] to_int8_activation_pack dimension mismatch: tensor is ["
+                      << shp[0] << ", " << shp[1] << "], requested " << rows << "x" << cols);
+            return {};
+        }
+
+        ActivationPack pack;
+        pack.rows = rows;
+        pack.cols = cols;
+        const size_t row_stride = static_cast<size_t>(cols);
+        const size_t total = row_stride * static_cast<size_t>(rows);
+        pack.data.resize(total);
+        pack.row_scales.resize(static_cast<size_t>(rows));
+
+        const float *src_data = data();
+
+#pragma omp parallel for
+        for (int m = 0; m < rows; ++m)
+        {
+            const float *row_src = src_data + static_cast<size_t>(m) * row_stride;
+            int8_t *row_dst = pack.data.data() + static_cast<size_t>(m) * row_stride;
+
+            // Calculate max abs directly from source
+            float max_abs = simd::activation_row_max_abs(row_src, cols);
+
+            const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+            pack.row_scales[static_cast<size_t>(m)] = scale;
+            const float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+            simd::quantize_activation_row(row_src, cols, inv_scale, row_dst);
+        }
+
+        return pack;
     }
 
     bool FP32Tensor::applyRMSNorm(
