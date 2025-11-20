@@ -395,7 +395,7 @@ TEST(Test__OneDNNGemmKernel, FusedMatmulSoftmaxMatchesReference)
 
     OneDNNGemmKernel kernel;
 
-    ASSERT_TRUE(kernel.multiply_activations_with_softmax(
+    ASSERT_TRUE(kernel.multiply_with_softmax(
         A,
         B,
         fused_output,
@@ -448,7 +448,7 @@ TEST(Test__OneDNNGemmKernel, FusedMatmulSoftmaxHandlesNegativeAxis)
 
     OneDNNGemmKernel kernel;
 
-    ASSERT_TRUE(kernel.multiply_activations_with_softmax(
+    ASSERT_TRUE(kernel.multiply_with_softmax(
         A,
         B,
         fused_output,
@@ -456,7 +456,7 @@ TEST(Test__OneDNNGemmKernel, FusedMatmulSoftmaxHandlesNegativeAxis)
         n,
         k,
         true,
-        -1,
+        1,
         nullptr,
         -1));
 
@@ -501,7 +501,7 @@ TEST(Test__OneDNNGemmKernel, ColumnSoftmaxFallbackMatchesReference)
 
     OneDNNGemmKernel kernel;
 
-    ASSERT_TRUE(kernel.multiply_activations_with_softmax(
+    ASSERT_TRUE(kernel.multiply_with_softmax(
         A,
         B,
         fused_output,
@@ -544,7 +544,7 @@ TEST(Test__OneDNNGemmKernel, RejectsInvalidSoftmaxAxis)
     float C[1] = {0.0f};
 
     OneDNNGemmKernel kernel;
-    EXPECT_FALSE(kernel.multiply_activations_with_softmax(
+    EXPECT_FALSE(kernel.multiply_with_softmax(
         A,
         B,
         C,

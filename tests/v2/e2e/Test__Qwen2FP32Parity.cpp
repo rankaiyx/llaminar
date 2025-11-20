@@ -78,7 +78,12 @@ protected:
 
         // Build command to regenerate snapshots
         std::ostringstream cmd;
-        cmd << "python3 python/reference/generate_qwen2_pipeline_snapshots.py "
+#ifdef PYTHON_EXECUTABLE
+        cmd << PYTHON_EXECUTABLE;
+#else
+        cmd << "python3";
+#endif
+        cmd << " python/reference/generate_qwen2_pipeline_snapshots.py "
             << "--model " << model_path_ << " "
             << "--output " << snapshot_dir_ << " "
             << "--layers 0 " // Just layer 0 for now (faster)

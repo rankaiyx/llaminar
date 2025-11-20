@@ -129,7 +129,7 @@ function(add_v2_test TEST_NAME)
     # E2E and Integration tests should use Release build for performance
     # Unit tests can use Debug build for better diagnostics
     set(USE_RELEASE_BUILD FALSE)
-    if("${ARG_LABELS}" MATCHES "E2E" OR "${ARG_LABELS}" MATCHES "Integration")
+    if(CMAKE_BUILD_TYPE MATCHES "Debug" AND ("${ARG_LABELS}" MATCHES "E2E" OR "${ARG_LABELS}" MATCHES "Integration"))
         set(USE_RELEASE_BUILD TRUE)
     endif()
     
@@ -336,6 +336,19 @@ add_v2_test(V2_Unit_OneDNNGemmKernel
     COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel>
     LABELS "V2;Unit;Kernels;GEMM;Softmax;OneDNN;CPU"
     MPI_PROCS 1  # OneDNN fused kernel executes on CPU only
+)
+
+# Test: OneDNN GEMM kernel typed interface (BF16/FP16/FP32)
+add_executable(v2_test_onednn_gemm_kernel_typed unit/kernels/gemm/Test__OneDNNGemmKernel_Typed.cpp)
+target_link_libraries(v2_test_onednn_gemm_kernel_typed
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_OneDNNGemmKernel_Typed
+    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel_typed>
+    LABELS "V2;Unit;Kernels;GEMM;OneDNN;Typed;BF16;FP16;CPU"
+    MPI_PROCS 1
 )
 
 # Test: OneDNN GEMM adapter (INT8 path with tensor interface)
@@ -935,7 +948,7 @@ target_link_libraries(v2_test_q4_k_simd
 add_v2_test(V2_Unit_Q4_K_SIMD 
     COMMAND $<TARGET_FILE:v2_test_q4_k_simd>
     MPI_PROCS 1
-    LABELS "V2;Unit;TensorOperations;Q4_K;Quantization;SIMD;AVX2;AVX512;Equivalency;KQuant;SuperBlock;ScaleMin"
+    LABELS "V2;Unit;TensorOperations;Q4_K;Quantization;SIMD;AVX2;AVX512;Equivalency;KQuant;SuperBlock"
 )
 
 # Test: Q5_K SIMD Equivalency
@@ -995,8 +1008,9 @@ add_v2_test(V2_Unit_WeightPlacementMap
 )
 
 # Test: PipelineBase Device Detection (Phase 3)
-# Tests pipeline integration helpers: detectAttentionDevices, detectFFNDevices
-add_executable(v2_test_pipeline_device_detection unit/pipelines/Test__PipelineBase_DeviceDetection.cpp)
+add_executable(v2_test_pipeline_device_detection
+    unit/pipelines/Test__PipelineBase_DeviceDetection.cpp
+)
 target_link_libraries(v2_test_pipeline_device_detection llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_PipelineDeviceDetection
     COMMAND $<TARGET_FILE:v2_test_pipeline_device_detection>
@@ -1121,10 +1135,9 @@ target_link_libraries(v2_test_iq2s_tensor
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_IQ2_STensor 
+add_v2_test(V2_Unit_IQ2_S_Tensor 
     COMMAND $<TARGET_FILE:v2_test_iq2s_tensor>
-    MPI_PROCS 1
-    LABELS "V2;Unit;TensorOperations;IQ2_S;Quantization;SIMD;AVX2;AVX512;Equivalency;IQQuant;GridLookup;HighBits;10BitIndex"
+    LABELS "V2;Unit;TensorOperations;IQ2_S;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
 )
 
 # Test: IQ3_S SIMD equivalency (scalar vs AVX2 vs AVX512)
@@ -1137,10 +1150,9 @@ target_link_libraries(v2_test_iq3s_tensor
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_IQ3_STensor 
+add_v2_test(V2_Unit_IQ3_S_Tensor 
     COMMAND $<TARGET_FILE:v2_test_iq3s_tensor>
-    MPI_PROCS 1
-    LABELS "V2;Unit;TensorOperations;IQ3_S;Quantization;SIMD;AVX2;AVX512;Equivalency;IQQuant;GridLookup;9BitIndex;SignArray"
+    LABELS "V2;Unit;TensorOperations;IQ3_S;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
 )
 
 # Test: IQ1_M SIMD equivalency (scalar vs AVX2 vs AVX512)
@@ -1156,7 +1168,7 @@ target_link_libraries(v2_test_iq1m_tensor
 add_v2_test(V2_Unit_IQ1_MTensor 
     COMMAND $<TARGET_FILE:v2_test_iq1m_tensor>
     MPI_PROCS 1
-    LABELS "V2;Unit;TensorOperations;IQ1_M;Quantization;SIMD;AVX2;AVX512;Equivalency;IQQuant;GridLookup;11BitIndex;PackedScales"
+    LABELS "V2;Unit;TensorOperations;IQ1_M;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
 )
 
 # Test: IQ1_S SIMD equivalency (scalar vs AVX2 vs AVX512)
@@ -1172,7 +1184,7 @@ target_link_libraries(v2_test_iq1s_tensor
 add_v2_test(V2_Unit_IQ1_STensor 
     COMMAND $<TARGET_FILE:v2_test_iq1s_tensor>
     MPI_PROCS 1
-    LABELS "V2;Unit;TensorOperations;IQ1_S;Quantization;SIMD;AVX2;AVX512;Equivalency;IQQuant;GridLookup;11BitIndex;SubScales"
+    LABELS "V2;Unit;TensorOperations;IQ1_S;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
 )
 
 # Test: IQ SIMD equivalency tests for all IQ formats
@@ -1405,7 +1417,7 @@ if(HAVE_CUDA)
         MPI_PROCS 1
     )
     
-    # Phase 3 Part 2: Pipelined large tiles for 900-1,000 GFLOPS
+    # Phase 3 Part 2: Pipelined large tiles for 900-1,000 GFLOPS target
     add_executable(v2_test_cuda_gemm_phase3_pipelined unit/Test__CudaGemmPhase3Pipelined.cpp)
     target_include_directories(v2_test_cuda_gemm_phase3_pipelined PRIVATE
         ${CMAKE_SOURCE_DIR}/kernels/cuda
@@ -1538,8 +1550,8 @@ if(HAVE_CUDA)
     )
     add_v2_test(V2_Perf_Phase5_SUB_K_Sweep
         COMMAND $<TARGET_FILE:v2_test_phase5_sub_k_sweep>
-        LABELS "V2;Performance;Sweep;SUB_K;CUDA;Phase5;Coalescing"
-        MPI_PROCS 1
+        LABELS "V2;Performance;CUDA;Phase5;TensorCore;TileSizeTuning;Optimization;GEMM"
+        MPI_PROCS 1  # Single GPU, no MPI
     )
     
     # Test: Phase 5 SUB_K=64 Profiling
@@ -2221,6 +2233,13 @@ if(ZLIB_FOUND)
             ${WORKSPACE_ROOT}/external/cnpy
         )
         
+        # Pass Python executable path to the test for snapshot generation
+        if(Python3_EXECUTABLE)
+            target_compile_definitions(v2_test_qwen2_fp32_parity PRIVATE
+                PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+            )
+        endif()
+
         add_v2_test(V2_E2E_Qwen2FP32Parity
             COMMAND $<TARGET_FILE:v2_test_qwen2_fp32_parity>
             LABELS "V2;E2E;Qwen;Parity;PyTorch;FP32"
@@ -2484,460 +2503,3 @@ add_v2_perf_test(V2_Perf_BF16_Profile
 # performance tests.
 
 # Performance Test: BF16 Conversion Optimization (side-by-side comparison)
-# Tests baseline vs optimized BF16 conversion implementations
-# Optimizations: loop unrolling, prefetching, aligned loads, streaming stores
-add_executable(v2_perf_bf16_conversion_opt performance/Perf__BF16_Conversion_Optimization.cpp)
-target_link_libraries(v2_perf_bf16_conversion_opt 
-    llaminar2_core 
-    GTest::gtest
-    MPI::MPI_CXX
-)
-set_target_properties(v2_perf_bf16_conversion_opt PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_BF16_ConversionOpt
-    COMMAND $<TARGET_FILE:v2_perf_bf16_conversion_opt>
-    LABELS "V2;Performance;BF16;Conversion;Optimization;Bandwidth;SIMD"
-    MPI_PROCS 2  # Match production configuration
-)
-
-# NOTE: Removed experimental Phase 2.7 pipelining tests
-# - Perf__CuTePipelining.cu (references non-existent CudaGemmKernelTensorCorePipelined.cuh)
-# - Perf__Phase2_7_TensorCore_Pipeline.cu (references non-existent CudaGemmKernelTensorCorePipeline.cuh)
-# These were experimental explorations of software pipelining with CuTe that are not
-# part of the current production kernel architecture.
-
-# NOTE: Removed CUDAvsGPU_GEMM performance test
-# Reason: Compared GPU against single-threaded CPU, which is not representative
-# of production performance and took 6+ minutes to run. Use V2_Perf_IQ4NL_GEMM
-# for proper multi-rank CPU benchmarks, and CUDA unit tests verify GPU correctness.
-
-# Performance Test: Phase 1 Standalone CUDA Kernel Benchmark
-# Direct baseline vs optimized kernel comparison with manual CUDA memory allocation
-# Bypasses pipeline/autotuner to measure pure kernel performance
-if(HAVE_CUDA)
-    add_executable(v2_perf_phase1_standalone performance/Perf__Phase1_Standalone.cu)
-    target_link_libraries(v2_perf_phase1_standalone
-        cuda_backend
-        GTest::gtest
-        CUDA::cudart
-    )
-    set_target_properties(v2_perf_phase1_standalone PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-        CUDA_SEPARABLE_COMPILATION ON
-    )
-    
-    add_v2_perf_test(V2_Perf_Phase1_Standalone
-        COMMAND $<TARGET_FILE:v2_perf_phase1_standalone>
-        LABELS "V2;Performance;CUDA;Phase1;Standalone;GEMM"
-        MPI_PROCS 1  # Single GPU, no MPI
-    )
-    
-    # Performance Test: Phase 1 Debug - Separate configs for baseline vs optimized
-    # Tests each kernel with its own optimal configuration
-    add_executable(v2_perf_phase1_debug performance/Perf__Phase1_Debug.cu)
-    target_link_libraries(v2_perf_phase1_debug
-        cuda_backend
-        GTest::gtest
-        GTest::gtest_main
-        CUDA::cudart
-    )
-    set_target_properties(v2_perf_phase1_debug PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-        CUDA_SEPARABLE_COMPILATION ON
-    )
-    
-    add_v2_perf_test(V2_Perf_Phase1_Debug
-        COMMAND $<TARGET_FILE:v2_perf_phase1_debug>
-        LABELS "V2;Performance;CUDA;Phase1;Debug;GEMM"
-        MPI_PROCS 1  # Single GPU, no MPI
-    )
-    
-    # Performance Test: Phase 2 Tensor Core - wmma API with FP16 compute
-    # Validates 3-4× speedup over Phase 1 using Tensor Cores
-    # COMMENTED OUT: Depends on obsolete CudaGemmVariantsTensorCore.h file
-    # add_executable(v2_perf_phase2_tensorcore performance/Perf__Phase2_TensorCore.cu)
-    # target_link_libraries(v2_perf_phase2_tensorcore
-    #     cuda_backend
-    #     GTest::gtest
-    #     GTest::gtest_main
-    #     CUDA::cudart
-    # )
-    # set_target_properties(v2_perf_phase2_tensorcore PROPERTIES
-    #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-    #     CUDA_SEPARABLE_COMPILATION ON
-    # )
-    # 
-    # add_v2_perf_test(V2_Perf_Phase2_TensorCore
-    #     COMMAND $<TARGET_FILE:v2_perf_phase2_tensorcore>
-    #     LABELS "V2;Performance;CUDA;Phase2;TensorCore;FP32Input;GEMM"
-    #     MPI_PROCS 1  # Single GPU, no MPI
-    # )
-    
-    # Phase 2.5: FP16 input with async copy
-    # COMMENTED OUT: Depends on obsolete CudaGemmKernel.cuh file
-    # add_executable(v2_perf_phase2_5_tensorcore_fp16 performance/Perf__Phase2_5_TensorCore_FP16.cu)
-    # target_link_libraries(v2_perf_phase2_5_tensorcore_fp16
-    #     cuda_backend
-    #     GTest::gtest
-    #     GTest::gtest_main
-    #     CUDA::cudart
-    # )
-    # set_target_properties(v2_perf_phase2_5_tensorcore_fp16 PROPERTIES
-    #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-    #     CUDA_SEPARABLE_COMPILATION ON
-    # )
-    
-    # add_v2_perf_test(V2_Perf_Phase2_5_TensorCore_FP16
-    #     COMMAND $<TARGET_FILE:v2_perf_phase2_5_tensorcore_fp16>
-    #     LABELS "V2;Performance;CUDA;Phase2_5;TensorCore;FP16Input;AsyncCopy;GEMM"
-    #     MPI_PROCS 1  # Single GPU, no MPI
-    # )
-    
-    # Phase 3: Tile size tuning sweep
-    # COMMENTED OUT: Depends on obsolete CudaGemmKernel.cuh file
-    # add_executable(v2_perf_phase3_tile_sweep performance/Perf__Phase3_TileSizeSweep.cu)
-    # target_link_libraries(v2_perf_phase3_tile_sweep
-    #     cuda_backend
-    #     GTest::gtest
-    #     GTest::gtest_main
-    #     CUDA::cudart
-    # )
-    # set_target_properties(v2_perf_phase3_tile_sweep PROPERTIES
-    #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-    #     CUDA_SEPARABLE_COMPILATION ON
-    # )
-    
-    # add_v2_perf_test(V2_Perf_Phase3_TileSizeSweep
-    #     COMMAND $<TARGET_FILE:v2_perf_phase3_tile_sweep>
-    #     LABELS "V2;Performance;CUDA;Phase3;TensorCore;TileSizeTuning;Optimization;GEMM"
-    #     MPI_PROCS 1  # Single GPU, no MPI
-    # )
-endif()
-
-# Performance Test: 64×32 Tile Size Comparison (DISABLED - missing GemmAutoTuner.h)
-# Compares V1's optimal 64×32 tile against auto-selected tiles for 1024 tokens
-# add_executable(v2_perf_tile64x32_comparison performance/Perf__Tile64x32Comparison.cpp)
-# target_link_libraries(v2_perf_tile64x32_comparison 
-#     llaminar2_core 
-#     GTest::gtest
-#     GTest::gtest_main
-# )
-# set_target_properties(v2_perf_tile64x32_comparison PROPERTIES
-#     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-# )
-# 
-# add_v2_perf_test(V2_Perf_Tile64x32Comparison
-#     COMMAND $<TARGET_FILE:v2_perf_tile64x32_comparison>
-#     LABELS "V2;Performance;GEMM;TileSizeOptimization;AutoTuning"
-#     MPI_PROCS 1  # Single rank benchmark
-# )
-
-# Performance Test: CUDA GEMM Heuristic Validation (Phase 6.11)
-# Benchmarks ALL kernel variants for 0.5B/4B model matrix shapes
-# Compares heuristic ranking vs empirical performance
-# Validates auto-selection logic makes good choices
-# NOTE: Excluded from default ALL target to avoid running on every build
-#       Build manually with: cmake --build . --target v2_perf_cuda_heuristic_validation
-if(HAVE_CUDA)
-    add_executable(v2_perf_cuda_heuristic_validation 
-        performance/Perf__CudaGemmHeuristicValidation.cpp
-    )
-    target_link_libraries(v2_perf_cuda_heuristic_validation 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    set_target_properties(v2_perf_cuda_heuristic_validation PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-        EXCLUDE_FROM_ALL TRUE  # Don't build as part of default ALL target
-    )
-    
-    add_v2_perf_test(V2_Perf_CudaHeuristicValidation
-        COMMAND $<TARGET_FILE:v2_perf_cuda_heuristic_validation>
-        LABELS "V2;Performance;CUDA;GEMM;AutoTuning;HeuristicValidation;ModelSizes"
-        MPI_PROCS 1  # Single rank GPU benchmark
-    )
-    
-    # Custom target: Train ML heuristic from benchmark data
-    # This regenerates cuda_heuristic_weights.h in the source tree
-    # Run with: cmake --build . --target train_cuda_heuristic
-    add_custom_target(train_cuda_heuristic
-        COMMAND ${CMAKE_COMMAND} -E echo "Training ML heuristic from benchmark data..."
-        COMMAND Python3::Interpreter 
-                ${PROJECT_SOURCE_DIR}/train_cuda_heuristic.py
-                --input ${CMAKE_BINARY_DIR}/cuda_gemm_benchmark_data.csv
-                --output-dir ${CMAKE_SOURCE_DIR}/src/v2/kernels/cuda
-        COMMAND ${CMAKE_COMMAND} -E echo "Generated: src/v2/kernels/cuda/cuda_heuristic_weights.h"
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMENT "Training CUDA GEMM ML heuristic and generating C++ header"
-        VERBATIM
-    )
-    
-    # Make training depend on the benchmark executable
-    add_dependencies(train_cuda_heuristic v2_perf_cuda_heuristic_validation)
-    
-    # Hash-based automatic retraining (only retrains if CSV changed)
-    # Run with: cmake --build . --target train_cuda_heuristic_auto
-    add_custom_target(train_cuda_heuristic_auto
-        COMMAND ${CMAKE_COMMAND} -E echo "Checking if ML retraining needed (hash-based)..."
-        COMMAND bash ${PROJECT_SOURCE_DIR}/scripts/check_cuda_heuristic_needs_retrain.sh && 
-                bash ${PROJECT_SOURCE_DIR}/scripts/train_cuda_heuristic.sh || 
-                ${CMAKE_COMMAND} -E echo "Heuristic weights already up-to-date"
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMENT "Auto-train CUDA GEMM heuristic (only if CSV hash changed)"
-        VERBATIM
-    )
-    
-    # Make auto-training depend on the benchmark executable
-    add_dependencies(train_cuda_heuristic_auto v2_perf_cuda_heuristic_validation)
-    
-    # Optional: Auto-train after running performance test
-    # Uncomment to automatically regenerate weights when benchmark data changes
-    # add_custom_command(
-    #     OUTPUT ${CMAKE_SOURCE_DIR}/src/v2/kernels/cuda/cuda_heuristic_weights.h
-    #     COMMAND $<TARGET_FILE:v2_perf_cuda_heuristic_validation>
-    #     COMMAND Python3::Interpreter 
-    #             ${PROJECT_SOURCE_DIR}/train_cuda_heuristic.py
-    #             --input ${CMAKE_BINARY_DIR}/cuda_gemm_benchmark_data.csv
-    #             --output-dir ${CMAKE_SOURCE_DIR}/src/v2/kernels/cuda
-    #     DEPENDS v2_perf_cuda_heuristic_validation
-    #     COMMENT "Running benchmark and training ML heuristic"
-    #     VERBATIM
-    # )
-    
-    # Performance Test: CUDA GEMM Heuristic Canary (Generalization Validation)
-    # Tests ML heuristic with UNTRAINED matrix shapes to detect overfitting
-    # Does NOT export training data - purely validation/testing
-    # Expected: >70% top-20 hit rate on unseen configurations
-    # NOTE: Excluded from default ALL target to avoid running on every build
-    #       Build manually with: cmake --build . --target v2_perf_cuda_heuristic_canary
-    add_executable(v2_perf_cuda_heuristic_canary 
-        performance/Perf__CudaGemmHeuristicCanary.cpp
-    )
-    target_link_libraries(v2_perf_cuda_heuristic_canary 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    set_target_properties(v2_perf_cuda_heuristic_canary PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-        EXCLUDE_FROM_ALL TRUE  # Don't build as part of default ALL target
-    )
-    set_target_properties(v2_perf_cuda_heuristic_canary PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-    )
-    
-    add_v2_perf_test(V2_Perf_CudaHeuristicCanary
-        COMMAND $<TARGET_FILE:v2_perf_cuda_heuristic_canary>
-        LABELS "V2;Performance;CUDA;GEMM;AutoTuning;HeuristicCanary;GeneralizationTest;NoTrainingData"
-        MPI_PROCS 1  # Single rank GPU benchmark
-    )
-
-    # Performance Test: Batch Prefill GFLOPS Benchmark
-    # Measures peak GFLOPS for batch prefill scenarios (Qwen 0.5B)
-    # Tests batch sizes from 1 to 1024 to find optimal throughput
-    # Useful for understanding batch scaling behavior
-    add_executable(v2_perf_batch_prefill_gflops 
-        performance/Perf__BatchPrefillGflops.cpp
-    )
-    target_link_libraries(v2_perf_batch_prefill_gflops 
-        llaminar2_core 
-        GTest::gtest
-        GTest::gtest_main
-    )
-    set_target_properties(v2_perf_batch_prefill_gflops PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-        EXCLUDE_FROM_ALL TRUE  # Build manually
-    )
-    
-    add_v2_perf_test(V2_Perf_BatchPrefillGflops
-        COMMAND $<TARGET_FILE:v2_perf_batch_prefill_gflops>
-        LABELS "V2;Performance;CUDA;GEMM;BatchPrefill;Throughput;Qwen"
-        MPI_PROCS 1  # Single rank GPU benchmark
-    )
-
-    # Performance Test: Tensor Core Heuristic Validation (Phase 3+)
-    # COMPREHENSIVE benchmarking of ALL Tensor Core variants
-    # Tests 0.5B, 4B, 7B, 14B model sizes with batch sizes 1, 8, 32, 128
-    # Exports data for ML heuristic training: tensorcore_benchmark_data.csv
-    # Validates Phase 3 optimization (32×64×16 for m=32)
-    # COMMENTED OUT: Depends on obsolete CudaGemmVariantsTensorCore.h file
-    # add_executable(v2_perf_tensorcore_heuristic_validation 
-    #     performance/Perf__TensorCoreHeuristicValidation.cpp
-    # )
-    # target_link_libraries(v2_perf_tensorcore_heuristic_validation 
-    #     llaminar2_core 
-    #     GTest::gtest
-    # )
-    # set_target_properties(v2_perf_tensorcore_heuristic_validation PROPERTIES
-    #     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-    # )
-    # 
-    # add_v2_perf_test(V2_Perf_TensorCoreHeuristicValidation
-    #     COMMAND $<TARGET_FILE:v2_perf_tensorcore_heuristic_validation>
-    #     LABELS "V2;Performance;CUDA;TensorCore;AutoTuning;HeuristicValidation;ModelSizes;Comprehensive"
-    #     MPI_PROCS 1  # Single rank GPU benchmark
-    # )
-    
-    # Custom target: Train ML heuristic from Tensor Core benchmark data
-    # This regenerates tensorcore_heuristic_weights.h in the source tree
-    # Run with: cmake --build . --target train_tensorcore_heuristic
-    add_custom_target(train_tensorcore_heuristic
-        COMMAND ${CMAKE_COMMAND} -E echo "Training Tensor Core ML heuristic from benchmark data..."
-        COMMAND Python3::Interpreter 
-                ${PROJECT_SOURCE_DIR}/train_tensorcore_heuristic.py
-                --input ${CMAKE_BINARY_DIR}/tensorcore_benchmark_data.csv
-                --output-dir ${CMAKE_SOURCE_DIR}/src/v2/kernels/cuda
-        COMMAND ${CMAKE_COMMAND} -E echo "Generated: src/v2/kernels/cuda/tensorcore_heuristic_weights.h"
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMENT "Training Tensor Core GEMM ML heuristic and generating C++ header"
-        VERBATIM
-    )
-    
-    # Make training depend on the benchmark executable
-    # COMMENTED OUT: v2_perf_tensorcore_heuristic_validation is disabled
-    # add_dependencies(train_tensorcore_heuristic v2_perf_tensorcore_heuristic_validation)
-endif()
-
-# Performance Test: Qwen2 E2E Pipeline Throughput
-# Benchmarks full pipeline: model loading, prefill, decode
-# Measures tokens/sec, GFLOPS, memory usage
-add_executable(v2_perf_qwen2_e2e 
-    performance/Perf__Qwen2E2EPerformance.cpp
-    e2e/gtest_mpi_main.cpp
-)
-target_link_libraries(v2_perf_qwen2_e2e 
-    llaminar2_core 
-    GTest::gtest
-    MPI::MPI_CXX
-)
-set_target_properties(v2_perf_qwen2_e2e PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-
-add_v2_perf_test(V2_Perf_Qwen2E2E
-    COMMAND $<TARGET_FILE:v2_perf_qwen2_e2e>
-    LABELS "V2;Performance;E2E;Qwen;Pipeline;Throughput;Models"
-    MPI_PROCS 2
-)
-# Performance Test: MPI Tensor-Parallel (Phase 3b)
-add_executable(v2_perf_mpi_tensor_parallel performance/Perf__MPITensorParallel.cpp)
-target_link_libraries(v2_perf_mpi_tensor_parallel 
-    llaminar2_core 
-    GTest::gtest
-    MPI::MPI_CXX
-)
-set_target_properties(v2_perf_mpi_tensor_parallel PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-)
-add_v2_perf_test(V2_Perf_MPITensorParallel 
-    COMMAND $<TARGET_FILE:v2_perf_mpi_tensor_parallel>
-    LABELS "V2;Performance;MPI;TensorParallel;Attention;Speedup"
-    MPI_PROCS 2
-)
-
-# Profiling tool: GEMM hotpath analysis
-# TEMPORARILY DISABLED - needs update for IBlockDecoder interface
-# add_executable(v2_profile_gemm_hotpath performance/profile_gemm_hotpath.cpp)
-# target_link_libraries(v2_profile_gemm_hotpath llaminar2_core)
-# set_target_properties(v2_profile_gemm_hotpath PROPERTIES
-#     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
-# )
-
-# NOTE: IQ4_NL GEMM tile sweep optimization perf test removed - depended on
-# obsolete GEMM v4 weight-owned APIs. IQ4_NL performance is now characterized
-# indirectly via end-to-end benchmarks.
-
-# NOTE: GemmAutoTuner and MicroKernelScaling performance tests removed - depend on obsolete gemm implementations
-
-# Future performance tests can be added here following the same pattern:
-# Example:
-# add_executable(v2_perf_attention performance/Perf__Attention.cpp)
-# target_link_libraries(v2_perf_attention llaminar2_core GTest::gtest GTest::gtest_main)
-# add_v2_perf_test(V2_Perf_Attention
-#     COMMAND $<TARGET_FILE:v2_perf_attention>
-#     LABELS "V2;Performance;Attention;Throughput"
-# )
-
-# =============================================================================
-# Test Suite Labels
-# =============================================================================
-# V2 tests use hierarchical, feature-based labels for flexible filtering:
-#
-# TIER 1 - Test Type (Required):
-#   Unit                    - Isolated component tests (no model loading)
-#   Integration             - Multi-component tests (may load models)
-#   E2E                     - End-to-end pipeline tests (full inference)
-#   Parity                  - Ground truth validation (PyTorch/llama.cpp)
-#   Performance             - Benchmarks (run manually, not in CTest)
-#
-# TIER 2 - Architecture (Optional):
-#   V2                      - V2 architecture tests
-#
-# TIER 3 - Component (Specific to what's being tested):
-#   DeviceManagement        - Device orchestration, discovery, selection
-#   TensorOperations        - Tensor creation, manipulation, conversion
-#   Kernels                 - Computational kernels (GEMM, RoPE, Attention)
-#   ModelLoading            - GGUF parsing, weight loading
-#   PipelineExecution       - Pipeline lifecycle, forward pass
-#   WeightPlacement         - Weight distribution strategies
-#   DataTransfer            - Cross-device buffer management
-#   ArgumentParsing         - CLI argument handling
-#
-# TIER 4 - Feature (Granular specifics):
-#   Orchestration           - Orchestrator-specific features
-#   Quantization            - Quantized tensor formats
-#   MultiDevice             - Heterogeneous execution
-#   CrossDevice             - Cross-device operations
-#   HeterogeneousExecution  - Mixed device types
-#   BasicFeatures           - Core functionality
-#   AdvancedFeatures        - Extended capabilities
-#   etc. (feature-specific)
-#
-# FILTERING EXAMPLES:
-#   ctest -L "V2;Unit"                          # All V2 unit tests
-#   ctest -L DeviceManagement                   # All device management tests
-#   ctest -L "TensorOperations;Quantization"    # All quantized tensor tests
-#   ctest -L Orchestration                      # All orchestrator tests
-#   ctest -L GEMM                               # All GEMM-related tests
-#   ctest -R "V2_Unit_.*"                       # All V2 unit tests (by name)
-#
-# NAMING CONVENTIONS:
-#   - Use CamelCase for label names (matches file naming)
-#   - Be specific: "PipelineFactory" not "Factory"
-#   - Feature-based, not timeline-based: "WeightPlacement" not "Phase1"
-#   - Multiple labels per test enable flexible filtering dimensions
-#
-# =============================================================================
-# Test Suite Labels
-# =============================================================================
-# Tests can be run by category using CTest filters:
-#
-#   ctest -L V2                    # All V2 tests
-#   ctest -L "V2;Unit"             # V2 unit tests only
-#   ctest -L "V2;Integration"      # V2 integration tests only
-#   ctest -L "V2;E2E"              # V2 end-to-end tests only
-#   ctest -L "V2;Parity"           # V2 PyTorch parity tests only
-#   ctest -R "V2_Unit_.*"          # All V2 unit tests (by name regex)
-#
-# The model fetching fixture (V2_FetchModelsFixture) will run automatically
-# before any test that requires the V2_Models fixture.
-
-# =============================================================================
-# Notes on Test Dependencies
-# =============================================================================
-# The CMake FIXTURES system ensures:
-#   1. V2_FetchModelsFixture runs before any test requiring V2_Models
-#   2. Models are fetched only once per CTest invocation
-#   3. If model fetch fails, dependent tests still run (script returns 0)
-#   4. Individual tests can check for model availability and SKIP if needed
-#
-# Environment variables respected by fetch_test_models.sh:
-#   LLAMINAR_SKIP_MODEL_DOWNLOAD=1    # Skip all downloads (use existing)
-#   LLAMINAR_FETCH_EXPERIMENTAL=1     # Include experimental/404-prone models
-#   LLAMINAR_FETCH_FP32=1             # Include large FP32 models
-#   LLAMINAR_FETCH_7B_IQ_MODELS=1     # Include large 7B IQ models
-#   LLAMINAR_ENFORCE_MODELS=1         # Fail if no models present after fetch
-

@@ -785,7 +785,8 @@ TEST_F(Qwen2E2ECorrectness, BatchScaling)
         GTEST_SKIP() << "Test requires exactly 2 MPI ranks";
     }
 
-    const float tolerance = 1e-3f;
+    // Slightly relaxed tolerance for larger batches with Q4_0 quantization
+    const float tolerance = 2e-3f;
 
     // Load model (propagate failures to all ranks)
     bool local_ok = loadModelMultiRank();

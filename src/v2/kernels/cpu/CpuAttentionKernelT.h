@@ -218,6 +218,122 @@ namespace llaminar2
                 return false;
             }
 
+            // Create GEMM kernel once (reused across heads) using ActivationTraits!
+            auto gemm = Traits::create_activation_gemm();
+
+            // Optimized path for FP32, BF16, FP16 (Native & Mixed Precision)
+            if constexpr (std::is_same_v<TensorType, FP32Tensor> ||
+                          std::is_same_v<TensorType, BF16Tensor> ||
+                          std::is_same_v<TensorType, FP16Tensor>)
+            {
+                ActivationFormat format = ActivationFormat::FP32;
+                if constexpr (std::is_same_v<TensorType, BF16Tensor>)
+                    format = ActivationFormat::BF16;
+                else if constexpr (std::is_same_v<TensorType, FP16Tensor>)
+                    format = ActivationFormat::FP16;
+
+                // 1. Handle GQA Broadcast (Typed)
+                const ElementType *K_use = K;
+                const ElementType *V_use = V;
+                std::vector<ElementType> K_buf, V_buf;
+
+                if (n_heads != n_kv_heads)
+                {
+                    K_buf.resize(seq_len * n_heads * head_dim);
+                    V_buf.resize(seq_len * n_heads * head_dim);
+
+                    // Manual broadcast loop for ElementType
+                    const int heads_per_kv = n_heads / n_kv_heads;
+
+#pragma omp parallel for collapse(2)
+                    for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+                    {
+                        for (int s = 0; s < seq_len; ++s)
+                        {
+                            // Source pointer for this token and KV head
+                            const ElementType *src_k = K + (s * n_kv_heads + kv_h) * head_dim;
+                            const ElementType *src_v = V + (s * n_kv_heads + kv_h) * head_dim;
+
+                            for (int i = 0; i < heads_per_kv; ++i)
+                            {
+                                int h = kv_h * heads_per_kv + i;
+                                // Dest pointer for this token and Q head
+                                ElementType *dst_k = K_buf.data() + (s * n_heads + h) * head_dim;
+                                ElementType *dst_v = V_buf.data() + (s * n_heads + h) * head_dim;
+
+                                std::memcpy(dst_k, src_k, head_dim * sizeof(ElementType));
+                                std::memcpy(dst_v, src_v, head_dim * sizeof(ElementType));
+                            }
+                        }
+                    }
+
+                    K_use = K_buf.data();
+                    V_use = V_buf.data();
+                }
+
+                // 2. Compute Q @ K^T -> Scores (FP32)
+                const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+#pragma omp parallel for if (n_heads > 1)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *scores_h = scores + h * seq_len * seq_len;
+                    const ElementType *Q_h = Q + h * head_dim;
+                    const ElementType *K_h = K_use + h * head_dim;
+
+                    const int lda = n_heads * head_dim;
+                    const int ldb = n_heads * head_dim;
+                    const int ldc = seq_len;
+
+                    gemm->template multiply_activations_strided_typed<ElementType, ElementType>(
+                        Q_h, K_h, scores_h,
+                        seq_len, seq_len, head_dim,
+                        lda, ldb, ldc,
+                        true, scale, 0.0f, nullptr, -1, format);
+                }
+
+                // 3. Masking & Softmax (FP32)
+                if (mask)
+                {
+#pragma omp parallel for if (n_heads > 1)
+                    for (int h = 0; h < n_heads; ++h)
+                    {
+                        float *scores_h = scores + h * seq_len * seq_len;
+                        attention_utils::apply_attention_mask(scores_h, mask, seq_len, seq_len);
+                    }
+                }
+
+#pragma omp parallel for if (n_heads > 1)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *scores_h = scores + h * seq_len * seq_len;
+                    primitives::softmax_row_major_fp32(scores_h, seq_len, seq_len, causal, 1.0f, true);
+                }
+
+                // 4. Scores @ V -> Output (FP32)
+                std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
+
+#pragma omp parallel for if (n_heads > 1)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const float *weights_h = scores + h * seq_len * seq_len;
+                    const ElementType *V_h = V_use + h * head_dim;
+                    float *output_h = output + h * head_dim;
+
+                    const int lda = seq_len;
+                    const int ldb = n_heads * head_dim;
+                    const int ldc = n_heads * head_dim;
+
+                    gemm->template multiply_activations_strided_typed<float, ElementType>(
+                        weights_h, V_h, output_h,
+                        seq_len, head_dim, seq_len,
+                        lda, ldb, ldc,
+                        false, 1.0f, 0.0f, nullptr, -1, format);
+                }
+
+                return true;
+            }
+
             // 1. Convert Q, K, V to FP32 (required for multiply_activations_strided)
             // CRITICAL: ITensorGemm::multiply_activations_strided expects float* inputs!
             std::vector<float> Q_fp32(seq_len * n_heads * head_dim);
@@ -365,8 +481,7 @@ namespace llaminar2
             // 3. Compute attention scores per head: Q @ K^T with fused scaling
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-            // Create GEMM kernel once (reused across heads) using ActivationTraits!
-            auto gemm = Traits::create_activation_gemm();
+            // GEMM kernel already created above
 
 #pragma omp parallel for if (n_heads > 1)
             for (int h = 0; h < n_heads; ++h)
