@@ -1334,6 +1334,18 @@ add_v2_test(V2_Unit_PipelineFactory
     LABELS "V2;Unit;PipelineExecution;Factory;Registration"
 )
 
+# Test: PipelineBase logits() override (regression test for decode segfault)
+add_executable(v2_test_pipeline_logits_override unit/pipelines/Test__PipelineBase_LogitsOverride.cpp)
+target_link_libraries(v2_test_pipeline_logits_override
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PipelineLogitsOverride
+    COMMAND $<TARGET_FILE:v2_test_pipeline_logits_override>
+    LABELS "V2;Unit;PipelineExecution;RegressionTest;LogitsBug;Qwen2;NullPointer"
+)
+
 # Test: MpiAttentionOrchestrator
 add_executable(v2_test_mpi_attention_orchestrator unit/pipelines/Test__MpiAttentionOrchestrator.cpp)
 target_link_libraries(v2_test_mpi_attention_orchestrator 
