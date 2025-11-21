@@ -32,8 +32,12 @@ namespace llaminar2::primitives
             std::size_t elems = rows * cols;
 
             // Single-row decode for large models (d_model >= 2048)
-            if (rows <= 1 && cols < 2048)
-                return false;
+            // If rows=1, we want parallel if cols is large enough.
+            if (rows == 1) {
+                 // Require significant work per thread to justify parallelization overhead.
+                 // For 3584 elements, sequential is likely faster than spawning threads.
+                 return cols >= 8192;
+            }
 
 #ifdef _OPENMP
             if (omp_in_parallel())
@@ -42,48 +46,11 @@ namespace llaminar2::primitives
 
             return elems >= opts.parallel_threshold_elems;
         }
-    } // anonymous namespace
-
-    void rmsnorm_compute_row_sumsq_vectorized(
-        const float *src,
-        std::size_t rows,
-        std::size_t cols,
-        double *row_sumsq,
-        const RMSNormExecOptions &opts)
-    {
-        if (!src || !row_sumsq || rows == 0 || cols == 0)
-            return;
-
-        // T5 compatibility: float32 accumulation
-        if (opts.t5_compat_mode)
-        {
-            bool parallel = want_parallel(rows, cols, opts);
-#pragma omp parallel for if (parallel)
-            for (long long r = 0; r < (long long)rows; ++r)
-            {
-                const float *row = src + (std::size_t)r * cols;
-                float sum_sq = 0.0f;
-                for (std::size_t c = 0; c < cols; ++c)
-                {
-                    float val = row[c];
-                    sum_sq += val * val;
-                }
-                row_sumsq[r] = (double)sum_sq;
-            }
-            return;
-        }
-
-        // Double precision vectorized path
-        bool parallel = want_parallel(rows, cols, opts);
-
-#pragma omp parallel for if (parallel)
-        for (long long r = 0; r < (long long)rows; ++r)
-        {
-            const float *row = src + (std::size_t)r * cols;
-            double acc = 0.0;
 
 #if defined(__AVX512F__)
-            // Multi-accumulator AVX512: process 64 elements per iteration
+        __attribute__((always_inline)) inline double compute_sumsq_avx512(const float *row, std::size_t cols)
+        {
+            double acc = 0.0;
             long long c = 0;
             __m512d dacc0 = _mm512_setzero_pd();
             __m512d dacc1 = _mm512_setzero_pd();
@@ -120,13 +87,15 @@ namespace llaminar2::primitives
                 __m512d d3b = _mm512_cvtps_pd(hi3);
 
                 // FMA: acc += d * d
+                // Distribute across 4 accumulators to break dependency chains
                 dacc0 = _mm512_fmadd_pd(d0a, d0a, dacc0);
-                dacc0 = _mm512_fmadd_pd(d0b, d0b, dacc0);
-                dacc1 = _mm512_fmadd_pd(d1a, d1a, dacc1);
-                dacc1 = _mm512_fmadd_pd(d1b, d1b, dacc1);
-                dacc2 = _mm512_fmadd_pd(d2a, d2a, dacc2);
-                dacc2 = _mm512_fmadd_pd(d2b, d2b, dacc2);
-                dacc3 = _mm512_fmadd_pd(d3a, d3a, dacc3);
+                dacc1 = _mm512_fmadd_pd(d0b, d0b, dacc1);
+                dacc2 = _mm512_fmadd_pd(d1a, d1a, dacc2);
+                dacc3 = _mm512_fmadd_pd(d1b, d1b, dacc3);
+                
+                dacc0 = _mm512_fmadd_pd(d2a, d2a, dacc0);
+                dacc1 = _mm512_fmadd_pd(d2b, d2b, dacc1);
+                dacc2 = _mm512_fmadd_pd(d3a, d3a, dacc2);
                 dacc3 = _mm512_fmadd_pd(d3b, d3b, dacc3);
             }
 
@@ -159,9 +128,12 @@ namespace llaminar2::primitives
                 double v = (double)row[c];
                 acc += v * v;
             }
-
+            return acc;
+        }
 #elif defined(__AVX2__)
-            // AVX2 path: 4-accumulator with 32 elements per iteration
+        __attribute__((always_inline)) inline double compute_sumsq_avx2(const float *row, std::size_t cols)
+        {
+            double acc = 0.0;
             long long c = 0;
             __m256 acc0 = _mm256_setzero_ps();
             __m256 acc1 = _mm256_setzero_ps();
@@ -225,9 +197,12 @@ namespace llaminar2::primitives
                 double v = (double)row[c];
                 acc += v * v;
             }
+            return acc;
+        }
+#endif
 
-#else
-            // Scalar fallback
+        __attribute__((always_inline)) inline double compute_sumsq_scalar(const float *row, std::size_t cols)
+        {
             double s_scalar = 0.0;
 #pragma omp simd reduction(+ : s_scalar)
             for (long long c = 0; c < (long long)cols; ++c)
@@ -235,10 +210,81 @@ namespace llaminar2::primitives
                 double v = (double)row[c];
                 s_scalar += v * v;
             }
-            acc = s_scalar;
-#endif
+            return s_scalar;
+        }
 
-            row_sumsq[r] = acc;
+        __attribute__((always_inline)) inline double compute_sumsq_dispatch(const float *row, std::size_t cols)
+        {
+#if defined(__AVX512F__)
+            return compute_sumsq_avx512(row, cols);
+#elif defined(__AVX2__)
+            return compute_sumsq_avx2(row, cols);
+#else
+            return compute_sumsq_scalar(row, cols);
+#endif
+        }
+
+    } // anonymous namespace
+
+    void rmsnorm_compute_row_sumsq_vectorized(
+        const float *src,
+        std::size_t rows,
+        std::size_t cols,
+        double *row_sumsq,
+        const RMSNormExecOptions &opts)
+    {
+        if (!src || !row_sumsq || rows == 0 || cols == 0)
+            return;
+
+        // T5 compatibility: float32 accumulation
+        if (opts.t5_compat_mode)
+        {
+            bool parallel = want_parallel(rows, cols, opts);
+#pragma omp parallel for if (parallel)
+            for (long long r = 0; r < (long long)rows; ++r)
+            {
+                const float *row = src + (std::size_t)r * cols;
+                float sum_sq = 0.0f;
+                for (std::size_t c = 0; c < cols; ++c)
+                {
+                    float val = row[c];
+                    sum_sq += val * val;
+                }
+                row_sumsq[r] = (double)sum_sq;
+            }
+            return;
+        }
+
+        // Double precision vectorized path
+        bool parallel = want_parallel(rows, cols, opts);
+
+        // Special case: Single row with large columns -> Parallelize reduction
+        if (rows == 1 && parallel)
+        {
+            double total_sum_sq = 0.0;
+            
+            #pragma omp parallel reduction(+:total_sum_sq)
+            {
+                int tid = omp_get_thread_num();
+                int nthreads = omp_get_num_threads();
+                
+                long long chunk_size = (cols + nthreads - 1) / nthreads;
+                long long start = tid * chunk_size;
+                long long end = std::min((long long)cols, start + chunk_size);
+                
+                if (start < end) {
+                    total_sum_sq += compute_sumsq_dispatch(src + start, end - start);
+                }
+            }
+            row_sumsq[0] = total_sum_sq;
+            return;
+        }
+
+#pragma omp parallel for if (parallel)
+        for (long long r = 0; r < (long long)rows; ++r)
+        {
+            const float *row = src + (std::size_t)r * cols;
+            row_sumsq[r] = compute_sumsq_dispatch(row, cols);
         }
     }
 
@@ -278,6 +324,29 @@ namespace llaminar2::primitives
 
         bool parallel = want_parallel(rows, cols, opts);
         bool has_gamma = (gamma != nullptr);
+
+        // Special case: Single row with large columns -> Parallelize application
+        if (rows == 1 && parallel)
+        {
+            float scale = inv[0];
+            if (scale == 0.0f) {
+                std::fill(dst, dst + cols, 0.0f);
+                return;
+            }
+
+            if (has_gamma) {
+                #pragma omp parallel for schedule(static)
+                for (long long c = 0; c < (long long)cols; ++c) {
+                    dst[c] = src[c] * scale * gamma[c];
+                }
+            } else {
+                #pragma omp parallel for schedule(static)
+                for (long long c = 0; c < (long long)cols; ++c) {
+                    dst[c] = src[c] * scale;
+                }
+            }
+            return;
+        }
 
 #pragma omp parallel for if (parallel)
         for (long long r = 0; r < (long long)rows; ++r)

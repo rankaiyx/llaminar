@@ -2658,3 +2658,22 @@ add_v2_perf_test(V2_Perf_Qwen2Pipeline
     LABELS "V2;Performance;Pipeline;Qwen2"
     MPI_PROCS 1
 )
+
+# Performance Test: CPURMSNormKernel (FP32)
+# Benchmarks CPU RMSNorm kernel latency and throughput
+add_executable(v2_perf_cpu_rmsnorm_fp32 performance/kernels/cpu/Perf__CPURMSNormKernel.cpp)
+target_link_libraries(v2_perf_cpu_rmsnorm_fp32
+    llaminar2_core
+    GTest::gtest
+    MPI::MPI_CXX
+    OpenMP::OpenMP_CXX
+)
+set_target_properties(v2_perf_cpu_rmsnorm_fp32 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/performance"
+)
+
+add_v2_perf_test(V2_Perf_CpuRMSNorm_FP32
+    COMMAND $<TARGET_FILE:v2_perf_cpu_rmsnorm_fp32>
+    LABELS "V2;Performance;RMSNorm;FP32;Latency"
+    MPI_PROCS 1
+)
