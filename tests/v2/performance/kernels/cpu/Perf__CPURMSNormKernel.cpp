@@ -87,10 +87,10 @@ protected:
             kernel.apply(
                 input.data(), gamma.data(), output.data(),
                 config.seq_len, config.d_model,
-                1e-6f,    // eps
-                false,    // use_bf16
-                nullptr,  // mpi_ctx
-                -1        // device_idx
+                1e-6f,   // eps
+                false,   // use_bf16
+                nullptr, // mpi_ctx
+                -1       // device_idx
             );
         }
 
@@ -106,10 +106,10 @@ protected:
             kernel.apply(
                 input.data(), gamma.data(), output.data(),
                 config.seq_len, config.d_model,
-                1e-6f,    // eps
-                false,    // use_bf16
-                nullptr,  // mpi_ctx
-                -1        // device_idx
+                1e-6f,   // eps
+                false,   // use_bf16
+                nullptr, // mpi_ctx
+                -1       // device_idx
             );
 
             auto end = std::chrono::high_resolution_clock::now();

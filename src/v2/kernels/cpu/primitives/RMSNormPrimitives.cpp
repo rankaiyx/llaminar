@@ -33,10 +33,11 @@ namespace llaminar2::primitives
 
             // Single-row decode for large models (d_model >= 2048)
             // If rows=1, we want parallel if cols is large enough.
-            if (rows == 1) {
-                 // Require significant work per thread to justify parallelization overhead.
-                 // For 3584 elements, sequential is likely faster than spawning threads.
-                 return cols >= 8192;
+            if (rows == 1)
+            {
+                // Require significant work per thread to justify parallelization overhead.
+                // For 3584 elements, sequential is likely faster than spawning threads.
+                return cols >= 8192;
             }
 
 #ifdef _OPENMP
@@ -92,7 +93,7 @@ namespace llaminar2::primitives
                 dacc1 = _mm512_fmadd_pd(d0b, d0b, dacc1);
                 dacc2 = _mm512_fmadd_pd(d1a, d1a, dacc2);
                 dacc3 = _mm512_fmadd_pd(d1b, d1b, dacc3);
-                
+
                 dacc0 = _mm512_fmadd_pd(d2a, d2a, dacc0);
                 dacc1 = _mm512_fmadd_pd(d2b, d2b, dacc1);
                 dacc2 = _mm512_fmadd_pd(d3a, d3a, dacc2);
@@ -262,17 +263,18 @@ namespace llaminar2::primitives
         if (rows == 1 && parallel)
         {
             double total_sum_sq = 0.0;
-            
-            #pragma omp parallel reduction(+:total_sum_sq)
+
+#pragma omp parallel reduction(+ : total_sum_sq)
             {
                 int tid = omp_get_thread_num();
                 int nthreads = omp_get_num_threads();
-                
+
                 long long chunk_size = (cols + nthreads - 1) / nthreads;
                 long long start = tid * chunk_size;
                 long long end = std::min((long long)cols, start + chunk_size);
-                
-                if (start < end) {
+
+                if (start < end)
+                {
                     total_sum_sq += compute_sumsq_dispatch(src + start, end - start);
                 }
             }
@@ -329,19 +331,25 @@ namespace llaminar2::primitives
         if (rows == 1 && parallel)
         {
             float scale = inv[0];
-            if (scale == 0.0f) {
+            if (scale == 0.0f)
+            {
                 std::fill(dst, dst + cols, 0.0f);
                 return;
             }
 
-            if (has_gamma) {
-                #pragma omp parallel for schedule(static)
-                for (long long c = 0; c < (long long)cols; ++c) {
+            if (has_gamma)
+            {
+#pragma omp parallel for schedule(static)
+                for (long long c = 0; c < (long long)cols; ++c)
+                {
                     dst[c] = src[c] * scale * gamma[c];
                 }
-            } else {
-                #pragma omp parallel for schedule(static)
-                for (long long c = 0; c < (long long)cols; ++c) {
+            }
+            else
+            {
+#pragma omp parallel for schedule(static)
+                for (long long c = 0; c < (long long)cols; ++c)
+                {
                     dst[c] = src[c] * scale;
                 }
             }
