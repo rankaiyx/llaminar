@@ -31,6 +31,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/FP16Utils.h"
 #include "../../../utils/CPUFeatures.h"
+#include "../CPUKernelBase.h"
 #include "OneDNNGemmAdapter.h"
 #include "../../../utils/Logger.h"
 #include "../primitives/SoftmaxPrimitives_New.h"
@@ -898,7 +899,7 @@ namespace llaminar2
             return true;
         }
 
-        class OneDNNGemmKernel : public ITensorGemm
+        class OneDNNGemmKernel : public ITensorGemm, public CPUKernelBase
         {
         public:
             /**

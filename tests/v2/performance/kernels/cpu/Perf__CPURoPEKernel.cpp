@@ -24,7 +24,8 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/CPURoPEKernel.h"
+#include "tensors/BlockStructures.h"
+#include "kernels/cpu/CPURoPEKernelT.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;
@@ -198,6 +199,82 @@ TEST_F(CPURoPEKernel_Perf, Large_SingleToken_Latency)
     config.description = "Qwen 2.5 7B Single Token (1->1)";
 
     run_benchmark(config);
+}
+
+TEST_F(CPURoPEKernel_Perf, Q8_1_SingleToken_Latency)
+{
+    if (rank_ == 0)
+    {
+        std::cout << "\n----------------------------------------------------------------" << std::endl;
+        std::cout << "Running Benchmark: Q8_1 Single Token (1->1)" << std::endl;
+        std::cout << "----------------------------------------------------------------" << std::endl;
+    }
+
+    // Create kernel for Q8_1
+    CPURoPEKernelT<Q8_1Tensor> kernel;
+
+    int seq_len = 1;
+    int n_heads = 14;
+    int n_kv_heads = 2;
+    int head_dim = 64;
+
+    // Allocate buffers
+    size_t q_blocks = seq_len * n_heads * head_dim / Q8_1Block::BLOCK_SIZE;
+    size_t k_blocks = seq_len * n_kv_heads * head_dim / Q8_1Block::BLOCK_SIZE;
+
+    std::vector<Q8_1Block> Q(q_blocks);
+    std::vector<Q8_1Block> K(k_blocks);
+    std::vector<int> position_ids(seq_len);
+    for (int i = 0; i < seq_len; ++i)
+        position_ids[i] = i;
+
+    // Initialize with dummy data
+    for (auto &b : Q)
+    {
+        b.d = 1;
+        b.sum_qs = 0;
+        for (int i = 0; i < 32; ++i)
+            b.qs[i] = 1;
+    }
+    for (auto &b : K)
+    {
+        b.d = 1;
+        b.sum_qs = 0;
+        for (int i = 0; i < 32; ++i)
+            b.qs[i] = 1;
+    }
+
+    // Warmup
+    for (int i = 0; i < 10; ++i)
+    {
+        kernel.apply_q8_1(
+            Q.data(), K.data(),
+            position_ids.data(),
+            seq_len, n_heads, n_kv_heads, head_dim,
+            10000.0f, // rope_theta
+            -1        // device_idx
+        );
+    }
+
+    // Benchmark
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < 1000; ++i)
+    {
+        kernel.apply_q8_1(
+            Q.data(), K.data(),
+            position_ids.data(),
+            seq_len, n_heads, n_kv_heads, head_dim,
+            10000.0f, // rope_theta
+            -1        // device_idx
+        );
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1000000.0 / 1000.0;
+
+    if (rank_ == 0)
+    {
+        std::cout << "  Mean:   " << std::fixed << std::setprecision(3) << ms << " ms" << std::endl;
+    }
 }
 
 int main(int argc, char **argv)

@@ -52,7 +52,7 @@ protected:
             block->d = fp32_to_fp16(scale_dist(rng_));
             for (int i = 0; i < 64; ++i)
                 block->qs[i] = byte_dist(rng_);
-            for (int i = 0; i < 16; ++i)
+            for (int i = 0; i < 8; ++i)
                 block->qh[i] = byte_dist(rng_);
             for (int i = 0; i < 32; ++i)
                 block->signs[i] = byte_dist(rng_);

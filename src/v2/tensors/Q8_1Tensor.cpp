@@ -6,11 +6,12 @@
 
 #include "Tensors.h"
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
-#include "../kernels/cpu/CPUSoftmaxKernel.h"
-#include "../kernels/cpu/CPURMSNormKernel.h"
-#include "../kernels/cpu/CPUSwiGLUKernel.h"
+#include "../kernels/cpu/CPUSoftmaxKernelT.h"
+#include "../kernels/cpu/CPURMSNormKernelT.h"
+
+#include "../kernels/cpu/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/CpuAttentionKernelT.h"
-#include "../kernels/cpu/CPURoPEKernel.h"
+#include "../kernels/cpu/CPURoPEKernelT.h"
 #include "../utils/Logger.h"
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
@@ -191,32 +192,29 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q8_1Tensor::createGemm()
     {
-        // Use generic QuantizedGemmKernel with ITensorGemmTileDataProvider interface
+        // Use OneDNN GEMM kernel
         return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
     }
 
     std::unique_ptr<ITensorRoPE> Q8_1Tensor::createRoPE()
     {
-        // RoPE operates on dequantized FP32 data
-        return std::make_unique<llaminar2::CPURoPEKernel>();
+        return std::make_unique<llaminar2::CPURoPEKernelT<Q8_1Tensor>>();
     }
 
     std::unique_ptr<ITensorSwiGLU> Q8_1Tensor::createSwiGLU()
     {
-        // SwiGLU operates on dequantized FP32 data
-        return std::make_unique<llaminar2::CPUSwiGLUKernel>();
+        return std::make_unique<llaminar2::CPUSwiGLUKernelT<Q8_1Tensor>>();
     }
 
     std::unique_ptr<ITensorSoftmax> Q8_1Tensor::createSoftmax()
     {
-        // Softmax operates on dequantized FP32 data
-        return std::make_unique<llaminar2::CPUSoftmaxKernel>();
+        return std::make_unique<CPUSoftmaxKernelT<Q8_1Tensor>>();
     }
 
     std::unique_ptr<ITensorRMSNorm> Q8_1Tensor::createRMSNorm()
     {
         // RMSNorm operates on dequantized FP32 data
-        return std::make_unique<llaminar2::CPURMSNormKernel>();
+        return std::make_unique<llaminar2::CPURMSNormKernelT<Q8_1Tensor>>();
     }
 
     std::unique_ptr<ITensorAttention> Q8_1Tensor::createAttention()
@@ -253,11 +251,22 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        // Q8_1 is intermediate format - dequantize, apply, requantize
-        // For now, throw error as this is inefficient
-        LOG_ERROR("[Q8_1Tensor::applyRoPE] In-place RoPE not supported for Q8_1");
-        LOG_ERROR("  Convert to FP32 first, apply RoPE, then quantize back to Q8_1");
-        return false;
+        // Create kernel
+        auto kernel = std::make_unique<CPURoPEKernelT<Q8_1Tensor>>();
+
+        // Get Q pointer
+        void *Q_ptr = is_view_ ? (void *)(raw_data_ptr_ + view_byte_offset_) : (void *)raw_data_.data();
+
+        // Get K pointer
+        // We assume K is also Q8_1Tensor data, passed as float*
+        void *K_ptr = (void *)K;
+
+        return kernel->apply_q8_1(
+            Q_ptr, K_ptr,
+            position_ids,
+            seq_len, n_heads, n_kv_heads, head_dim,
+            rope_theta,
+            device_idx);
     }
 
     bool Q8_1Tensor::from_int32_with_scales(

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <omp.h>
 #include <algorithm>
+#include "../../../tensors/SIMDHelpers.h"
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -27,6 +28,9 @@ extern "C"
 #endif
 }
 #endif
+
+#include "../../../tensors/FP16Utils.h"
+#include "../../../tensors/BlockStructures.h"
 
 namespace llaminar2::primitives
 {
@@ -218,6 +222,442 @@ namespace llaminar2::primitives
             }
 #endif
         }
+    }
+
+    void compute_swiglu_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)
+    {
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < size; ++i)
+        {
+            float g = simd::bf16_to_fp32(gate[i]);
+            float u = simd::bf16_to_fp32(up[i]);
+            float res = g * silu_scalar(u);
+            output[i] = simd::fp32_to_bf16(res);
+        }
+    }
+
+    void compute_swiglu_fp16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)
+    {
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < size; ++i)
+        {
+            float g = simd::fp16_to_fp32(gate[i]);
+            float u = simd::fp16_to_fp32(up[i]);
+            float res = g * silu_scalar(u);
+            output[i] = simd::fp32_to_fp16(res);
+        }
+    }
+
+#if defined(__AVX2__)
+    static void compute_swiglu_q8_1_avx2(const void *gate, const void *up, void *output, int size)
+    {
+        const Q8_1Block *g_blocks = static_cast<const Q8_1Block *>(gate);
+        const Q8_1Block *u_blocks = static_cast<const Q8_1Block *>(up);
+        Q8_1Block *o_blocks = static_cast<Q8_1Block *>(output);
+        int num_blocks = size / Q8_1Block::BLOCK_SIZE;
+
+        __m256 one = _mm256_set1_ps(1.0f);
+        __m256 zero = _mm256_setzero_ps();
+        __m256 two = _mm256_set1_ps(2.0f);
+        __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+        __m256 max_val_127 = _mm256_set1_ps(127.0f);
+        __m256 min_val_neg127 = _mm256_set1_ps(-127.0f);
+        __m256i perm_idx = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        __m256i offset_128 = _mm256_set1_epi8(-128);
+
+#pragma omp parallel for schedule(static)
+        for (int b = 0; b < num_blocks; ++b)
+        {
+            const Q8_1Block &gb = g_blocks[b];
+            const Q8_1Block &ub = u_blocks[b];
+            Q8_1Block &ob = o_blocks[b];
+
+            float g_scale_f = simd::fp16_to_fp32(gb.d);
+            float u_scale_f = simd::fp16_to_fp32(ub.d);
+
+            __m256 g_scale = _mm256_set1_ps(g_scale_f);
+            __m256 u_scale = _mm256_set1_ps(u_scale_f);
+
+            // Load 32 int8s
+            __m128i g_lo = _mm_loadu_si128((const __m128i *)gb.qs);
+            __m128i g_hi = _mm_loadu_si128((const __m128i *)(gb.qs + 16));
+            __m128i u_lo = _mm_loadu_si128((const __m128i *)ub.qs);
+            __m128i u_hi = _mm_loadu_si128((const __m128i *)(ub.qs + 16));
+
+            // Convert to floats (4 groups of 8)
+            __m256 g0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(g_lo));
+            __m256 g1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(g_lo, 8)));
+            __m256 g2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(g_hi));
+            __m256 g3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(g_hi, 8)));
+
+            __m256 u0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(u_lo));
+            __m256 u1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(u_lo, 8)));
+            __m256 u2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(u_hi));
+            __m256 u3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(u_hi, 8)));
+
+            // Apply scales
+            g0 = _mm256_mul_ps(g0, g_scale);
+            g1 = _mm256_mul_ps(g1, g_scale);
+            g2 = _mm256_mul_ps(g2, g_scale);
+            g3 = _mm256_mul_ps(g3, g_scale);
+
+            u0 = _mm256_mul_ps(u0, u_scale);
+            u1 = _mm256_mul_ps(u1, u_scale);
+            u2 = _mm256_mul_ps(u2, u_scale);
+            u3 = _mm256_mul_ps(u3, u_scale);
+
+            // Compute SwiGLU: g * silu(u)
+            auto compute_silu_op = [&](__m256 u_val)
+            {
+                __m256 neg_u = _mm256_sub_ps(zero, u_val);
+                __m256 exp_neg_u = fast_exp256(neg_u);
+                __m256 denom = _mm256_add_ps(one, exp_neg_u);
+                __m256 rcp = _mm256_rcp_ps(denom);
+                __m256 term = _mm256_fnmadd_ps(denom, rcp, two);
+                __m256 sigmoid_u = _mm256_mul_ps(rcp, term);
+                return _mm256_mul_ps(u_val, sigmoid_u);
+            };
+
+            __m256 res0 = _mm256_mul_ps(g0, compute_silu_op(u0));
+            __m256 res1 = _mm256_mul_ps(g1, compute_silu_op(u1));
+            __m256 res2 = _mm256_mul_ps(g2, compute_silu_op(u2));
+            __m256 res3 = _mm256_mul_ps(g3, compute_silu_op(u3));
+
+            // Max abs
+            __m256 max_v = _mm256_and_ps(res0, abs_mask);
+            max_v = _mm256_max_ps(max_v, _mm256_and_ps(res1, abs_mask));
+            max_v = _mm256_max_ps(max_v, _mm256_and_ps(res2, abs_mask));
+            max_v = _mm256_max_ps(max_v, _mm256_and_ps(res3, abs_mask));
+
+            // Horizontal max
+            __m256 perm = _mm256_permute_ps(max_v, _MM_SHUFFLE(2, 3, 0, 1));
+            max_v = _mm256_max_ps(max_v, perm);
+            perm = _mm256_permute_ps(max_v, _MM_SHUFFLE(1, 0, 3, 2));
+            max_v = _mm256_max_ps(max_v, perm);
+            __m128 max_128 = _mm256_castps256_ps128(max_v);
+            __m128 max_high = _mm256_extractf128_ps(max_v, 1);
+            max_128 = _mm_max_ps(max_128, max_high);
+            float max_abs = _mm_cvtss_f32(max_128);
+
+            // Requantize
+            float d = max_abs / 127.0f;
+            ob.d = simd::fp32_to_fp16(d);
+            float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
+            __m256 inv_d = _mm256_set1_ps(inv_d_f);
+
+            auto quantize_op = [&](__m256 val)
+            {
+                val = _mm256_mul_ps(val, inv_d);
+                val = _mm256_max_ps(min_val_neg127, _mm256_min_ps(max_val_127, val));
+                return _mm256_cvtps_epi32(_mm256_round_ps(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            };
+
+            __m256i q0 = quantize_op(res0);
+            __m256i q1 = quantize_op(res1);
+            __m256i q2 = quantize_op(res2);
+            __m256i q3 = quantize_op(res3);
+
+            // Pack back to int8
+            __m256i p0 = _mm256_packs_epi32(q0, q1);
+            __m256i p1 = _mm256_packs_epi32(q2, q3);
+            __m256i packed_bytes = _mm256_packs_epi16(p0, p1);
+            __m256i result = _mm256_permutevar8x32_epi32(packed_bytes, perm_idx);
+
+            _mm256_storeu_si256((__m256i *)ob.qs, result);
+
+            // Compute sum
+            __m256i u = _mm256_add_epi8(result, offset_128);
+            __m256i sums = _mm256_sad_epu8(u, _mm256_setzero_si256());
+
+            int64_t sum_val = _mm256_extract_epi64(sums, 0) + _mm256_extract_epi64(sums, 1) +
+                              _mm256_extract_epi64(sums, 2) + _mm256_extract_epi64(sums, 3);
+            ob.sum_qs = (int16_t)(sum_val - 4096);
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    static void compute_swiglu_q8_1_avx512(const void *gate, const void *up, void *output, int size)
+    {
+        const Q8_1Block *g_blocks = static_cast<const Q8_1Block *>(gate);
+        const Q8_1Block *u_blocks = static_cast<const Q8_1Block *>(up);
+        Q8_1Block *o_blocks = static_cast<Q8_1Block *>(output);
+        int num_blocks = size / Q8_1Block::BLOCK_SIZE;
+
+        __m512 one = _mm512_set1_ps(1.0f);
+        __m512 zero = _mm512_setzero_ps();
+        __m512 two = _mm512_set1_ps(2.0f);
+        __m512 max_val_127 = _mm512_set1_ps(127.0f);
+        __m512 min_val_neg127 = _mm512_set1_ps(-127.0f);
+
+        int b = 0;
+
+        // Process 2 blocks at a time to expose ILP (4 vectors in flight)
+        // AVX512 has 32 registers, so we can easily handle this without spilling.
+        for (; b < num_blocks - 1; b += 2)
+        {
+            // --- Block 0 ---
+            const Q8_1Block &gb0 = g_blocks[b];
+            const Q8_1Block &ub0 = u_blocks[b];
+            Q8_1Block &ob0 = o_blocks[b];
+
+            // --- Block 1 ---
+            const Q8_1Block &gb1 = g_blocks[b + 1];
+            const Q8_1Block &ub1 = u_blocks[b + 1];
+            Q8_1Block &ob1 = o_blocks[b + 1];
+
+            // Load scales
+            __m512 g_scale0 = _mm512_set1_ps(simd::fp16_to_fp32(gb0.d));
+            __m512 u_scale0 = _mm512_set1_ps(simd::fp16_to_fp32(ub0.d));
+            __m512 g_scale1 = _mm512_set1_ps(simd::fp16_to_fp32(gb1.d));
+            __m512 u_scale1 = _mm512_set1_ps(simd::fp16_to_fp32(ub1.d));
+
+            // Load Block 0 (Low/High)
+            __m128i bytes0_lo = _mm_loadu_si128((const __m128i *)gb0.qs);
+            __m512 g0_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_lo));
+            bytes0_lo = _mm_loadu_si128((const __m128i *)ub0.qs);
+            __m512 u0_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_lo));
+
+            __m128i bytes0_hi = _mm_loadu_si128((const __m128i *)(gb0.qs + 16));
+            __m512 g0_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_hi));
+            bytes0_hi = _mm_loadu_si128((const __m128i *)(ub0.qs + 16));
+            __m512 u0_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_hi));
+
+            // Load Block 1 (Low/High)
+            __m128i bytes1_lo = _mm_loadu_si128((const __m128i *)gb1.qs);
+            __m512 g1_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_lo));
+            bytes1_lo = _mm_loadu_si128((const __m128i *)ub1.qs);
+            __m512 u1_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_lo));
+
+            __m128i bytes1_hi = _mm_loadu_si128((const __m128i *)(gb1.qs + 16));
+            __m512 g1_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_hi));
+            bytes1_hi = _mm_loadu_si128((const __m128i *)(ub1.qs + 16));
+            __m512 u1_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_hi));
+
+            // Apply scales
+            g0_lo = _mm512_mul_ps(g0_lo, g_scale0);
+            g0_hi = _mm512_mul_ps(g0_hi, g_scale0);
+            u0_lo = _mm512_mul_ps(u0_lo, u_scale0);
+            u0_hi = _mm512_mul_ps(u0_hi, u_scale0);
+
+            g1_lo = _mm512_mul_ps(g1_lo, g_scale1);
+            g1_hi = _mm512_mul_ps(g1_hi, g_scale1);
+            u1_lo = _mm512_mul_ps(u1_lo, u_scale1);
+            u1_hi = _mm512_mul_ps(u1_hi, u_scale1);
+
+            // Compute SwiGLU (lambda for reuse)
+            auto swiglu_op = [&](__m512 g, __m512 u)
+            {
+                __m512 neg_u = _mm512_sub_ps(zero, u);
+                __m512 exp_neg_u = fast_exp512(neg_u);
+                __m512 denom = _mm512_add_ps(one, exp_neg_u);
+                __m512 rcp = _mm512_rcp14_ps(denom);
+                __m512 term = _mm512_fnmadd_ps(denom, rcp, two);
+                __m512 sigmoid_u = _mm512_mul_ps(rcp, term);
+                __m512 silu_u = _mm512_mul_ps(u, sigmoid_u);
+                return _mm512_mul_ps(g, silu_u);
+            };
+
+            __m512 res0_lo = swiglu_op(g0_lo, u0_lo);
+            __m512 res0_hi = swiglu_op(g0_hi, u0_hi);
+            __m512 res1_lo = swiglu_op(g1_lo, u1_lo);
+            __m512 res1_hi = swiglu_op(g1_hi, u1_hi);
+
+            // Max abs (reduce locally first)
+            __m512 abs0 = _mm512_max_ps(_mm512_abs_ps(res0_lo), _mm512_abs_ps(res0_hi));
+            float max_abs0 = _mm512_reduce_max_ps(abs0);
+
+            __m512 abs1 = _mm512_max_ps(_mm512_abs_ps(res1_lo), _mm512_abs_ps(res1_hi));
+            float max_abs1 = _mm512_reduce_max_ps(abs1);
+
+            // Requantize Block 0
+            {
+                float d = max_abs0 / 127.0f;
+                ob0.d = simd::fp32_to_fp16(d);
+                float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
+                __m512 inv_d = _mm512_set1_ps(inv_d_f);
+
+                auto quant_op = [&](__m512 val)
+                {
+                    val = _mm512_mul_ps(val, inv_d);
+                    val = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val));
+                    return _mm512_cvtps_epi32(_mm512_roundscale_ps(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                };
+
+                __m512i q_lo = quant_op(res0_lo);
+                __m512i q_hi = quant_op(res0_hi);
+
+                _mm512_mask_cvtsepi32_storeu_epi8(ob0.qs, 0xFFFF, q_lo);
+                _mm512_mask_cvtsepi32_storeu_epi8(ob0.qs + 16, 0xFFFF, q_hi);
+
+                int32_t sum = _mm512_reduce_add_epi32(q_lo) + _mm512_reduce_add_epi32(q_hi);
+                ob0.sum_qs = (int16_t)sum;
+            }
+
+            // Requantize Block 1
+            {
+                float d = max_abs1 / 127.0f;
+                ob1.d = simd::fp32_to_fp16(d);
+                float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
+                __m512 inv_d = _mm512_set1_ps(inv_d_f);
+
+                auto quant_op = [&](__m512 val)
+                {
+                    val = _mm512_mul_ps(val, inv_d);
+                    val = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val));
+                    return _mm512_cvtps_epi32(_mm512_roundscale_ps(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                };
+
+                __m512i q_lo = quant_op(res1_lo);
+                __m512i q_hi = quant_op(res1_hi);
+
+                _mm512_mask_cvtsepi32_storeu_epi8(ob1.qs, 0xFFFF, q_lo);
+                _mm512_mask_cvtsepi32_storeu_epi8(ob1.qs + 16, 0xFFFF, q_hi);
+
+                int32_t sum = _mm512_reduce_add_epi32(q_lo) + _mm512_reduce_add_epi32(q_hi);
+                ob1.sum_qs = (int16_t)sum;
+            }
+        }
+
+        // Tail loop (1 block)
+        for (; b < num_blocks; ++b)
+        {
+            const Q8_1Block &gb = g_blocks[b];
+            const Q8_1Block &ub = u_blocks[b];
+            Q8_1Block &ob = o_blocks[b];
+
+            float g_scale_f = simd::fp16_to_fp32(gb.d);
+            float u_scale_f = simd::fp16_to_fp32(ub.d);
+
+            __m512 g_scale = _mm512_set1_ps(g_scale_f);
+            __m512 u_scale = _mm512_set1_ps(u_scale_f);
+
+            // Process 32 elements in 2 chunks of 16
+            __m512 res[2];
+            float max_abs = 0.0f;
+
+            // Unrolled inner loop
+            {
+                // Chunk 0
+                __m128i bytes0 = _mm_loadu_si128((const __m128i *)gb.qs);
+                __m512 g0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0));
+                bytes0 = _mm_loadu_si128((const __m128i *)ub.qs);
+                __m512 u0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0));
+
+                g0 = _mm512_mul_ps(g0, g_scale);
+                u0 = _mm512_mul_ps(u0, u_scale);
+
+                __m512 neg_u0 = _mm512_sub_ps(zero, u0);
+                __m512 exp_neg_u0 = fast_exp512(neg_u0);
+                __m512 denom0 = _mm512_add_ps(one, exp_neg_u0);
+                __m512 rcp0 = _mm512_rcp14_ps(denom0);
+                __m512 term0 = _mm512_fnmadd_ps(denom0, rcp0, two);
+                __m512 sigmoid_u0 = _mm512_mul_ps(rcp0, term0);
+                __m512 silu_u0 = _mm512_mul_ps(u0, sigmoid_u0);
+                res[0] = _mm512_mul_ps(g0, silu_u0);
+
+                // Chunk 1
+                __m128i bytes1 = _mm_loadu_si128((const __m128i *)(gb.qs + 16));
+                __m512 g1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1));
+                bytes1 = _mm_loadu_si128((const __m128i *)(ub.qs + 16));
+                __m512 u1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1));
+
+                g1 = _mm512_mul_ps(g1, g_scale);
+                u1 = _mm512_mul_ps(u1, u_scale);
+
+                __m512 neg_u1 = _mm512_sub_ps(zero, u1);
+                __m512 exp_neg_u1 = fast_exp512(neg_u1);
+                __m512 denom1 = _mm512_add_ps(one, exp_neg_u1);
+                __m512 rcp1 = _mm512_rcp14_ps(denom1);
+                __m512 term1 = _mm512_fnmadd_ps(denom1, rcp1, two);
+                __m512 sigmoid_u1 = _mm512_mul_ps(rcp1, term1);
+                __m512 silu_u1 = _mm512_mul_ps(u1, sigmoid_u1);
+                res[1] = _mm512_mul_ps(g1, silu_u1);
+            }
+
+            // Max abs
+            __m512 abs_res = _mm512_max_ps(_mm512_abs_ps(res[0]), _mm512_abs_ps(res[1]));
+            max_abs = _mm512_reduce_max_ps(abs_res);
+
+            float d = max_abs / 127.0f;
+            ob.d = simd::fp32_to_fp16(d);
+            float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
+            __m512 inv_d = _mm512_set1_ps(inv_d_f);
+
+            int32_t sum = 0;
+
+            // Requantize
+            {
+                // Chunk 0
+                __m512 val0 = _mm512_mul_ps(res[0], inv_d);
+                val0 = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val0));
+                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(val0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                _mm512_mask_cvtsepi32_storeu_epi8(ob.qs, 0xFFFF, q0);
+                sum += _mm512_reduce_add_epi32(q0);
+
+                // Chunk 1
+                __m512 val1 = _mm512_mul_ps(res[1], inv_d);
+                val1 = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val1));
+                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(val1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                _mm512_mask_cvtsepi32_storeu_epi8(ob.qs + 16, 0xFFFF, q1);
+                sum += _mm512_reduce_add_epi32(q1);
+            }
+            ob.sum_qs = (int16_t)sum;
+        }
+    }
+#endif
+
+    void compute_swiglu_q8_1(const void *gate, const void *up, void *output, int size)
+    {
+#if defined(__AVX512F__)
+        compute_swiglu_q8_1_avx512(gate, up, output, size);
+#elif defined(__AVX2__)
+        compute_swiglu_q8_1_avx2(gate, up, output, size);
+#else
+        const Q8_1Block *g_blocks = static_cast<const Q8_1Block *>(gate);
+        const Q8_1Block *u_blocks = static_cast<const Q8_1Block *>(up);
+        Q8_1Block *o_blocks = static_cast<Q8_1Block *>(output);
+
+        // size is total elements. Q8_1Block::BLOCK_SIZE is 32.
+        int num_blocks = size / Q8_1Block::BLOCK_SIZE;
+
+#pragma omp parallel for schedule(static)
+        for (int b = 0; b < num_blocks; ++b)
+        {
+            const Q8_1Block &gb = g_blocks[b];
+            const Q8_1Block &ub = u_blocks[b];
+            Q8_1Block &ob = o_blocks[b];
+
+            float g_scale = simd::fp16_to_fp32(gb.d);
+            float u_scale = simd::fp16_to_fp32(ub.d);
+
+            float temp[Q8_1Block::BLOCK_SIZE];
+            float max_abs = 0.0f;
+
+            for (int i = 0; i < Q8_1Block::BLOCK_SIZE; ++i)
+            {
+                float g = g_scale * gb.qs[i];
+                float u = u_scale * ub.qs[i];
+                float res = g * silu_scalar(u);
+                temp[i] = res;
+                max_abs = std::max(max_abs, std::abs(res));
+            }
+
+            // Requantize
+            float d = max_abs / 127.0f;
+            ob.d = simd::fp32_to_fp16(d);
+            float inv_d = (d > 1e-10f) ? 1.0f / d : 0.0f;
+            int32_t sum = 0;
+
+            for (int i = 0; i < Q8_1Block::BLOCK_SIZE; ++i)
+            {
+                int8_t q = (int8_t)std::round(std::max(-127.0f, std::min(127.0f, temp[i] * inv_d)));
+                ob.qs[i] = q;
+                sum += q;
+            }
+            ob.sum_qs = sum;
+        }
+#endif
     }
 
 } // namespace llaminar2::primitives

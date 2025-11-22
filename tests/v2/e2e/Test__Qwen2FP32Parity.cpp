@@ -3,6 +3,7 @@
  * @brief End-to-end FP32 parity tests for Qwen2Pipeline against PyTorch reference
  * @author David Sanftenberg
  * @date 2025-11-06
+ * @updated 2025-11-22
  *
  * Validates Qwen2Pipeline FP32 correctness by comparing against PyTorch ground truth.
  *
@@ -74,8 +75,10 @@ protected:
         tolerance_rel_l2_ = 0.06f;  // 6% relative L2 (accounts for FFN error accumulation)
         tolerance_max_abs_ = 0.12f; // 0.12 absolute (accounts for FFN gate projection range)
 
-        // Regenerate PyTorch snapshots to ensure they match the GGUF model
-        regeneratePyTorchSnapshots();
+        // NOTE: Snapshot regeneration disabled - requires transformers library
+        // Pre-generated snapshots in pytorch_qwen2_snapshots/ are used instead.
+        // To regenerate: Run python/reference/generate_qwen2_pipeline_snapshots.py manually
+        // regeneratePyTorchSnapshots();
     }
 
     /**
@@ -652,7 +655,7 @@ TEST_F(Qwen2FP32Parity, FinalNormAndLogits)
  * Validates all intermediate activations across all 24 transformer layers.
  * This is the comprehensive end-to-end validation test.
  */
-TEST_F(Qwen2FP32Parity, DISABLED_AllLayersParity)
+TEST_F(Qwen2FP32Parity, AllLayersParity)
 {
     // This test is disabled by default (runs all 24 layers × 17 stages = 408 comparisons)
     // Enable manually for comprehensive validation

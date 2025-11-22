@@ -20,7 +20,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/v2/kernels/cpu/CPURMSNormKernel.h"
+#include "../../../src/v2/kernels/cpu/CPURMSNormKernelT.h"
 #include "../../../src/v2/kernels/cpu/primitives/RMSNormPrimitives.h"
 #include <memory>
 #include <cmath>
@@ -152,7 +152,7 @@ TEST_F(Test__INT32RMSNorm, BasicWithoutGamma)
     std::vector<float> output_row_scales(seq_len);
 
     // Run INT32→INT8 RMSNorm
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
     bool success = kernel.apply_int32_to_int8(
         input.data(),
         nullptr, // No gamma
@@ -202,7 +202,7 @@ TEST_F(Test__INT32RMSNorm, BasicWithGamma)
     std::vector<float> output_row_scales(seq_len);
 
     // Run INT32→INT8 RMSNorm
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
     bool success = kernel.apply_int32_to_int8(
         input.data(),
         gamma.data(),
@@ -252,7 +252,7 @@ TEST_F(Test__INT32RMSNorm, AccuracyVsFP32Reference)
     std::vector<int8_t> output_int8(seq_len * d_model);
     std::vector<float> output_row_scales(seq_len);
 
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
     bool success = kernel.apply_int32_to_int8(
         input.data(),
         gamma.data(),
@@ -304,7 +304,7 @@ TEST_F(Test__INT32RMSNorm, ZeroRow)
     std::vector<int8_t> output_int8(seq_len * d_model);
     std::vector<float> output_row_scales(seq_len);
 
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
     bool success = kernel.apply_int32_to_int8(
         input.data(), nullptr,
         output_int8.data(), output_row_scales.data(),
@@ -342,7 +342,7 @@ TEST_F(Test__INT32RMSNorm, ExtremeValues)
     std::vector<int8_t> output_int8(seq_len * d_model);
     std::vector<float> output_row_scales(seq_len);
 
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
     bool success = kernel.apply_int32_to_int8(
         input.data(), nullptr,
         output_int8.data(), output_row_scales.data(),
@@ -393,7 +393,7 @@ TEST_F(Test__INT32RMSNorm, SingleRow)
     std::vector<int8_t> output_int8(d_model);
     std::vector<float> output_row_scales(1);
 
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
     bool success = kernel.apply_int32_to_int8(
         input.data(), nullptr,
         output_int8.data(), output_row_scales.data(),
@@ -421,7 +421,7 @@ TEST_F(Test__INT32RMSNorm, LargeTensorStressTest)
     std::vector<int8_t> output_int8(seq_len * d_model);
     std::vector<float> output_row_scales(seq_len);
 
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
     bool success = kernel.apply_int32_to_int8(
         input.data(), gamma.data(),
         output_int8.data(), output_row_scales.data(),
@@ -458,7 +458,7 @@ TEST_F(Test__INT32RMSNorm, PerRowQuantizationPrecision)
     std::vector<int8_t> output_int8(seq_len * d_model);
     std::vector<float> output_row_scales(seq_len);
 
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
     bool success = kernel.apply_int32_to_int8(
         input.data(), nullptr,
         output_int8.data(), output_row_scales.data(),
@@ -523,7 +523,7 @@ TEST_F(Test__INT32RMSNorm, NullPointerHandling)
     std::vector<int8_t> output_int8(seq_len * d_model);
     std::vector<float> output_row_scales(seq_len);
 
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
 
     // Null input
     EXPECT_FALSE(kernel.apply_int32_to_int8(
@@ -553,7 +553,7 @@ TEST_F(Test__INT32RMSNorm, InvalidDimensions)
     std::vector<int8_t> output_int8(32);
     std::vector<float> output_row_scales(4);
 
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<INT32Tensor> kernel;
 
     // Zero seq_len
     EXPECT_FALSE(kernel.apply_int32_to_int8(

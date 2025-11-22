@@ -122,7 +122,6 @@ namespace llaminar2
         // Kernel access (lazily created on first access)
         ITensorRoPE *get_rope_kernel();
         ITensorSoftmax *get_softmax_kernel();
-        ITensorRMSNorm *get_rmsnorm_kernel();
         ITensorSwiGLU *get_swiglu_kernel();
 
     private:

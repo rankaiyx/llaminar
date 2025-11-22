@@ -44,7 +44,7 @@ namespace llaminar2
      *
      * Provides format-specific dequantization for block-quantized formats.
      * Implementations MUST be header-only with always_inline to ensure zero overhead
-     * when called from QuantizedGemmKernel hot path.
+     * when called from GEMM hot paths.
      *
      * Supported formats: IQ4_NL, Q6_K, Q8_0, etc.
      *
@@ -686,6 +686,12 @@ namespace llaminar2
             const int *pos_ids,
             int batch_size, int seq_len, int head_dim, int num_heads,
             float theta_base, int device_idx) { return false; }
+
+        virtual bool apply_q8_1(
+            void *data, void *output,
+            const int *pos_ids,
+            int batch_size, int seq_len, int head_dim, int num_heads,
+            float theta_base, int device_idx) { return false; }
     };
 
     /**
@@ -700,6 +706,27 @@ namespace llaminar2
             bool add_residual,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        virtual bool apply_bf16(
+            const uint16_t *gate, const uint16_t *up, uint16_t *output,
+            int rows, int cols,
+            bool add_residual,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        virtual bool apply_fp16(
+            const uint16_t *gate, const uint16_t *up, uint16_t *output,
+            int rows, int cols,
+            bool add_residual,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        virtual bool apply_q8_1(
+            const void *gate, const void *up, void *output,
+            int rows, int cols,
+            bool add_residual,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
     };
 
     /**
@@ -714,6 +741,20 @@ namespace llaminar2
             bool use_causal_mask,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        virtual bool apply_bf16(
+            const uint16_t *input, uint16_t *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        virtual bool apply_fp16(
+            const uint16_t *input, uint16_t *output,
+            int rows, int cols,
+            bool use_causal_mask,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
     };
 
     /**

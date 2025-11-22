@@ -25,7 +25,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/CPURMSNormKernel.h"
+#include "kernels/cpu/CPURMSNormKernelT.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;
@@ -72,7 +72,7 @@ protected:
         }
 
         // Create kernel
-        CPURMSNormKernel kernel;
+        CPURMSNormKernelT<FP32Tensor> kernel;
 
         // Allocate tensors
         size_t size = config.seq_len * config.d_model;
@@ -87,10 +87,7 @@ protected:
             kernel.apply(
                 input.data(), gamma.data(), output.data(),
                 config.seq_len, config.d_model,
-                1e-6f,   // eps
-                false,   // use_bf16
-                nullptr, // mpi_ctx
-                -1       // device_idx
+                1e-6f // eps
             );
         }
 
@@ -106,10 +103,7 @@ protected:
             kernel.apply(
                 input.data(), gamma.data(), output.data(),
                 config.seq_len, config.d_model,
-                1e-6f,   // eps
-                false,   // use_bf16
-                nullptr, // mpi_ctx
-                -1       // device_idx
+                1e-6f // eps
             );
 
             auto end = std::chrono::high_resolution_clock::now();

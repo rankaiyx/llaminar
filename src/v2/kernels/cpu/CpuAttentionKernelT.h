@@ -19,6 +19,7 @@
 #include "../../tensors/TensorKernels.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/SIMDHelpers.h"
+#include "CPUKernelBase.h"
 #include "primitives/ActivationTraits.h"
 #include "primitives/SoftmaxPrimitivesImpl.h"
 #include "../../pipelines/AttentionUtils.h"
@@ -55,13 +56,13 @@ namespace llaminar2
      * - Strided GEMM for zero-copy multi-head processing
      * - Fused attention scaling in Q@K^T GEMM alpha parameter
      */
-    template <typename TensorType>
-    class CpuAttentionKernelT : public ITensorAttention
+    template <typename TensorT>
+    class CpuAttentionKernelT : public ITensorAttention, public CPUKernelBase
     {
     public:
         // Infer ElementType from ActivationTraits (which knows the mapping)
-        using ElementType = typename primitives::ActivationTraits<TensorType>::ElementType;
-        using Traits = primitives::ActivationTraits<TensorType>;
+        using ElementType = typename primitives::ActivationTraits<TensorT>::ElementType;
+        using Traits = primitives::ActivationTraits<TensorT>;
 
         CpuAttentionKernelT() = default;
         ~CpuAttentionKernelT() override = default;

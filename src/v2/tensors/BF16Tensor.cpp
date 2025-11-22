@@ -11,9 +11,11 @@
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/CPURMSNormKernel.h"
+#include "../kernels/cpu/CPURMSNormKernelT.h"
 #include "../kernels/cpu/CpuAttentionKernelT.h"
-#include "../kernels/cpu/CPURoPEKernel.h"
+#include "../kernels/cpu/CPURoPEKernelT.h"
+#include "../kernels/cpu/CPUSwiGLUKernelT.h"
+#include "../kernels/cpu/CPUSoftmaxKernelT.h"
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
@@ -203,23 +205,23 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRoPE> BF16Tensor::createRoPE()
     {
-        return std::make_unique<CPURoPEKernel>();
+        return std::make_unique<CPURoPEKernelT<BF16Tensor>>();
     }
 
     std::unique_ptr<ITensorSwiGLU> BF16Tensor::createSwiGLU()
     {
-        throw std::runtime_error("BF16Tensor: SwiGLU not supported");
+        return std::make_unique<CPUSwiGLUKernelT<BF16Tensor>>();
     }
 
     std::unique_ptr<ITensorSoftmax> BF16Tensor::createSoftmax()
     {
-        throw std::runtime_error("BF16Tensor: Softmax not supported");
+        return std::make_unique<CPUSoftmaxKernelT<BF16Tensor>>();
     }
 
     std::unique_ptr<ITensorRMSNorm> BF16Tensor::createRMSNorm()
     {
         // BF16 tensors use native BF16 RMSNorm kernel (no conversion to FP32)
-        return std::make_unique<CPURMSNormKernel>();
+        return std::make_unique<CPURMSNormKernelT<BF16Tensor>>();
     }
 
     std::unique_ptr<ITensorAttention> BF16Tensor::createAttention()

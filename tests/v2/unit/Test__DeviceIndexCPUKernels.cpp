@@ -14,10 +14,11 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/kernels/cpu/CPURMSNormKernel.h"
-#include "../../src/v2/kernels/cpu/CPURoPEKernel.h"
-#include "../../src/v2/kernels/cpu/CPUSwiGLUKernel.h"
-#include "../../src/v2/kernels/cpu/CPUSoftmaxKernel.h"
+#include "../../src/v2/kernels/cpu/CPURMSNormKernelT.h"
+#include "../../src/v2/kernels/cpu/CPURoPEKernelT.h"
+#include "../../src/v2/kernels/cpu/CPUSwiGLUKernelT.h"
+#include "../../src/v2/kernels/cpu/CPUSoftmaxKernelT.h"
+
 #include "../../src/v2/tensors/Tensors.h"
 #include "../../src/v2/utils/MPIContext.h"
 #include "../../src/v2/utils/MPIStager.h"
@@ -46,7 +47,7 @@ protected:
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceZero)
 {
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<FP32Tensor> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -76,7 +77,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceZero)
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceMinusOne)
 {
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<FP32Tensor> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -98,7 +99,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceMinusOne)
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_IgnoresDeviceIndex)
 {
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<FP32Tensor> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -243,7 +244,7 @@ TEST_F(Test__DeviceIndexCPUKernels, SwiGLU_AcceptsDeviceMinusOne)
 
 TEST_F(Test__DeviceIndexCPUKernels, Softmax_AcceptsDeviceZero)
 {
-    CPUSoftmaxKernel kernel;
+    CPUSoftmaxKernelT<FP32Tensor> kernel;
 
     const int rows = 4;
     const int cols = 8;
@@ -281,7 +282,7 @@ TEST_F(Test__DeviceIndexCPUKernels, Softmax_AcceptsDeviceZero)
 
 TEST_F(Test__DeviceIndexCPUKernels, Softmax_AcceptsDeviceMinusOne)
 {
-    CPUSoftmaxKernel kernel;
+    CPUSoftmaxKernelT<FP32Tensor> kernel;
 
     const int rows = 4;
     const int cols = 8;

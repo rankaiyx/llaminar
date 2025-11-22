@@ -11,7 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "v2/kernels/cpu/CPURMSNormKernel.h"
+#include "v2/kernels/cpu/CPURMSNormKernelT.h"
 #include "v2/tensors/Tensors.h"
 #include <vector>
 #include <cmath>
@@ -25,7 +25,7 @@ protected:
     void SetUp() override
     {
         // Create kernel through interface
-        kernel_ = std::make_unique<CPURMSNormKernel>();
+        kernel_ = std::make_unique<CPURMSNormKernelT<FP32Tensor>>();
     }
 
     std::unique_ptr<ITensorRMSNorm> kernel_;
@@ -64,6 +64,9 @@ TEST_F(Test__RMSNormInterface, FP32_ThroughInterface)
  */
 TEST_F(Test__RMSNormInterface, BF16_ThroughInterface)
 {
+    // Use BF16 kernel
+    kernel_ = std::make_unique<CPURMSNormKernelT<BF16Tensor>>();
+
     const int seq_len = 4;
     const int d_model = 8;
 
@@ -97,6 +100,9 @@ TEST_F(Test__RMSNormInterface, BF16_ThroughInterface)
  */
 TEST_F(Test__RMSNormInterface, FP16_ThroughInterface)
 {
+    // Use FP16 kernel
+    kernel_ = std::make_unique<CPURMSNormKernelT<FP16Tensor>>();
+
     const int seq_len = 4;
     const int d_model = 8;
 
@@ -129,6 +135,9 @@ TEST_F(Test__RMSNormInterface, FP16_ThroughInterface)
  */
 TEST_F(Test__RMSNormInterface, INT32ToINT8_ThroughInterface)
 {
+    // Use INT32 kernel
+    kernel_ = std::make_unique<CPURMSNormKernelT<INT32Tensor>>();
+
     const int seq_len = 4;
     const int d_model = 8;
 

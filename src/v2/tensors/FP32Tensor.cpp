@@ -12,11 +12,12 @@
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/CPUSoftmaxKernel.h"
-#include "../kernels/cpu/CPURMSNormKernel.h"
-#include "../kernels/cpu/CPUSwiGLUKernel.h"
+#include "../kernels/cpu/CPUSoftmaxKernelT.h"
+#include "../kernels/cpu/CPURMSNormKernelT.h"
+
+#include "../kernels/cpu/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/CpuAttentionKernelT.h"
-#include "../kernels/cpu/CPURoPEKernel.h"
+#include "../kernels/cpu/CPURoPEKernelT.h"
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
@@ -125,15 +126,13 @@ namespace llaminar2
 
     std::unique_ptr<ITensorSoftmax> FP32Tensor::createSoftmax()
     {
-        // TODO: Implement Softmax kernel creation
-        LOG_ERROR("[FP32Tensor] createSoftmax not yet implemented");
-        return nullptr;
+        return std::make_unique<CPUSoftmaxKernelT<FP32Tensor>>();
     }
 
     std::unique_ptr<ITensorRMSNorm> FP32Tensor::createRMSNorm()
     {
         // FP32 tensors use CPU RMSNorm kernel
-        return std::make_unique<CPURMSNormKernel>();
+        return std::make_unique<CPURMSNormKernelT<FP32Tensor>>();
     }
 
     std::unique_ptr<ITensorAttention> FP32Tensor::createAttention()

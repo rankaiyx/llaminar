@@ -4,6 +4,8 @@
 # Core ML framework
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.6.0
+torchvision  # Will auto-match torch version
+torchaudio   # Will auto-match torch version
 
 # HuggingFace ecosystem
 transformers>=4.45.0

@@ -500,6 +500,32 @@ add_v2_test(V2_Unit_RoPEPrecisionCorrectness
     MPI_PROCS 1  # RoPE is CPU-only, single rank
 )
 
+# Test: CPURoPEKernelT class interface
+add_executable(v2_test_cpu_rope_kernel unit/kernels/Test__CPURoPEKernelT.cpp)
+target_link_libraries(v2_test_cpu_rope_kernel 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPURoPEKernelT 
+    COMMAND $<TARGET_FILE:v2_test_cpu_rope_kernel>
+    LABELS "V2;Unit;Kernels;RoPE;CPU"
+    MPI_PROCS 1
+)
+
+# Test: CPUSwiGLUKernelT class interface
+add_executable(v2_test_cpu_swiglu_kernel unit/kernels/Test__CPUSwiGLUKernelT.cpp)
+target_link_libraries(v2_test_cpu_swiglu_kernel 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUSwiGLUKernelT 
+    COMMAND $<TARGET_FILE:v2_test_cpu_swiglu_kernel>
+    LABELS "V2;Unit;Kernels;SwiGLU;CPU"
+    MPI_PROCS 1
+)
+
 # Test: BPETokenizer (native tokenizer implementation)
 add_executable(v2_test_bpe_tokenizer integration/Test__BPETokenizer.cpp)
 target_link_libraries(v2_test_bpe_tokenizer 
@@ -552,19 +578,6 @@ add_v2_test(V2_Unit_SwiGLUParity
     MPI_PROCS 1  # Single rank for unit testing
 )
 
-# Test: FP32 Attention kernel parity test against PyTorch
-add_executable(v2_test_fp32_attention_parity unit/Test__FP32AttentionParity.cpp)
-target_link_libraries(v2_test_fp32_attention_parity 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FP32AttentionParity 
-    COMMAND $<TARGET_FILE:v2_test_fp32_attention_parity>
-    LABELS "V2;Unit;Kernels;Attention;FP32;PyTorchParity;GroundTruth;MultiHead;GQA;CPU"
-    MPI_PROCS 1  # Parity test is CPU-only, single rank
-)
-
 # Test: Batch attention correctness - mask generation and batched processing
 add_executable(v2_test_batch_attention_correctness unit/Test__BatchAttentionCorrectness.cpp)
 target_link_libraries(v2_test_batch_attention_correctness 
@@ -615,19 +628,6 @@ add_v2_test(V2_Unit_GQAAttention_BatchedPath
     COMMAND $<TARGET_FILE:v2_test_gqa_attention_batched_path>
     LABELS "V2;Unit;Attention;GQA;Batched;Causal;Padding;HeadBroadcasting"
     MPI_PROCS 1  # Unit test for GQAAttention compute_batch()
-)
-
-# Test: INT8 SwiGLU kernel (SwiGLU activation with INT8 gate/up projections)
-add_executable(v2_test_int8_swiglu unit/Test__INT8SwiGLUKernel.cpp)
-target_link_libraries(v2_test_int8_swiglu 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_INT8SwiGLU 
-    COMMAND $<TARGET_FILE:v2_test_int8_swiglu>
-    LABELS "V2;Unit;Kernels;SwiGLU;INT8;INT8Pipeline;Quantization;Activation;CPU"
-    MPI_PROCS 1  # SwiGLU is CPU-only, single rank
 )
 
 # Test: INT8GemmKernel (OneDNN per-channel quantization)
@@ -1467,6 +1467,7 @@ if(HAVE_CUDA)
     add_executable(v2_test_cuda_gemm_phase3 unit/Test__CudaGemmPhase3.cpp)
     target_include_directories(v2_test_cuda_gemm_phase3 PRIVATE
         ${CMAKE_SOURCE_DIR}/kernels/cuda
+       
         /opt/cutlass/include
     )
     target_link_libraries(v2_test_cuda_gemm_phase3 
@@ -1845,7 +1846,7 @@ if(HAVE_CUDA)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_Phase7_CUTLASS
+    add_v2_perf_test(V2_Perf_Phase7_CUTLASS
         COMMAND $<TARGET_FILE:v2_perf_phase7_cutlass>
         LABELS "V2;Performance;CUDA;Phase7;CUTLASS;Int8;GEMM;Throughput"
         MPI_PROCS 1

@@ -437,18 +437,21 @@ namespace llaminar2::primitives
         }
     }
 
-    /**
-     * @brief Apply RoPE with persistent state (single-token decode optimization)
-     */
-    static void apply_rope_with_persistent_state(
-        float *q, float *k,
-        int q_heads, int k_heads, int head_dim,
-        int n_past,
-        const std::vector<float> &inv_freq,
+    void update_rope_cache(
+        int head_dim, float freq_base, int target_pos,
         RoPEPersistentState &state)
     {
+        // Reset state if parameters changed
+        if (state.cached_head_dim != head_dim ||
+            state.cached_freq_base != freq_base)
+        {
+            state.cached_head_dim = head_dim;
+            state.cached_freq_base = freq_base;
+            state.reset();
+        }
+
+        const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
         const int half_dim = head_dim / 2;
-        int target_pos = n_past;
 
         // Initialize or reset if position jumped
         if (state.last_pos == -1 || target_pos < state.last_pos)
@@ -493,6 +496,17 @@ namespace llaminar2::primitives
             }
             state.last_pos = target_pos;
         }
+    }
+
+    /**
+     * @brief Apply RoPE with persistent state (single-token decode optimization)
+     */
+    static void apply_rope_from_cache(
+        float *q, float *k,
+        int q_heads, int k_heads, int head_dim,
+        const RoPEPersistentState &state)
+    {
+        const int half_dim = head_dim / 2;
 
         // Apply rotation to all heads using cached sin/cos
         auto apply_to_heads = [&](float *tensor, int num_heads)
@@ -520,10 +534,11 @@ namespace llaminar2::primitives
         };
 
         apply_to_heads(q, q_heads);
-        apply_to_heads(k, k_heads);
-    }
-
-    // ============================================================================
+        if (k)
+        {
+            apply_to_heads(k, k_heads);
+        }
+    } // ============================================================================
     // Public API
     // ============================================================================
 
@@ -544,18 +559,11 @@ namespace llaminar2::primitives
         // Single-token decode with persistent state
         if (seq_len == 1 && persistent_state)
         {
-            // Reset state if parameters changed
-            if (persistent_state->cached_head_dim != head_dim ||
-                persistent_state->cached_freq_base != freq_base)
-            {
-                persistent_state->cached_head_dim = head_dim;
-                persistent_state->cached_freq_base = freq_base;
-                persistent_state->reset();
-            }
+            update_rope_cache(head_dim, freq_base, n_past, *persistent_state);
 
-            apply_rope_with_persistent_state(
+            apply_rope_from_cache(
                 q, k, q_heads, k_heads, head_dim,
-                n_past, inv_freq, *persistent_state);
+                *persistent_state);
         }
         else
         {

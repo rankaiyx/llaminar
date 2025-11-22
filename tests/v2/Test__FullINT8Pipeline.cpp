@@ -20,7 +20,7 @@
 #include <gtest/gtest.h>
 #include "../../src/v2/tensors/Tensors.h"
 #include "../../src/v2/kernels/cpu/INT8GemmKernel.h"
-#include "../../src/v2/kernels/cpu/CPURMSNormKernel.h"
+#include "../../src/v2/kernels/cpu/CPURMSNormKernelT.h"
 #include "../../src/v2/utils/Logger.h"
 #include <vector>
 #include <cmath>
@@ -174,7 +174,7 @@ TEST_F(FullINT8Pipeline, TwoLayerFlow)
     std::vector<float> layer0_output_row_scales(m_);
     std::vector<float> gamma0(n_, 1.0f); // Unity gamma for simplicity
 
-    CPURMSNormKernel rmsnorm_kernel;
+    CPURMSNormKernelT<INT32Tensor> rmsnorm_kernel;
     success = rmsnorm_kernel.apply_int32_to_int8(
         layer0_output_int32.data(),
         gamma0.data(),

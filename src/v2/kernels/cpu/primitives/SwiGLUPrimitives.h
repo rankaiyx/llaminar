@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace llaminar2::primitives
 {
     /**
@@ -17,5 +19,9 @@ namespace llaminar2::primitives
      * @param size Number of elements
      */
     void compute_swiglu(const float *gate, const float *up, float *output, int size);
+
+    void compute_swiglu_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size);
+    void compute_swiglu_fp16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size);
+    void compute_swiglu_q8_1(const void *gate, const void *up, void *output, int size);
 
 } // namespace llaminar2::primitives

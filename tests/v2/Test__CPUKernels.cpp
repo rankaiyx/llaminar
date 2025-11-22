@@ -6,10 +6,11 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/kernels/cpu/CPURoPEKernel.h"
-#include "../../src/v2/kernels/cpu/CPURMSNormKernel.h"
-#include "../../src/v2/kernels/cpu/CPUSoftmaxKernel.h"
-#include "../../src/v2/kernels/cpu/CPUSwiGLUKernel.h"
+#include "../../src/v2/kernels/cpu/CPURoPEKernelT.h"
+#include "../../src/v2/kernels/cpu/CPURMSNormKernelT.h"
+#include "../../src/v2/kernels/cpu/CPUSoftmaxKernelT.h"
+
+#include "../../src/v2/kernels/cpu/CPUSwiGLUKernelT.h"
 #include "../../src/v2/kernels/cpu/FP32GemmKernel.h"
 #include "../../src/v2/tensors/Tensors.h"
 #include <cmath>
@@ -34,7 +35,7 @@ protected:
  */
 TEST_F(Test__CPUKernels, RMSNormBasic)
 {
-    CPURMSNormKernel kernel;
+    CPURMSNormKernelT<FP32Tensor> kernel;
 
     const int seq_len = 2;
     const int d_model = 4;
@@ -63,7 +64,7 @@ TEST_F(Test__CPUKernels, RMSNormBasic)
  */
 TEST_F(Test__CPUKernels, SoftmaxBasic)
 {
-    CPUSoftmaxKernel kernel;
+    CPUSoftmaxKernelT<FP32Tensor> kernel;
 
     const int rows = 2;
     const int cols = 3;

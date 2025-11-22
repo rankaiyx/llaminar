@@ -5,11 +5,10 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/QuantizedGemmKernel.h"
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "Tensors.h"
-#include "../kernels/cpu/CPURoPEKernel.h"
-#include "../kernels/cpu/CPUSwiGLUKernel.h"
+#include "../kernels/cpu/CPURoPEKernelT.h"
+#include "../kernels/cpu/CPUSwiGLUKernelT.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"

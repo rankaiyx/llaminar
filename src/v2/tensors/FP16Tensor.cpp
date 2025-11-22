@@ -7,9 +7,11 @@
 #include "Tensors.h"
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
-#include "../kernels/cpu/CPURMSNormKernel.h"
+#include "../kernels/cpu/CPURMSNormKernelT.h"
 #include "../kernels/cpu/CpuAttentionKernelT.h"
-#include "../kernels/cpu/CPURoPEKernel.h"
+#include "../kernels/cpu/CPURoPEKernelT.h"
+#include "../kernels/cpu/CPUSwiGLUKernelT.h"
+#include "../kernels/cpu/CPUSoftmaxKernelT.h"
 #include "../backends/ComputeBackend.h"
 #ifdef HAVE_CUDA
 #include "../kernels/cuda/CudaGemmFactory.h"
@@ -205,23 +207,23 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRoPE> FP16Tensor::createRoPE()
     {
-        return std::make_unique<CPURoPEKernel>();
+        return std::make_unique<CPURoPEKernelT<FP16Tensor>>();
     }
 
     std::unique_ptr<ITensorSwiGLU> FP16Tensor::createSwiGLU()
     {
-        throw std::runtime_error("FP16Tensor: SwiGLU not supported");
+        return std::make_unique<CPUSwiGLUKernelT<FP16Tensor>>();
     }
 
     std::unique_ptr<ITensorSoftmax> FP16Tensor::createSoftmax()
     {
-        throw std::runtime_error("FP16Tensor: Softmax not supported");
+        return std::make_unique<CPUSoftmaxKernelT<FP16Tensor>>();
     }
 
     std::unique_ptr<ITensorRMSNorm> FP16Tensor::createRMSNorm()
     {
         // FP16 tensors use native FP16 RMSNorm kernel (no conversion to FP32)
-        return std::make_unique<CPURMSNormKernel>();
+        return std::make_unique<CPURMSNormKernelT<FP16Tensor>>();
     }
 
     std::unique_ptr<ITensorAttention> FP16Tensor::createAttention()

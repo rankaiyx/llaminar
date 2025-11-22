@@ -37,6 +37,16 @@ else
     echo "[3/4] No requirements.txt found, skipping dependency installation"
 fi
 
+# Install python/reference package in editable mode for snapshot generation
+PYTHON_REFERENCE_DIR="$WORKSPACE_DIR/python"
+if [ -d "$PYTHON_REFERENCE_DIR" ]; then
+    echo "    Installing python/reference package in editable mode..."
+    # Add the python directory to PYTHONPATH for snapshot scripts
+    export PYTHONPATH="$PYTHON_REFERENCE_DIR:$PYTHONPATH"
+    echo "    ✓ Added $PYTHON_REFERENCE_DIR to PYTHONPATH"
+    echo "    Note: python/reference modules now importable for snapshot generation"
+fi
+
 # Fetch test models if script exists
 if [ -f "$FETCH_MODELS_SCRIPT" ]; then
     echo "[4/4] Fetching test models..."
@@ -55,6 +65,15 @@ if ! grep -q "$VENV_ACTIVATION" "$BASHRC" 2>/dev/null; then
     echo "# Auto-activate Llaminar Python virtual environment" >> "$BASHRC"
     echo "$VENV_ACTIVATION" >> "$BASHRC"
     echo "✓ Added venv auto-activation to ~/.bashrc"
+fi
+
+# Add PYTHONPATH to bashrc for persistent snapshot script support
+PYTHONPATH_EXPORT="export PYTHONPATH=\"$PYTHON_REFERENCE_DIR:\$PYTHONPATH\""
+if ! grep -q "PYTHONPATH.*$PYTHON_REFERENCE_DIR" "$BASHRC" 2>/dev/null; then
+    echo "" >> "$BASHRC"
+    echo "# Add python/reference to PYTHONPATH for snapshot generation" >> "$BASHRC"
+    echo "$PYTHONPATH_EXPORT" >> "$BASHRC"
+    echo "✓ Added PYTHONPATH configuration to ~/.bashrc"
 fi
 
 echo ""

@@ -18,7 +18,7 @@
 #include "../../loaders/ModelLoader.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/BatchPaddingUtils.h"
-#include "../../kernels/cpu/CPURMSNormKernel.h"
+#include "../../kernels/cpu/CPURMSNormKernelT.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>

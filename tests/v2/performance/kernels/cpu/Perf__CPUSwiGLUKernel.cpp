@@ -24,7 +24,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/CPUSwiGLUKernel.h"
+#include "kernels/cpu/CPUSwiGLUKernelT.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;

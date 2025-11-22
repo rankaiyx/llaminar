@@ -65,6 +65,21 @@ namespace llaminar2::primitives
         RoPEPersistentState *persistent_state = nullptr);
 
     /**
+     * @brief Update persistent state cache for a specific position
+     *
+     * Ensures that the sin/cos cache in the persistent state is valid for the target position.
+     * This is useful for kernels that need to access the cache directly (e.g. fused kernels).
+     *
+     * @param head_dim Dimension per head
+     * @param freq_base Base frequency for RoPE
+     * @param target_pos Target position index
+     * @param state Persistent state to update
+     */
+    void update_rope_cache(
+        int head_dim, float freq_base, int target_pos,
+        RoPEPersistentState &state);
+
+    /**
      * @brief Get cached inverse frequencies for (head_dim, freq_base)
      * @return Vector of inverse frequencies, length = head_dim/2
      */

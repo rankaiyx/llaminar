@@ -16,10 +16,11 @@
 #include "../utils/Logger.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/NUMATopology.h"
-#include "../kernels/cpu/CPURoPEKernel.h"
-#include "../kernels/cpu/CPUSoftmaxKernel.h"
-#include "../kernels/cpu/CPURMSNormKernel.h"
-#include "../kernels/cpu/CPUSwiGLUKernel.h"
+#include "../kernels/cpu/CPURoPEKernelT.h"
+#include "../kernels/cpu/CPUSoftmaxKernelT.h"
+
+#include "../kernels/cpu/CPURMSNormKernelT.h"
+#include "../kernels/cpu/CPUSwiGLUKernelT.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -750,8 +751,7 @@ namespace llaminar2
     struct CPUComputeContext::Impl
     {
         std::unique_ptr<CPURoPEKernel> rope_kernel;
-        std::unique_ptr<CPUSoftmaxKernel> softmax_kernel;
-        std::unique_ptr<CPURMSNormKernel> rmsnorm_kernel;
+        std::unique_ptr<ITensorSoftmax> softmax_kernel;
         std::unique_ptr<CPUSwiGLUKernel> swiglu_kernel;
     };
 
@@ -795,18 +795,9 @@ namespace llaminar2
     {
         if (!pimpl_->softmax_kernel)
         {
-            pimpl_->softmax_kernel = std::make_unique<CPUSoftmaxKernel>();
+            pimpl_->softmax_kernel = std::make_unique<CPUSoftmaxKernelT<FP32Tensor>>();
         }
         return pimpl_->softmax_kernel.get();
-    }
-
-    ITensorRMSNorm *CPUComputeContext::get_rmsnorm_kernel()
-    {
-        if (!pimpl_->rmsnorm_kernel)
-        {
-            pimpl_->rmsnorm_kernel = std::make_unique<CPURMSNormKernel>();
-        }
-        return pimpl_->rmsnorm_kernel.get();
     }
 
     ITensorSwiGLU *CPUComputeContext::get_swiglu_kernel()
