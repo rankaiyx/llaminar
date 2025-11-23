@@ -520,8 +520,11 @@ add_library(llaminar2_core STATIC
 
     kernels/cpu/CPUSwiGLUKernelT.cpp
     kernels/cpu/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
-    # Fused kernels (operator fusion framework - Phase 1)
-    kernels/cpu/fused/FusedRMSNormQuantize.cpp
+    # Fused kernels (operator fusion framework)
+    kernels/cpu/fused/FusedRMSNormQuantize.cpp  # Phase 1: RMSNorm + INT8 quantization
+    kernels/cpu/fused/FusedDualGEMM.cpp         # Phase 2: Gate/Up shared quantization
+    kernels/cpu/fused/FusedTripleGEMM.cpp       # Phase 2: Q/K/V shared quantization
+    kernels/cpu/fused/FusedDequantSwiGLU.cpp    # Phase 2: Dequant + SwiGLU activation
     # Testing infrastructure (Phase 3a & 3b)
     testing/MockPipeline.cpp
     testing/AttentionTestHarness.cpp

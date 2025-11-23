@@ -462,4 +462,63 @@ namespace llaminar2::primitives
         float epsilon,
         const RMSNormExecOptions &opts = {});
 
+    // ========================================================================
+    // FP32→INT8 RMSNorm + Quantization (single-pass fusion)
+    // ========================================================================
+
+    /**
+     * @brief Fused RMSNorm + per-row symmetric INT8 quantization (single row)
+     *
+     * Performs RMSNorm and quantization in a single pass to avoid intermediate buffer:
+     * 1. Compute RMS: rms = sqrt(mean(x²) + eps)
+     * 2. Normalize and apply gamma: x_norm = (x / rms) * gamma
+     * 3. Find max absolute value for quantization scale
+     * 4. Quantize to INT8: x_int8 = round(x_norm / scale), scale = max(|x_norm|) / 127
+     *
+     * This primitive is used by FusedRMSNormQuantize kernel to eliminate intermediate
+     * FP32 buffer allocation between normalization and quantization.
+     *
+     * @param input_row Input FP32 row [cols]
+     * @param weight Gamma weights [cols]
+     * @param output_row Output INT8 row [cols]
+     * @param out_scale Output quantization scale (dequant scale = 1/quant_scale)
+     * @param cols Number of columns
+     * @param epsilon Epsilon for RMS stability
+     */
+    void rmsnorm_quantize_row_scalar(
+        const float *input_row,
+        const float *weight,
+        int8_t *output_row,
+        float &out_scale,
+        int cols,
+        float epsilon);
+
+    /**
+     * @brief Fused RMSNorm + INT8 quantization (AVX2 vectorization)
+     *
+     * AVX2 vectorized version of rmsnorm_quantize_row_scalar.
+     * Uses 8-way SIMD for FP32 operations.
+     */
+    void rmsnorm_quantize_row_avx2(
+        const float *input_row,
+        const float *weight,
+        int8_t *output_row,
+        float &out_scale,
+        int cols,
+        float epsilon);
+
+    /**
+     * @brief Fused RMSNorm + INT8 quantization (AVX512 vectorization)
+     *
+     * AVX512 vectorized version of rmsnorm_quantize_row_scalar.
+     * Uses 16-way SIMD for FP32 operations.
+     */
+    void rmsnorm_quantize_row_avx512(
+        const float *input_row,
+        const float *weight,
+        int8_t *output_row,
+        float &out_scale,
+        int cols,
+        float epsilon);
+
 } // namespace llaminar2::primitives

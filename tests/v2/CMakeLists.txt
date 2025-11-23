@@ -323,6 +323,45 @@ add_v2_test(V2_Unit_FusedRMSNormQuantize_Padding
     MPI_PROCS 1
 )
 
+# Test: FusedDualGEMM kernel (operator fusion framework - Phase 2)
+add_executable(v2_test_fused_dual_gemm unit/Test__FusedDualGEMM.cpp)
+target_link_libraries(v2_test_fused_dual_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedDualGEMM
+    COMMAND $<TARGET_FILE:v2_test_fused_dual_gemm>
+    LABELS "V2;Unit;Kernels;FusedKernels;GEMM;Quantization;INT8;INT32;OperatorFusion;FFN;AVX512;AVX2;CPU"
+    MPI_PROCS 1  # CPU-only fused kernel, single rank
+)
+
+# Test: FusedTripleGEMM kernel (operator fusion framework - Phase 2)
+add_executable(v2_test_fused_triple_gemm unit/Test__FusedTripleGEMM.cpp)
+target_link_libraries(v2_test_fused_triple_gemm
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedTripleGEMM
+    COMMAND $<TARGET_FILE:v2_test_fused_triple_gemm>
+    LABELS "V2;Unit;Kernels;FusedKernels;GEMM;Quantization;INT8;INT32;OperatorFusion;Attention;AVX512;AVX2;CPU"
+    MPI_PROCS 1  # CPU-only fused kernel, single rank
+)
+
+# Test: FusedDequantSwiGLU kernel (operator fusion framework - Phase 2)
+add_executable(v2_test_fused_dequant_swiglu unit/Test__FusedDequantSwiGLU.cpp)
+target_link_libraries(v2_test_fused_dequant_swiglu
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedDequantSwiGLU
+    COMMAND $<TARGET_FILE:v2_test_fused_dequant_swiglu>
+    LABELS "V2;Unit;Kernels;FusedKernels;Dequantization;SwiGLU;Activation;INT32;FP32;OperatorFusion;FFN;AVX512;AVX2;CPU"
+    MPI_PROCS 1  # CPU-only fused kernel, single rank
+)
+
 # Test: Device index handling in CPU kernels (regression test for device_idx=0 bug)
 add_executable(v2_test_device_index_cpu_kernels unit/Test__DeviceIndexCPUKernels.cpp)
 target_link_libraries(v2_test_device_index_cpu_kernels
@@ -2932,3 +2971,9 @@ add_v2_test(V2_Unit_MpiAttentionOrchestrator_Masking
     LABELS "V2;Unit;PipelineExecution;Orchestration;Attention"
     MPI_PROCS 1
 )
+
+# Disable ASAN leak detection for this test (known OpenMPI internal leaks)
+set_tests_properties(V2_Unit_MpiAttentionOrchestrator_Masking PROPERTIES
+    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;LLAMINAR_LOG_LEVEL=DEBUG;HWLOC_COMPONENTS=-gl,-opencl;OMP_NUM_THREADS=${CORES_PER_SOCKET};OMP_PLACES=sockets;OMP_PROC_BIND=close;OMP_NESTED=false;OMP_DYNAMIC=false;KMP_AFFINITY=granularity=fine,compact,1,0;KMP_BLOCKTIME=0;OPENBLAS_NUM_THREADS=${CORES_PER_SOCKET};GOTO_NUM_THREADS=${CORES_PER_SOCKET};MKL_NUM_THREADS=${CORES_PER_SOCKET};MKL_DYNAMIC=false;OMPI_MCA_mpi_leave_pinned=1;OMPI_MCA_btl_vader_single_copy_mechanism=none;OMPI_MCA_btl_openib_allow_ib=1"
+)
+
