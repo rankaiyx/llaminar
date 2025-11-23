@@ -174,17 +174,26 @@ namespace llaminar2
         std::shared_ptr<TensorBase> normalized_int8; // INT8 post-fusion buffer
         std::vector<float> normalized_scales;        // Per-row quantization scales
 
-        // Attention buffers
+        // Attention buffers (FP32 for final Q/K/V after dequantization)
         std::shared_ptr<TensorBase> Q;
         std::shared_ptr<TensorBase> K;
         std::shared_ptr<TensorBase> V;
         std::shared_ptr<TensorBase> attn_output;
         std::shared_ptr<TensorBase> attn_proj;
 
-        // FFN buffers
+        // INT32 attention buffers (for FusedTripleGEMM output - raw accumulator)
+        std::shared_ptr<TensorBase> Q_int32;
+        std::shared_ptr<TensorBase> K_int32;
+        std::shared_ptr<TensorBase> V_int32;
+
+        // FFN buffers (FP32 for final gate/up after dequantization)
         std::shared_ptr<TensorBase> gate;
         std::shared_ptr<TensorBase> up;
         std::shared_ptr<TensorBase> ffn_output;
+
+        // INT32 FFN buffers (for FusedDualGEMM output - raw accumulator)
+        std::shared_ptr<TensorBase> gate_int32;
+        std::shared_ptr<TensorBase> up_int32;
 
         int max_seq_len = 0; // Maximum sequence length these buffers support
     };

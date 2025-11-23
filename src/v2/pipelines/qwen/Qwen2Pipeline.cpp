@@ -20,6 +20,9 @@
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/BatchPaddingUtils.h"
 #include "../../kernels/cpu/CPURMSNormKernelT.h"
+#include "../../kernels/cpu/fused/FusedDualGEMM.h"
+#include "../../kernels/cpu/fused/FusedTripleGEMM.h"
+#include "../../kernels/cpu/fused/FusedDequantSwiGLU.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -310,6 +313,27 @@ namespace llaminar2
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
             device_idx, precision);
 
+        // INT32 attention buffers (for FusedTripleGEMM output - raw INT8×INT8→INT32 accumulators)
+        // Always allocate when using INT8 precision (needed for Phase 2 fused kernels)
+        if (precision == ActivationPrecision::INT8)
+        {
+            buffers.Q_int32 = createActivationTensor(
+                {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
+                device_idx, ActivationPrecision::INT32);
+            buffers.K_int32 = createActivationTensor(
+                {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
+                device_idx, ActivationPrecision::INT32);
+            buffers.V_int32 = createActivationTensor(
+                {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
+                device_idx, ActivationPrecision::INT32);
+        }
+        else
+        {
+            buffers.Q_int32 = nullptr;
+            buffers.K_int32 = nullptr;
+            buffers.V_int32 = nullptr;
+        }
+
         // FFN buffers (Qwen-specific d_ff_) - sized for batch
         buffers.gate = createActivationTensor(
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
@@ -320,6 +344,23 @@ namespace llaminar2
         buffers.ffn_output = createActivationTensor(
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
             device_idx, precision);
+
+        // INT32 FFN buffers (for FusedDualGEMM output - raw INT8×INT8→INT32 accumulators)
+        // Always allocate when using INT8 precision (needed for Phase 2 fused kernels)
+        if (precision == ActivationPrecision::INT8)
+        {
+            buffers.gate_int32 = createActivationTensor(
+                {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
+                device_idx, ActivationPrecision::INT32);
+            buffers.up_int32 = createActivationTensor(
+                {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
+                device_idx, ActivationPrecision::INT32);
+        }
+        else
+        {
+            buffers.gate_int32 = nullptr;
+            buffers.up_int32 = nullptr;
+        }
 
         return buffers;
     }
@@ -1091,73 +1132,126 @@ namespace llaminar2
             }
         }
 
-        // 2. Gate and up projections (use device-appropriate buffers)
-        VALIDATE_KERNEL(gate_gemm, layer.gate_proj->createGemm(), "gate GEMM kernel");
-        VALIDATE_KERNEL(up_gemm, layer.up_proj->createGemm(), "up GEMM kernel");
-
-        // gate = hidden @ gate_proj^T (use typed activations if fused quantization was used)
+        // 2. Gate and up projections - PHASE 2 FUSED PATH
+        // Use FusedDualGEMM to eliminate redundant quantization:
+        //   Old: Quant(norm) → gate_gemm + Quant(norm) → up_gemm → Dequant(gate) + Dequant(up) → SwiGLU
+        //   New: Quant(norm) → FusedDualGEMM → [gate_int32, up_int32] → FusedDequantSwiGLU → output_fp32
         if (use_fused_quantize)
         {
-            VALIDATE_OP(gate_gemm->multiply_typed_activations(
-                            buffers.normalized_int8->data(), TensorFormat::INT8,
-                            buffers.normalized_scales.data(),
-                            buffers.gate->mutable_data(),
-                            effective_seq_len, d_ff_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
-                        "Gate projection (INT8)");
+            // Phase 2: Fused path with FusedDualGEMM + FusedDequantSwiGLU
+            // Create fused kernel from INT8 activation tensor
+            auto *int8_activation = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
+            VALIDATE_POINTER(int8_activation, "INT8 activation tensor for FusedDualGEMM");
+
+            auto fused_dual_gemm = int8_activation->createFusedDualGemm(
+                layer.gate_proj.get(), layer.up_proj.get());
+            VALIDATE_POINTER(fused_dual_gemm, "FusedDualGEMM kernel");
+
+            // Get INT32 buffers from activation buffers
+            auto *gate_int32 = dynamic_cast<INT32Tensor *>(buffers.gate_int32.get());
+            auto *up_int32 = dynamic_cast<INT32Tensor *>(buffers.up_int32.get());
+            VALIDATE_POINTER(gate_int32, "INT32 gate buffer");
+            VALIDATE_POINTER(up_int32, "INT32 up buffer");
+
+            // Get column scales from weight tensors (for INT32 dequantization)
+            auto *gate_weight_int8 = dynamic_cast<INT8Tensor *>(layer.gate_proj.get());
+            auto *up_weight_int8 = dynamic_cast<INT8Tensor *>(layer.up_proj.get());
+            VALIDATE_POINTER(gate_weight_int8, "INT8 gate weight");
+            VALIDATE_POINTER(up_weight_int8, "INT8 up weight");
+
+            const float *gate_col_scales = gate_weight_int8->col_scales();
+            const float *up_col_scales = up_weight_int8->col_scales();
+            VALIDATE_POINTER(gate_col_scales, "Gate weight column scales");
+            VALIDATE_POINTER(up_col_scales, "Up weight column scales");
+
+            // Execute FusedDualGEMM: normalized_fp32 → [gate_int32, up_int32]
+            // Note: FusedDualGEMM internally quantizes FP32 input to INT8, then performs GEMMs
+            // We pass normalized FP32 buffer (not INT8), as kernel handles quantization
+            VALIDATE_OP(fused_dual_gemm->execute(
+                            normalized_hidden->data(),           // Input FP32 [m, k]
+                            gate_int32->mutable_int32_data(),    // Output INT32 [m, n]
+                            up_int32->mutable_int32_data(),      // Output INT32 [m, n]
+                            buffers.normalized_scales.data(),    // Output row scales [m]
+                            effective_seq_len, d_ff_, d_model_), // Dimensions
+                        "FusedDualGEMM (gate+up projections)");
+
+            // Health check: INT32 accumulator outputs
+            LOG_DEBUG("[Phase2] FusedDualGEMM completed, checking INT32 outputs");
+
+            // Execute FusedDequantSwiGLU: [gate_int32, up_int32] → up_fp32 (with SwiGLU activation)
+            FusedDequantSwiGLU fused_dequant_swiglu;
+            VALIDATE_OP(fused_dequant_swiglu.execute(
+                            gate_int32->int32_data(),         // Gate INT32 [m, n]
+                            up_int32->int32_data(),           // Up INT32 [m, n]
+                            buffers.up->mutable_data(),       // Output FP32 [m, n] (reuse up buffer)
+                            buffers.normalized_scales.data(), // Row scales [m]
+                            gate_col_scales,                  // Gate column scales [n]
+                            up_col_scales,                    // Up column scales [n]
+                            effective_seq_len, d_ff_),        // Dimensions
+                        "FusedDequantSwiGLU (dequant+activation)");
+
+            // Capture gate projection (dequantize INT32 for snapshot)
+            // This is for parity testing - production code only stores INT32
+            for (int r = 0; r < effective_seq_len; ++r)
+            {
+                const float row_scale = buffers.normalized_scales[r];
+                for (int c = 0; c < d_ff_; ++c)
+                {
+                    const size_t idx = r * d_ff_ + c;
+                    buffers.gate->mutable_data()[idx] =
+                        static_cast<float>(gate_int32->int32_data()[idx]) * row_scale * gate_col_scales[c];
+                }
+            }
+            CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE",
+                                  buffers.gate, effective_seq_len, d_ff_);
+
+            LOG_DEBUG("[Phase2] FusedDequantSwiGLU completed");
         }
         else
         {
+            // Phase 1: Unfused path (fallback for non-INT8 precision)
+            VALIDATE_KERNEL(gate_gemm, layer.gate_proj->createGemm(), "gate GEMM kernel");
+            VALIDATE_KERNEL(up_gemm, layer.up_proj->createGemm(), "up GEMM kernel");
+
+            // gate = hidden @ gate_proj^T
             VALIDATE_OP(gate_gemm->multiply_activations(
                             normalized_hidden->data(), nullptr, buffers.gate->mutable_data(),
                             effective_seq_len, d_ff_, d_model_,
                             true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                         "Gate projection");
-        }
-        VALIDATE_TENSOR_BUFFER(buffers.gate, spec_ffn_gate_up(effective_seq_len), "after_gate_proj");
+            VALIDATE_TENSOR_BUFFER(buffers.gate, spec_ffn_gate_up(effective_seq_len), "after_gate_proj");
 
-        // Capture gate projection
-        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE", buffers.gate, effective_seq_len, d_ff_);
+            // Capture gate projection
+            CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE",
+                                  buffers.gate, effective_seq_len, d_ff_);
 
-        // Health check: Gate projection output
-        CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_GATE").c_str(),
-                               buffers.gate->data(), effective_seq_len * d_ff_);
+            // Health check: Gate projection output
+            CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_GATE").c_str(),
+                                   buffers.gate->data(), effective_seq_len * d_ff_);
 
-        // up = hidden @ up_proj^T (use typed activations if fused quantization was used)
-        if (use_fused_quantize)
-        {
-            VALIDATE_OP(up_gemm->multiply_typed_activations(
-                            buffers.normalized_int8->data(), TensorFormat::INT8,
-                            buffers.normalized_scales.data(),
-                            buffers.up->mutable_data(),
-                            effective_seq_len, d_ff_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
-                        "Up projection (INT8)");
-        }
-        else
-        {
+            // up = hidden @ up_proj^T
             VALIDATE_OP(up_gemm->multiply_activations(
                             normalized_hidden->data(), nullptr, buffers.up->mutable_data(),
                             effective_seq_len, d_ff_, d_model_,
                             true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
                         "Up projection");
+            VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_gate_up(effective_seq_len), "after_up_proj");
+
+            // Capture up projection
+            CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_UP",
+                                  buffers.up, effective_seq_len, d_ff_);
+
+            // SwiGLU activation (up buffer reused for output)
+            auto *activation_tensor_up = dynamic_cast<IActivationTensor *>(buffers.up.get());
+            VALIDATE_POINTER(activation_tensor_up, "activation tensor for SwiGLU kernel");
+            VALIDATE_KERNEL(swiglu_kernel, activation_tensor_up->createSwiGLU(), "SwiGLU kernel");
+
+            VALIDATE_OP(swiglu_kernel->apply(
+                            buffers.gate->data(), buffers.up->data(),
+                            buffers.up->mutable_data(),
+                            effective_seq_len, d_ff_, false, mpi_ctx_.get(), ffn_device),
+                        "SwiGLU activation");
         }
-        VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_gate_up(effective_seq_len), "after_up_proj");
-
-        // Capture up projection
-        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_UP", buffers.up, effective_seq_len, d_ff_);
-
-        // 3. SwiGLU activation (up buffer reused for output)
-        // Create kernel from activation tensor (up buffer), not weight tensor
-        auto *activation_tensor_up = dynamic_cast<IActivationTensor *>(buffers.up.get());
-        VALIDATE_POINTER(activation_tensor_up, "activation tensor for SwiGLU kernel");
-        VALIDATE_KERNEL(swiglu_kernel, activation_tensor_up->createSwiGLU(), "SwiGLU kernel");
-
-        VALIDATE_OP(swiglu_kernel->apply(
-                        buffers.gate->data(), buffers.up->data(),
-                        buffers.up->mutable_data(),
-                        effective_seq_len, d_ff_, false, mpi_ctx_.get(), ffn_device),
-                    "SwiGLU activation");
         VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_intermediate(effective_seq_len), "after_swiglu");
 
         // Capture SwiGLU output

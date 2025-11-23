@@ -1038,6 +1038,10 @@ namespace llaminar2
         std::unique_ptr<ITensorSwiGLU> createSwiGLU() override;
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
 
+        // Phase 2 fused kernel factory methods
+        std::unique_ptr<class FusedDualGEMM> createFusedDualGemm(TensorBase *gate_weight, TensorBase *up_weight);
+        std::unique_ptr<class FusedTripleGEMM> createFusedTripleGemm(TensorBase *q_weight, TensorBase *k_weight, TensorBase *v_weight);
+
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
         bool applyRoPE(float *K, const int *position_ids, int seq_len,
                        int n_heads, int n_kv_heads, int head_dim,

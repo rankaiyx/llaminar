@@ -8,6 +8,8 @@
 #include "Tensors.h"
 #include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../kernels/cpu/fused/FusedRMSNormQuantize.h"
+#include "../kernels/cpu/fused/FusedDualGEMM.h"
+#include "../kernels/cpu/fused/FusedTripleGEMM.h"
 #include "../utils/Logger.h"
 // #include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"  // DEPRECATED: Now using IntegerGemm via createGemm()
 #include <cmath>
@@ -680,6 +682,51 @@ namespace llaminar2
     INT8Tensor::get_raw_block_at(size_t row_idx, size_t k_block_offset) const
     {
         return host_int8_data_.data() + row_idx * shape_[1];
+    }
+
+    // =============================================================================
+    // Phase 2 Fused Kernel Factory Methods
+    // =============================================================================
+
+    /**
+     * @brief Create fused dual GEMM kernel for FFN gate/up projections
+     *
+     * Creates kernel that fuses:
+     * 1. Shared input quantization (FP32 → INT8)
+     * 2. Gate GEMM (INT8×INT8 → INT32)
+     * 3. Up GEMM (INT8×INT8 → INT32)
+     *
+     * @param gate_weight INT8 quantized gate projection weights [k, n]
+     * @param up_weight INT8 quantized up projection weights [k, n]
+     * @return Unique pointer to FusedDualGEMM kernel instance
+     */
+    std::unique_ptr<FusedDualGEMM> INT8Tensor::createFusedDualGemm(
+        TensorBase *gate_weight,
+        TensorBase *up_weight)
+    {
+        return std::make_unique<FusedDualGEMM>(gate_weight, up_weight);
+    }
+
+    /**
+     * @brief Create fused triple GEMM kernel for attention Q/K/V projections
+     *
+     * Creates kernel that fuses:
+     * 1. Shared input quantization (FP32 → INT8)
+     * 2. Q GEMM (INT8×INT8 → INT32)
+     * 3. K GEMM (INT8×INT8 → INT32)
+     * 4. V GEMM (INT8×INT8 → INT32)
+     *
+     * @param q_weight INT8 quantized Q projection weights [k, n]
+     * @param k_weight INT8 quantized K projection weights [k, n]
+     * @param v_weight INT8 quantized V projection weights [k, n]
+     * @return Unique pointer to FusedTripleGEMM kernel instance
+     */
+    std::unique_ptr<FusedTripleGEMM> INT8Tensor::createFusedTripleGemm(
+        TensorBase *q_weight,
+        TensorBase *k_weight,
+        TensorBase *v_weight)
+    {
+        return std::make_unique<FusedTripleGEMM>(q_weight, k_weight, v_weight);
     }
 
 } // namespace llaminar2
