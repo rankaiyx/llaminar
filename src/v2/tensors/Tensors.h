@@ -227,6 +227,31 @@ namespace llaminar2
             int device_idx = -1) = 0;
 
         /**
+         * @brief Apply RMS normalization in-place (native precision)
+         *
+         * Each tensor type implements this using its native precision method:
+         * - FP32Tensor: Creates FP32 RMSNorm kernel
+         * - BF16Tensor: Creates BF16 RMSNorm kernel (apply_bf16)
+         * - FP16Tensor: Creates FP16 RMSNorm kernel (apply_fp16)
+         *
+         * @param gamma Gamma (scale) weights [d_model]
+         * @param seq_len Sequence length (number of rows)
+         * @param d_model Model dimension (columns)
+         * @param eps Epsilon for numerical stability (default 1e-6)
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index for kernel execution
+         *
+         * @return true on success, false on failure
+         */
+        virtual bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) = 0;
+
+        /**
          * @brief Populate this activation tensor directly from INT32 accumulators
          *
          * @param accum Pointer to INT32 accumulator buffer in row-major order [rows, cols]
@@ -645,6 +670,14 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
         bool from_int32_with_scales(
             const int32_t *accum,
             int rows,
@@ -803,6 +836,14 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
@@ -974,6 +1015,14 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
         bool from_int32_with_scales(
             const int32_t *accum,
             int rows,
@@ -1126,14 +1175,22 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
 
         // Phase 2 fused kernel factory methods
-        std::unique_ptr<class FusedDualGEMM> createFusedDualGemm(TensorBase *gate_weight, TensorBase *up_weight);
-        std::unique_ptr<class FusedTripleGEMM> createFusedTripleGemm(TensorBase *q_weight, TensorBase *k_weight, TensorBase *v_weight);
+        std::unique_ptr<class FusedGEMM> createFusedDualGemm(TensorBase *gate_weight, TensorBase *up_weight);
+        std::unique_ptr<class FusedGEMM> createFusedTripleGemm(TensorBase *q_weight, TensorBase *k_weight, TensorBase *v_weight);
 
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
         bool applyRoPE(float *K, const int *position_ids, int seq_len,
                        int n_heads, int n_kv_heads, int head_dim,
                        float rope_theta = 10000.0f, bool use_bf16 = false,
                        const MPIContext *mpi_ctx = nullptr, int device_idx = 0) override;
+
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
 
         bool from_int32_with_scales(
             const int32_t *accum,
@@ -1686,6 +1743,14 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             bool use_bf16 = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override;
+
+        bool applyRMSNorm(
+            const float *gamma,
+            int seq_len,
+            int d_model,
+            float eps = 1e-6f,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 

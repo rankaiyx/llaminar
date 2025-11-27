@@ -26,7 +26,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
+#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 
 using namespace llaminar2;
 using namespace llaminar2::gemm_v4;
@@ -112,7 +112,7 @@ protected:
 
         MPIContext ctx(0, 1, MPI_COMM_WORLD);
         auto generic_kernel = weights_tensor->createGemm();
-        auto kernel = dynamic_cast<Q8_1GemmKernel *>(generic_kernel.get());
+        auto kernel = dynamic_cast<QuantisedGemmKernel *>(generic_kernel.get());
         ASSERT_NE(kernel, nullptr);
 
         std::vector<float> A(M * K);

@@ -259,19 +259,6 @@ add_v2_test(V2_Unit_Q8_1Tensor
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
 
-# Test: OneDNN BRGEMM Experiment
-add_executable(v2_test_onednn_brgemm_experiment unit/Test__OneDNN_BRGEMM_Experiment.cpp)
-target_link_libraries(v2_test_onednn_brgemm_experiment 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_OneDNN_BRGEMM_Experiment 
-    COMMAND $<TARGET_FILE:v2_test_onednn_brgemm_experiment>
-    LABELS "V2;Unit;Kernels;OneDNN;BRGEMM;Experiment"
-    MPI_PROCS 1
-)
-
 # Test: INT8Tensor class (runtime activation quantization with per-row scales)
 add_executable(v2_test_int8_tensor unit/Test__INT8Tensor.cpp)
 target_link_libraries(v2_test_int8_tensor 
@@ -336,52 +323,34 @@ add_v2_test(V2_Unit_FusedRMSNormQuantize_Padding
     MPI_PROCS 1
 )
 
-# NOTE: FusedDualGEMM, FusedTripleGEMM, and FusedDequantSwiGLU tests are temporarily
-# disabled during the FP32 residual architecture migration. These kernels now use
-# Q8_1GemmKernel with FP32 output, but the tests still use the old INT32 API.
+# NOTE: FusedDequantSwiGLU tests temporarily disabled during FP32 residual migration.
 # See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for integration timeline.
-# TODO: Update tests when Phase 3 is complete.
 
-#[[ DISABLED: Tests use old INT32 API
-# Test: FusedDualGEMM kernel (operator fusion framework - Phase 2)
-add_executable(v2_test_fused_dual_gemm unit/Test__FusedDualGEMM.cpp)
-target_link_libraries(v2_test_fused_dual_gemm
+# Test: FusedSwiGLU kernel (SwiGLU activation for FP32 inputs)
+add_executable(v2_test_fused_swiglu unit/Test__FusedSwiGLU.cpp)
+target_link_libraries(v2_test_fused_swiglu
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_FusedDualGEMM
-    COMMAND $<TARGET_FILE:v2_test_fused_dual_gemm>
-    LABELS "V2;Unit;Kernels;FusedKernels;GEMM;Quantization;INT8;INT32;OperatorFusion;FFN;AVX512;AVX2;CPU"
+add_v2_test(V2_Unit_FusedSwiGLU
+    COMMAND $<TARGET_FILE:v2_test_fused_swiglu>
+    LABELS "V2;Unit;Kernels;FusedKernels;SwiGLU;Activation;FP32;FFN;AVX512;AVX2;CPU"
     MPI_PROCS 1  # CPU-only fused kernel, single rank
 )
 
-# Test: FusedTripleGEMM kernel (operator fusion framework - Phase 2)
-add_executable(v2_test_fused_triple_gemm unit/Test__FusedTripleGEMM.cpp)
-target_link_libraries(v2_test_fused_triple_gemm
+# Test: FusedGEMM kernel (generic N-projection fused GEMM)
+add_executable(v2_test_fused_gemm unit/Test__FusedGEMM.cpp)
+target_link_libraries(v2_test_fused_gemm
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_FusedTripleGEMM
-    COMMAND $<TARGET_FILE:v2_test_fused_triple_gemm>
-    LABELS "V2;Unit;Kernels;FusedKernels;GEMM;Quantization;INT8;INT32;OperatorFusion;Attention;AVX512;AVX2;CPU"
+add_v2_test(V2_Unit_FusedGEMM
+    COMMAND $<TARGET_FILE:v2_test_fused_gemm>
+    LABELS "V2;Unit;Kernels;FusedKernels;GEMM;Quantization;OperatorFusion;FFN;Attention;AVX512;AVX2;CPU"
     MPI_PROCS 1  # CPU-only fused kernel, single rank
 )
-
-# Test: FusedDequantSwiGLU kernel (operator fusion framework - Phase 2)
-add_executable(v2_test_fused_dequant_swiglu unit/Test__FusedDequantSwiGLU.cpp)
-target_link_libraries(v2_test_fused_dequant_swiglu
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FusedDequantSwiGLU
-    COMMAND $<TARGET_FILE:v2_test_fused_dequant_swiglu>
-    LABELS "V2;Unit;Kernels;FusedKernels;Dequantization;SwiGLU;Activation;INT32;FP32;OperatorFusion;FFN;AVX512;AVX2;CPU"
-    MPI_PROCS 1  # CPU-only fused kernel, single rank
-)
-#]]
 
 # Test: Device index handling in CPU kernels (regression test for device_idx=0 bug)
 add_executable(v2_test_device_index_cpu_kernels unit/Test__DeviceIndexCPUKernels.cpp)
@@ -461,108 +430,43 @@ add_v2_test(V2_Unit_SoftmaxInf
     MPI_PROCS 1
 )
 
-# Test: OneDNN GEMM kernel fused matmul + softmax path
-add_executable(v2_test_onednn_gemm_kernel unit/kernels/gemm/Test__OneDNNGemmKernel.cpp)
-target_link_libraries(v2_test_onednn_gemm_kernel
+# Test: Quantised JIT GEMM kernel
+add_executable(v2_test_quantised_gemm_kernel unit/kernels/gemm/Test__QuantisedGemmKernel.cpp)
+target_link_libraries(v2_test_quantised_gemm_kernel
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_OneDNNGemmKernel
-    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel>
-    LABELS "V2;Unit;Kernels;GEMM;Softmax;OneDNN;CPU"
-    MPI_PROCS 1  # OneDNN fused kernel executes on CPU only
-)
-
-# Test: Q8_1 JIT GEMM kernel
-add_executable(v2_test_q8_1_gemm_kernel unit/kernels/gemm/Test__Q8_1GemmKernel.cpp)
-target_link_libraries(v2_test_q8_1_gemm_kernel
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q8_1GemmKernel
-    COMMAND $<TARGET_FILE:v2_test_q8_1_gemm_kernel>
-    LABELS "V2;Unit;Kernels;GEMM;Q8_1;JIT;CPU"
+add_v2_test(V2_Unit_QuantisedGemmKernel
+    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_kernel>
+    LABELS "V2;Unit;Kernels;GEMM;Quantised;JIT;CPU"
     MPI_PROCS 1
 )
 
-# Test: Q8_1 JIT GEMM Fused Operations (Bias, Mask, Softmax)
-add_executable(v2_test_q8_1_gemm_fused unit/kernels/gemm/Test__Q8_1GemmFused.cpp)
-target_link_libraries(v2_test_q8_1_gemm_fused
+# Test: Quantised JIT GEMM Fused Operations (Bias, Mask, Softmax)
+add_executable(v2_test_quantised_gemm_fused unit/kernels/gemm/Test__QuantisedGemmFused.cpp)
+target_link_libraries(v2_test_quantised_gemm_fused
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_Q8_1GemmFused
-    COMMAND $<TARGET_FILE:v2_test_q8_1_gemm_fused>
-    LABELS "V2;Unit;Kernels;GEMM;Q8_1;Fused;CPU"
+add_v2_test(V2_Unit_QuantisedGemmFused
+    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_fused>
+    LABELS "V2;Unit;Kernels;GEMM;Quantised;Fused;CPU"
     MPI_PROCS 1
 )
 
-# Test: OneDNN GEMM kernel strided/causal support
-add_executable(v2_test_onednn_gemm_kernel_strided unit/kernels/gemm/Test__OneDNNGemmKernel_Strided.cpp)
-target_link_libraries(v2_test_onednn_gemm_kernel_strided
+# Test: FloatingPointGemmKernel (OneDNN-based FP32/BF16/FP16 GEMM)
+add_executable(v2_test_fp_gemm_kernel unit/kernels/gemm/Test__FloatingPointGemmKernel.cpp)
+target_link_libraries(v2_test_fp_gemm_kernel
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_OneDNNGemmKernel_Strided
-    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel_strided>
-    LABELS "V2;Unit;Kernels;GEMM;Softmax;OneDNN;CPU;Strided"
+add_v2_test(V2_Unit_FloatingPointGemmKernel
+    COMMAND $<TARGET_FILE:v2_test_fp_gemm_kernel>
+    LABELS "V2;Unit;Kernels;GEMM;FloatingPoint;OneDNN;FP32;Strided;Softmax;CausalMask;CPU"
     MPI_PROCS 1
-)
-
-# Test: OneDNN GEMM kernel typed interface (BF16/FP16/FP32)
-add_executable(v2_test_onednn_gemm_kernel_typed unit/kernels/gemm/Test__OneDNNGemmKernel_Typed.cpp)
-target_link_libraries(v2_test_onednn_gemm_kernel_typed
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_OneDNNGemmKernel_Typed
-    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel_typed>
-    LABELS "V2;Unit;Kernels;GEMM;OneDNN;Typed;BF16;FP16;CPU"
-    MPI_PROCS 1
-)
-
-# Test: OneDNN GEMM kernel scratch buffer functionality
-add_executable(v2_test_onednn_gemm_kernel_scratch_buffers unit/kernels/gemm/Test__OneDNNGemmKernel_ScratchBuffers.cpp)
-target_link_libraries(v2_test_onednn_gemm_kernel_scratch_buffers
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_OneDNNGemmKernel_ScratchBuffers
-    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_kernel_scratch_buffers>
-    LABELS "V2;Unit;Kernels;GEMM;OneDNN;ScratchBuffers;MemoryManagement;ThreadLocal;Performance;CPU"
-    MPI_PROCS 1
-)
-
-# Test: OneDNN GEMM adapter (INT8 path with tensor interface)
-add_executable(v2_test_onednn_gemm_adapter unit/kernels/gemm/Test__OneDNNGemmAdapter.cpp)
-target_link_libraries(v2_test_onednn_gemm_adapter
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_OneDNNGemmAdapter
-    COMMAND $<TARGET_FILE:v2_test_onednn_gemm_adapter>
-    LABELS "V2;Unit;Kernels;GEMM;OneDNN;INT8;Adapter;CPU"
-    MPI_PROCS 1  # Adapter operates purely on CPU tensors, single rank
-)
-
-# Test: WeightPack cache functionality (lazy INT8 repacking, memory deallocation)
-add_executable(v2_test_weight_pack_cache unit/Test__WeightPackCache.cpp)
-target_link_libraries(v2_test_weight_pack_cache
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_WeightPackCache
-    COMMAND $<TARGET_FILE:v2_test_weight_pack_cache>
-    LABELS "V2;Unit;TensorOperations;WeightCaching;INT8;MemoryOptimization;OneDNN;CPU"
-    MPI_PROCS 1  # Cache tests are single-rank CPU operations
 )
 
 # Test: ActivationTraits (trait dispatch to softmax primitives, GEMM, workspace allocation)
@@ -685,32 +589,6 @@ target_link_libraries(v2_test_cpu_swiglu_kernel
 add_v2_test(V2_Unit_CPUSwiGLUKernelT 
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu_kernel>
     LABELS "V2;Unit;Kernels;SwiGLU;CPU"
-    MPI_PROCS 1
-)
-
-# Test: OneDNN Blockwise GEMM microkernel (Q8_1 × quantized weights)
-add_executable(v2_test_onednn_blockwise_gemm unit/kernels/Test__OneDNNBlockwiseGEMM.cpp)
-target_link_libraries(v2_test_onednn_blockwise_gemm 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_OneDNNBlockwiseGEMM 
-    COMMAND $<TARGET_FILE:v2_test_onednn_blockwise_gemm>
-    LABELS "V2;Unit;Kernels;GEMM;OneDNN;BRGEMM;Quantization;Q8_1;Q4_0"
-    MPI_PROCS 1
-)
-
-# Test: OneDNN Column Sum Optimization (precomputed compensation)
-add_executable(v2_test_onednn_column_sum_optimization unit/kernels/Test__OneDNN_ColumnSumOptimization.cpp)
-target_link_libraries(v2_test_onednn_column_sum_optimization
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_OneDNNColumnSumOptimization
-    COMMAND $<TARGET_FILE:v2_test_onednn_column_sum_optimization>
-    LABELS "V2;Unit;Kernels;GEMM;OneDNN;BRGEMM;Optimization;ColumnSum;Performance"
     MPI_PROCS 1
 )
 
@@ -1489,3 +1367,74 @@ add_v2_test(V2_Unit_IQ4_XSTensor
     COMMAND v2_test_iq4_xs_simd
     LABELS "V2;Unit;TensorOperations;Quantization;IQ4_XS"
 )
+
+# =============================================================================
+# E2E Tests
+# =============================================================================
+# Full pipeline tests with real models and inference
+# Tests complete workflows: load -> prefill -> decode -> validate output
+
+# Qwen2 MPI Rank Parity (single-rank vs multi-rank comparison)
+# These tests compare MPI ranks against each other, NOT against PyTorch ground truth.
+# Only build for Debug or E2ERelease configurations (requires ENABLE_PIPELINE_SNAPSHOTS)
+if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
+    add_executable(v2_test_qwen2_mpi_rank_parity 
+        e2e/Test__Qwen2MPIRankParity.cpp
+        e2e/gtest_mpi_main.cpp
+    )
+    target_link_libraries(v2_test_qwen2_mpi_rank_parity llaminar2_core GTest::gtest MPI::MPI_CXX)
+
+    add_v2_test(V2_E2E_Qwen2MPIRankParity
+        COMMAND $<TARGET_FILE:v2_test_qwen2_mpi_rank_parity>
+        LABELS "V2;E2E;Qwen;MPI;RankParity;Models"
+        MPI_PROCS 2
+    )
+else()
+    message(STATUS "V2: E2E MPI rank parity test disabled (snapshots not available in Release build)")
+    message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
+endif()
+
+# =============================================================================
+# PyTorch Parity Tests
+# =============================================================================
+# Ground truth validation against PyTorch reference implementation
+# Compares layer-by-layer outputs, logits, attention scores, etc.
+
+# Qwen2 FP32 Parity (PyTorch ground truth validation)
+# Requires: PyTorch snapshots generated by python/reference/generate_qwen2_pipeline_snapshots.py
+# Requires: cnpy library for NumPy .npz file loading
+find_package(ZLIB)
+if(ZLIB_FOUND)
+    # Get the workspace root (parent of src/v2)
+    get_filename_component(WORKSPACE_ROOT "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+    
+    # E2E parity test requires ENABLE_PIPELINE_SNAPSHOTS (Debug or E2ERelease builds)
+    # Skip in standard Release builds to avoid linking errors
+    if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR ENABLE_SNAPSHOTS)
+        add_executable(v2_test_qwen2_fp32_parity 
+            e2e/Test__Qwen2FP32Parity.cpp
+            ${WORKSPACE_ROOT}/external/cnpy/cnpy.cpp
+        )
+        target_link_libraries(v2_test_qwen2_fp32_parity 
+            llaminar2_core 
+            GTest::gtest 
+            GTest::gtest_main
+            ZLIB::ZLIB
+        )
+        target_include_directories(v2_test_qwen2_fp32_parity PRIVATE 
+            ${WORKSPACE_ROOT}/external/cnpy
+        )
+        
+        add_v2_test(V2_E2E_Qwen2FP32Parity
+            COMMAND $<TARGET_FILE:v2_test_qwen2_fp32_parity>
+            LABELS "V2;E2E;Qwen;Parity;PyTorch;FP32"
+            MPI_PROCS 1
+        )
+        message(STATUS "V2: E2E parity test enabled (snapshots available)")
+    else()
+        message(STATUS "V2: E2E parity test disabled (snapshots not available in Release build)")
+        message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
+    endif()
+else()
+    message(WARNING "ZLIB not found - Qwen2 FP32 parity test disabled (requires cnpy for .npz loading)")
+endif()

@@ -5,8 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
-#include "../kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
+#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "../kernels/cpu/CPUSoftmaxKernelT.h"
 #include "../kernels/cpu/CPURMSNormKernelT.h"
 
@@ -194,7 +193,7 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> Q8_1Tensor::createGemm()
     {
         // Use custom JIT GEMM kernel for Q8_1
-        return std::make_unique<llaminar2::gemm_v4::Q8_1GemmKernel>(this);
+        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
     }
 
     std::unique_ptr<ITensorRoPE> Q8_1Tensor::createRoPE()
@@ -669,6 +668,25 @@ namespace llaminar2
 
         // Create and return Q8_1Tensor
         return std::make_shared<Q8_1Tensor>(shape, raw_data);
+    }
+
+    bool Q8_1Tensor::applyRMSNorm(
+        const float *gamma,
+        int seq_len,
+        int d_model,
+        float eps,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)gamma;
+        (void)seq_len;
+        (void)d_model;
+        (void)eps;
+        (void)mpi_ctx;
+        (void)device_idx;
+        // Q8_1 tensor doesn't support in-place RMSNorm - use createRMSNorm() instead
+        LOG_ERROR("[Q8_1Tensor::applyRMSNorm] Not supported for Q8_1 tensors");
+        return false;
     }
 
 } // namespace llaminar2

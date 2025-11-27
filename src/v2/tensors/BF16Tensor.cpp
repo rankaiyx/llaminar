@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
 #include "../utils/Logger.h"
 #include "../utils/BFloat16.h"
 #include "SIMDHelpers.h"
@@ -196,10 +196,9 @@ namespace llaminar2
         }
         else
         {
-            // Tensor is on CPU - use auto-tuned CPU kernel
-            // BF16 implements ITensorGemmTileDataProvider interface (used generically for auto-tuner)
-            LOG_DEBUG("[BF16Tensor] Creating CPU GEMM kernel with auto-tuner");
-            return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+            // Tensor is on CPU - use OneDNN-backed floating-point GEMM kernel
+            LOG_DEBUG("[BF16Tensor] Creating FloatingPointGemmKernel for BF16");
+            return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(this);
         }
     }
 
@@ -641,6 +640,30 @@ namespace llaminar2
         }
 
         return pack;
+    }
+
+    bool BF16Tensor::applyRMSNorm(
+        const float *gamma,
+        int seq_len,
+        int d_model,
+        float eps,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        auto kernel = createRMSNorm();
+        if (!kernel)
+        {
+            LOG_ERROR("[BF16Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
+            return false;
+        }
+
+        // BF16 path: apply_bf16() with BF16 buffers (in-place)
+        return kernel->apply_bf16(
+            this->bf16_data(),
+            gamma,
+            this->mutable_bf16_data(),
+            seq_len, d_model, eps,
+            device_idx);
     }
 
     bool BF16Tensor::applyRoPE(

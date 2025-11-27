@@ -22,6 +22,7 @@
 #include "../PipelineBase.h"
 #include "../TensorDimensions.h"
 #include "../../tensors/BatchedKVCache.h"
+#include "../../kernels/cpu/fused/FusedGEMM.h"
 
 namespace llaminar2
 {
@@ -53,6 +54,11 @@ namespace llaminar2
             std::shared_ptr<TensorBase> up_proj;   // FFN up projection [d_model, d_ff]
             std::shared_ptr<TensorBase> down_proj; // FFN down projection [d_ff, d_model]
             std::shared_ptr<TensorBase> ffn_norm;  // Pre-FFN norm gamma [d_model]
+
+            // Fused GEMM kernels (lazily initialized)
+            // These quantize activations once and reuse for multiple projections
+            mutable std::unique_ptr<FusedGEMM> qkv_fused;     // Q/K/V fused projection
+            mutable std::unique_ptr<FusedGEMM> gate_up_fused; // Gate/Up fused projection
         };
 
         /**
@@ -79,22 +85,20 @@ namespace llaminar2
         const float *logits() const override { return getLogits(0); } // Return logits for first sequence
 
         /**
-         * @brief Get output logits for a specific sequence in batch (FP32)
-         *
-         * Overrides PipelineBase to support batched inference.
-         *
-         * @param seq_idx Sequence index in batch (default=0)
-         * @return Logits tensor [padded_seq_len, vocab_size], or nullptr if forward() not called
-         */
-        const float *getLogits(int seq_idx = 0) const override;
-
-        /**
          * @brief Batch-first forward pass (primary interface)
          *
          * @param token_batches Vector of token sequences (batch_size sequences)
          * @return true if forward pass succeeded
          */
         bool forward_batch(const std::vector<std::vector<int>> &token_batches);
+
+        /**
+         * @brief Get output logits for E2E testing/validation
+         *
+         * @param seq_idx Sequence index in batch (default=0)
+         * @return Logits tensor [padded_seq_len, vocab_size], or nullptr if forward() not called
+         */
+        const float *getLogits(int seq_idx = 0) const;
 
         /**
          * @brief Get batch size

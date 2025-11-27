@@ -299,23 +299,6 @@ namespace llaminar2
             0, n_));
     }
 
-    // =============================================================================
-    // Kernel Contract Tests
-    // =============================================================================
-
-    TEST_F(Test__FusedDequantSwiGLU, KernelContract)
-    {
-        FusedDequantSwiGLU kernel;
-        auto contract = kernel.get_contract();
-
-        EXPECT_EQ(contract.output_format, TensorFormat::FP32);
-        EXPECT_TRUE(contract.is_fusable);
-        EXPECT_FALSE(contract.supports_inplace);
-        EXPECT_TRUE(kernel.supports_fusion());
-        EXPECT_EQ(kernel.preferred_fusion_format(), TensorFormat::FP32);
-        EXPECT_TRUE(kernel.supports_device(-1)); // CPU
-    }
-
 } // namespace llaminar2
 
 int main(int argc, char **argv)

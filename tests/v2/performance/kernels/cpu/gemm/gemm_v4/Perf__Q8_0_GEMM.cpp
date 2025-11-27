@@ -31,7 +31,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
+#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 
 using namespace llaminar2;
 

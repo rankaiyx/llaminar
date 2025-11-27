@@ -6,7 +6,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
 #include "../utils/Logger.h"
 #include "TensorKernels.h"
 #include "SIMDHelpers.h"
@@ -109,9 +109,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> FP32Tensor::createGemm()
     {
-        // FP32 tensors use the auto-tuned GEMM kernel for optimal performance
-        // FP32Tensor implements ITensorGemmTileDataProvider with block_size() = 32
-        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+        // FP32 tensors use OneDNN-backed floating-point GEMM kernel
+        return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(this);
     }
 
     std::unique_ptr<ITensorRoPE> FP32Tensor::createRoPE()
@@ -568,6 +567,32 @@ namespace llaminar2
         }
 
         return pack;
+    }
+
+    bool FP32Tensor::applyRMSNorm(
+        const float *gamma,
+        int seq_len,
+        int d_model,
+        float eps,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        auto kernel = createRMSNorm();
+        if (!kernel)
+        {
+            LOG_ERROR("[FP32Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
+            return false;
+        }
+
+        // FP32 path: apply() with FP32 buffers (in-place)
+        return kernel->apply(
+            this->data(),
+            gamma,
+            this->mutable_data(),
+            seq_len, d_model, eps,
+            false, // normalize_gamma
+            mpi_ctx,
+            device_idx);
     }
 
     bool FP32Tensor::from_int32_with_scales(

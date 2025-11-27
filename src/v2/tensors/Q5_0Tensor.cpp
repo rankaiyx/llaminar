@@ -1,5 +1,4 @@
 #include "../utils/Logger.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 /**
  * @file Q5_0Tensor.cpp
  * @brief Q5_0 quantized tensor implementation (5-bit uniform quantization)
@@ -8,6 +7,7 @@
  */
 
 #include "Tensors.h"
+#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/CPUFeatures.h"
 #include "FP16Utils.h"
@@ -116,7 +116,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q5_0Tensor::createGemm()
     {
-        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+        // Use QuantisedGemmKernel - requires IINT8Unpackable interface
+        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
     }
 
     std::shared_ptr<TensorBase> Q5_0Tensor::create_view(

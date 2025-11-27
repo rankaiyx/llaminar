@@ -80,34 +80,42 @@ protected:
 
     /**
      * @brief Decode Q4_0 block to FP32 (ground truth)
+     *
+     * Uses SPLIT LAYOUT to match SIMD unpacking for QuantisedGemmKernel:
+     * - output[0..15]: low nibbles from qs[0..15]
+     * - output[16..31]: high nibbles from qs[0..15]
      */
     void decodeQ4_0BlockToFP32(const Q4_0Block &block, float *output)
     {
         float d = fp16_to_fp32(block.d);
 
+        // SPLIT LAYOUT: low nibbles in [0..15], high nibbles in [16..31]
         for (int i = 0; i < 16; ++i)
         {
             uint8_t packed = block.qs[i];
-            int8_t q0 = (packed & 0x0F) - 8; // Extract low nibble, remove offset
-            int8_t q1 = (packed >> 4) - 8;   // Extract high nibble, remove offset
+            int8_t q_lo = (packed & 0x0F) - 8; // Extract low nibble, remove offset
+            int8_t q_hi = (packed >> 4) - 8;   // Extract high nibble, remove offset
 
-            output[i * 2] = q0 * d;
-            output[i * 2 + 1] = q1 * d;
+            output[i] = q_lo * d;      // Low nibbles in first half
+            output[i + 16] = q_hi * d; // High nibbles in second half
         }
     }
 
     /**
      * @brief Unpack Q4_0 block to native int8 range [-8, 7] (REFERENCE IMPLEMENTATION)
+     *
+     * Uses SPLIT LAYOUT to match SIMD unpacking for QuantisedGemmKernel:
+     * - output[0..15]: low nibbles from qs[0..15]
+     * - output[16..31]: high nibbles from qs[0..15]
      */
     void unpackQ4_0BlockToInt8(const Q4_0Block &block, int8_t *output)
     {
-        // Unpack 4-bit nibbles to native Q4_0 range [-8, 7]
-        for (int i = 0; i < 32; ++i)
+        // SPLIT LAYOUT: low nibbles in [0..15], high nibbles in [16..31]
+        for (int i = 0; i < 16; ++i)
         {
-            uint8_t packed = block.qs[i / 2];
-            int8_t val = (i % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
-            val -= 8; // Q4_0 native range: [-8, 7]
-            output[i] = val;
+            uint8_t packed = block.qs[i];
+            output[i] = (packed & 0x0F) - 8;    // Low nibbles in first half
+            output[i + 16] = (packed >> 4) - 8; // High nibbles in second half
         }
     }
 
@@ -383,11 +391,16 @@ TEST_F(Test__NativeFormatDecode, Q4_0_EdgeCases)
         EXPECT_TRUE(all_in_range) << "All unpacked values should be in Q4_0 range [-8, 7]";
 
         // Verify decoded values preserve accuracy
+        // SPLIT LAYOUT mapping:
+        // - output[0..15] = low nibbles → original indices 0, 2, 4, ... 30
+        // - output[16..31] = high nibbles → original indices 1, 3, 5, ... 31
         for (int i = 0; i < 32; ++i)
         {
             float reconstructed = output[i] * scale;
-            EXPECT_NEAR(reconstructed, large[i], large[i] * 0.15f)
-                << "Large values should preserve relative accuracy";
+            size_t original_idx = (i < 16) ? (i * 2) : ((i - 16) * 2 + 1);
+            EXPECT_NEAR(reconstructed, large[original_idx], large[original_idx] * 0.15f)
+                << "Large values should preserve relative accuracy (output[" << i
+                << "] → large[" << original_idx << "])";
         }
     }
 }

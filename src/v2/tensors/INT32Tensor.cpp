@@ -6,7 +6,6 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../utils/Logger.h"
 #include "../kernels/cpu/CPURMSNormKernelT.h"
 #include "../kernels/cpu/CpuAttentionKernelT.h"

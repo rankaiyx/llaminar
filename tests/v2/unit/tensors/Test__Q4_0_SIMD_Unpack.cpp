@@ -93,7 +93,7 @@ TEST_F(Q4_0_SIMD_Unpack, ScalarReference_Pattern)
     Q4_0Block block = create_test_block_pattern();
     int8_t output[32];
 
-    unpack_q4_0_to_int8_scalar(&block, output);
+    unpack_q4_0_to_int8_scalar(block, output);
 
     // Verify pattern with split layout (GGUF Q4_0 spec):
     // Indices 0-15: Low nibbles of qs[0..15] -> even numbers 0, 2, 4...
@@ -125,7 +125,7 @@ TEST_F(Q4_0_SIMD_Unpack, ScalarReference_AllZeros)
     block.d = fp32_to_fp16(1.0f);
 
     int8_t output[32];
-    unpack_q4_0_to_int8_scalar(&block, output);
+    unpack_q4_0_to_int8_scalar(block, output);
 
     // All nibbles = 0 → all output = -8
     for (size_t i = 0; i < 32; ++i)
@@ -142,7 +142,7 @@ TEST_F(Q4_0_SIMD_Unpack, ScalarReference_AllOnes)
     block.d = fp32_to_fp16(1.0f);
 
     int8_t output[32];
-    unpack_q4_0_to_int8_scalar(&block, output);
+    unpack_q4_0_to_int8_scalar(block, output);
 
     // All nibbles = 15 → all output = 7
     for (size_t i = 0; i < 32; ++i)
@@ -157,7 +157,7 @@ TEST_F(Q4_0_SIMD_Unpack, ScalarReference_Range)
     Q4_0Block block = create_test_block_pattern();
     int8_t output[32];
 
-    unpack_q4_0_to_int8_scalar(&block, output);
+    unpack_q4_0_to_int8_scalar(block, output);
 
     // Verify range: all values in [-8, 7]
     for (size_t i = 0; i < 32; ++i)
@@ -183,8 +183,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX2_vs_Scalar_Pattern)
     int8_t scalar_output[32];
     int8_t avx2_output[32];
 
-    unpack_q4_0_to_int8_scalar(&block, scalar_output);
-    unpack_q4_0_to_int8_avx2(&block, avx2_output);
+    unpack_q4_0_to_int8_scalar(block, scalar_output);
+    unpack_q4_0_to_int8_avx2(block, avx2_output);
 
     verify_arrays_equal(scalar_output, avx2_output, 32, "AVX2 vs Scalar (pattern)");
 }
@@ -203,8 +203,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX2_vs_Scalar_Random)
         int8_t scalar_output[32];
         int8_t avx2_output[32];
 
-        unpack_q4_0_to_int8_scalar(&block, scalar_output);
-        unpack_q4_0_to_int8_avx2(&block, avx2_output);
+        unpack_q4_0_to_int8_scalar(block, scalar_output);
+        unpack_q4_0_to_int8_avx2(block, avx2_output);
 
         verify_arrays_equal(scalar_output, avx2_output, 32,
                             "AVX2 vs Scalar (random trial " + std::to_string(trial) + ")");
@@ -227,8 +227,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX2_vs_Scalar_EdgeCases)
         int8_t scalar_output[32];
         int8_t avx2_output[32];
 
-        unpack_q4_0_to_int8_scalar(&block, scalar_output);
-        unpack_q4_0_to_int8_avx2(&block, avx2_output);
+        unpack_q4_0_to_int8_scalar(block, scalar_output);
+        unpack_q4_0_to_int8_avx2(block, avx2_output);
 
         verify_arrays_equal(scalar_output, avx2_output, 32, "AVX2 vs Scalar (all zeros)");
     }
@@ -242,8 +242,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX2_vs_Scalar_EdgeCases)
         int8_t scalar_output[32];
         int8_t avx2_output[32];
 
-        unpack_q4_0_to_int8_scalar(&block, scalar_output);
-        unpack_q4_0_to_int8_avx2(&block, avx2_output);
+        unpack_q4_0_to_int8_scalar(block, scalar_output);
+        unpack_q4_0_to_int8_avx2(block, avx2_output);
 
         verify_arrays_equal(scalar_output, avx2_output, 32, "AVX2 vs Scalar (all ones)");
     }
@@ -260,8 +260,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX2_vs_Scalar_EdgeCases)
         int8_t scalar_output[32];
         int8_t avx2_output[32];
 
-        unpack_q4_0_to_int8_scalar(&block, scalar_output);
-        unpack_q4_0_to_int8_avx2(&block, avx2_output);
+        unpack_q4_0_to_int8_scalar(block, scalar_output);
+        unpack_q4_0_to_int8_avx2(block, avx2_output);
 
         verify_arrays_equal(scalar_output, avx2_output, 32, "AVX2 vs Scalar (alternating)");
     }
@@ -284,8 +284,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX512_vs_Scalar_Pattern)
     int8_t scalar_output[32];
     int8_t avx512_output[32];
 
-    unpack_q4_0_to_int8_scalar(&block, scalar_output);
-    unpack_q4_0_to_int8_avx512(&block, avx512_output);
+    unpack_q4_0_to_int8_scalar(block, scalar_output);
+    unpack_q4_0_to_int8_avx512(block, avx512_output);
 
     verify_arrays_equal(scalar_output, avx512_output, 32, "AVX-512 vs Scalar (pattern)");
 }
@@ -304,8 +304,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX512_vs_Scalar_Random)
         int8_t scalar_output[32];
         int8_t avx512_output[32];
 
-        unpack_q4_0_to_int8_scalar(&block, scalar_output);
-        unpack_q4_0_to_int8_avx512(&block, avx512_output);
+        unpack_q4_0_to_int8_scalar(block, scalar_output);
+        unpack_q4_0_to_int8_avx512(block, avx512_output);
 
         verify_arrays_equal(scalar_output, avx512_output, 32,
                             "AVX-512 vs Scalar (random trial " + std::to_string(trial) + ")");
@@ -328,8 +328,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX512_vs_Scalar_EdgeCases)
         int8_t scalar_output[32];
         int8_t avx512_output[32];
 
-        unpack_q4_0_to_int8_scalar(&block, scalar_output);
-        unpack_q4_0_to_int8_avx512(&block, avx512_output);
+        unpack_q4_0_to_int8_scalar(block, scalar_output);
+        unpack_q4_0_to_int8_avx512(block, avx512_output);
 
         verify_arrays_equal(scalar_output, avx512_output, 32, "AVX-512 vs Scalar (all zeros)");
     }
@@ -343,8 +343,8 @@ TEST_F(Q4_0_SIMD_Unpack, AVX512_vs_Scalar_EdgeCases)
         int8_t scalar_output[32];
         int8_t avx512_output[32];
 
-        unpack_q4_0_to_int8_scalar(&block, scalar_output);
-        unpack_q4_0_to_int8_avx512(&block, avx512_output);
+        unpack_q4_0_to_int8_scalar(block, scalar_output);
+        unpack_q4_0_to_int8_avx512(block, avx512_output);
 
         verify_arrays_equal(scalar_output, avx512_output, 32, "AVX-512 vs Scalar (all ones)");
     }
@@ -361,8 +361,8 @@ TEST_F(Q4_0_SIMD_Unpack, AutoDispatch_Pattern)
     int8_t scalar_output[32];
     int8_t dispatch_output[32];
 
-    unpack_q4_0_to_int8_scalar(&block, scalar_output);
-    unpack_q4_0_to_int8(&block, dispatch_output);
+    unpack_q4_0_to_int8_scalar(block, scalar_output);
+    unpack_q4_0_to_int8(block, dispatch_output);
 
     verify_arrays_equal(scalar_output, dispatch_output, 32, "Auto-dispatch vs Scalar (pattern)");
 }
@@ -376,8 +376,8 @@ TEST_F(Q4_0_SIMD_Unpack, AutoDispatch_Random)
         int8_t scalar_output[32];
         int8_t dispatch_output[32];
 
-        unpack_q4_0_to_int8_scalar(&block, scalar_output);
-        unpack_q4_0_to_int8(&block, dispatch_output);
+        unpack_q4_0_to_int8_scalar(block, scalar_output);
+        unpack_q4_0_to_int8(block, dispatch_output);
 
         verify_arrays_equal(scalar_output, dispatch_output, 32,
                             "Auto-dispatch vs Scalar (random trial " + std::to_string(trial) + ")");
@@ -397,7 +397,7 @@ TEST_F(Q4_0_SIMD_Unpack, DISABLED_Benchmark)
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < N_TRIALS; ++i)
     {
-        unpack_q4_0_to_int8(&block, output);
+        unpack_q4_0_to_int8(block, output);
     }
     auto end = std::chrono::high_resolution_clock::now();
 

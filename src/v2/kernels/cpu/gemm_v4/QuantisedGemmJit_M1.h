@@ -11,7 +11,7 @@ namespace llaminar2
     namespace gemm_v4
     {
 
-        struct Q8_1PackedWeights
+        struct QuantisedPackedWeights
         {
             // Packed data: [K/4][N][4] (int8_t)
             // But we flatten it to [K/4 * N * 4]
@@ -27,7 +27,7 @@ namespace llaminar2
             int N;
         };
 
-        struct Q8_1GemmParams
+        struct QuantisedGemmParams
         {
             const void *A;
             const void *B_packed;
@@ -44,27 +44,29 @@ namespace llaminar2
             float *local_sum; // Output: Local sum for each 64-col block
             bool do_softmax;
             int A_stride;
+            const float *gate_input; // For SwiGLU
+            bool do_swiglu;
         };
 
-        class Q8_1GemmJit_M1 : public Xbyak::CodeGenerator
+        class QuantisedGemmJit_M1 : public Xbyak::CodeGenerator
         {
         public:
-            Q8_1GemmJit_M1() : Xbyak::CodeGenerator(4096 * 32)
+            QuantisedGemmJit_M1() : Xbyak::CodeGenerator(4096 * 32)
             { // Allocate enough space
                 generate();
             }
 
             // Signature:
-            using kernel_func_t = void (*)(const Q8_1GemmParams *params);
+            using kernel_func_t = void (*)(const QuantisedGemmParams *params);
 
             kernel_func_t get_kernel()
             {
                 return getCode<kernel_func_t>();
             }
 
-            static void pack_weights(const int8_t *B, int K, int N, Q8_1PackedWeights &packed)
+            static void pack_weights(const int8_t *B, int K, int N, QuantisedPackedWeights &packed)
             {
-                // Dummy implementation for now, real one in Q8_1GemmKernel
+                // Dummy implementation for now, real one in QuantisedGemmKernel
                 packed.K = K;
                 packed.N = N;
                 packed.packed_data.resize(K * N);
@@ -498,6 +500,125 @@ namespace llaminar2
                         vmovss(ptr[rdx + r15], xmm4);
                     }
                     L(skip_softmax);
+
+                    // 4. SwiGLU
+                    // Reload params (rax might be clobbered)
+                    mov(rax, ptr[rsp + 8]);
+                    cmp(byte[rax + 104], 1); // do_swiglu
+                    Label skip_swiglu;
+                    jne(skip_swiglu, T_NEAR);
+                    {
+                        // Registers for SwiGLU (reuse Softmax regs since they are free now)
+                        const Zmm &zmm_gate = zmm20;
+                        const Zmm &zmm_tmp = zmm21;
+                        const Zmm &zmm_c1_const = zmm22;
+                        const Zmm &zmm_c2_const = zmm23;
+                        const Zmm &zmm_c3_coeff = zmm24;
+                        const Zmm &zmm_c4_const = zmm25;
+                        const Zmm &zmm_c5_const = zmm26;
+                        const Zmm &zmm_inv_ln2 = zmm27;
+                        const Zmm &zmm_max_clip = zmm28;
+                        const Zmm &zmm_min_clip = zmm29;
+                        const Zmm &zmm_127 = zmm30;
+                        const Zmm &zmm_one = zmm31;
+
+                        // Load constants
+                        mov(reg_tmp_32, 0x3fb8aa3b); // 1.44269504 (inv_ln2)
+                        vpbroadcastd(zmm_inv_ln2, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3f7ffffe); // 0.99999994 (c1)
+                        vpbroadcastd(zmm_c1_const, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3f317218); // 0.69314718 (c2)
+                        vpbroadcastd(zmm_c2_const, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3e75fdf1); // 0.24022651 (c3)
+                        vpbroadcastd(zmm_c3_coeff, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3d6356eb); // 0.05550411 (c4)
+                        vpbroadcastd(zmm_c4_const, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3c1d9422); // 0.00961813 (c5)
+                        vpbroadcastd(zmm_c5_const, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x42b00000); // 88.0f (max_clip)
+                        vpbroadcastd(zmm_max_clip, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0xc2b00000); // -88.0f (min_clip)
+                        vpbroadcastd(zmm_min_clip, reg_tmp_32);
+
+                        mov(reg_tmp_32, 0x3f800000); // 1.0f
+                        vpbroadcastd(zmm_one, reg_tmp_32);
+
+                        mov(reg_tmp_32, 127);
+                        vpbroadcastd(zmm_127, reg_tmp_32);
+
+                        // Load gate_input pointer
+                        mov(rdx, ptr[rax + 96]);
+                        // Offset: reg_loop_N * 4
+                        mov(r15, reg_loop_N);
+                        shl(r15, 2);
+                        add(rdx, r15);
+
+                        auto compute_swish = [&](const Zmm &zmm_val, int offset)
+                        {
+                            // Load gate
+                            vmovups(zmm_gate, ptr[rdx + offset * 64]);
+
+                            // Compute sigmoid(gate)
+                            // y = -gate
+                            vxorps(zmm_tmp, zmm_tmp, zmm_tmp);
+                            vsubps(zmm_tmp, zmm_tmp, zmm_gate); // zmm_tmp = -gate
+
+                            // Clip y to [-88, 88]
+                            vminps(zmm_tmp, zmm_tmp, zmm_max_clip);
+                            vmaxps(zmm_tmp, zmm_tmp, zmm_min_clip);
+
+                            // exp(y)
+                            // xf = x * inv_ln2
+                            vmulps(zmm_tmp, zmm_tmp, zmm_inv_ln2);
+
+                            // fx = floor(xf)
+                            // Use zmm18 as fx (zmm_fx) - zmm_bias (zmm18) is free
+                            const Zmm &zmm_fx = zmm18;
+                            vrndscaleps(zmm_fx, zmm_tmp, 0x01);
+
+                            // fpart = xf - fx
+                            vsubps(zmm_tmp, zmm_tmp, zmm_fx);
+
+                            // Polynomial
+                            // p = c5
+                            const Zmm &zmm_p = zmm19; // zmm_mask (zmm19) is free
+                            vmovaps(zmm_p, zmm_c5_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c4_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c3_coeff);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c2_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c1_const);
+
+                            // 2^floor(x/ln2)
+                            vcvtps2dq(zmm_fx, zmm_fx);
+                            vpaddd(zmm_fx, zmm_fx, zmm_127);
+                            vpslld(zmm_fx, zmm_fx, 23);
+
+                            // Result = p * 2^fx
+                            vmulps(zmm_p, zmm_p, zmm_fx); // zmm_p is exp(-gate)
+
+                            // den = 1 + exp
+                            vaddps(zmm_p, zmm_p, zmm_one);
+
+                            // res = gate / den
+                            vdivps(zmm_p, zmm_gate, zmm_p); // zmm_p = swish(gate)
+
+                            // val = val * res
+                            vmulps(zmm_val, zmm_val, zmm_p);
+                        };
+
+                        compute_swish(zmm_c0, 0);
+                        compute_swish(zmm_c1, 1);
+                        compute_swish(zmm_c2, 2);
+                        compute_swish(zmm_c3, 3);
+                    }
+                    L(skip_swiglu);
 
                     // Store C
                     vmovups(ptr[reg_C_cursor + 0 * 64], zmm_c0);

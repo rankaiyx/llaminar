@@ -5047,195 +5047,139 @@ namespace llaminar2
 #endif
         }
 
-        // ========================================================================
-        // Q4_0 Unpacking to INT8 (IINT8Unpackable Interface)
-        // ========================================================================
+        // ============================================================================
+        // Q4_0 → INT8 Unpacking (IINT8Unpackable support)
+        // ============================================================================
 
         /**
-         * @brief Unpack Q4_0 block to INT8 (scalar reference implementation)
+         * @brief Scalar implementation for unpacking Q4_0 block to int8
+         * @param block Q4_0Block containing 32 values in 16 bytes
+         * @param output Output buffer for 32 int8 values
          *
-         * Q4_0 format: 32 elements stored as 16 bytes (2 nibbles per byte)
-         * Native range: 4-bit [0,15] → int8 [-8,7] via subtraction by 8
-         *
-         * @param q4_block Pointer to Q4_0 block (16 bytes quantized + 2 bytes FP16 scale)
-         * @param output Output buffer for 32 int8 values [-8, 7]
+         * Q4_0 stores 32 4-bit values in 16 bytes:
+         * - Lower nibble = first 16 values
+         * - Upper nibble = last 16 values
+         * Values are signed: -8..7 (4-bit signed with bias)
          */
-        inline void unpack_q4_0_to_int8_scalar(
-            const Q4_0Block *q4_block,
-            int8_t *output)
+        inline void unpack_q4_0_to_int8_scalar(const Q4_0Block &block, int8_t *output)
         {
-            // Unpack 4-bit nibbles to native Q4_0 int8 range [-8, 7]
-            // Layout: low nibbles in first half [0..15], high nibbles in second half [16..31]
-            for (size_t i = 0; i < 16; ++i)
+            for (int j = 0; j < 16; ++j)
             {
-                const uint8_t packed = q4_block->qs[i];
-                output[i] = (packed & 0x0F) - 8;
-                output[i + 16] = (packed >> 4) - 8;
+                uint8_t byte = block.qs[j];
+                // Lower nibble: values 0-15, Upper nibble: values 16-31
+                // Q4_0 uses unsigned 0-15 representation, subtract 8 to get signed -8..7
+                output[j] = static_cast<int8_t>((byte & 0xF) - 8);
+                output[j + 16] = static_cast<int8_t>((byte >> 4) - 8);
             }
         }
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
         /**
-         * @brief Unpack Q4_0 block to INT8 (AVX-512 implementation, 16-wide)
+         * @brief AVX512 dual-block implementation for Q4_0 → int8 unpacking
+         * @param block1 First Q4_0Block
+         * @param block2 Second Q4_0Block
+         * @param output1 Output for first block (32 int8 values)
+         * @param output2 Output for second block (32 int8 values)
          *
-         * Strategy:
-         * - Load 16 bytes (32 nibbles) as 128-bit vector
-         * - Unpack nibbles using shuffle + mask operations
-         * - Subtract 8 from each element to get [-8, 7] range
-         * - Store 32 int8 values
-         *
-         * Optimizations:
-         * - Interleaved loads for ILP
-         * - Single shuffle for both low/high nibbles
-         * - Prefetch next block
-         */
-        /**
-         * @brief Unpack TWO Q4_0 blocks to INT8 (AVX-512 implementation)
-         *
-         * This processes 2 blocks (64 nibbles → 64 int8) simultaneously
-         * to fully utilize AVX-512 width
+         * Processes 2 blocks (64 values) simultaneously for better throughput.
          */
         inline void unpack_q4_0_to_int8_avx512_dual(
-            const Q4_0Block *q4_block0,
-            const Q4_0Block *q4_block1,
-            int8_t *output0,
-            int8_t *output1)
+            const Q4_0Block &block1, const Q4_0Block &block2,
+            int8_t *output1, int8_t *output2)
         {
-            // Load both blocks (16 bytes each) into 256-bit register
-            const __m128i packed0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q4_block0->qs));
-            const __m128i packed1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q4_block1->qs));
-            const __m256i packed_256 = _mm256_inserti128_si256(_mm256_castsi128_si256(packed0), packed1, 1);
+            // Load both blocks into a single 256-bit register
+            __m128i raw1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block1.qs));
+            __m128i raw2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block2.qs));
+            __m256i combined = _mm256_set_m128i(raw2, raw1);
 
-            // Broadcast to 512-bit
-            const __m512i packed = _mm512_broadcast_i64x4(packed_256);
+            // Promote to 512-bit for AVX512 operations
+            __m512i raw512 = _mm512_castsi256_si512(combined);
 
-            // Extract nibbles
-            const __m512i mask_low = _mm512_set1_epi8(0x0F);
-            __m512i low_nibbles = _mm512_and_si512(packed, mask_low);
-            __m512i high_nibbles = _mm512_srli_epi16(packed, 4);
-            high_nibbles = _mm512_and_si512(high_nibbles, mask_low);
+            // Extract lower and upper nibbles
+            __m512i low_mask = _mm512_set1_epi8(0x0F);
+            __m512i bias = _mm512_set1_epi8(8);
 
-            // Interleave
-            const __m512i interleaved_low = _mm512_unpacklo_epi8(low_nibbles, high_nibbles);
-            const __m512i interleaved_high = _mm512_unpackhi_epi8(low_nibbles, high_nibbles);
+            __m512i low_nibbles = _mm512_and_si512(raw512, low_mask);
+            __m512i high_nibbles = _mm512_srli_epi16(raw512, 4);
+            high_nibbles = _mm512_and_si512(high_nibbles, low_mask);
 
-            // Subtract 8
-            const __m512i offset = _mm512_set1_epi8(8);
-            const __m512i result_low = _mm512_sub_epi8(interleaved_low, offset);
-            const __m512i result_high = _mm512_sub_epi8(interleaved_high, offset);
+            // Subtract bias (8) to get signed values
+            __m512i low_signed = _mm512_sub_epi8(low_nibbles, bias);
+            __m512i high_signed = _mm512_sub_epi8(high_nibbles, bias);
 
-            // Extract results for each block
-            // Lane 0: block 0 data, Lane 2: block 1 data
-            const __m256i block0_low = _mm512_castsi512_si256(result_low);
-            const __m256i block0_high = _mm512_castsi512_si256(result_high);
-            const __m256i block1_low = _mm512_extracti64x4_epi64(result_low, 1);
-            const __m256i block1_high = _mm512_extracti64x4_epi64(result_high, 1);
-
-            // Store block 0
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output0), _mm256_castsi256_si128(block0_low));
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output0 + 16), _mm256_castsi256_si128(block0_high));
+            // Interleave low and high into final order
+            // For Q4_0: output[0..15] = low nibbles, output[16..31] = high nibbles
+            __m256i low_256 = _mm512_castsi512_si256(low_signed);
+            __m256i high_256 = _mm512_castsi512_si256(high_signed);
 
             // Store block 1
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output1), _mm256_castsi256_si128(block1_low));
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output1 + 16), _mm256_castsi256_si128(block1_high));
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output1), _mm256_castsi256_si128(low_256));
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output1 + 16), _mm256_castsi256_si128(high_256));
+
+            // Store block 2
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output2), _mm256_extracti128_si256(low_256, 1));
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output2 + 16), _mm256_extracti128_si256(high_256, 1));
         }
 
         /**
-         * @brief Unpack Q4_0 block to INT8 (AVX-512 optimized single block)
-         *
-         * Uses 512-bit broadcast and bitwise ops to process the 16-byte block
-         * in parallel lanes, then merges results.
+         * @brief AVX512 single-block implementation for Q4_0 → int8 unpacking
          */
-        inline void unpack_q4_0_to_int8_avx512(
-            const Q4_0Block *q4_block,
-            int8_t *output)
+        inline void unpack_q4_0_to_int8_avx512(const Q4_0Block &block, int8_t *output)
         {
-            // Prefetch next blocks
-            _mm_prefetch(reinterpret_cast<const char *>(q4_block + 1), _MM_HINT_T0);
+            __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+            __m128i low_mask = _mm_set1_epi8(0x0F);
+            __m128i bias = _mm_set1_epi8(8);
 
-            // Load 16 bytes
-            __m128i src128 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q4_block->qs));
+            __m128i low_nibbles = _mm_and_si128(raw, low_mask);
+            __m128i high_nibbles = _mm_srli_epi16(raw, 4);
+            high_nibbles = _mm_and_si128(high_nibbles, low_mask);
 
-            const __m128i mask_low = _mm_set1_epi8(0x0F);
-            const __m128i offset = _mm_set1_epi8(8);
+            __m128i low_signed = _mm_sub_epi8(low_nibbles, bias);
+            __m128i high_signed = _mm_sub_epi8(high_nibbles, bias);
 
-            // Low nibbles -> output[0..15]
-            __m128i low = _mm_and_si128(src128, mask_low);
-            low = _mm_sub_epi8(low, offset);
-
-            // High nibbles -> output[16..31]
-            __m128i high = _mm_srli_epi16(src128, 4);
-            high = _mm_and_si128(high, mask_low);
-            high = _mm_sub_epi8(high, offset);
-
-            // Combine into 256-bit register
-            __m256i result = _mm256_set_m128i(high, low); // high is upper 128, low is lower 128
-            _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), result);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), low_signed);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), high_signed);
         }
-#endif
+#endif // AVX512F + AVX512BW
 
 #if defined(__AVX2__)
         /**
-         * @brief Unpack Q4_0 block to INT8 (AVX2 implementation, 8-wide and 4-wide)
-         *
-         * Strategy:
-         * - Process 8 bytes at a time (16 nibbles → 16 int8)
-         * - Use AVX2 for nibble unpacking
-         * - Fall back to SSE for 4-wide operations
+         * @brief AVX2 implementation for Q4_0 → int8 unpacking
          */
-        inline void unpack_q4_0_to_int8_avx2(
-            const Q4_0Block *q4_block,
-            int8_t *output)
+        inline void unpack_q4_0_to_int8_avx2(const Q4_0Block &block, int8_t *output)
         {
-            // Load 16 bytes (32 nibbles)
-            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q4_block->qs));
+            __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+            __m128i low_mask = _mm_set1_epi8(0x0F);
+            __m128i bias = _mm_set1_epi8(8);
 
-            const __m128i mask_low = _mm_set1_epi8(0x0F);
-            const __m128i offset = _mm_set1_epi8(8);
+            __m128i low_nibbles = _mm_and_si128(raw, low_mask);
+            __m128i high_nibbles = _mm_srli_epi16(raw, 4);
+            high_nibbles = _mm_and_si128(high_nibbles, low_mask);
 
-            // Low nibbles -> output[0..15]
-            __m128i low_nibbles = _mm_and_si128(packed, mask_low);
-            low_nibbles = _mm_sub_epi8(low_nibbles, offset);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), low_nibbles);
+            __m128i low_signed = _mm_sub_epi8(low_nibbles, bias);
+            __m128i high_signed = _mm_sub_epi8(high_nibbles, bias);
 
-            // High nibbles -> output[16..31]
-            __m128i high_nibbles = _mm_srli_epi16(packed, 4);
-            high_nibbles = _mm_and_si128(high_nibbles, mask_low);
-            high_nibbles = _mm_sub_epi8(high_nibbles, offset);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), high_nibbles);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), low_signed);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), high_signed);
         }
-#endif
+#endif // AVX2
 
         /**
-         * @brief Unpack Q4_0 block to INT8 (auto-dispatch to best SIMD path)
-         *
-         * Dispatches to:
-         * - AVX-512: 16-wide operations
-         * - AVX2: 8-wide operations
-         * - Scalar: Reference implementation
-         *
-         * @param q4_block Pointer to Q4_0 block
+         * @brief Auto-dispatching Q4_0 → int8 unpacker
+         * @param block Q4_0Block to unpack
          * @param output Output buffer for 32 int8 values
+         *
+         * Selects best available SIMD implementation at compile time.
          */
-        inline void unpack_q4_0_to_int8(
-            const Q4_0Block *q4_block,
-            int8_t *output)
+        inline void unpack_q4_0_to_int8(const Q4_0Block &block, int8_t *output)
         {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-            if (cpu_supports_avx512())
-            {
-                unpack_q4_0_to_int8_avx512(q4_block, output);
-                return;
-            }
+            unpack_q4_0_to_int8_avx512(block, output);
+#elif defined(__AVX2__)
+            unpack_q4_0_to_int8_avx2(block, output);
+#else
+            unpack_q4_0_to_int8_scalar(block, output);
 #endif
-#if defined(__AVX2__)
-            if (cpu_supports_avx2())
-            {
-                unpack_q4_0_to_int8_avx2(q4_block, output);
-                return;
-            }
-#endif
-            unpack_q4_0_to_int8_scalar(q4_block, output);
         }
 
     } // namespace simd

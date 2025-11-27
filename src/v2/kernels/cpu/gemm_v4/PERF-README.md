@@ -1,15 +1,15 @@
-# Q8_1 GEMM Performance Optimization Report
+# Quantised GEMM Performance Optimization Report
 
 **Date:** November 25, 2025
-**Kernel:** `src/v2/kernels/cpu/gemm_v4/Q8_1GemmKernel.h`
+**Kernel:** `src/v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h`
 **Test Suites:** 
-- `tests/v2/performance/Perf__Q8_1_GEMM.cpp`
-- `tests/v2/performance/Perf__Q8_0_GEMM.cpp`
-- `tests/v2/performance/Perf__Q4_0_GEMM.cpp`
+- `tests/v2/performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_GEMM.cpp`
+- `tests/v2/performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_0_GEMM.cpp`
+- `tests/v2/performance/kernels/cpu/gemm/gemm_v4/Perf__Q4_0_GEMM.cpp`
 
 ## Executive Summary
 
-This document details the optimization journey for the `Q8_1` (8-bit quantized weights, FP32 activation) GEMM kernel. The goal was to achieve high throughput (>1500 GFLOPS) across a wide range of model sizes (Qwen 0.5B to 32B) and batch sizes (M=1 to M=512).
+This document details the optimization journey for the **Quantised GEMM** kernel (8-bit quantized weights with FP32 or Q8_1 activations). The goal was to achieve high throughput (>1500 GFLOPS) across a wide range of model sizes (Qwen 0.5B to 32B) and batch sizes (M=1 to M=512).
 
 **Key Achievements:**
 - **Qwen 32B FFN Down**: Achieved **~2100 GFLOPS** (M=512), saturating compute capability.
@@ -106,7 +106,7 @@ ctest --test-dir build_v2_release -R "V2_Perf_Q.*_GEMM$" --verbose
 | **Qwen 0.5B** | FFN Down | 896, 4864 | 250 | 1277 | 1594 | **1398** |
 
 ## Conclusion
-The `Q8_1` kernel is now highly robust. It dynamically adapts its blocking strategy to handle:
+The **Quantised GEMM** kernel is now highly robust. It dynamically adapts its blocking strategy to handle:
 1.  **Massive K dimensions** (via K-tiling) to preserve L2 locality.
 2.  **Small N dimensions** (via adaptive splitting) to ensure thread saturation.
 3.  **Large Batch Sizes** (via conservative cache targets) to prevent thrashing.

@@ -51,33 +51,6 @@ namespace llaminar2
         ~FusedSwiGLU() override = default;
 
         // =============================================================================
-        // CPUKernelBase Interface (Fusion Framework)
-        // =============================================================================
-
-        /**
-         * @brief Get kernel I/O contract for fusion pattern detection
-         */
-        KernelContract get_contract() const override
-        {
-            return KernelContract{
-                .accepted_input_formats = {TensorFormat::FP32}, // Accept FP32 inputs
-                .output_format = TensorFormat::FP32,            // Produce FP32 output
-                .supports_inplace = true,                       // Can write to gate buffer
-                .is_fusable = true                              // Can fuse with downstream ops
-            };
-        }
-
-        bool supports_fusion() const override
-        {
-            return true;
-        }
-
-        TensorFormat preferred_fusion_format() const override
-        {
-            return TensorFormat::FP32;
-        }
-
-        // =============================================================================
         // Execution Interface
         // =============================================================================
 

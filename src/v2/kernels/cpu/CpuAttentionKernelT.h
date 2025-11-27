@@ -38,9 +38,9 @@ namespace llaminar2
     /**
      * @brief Template-based CPU attention kernel
      *
-     * @tparam TensorType Tensor type (FP32Tensor, BF16Tensor, FP16Tensor, INT32Tensor)
+     * @tparam TensorT Tensor type (FP32Tensor, BF16Tensor, FP16Tensor, INT32Tensor)
      *
-     * Uses ActivationTraits<TensorType> for precision-specific operations:
+     * Uses ActivationTraits<TensorT> for precision-specific operations:
      * - apply_softmax(): Native precision softmax (FP32/BF16/FP16) or conversion (INT32)
      * - create_activation_gemm(): Precision-specific GEMM kernel
      * - allocate_workspace(): Precision-specific workspace allocation
@@ -771,6 +771,4 @@ namespace llaminar2
     extern template class CpuAttentionKernelT<FP32Tensor>;
     extern template class CpuAttentionKernelT<BF16Tensor>;
     extern template class CpuAttentionKernelT<FP16Tensor>;
-    extern template class CpuAttentionKernelT<INT32Tensor>;
-
 } // namespace llaminar2

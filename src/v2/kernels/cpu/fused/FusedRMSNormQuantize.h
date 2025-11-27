@@ -53,33 +53,6 @@ namespace llaminar2
         ~FusedRMSNormQuantize() override = default;
 
         // =============================================================================
-        // CPUKernelBase Interface (Fusion Framework)
-        // =============================================================================
-
-        /**
-         * @brief Get kernel I/O contract for fusion pattern detection
-         */
-        KernelContract get_contract() const override
-        {
-            return KernelContract{
-                .accepted_input_formats = {TensorFormat::FP32}, // Accept FP32 input
-                .output_format = TensorFormat::FP32,            // Produce FP32 output
-                .supports_inplace = true,                       // Can write in-place
-                .is_fusable = true                              // Can be fused with GEMM consumers
-            };
-        }
-
-        bool supports_fusion() const override
-        {
-            return true;
-        }
-
-        TensorFormat preferred_fusion_format() const override
-        {
-            return TensorFormat::FP32; // FP32 output for fusion chains
-        }
-
-        // =============================================================================
         // ITensorRMSNorm Interface (Standard RMSNorm API)
         // =============================================================================
 

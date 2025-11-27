@@ -94,11 +94,10 @@ namespace llaminar2
      */
     enum class ActivationPrecision
     {
-        FP32,  ///< 32-bit float activations (default, highest accuracy)
-        BF16,  ///< bfloat16 activations (Intel AMX, reduced bandwidth)
-        FP16,  ///< 16-bit float activations (ARM/GPU optimization)
-        INT32, ///< 32-bit integer activations (for accumulation in quantized pipelines),
-        INT8   ///< 8-bit integer activations (for quantized pipelines)
+        FP32, ///< 32-bit float activations (default, highest accuracy)
+        BF16, ///< bfloat16 activations (Intel AMX, reduced bandwidth)
+        FP16, ///< 16-bit float activations (ARM/GPU optimization)
+        INT32 ///< 32-bit integer activations (for accumulation in quantized pipelines)
     };
 
     /**

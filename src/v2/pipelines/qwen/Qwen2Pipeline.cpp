@@ -20,8 +20,8 @@
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/BatchPaddingUtils.h"
 #include "../../kernels/cpu/CPURMSNormKernelT.h"
-#include "../../kernels/cpu/fused/FusedDualGEMM.h"
-#include "../../kernels/cpu/fused/FusedTripleGEMM.h"
+#include "../../kernels/cpu/CPUSwiGLUKernelT.h"
+#include "../../kernels/cpu/fused/FusedGEMM.h"
 #include "../../kernels/cpu/fused/FusedDequantSwiGLU.h"
 #include <iostream>
 #include <fstream>
@@ -251,9 +251,6 @@ namespace llaminar2
             case ActivationPrecision::INT32:
                 return std::make_shared<INT32Tensor>(shape);
 
-            case ActivationPrecision::INT8:
-                return std::make_shared<INT8Tensor>(shape);
-
             default:
                 LOG_ERROR("Unknown activation precision, defaulting to FP32");
                 return std::make_shared<FP32Tensor>(shape, device_idx);
@@ -281,21 +278,6 @@ namespace llaminar2
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
             device_idx, precision);
 
-        // INT8 quantization buffers (for FusedRMSNormQuantize output)
-        // Only allocate if using INT8 activation precision
-        if (precision == ActivationPrecision::INT8)
-        {
-            buffers.normalized_int8 = createActivationTensor(
-                {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-                device_idx, ActivationPrecision::INT8);
-            buffers.normalized_scales.resize(effective_max); // Per-row scales
-        }
-        else
-        {
-            buffers.normalized_int8 = nullptr; // Explicitly null when not using INT8
-            buffers.normalized_scales.clear();
-        }
-
         // Attention buffers (Qwen-specific dimensions) - sized for batch
         buffers.Q = createActivationTensor(
             {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
@@ -313,27 +295,6 @@ namespace llaminar2
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
             device_idx, precision);
 
-        // INT32 attention buffers (for FusedTripleGEMM output - raw INT8×INT8→INT32 accumulators)
-        // Always allocate when using INT8 precision (needed for Phase 2 fused kernels)
-        if (precision == ActivationPrecision::INT8)
-        {
-            buffers.Q_int32 = createActivationTensor(
-                {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
-                device_idx, ActivationPrecision::INT32);
-            buffers.K_int32 = createActivationTensor(
-                {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-                device_idx, ActivationPrecision::INT32);
-            buffers.V_int32 = createActivationTensor(
-                {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-                device_idx, ActivationPrecision::INT32);
-        }
-        else
-        {
-            buffers.Q_int32 = nullptr;
-            buffers.K_int32 = nullptr;
-            buffers.V_int32 = nullptr;
-        }
-
         // FFN buffers (Qwen-specific d_ff_) - sized for batch
         buffers.gate = createActivationTensor(
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
@@ -344,23 +305,6 @@ namespace llaminar2
         buffers.ffn_output = createActivationTensor(
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
             device_idx, precision);
-
-        // INT32 FFN buffers (for FusedDualGEMM output - raw INT8×INT8→INT32 accumulators)
-        // Always allocate when using INT8 precision (needed for Phase 2 fused kernels)
-        if (precision == ActivationPrecision::INT8)
-        {
-            buffers.gate_int32 = createActivationTensor(
-                {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
-                device_idx, ActivationPrecision::INT32);
-            buffers.up_int32 = createActivationTensor(
-                {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
-                device_idx, ActivationPrecision::INT32);
-        }
-        else
-        {
-            buffers.gate_int32 = nullptr;
-            buffers.up_int32 = nullptr;
-        }
 
         return buffers;
     }
@@ -574,107 +518,23 @@ namespace llaminar2
         std::memcpy(normalized_hidden->mutable_data(), input_hidden->data(),
                     effective_seq_len * d_model_ * sizeof(float));
 
-        // 1. Pre-attention RMSNorm + INT8 Quantization (fused for efficiency)
-        // Use FusedRMSNormQuantize to eliminate redundant FP32→INT8 quantization in GEMM
+        // 1. Pre-attention RMSNorm
+        auto *fp32_activation = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
+        VALIDATE_POINTER(fp32_activation, "FP32 activation tensor for RMSNorm");
 
-        // Check if FusedRMSNormQuantize is available and INT8 buffers allocated
-        // NOTE: Fused INT32 path temporarily disabled during FP32 residual migration
-        // The fused kernels now output FP32 (via Q8_1GemmKernel), but pipeline integration
-        // is pending. See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for details.
-        constexpr bool ENABLE_FUSED_INT32_PATH = false; // TODO: Remove when FP32 fused path integrated
-        bool use_fused_quantize = ENABLE_FUSED_INT32_PATH &&
-                                  (buffers.normalized_int8 != nullptr) &&
-                                  (!buffers.normalized_scales.empty());
+        auto rmsnorm_kernel = fp32_activation->createRMSNorm();
+        VALIDATE_POINTER(rmsnorm_kernel, "RMSNorm kernel");
 
-        if (use_fused_quantize)
-        {
-            // Fused path: RMSNorm + INT8 quantization in single kernel
-            // Use kernel from INT8 output tensor (which provides FusedRMSNormQuantize)
-            auto *int8_activation = dynamic_cast<IActivationTensor *>(buffers.normalized_int8.get());
-            VALIDATE_POINTER(int8_activation, "INT8 activation tensor for fused RMSNorm");
-
-            auto rmsnorm_kernel = int8_activation->createRMSNorm();
-            VALIDATE_POINTER(rmsnorm_kernel, "Fused RMSNorm kernel");
-
-            // CRITICAL: Process ALL batch rows, not just effective_seq_len
-            const int total_rows = batch_size_ * padded_seq_len_;
-
-            // Get INT8 buffer directly (don't use dangerous mutable_data() cast)
-            auto *int8_tensor_ptr = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
-            VALIDATE_POINTER(int8_tensor_ptr, "INT8 tensor for quantized output");
-
-            VALIDATE_OP(rmsnorm_kernel->execute(
-                            buffers.residual->data(),             // input (FP32)
-                            layer.attn_norm->data(),              // weight
-                            int8_tensor_ptr->mutable_int8_data(), // output (INT8)
-                            buffers.normalized_scales.data(),     // scales
-                            total_rows, d_model_,
-                            1e-6f, mpi_ctx_.get(), attn_device),
-                        "Attention norm (fused INT8)");
-            VALIDATE_TENSOR_BUFFER(buffers.normalized_int8,
-                                   TensorSpec({static_cast<size_t>(effective_seq_len),
-                                               static_cast<size_t>(d_model_)},
-                                              "normalized_int8"),
-                                   "after_fused_attn_norm_quantize");
-
-            // Register per-row scales with INT8 tensor (critical for correct dequantization)
-            auto *int8_tensor = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
-            if (int8_tensor)
-            {
-                int8_tensor->set_row_scales(buffers.normalized_scales.data(), total_rows);
-
-                // Debug: Verify scale sanity
-                float min_scale = 1e9f, max_scale = -1e9f;
-                for (int r = 0; r < total_rows; ++r)
-                {
-                    min_scale = std::min(min_scale, buffers.normalized_scales[r]);
-                    max_scale = std::max(max_scale, buffers.normalized_scales[r]);
-                }
-                LOG_DEBUG("[FusedQuantize] Attn norm L" << layer_idx
-                                                        << " scales: min=" << min_scale << " max=" << max_scale
-                                                        << " total_rows=" << total_rows << " effective_seq_len=" << effective_seq_len);
-            }
-
-            // Capture INT8 normalized output (convert to FP32 for snapshot compatibility)
-            // CRITICAL FIX: Dequantize only effective_seq_len rows (not total_rows)
-            // BUG: Previously used total_rows, which accessed uninitialized scales beyond effective_seq_len,
-            //      causing garbage in normalized_hidden that propagated through QKV projections
-            auto *int8_tensor_data = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
-            if (int8_tensor_data)
-            {
-                const int8_t *int8_data = int8_tensor_data->int8_data();
-                for (int r = 0; r < effective_seq_len; ++r) // ← FIX: Use effective_seq_len
-                {
-                    const float row_scale = buffers.normalized_scales[r];
-                    for (int c = 0; c < d_model_; ++c)
-                    {
-                        const size_t idx = r * d_model_ + c;
-                        normalized_hidden->mutable_data()[idx] =
-                            static_cast<float>(int8_data[idx]) * row_scale;
-                    }
-                }
-            }
-        }
-        else
-        {
-            // Unfused path (fallback): Separate RMSNorm + implicit quantization in GEMM
-            auto *fp32_activation = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
-            VALIDATE_POINTER(fp32_activation, "FP32 activation tensor for RMSNorm");
-
-            auto rmsnorm_kernel = fp32_activation->createRMSNorm();
-            VALIDATE_POINTER(rmsnorm_kernel, "RMSNorm kernel");
-
-            VALIDATE_OP(rmsnorm_kernel->apply(
-                            buffers.residual->data(),          // input
-                            layer.attn_norm->data(),           // weight
-                            normalized_hidden->mutable_data(), // output
-                            effective_seq_len, d_model_,
-                            1e-6f, // epsilon
-                            false, // normalize_gamma
-                            mpi_ctx_.get(), attn_device),
-                        "Attention norm");
-            VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_attn_norm");
-        }
+        VALIDATE_OP(rmsnorm_kernel->apply(
+                        buffers.residual->data(),          // input
+                        layer.attn_norm->data(),           // weight
+                        normalized_hidden->mutable_data(), // output
+                        effective_seq_len, d_model_,
+                        1e-6f, // epsilon
+                        false, // normalize_gamma
+                        mpi_ctx_.get(), attn_device),
+                    "Attention norm");
+        VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_attn_norm");
 
         // Capture attention norm output (use view to get only valid data, not entire buffer)
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_ATTENTION_NORM",
@@ -692,146 +552,33 @@ namespace llaminar2
             }
         }
 
-        // 2. Q/K/V projections - PHASE 2 FUSED PATH
-        // Use FusedTripleGEMM to eliminate redundant quantization:
-        //   Old: Quant(norm) → q_gemm + Quant(norm) → k_gemm + Quant(norm) → v_gemm → Dequant(Q) + Dequant(K) + Dequant(V)
-        //   New: Quant(norm) → FusedTripleGEMM → [q_int32, k_int32, v_int32] → Dequant → [Q_fp32, K_fp32, V_fp32]
-
-        // NOTE: Fused INT32 path temporarily disabled during FP32 residual migration.
-        // The fused kernels now output FP32 (via Q8_1GemmKernel), but pipeline integration
-        // is pending. See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for details.
-#if 0 // DISABLED: Old INT32 fused path - to be replaced with FP32 fused path
-        if (use_fused_quantize)
+        // 2. Q/K/V projections (FUSED: quantize activations once, reuse for all 3 projections)
+        // Lazily initialize the fused QKV kernel if not already done
+        if (!layer.qkv_fused)
         {
-            // Phase 2: Fused path with FusedTripleGEMM + manual dequantization
-            // Create fused kernel from INT8 activation tensor
-            auto *int8_activation = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
-            VALIDATE_POINTER(int8_activation, "INT8 activation tensor for FusedTripleGEMM");
-
-            auto fused_triple_gemm = int8_activation->createFusedTripleGemm(
+            layer.qkv_fused = std::make_unique<FusedGEMM>(
                 layer.wq.get(), layer.wk.get(), layer.wv.get());
-            VALIDATE_POINTER(fused_triple_gemm, "FusedTripleGEMM kernel");
-
-            // Get INT32 buffers from activation buffers
-            auto *q_int32 = dynamic_cast<INT32Tensor *>(buffers.Q_int32.get());
-            auto *k_int32 = dynamic_cast<INT32Tensor *>(buffers.K_int32.get());
-            auto *v_int32 = dynamic_cast<INT32Tensor *>(buffers.V_int32.get());
-            VALIDATE_POINTER(q_int32, "INT32 Q buffer");
-            VALIDATE_POINTER(k_int32, "INT32 K buffer");
-            VALIDATE_POINTER(v_int32, "INT32 V buffer");
-
-            // Get column scales from weight tensors (for INT32 dequantization)
-            auto *q_weight_int8 = dynamic_cast<INT8Tensor *>(layer.wq.get());
-            auto *k_weight_int8 = dynamic_cast<INT8Tensor *>(layer.wk.get());
-            auto *v_weight_int8 = dynamic_cast<INT8Tensor *>(layer.wv.get());
-            VALIDATE_POINTER(q_weight_int8, "INT8 Q weight");
-            VALIDATE_POINTER(k_weight_int8, "INT8 K weight");
-            VALIDATE_POINTER(v_weight_int8, "INT8 V weight");
-
-            const float *q_col_scales = q_weight_int8->col_scales();
-            const float *k_col_scales = k_weight_int8->col_scales();
-            const float *v_col_scales = v_weight_int8->col_scales();
-            VALIDATE_POINTER(q_col_scales, "Q weight column scales");
-            VALIDATE_POINTER(k_col_scales, "K weight column scales");
-            VALIDATE_POINTER(v_col_scales, "V weight column scales");
-
-            // Execute FusedTripleGEMM: normalized_fp32 → [q_int32, k_int32, v_int32]
-            // Note: FusedTripleGEMM internally quantizes FP32 input to INT8, then performs GEMMs
-            // We pass normalized FP32 buffer (not INT8), as kernel handles quantization
-            const int n_q = n_heads_ * head_dim_;
-            const int n_kv = n_kv_heads_ * head_dim_;
-
-            // FusedTripleGEMM now supports GQA (different Q vs K/V dimensions)
-            VALIDATE_OP(fused_triple_gemm->execute(
-                            normalized_hidden->data(),        // Input FP32 [m, k]
-                            q_int32->mutable_int32_data(),    // Output Q INT32 [m, n_q]
-                            k_int32->mutable_int32_data(),    // Output K INT32 [m, n_kv]
-                            v_int32->mutable_int32_data(),    // Output V INT32 [m, n_kv]
-                            buffers.normalized_scales.data(), // Output row scales [m]
-                            effective_seq_len,                // m (batch size)
-                            n_q,                              // n_q (Q output features)
-                            n_kv,                             // n_kv (K/V output features, may differ for GQA)
-                            d_model_),                        // k (input features)
-                        "FusedTripleGEMM (Q+K+V projections)");
-
-            LOG_DEBUG("[Phase2] FusedTripleGEMM completed, dequantizing Q/K/V INT32 → FP32");
-
-// Dequantize Q: INT32 → FP32 (row_scales * col_scales)
-#pragma omp parallel for collapse(2)
-            for (int r = 0; r < effective_seq_len; ++r)
-            {
-                for (int c = 0; c < n_q; ++c)
-                {
-                    const size_t idx = r * n_q + c;
-                    buffers.Q->mutable_data()[idx] =
-                        static_cast<float>(q_int32->int32_data()[idx]) *
-                        buffers.normalized_scales[r] * q_col_scales[c];
-                }
-            }
-
-// Dequantize K: INT32 → FP32 (row_scales * col_scales)
-#pragma omp parallel for collapse(2)
-            for (int r = 0; r < effective_seq_len; ++r)
-            {
-                for (int c = 0; c < n_kv; ++c)
-                {
-                    const size_t idx = r * n_kv + c;
-                    buffers.K->mutable_data()[idx] =
-                        static_cast<float>(k_int32->int32_data()[idx]) *
-                        buffers.normalized_scales[r] * k_col_scales[c];
-                }
-            }
-
-// Dequantize V: INT32 → FP32 (row_scales * col_scales)
-#pragma omp parallel for collapse(2)
-            for (int r = 0; r < effective_seq_len; ++r)
-            {
-                for (int c = 0; c < n_kv; ++c)
-                {
-                    const size_t idx = r * n_kv + c;
-                    buffers.V->mutable_data()[idx] =
-                        static_cast<float>(v_int32->int32_data()[idx]) *
-                        buffers.normalized_scales[r] * v_col_scales[c];
-                }
-            }
-
-            LOG_DEBUG("[Phase2] Q/K/V dequantization completed");
-            VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_q_proj");
-            VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_k_proj");
-            VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
         }
-        else
-#endif // DISABLED: Old INT32 fused path
-        {
-            // Phase 1: Unfused path (fallback for non-INT8 precision)
-            VALIDATE_KERNEL(q_gemm, layer.wq->createGemm(), "Q GEMM kernel");
-            VALIDATE_KERNEL(k_gemm, layer.wk->createGemm(), "K GEMM kernel");
-            VALIDATE_KERNEL(v_gemm, layer.wv->createGemm(), "V GEMM kernel");
 
-            // Q = hidden @ wq^T
-            VALIDATE_OP(q_gemm->multiply_activations(
-                            normalized_hidden->data(), nullptr, buffers.Q->mutable_data(),
-                            effective_seq_len, n_heads_ * head_dim_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                        "Q projection");
-            VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_q_proj");
+        // Execute fused Q/K/V projection
+        // Q: [seq, n_heads * head_dim], K: [seq, n_kv_heads * head_dim], V: [seq, n_kv_heads * head_dim]
+        VALIDATE_OP(layer.qkv_fused->execute(
+                        normalized_hidden->data(),
+                        buffers.Q->mutable_data(),
+                        buffers.K->mutable_data(),
+                        buffers.V->mutable_data(),
+                        nullptr, nullptr, nullptr, // No biases
+                        effective_seq_len,
+                        n_heads_ * head_dim_,    // n1 = Q dimension
+                        n_kv_heads_ * head_dim_, // n2 = K dimension
+                        n_kv_heads_ * head_dim_, // n3 = V dimension
+                        d_model_,                // k = input dimension
+                        mpi_ctx_.get(), attn_device),
+                    "Fused Q/K/V projection");
 
-            // K = hidden @ wk^T
-            VALIDATE_OP(k_gemm->multiply_activations(
-                            normalized_hidden->data(), nullptr, buffers.K->mutable_data(),
-                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                        "K projection");
-            VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_k_proj");
-
-            // V = hidden @ wv^T
-            VALIDATE_OP(v_gemm->multiply_activations(
-                            normalized_hidden->data(), nullptr, buffers.V->mutable_data(),
-                            effective_seq_len, n_kv_heads_ * head_dim_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), attn_device),
-                        "V projection");
-            VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
-        }
+        VALIDATE_TENSOR_BUFFER(buffers.Q, spec_q(effective_seq_len), "after_q_proj");
+        VALIDATE_TENSOR_BUFFER(buffers.K, spec_kv(effective_seq_len), "after_k_proj");
+        VALIDATE_TENSOR_BUFFER(buffers.V, spec_kv(effective_seq_len), "after_v_proj");
 
         // Capture Q projection
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_Q_PROJECTION", buffers.Q, effective_seq_len, n_heads_ * head_dim_);
@@ -1097,105 +844,23 @@ namespace llaminar2
         std::memcpy(normalized_hidden->mutable_data(), input_hidden->data(),
                     effective_seq_len * d_model_ * sizeof(float));
 
-        // 1. Pre-FFN RMSNorm + INT8 Quantization (fused for efficiency)
+        // 1. Pre-FFN RMSNorm
+        auto *fp32_activation = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
+        VALIDATE_POINTER(fp32_activation, "FP32 activation tensor for FFN RMSNorm");
 
-        // Check if FusedRMSNormQuantize is available and INT8 buffers allocated
-        // NOTE: Fused INT32 path temporarily disabled during FP32 residual migration
-        // See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for details.
-        constexpr bool ENABLE_FUSED_INT32_PATH = false; // TODO: Remove when FP32 fused path integrated
-        bool use_fused_quantize = ENABLE_FUSED_INT32_PATH &&
-                                  (buffers.normalized_int8 != nullptr) &&
-                                  (!buffers.normalized_scales.empty());
+        auto rmsnorm_kernel = fp32_activation->createRMSNorm();
+        VALIDATE_POINTER(rmsnorm_kernel, "RMSNorm kernel");
 
-        if (use_fused_quantize)
-        {
-            // Fused path: RMSNorm + INT8 quantization in single kernel
-            // Use kernel from INT8 output tensor (which provides FusedRMSNormQuantize)
-            auto *int8_activation = dynamic_cast<IActivationTensor *>(buffers.normalized_int8.get());
-            VALIDATE_POINTER(int8_activation, "INT8 activation tensor for fused FFN RMSNorm");
-
-            auto rmsnorm_kernel = int8_activation->createRMSNorm();
-            VALIDATE_POINTER(rmsnorm_kernel, "Fused RMSNorm kernel");
-
-            // CRITICAL: Process ALL batch rows, not just effective_seq_len
-            const int total_rows = batch_size_ * padded_seq_len_;
-
-            // Get INT8 buffer directly (don't use dangerous mutable_data() cast)
-            auto *int8_tensor_ptr = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
-            VALIDATE_POINTER(int8_tensor_ptr, "INT8 tensor for quantized output");
-
-            VALIDATE_OP(rmsnorm_kernel->execute(
-                            buffers.residual->data(),             // input (FP32)
-                            layer.ffn_norm->data(),               // weight
-                            int8_tensor_ptr->mutable_int8_data(), // output (INT8)
-                            buffers.normalized_scales.data(),     // scales
-                            total_rows, d_model_,
-                            1e-6f, mpi_ctx_.get(), ffn_device),
-                        "FFN norm (fused INT8)");
-            VALIDATE_TENSOR_BUFFER(buffers.normalized_int8,
-                                   TensorSpec({static_cast<size_t>(effective_seq_len),
-                                               static_cast<size_t>(d_model_)},
-                                              "normalized_int8"),
-                                   "after_fused_ffn_norm_quantize");
-
-            // Register per-row scales with INT8 tensor (critical for correct dequantization)
-            auto *int8_tensor = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
-            if (int8_tensor)
-            {
-                int8_tensor->set_row_scales(buffers.normalized_scales.data(), total_rows);
-
-                // Debug: Verify scale sanity
-                float min_scale = 1e9f, max_scale = -1e9f;
-                for (int r = 0; r < total_rows; ++r)
-                {
-                    min_scale = std::min(min_scale, buffers.normalized_scales[r]);
-                    max_scale = std::max(max_scale, buffers.normalized_scales[r]);
-                }
-                LOG_DEBUG("[FusedQuantize] FFN norm L" << layer_idx
-                                                       << " scales: min=" << min_scale << " max=" << max_scale
-                                                       << " total_rows=" << total_rows << " effective_seq_len=" << effective_seq_len);
-            }
-
-            // Capture INT8 normalized output (convert to FP32 for snapshot compatibility)
-            // CRITICAL FIX: Dequantize only effective_seq_len rows (not total_rows)
-            // BUG: Previously used total_rows, which accessed uninitialized scales beyond effective_seq_len,
-            //      causing garbage in normalized_hidden that propagated through FFN projections
-            auto *int8_tensor_data = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
-            if (int8_tensor_data)
-            {
-                const int8_t *int8_data = int8_tensor_data->int8_data();
-                for (int r = 0; r < effective_seq_len; ++r) // ← FIX: Use effective_seq_len
-                {
-                    const float row_scale = buffers.normalized_scales[r];
-                    for (int c = 0; c < d_model_; ++c)
-                    {
-                        const size_t idx = r * d_model_ + c;
-                        normalized_hidden->mutable_data()[idx] =
-                            static_cast<float>(int8_data[idx]) * row_scale;
-                    }
-                }
-            }
-        }
-        else
-        {
-            // Unfused path (fallback): Separate RMSNorm + implicit quantization in GEMM
-            auto *fp32_activation = dynamic_cast<IActivationTensor *>(normalized_hidden.get());
-            VALIDATE_POINTER(fp32_activation, "FP32 activation tensor for FFN RMSNorm");
-
-            auto rmsnorm_kernel = fp32_activation->createRMSNorm();
-            VALIDATE_POINTER(rmsnorm_kernel, "RMSNorm kernel");
-
-            VALIDATE_OP(rmsnorm_kernel->apply(
-                            buffers.residual->data(),          // input
-                            layer.ffn_norm->data(),            // weight
-                            normalized_hidden->mutable_data(), // output
-                            effective_seq_len, d_model_,
-                            1e-6f, // epsilon
-                            false, // normalize_gamma
-                            mpi_ctx_.get(), ffn_device),
-                        "FFN norm");
-            VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_ffn_norm");
-        }
+        VALIDATE_OP(rmsnorm_kernel->apply(
+                        buffers.residual->data(),          // input
+                        layer.ffn_norm->data(),            // weight
+                        normalized_hidden->mutable_data(), // output
+                        effective_seq_len, d_model_,
+                        1e-6f, // epsilon
+                        false, // normalize_gamma
+                        mpi_ctx_.get(), ffn_device),
+                    "FFN norm");
+        VALIDATE_TENSOR_BUFFER(normalized_hidden, spec_hidden(effective_seq_len), "after_ffn_norm");
 
         // Capture FFN norm output
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_NORM", normalized_hidden, effective_seq_len, d_model_);
@@ -1212,135 +877,55 @@ namespace llaminar2
             }
         }
 
-        // 2. Gate and up projections - PHASE 2 FUSED PATH
-        // Use FusedDualGEMM to eliminate redundant quantization:
-        //   Old: Quant(norm) → gate_gemm + Quant(norm) → up_gemm → Dequant(gate) + Dequant(up) → SwiGLU
-        //   New: Quant(norm) → FusedDualGEMM → [gate_int32, up_int32] → FusedDequantSwiGLU → output_fp32
-
-        // NOTE: Fused INT32 path temporarily disabled during FP32 residual migration.
-        // The fused kernels now output FP32 (via Q8_1GemmKernel), but pipeline integration
-        // is pending. See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for details.
-#if 0  // DISABLED: Old INT32 fused path - to be replaced with FP32 fused path
-        if (use_fused_quantize)
+        // 2. Gate and up projections (FUSED: quantize activations once, reuse for both projections)
+        // Lazily initialize the fused gate/up kernel if not already done
+        if (!layer.gate_up_fused)
         {
-            // Phase 2: Fused path with FusedDualGEMM + FusedDequantSwiGLU
-            // Create fused kernel from INT8 activation tensor
-            auto *int8_activation = dynamic_cast<INT8Tensor *>(buffers.normalized_int8.get());
-            VALIDATE_POINTER(int8_activation, "INT8 activation tensor for FusedDualGEMM");
-
-            auto fused_dual_gemm = int8_activation->createFusedDualGemm(
+            layer.gate_up_fused = std::make_unique<FusedGEMM>(
                 layer.gate_proj.get(), layer.up_proj.get());
-            VALIDATE_POINTER(fused_dual_gemm, "FusedDualGEMM kernel");
-
-            // Get INT32 buffers from activation buffers
-            auto *gate_int32 = dynamic_cast<INT32Tensor *>(buffers.gate_int32.get());
-            auto *up_int32 = dynamic_cast<INT32Tensor *>(buffers.up_int32.get());
-            VALIDATE_POINTER(gate_int32, "INT32 gate buffer");
-            VALIDATE_POINTER(up_int32, "INT32 up buffer");
-
-            // Get column scales from weight tensors (for INT32 dequantization)
-            auto *gate_weight_int8 = dynamic_cast<INT8Tensor *>(layer.gate_proj.get());
-            auto *up_weight_int8 = dynamic_cast<INT8Tensor *>(layer.up_proj.get());
-            VALIDATE_POINTER(gate_weight_int8, "INT8 gate weight");
-            VALIDATE_POINTER(up_weight_int8, "INT8 up weight");
-
-            const float *gate_col_scales = gate_weight_int8->col_scales();
-            const float *up_col_scales = up_weight_int8->col_scales();
-            VALIDATE_POINTER(gate_col_scales, "Gate weight column scales");
-            VALIDATE_POINTER(up_col_scales, "Up weight column scales");
-
-            // Execute FusedDualGEMM: normalized_fp32 → [gate_int32, up_int32]
-            // Note: FusedDualGEMM internally quantizes FP32 input to INT8, then performs GEMMs
-            // We pass normalized FP32 buffer (not INT8), as kernel handles quantization
-            VALIDATE_OP(fused_dual_gemm->execute(
-                            normalized_hidden->data(),           // Input FP32 [m, k]
-                            gate_int32->mutable_int32_data(),    // Output INT32 [m, n]
-                            up_int32->mutable_int32_data(),      // Output INT32 [m, n]
-                            buffers.normalized_scales.data(),    // Output row scales [m]
-                            effective_seq_len, d_ff_, d_model_), // Dimensions
-                        "FusedDualGEMM (gate+up projections)");
-
-            // Health check: INT32 accumulator outputs
-            LOG_DEBUG("[Phase2] FusedDualGEMM completed, checking INT32 outputs");
-
-            // Execute FusedDequantSwiGLU: [gate_int32, up_int32] → up_fp32 (with SwiGLU activation)
-            FusedDequantSwiGLU fused_dequant_swiglu;
-            VALIDATE_OP(fused_dequant_swiglu.execute(
-                            gate_int32->int32_data(),         // Gate INT32 [m, n]
-                            up_int32->int32_data(),           // Up INT32 [m, n]
-                            buffers.up->mutable_data(),       // Output FP32 [m, n] (reuse up buffer)
-                            buffers.normalized_scales.data(), // Row scales [m]
-                            gate_col_scales,                  // Gate column scales [n]
-                            up_col_scales,                    // Up column scales [n]
-                            effective_seq_len, d_ff_),        // Dimensions
-                        "FusedDequantSwiGLU (dequant+activation)");
-
-            // Capture gate projection (dequantize INT32 for snapshot)
-            // This is for parity testing - production code only stores INT32
-            for (int r = 0; r < effective_seq_len; ++r)
-            {
-                const float row_scale = buffers.normalized_scales[r];
-                for (int c = 0; c < d_ff_; ++c)
-                {
-                    const size_t idx = r * d_ff_ + c;
-                    buffers.gate->mutable_data()[idx] =
-                        static_cast<float>(gate_int32->int32_data()[idx]) * row_scale * gate_col_scales[c];
-                }
-            }
-            CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE",
-                                  buffers.gate, effective_seq_len, d_ff_);
-
-            LOG_DEBUG("[Phase2] FusedDequantSwiGLU completed");
         }
-        else
-#endif // DISABLED: Old INT32 fused path
-        {
-            // Phase 1: Unfused path (fallback for non-INT8 precision)
-            VALIDATE_KERNEL(gate_gemm, layer.gate_proj->createGemm(), "gate GEMM kernel");
-            VALIDATE_KERNEL(up_gemm, layer.up_proj->createGemm(), "up GEMM kernel");
 
-            // gate = hidden @ gate_proj^T
-            VALIDATE_OP(gate_gemm->multiply_activations(
-                            normalized_hidden->data(), nullptr, buffers.gate->mutable_data(),
-                            effective_seq_len, d_ff_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
-                        "Gate projection");
-            VALIDATE_TENSOR_BUFFER(buffers.gate, spec_ffn_gate_up(effective_seq_len), "after_gate_proj");
+        // Execute fused gate/up projection (Raw projections, no SwiGLU fusion yet)
+        // We compute raw projections first to allow capturing snapshots of FFN_GATE and FFN_UP
+        // for parity debugging. SwiGLU is applied manually afterwards.
+        VALIDATE_OP(layer.gate_up_fused->execute(
+                        normalized_hidden->data(),
+                        {{buffers.gate->mutable_data(), nullptr, d_ff_, "gate"},
+                         {buffers.up->mutable_data(), nullptr, d_ff_, "up", nullptr, false}}, // do_swiglu=false
+                        effective_seq_len, d_model_,
+                        mpi_ctx_.get(), ffn_device),
+                    "Fused Gate/Up projection");
 
-            // Capture gate projection
-            CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE",
-                                  buffers.gate, effective_seq_len, d_ff_);
+        VALIDATE_TENSOR_BUFFER(buffers.gate, spec_ffn_gate_up(effective_seq_len), "after_gate_proj");
+        VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_gate_up(effective_seq_len), "after_up_proj");
 
-            // Health check: Gate projection output
-            CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_GATE").c_str(),
-                                   buffers.gate->data(), effective_seq_len * d_ff_);
+        // Capture gate projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_GATE",
+                              buffers.gate, effective_seq_len, d_ff_);
 
-            // up = hidden @ up_proj^T
-            VALIDATE_OP(up_gemm->multiply_activations(
-                            normalized_hidden->data(), nullptr, buffers.up->mutable_data(),
-                            effective_seq_len, d_ff_, d_model_,
-                            true, 1.0f, 0.0f, mpi_ctx_.get(), ffn_device),
-                        "Up projection");
-            VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_gate_up(effective_seq_len), "after_up_proj");
+        // Health check: Gate projection output
+        CHECK_NUMERICAL_HEALTH(("layer" + std::to_string(layer_idx) + "_FFN_GATE").c_str(),
+                               buffers.gate->data(), effective_seq_len * d_ff_);
 
-            // Capture up projection
-            CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_UP",
-                                  buffers.up, effective_seq_len, d_ff_);
+        // Capture up projection
+        CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_UP",
+                              buffers.up, effective_seq_len, d_ff_);
 
-            // SwiGLU activation (up buffer reused for output)
-            auto *activation_tensor_up = dynamic_cast<IActivationTensor *>(buffers.up.get());
-            VALIDATE_POINTER(activation_tensor_up, "activation tensor for SwiGLU kernel");
-            VALIDATE_KERNEL(swiglu_kernel, activation_tensor_up->createSwiGLU(), "SwiGLU kernel");
+        // Apply SwiGLU manually
+        // Qwen2 SwiGLU formulation: output = gate * silu(up)
+        // Note: This differs from standard SwiGLU (swish(gate) * up)
+        // We pass buffers.gate as the "gate" param (linear term) and buffers.up as "up" param (activated term)
+        static CPUSwiGLUKernelT<FP32Tensor> swiglu_kernel;
+        VALIDATE_OP(swiglu_kernel.apply(
+                        buffers.gate->data(),       // Linear term
+                        buffers.up->data(),         // Activated term (silu applied to this)
+                        buffers.up->mutable_data(), // Output (in-place in up buffer)
+                        effective_seq_len, d_ff_,
+                        false, // no residual
+                        mpi_ctx_.get(), ffn_device),
+                    "SwiGLU activation");
 
-            VALIDATE_OP(swiglu_kernel->apply(
-                            buffers.gate->data(), buffers.up->data(),
-                            buffers.up->mutable_data(),
-                            effective_seq_len, d_ff_, false, mpi_ctx_.get(), ffn_device),
-                        "SwiGLU activation");
-        }
-        VALIDATE_TENSOR_BUFFER(buffers.up, spec_ffn_intermediate(effective_seq_len), "after_swiglu");
-
-        // Capture SwiGLU output
+        // Capture SwiGLU output (same as UP now, but keeping key for compatibility)
         CAPTURE_SNAPSHOT_VIEW("layer" + std::to_string(layer_idx) + "_FFN_SWIGLU", buffers.up, effective_seq_len, d_ff_);
 
         // Health check: SwiGLU activation output (critical for numerical stability)

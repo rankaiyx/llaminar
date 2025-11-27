@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../../../../../external/onednn/third_party/xbyak/xbyak.h"
-#include "Q8_1GemmJit_M1.h" // For Q8_1GemmParams
+#include "QuantisedGemmJit_M1.h" // For QuantisedGemmParams
 #include <vector>
 #include <cstdint>
 
@@ -10,16 +10,16 @@ namespace llaminar2
     namespace gemm_v4
     {
 
-        class Q8_1GemmJit_M2 : public Xbyak::CodeGenerator
+        class QuantisedGemmJit_M2 : public Xbyak::CodeGenerator
         {
         public:
-            Q8_1GemmJit_M2() : Xbyak::CodeGenerator(4096 * 64)
+            QuantisedGemmJit_M2() : Xbyak::CodeGenerator(4096 * 64)
             {
                 generate();
             }
 
             // Signature:
-            using kernel_func_t = void (*)(const Q8_1GemmParams *params);
+            using kernel_func_t = void (*)(const QuantisedGemmParams *params);
 
             kernel_func_t get_kernel()
             {
@@ -539,6 +539,103 @@ namespace llaminar2
                         vmovss(ptr[rcx + rdx], xmm10);
                     }
                     L(skip_softmax);
+
+                    // 4. SwiGLU
+                    mov(rax, ptr[rsp + 8]);  // params
+                    cmp(byte[rax + 104], 1); // do_swiglu
+                    Label skip_swiglu;
+                    jne(skip_swiglu, T_NEAR);
+                    {
+                        // Registers
+                        const Zmm &zmm_gate = zmm8;
+                        const Zmm &zmm_tmp = zmm9;
+                        const Zmm &zmm_c1_const = zmm10;
+                        const Zmm &zmm_c2_const = zmm11;
+                        const Zmm &zmm_c3_coeff = zmm12;
+                        const Zmm &zmm_c4_const = zmm13;
+                        const Zmm &zmm_c5_const = zmm14;
+                        const Zmm &zmm_inv_ln2 = zmm15;
+                        const Zmm &zmm_max_clip = zmm16;
+                        const Zmm &zmm_min_clip = zmm17;
+                        const Zmm &zmm_127 = zmm18;
+                        const Zmm &zmm_one = zmm19;
+                        const Zmm &zmm_fx = zmm20; // Free
+                        const Zmm &zmm_p = zmm21;  // Free
+
+                        // Load constants (same as M1)
+                        mov(reg_tmp_32, 0x3fb8aa3b);
+                        vpbroadcastd(zmm_inv_ln2, reg_tmp_32);
+                        mov(reg_tmp_32, 0x3f7ffffe);
+                        vpbroadcastd(zmm_c1_const, reg_tmp_32);
+                        mov(reg_tmp_32, 0x3f317218);
+                        vpbroadcastd(zmm_c2_const, reg_tmp_32);
+                        mov(reg_tmp_32, 0x3e75fdf1);
+                        vpbroadcastd(zmm_c3_coeff, reg_tmp_32);
+                        mov(reg_tmp_32, 0x3d6356eb);
+                        vpbroadcastd(zmm_c4_const, reg_tmp_32);
+                        mov(reg_tmp_32, 0x3c1d9422);
+                        vpbroadcastd(zmm_c5_const, reg_tmp_32);
+                        mov(reg_tmp_32, 0x42b00000);
+                        vpbroadcastd(zmm_max_clip, reg_tmp_32);
+                        mov(reg_tmp_32, 0xc2b00000);
+                        vpbroadcastd(zmm_min_clip, reg_tmp_32);
+                        mov(reg_tmp_32, 0x3f800000);
+                        vpbroadcastd(zmm_one, reg_tmp_32);
+                        mov(reg_tmp_32, 127);
+                        vpbroadcastd(zmm_127, reg_tmp_32);
+
+                        // Load gate_input pointer
+                        mov(rdx, ptr[rax + 96]);
+                        // Offset: reg_loop_N * 4
+                        mov(r15, reg_loop_N);
+                        shl(r15, 2);
+                        add(rdx, r15); // rdx = gate_cursor (Row 0)
+
+                        // Load ldc for Row 1
+                        mov(reg_tmp.cvt32(), ptr[rax + 48]); // ldc
+                        shl(reg_tmp, 2);                     // ldc * 4
+
+                        auto compute_swish = [&](Zmm &zmm_val, const Reg64 &base, int offset)
+                        {
+                            // Load gate
+                            vmovups(zmm_gate, ptr[base + offset * 64]);
+
+                            // Compute sigmoid(gate)
+                            vxorps(zmm_tmp, zmm_tmp, zmm_tmp);
+                            vsubps(zmm_tmp, zmm_tmp, zmm_gate); // -gate
+                            vminps(zmm_tmp, zmm_tmp, zmm_max_clip);
+                            vmaxps(zmm_tmp, zmm_tmp, zmm_min_clip);
+                            vmulps(zmm_tmp, zmm_tmp, zmm_inv_ln2);
+                            vrndscaleps(zmm_fx, zmm_tmp, 0x01);
+                            vsubps(zmm_tmp, zmm_tmp, zmm_fx);
+                            vmovaps(zmm_p, zmm_c5_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c4_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c3_coeff);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c2_const);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c1_const);
+                            vcvtps2dq(zmm_fx, zmm_fx);
+                            vpaddd(zmm_fx, zmm_fx, zmm_127);
+                            vpslld(zmm_fx, zmm_fx, 23);
+                            vmulps(zmm_p, zmm_p, zmm_fx);
+                            vaddps(zmm_p, zmm_p, zmm_one);
+                            vdivps(zmm_p, zmm_gate, zmm_p);
+                            vmulps(zmm_val, zmm_val, zmm_p);
+                        };
+
+                        // Row 0
+                        compute_swish(zmm0, rdx, 0);
+                        compute_swish(zmm1, rdx, 1);
+                        compute_swish(zmm2, rdx, 2);
+                        compute_swish(zmm3, rdx, 3);
+
+                        // Row 1
+                        add(rdx, reg_tmp); // gate_cursor += ldc * 4
+                        compute_swish(zmm4, rdx, 0);
+                        compute_swish(zmm5, rdx, 1);
+                        compute_swish(zmm6, rdx, 2);
+                        compute_swish(zmm7, rdx, 3);
+                    }
+                    L(skip_swiglu);
 
                     // Store C
                     // Load ldc

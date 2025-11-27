@@ -170,30 +170,17 @@ namespace llaminar2
         // Normalization buffer (reused by attention and FFN blocks)
         std::shared_ptr<TensorBase> normalized;
 
-        // INT8 quantization buffers (for FusedRMSNormQuantize output)
-        std::shared_ptr<TensorBase> normalized_int8; // INT8 post-fusion buffer
-        std::vector<float> normalized_scales;        // Per-row quantization scales
-
-        // Attention buffers (FP32 for final Q/K/V after dequantization)
+        // Attention buffers
         std::shared_ptr<TensorBase> Q;
         std::shared_ptr<TensorBase> K;
         std::shared_ptr<TensorBase> V;
         std::shared_ptr<TensorBase> attn_output;
         std::shared_ptr<TensorBase> attn_proj;
 
-        // INT32 attention buffers (for FusedTripleGEMM output - raw accumulator)
-        std::shared_ptr<TensorBase> Q_int32;
-        std::shared_ptr<TensorBase> K_int32;
-        std::shared_ptr<TensorBase> V_int32;
-
-        // FFN buffers (FP32 for final gate/up after dequantization)
+        // FFN buffers
         std::shared_ptr<TensorBase> gate;
         std::shared_ptr<TensorBase> up;
         std::shared_ptr<TensorBase> ffn_output;
-
-        // INT32 FFN buffers (for FusedDualGEMM output - raw accumulator)
-        std::shared_ptr<TensorBase> gate_int32;
-        std::shared_ptr<TensorBase> up_int32;
 
         int max_seq_len = 0; // Maximum sequence length these buffers support
     };
@@ -238,14 +225,6 @@ namespace llaminar2
          * @return Logits tensor [seq_len, vocab_size], or nullptr if not available
          */
         virtual const float *logits() const;
-
-        /**
-         * @brief Get output logits for a specific sequence in batch (FP32)
-         *
-         * @param seq_idx Sequence index in the batch (0-based)
-         * @return Logits tensor [seq_len_for_seq, vocab_size], or nullptr if not available
-         */
-        virtual const float *getLogits(int seq_idx = 0) const;
 
         // ===== Snapshot Capture API (for parity testing / debugging) =====
         // Only available when ENABLE_PIPELINE_SNAPSHOTS is defined (test builds)

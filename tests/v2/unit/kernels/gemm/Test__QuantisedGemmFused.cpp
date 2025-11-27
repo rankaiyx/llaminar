@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
+#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include <vector>
 #include <random>
 #include <cmath>
@@ -28,7 +28,7 @@ void RunSoftmaxTest(int M)
     // Create kernel
     MPIContext ctx(0, 1, MPI_COMM_WORLD);
     auto generic_kernel = weights_tensor->createGemm();
-    auto kernel = dynamic_cast<Q8_1GemmKernel *>(generic_kernel.get());
+    auto kernel = dynamic_cast<QuantisedGemmKernel *>(generic_kernel.get());
     ASSERT_NE(kernel, nullptr);
 
     // Create random input A (M x K)
@@ -90,12 +90,12 @@ void RunSoftmaxTest(int M)
     }
 }
 
-TEST(Test__Q8_1GemmFused, SoftmaxCorrectness_M2)
+TEST(Test__QuantisedGemmFused, SoftmaxCorrectness_M2)
 {
     RunSoftmaxTest(2);
 }
 
-TEST(Test__Q8_1GemmFused, SoftmaxCorrectness_M1)
+TEST(Test__QuantisedGemmFused, SoftmaxCorrectness_M1)
 {
     RunSoftmaxTest(1);
 }

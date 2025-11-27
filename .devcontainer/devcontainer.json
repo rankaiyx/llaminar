@@ -80,12 +80,10 @@
     "containerEnv": {
         "VIRTUAL_ENV": "/workspaces/llaminar/.venv"
     },
-    "postCreateCommand": "bash -c 'sudo chown -R vscode:vscode /workspace || true && git config --global user.email \"david.sanftenberg@gmail.com\" && git config --global user.name \"David Sanftenberg\" && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/fix-perf.sh && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && cmake --version && gcc --version'",
-    "postStartCommand": "sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid' || true",
+    "postCreateCommand": "bash -c 'sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && cmake --version && gcc --version'",
     "remoteUser": "vscode",
     "overrideCommand": false,
     "runArgs": [
-        "--init",
         "--privileged",
         "--cap-add=SYS_ADMIN",
         "--security-opt",

@@ -1,5 +1,5 @@
 /**
- * @file Test__Qwen2E2ECorrectness.cpp
+ * @file Test__Qwen2MPIRankParity.cpp
  * @brief End-to-end MPI rank parity tests for Qwen2Pipeline
  * @author David Sanftenberg
  *
@@ -19,7 +19,7 @@
 
 // CRITICAL: This test requires snapshot capture to work properly
 #ifndef ENABLE_PIPELINE_SNAPSHOTS
-#error "Test__Qwen2E2ECorrectness requires ENABLE_PIPELINE_SNAPSHOTS to be defined. Build with CMAKE_BUILD_TYPE=Debug or CMAKE_BUILD_TYPE=E2ERelease"
+#error "Test__Qwen2MPIRankParity requires ENABLE_PIPELINE_SNAPSHOTS to be defined. Build with CMAKE_BUILD_TYPE=Debug or CMAKE_BUILD_TYPE=E2ERelease"
 #endif
 
 #include <gtest/gtest.h>

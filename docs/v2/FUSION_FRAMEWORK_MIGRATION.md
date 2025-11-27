@@ -106,9 +106,8 @@ The new bottleneck is **memory bandwidth**, not quantization CPU cycles:
    - Per-row scaling captures local dynamic range
    - Block size = 32 elements (matches VNNI vector width)
 
-3. **Direct Q8_1 Weight Consumption**
-   - Weights stored in Q8_1 format (from GGUF or converted)
-   - No dequantization needed at runtime
+3. **Direct Quantised Weight Consumption**
+   - Weights stored in Quantised format (from GGUF)
    - VNNI `vpdpbusd` operates on INT8 directly
 
 4. **Fused Post-Ops**
@@ -125,8 +124,8 @@ The new bottleneck is **memory bandwidth**, not quantization CPU cycles:
 **Goal**: High-performance INT8 GEMM with VNNI.
 
 **Delivered**:
-- `Q8_1GemmKernel` with adaptive blocking (0.5B - 32B models)
-- `Q8_1GemmJit_M1` / `Q8_1GemmJit_M2` specialized kernels
+- `QuantisedGemmKernel` with adaptive blocking (0.5B - 32B models)
+- `QuantisedGemmJit_M1` / `QuantisedGemmJit_M2` specialized kernels
 - K-Tiling for large models (prevents L2 thrashing)
 - **Performance**: ~2100 GFLOPS on Qwen 32B FFN Down
 

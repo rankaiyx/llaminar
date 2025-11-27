@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
+#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "Tensors.h"
 #include "../kernels/cpu/CPURoPEKernelT.h"
 #include "../kernels/cpu/CPUSwiGLUKernelT.h"
@@ -139,8 +139,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q4_0Tensor::createGemm()
     {
-        // Use Q8_1GemmKernel for AVX512 support
-        return std::make_unique<llaminar2::gemm_v4::Q8_1GemmKernel>(this);
+        // Use QuantisedGemmKernel for AVX512 support
+        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
     }
 
     void Q4_0Tensor::decodeBlock(const Q4_0Block &block, float *output)
@@ -506,8 +506,8 @@ namespace llaminar2
         const Q4_0Block *blocks = reinterpret_cast<const Q4_0Block *>(data_ptr);
         const Q4_0Block *q4_block = &blocks[row_idx * blocks_per_row + k_block_offset];
 
-        // Dispatch to optimized SIMD implementation
-        simd::unpack_q4_0_to_int8(q4_block, output);
+        // Unpack Q4_0 block to INT8 using SIMD dispatcher
+        simd::unpack_q4_0_to_int8(*q4_block, output);
     }
 
     float Q4_0Tensor::get_block_scale(

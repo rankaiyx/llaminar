@@ -5,8 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
-#include "../kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
+#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "Tensors.h"
 #include "../utils/Logger.h"
 #include <algorithm>
@@ -188,8 +187,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q8_0Tensor::createGemm()
     {
-        // Use optimized Q8_1GemmKernel (repacks Q8_0 weights to Q8_1 format internally)
-        return std::make_unique<llaminar2::gemm_v4::Q8_1GemmKernel>(this);
+        // Use optimized QuantisedGemmKernel (repacks Q8_0 weights to Q8_1 format internally)
+        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
     }
 
     void Q8_0Tensor::decodeBlockScalar(const Q8_0Block &block, float *output)

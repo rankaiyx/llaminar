@@ -11,11 +11,12 @@
 #pragma once
 
 #include "../utils/MPIContext.h"
-#include "../kernels/cpu/CPUKernelBase.h" // For TensorFormat enum
 #include <memory>
 
 namespace llaminar2
 {
+    // Forward declaration for tensor-based GEMM interface
+    class TensorBase;
     /**
      * @brief Activation precision format enumeration
      *
@@ -194,6 +195,53 @@ namespace llaminar2
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Tensor-based matrix multiplication: C = alpha * A @ B + beta * C
+         *
+         * This interface accepts tensors directly, enabling:
+         * - **Type introspection**: Kernel can detect activation format (FP32, Q8_1, BF16, etc.)
+         * - **Zero-copy quantized path**: If A is Q8_1Tensor, skip float→Q8_1 conversion
+         * - **Flexible output**: C can be any precision (FP32, BF16, etc.)
+         *
+         * **Dispatch logic** (typical implementation):
+         * 1. Check A->native_type() to determine activation format
+         * 2. If Q8_1: Use quantized blocks directly (via IQ8_1Decodable or block access)
+         * 3. If FP32: Fall back to multiply(A->data(), C->mutable_data(), ...)
+         * 4. If BF16: Convert or use native BF16 GEMM if available
+         *
+         * @param A Input activations tensor [m, k] (any format)
+         * @param C Output tensor [m, n] (must be mutable, typically FP32)
+         * @param transpose_B Whether B (packed weights) is transposed (typical: true)
+         * @param alpha Scale factor for A@B
+         * @param beta Scale factor for existing C (for fused add)
+         * @param mpi_ctx MPI context for distributed execution
+         * @param device_idx Device index for execution
+         *
+         * @return true on success, false if format combination not supported
+         *
+         * @note Default implementation returns false (not supported).
+         *       Kernels that include Tensors.h can override with optimized paths.
+         */
+        virtual bool multiply_tensor(
+            const TensorBase *A, TensorBase *C,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            // Default: not supported (TensorBase is only forward-declared here)
+            // Subclasses that include Tensors.h can override with real implementation
+            (void)A;
+            (void)C;
+            (void)transpose_B;
+            (void)alpha;
+            (void)beta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
+
         /**
          * @brief Activation-activation matrix multiplication: C = alpha * A @ B^T + beta * C
          *
@@ -423,66 +471,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Matrix multiplication with typed activations (fusion framework API)
-         *
-         * Accepts pre-quantized or typed activations from fused kernels (e.g., FusedRMSNormQuantize).
-         * Enables operator fusion by eliminating redundant FP32 materialization.
-         *
-         * **Use Case**: After FusedRMSNormQuantize outputs INT8 activations, pass directly to GEMM:
-         * ```cpp
-         * FusedRMSNormQuantize fused_kernel;
-         * fused_kernel.execute(input_fp32, gamma, output_int8, scales, ...);
-         *
-         * gemm->multiply_typed_activations(
-         *     output_int8, TensorFormat::INT8, scales,
-         *     output_fp32, m, n, k, ...
-         * );
-         * ```
-         *
-         * @param A Left activation matrix [m, k] (typed format)
-         * @param format_A Format of activation matrix (INT8, FP32, BF16, FP16, etc.)
-         * @param A_scales Per-row or per-tensor scales for quantized formats (nullptr for FP32/BF16/FP16)
-         * @param C Output matrix [m, n] (FP32)
-         * @param m Number of rows in A and C
-         * @param n Number of columns in output C (rows in B if transpose_B=true)
-         * @param k Number of columns in A and rows in B
-         * @param transpose_B Whether weight matrix B is stored transposed (typical)
-         * @param alpha Scale factor for A@B
-         * @param beta Scale factor for existing C (for fused add)
-         * @param mpi_ctx MPI context for distributed execution (nullptr = single node)
-         * @param device_idx Device index (-1 = CPU, ≥0 = GPU)
-         *
-         * @return true on success, false if format combination not supported
-         *
-         * @note Default implementation returns false (not implemented).
-         *       Kernels override to support specific format combinations.
-         *       Currently supported: INT8 activations with quantized weights (OneDNN path).
-         */
-        virtual bool multiply_typed_activations(
-            const void *A, TensorFormat format_A, const float *A_scales,
-            float *C,
-            int m, int n, int k,
-            bool transpose_B = true,
-            float alpha = 1.0f, float beta = 0.0f,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            (void)A;
-            (void)format_A;
-            (void)A_scales;
-            (void)C;
-            (void)m;
-            (void)n;
-            (void)k;
-            (void)transpose_B;
-            (void)alpha;
-            (void)beta;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Not implemented by default
-        }
-
-        /**
          * @brief Matrix multiplication with fused Softmax (for attention scores)
          *
          * C = Softmax(A @ B^T / sqrt(k) + mask)
@@ -696,6 +684,132 @@ namespace llaminar2
             return multiply_with_softmax_strided_typed_impl(
                 static_cast<const void *>(A), static_cast<const void *>(B), C,
                 m, n, k, lda, ldb, ldc, scale, transpose_B, softmax_axis, mask, is_causal, mpi_ctx, device_idx, fmt_A, fmt_B);
+        }
+
+        // =============================================================================
+        // Fused Multi-GEMM Interface (Activation Sharing)
+        // =============================================================================
+        // These methods enable fusing multiple GEMMs that share the same input activations.
+        // For quantized kernels, this avoids redundant FP32→Q8_1 quantization passes.
+        //
+        // Use cases:
+        // - FFN: gate + up projections share same input (FusedDualGEMM)
+        // - Attention: Q + K + V projections share same input (FusedTripleGEMM)
+        //
+        // The workflow:
+        // 1. Call quantize_activations() once to get reusable Q8_1 buffer
+        // 2. Call multiply_with_precomputed_q8_1() N times, passing the same buffer
+        // 3. Buffer can be a thread-local scratch to avoid allocation
+        // =============================================================================
+
+        /**
+         * @brief Quantize FP32 activations to Q8_1 format for reuse across multiple GEMMs
+         *
+         * This method quantizes FP32 activations to Q8_1 blocks that can be reused
+         * by multiple subsequent GEMM operations. This is the first step in the
+         * fused multi-GEMM workflow.
+         *
+         * @param A Input FP32 activations [m, k]
+         * @param q8_1_buffer Output buffer for Q8_1 blocks [m * k_blocks], where k_blocks = k/32
+         *                    Must be pre-allocated with at least m * ((k+31)/32) * sizeof(Q8_1Block) bytes
+         * @param m Number of rows in activation matrix
+         * @param k Number of columns in activation matrix
+         *
+         * @return true on success, false if not supported (e.g., non-quantized kernel)
+         *
+         * @note This is a no-op for floating-point kernels that don't need quantization.
+         *       For QuantisedGemmKernel, this performs the FP32→Q8_1 conversion.
+         *
+         * @note Thread safety: This method is thread-safe. The output buffer can be
+         *       thread-local to avoid contention.
+         */
+        virtual bool quantize_activations(
+            const float *A,
+            void *q8_1_buffer,
+            int m, int k)
+        {
+            (void)A;
+            (void)q8_1_buffer;
+            (void)m;
+            (void)k;
+            return false; // Not implemented for non-quantized kernels
+        }
+
+        /**
+         * @brief Get required buffer size for quantized activations
+         *
+         * @param m Number of rows in activation matrix
+         * @param k Number of columns in activation matrix
+         * @return Required buffer size in bytes, or 0 if quantization not supported
+         */
+        virtual size_t get_quantized_activation_buffer_size(int m, int k) const
+        {
+            (void)m;
+            (void)k;
+            return 0; // Not supported for non-quantized kernels
+        }
+
+        /**
+         * @brief GEMM with pre-quantized activations (no redundant quantization)
+         *
+         * This method performs GEMM using pre-quantized Q8_1 activations from a prior
+         * quantize_activations() call. This is the second step in the fused multi-GEMM
+         * workflow and enables activation sharing across multiple GEMMs.
+         *
+         * Performance: When calling N GEMMs with the same input, this saves (N-1)
+         * quantization passes compared to calling multiply() N times.
+         *
+         * @param q8_1_activations Pre-quantized Q8_1 blocks from quantize_activations()
+         * @param C Output matrix [m, n] (FP32)
+         * @param m Number of rows in activation matrix
+         * @param n Number of columns in output (rows in weight matrix)
+         * @param k Number of columns in activation matrix
+         * @param bias Optional bias vector [n] to add after GEMM (nullptr = no bias)
+         * @param accumulate If true, add to existing C; if false, overwrite
+         * @param alpha Scale factor for GEMM result
+         * @param beta Scale factor for existing C (only used if accumulate=true)
+         * @param mpi_ctx MPI context for distributed execution
+         * @param device_idx Device index (-1 = CPU)
+         *
+         * @return true on success, false if not supported
+         *
+         * @note For non-quantized kernels, this returns false. Use multiply() instead.
+         * @note The q8_1_activations buffer must have been populated by quantize_activations()
+         *       with the same m and k dimensions.
+         */
+        virtual bool multiply_with_precomputed_q8_1(
+            const void *q8_1_activations,
+            float *C,
+            int m, int n, int k,
+            const float *bias = nullptr,
+            bool accumulate = false,
+            float alpha = 1.0f, float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)q8_1_activations;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)bias;
+            (void)accumulate;
+            (void)alpha;
+            (void)beta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Not implemented for non-quantized kernels
+        }
+
+        /**
+         * @brief Check if this kernel supports the fused multi-GEMM interface
+         *
+         * @return true if quantize_activations() and multiply_with_precomputed_q8_1()
+         *         are implemented
+         */
+        virtual bool supports_activation_sharing() const
+        {
+            return false; // Default: not supported
         }
     };
 

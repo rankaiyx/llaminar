@@ -268,11 +268,8 @@ TEST_F(Test__RMSNormInterface, FP32_TensorMethod)
     // Create gamma weights
     std::vector<float> gamma(d_model, 1.0f);
 
-    // Use kernel pattern: tensor creates kernel, kernel executes
-    auto kernel = tensor->createRMSNorm();
-    ASSERT_NE(kernel, nullptr);
-    bool success = kernel->apply(tensor->data(), gamma.data(), tensor->mutable_data(),
-                                 seq_len, d_model, 1e-6f, false, nullptr, 0);
+    // Call applyRMSNorm directly on tensor - clean!
+    bool success = tensor->applyRMSNorm(gamma.data(), seq_len, d_model);
 
     EXPECT_TRUE(success);
 
@@ -302,11 +299,8 @@ TEST_F(Test__RMSNormInterface, BF16_TensorMethod)
     // Create gamma weights
     std::vector<float> gamma(d_model, 1.0f);
 
-    // Use kernel pattern: tensor creates kernel, kernel executes
-    auto kernel = tensor->createRMSNorm();
-    ASSERT_NE(kernel, nullptr);
-    bool success = kernel->apply_bf16(tensor->bf16_data(), gamma.data(), tensor->mutable_bf16_data(),
-                                      seq_len, d_model, 1e-6f, 0);
+    // Call applyRMSNorm directly on tensor - no type dispatch in pipeline!
+    bool success = tensor->applyRMSNorm(gamma.data(), seq_len, d_model);
 
     EXPECT_TRUE(success);
 
@@ -336,11 +330,8 @@ TEST_F(Test__RMSNormInterface, FP16_TensorMethod)
     // Create gamma weights
     std::vector<float> gamma(d_model, 1.0f);
 
-    // Use kernel pattern: tensor creates kernel, kernel executes
-    auto kernel = tensor->createRMSNorm();
-    ASSERT_NE(kernel, nullptr);
-    bool success = kernel->apply_fp16(tensor->fp16_data(), gamma.data(), tensor->mutable_fp16_data(),
-                                      seq_len, d_model, 1e-6f, 0);
+    // Call applyRMSNorm directly on tensor
+    bool success = tensor->applyRMSNorm(gamma.data(), seq_len, d_model);
 
     EXPECT_TRUE(success);
 
@@ -354,42 +345,25 @@ TEST_F(Test__RMSNormInterface, FP16_TensorMethod)
 
 /**
  * @brief NEW: Polymorphic dispatch through IActivationTensor interface
- *
- * This test demonstrates that different tensor types can create
- * appropriate kernels via the IActivationTensor interface.
  */
 TEST_F(Test__RMSNormInterface, PolymorphicDispatch)
 {
     const int seq_len = 4;
     const int d_model = 8;
 
-    // Prepare test data
-    std::vector<float> input_data(seq_len * d_model, 1.0f);
-    std::vector<float> gamma(d_model, 1.0f);
-
-    // Test that different tensor types can create kernels polymorphically
+    // Create tensors of different types
     std::vector<IActivationTensor *> tensors;
     tensors.push_back(new FP32Tensor({seq_len, d_model}));
     tensors.push_back(new BF16Tensor({seq_len, d_model}));
     tensors.push_back(new FP16Tensor({seq_len, d_model}));
 
-    // Each tensor type can create its kernel
+    std::vector<float> gamma(d_model, 1.0f);
+
+    // Polymorphic dispatch - each tensor knows how to normalize itself!
     for (auto *tensor : tensors)
     {
-        auto kernel = tensor->createRMSNorm();
-        ASSERT_NE(kernel, nullptr) << "Failed to create kernel for tensor type";
+        bool success = tensor->applyRMSNorm(gamma.data(), seq_len, d_model);
+        EXPECT_TRUE(success) << "Failed for tensor type";
         delete tensor;
     }
-
-    // Additional test: FP32 can actually execute (others would need format-specific setup)
-    auto fp32_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{seq_len, d_model});
-    std::copy(input_data.begin(), input_data.end(), fp32_tensor->mutable_data());
-
-    auto kernel = fp32_tensor->createRMSNorm();
-    ASSERT_NE(kernel, nullptr);
-
-    bool success = kernel->apply(fp32_tensor->data(), gamma.data(),
-                                 fp32_tensor->mutable_data(),
-                                 seq_len, d_model, 1e-6f, false, nullptr, 0);
-    EXPECT_TRUE(success);
 }

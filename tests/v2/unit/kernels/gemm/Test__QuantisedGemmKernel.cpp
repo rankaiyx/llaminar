@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
+#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include <vector>
 #include <random>
 
 using namespace llaminar2;
 using namespace llaminar2::gemm_v4;
 
-TEST(Test__Q8_1GemmKernel, BasicMatMul)
+TEST(Test__QuantisedGemmKernel, BasicMatMul)
 {
     // Dimensions
     int M = 1;
@@ -69,7 +69,7 @@ TEST(Test__Q8_1GemmKernel, BasicMatMul)
  *
  * This tests the fallback path: FP32 activations go through online quantization
  */
-TEST(Test__Q8_1GemmKernel, MultiplyTensorFP32Activations)
+TEST(Test__QuantisedGemmKernel, MultiplyTensorFP32Activations)
 {
     int M = 4;
     int N = 128;
@@ -129,7 +129,7 @@ TEST(Test__Q8_1GemmKernel, MultiplyTensorFP32Activations)
  *
  * This tests the optimized path: Q8_1 activations bypass float conversion
  */
-TEST(Test__Q8_1GemmKernel, MultiplyTensorQ8_1Activations)
+TEST(Test__QuantisedGemmKernel, MultiplyTensorQ8_1Activations)
 {
     int M = 4;
     int N = 128;
@@ -175,4 +175,101 @@ TEST(Test__Q8_1GemmKernel, MultiplyTensorQ8_1Activations)
         // because the FP32 path does its own online quantization)
         EXPECT_NEAR(C_act[i], C_ref[i], 2.0f) << "Mismatch at index " << i;
     }
+}
+
+/**
+ * @brief Test activation sharing interface (quantize_activations + multiply_with_precomputed_q8_1)
+ *
+ * This tests the fused multi-GEMM workflow:
+ * 1. quantize_activations() once
+ * 2. multiply_with_precomputed_q8_1() multiple times with different weights
+ */
+TEST(Test__QuantisedGemmKernel, ActivationSharingInterface)
+{
+    int M = 4;
+    int N = 128;
+    int K = 64;
+
+    // Create random weights for two projections (like gate/up in FFN)
+    std::vector<float> weights1_fp32(N * K);
+    std::vector<float> weights2_fp32(N * K);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights1_fp32)
+        x = dist(gen);
+    for (auto &x : weights2_fp32)
+        x = dist(gen);
+
+    // Quantize weights
+    auto weights1 = Q8_1Tensor::quantize_from_fp32(weights1_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto weights2 = Q8_1Tensor::quantize_from_fp32(weights2_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+    // Create kernels
+    auto kernel1 = weights1->createGemm();
+    auto kernel2 = weights2->createGemm();
+    ASSERT_NE(kernel1, nullptr);
+    ASSERT_NE(kernel2, nullptr);
+
+    // Verify activation sharing is supported
+    EXPECT_TRUE(kernel1->supports_activation_sharing());
+    EXPECT_TRUE(kernel2->supports_activation_sharing());
+
+    // Create random input
+    std::vector<float> A(M * K);
+    for (auto &x : A)
+        x = dist(gen);
+
+    // Compute reference using standard path
+    std::vector<float> C1_ref(M * N, 0.0f);
+    std::vector<float> C2_ref(M * N, 0.0f);
+    ASSERT_TRUE(kernel1->multiply(A.data(), C1_ref.data(), M, N, K));
+    ASSERT_TRUE(kernel2->multiply(A.data(), C2_ref.data(), M, N, K));
+
+    // Test shared activation path
+    // Step 1: Allocate buffer
+    size_t buffer_size = kernel1->get_quantized_activation_buffer_size(M, K);
+    EXPECT_GT(buffer_size, 0u);
+    std::vector<uint8_t> q8_1_buffer(buffer_size);
+
+    // Step 2: Quantize activations once
+    ASSERT_TRUE(kernel1->quantize_activations(A.data(), q8_1_buffer.data(), M, K));
+
+    // Step 3: Execute both GEMMs with shared activations
+    std::vector<float> C1_act(M * N, 0.0f);
+    std::vector<float> C2_act(M * N, 0.0f);
+    ASSERT_TRUE(kernel1->multiply_with_precomputed_q8_1(q8_1_buffer.data(), C1_act.data(), M, N, K));
+    ASSERT_TRUE(kernel2->multiply_with_precomputed_q8_1(q8_1_buffer.data(), C2_act.data(), M, N, K));
+
+    // Compare - shared activation path should produce identical results to standard path
+    // (both use the same quantization algorithm)
+    for (int i = 0; i < M * N; ++i)
+    {
+        EXPECT_NEAR(C1_act[i], C1_ref[i], 0.01f) << "Kernel1 mismatch at index " << i;
+        EXPECT_NEAR(C2_act[i], C2_ref[i], 0.01f) << "Kernel2 mismatch at index " << i;
+    }
+}
+
+/**
+ * @brief Test that non-quantized kernels correctly report no activation sharing support
+ */
+TEST(Test__QuantisedGemmKernel, ActivationSharingNotSupportedByDefault)
+{
+    // The base ITensorGemm returns false for supports_activation_sharing()
+    // We can't easily test this without a non-quantized kernel, but we can at least
+    // verify the interface methods exist and return sensible values
+    int M = 2;
+    int K = 32;
+
+    // Create a simple Q8_1 tensor just to get a kernel
+    std::vector<float> weights(32 * 32);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights)
+        x = dist(gen);
+    auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights.data(), {32, 32});
+    auto kernel = weights_tensor->createGemm();
+
+    // Test buffer size calculation
+    size_t buffer_size = kernel->get_quantized_activation_buffer_size(M, K);
+    EXPECT_EQ(buffer_size, M * (K / 32) * sizeof(Q8_1Block));
 }

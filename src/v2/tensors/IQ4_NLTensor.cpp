@@ -6,7 +6,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
 #include "FP16Utils.h"
@@ -249,9 +249,9 @@ namespace llaminar2
         }
         else
         {
-            // Tensor is on CPU - use auto-tuned CPU kernel
+            // Tensor is on CPU - use QuantisedGemmKernel (requires IINT8Unpackable)
             LOG_DEBUG("[IQ4_NLTensor] Creating CPU GEMM kernel");
-        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+            return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
         }
     }
 

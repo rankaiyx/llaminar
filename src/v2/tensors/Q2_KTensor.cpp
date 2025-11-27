@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "SIMDHelpers.h"
 #include <cstring>
 #include <stdexcept>
@@ -120,7 +120,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> Q2_KTensor::createGemm()
     {
-        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+        // Use QuantisedGemmKernel - requires IINT8Unpackable interface
+        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
     }
 
     void Q2_KTensor::decodeBlockScalar(const Q2_KBlock &block, float *output)

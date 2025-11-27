@@ -525,8 +525,11 @@ TEST(Test__BF16Tensor, DISABLED_ActivationGemmQKT)
  * @brief Test BF16 strided activation GEMM (multi-head attention pattern)
  *
  * Tests multiply_activations_strided for zero-copy multi-head operations.
+ *
+ * DISABLED: FloatingPointGemmKernel no longer supports strided GEMM.
+ * Strided operations are handled by attention kernels directly.
  */
-TEST(Test__BF16Tensor, ActivationGemmStrided)
+TEST(Test__BF16Tensor, DISABLED_ActivationGemmStrided)
 {
     // Simulate 2 heads, seq_len=2, head_dim=4
     // V: [seq_len, n_heads, head_dim] = [2, 2, 4] interleaved

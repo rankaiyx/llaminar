@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
 #include "../utils/Logger.h"
 #include "../kernels/cpu/CPURMSNormKernelT.h"
 #include "../kernels/cpu/CpuAttentionKernelT.h"
@@ -198,10 +198,9 @@ namespace llaminar2
         }
         else
         {
-            // Tensor is on CPU - use auto-tuned CPU kernel
-            // FP16 implements ITensorGemmTileDataProvider interface (used generically for auto-tuner)
-            LOG_DEBUG("[FP16Tensor] Creating CPU GEMM kernel with auto-tuner");
-            return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+            // Tensor is on CPU - use OneDNN-backed floating-point GEMM kernel
+            LOG_DEBUG("[FP16Tensor] Creating FloatingPointGemmKernel for FP16");
+            return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(this);
         }
     }
 
@@ -715,6 +714,30 @@ namespace llaminar2
         }
 
         return pack;
+    }
+
+    bool FP16Tensor::applyRMSNorm(
+        const float *gamma,
+        int seq_len,
+        int d_model,
+        float eps,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        auto kernel = createRMSNorm();
+        if (!kernel)
+        {
+            LOG_ERROR("[FP16Tensor::applyRMSNorm] Failed to create RMSNorm kernel");
+            return false;
+        }
+
+        // FP16 path: apply_fp16() with FP16 buffers (in-place)
+        return kernel->apply_fp16(
+            this->fp16_data(),
+            gamma,
+            this->mutable_fp16_data(),
+            seq_len, d_model, eps,
+            device_idx);
     }
 
     bool FP16Tensor::applyRoPE(

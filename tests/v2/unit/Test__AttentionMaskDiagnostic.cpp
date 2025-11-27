@@ -58,7 +58,7 @@ TEST(Test__AttentionMaskDiagnostic, SimpleCausalMask)
     std::vector<float> mask(seq_len * seq_len, 0.0f);
 
     // Create simple causal mask
-    attention_utils::create_causal_mask(mask.data(), seq_len, 0 /* no window */);
+    attention_utils::create_causal_mask(mask.data(), seq_len, -1 /* no window (full attention) */);
 
     print_mask("Simple Causal (4x4)", mask.data(), seq_len, seq_len);
 
@@ -97,7 +97,7 @@ TEST(Test__AttentionMaskDiagnostic, SimplePaddingMask)
         batch_size,
         seq_len,
         lengths.data(),
-        0 /* no window */
+        -1 /* no window (full attention) */
     );
 
     print_mask("Padding Only (batch=1, len=2/4)", mask.data(), total_len, total_len);
@@ -140,7 +140,7 @@ TEST(Test__AttentionMaskDiagnostic, BatchPaddingMask)
         batch_size,
         seq_len,
         lengths.data(),
-        0 /* no window */
+        -1 /* no window (full attention) */
     );
 
     print_mask("Batch Padding (lengths=[4,2])", mask.data(), total_len, total_len);
@@ -187,7 +187,7 @@ TEST(Test__AttentionMaskDiagnostic, CombinedCausalPaddingMask)
         seq_len,
         lengths.data(),
         true, /* causal */
-        0     /* no window */
+        -1    /* no window (full attention) */
     );
 
     print_mask("Combined Causal+Padding (len=2/4)", mask.data(), total_len, total_len);

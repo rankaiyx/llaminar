@@ -1,11 +1,11 @@
-# Q8_1 GEMM JIT Architecture
+# Quantised GEMM JIT Architecture
 
 **Location:** `src/v2/kernels/cpu/gemm_v4/`
 **Status:** Production (Optimized for Qwen 0.5B - 32B)
 
 ## Overview
 
-The `Q8_1` GEMM system is a high-performance, JIT-compiled Int8 matrix multiplication engine designed for CPU inference. It performs the core computation of **Quantized Weights (Int8) × Quantized Activations (Int8)**, utilizing AVX512-VNNI instructions to achieve theoretical peak throughput.
+The **Quantised GEMM** system is a high-performance, JIT-compiled Int8 matrix multiplication engine designed for CPU inference. It performs the core computation of **Quantized Weights (Int8) × Quantized Activations (Int8)**, utilizing AVX512-VNNI instructions to achieve theoretical peak throughput.
 
 Unlike static kernels, this system uses **Xbyak** to generate machine code at runtime, allowing for register-level optimizations specific to the batch size (M) and available instruction set.
 
@@ -15,17 +15,17 @@ It now supports **Generic Weight Packing** via the `IINT8Unpackable` interface, 
 
 The system is composed of three layers:
 
-### 1. The JIT Kernels (`Q8_1GemmJit_M*.h`)
+### 1. The JIT Kernels (`QuantisedGemmJit_M*.h`)
 These files define the assembly generation logic using the **Xbyak** JIT assembler.
-- **`Q8_1GemmJit_M1.h`**: Generates a kernel specialized for **M=1** (Single token decode). Optimized for latency.
-- **`Q8_1GemmJit_M2.h`**: Generates a kernel specialized for **M=2** (Small batch/speculative decoding).
-- **`Q8_1GemmJit_M4.h`** (and others): Specialized for larger fixed M sizes.
+- **`QuantisedGemmJit_M1.h`**: Generates a kernel specialized for **M=1** (Single token decode). Optimized for latency.
+- **`QuantisedGemmJit_M2.h`**: Generates a kernel specialized for **M=2** (Small batch/speculative decoding).
+- **(Future)**: Additional specializations for larger fixed M sizes.
 - **Mechanism**:
     - Allocates executable memory.
     - Emits AVX512 instructions (`vmovups`, `vpdpbusd`, `vfmadd231ps`).
     - Hardcodes loop unrolling and register allocation for the specific M.
 
-### 2. The Orchestrator (`Q8_1GemmKernel.h`)
+### 2. The Orchestrator (`QuantisedGemmKernel.h`)
 This is the high-level C++ driver that manages execution strategy. It does **not** perform the math itself but orchestrates:
 - **Threading**: OpenMP parallelization over N and M dimensions.
 - **Cache Management**: K-Tiling and Block sizing.
@@ -38,7 +38,7 @@ This is the high-level C++ driver that manages execution strategy. It does **not
     - Block size: 32 elements.
     - Content: 32 `int8_t` values (`qs`), 1 `float16` scale (`d`), and 1 `int16_t` sum (`sum_qs`).
     - **Purpose**: The `sum_qs` allows for efficient zero-point compensation during the dot product.
-- **Weights (`Q8_1PackedWeights`)**:
+- **Weights (`QuantisedPackedWeights`)**:
     - Re-packed into a layout optimal for VNNI loading (e.g., [K/4][N][4]).
     - Contains pre-computed scales and compensation terms.
     - Populated via `IINT8Unpackable::unpack_block_to_int8()`.
@@ -126,6 +126,24 @@ To further reduce memory bandwidth and latency, the V4 kernel supports fusing co
 ## Use Case
 
 This kernel is the default engine for **CPU Inference** in Llaminar V2 when using quantized models. It is specifically designed for:
-- **Input**: Any Quantized Weights implementing `IINT8Unpackable` (Q4_0, Q8_0, Q8_1, etc.) + FP32 Activations (quantized on-the-fly).
+- **Input**: Any Quantized Weights implementing `IINT8Unpackable` (Q4_0, Q8_0, Q8_1, etc.) + FP32 or Q8_1 Activations.
 - **Hardware**: Intel CPUs with AVX512-VNNI (Skylake-X, Cascade Lake, Ice Lake, Sapphire Rapids).
 - **Goal**: Maximize token generation speed (M=1) and prompt processing throughput (M=512).
+
+## Related Files
+
+- **Kernel Files:**
+  - `QuantisedGemmKernel.h` - Main orchestrator class (`QuantisedGemmKernel`)
+  - `QuantisedGemmJit_M1.h` - JIT kernel for M=1 (`QuantisedGemmJit_M1`)
+  - `QuantisedGemmJit_M2.h` - JIT kernel for M=2 (`QuantisedGemmJit_M2`)
+
+- **Test Files:**
+  - `tests/v2/unit/kernels/gemm/Test__QuantisedGemmKernel.cpp`
+  - `tests/v2/unit/kernels/gemm/Test__QuantisedGemmKernel_KQuants.cpp`
+  - `tests/v2/unit/kernels/gemm/Test__QuantisedGemmFused.cpp`
+
+- **Performance Tests:**
+  - `tests/v2/performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_GEMM.cpp`
+  - `tests/v2/performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_0_GEMM.cpp`
+  - `tests/v2/performance/kernels/cpu/gemm/gemm_v4/Perf__Q4_0_GEMM.cpp`
+  - `tests/v2/performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_GEMM_Fused.cpp`

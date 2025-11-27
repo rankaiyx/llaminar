@@ -6,10 +6,8 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
 #include "../kernels/cpu/fused/FusedRMSNormQuantize.h"
-#include "../kernels/cpu/fused/FusedDualGEMM.h"
-#include "../kernels/cpu/fused/FusedTripleGEMM.h"
+#include "../kernels/cpu/fused/FusedGEMM.h"
 #include "../utils/Logger.h"
 // #include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"  // DEPRECATED: Now using IntegerGemm via createGemm()
 #include <cmath>
@@ -692,55 +690,69 @@ namespace llaminar2
      * @brief Create fused dual GEMM kernel for FFN gate/up projections
      *
      * Creates kernel that fuses:
-     * 1. Shared input quantization (FP32 → INT8)
-     * 2. Gate GEMM (INT8×INT8 → INT32)
-     * 3. Up GEMM (INT8×INT8 → INT32)
+     * 1. Shared input quantization (FP32 → Q8_1)
+     * 2. Gate GEMM (Q8_1×weight → FP32)
+     * 3. Up GEMM (Q8_1×weight → FP32)
      *
-     * @param gate_weight INT8 quantized gate projection weights [k, n]
-     * @param up_weight Q8_1 quantized up projection weights [k, n]
-     * @return Unique pointer to FusedDualGEMM kernel instance
+     * @param gate_weight Quantized gate projection weights [n, k]
+     * @param up_weight Quantized up projection weights [n, k]
+     * @return Unique pointer to FusedGEMM kernel instance
      */
-    std::unique_ptr<FusedDualGEMM> INT8Tensor::createFusedDualGemm(
+    std::unique_ptr<FusedGEMM> INT8Tensor::createFusedDualGemm(
         TensorBase *gate_weight,
         TensorBase *up_weight)
     {
-        auto *gate_q8_1 = dynamic_cast<const Q8_1Tensor *>(gate_weight);
-        auto *up_q8_1 = dynamic_cast<const Q8_1Tensor *>(up_weight);
-        if (!gate_q8_1 || !up_q8_1)
+        if (!gate_weight || !up_weight)
         {
-            LOG_ERROR("[INT8Tensor] FusedDualGEMM requires Q8_1Tensor weights");
+            LOG_ERROR("[INT8Tensor] FusedGEMM requires non-null weight tensors");
             return nullptr;
         }
-        return std::make_unique<FusedDualGEMM>(gate_q8_1, up_q8_1);
+        return std::make_unique<FusedGEMM>(gate_weight, up_weight);
     }
 
     /**
      * @brief Create fused triple GEMM kernel for attention Q/K/V projections
      *
      * Creates kernel that fuses:
-     * 1. Q GEMM: FP32 input × Q8_1 weight → FP32 output
-     * 2. K GEMM: FP32 input × Q8_1 weight → FP32 output
-     * 3. V GEMM: FP32 input × Q8_1 weight → FP32 output
+     * 1. Q GEMM: FP32 input × weight → FP32 output
+     * 2. K GEMM: FP32 input × weight → FP32 output
+     * 3. V GEMM: FP32 input × weight → FP32 output
      *
-     * @param q_weight Q8_1 quantized Q projection weights [k, n]
-     * @param k_weight Q8_1 quantized K projection weights [k, n]
-     * @param v_weight Q8_1 quantized V projection weights [k, n]
-     * @return Unique pointer to FusedTripleGEMM kernel instance
+     * @param q_weight Quantized Q projection weights [n_q, k]
+     * @param k_weight Quantized K projection weights [n_kv, k]
+     * @param v_weight Quantized V projection weights [n_kv, k]
+     * @return Unique pointer to FusedGEMM kernel instance
      */
-    std::unique_ptr<FusedTripleGEMM> INT8Tensor::createFusedTripleGemm(
+    std::unique_ptr<FusedGEMM> INT8Tensor::createFusedTripleGemm(
         TensorBase *q_weight,
         TensorBase *k_weight,
         TensorBase *v_weight)
     {
-        auto *q_q8_1 = dynamic_cast<const Q8_1Tensor *>(q_weight);
-        auto *k_q8_1 = dynamic_cast<const Q8_1Tensor *>(k_weight);
-        auto *v_q8_1 = dynamic_cast<const Q8_1Tensor *>(v_weight);
-        if (!q_q8_1 || !k_q8_1 || !v_q8_1)
+        if (!q_weight || !k_weight || !v_weight)
         {
-            LOG_ERROR("[INT8Tensor] FusedTripleGEMM requires Q8_1Tensor weights");
+            LOG_ERROR("[INT8Tensor] FusedGEMM requires non-null weight tensors");
             return nullptr;
         }
-        return std::make_unique<FusedTripleGEMM>(q_q8_1, k_q8_1, v_q8_1);
+        return std::make_unique<FusedGEMM>(q_weight, k_weight, v_weight);
+    }
+
+    bool INT8Tensor::applyRMSNorm(
+        const float *gamma,
+        int seq_len,
+        int d_model,
+        float eps,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)gamma;
+        (void)seq_len;
+        (void)d_model;
+        (void)eps;
+        (void)mpi_ctx;
+        (void)device_idx;
+        // INT8 tensor doesn't support in-place RMSNorm - use createRMSNorm() instead
+        LOG_ERROR("[INT8Tensor::applyRMSNorm] Not supported for INT8 tensors");
+        return false;
     }
 
 } // namespace llaminar2

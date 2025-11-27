@@ -5,7 +5,7 @@
  */
 
 #include "Tensors.h"
-#include "../kernels/cpu/gemm_v4/OneDNNGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "TensorKernels.h"
 #include "IQQuantTables.h"
 #include <cstring>
@@ -87,7 +87,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorGemm> IQ1_MTensor::createGemm()
     {
-        return std::make_unique<llaminar2::gemm_v4::OneDNNGemmKernel>(this);
+        // Use QuantisedGemmKernel - requires IINT8Unpackable interface
+        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(this);
     }
 
     void IQ1_MTensor::decodeBlock(const IQ1_MBlock &block, float *output)
@@ -225,7 +226,7 @@ namespace llaminar2
         throw std::runtime_error("IQ1_MTensor::mutable_data: quantized tensors are immutable");
     }
 
-        bool IQ1_MTensor::copyFrom(const TensorBase *src)
+    bool IQ1_MTensor::copyFrom(const TensorBase *src)
     {
         // Quantized tensors are read-only weights - no transfer needed
         (void)src;
