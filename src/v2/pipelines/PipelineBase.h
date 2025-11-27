@@ -135,6 +135,67 @@
     } while (0)
 #endif
 
+/**
+ * @brief Capture tensor snapshot for E2E parity testing
+ *
+ * Captures the full tensor contents for later comparison with PyTorch reference.
+ * Only active when ENABLE_PIPELINE_SNAPSHOTS is defined (E2E/Debug builds).
+ * Compiles to no-op in Release builds for zero overhead.
+ *
+ * Usage: CAPTURE_SNAPSHOT("layer5_ATTENTION_CONTEXT", buffers.attn_output.get())
+ *
+ * @param key Human-readable snapshot identifier
+ * @param tensor_ptr Pointer to TensorBase with data() and shape() methods
+ */
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+#define CAPTURE_SNAPSHOT(key, tensor_ptr)                     \
+    do                                                        \
+    {                                                         \
+        const auto &_shape = (tensor_ptr)->shape();           \
+        size_t _numel = 1;                                    \
+        for (auto _dim : _shape)                              \
+            _numel *= _dim;                                   \
+        captureSnapshot((key), (tensor_ptr)->data(), _numel); \
+    } while (0)
+
+/**
+ * @brief Capture tensor snapshot with view for buffers larger than actual data
+ *
+ * Creates a view of the specified dimensions before capturing, useful when
+ * activation buffers are pre-allocated larger than the current sequence length.
+ * Only active when ENABLE_PIPELINE_SNAPSHOTS is defined (E2E/Debug builds).
+ *
+ * Usage: CAPTURE_SNAPSHOT_VIEW("layer0_Q_PROJECTION", buffers.Q, seq_len, n_heads * head_dim)
+ *
+ * @param key Human-readable snapshot identifier
+ * @param tensor_ptr Pointer to TensorBase with create_view() method
+ * @param rows Number of rows (typically effective_seq_len)
+ * @param cols Number of columns (typically feature dimension)
+ */
+#define CAPTURE_SNAPSHOT_VIEW(key, tensor_ptr, rows, cols)                                              \
+    do                                                                                                  \
+    {                                                                                                   \
+        auto _view = (tensor_ptr)->create_view({static_cast<size_t>(rows), static_cast<size_t>(cols)}); \
+        if (_view)                                                                                      \
+        {                                                                                               \
+            const auto &_shape = _view->shape();                                                        \
+            size_t _numel = 1;                                                                          \
+            for (auto _dim : _shape)                                                                    \
+                _numel *= _dim;                                                                         \
+            captureSnapshot((key), _view->data(), _numel);                                              \
+        }                                                                                               \
+    } while (0)
+#else
+#define CAPTURE_SNAPSHOT(key, tensor_ptr) \
+    do                                    \
+    {                                     \
+    } while (0)
+#define CAPTURE_SNAPSHOT_VIEW(key, tensor_ptr, rows, cols) \
+    do                                                     \
+    {                                                      \
+    } while (0)
+#endif
+
 namespace llaminar2
 {
     // Forward declarations

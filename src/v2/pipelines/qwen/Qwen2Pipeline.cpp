@@ -33,43 +33,6 @@
 #include <algorithm>
 #include <omp.h>
 
-// Helper macro for snapshot capture (element_count() is protected)
-#ifdef ENABLE_PIPELINE_SNAPSHOTS
-#define CAPTURE_SNAPSHOT(key, tensor_ptr)                     \
-    do                                                        \
-    {                                                         \
-        const auto &_shape = (tensor_ptr)->shape();           \
-        size_t _numel = 1;                                    \
-        for (auto _dim : _shape)                              \
-            _numel *= _dim;                                   \
-        captureSnapshot((key), (tensor_ptr)->data(), _numel); \
-    } while (0)
-
-// Helper macro for snapshot capture with view (for buffers larger than actual data)
-#define CAPTURE_SNAPSHOT_VIEW(key, tensor_ptr, rows, cols)                                              \
-    do                                                                                                  \
-    {                                                                                                   \
-        auto _view = (tensor_ptr)->create_view({static_cast<size_t>(rows), static_cast<size_t>(cols)}); \
-        if (_view)                                                                                      \
-        {                                                                                               \
-            const auto &_shape = _view->shape();                                                        \
-            size_t _numel = 1;                                                                          \
-            for (auto _dim : _shape)                                                                    \
-                _numel *= _dim;                                                                         \
-            captureSnapshot((key), _view->data(), _numel);                                              \
-        }                                                                                               \
-    } while (0)
-#else
-#define CAPTURE_SNAPSHOT(key, tensor_ptr) \
-    do                                    \
-    {                                     \
-    } while (0)
-#define CAPTURE_SNAPSHOT_VIEW(key, tensor_ptr, rows, cols) \
-    do                                                     \
-    {                                                      \
-    } while (0)
-#endif
-
 namespace llaminar2
 {
     // =============================================================================
