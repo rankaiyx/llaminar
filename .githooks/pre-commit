@@ -88,7 +88,7 @@ echo ""
 # Filter: ^V2_Integration_ matches all integration tests
 # NOTE: Integration tests should run against optimized Release build
 set +e
-ctest --test-dir "$BUILD_V2_RELEASE" -R "^V2_Integration_" --output-on-failure
+ctest --test-dir "$BUILD_V2_RELEASE" -R "^V2_Integration_" --output-on-failure --parallel
 INTEGRATION_EXIT_CODE=$?
 set -e
 
