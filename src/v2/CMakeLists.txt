@@ -460,6 +460,25 @@ if(NOT TARGET ggml)
                      ${CMAKE_CURRENT_BINARY_DIR}/llama.cpp)
 endif()
 
+# =============================================================================
+# FTXUI Integration (for interactive chat UI)
+# =============================================================================
+include(FetchContent)
+FetchContent_Declare(ftxui
+    GIT_REPOSITORY https://github.com/ArthurSonzogni/ftxui
+    GIT_TAG v5.0.0
+    GIT_SHALLOW TRUE
+)
+
+# Disable FTXUI examples and tests to speed up build
+set(FTXUI_BUILD_DOCS OFF CACHE BOOL "Disable FTXUI docs" FORCE)
+set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "Disable FTXUI examples" FORCE)
+set(FTXUI_BUILD_TESTS OFF CACHE BOOL "Disable FTXUI tests" FORCE)
+set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "Disable FTXUI install" FORCE)
+
+FetchContent_MakeAvailable(ftxui)
+message(STATUS "V2: FTXUI v5.0.0 configured for interactive chat UI")
+
 # V2 Core Library
 add_library(llaminar2_core STATIC
     backends/ComputeBackend.cpp
@@ -534,6 +553,7 @@ add_library(llaminar2_core STATIC
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
     utils/Sampler.cpp
+    utils/ChatTemplate.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
 )
@@ -584,6 +604,9 @@ endif()
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
+    ftxui::screen
+    ftxui::dom
+    ftxui::component
 )
 
 # OneDNN for INT8 GEMM acceleration

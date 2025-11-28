@@ -631,6 +631,19 @@ add_v2_test(V2_Unit_Sampler
     MPI_PROCS 1  # Sampler is single-rank only
 )
 
+# Test: ChatTemplate (chat template detection and formatting)
+add_executable(v2_test_chat_template unit/Test__ChatTemplate.cpp)
+target_link_libraries(v2_test_chat_template 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ChatTemplate 
+    COMMAND $<TARGET_FILE:v2_test_chat_template>
+    LABELS "V2;Unit;Chat;Template;Tokenization;TextProcessing"
+    MPI_PROCS 1  # ChatTemplate is single-rank only
+)
+
 # Test: Attention parity regression tests (locks in RoPE theta, causal masking, GQA behavior)
 add_executable(v2_test_attention_parity unit/Test__AttentionParity.cpp)
 target_link_libraries(v2_test_attention_parity 
