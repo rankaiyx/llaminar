@@ -297,9 +297,9 @@ int main(int argc, char *argv[])
     {
         pipeline_config.activation_precision = ActivationPrecision::FP16;
     }
-    else if (args.activation_precision == "int32")
+    else if (args.activation_precision == "q8_1")
     {
-        pipeline_config.activation_precision = ActivationPrecision::INT32;
+        pipeline_config.activation_precision = ActivationPrecision::Q8_1;
     }
     else
     {
@@ -400,8 +400,8 @@ int main(int argc, char *argv[])
         case ActivationPrecision::FP16:
             activation_prec_name = "FP16 (16-bit float)";
             break;
-        case ActivationPrecision::INT32:
-            activation_prec_name = "INT32 (32-bit integer)";
+        case ActivationPrecision::Q8_1:
+            activation_prec_name = "Q8_1 (quantized 8-bit with per-block scaling)";
             break;
         }
 

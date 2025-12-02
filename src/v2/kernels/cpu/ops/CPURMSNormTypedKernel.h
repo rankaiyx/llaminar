@@ -1,0 +1,403 @@
+/**
+ * @file CPURMSNormTypedKernel.h
+ * @brief Typed RMSNorm kernel with fused precision conversion
+ *
+ * This kernel implements the "kernel black-box model" for typed residuals:
+ * - External interface uses configured ActivationPrecision
+ * - Internal computation always uses FP32 for numerical stability
+ * - Fused dequant on input (if input precision != FP32)
+ * - Fused requant on output (if output precision != FP32)
+ *
+ * Design Contract:
+ * - Pipeline instantiates CPURMSNormTypedKernel<Precision> based on config
+ * - Kernel accepts input/output buffers in that precision format
+ * - All precision conversion is internal and transparent to caller
+ *
+ * Memory Bandwidth Benefits (vs FP32):
+ * - BF16: 2× reduction (input: 2B, output: 2B vs 4B each)
+ * - FP16: 2× reduction (input: 2B, output: 2B vs 4B each)
+ * - Q8_1: 3.5× reduction (36 bytes per 32 elements vs 128 bytes)
+ *
+ * @author David Sanftenberg
+ * @date 2025-12-04
+ */
+
+#pragma once
+
+#include "../../../pipelines/PipelineConfig.h"
+#include "../../../tensors/TensorKernels.h"
+#include "../../../tensors/BlockStructures.h"
+#include "../CPUKernelBase.h"
+#include <memory>
+#include <cstdint>
+
+namespace llaminar2
+{
+
+    // =========================================================================
+    // Precision Metadata Traits (minimal - just storage type and metadata)
+    // =========================================================================
+
+    namespace detail
+    {
+        /**
+         * @brief Primary template for precision metadata (must be specialized)
+         */
+        template <ActivationPrecision Precision>
+        struct PrecisionMetadata;
+
+        template <>
+        struct PrecisionMetadata<ActivationPrecision::FP32>
+        {
+            using StorageType = float;
+            static constexpr const char *name = "FP32";
+            static constexpr float compression_ratio = 1.0f;
+        };
+
+        template <>
+        struct PrecisionMetadata<ActivationPrecision::BF16>
+        {
+            using StorageType = uint16_t;
+            static constexpr const char *name = "BF16";
+            static constexpr float compression_ratio = 2.0f;
+        };
+
+        template <>
+        struct PrecisionMetadata<ActivationPrecision::FP16>
+        {
+            using StorageType = uint16_t;
+            static constexpr const char *name = "FP16";
+            static constexpr float compression_ratio = 2.0f;
+        };
+
+        template <>
+        struct PrecisionMetadata<ActivationPrecision::Q8_1>
+        {
+            using StorageType = Q8_1Block;
+            static constexpr const char *name = "Q8_1";
+            static constexpr float compression_ratio = 3.5f; // 36 bytes per 32 elements vs 128
+        };
+    } // namespace detail
+
+    /**
+     * @brief Typed RMSNorm kernel with fused precision conversion
+     *
+     * @tparam Precision The ActivationPrecision for input/output buffers
+     *
+     * Usage:
+     * @code
+     * // Pipeline creates kernel based on configured precision
+     * auto kernel = std::make_unique<CPURMSNormTypedKernel<ActivationPrecision::BF16>>();
+     *
+     * // Kernel takes BF16 input, computes in FP32, outputs BF16
+     * kernel->apply_typed(bf16_input, gamma, bf16_output, rows, cols, epsilon);
+     * @endcode
+     */
+    template <ActivationPrecision Precision>
+    class CPURMSNormTypedKernel : public CPUKernelBase
+    {
+    public:
+        using Metadata = detail::PrecisionMetadata<Precision>;
+        using StorageType = typename Metadata::StorageType;
+
+        CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() = default;
+
+        bool supports_device(int device_idx) const
+        {
+            return device_idx == -1; // CPU only
+        }
+
+        /**
+         * @brief Apply RMSNorm with typed input/output (fused precision conversion)
+         *
+         * Algorithm:
+         * 1. If input precision != FP32: fused dequantize to FP32
+         * 2. Compute RMSNorm in FP32: output = (x / rms(x)) * gamma
+         * 3. If output precision != FP32: fused quantize to output format
+         *
+         * @param input Input buffer in StorageType format [rows, cols]
+         * @param gamma RMSNorm scale weights [cols] (always FP32)
+         * @param output Output buffer in StorageType format [rows, cols]
+         * @param rows Number of rows (batch_size * seq_len)
+         * @param cols Hidden dimension (d_model)
+         * @param epsilon Numerical stability epsilon (default: 1e-6f)
+         * @param device_idx Device index (-1 = CPU)
+         * @return true on success, false on error
+         */
+        bool apply_typed(
+            const StorageType *input,
+            const float *gamma,
+            StorageType *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        /**
+         * @brief Apply RMSNorm with fused residual addition
+         *
+         * Computes: output = RMSNorm(dequant(residual) + fp32_input) * gamma
+         * Then quantizes output to configured precision.
+         *
+         * This fuses three operations:
+         * 1. Dequantize typed residual to FP32
+         * 2. Add FP32 input to dequantized residual
+         * 3. Apply RMSNorm
+         * 4. Quantize output to typed format
+         *
+         * @param residual Typed residual buffer [rows, cols]
+         * @param fp32_input FP32 input to add to residual [rows, cols]
+         * @param gamma RMSNorm scale weights [cols]
+         * @param output Typed output buffer [rows, cols]
+         * @param rows Number of rows
+         * @param cols Hidden dimension
+         * @param epsilon Numerical stability epsilon
+         * @param device_idx Device index (-1 = CPU)
+         * @return true on success, false on error
+         */
+        bool apply_with_residual_add(
+            const StorageType *residual,
+            const float *fp32_input,
+            const float *gamma,
+            StorageType *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        /**
+         * @brief Get the precision of this kernel instance
+         */
+        static constexpr ActivationPrecision precision() { return Precision; }
+
+        /**
+         * @brief Get human-readable precision name
+         */
+        static const char *precision_name() { return Metadata::name; }
+
+        /**
+         * @brief Get compression ratio vs FP32
+         */
+        static constexpr float compression_ratio() { return Metadata::compression_ratio; }
+    };
+
+    // =========================================================================
+    // FP32 Specialization (No Conversion Needed)
+    // =========================================================================
+
+    /**
+     * @brief FP32 specialization - direct computation, no conversion
+     *
+     * This is the baseline case where input/output are already FP32.
+     * No dequant/requant overhead.
+     */
+    template <>
+    class CPURMSNormTypedKernel<ActivationPrecision::FP32> : public CPUKernelBase
+    {
+    public:
+        using StorageType = float;
+
+        CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() = default;
+
+        bool supports_device(int device_idx) const
+        {
+            return device_idx == -1;
+        }
+
+        /**
+         * @brief Apply RMSNorm with FP32 input/output (no conversion)
+         */
+        bool apply_typed(
+            const float *input,
+            const float *gamma,
+            float *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        /**
+         * @brief Apply RMSNorm with fused FP32 residual addition
+         */
+        bool apply_with_residual_add(
+            const float *residual,
+            const float *fp32_input,
+            const float *gamma,
+            float *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
+        static const char *precision_name() { return "FP32"; }
+        static constexpr float compression_ratio() { return 1.0f; }
+    };
+
+    // =========================================================================
+    // BF16 Specialization (2x Compression)
+    // =========================================================================
+
+    template <>
+    class CPURMSNormTypedKernel<ActivationPrecision::BF16> : public CPUKernelBase
+    {
+    public:
+        using StorageType = uint16_t; // BF16 stored as uint16_t
+
+        CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() = default;
+
+        bool supports_device(int device_idx) const
+        {
+            return device_idx == -1;
+        }
+
+        /**
+         * @brief Apply RMSNorm with BF16 input/output
+         *
+         * Algorithm:
+         * 1. Dequantize BF16 input to FP32 (vectorized)
+         * 2. Compute RMSNorm in FP32
+         * 3. Quantize FP32 output to BF16 (vectorized)
+         */
+        bool apply_typed(
+            const uint16_t *input,
+            const float *gamma,
+            uint16_t *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        /**
+         * @brief Apply RMSNorm with fused BF16 residual addition
+         */
+        bool apply_with_residual_add(
+            const uint16_t *residual,
+            const float *fp32_input,
+            const float *gamma,
+            uint16_t *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
+        static const char *precision_name() { return "BF16"; }
+        static constexpr float compression_ratio() { return 2.0f; }
+    };
+
+    // =========================================================================
+    // FP16 Specialization (2x Compression)
+    // =========================================================================
+
+    template <>
+    class CPURMSNormTypedKernel<ActivationPrecision::FP16> : public CPUKernelBase
+    {
+    public:
+        using StorageType = uint16_t; // FP16 stored as uint16_t
+
+        CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() = default;
+
+        bool supports_device(int device_idx) const
+        {
+            return device_idx == -1;
+        }
+
+        /**
+         * @brief Apply RMSNorm with FP16 input/output
+         */
+        bool apply_typed(
+            const uint16_t *input,
+            const float *gamma,
+            uint16_t *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        /**
+         * @brief Apply RMSNorm with fused FP16 residual addition
+         */
+        bool apply_with_residual_add(
+            const uint16_t *residual,
+            const float *fp32_input,
+            const float *gamma,
+            uint16_t *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
+        static const char *precision_name() { return "FP16"; }
+        static constexpr float compression_ratio() { return 2.0f; }
+    };
+
+    // =========================================================================
+    // Q8_1 Specialization (3.5x Compression)
+    // =========================================================================
+
+    // Forward declaration for Q8_1Block
+    struct Q8_1Block;
+
+    template <>
+    class CPURMSNormTypedKernel<ActivationPrecision::Q8_1> : public CPUKernelBase
+    {
+    public:
+        using StorageType = Q8_1Block;
+
+        CPURMSNormTypedKernel() = default;
+        ~CPURMSNormTypedKernel() = default;
+
+        bool supports_device(int device_idx) const
+        {
+            return device_idx == -1;
+        }
+
+        /**
+         * @brief Apply RMSNorm with Q8_1 input/output
+         *
+         * Algorithm:
+         * 1. Dequantize Q8_1 blocks to FP32 (per-block scale × int8 values)
+         * 2. Compute RMSNorm in FP32
+         * 3. Quantize FP32 output to Q8_1 blocks (find scale, quantize)
+         *
+         * Note: cols must be a multiple of 32 (Q8_1 block size)
+         */
+        bool apply_typed(
+            const Q8_1Block *input,
+            const float *gamma,
+            Q8_1Block *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        /**
+         * @brief Apply RMSNorm with fused Q8_1 residual addition
+         *
+         * Optimized for the typed residual pattern where:
+         * - residual is stored compressed as Q8_1
+         * - fp32_input is the new contribution to add
+         * - output is stored compressed as Q8_1
+         */
+        bool apply_with_residual_add(
+            const Q8_1Block *residual,
+            const float *fp32_input,
+            const float *gamma,
+            Q8_1Block *output,
+            int rows,
+            int cols,
+            float epsilon = 1e-6f,
+            int device_idx = -1);
+
+        static constexpr ActivationPrecision precision() { return ActivationPrecision::Q8_1; }
+        static const char *precision_name() { return "Q8_1"; }
+        static constexpr float compression_ratio() { return 3.556f; }
+    };
+
+} // namespace llaminar2

@@ -689,4 +689,51 @@ namespace llaminar2
         return false;
     }
 
+    // ===== Bulk Q8_1 Quantization (Q8_1 → Q8_1 direct copy) =====
+
+    bool Q8_1Tensor::quantize_to_q8_1(void *q8_1_buffer, int m, int k) const
+    {
+        if (!q8_1_buffer || m <= 0 || k <= 0)
+        {
+            return false;
+        }
+
+        // Validate dimensions against tensor shape
+        const size_t cols = shape_[1];
+        const size_t rows = shape_[0];
+        if (static_cast<size_t>(m) > rows || static_cast<size_t>(k) > cols)
+        {
+            return false;
+        }
+
+        const int k_blocks = (k + 31) / 32;
+        const size_t blocks_per_row = (cols + 31) / 32;
+
+        // Get source data pointer (handle views)
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q8_1Block *src_blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
+        Q8_1Block *dst_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
+
+        // Direct copy - Q8_1 is already in the right format
+        // Just need to handle potential row stride differences if k < cols
+        if (k == static_cast<int>(cols))
+        {
+            // Fast path: contiguous copy
+            std::memcpy(dst_blocks, src_blocks, static_cast<size_t>(m) * k_blocks * sizeof(Q8_1Block));
+        }
+        else
+        {
+            // Copy row by row (handle different k vs cols)
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < m; ++i)
+            {
+                const Q8_1Block *src_row = src_blocks + i * blocks_per_row;
+                Q8_1Block *dst_row = dst_blocks + i * k_blocks;
+                std::memcpy(dst_row, src_row, k_blocks * sizeof(Q8_1Block));
+            }
+        }
+
+        return true;
+    }
+
 } // namespace llaminar2

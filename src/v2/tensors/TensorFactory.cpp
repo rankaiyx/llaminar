@@ -5,6 +5,7 @@
  */
 
 #include "TensorFactory.h"
+#include "BlockStructures.h"
 #include "v2/utils/Logger.h"
 #include <stdexcept>
 #include <sstream>
@@ -80,6 +81,74 @@ namespace llaminar2
         }
 
         return std::make_unique<BF16Tensor>(shape, bf16_data);
+    }
+
+    std::unique_ptr<INT32Tensor> TensorFactory::createINT32(const std::vector<size_t> &shape)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        return std::make_unique<INT32Tensor>(shape);
+    }
+
+    std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        // Q8_1Tensor requires block-aligned allocation
+        size_t n_elems = 1;
+        for (auto dim : shape)
+            n_elems *= dim;
+        size_t n_blocks = (n_elems + 31) / 32;
+        size_t n_bytes = n_blocks * sizeof(Q8_1Block);
+        std::vector<uint8_t> raw_data(n_bytes, 0);
+
+        return std::make_unique<Q8_1Tensor>(shape, raw_data);
+    }
+
+    std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape,
+                                                          const std::vector<uint8_t> &raw_data)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        return std::make_unique<Q8_1Tensor>(shape, raw_data);
+    }
+
+    std::unique_ptr<TensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
+                                                                ActivationPrecision precision,
+                                                                int device_idx)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+            return createFP32(shape, device_idx);
+
+        case ActivationPrecision::BF16:
+            return createBF16(shape);
+
+        case ActivationPrecision::FP16:
+            return createFP16(shape);
+
+        case ActivationPrecision::Q8_1:
+            return createQ8_1(shape);
+
+        default:
+            LOG_ERROR("TensorFactory::createActivation: unknown precision, defaulting to FP32");
+            return createFP32(shape, device_idx);
+        }
     }
 
     std::unique_ptr<TensorBase> TensorFactory::createQuantized(TensorType type,

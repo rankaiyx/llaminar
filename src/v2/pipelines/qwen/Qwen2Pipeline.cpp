@@ -192,35 +192,6 @@ namespace llaminar2
         return weight_names;
     }
 
-    // Helper: Create activation tensor with configured precision
-    namespace
-    {
-        std::shared_ptr<TensorBase> createActivationTensor(
-            const std::vector<size_t> &shape,
-            int device_idx,
-            ActivationPrecision precision)
-        {
-            switch (precision)
-            {
-            case ActivationPrecision::FP32:
-                return std::make_shared<FP32Tensor>(shape, device_idx);
-
-            case ActivationPrecision::BF16:
-                return std::make_shared<BF16Tensor>(shape);
-
-            case ActivationPrecision::FP16:
-                return std::make_shared<FP16Tensor>(shape);
-
-            case ActivationPrecision::INT32:
-                return std::make_shared<INT32Tensor>(shape);
-
-            default:
-                LOG_ERROR("Unknown activation precision, defaulting to FP32");
-                return std::make_shared<FP32Tensor>(shape, device_idx);
-            }
-        }
-    } // anonymous namespace
-
     ActivationBuffers Qwen2Pipeline::createBuffersForDevice(int device_idx, int max_seq_len)
     {
         ActivationBuffers buffers;
@@ -231,43 +202,39 @@ namespace llaminar2
         // Get configured activation precision
         auto precision = config_.activation_precision;
 
+        // Helper lambda to create activation tensors via inherited tensor_factory_
+        auto createActivation = [&](const std::vector<size_t> &shape) -> std::shared_ptr<TensorBase>
+        {
+            return tensor_factory_->createActivation(shape, precision, device_idx);
+        };
+
         // Residual (d_model) - sized for batch
-        buffers.residual = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-            device_idx, precision);
+        buffers.residual = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
 
         // Normalization buffer (shared across attention and FFN) - sized for batch
-        buffers.normalized = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-            device_idx, precision);
+        buffers.normalized = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
 
         // Attention buffers (Qwen-specific dimensions) - sized for batch
-        buffers.Q = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
-            device_idx, precision);
-        buffers.K = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-            device_idx, precision);
-        buffers.V = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)},
-            device_idx, precision);
-        buffers.attn_output = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)},
-            device_idx, precision);
-        buffers.attn_proj = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-            device_idx, precision);
+        buffers.Q = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)});
+        buffers.K = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)});
+        buffers.V = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)});
+        buffers.attn_output = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)});
+        buffers.attn_proj = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
 
         // FFN buffers (Qwen-specific d_ff_) - sized for batch
-        buffers.gate = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
-            device_idx, precision);
-        buffers.up = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)},
-            device_idx, precision);
-        buffers.ffn_output = createActivationTensor(
-            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)},
-            device_idx, precision);
+        buffers.gate = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)});
+        buffers.up = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_ff_)});
+        buffers.ffn_output = createActivation(
+            {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
 
         return buffers;
     }
@@ -315,9 +282,9 @@ namespace llaminar2
         // Allocate activation tensors if needed (sized for batch)
         if (!current_hidden_ || static_cast<int>(current_hidden_->shape()[0]) != effective_seq_len)
         {
-            current_hidden_ = createActivationTensor(
+            current_hidden_ = tensor_factory_->createActivation(
                 {static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_model_)},
-                device_idx_, config_.activation_precision);
+                config_.activation_precision, device_idx_);
             LOG_DEBUG("Allocated hidden states: "
                       << effective_seq_len << " x " << d_model_ << " on device " << device_idx_);
         }
@@ -1076,9 +1043,9 @@ namespace llaminar2
         // Allocate logits buffer if needed
         if (!logits_buffer_ || static_cast<int>(logits_buffer_->shape()[0]) != effective_seq_len)
         {
-            logits_buffer_ = createActivationTensor(
+            logits_buffer_ = tensor_factory_->createActivation(
                 {static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
-                device_idx_, config_.activation_precision);
+                config_.activation_precision, device_idx_);
             LOG_DEBUG("Allocated logits buffer: "
                       << effective_seq_len << " x " << vocab_size_ << " on device " << device_idx_);
         }

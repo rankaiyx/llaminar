@@ -21,6 +21,7 @@
 #include "../loaders/ModelContext.h"
 #include "../loaders/WeightPlacementMap.h"
 #include "../tensors/Tensors.h"
+#include "../tensors/TensorFactory.h"
 #include "../tensors/TensorKernels.h"
 #include "../tensors/KVCache.h" // KV cache for autoregressive decode
 #include "PipelineConfig.h"     // Runtime configuration
@@ -390,6 +391,15 @@ namespace llaminar2
         std::shared_ptr<MPIContext> mpi_ctx_;
         int device_idx_;        // Primary device (-1 = CPU, ≥0 = GPU index)
         PipelineConfig config_; // Runtime configuration (max_seq_len, etc.)
+
+        /**
+         * @brief Tensor factory for creating activation and residual tensors
+         *
+         * Provides NUMA-aware allocation with proper device placement.
+         * All tensor creation in pipelines should go through this factory.
+         * Initialized in PipelineBase constructor.
+         */
+        std::unique_ptr<TensorFactory> tensor_factory_;
 
         // Model path for convenience (from model_ctx_)
         std::string model_path_;

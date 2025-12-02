@@ -67,7 +67,7 @@ namespace llaminar2
         std::string weight_precision = "native"; // "native", "fp32", "bf16", "fp16", "int8"
 
         // Activation/accumulation precision
-        std::string activation_precision = "fp32"; // "fp32", "bf16", "fp16", "int32"
+        std::string activation_precision = "fp32"; // "fp32", "bf16", "fp16", "q8_1"
 
         // Chat mode
         bool chat_mode = false;         // Enable interactive chat (FTXUI UI)

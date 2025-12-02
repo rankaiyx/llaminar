@@ -1115,6 +1115,386 @@ namespace llaminar2
             }
         }
 
+        // ====================================================================
+        // Fused Residual Add Operations (Typed Residuals Optimization)
+        // ====================================================================
+        // These functions perform fused dequantize + add operations for residual
+        // connections in transformer blocks. By fusing dequant and add, we:
+        // 1. Avoid intermediate FP32 buffer allocation
+        // 2. Keep data in registers between dequant and add
+        // 3. Reduce memory traffic (only read typed residual once)
+
+        /**
+         * @brief Fused FP32 residual add: output = residual + input
+         *
+         * @param residual FP32 residual buffer
+         * @param input FP32 input to add
+         * @param output FP32 output buffer
+         * @param count Number of elements
+         */
+        inline void fused_fp32_residual_add(
+            const float *residual, const float *input, float *output, size_t count)
+        {
+            size_t i = 0;
+#ifdef __AVX512F__
+            for (; i + 16 <= count; i += 16)
+            {
+                __m512 r = _mm512_loadu_ps(residual + i);
+                __m512 x = _mm512_loadu_ps(input + i);
+                __m512 sum = _mm512_add_ps(r, x);
+                _mm512_storeu_ps(output + i, sum);
+            }
+#elif defined(__AVX2__)
+            for (; i + 8 <= count; i += 8)
+            {
+                __m256 r = _mm256_loadu_ps(residual + i);
+                __m256 x = _mm256_loadu_ps(input + i);
+                __m256 sum = _mm256_add_ps(r, x);
+                _mm256_storeu_ps(output + i, sum);
+            }
+#endif
+            for (; i < count; ++i)
+            {
+                output[i] = residual[i] + input[i];
+            }
+        }
+
+        /**
+         * @brief Fused BF16 residual add: output = dequant(bf16_residual) + fp32_input
+         *
+         * Performs BF16→FP32 dequantization and addition in a single pass,
+         * keeping intermediate FP32 values in registers.
+         *
+         * @param residual BF16 residual buffer (uint16_t)
+         * @param input FP32 input to add
+         * @param output FP32 output buffer
+         * @param count Number of elements
+         */
+        inline void fused_bf16_residual_add(
+            const uint16_t *residual, const float *input, float *output, size_t count)
+        {
+            size_t i = 0;
+#ifdef __AVX512F__
+            for (; i + 16 <= count; i += 16)
+            {
+                // Dequantize BF16 → FP32
+                __m256i bf16_vals = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(residual + i));
+                __m512i unpacked = _mm512_cvtepu16_epi32(bf16_vals);
+                __m512i shifted = _mm512_slli_epi32(unpacked, 16);
+                __m512 r = _mm512_castsi512_ps(shifted);
+
+                // Load input and add
+                __m512 x = _mm512_loadu_ps(input + i);
+                __m512 sum = _mm512_add_ps(r, x);
+                _mm512_storeu_ps(output + i, sum);
+            }
+#elif defined(__AVX2__)
+            for (; i + 8 <= count; i += 8)
+            {
+                // Dequantize BF16 → FP32
+                __m128i bf16_vals = _mm_loadu_si128(reinterpret_cast<const __m128i *>(residual + i));
+                __m256i unpacked = _mm256_cvtepu16_epi32(bf16_vals);
+                __m256i shifted = _mm256_slli_epi32(unpacked, 16);
+                __m256 r = _mm256_castsi256_ps(shifted);
+
+                // Load input and add
+                __m256 x = _mm256_loadu_ps(input + i);
+                __m256 sum = _mm256_add_ps(r, x);
+                _mm256_storeu_ps(output + i, sum);
+            }
+#endif
+            // Scalar tail
+            for (; i < count; ++i)
+            {
+                output[i] = bf16_to_fp32(residual[i]) + input[i];
+            }
+        }
+
+        /**
+         * @brief Fused FP16 residual add: output = dequant(fp16_residual) + fp32_input
+         *
+         * Performs FP16→FP32 dequantization and addition in a single pass.
+         * Uses F16C hardware instructions when available.
+         *
+         * @param residual FP16 residual buffer (uint16_t)
+         * @param input FP32 input to add
+         * @param output FP32 output buffer
+         * @param count Number of elements
+         */
+        inline void fused_fp16_residual_add(
+            const uint16_t *residual, const float *input, float *output, size_t count)
+        {
+            size_t i = 0;
+#if defined(__AVX512F__)
+            for (; i + 16 <= count; i += 16)
+            {
+                // Dequantize FP16 → FP32
+                __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(residual + i));
+                __m512 r = _mm512_cvtph_ps(h);
+
+                // Load input and add
+                __m512 x = _mm512_loadu_ps(input + i);
+                __m512 sum = _mm512_add_ps(r, x);
+                _mm512_storeu_ps(output + i, sum);
+            }
+#elif defined(__AVX2__) && defined(__F16C__)
+            for (; i + 8 <= count; i += 8)
+            {
+                // Dequantize FP16 → FP32
+                __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i *>(residual + i));
+                __m256 r = _mm256_cvtph_ps(h);
+
+                // Load input and add
+                __m256 x = _mm256_loadu_ps(input + i);
+                __m256 sum = _mm256_add_ps(r, x);
+                _mm256_storeu_ps(output + i, sum);
+            }
+#endif
+            // Scalar tail
+            for (; i < count; ++i)
+            {
+                output[i] = fp16_to_fp32(residual[i]) + input[i];
+            }
+        }
+
+        /**
+         * @brief Fused Q8_1 residual add: output = dequant(q8_1_residual) + fp32_input
+         *
+         * Performs Q8_1→FP32 dequantization and addition in a single pass.
+         * Processes one block (32 elements) at a time.
+         *
+         * @param residual Q8_1 block buffer
+         * @param input FP32 input to add (must be 32-element aligned to block)
+         * @param output FP32 output buffer
+         * @param count Number of elements (must be multiple of 32)
+         */
+        inline void fused_q8_1_residual_add(
+            const Q8_1Block *residual, const float *input, float *output, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const Q8_1Block &block = residual[b];
+                const float *block_input = input + b * 32;
+                float *block_output = output + b * 32;
+
+                // Get scale
+                const float scale = fp16_to_fp32(block.d);
+
+#ifdef __AVX512F__
+                __m512 scale_vec = _mm512_set1_ps(scale);
+
+                // Load 32 int8 values
+                __m128i q_lo = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+                __m128i q_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + 16));
+
+                // Sign-extend to int32
+                __m512i i0 = _mm512_cvtepi8_epi32(q_lo);
+                __m512i i1 = _mm512_cvtepi8_epi32(q_hi);
+
+                // Convert to float, scale, and add input
+                __m512 r0 = _mm512_mul_ps(_mm512_cvtepi32_ps(i0), scale_vec);
+                __m512 r1 = _mm512_mul_ps(_mm512_cvtepi32_ps(i1), scale_vec);
+
+                __m512 x0 = _mm512_loadu_ps(block_input);
+                __m512 x1 = _mm512_loadu_ps(block_input + 16);
+
+                __m512 sum0 = _mm512_add_ps(r0, x0);
+                __m512 sum1 = _mm512_add_ps(r1, x1);
+
+                _mm512_storeu_ps(block_output, sum0);
+                _mm512_storeu_ps(block_output + 16, sum1);
+#elif defined(__AVX2__)
+                __m256 scale_vec = _mm256_set1_ps(scale);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    // Load 8 int8 values
+                    __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + i * 8));
+                    // Sign-extend to int32
+                    __m256i i32 = _mm256_cvtepi8_epi32(q8);
+                    // Convert to float and scale
+                    __m256 r = _mm256_mul_ps(_mm256_cvtepi32_ps(i32), scale_vec);
+                    // Load input and add
+                    __m256 x = _mm256_loadu_ps(block_input + i * 8);
+                    __m256 sum = _mm256_add_ps(r, x);
+                    // Store
+                    _mm256_storeu_ps(block_output + i * 8, sum);
+                }
+#else
+                // Scalar fallback
+                for (int i = 0; i < 32; ++i)
+                {
+                    float r = scale * static_cast<float>(block.qs[i]);
+                    block_output[i] = r + block_input[i];
+                }
+#endif
+            }
+        }
+
+        /**
+         * @brief Dequantize Q8_1 block to FP32
+         *
+         * @param src Q8_1 block buffer
+         * @param dst FP32 output buffer
+         * @param count Number of elements (must be multiple of 32)
+         */
+        inline void dequantize_q8_1_to_fp32(
+            const Q8_1Block *src, float *dst, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const Q8_1Block &block = src[b];
+                float *block_dst = dst + b * 32;
+                const float scale = fp16_to_fp32(block.d);
+
+#ifdef __AVX512F__
+                __m512 scale_vec = _mm512_set1_ps(scale);
+
+                __m128i q_lo = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+                __m128i q_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + 16));
+
+                __m512i i0 = _mm512_cvtepi8_epi32(q_lo);
+                __m512i i1 = _mm512_cvtepi8_epi32(q_hi);
+
+                __m512 f0 = _mm512_mul_ps(_mm512_cvtepi32_ps(i0), scale_vec);
+                __m512 f1 = _mm512_mul_ps(_mm512_cvtepi32_ps(i1), scale_vec);
+
+                _mm512_storeu_ps(block_dst, f0);
+                _mm512_storeu_ps(block_dst + 16, f1);
+#elif defined(__AVX2__)
+                __m256 scale_vec = _mm256_set1_ps(scale);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + i * 8));
+                    __m256i i32 = _mm256_cvtepi8_epi32(q8);
+                    __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(i32), scale_vec);
+                    _mm256_storeu_ps(block_dst + i * 8, f);
+                }
+#else
+                for (int i = 0; i < 32; ++i)
+                {
+                    block_dst[i] = scale * static_cast<float>(block.qs[i]);
+                }
+#endif
+            }
+        }
+
+        /**
+         * @brief Quantize FP32 to Q8_1 blocks
+         *
+         * Self-contained implementation that doesn't depend on other functions
+         * declared later in this file.
+         *
+         * @param src FP32 input buffer
+         * @param dst Q8_1 block output buffer
+         * @param count Number of elements (must be multiple of 32)
+         */
+        inline void quantize_fp32_to_q8_1_blocks(
+            const float *src, Q8_1Block *dst, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                const float *block_src = src + b * 32;
+                Q8_1Block &block = dst[b];
+
+                // Find max absolute value
+                float max_abs = 0.0f;
+#if defined(__AVX512F__)
+                __m512 vmax0 = _mm512_abs_ps(_mm512_loadu_ps(block_src));
+                __m512 vmax1 = _mm512_abs_ps(_mm512_loadu_ps(block_src + 16));
+                __m512 vmax = _mm512_max_ps(vmax0, vmax1);
+                max_abs = _mm512_reduce_max_ps(vmax);
+#elif defined(__AVX2__)
+                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src));
+                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 8));
+                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 16));
+                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_loadu_ps(block_src + 24));
+                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
+                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                // Horizontal max in AVX2
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                max_abs = _mm_cvtss_f32(vmax128);
+#else
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(block_src[i]));
+                }
+#endif
+
+                constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+                if (max_abs < MIN_SCALE_THRESHOLD)
+                {
+                    block.d = 0;
+                    block.sum_qs = 0;
+                    std::memset(block.qs, 0, 32);
+                    continue;
+                }
+
+                // Calculate scale
+                float scale = max_abs / 127.0f;
+                if (scale > 65504.0f)
+                {
+                    scale = 65504.0f;
+                }
+                float inv_scale = 1.0f / scale;
+
+                // Quantize and sum
+                int32_t sum_i32 = 0;
+#if defined(__AVX512F__)
+                __m512 vinv = _mm512_set1_ps(inv_scale);
+                __m512 vmin = _mm512_set1_ps(-127.0f);
+                __m512 vmax_q = _mm512_set1_ps(127.0f);
+
+                __m512 v0 = _mm512_loadu_ps(block_src);
+                __m512 v1 = _mm512_loadu_ps(block_src + 16);
+
+                __m512 scaled0 = _mm512_mul_ps(v0, vinv);
+                __m512 scaled1 = _mm512_mul_ps(v1, vinv);
+
+                scaled0 = _mm512_max_ps(vmin, _mm512_min_ps(vmax_q, scaled0));
+                scaled1 = _mm512_max_ps(vmin, _mm512_min_ps(vmax_q, scaled1));
+
+                __m512i i0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled0, _MM_FROUND_TO_NEAREST_INT));
+                __m512i i1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled1, _MM_FROUND_TO_NEAREST_INT));
+
+                // Pack to int8
+                __m256i i16_0 = _mm512_cvtsepi32_epi16(i0);
+                __m256i i16_1 = _mm512_cvtsepi32_epi16(i1);
+                __m128i i8_0 = _mm256_cvtsepi16_epi8(i16_0);
+                __m128i i8_1 = _mm256_cvtsepi16_epi8(i16_1);
+
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(block.qs), i8_0);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(block.qs + 16), i8_1);
+
+                // Compute sum
+                sum_i32 = _mm512_reduce_add_epi32(i0) + _mm512_reduce_add_epi32(i1);
+#else
+                for (int i = 0; i < 32; ++i)
+                {
+                    float scaled = block_src[i] * inv_scale;
+                    block.qs[i] = static_cast<int8_t>(std::round(std::max(-127.0f, std::min(127.0f, scaled))));
+                    sum_i32 += static_cast<int32_t>(block.qs[i]);
+                }
+#endif
+
+                // Store scale as FP16 and sum as int16
+                block.d = fp32_to_fp16(scale);
+                block.sum_qs = static_cast<int16_t>(sum_i32);
+            }
+        }
+
         // ==========================================
         // FP32 to Q8_0 Quantization (for TensorBase::to_q8_0())
         // ==========================================

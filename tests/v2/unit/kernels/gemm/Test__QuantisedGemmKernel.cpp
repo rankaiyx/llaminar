@@ -1101,3 +1101,133 @@ TEST(Test__QuantisedGemmKernel, SwiGLU_FusedVsNonFused_BatchSizeScaling)
     }
     std::cout << "====================================================\n\n";
 }
+
+/**
+ * @brief Test multiply_tensor with BF16 activations
+ *
+ * This tests the new IActivationTensor::quantize_to_q8_1() path for BF16.
+ * BF16 → FP32 → Q8_1 quantization happens inside the tensor.
+ */
+TEST(Test__QuantisedGemmKernel, MultiplyTensorBF16Activations)
+{
+    int M = 4;
+    int N = 128;
+    int K = 64;
+
+    // Create random weights (N x K)
+    std::vector<float> weights_fp32(N * K);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights to Q8_1Tensor
+    auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights_tensor->createGemm();
+    ASSERT_NE(kernel, nullptr);
+
+    // Create FP32 activations first
+    std::vector<float> A_fp32(M * K);
+    for (auto &x : A_fp32)
+        x = dist(gen);
+
+    // Convert to BF16
+    std::vector<uint16_t> A_bf16(M * K);
+    for (int i = 0; i < M * K; ++i)
+    {
+        // BF16 = upper 16 bits of FP32
+        uint32_t fp32_bits;
+        std::memcpy(&fp32_bits, &A_fp32[i], sizeof(float));
+        A_bf16[i] = static_cast<uint16_t>((fp32_bits + 0x8000) >> 16); // Round to nearest
+    }
+
+    // Create BF16Tensor
+    auto A_bf16_tensor = std::make_unique<BF16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)},
+        A_bf16);
+
+    // Create output tensor
+    auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    // Compute reference using FP32 path
+    std::vector<float> C_ref(M * N, 0.0f);
+    kernel->multiply(A_fp32.data(), C_ref.data(), M, N, K);
+
+    // Test multiply_tensor with BF16 input
+    bool ok = kernel->multiply_tensor(A_bf16_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f);
+    ASSERT_TRUE(ok);
+
+    // Compare - BF16 has limited precision, so tolerance is higher
+    const float *C_act = C_tensor->data();
+    double max_err = 0.0;
+    for (int i = 0; i < M * N; ++i)
+    {
+        double err = std::abs(C_act[i] - C_ref[i]);
+        if (err > max_err)
+            max_err = err;
+        // BF16 has ~3 decimal digits of precision, accumulated over K elements
+        EXPECT_NEAR(C_act[i], C_ref[i], 2.0f) << "Mismatch at index " << i;
+    }
+    std::cout << "[BF16 GEMM] Max error: " << max_err << std::endl;
+}
+
+/**
+ * @brief Test multiply_tensor with INT8 activations (transcoding path)
+ *
+ * This tests the INT8 → FP32 → Q8_1 transcoding path.
+ * INT8 activations are dequantized using their per-tensor scale,
+ * then re-quantized to Q8_1 block format.
+ */
+TEST(Test__QuantisedGemmKernel, MultiplyTensorINT8Activations)
+{
+    int M = 4;
+    int N = 128;
+    int K = 64;
+
+    // Create random weights (N x K)
+    std::vector<float> weights_fp32(N * K);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto &x : weights_fp32)
+        x = dist(gen);
+
+    // Quantize weights to Q8_1Tensor
+    auto weights_tensor = Q8_1Tensor::quantize_from_fp32(weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
+    auto kernel = weights_tensor->createGemm();
+    ASSERT_NE(kernel, nullptr);
+
+    // Create FP32 activations first
+    std::vector<float> A_fp32(M * K);
+    for (auto &x : A_fp32)
+        x = dist(gen);
+
+    // Create INT8Tensor by quantizing FP32 (uses constructor that takes fp32_data)
+    auto A_int8_tensor = std::make_unique<INT8Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)},
+        A_fp32);
+    ASSERT_NE(A_int8_tensor, nullptr);
+
+    // Create output tensor
+    auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    // Compute reference using FP32 path
+    std::vector<float> C_ref(M * N, 0.0f);
+    kernel->multiply(A_fp32.data(), C_ref.data(), M, N, K);
+
+    // Test multiply_tensor with INT8 input (should use transcoding path)
+    bool ok = kernel->multiply_tensor(A_int8_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f);
+    ASSERT_TRUE(ok);
+
+    // Compare - INT8 has ~7 bits of precision, plus Q8_1 quantization
+    const float *C_act = C_tensor->data();
+    double max_err = 0.0;
+    for (int i = 0; i < M * N; ++i)
+    {
+        double err = std::abs(C_act[i] - C_ref[i]);
+        if (err > max_err)
+            max_err = err;
+        // Double quantization (INT8→Q8_1) accumulates error
+        EXPECT_NEAR(C_act[i], C_ref[i], 3.0f) << "Mismatch at index " << i;
+    }
+    std::cout << "[INT8 GEMM] Max error: " << max_err << std::endl;
+}

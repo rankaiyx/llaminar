@@ -9,11 +9,14 @@
 #include "../kernels/cpu/fused/FusedRMSNormQuantize.h"
 #include "../kernels/cpu/gemm_v4/FusedGEMM.h"
 #include "../utils/Logger.h"
+#include "../utils/DebugEnv.h"
+#include "FP16Utils.h"
 // #include "../kernels/cpu/gemm/int8/INT8PackedGemm.h"  // DEPRECATED: Now using IntegerGemm via createGemm()
 #include <cmath>
 #include <algorithm>
 #include <limits>
 #include <cstring>
+#include <omp.h>
 
 namespace llaminar2
 {
@@ -757,6 +760,157 @@ namespace llaminar2
         // INT8 tensor doesn't support in-place RMSNorm - use createRMSNorm() instead
         LOG_ERROR("[INT8Tensor::applyRMSNorm] Not supported for INT8 tensors");
         return false;
+    }
+
+    // ===== Bulk Q8_1 Quantization (INT8 → Q8_1 transcoding) =====
+
+    bool INT8Tensor::quantize_to_q8_1(void *q8_1_buffer, int m, int k) const
+    {
+        if (!q8_1_buffer || m <= 0 || k <= 0)
+        {
+            return false;
+        }
+
+        // Validate dimensions against tensor shape
+        const size_t cols = shape_[1];
+        const size_t rows = shape_[0];
+        if (static_cast<size_t>(m) > rows || static_cast<size_t>(k) > cols)
+        {
+            return false;
+        }
+
+        const int k_blocks = (k + 31) / 32;
+        Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
+        const int8_t *int8_data = host_int8_data_.data();
+        const bool has_per_col_scales = has_col_scales();
+        const float *per_col_scales = has_per_col_scales ? col_scales_.data() : nullptr;
+        const float global_scale = scale_;
+
+#pragma omp parallel
+        {
+            // Parallelize over rows for large M, or collapse(2) for small M
+            int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
+            if (quant_thresh == 0)
+                quant_thresh = omp_get_num_threads();
+
+            // Thread-local buffer for INT8→FP32 dequantization
+            alignas(64) float fp32_block[32];
+
+            if (m < quant_thresh)
+            {
+#pragma omp for collapse(2) schedule(static)
+                for (int i = 0; i < m; ++i)
+                {
+                    for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                    {
+                        const int8_t *int8_row = int8_data + i * cols;
+                        Q8_1Block *row_blocks = all_blocks + i * k_blocks;
+
+                        // Dequantize INT8 block to FP32
+                        const int k_start = k_blk * 32;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            int col_idx = k_start + j;
+                            if (col_idx < k)
+                            {
+                                float scale = has_per_col_scales ? per_col_scales[col_idx] : global_scale;
+                                fp32_block[j] = static_cast<float>(int8_row[col_idx]) * scale;
+                            }
+                            else
+                            {
+                                fp32_block[j] = 0.0f;
+                            }
+                        }
+
+                        // Find max absolute value in dequantized block
+                        float max_abs = 0.0f;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            float val = std::abs(fp32_block[j]);
+                            if (val > max_abs)
+                                max_abs = val;
+                        }
+
+                        // Compute new Q8_1 scale
+                        float d = max_abs / 127.0f;
+                        if (d < 1e-10f)
+                            d = 1e-10f;
+                        float id = 1.0f / d;
+
+                        row_blocks[k_blk].d = fp32_to_fp16(d);
+
+                        // Re-quantize to Q8_1 and compute sum
+                        int32_t sum_qs = 0;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            int8_t q = static_cast<int8_t>(std::round(fp32_block[j] * id));
+                            row_blocks[k_blk].qs[j] = q;
+                            sum_qs += q;
+                        }
+
+                        row_blocks[k_blk].sum_qs = static_cast<int16_t>(sum_qs);
+                    }
+                }
+            }
+            else
+            {
+#pragma omp for schedule(static)
+                for (int i = 0; i < m; ++i)
+                {
+                    const int8_t *int8_row = int8_data + i * cols;
+                    Q8_1Block *row_blocks = all_blocks + i * k_blocks;
+
+                    for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                    {
+                        // Dequantize INT8 block to FP32
+                        const int k_start = k_blk * 32;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            int col_idx = k_start + j;
+                            if (col_idx < k)
+                            {
+                                float scale = has_per_col_scales ? per_col_scales[col_idx] : global_scale;
+                                fp32_block[j] = static_cast<float>(int8_row[col_idx]) * scale;
+                            }
+                            else
+                            {
+                                fp32_block[j] = 0.0f;
+                            }
+                        }
+
+                        // Find max absolute value in dequantized block
+                        float max_abs = 0.0f;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            float val = std::abs(fp32_block[j]);
+                            if (val > max_abs)
+                                max_abs = val;
+                        }
+
+                        // Compute new Q8_1 scale
+                        float d = max_abs / 127.0f;
+                        if (d < 1e-10f)
+                            d = 1e-10f;
+                        float id = 1.0f / d;
+
+                        row_blocks[k_blk].d = fp32_to_fp16(d);
+
+                        // Re-quantize to Q8_1 and compute sum
+                        int32_t sum_qs = 0;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            int8_t q = static_cast<int8_t>(std::round(fp32_block[j] * id));
+                            row_blocks[k_blk].qs[j] = q;
+                            sum_qs += q;
+                        }
+
+                        row_blocks[k_blk].sum_qs = static_cast<int16_t>(sum_qs);
+                    }
+                }
+            }
+        }
+
+        return true;
     }
 
 } // namespace llaminar2

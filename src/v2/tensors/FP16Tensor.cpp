@@ -7,6 +7,7 @@
 #include "Tensors.h"
 #include "../kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
 #include "../utils/Logger.h"
+#include "../utils/DebugEnv.h"
 #include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
@@ -22,6 +23,7 @@
 #include "FP16Utils.h"
 #include <algorithm>
 #include <cmath>
+#include <omp.h>
 
 namespace llaminar2
 {
@@ -828,6 +830,138 @@ namespace llaminar2
             reinterpret_cast<uint16_t *>(&q8_1_block.sum_qs)); // Output: Q8_1 INT16 pre-computed sum (Nov 2024: changed from FP16 's')
 
         return &q8_1_block;
+    }
+
+    // ===== Bulk Q8_1 Quantization =====
+
+    bool FP16Tensor::quantize_to_q8_1(void *q8_1_buffer, int m, int k) const
+    {
+        if (!q8_1_buffer || m <= 0 || k <= 0)
+        {
+            return false;
+        }
+
+        // Validate dimensions against tensor shape
+        const size_t cols = shape_[1];
+        const size_t rows = shape_[0];
+        if (static_cast<size_t>(m) > rows || static_cast<size_t>(k) > cols)
+        {
+            return false;
+        }
+
+        const int k_blocks = (k + 31) / 32;
+        Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
+        const uint16_t *fp16_data = host_fp16_data_.data();
+
+#pragma omp parallel
+        {
+            // Parallelize over rows for large M, or collapse(2) for small M
+            int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
+            if (quant_thresh == 0)
+                quant_thresh = omp_get_num_threads();
+
+            // Thread-local buffer for FP16→FP32 conversion
+            alignas(64) float fp32_block[32];
+
+            if (m < quant_thresh)
+            {
+#pragma omp for collapse(2) schedule(static)
+                for (int i = 0; i < m; ++i)
+                {
+                    for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                    {
+                        const uint16_t *fp16_row = fp16_data + i * cols;
+                        Q8_1Block *row_blocks = all_blocks + i * k_blocks;
+
+                        // Convert FP16 block to FP32
+                        const int k_start = k_blk * 32;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            int col_idx = k_start + j;
+                            fp32_block[j] = (col_idx < k) ? fp16_to_fp32(fp16_row[col_idx]) : 0.0f;
+                        }
+
+                        // Find max absolute value in block
+                        float max_abs = 0.0f;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            float val = std::abs(fp32_block[j]);
+                            if (val > max_abs)
+                                max_abs = val;
+                        }
+
+                        // Compute scale
+                        float d = max_abs / 127.0f;
+                        if (d < 1e-10f)
+                            d = 1e-10f;
+                        float id = 1.0f / d;
+
+                        row_blocks[k_blk].d = fp32_to_fp16(d);
+
+                        // Quantize values and compute sum
+                        int32_t sum_qs = 0;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            int8_t q = static_cast<int8_t>(std::round(fp32_block[j] * id));
+                            row_blocks[k_blk].qs[j] = q;
+                            sum_qs += q;
+                        }
+
+                        row_blocks[k_blk].sum_qs = static_cast<int16_t>(sum_qs);
+                    }
+                }
+            }
+            else
+            {
+#pragma omp for schedule(static)
+                for (int i = 0; i < m; ++i)
+                {
+                    const uint16_t *fp16_row = fp16_data + i * cols;
+                    Q8_1Block *row_blocks = all_blocks + i * k_blocks;
+
+                    for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
+                    {
+                        // Convert FP16 block to FP32
+                        const int k_start = k_blk * 32;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            int col_idx = k_start + j;
+                            fp32_block[j] = (col_idx < k) ? fp16_to_fp32(fp16_row[col_idx]) : 0.0f;
+                        }
+
+                        // Find max absolute value in block
+                        float max_abs = 0.0f;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            float val = std::abs(fp32_block[j]);
+                            if (val > max_abs)
+                                max_abs = val;
+                        }
+
+                        // Compute scale
+                        float d = max_abs / 127.0f;
+                        if (d < 1e-10f)
+                            d = 1e-10f;
+                        float id = 1.0f / d;
+
+                        row_blocks[k_blk].d = fp32_to_fp16(d);
+
+                        // Quantize values and compute sum
+                        int32_t sum_qs = 0;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            int8_t q = static_cast<int8_t>(std::round(fp32_block[j] * id));
+                            row_blocks[k_blk].qs[j] = q;
+                            sum_qs += q;
+                        }
+
+                        row_blocks[k_blk].sum_qs = static_cast<int16_t>(sum_qs);
+                    }
+                }
+            }
+        }
+
+        return true;
     }
 
 } // namespace llaminar2

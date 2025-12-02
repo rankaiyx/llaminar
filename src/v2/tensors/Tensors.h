@@ -270,6 +270,47 @@ namespace llaminar2
             const float *row_scales,
             const float *col_scales,
             const float *bias = nullptr) = 0;
+
+        /**
+         * @brief Bulk quantize activation tensor to Q8_1 format for GEMM
+         *
+         * Quantizes the entire activation buffer [m, k] to Q8_1 blocks for use
+         * in integer GEMM operations. This is the optimized bulk quantization
+         * path used by QuantisedGemmKernel.
+         *
+         * **Design Pattern ("quantize once, use many times")**:
+         * - Activation quantized to Q8_1 once before multi-head attention
+         * - Same Q8_1 blocks reused for Q, K, V projections
+         * - Eliminates redundant FP32→Q8_1 conversion overhead
+         *
+         * **Implementation by tensor type**:
+         * - FP32Tensor: Direct quantization (optimized AVX512/AVX2 path)
+         * - BF16Tensor: Dequant to FP32, then quantize to Q8_1
+         * - FP16Tensor: Dequant to FP32, then quantize to Q8_1
+         * - Q8_1Tensor: Zero-copy (already in Q8_1 format)
+         *
+         * @param q8_1_buffer Output buffer for Q8_1 blocks [m * k_blocks] where k_blocks = (k+31)/32
+         * @param m Number of rows (batch_size * seq_len)
+         * @param k Number of columns (must match tensor's K dimension)
+         * @return true on success, false on failure
+         *
+         * @note Caller must pre-allocate buffer of size: m * ((k+31)/32) * sizeof(Q8_1Block)
+         * @note Uses OpenMP parallelization for large M, collapse(2) for small M
+         */
+        virtual bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const = 0;
+
+        /**
+         * @brief Get buffer size needed for quantize_to_q8_1 output
+         *
+         * @param m Number of rows
+         * @param k Number of columns
+         * @return Size in bytes needed for Q8_1 buffer
+         */
+        static size_t get_q8_1_buffer_size(int m, int k)
+        {
+            int k_blocks = (k + 31) / 32;
+            return static_cast<size_t>(m) * k_blocks * sizeof(Q8_1Block);
+        }
     };
 
     /**
@@ -762,6 +803,7 @@ namespace llaminar2
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
+        bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
 
         bool applyRoPE(
             float *K,
@@ -931,6 +973,7 @@ namespace llaminar2
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
+        bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
 
         bool applyRoPE(
             float *K,
@@ -1107,6 +1150,7 @@ namespace llaminar2
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
+        bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
 
         bool applyRoPE(
             float *K,
@@ -1284,6 +1328,7 @@ namespace llaminar2
         std::unique_ptr<class FusedGEMM> createFusedTripleGemm(TensorBase *q_weight, TensorBase *k_weight, TensorBase *v_weight);
 
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
+        bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
         bool applyRoPE(float *K, const int *position_ids, int seq_len,
                        int n_heads, int n_kv_heads, int head_dim,
                        float rope_theta = 10000.0f, bool use_bf16 = false,
@@ -1966,6 +2011,7 @@ namespace llaminar2
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
+        bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
 
         bool applyRoPE(
             float *K,

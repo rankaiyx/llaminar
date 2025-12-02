@@ -86,18 +86,18 @@ namespace llaminar2
      *   - Requires careful handling of numerical stability
      *   - 2 bytes per activation element
      *
-     * INT32: All activations and accumulation in 32-bit integer
-     *   - Used as accumulation format in quantized inference pipelines
-     *   - 4 bytes per element (same as FP32)
-     *   - Prevents overflow from quantized GEMM accumulation
-     *   - Typically converted back to float for non-linear ops (softmax, RMSNorm)
+     * Q8_1: Block-quantized 8-bit integer with scale and sum
+     *   - Extreme memory bandwidth reduction (1.125 bytes per element)
+     *   - 36 bytes per 32 elements (Q8_1Block structure)
+     *   - Ideal for residual storage (3.5x compression vs FP32)
+     *   - Pre-computed sum enables efficient VNNI dot products
      */
     enum class ActivationPrecision
     {
         FP32, ///< 32-bit float activations (default, highest accuracy)
         BF16, ///< bfloat16 activations (Intel AMX, reduced bandwidth)
         FP16, ///< 16-bit float activations (ARM/GPU optimization)
-        INT32 ///< 32-bit integer activations (for accumulation in quantized pipelines)
+        Q8_1  ///< Block-quantized int8 (36 bytes per 32 elements, 3.5x compression)
     };
 
     /**
@@ -183,21 +183,22 @@ namespace llaminar2
         WeightPrecision weight_precision = WeightPrecision::NATIVE;
 
         /**
-         * @brief Activation and accumulation precision
+         * @brief Activation buffer format
          *
-         * Determines precision for:
-         * - Hidden states (layer outputs)
-         * - Attention scores, softmax, context vectors
-         * - GEMM accumulation buffers
-         * - RMSNorm, SwiGLU intermediate results
+         * Determines the format for all activation buffers in DRAM:
+         * - Hidden states between layers
+         * - KV cache entries
+         * - Residual buffers
+         * - Intermediate computation results
          *
-         * Examples:
-         * - FP32: All activations in 32-bit float (highest accuracy)
-         * - BF16: All activations in bfloat16 (Intel AMX optimization)
-         * - INT32: All activations in 32-bit integer (quantized pipeline accumulation)
+         * Memory per element:
+         * - FP32: 4.0 bytes (highest accuracy)
+         * - BF16: 2.0 bytes (Intel AMX optimization)
+         * - FP16: 2.0 bytes (ARM/GPU optimization)
+         * - Q8_1: 1.125 bytes (36 bytes per 32 elements, maximum compression)
          *
-         * Note: Some operations (softmax, RMSNorm) may require FP32 for stability
-         * even when activations are BF16/FP16. Kernels handle this internally.
+         * Kernels handle format conversion internally. This setting only
+         * affects how data is stored in DRAM between kernel invocations.
          *
          * Default: FP32 (standard baseline)
          */

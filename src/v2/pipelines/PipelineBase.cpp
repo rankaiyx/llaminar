@@ -47,6 +47,12 @@ namespace llaminar2
 
         model_path_ = model_ctx_->path();
 
+        // Initialize tensor factory for NUMA-aware allocation (only if MPI context available)
+        if (mpi_ctx_)
+        {
+            tensor_factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
+        }
+
         LOG_INFO("[PipelineBase] Initializing with model: " << model_path_);
         LOG_INFO("[PipelineBase] Runtime config: max_seq_len=" << config_.max_seq_len
                                                                << ", n_threads=" << config_.n_threads << ", batch_size=" << config_.batch_size);

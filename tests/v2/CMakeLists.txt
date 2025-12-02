@@ -710,6 +710,19 @@ add_v2_test(V2_Unit_ActivationTraits
     MPI_PROCS 1  # ActivationTraits tests are CPU-only, single rank
 )
 
+# Test: CPURMSNormTypedKernel (typed RMSNorm with fused precision conversion)
+add_executable(v2_test_rmsnorm_typed_kernel unit/Test__CPURMSNormTypedKernel.cpp)
+target_link_libraries(v2_test_rmsnorm_typed_kernel
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RMSNormTypedKernel
+    COMMAND $<TARGET_FILE:v2_test_rmsnorm_typed_kernel>
+    LABELS "V2;Unit;Kernels;RMSNorm;FP32;BF16;FP16;Q8_1;FusedPrecision;TypedResidual;CPU"
+    MPI_PROCS 1  # RMSNormTypedKernel tests are CPU-only, single rank
+)
+
 # Test: CpuAttentionKernelT (template-based attention kernel)
 add_executable(v2_test_cpu_attention_kernel_t unit/Test__CpuAttentionKernelT.cpp)
 target_link_libraries(v2_test_cpu_attention_kernel_t
@@ -2099,4 +2112,16 @@ target_link_libraries(v2_perf_q3k_unpack
 add_v2_test(V2_Perf_Q3K_Unpack 
     COMMAND $<TARGET_FILE:v2_perf_q3k_unpack>
     LABELS "V2;Performance;Q3_K;Unpack"
+)
+
+# Performance Test: CPURMSNormTypedKernel (typed residuals performance)
+add_executable(v2_perf_rmsnorm_typed performance/kernels/cpu/ops/Perf__CPURMSNormTypedKernel.cpp)
+target_link_libraries(v2_perf_rmsnorm_typed 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_RMSNormTyped 
+    COMMAND $<TARGET_FILE:v2_perf_rmsnorm_typed>
+    LABELS "V2;Performance;RMSNorm;TypedResiduals;Kernels"
 )

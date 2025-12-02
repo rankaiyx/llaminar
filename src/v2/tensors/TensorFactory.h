@@ -8,6 +8,7 @@
 
 #include "Tensors.h"
 #include "../utils/MPIContext.h"
+#include "../pipelines/PipelineConfig.h"
 #include <memory>
 #include <vector>
 #include <cstddef>
@@ -78,6 +79,44 @@ namespace llaminar2
          */
         std::unique_ptr<BF16Tensor> createBF16(const std::vector<size_t> &shape,
                                                const std::vector<uint16_t> &bf16_data);
+
+        /**
+         * @brief Create INT32 tensor with NUMA-aware allocation
+         * @param shape Tensor dimensions
+         * @return INT32 tensor allocated on local NUMA node
+         */
+        std::unique_ptr<INT32Tensor> createINT32(const std::vector<size_t> &shape);
+
+        /**
+         * @brief Create Q8_1 tensor with NUMA-aware allocation
+         * @param shape Tensor dimensions (logical element count)
+         * @return Q8_1 tensor with properly sized block storage
+         */
+        std::unique_ptr<Q8_1Tensor> createQ8_1(const std::vector<size_t> &shape);
+
+        /**
+         * @brief Create Q8_1 tensor from existing raw data
+         * @param shape Tensor dimensions (logical element count)
+         * @param raw_data Raw Q8_1 block data
+         * @return Q8_1 tensor
+         */
+        std::unique_ptr<Q8_1Tensor> createQ8_1(const std::vector<size_t> &shape,
+                                               const std::vector<uint8_t> &raw_data);
+
+        /**
+         * @brief Create activation tensor based on precision setting
+         *
+         * Convenience method that creates the appropriate tensor type based on
+         * ActivationPrecision enum. Useful for creating activation buffers.
+         *
+         * @param shape Tensor dimensions
+         * @param precision Activation precision (FP32, BF16, FP16, Q8_1)
+         * @param device_idx Optional device index (-1 = CPU)
+         * @return Tensor of appropriate type
+         */
+        std::unique_ptr<TensorBase> createActivation(const std::vector<size_t> &shape,
+                                                     ActivationPrecision precision,
+                                                     int device_idx = -1);
 
         /**
          * @brief Create quantized tensor from raw GGUF data

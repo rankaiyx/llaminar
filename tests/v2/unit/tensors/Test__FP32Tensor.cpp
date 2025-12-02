@@ -464,3 +464,154 @@ TEST(Test__FP32Tensor, FromInt32WithScalesDefaultsWhenPointersNull)
         EXPECT_FLOAT_EQ(data[i], static_cast<float>(accum[i])) << "Index " << i << " should remain unchanged";
     }
 }
+
+// ============================================================================
+// quantize_to_q8_1 Tests
+// ============================================================================
+
+TEST(Test__FP32Tensor, QuantizeToQ8_1_BasicRoundTrip)
+{
+    // Create a small FP32 tensor with known values
+    auto tensor = std::make_unique<llaminar2::FP32Tensor>(std::vector<size_t>{2, 64});
+    float *data = tensor->mutable_data();
+
+    // Initialize with varied values across dynamic range
+    for (int i = 0; i < 2; ++i)
+    {
+        for (int j = 0; j < 64; ++j)
+        {
+            // Mix of positive and negative values
+            data[i * 64 + j] = (j % 2 == 0) ? (j * 0.5f) : (-j * 0.3f);
+        }
+    }
+
+    // Allocate Q8_1 buffer using static helper
+    const int m = 2, k = 64;
+    size_t buffer_size = llaminar2::IActivationTensor::get_q8_1_buffer_size(m, k);
+    std::vector<uint8_t> q8_buffer(buffer_size);
+
+    // Quantize
+    bool success = tensor->quantize_to_q8_1(q8_buffer.data(), m, k);
+    EXPECT_TRUE(success);
+
+    // Verify blocks are valid (scale should be non-zero, sum should be computed)
+    const llaminar2::Q8_1Block *blocks = reinterpret_cast<const llaminar2::Q8_1Block *>(q8_buffer.data());
+    int k_blocks = (k + 31) / 32;
+
+    for (int i = 0; i < m; ++i)
+    {
+        for (int kb = 0; kb < k_blocks; ++kb)
+        {
+            const auto &block = blocks[i * k_blocks + kb];
+
+            // Scale should be positive
+            float scale = llaminar2::fp16_to_fp32(block.d);
+            EXPECT_GT(scale, 0.0f) << "Block [" << i << "," << kb << "] has zero scale";
+
+            // Verify sum_qs matches actual sum
+            int32_t actual_sum = 0;
+            for (int j = 0; j < 32; ++j)
+            {
+                actual_sum += block.qs[j];
+            }
+            EXPECT_EQ(block.sum_qs, static_cast<int16_t>(actual_sum))
+                << "Block [" << i << "," << kb << "] sum mismatch";
+        }
+    }
+}
+
+TEST(Test__FP32Tensor, QuantizeToQ8_1_DequantAccuracy)
+{
+    // Test that quantize -> dequant has acceptable error
+    // Use dimensions that are multiples of 32 to avoid padding edge cases
+    auto tensor = std::make_unique<llaminar2::FP32Tensor>(std::vector<size_t>{4, 128});
+
+    // Initialize with realistic activation-like values
+    // Use data() consistently since quantize_to_q8_1 uses data()
+    for (size_t i = 0; i < 4 * 128; ++i)
+    {
+        tensor->mutable_data()[i] = ((static_cast<int>(i) % 100) - 50) * 0.1f; // Range: -5 to +5
+    }
+
+    // Now use const access
+    const float *data = tensor->data();
+
+    // Verify initial data is set
+    ASSERT_NE(data, nullptr);
+    EXPECT_FLOAT_EQ(data[0], -5.0f); // First value: ((0 % 100) - 50) * 0.1 = -5
+    EXPECT_FLOAT_EQ(data[1], -4.9f); // Second value: ((1 % 100) - 50) * 0.1 = -4.9
+
+    const int m = 4, k = 128;
+    size_t buffer_size = llaminar2::IActivationTensor::get_q8_1_buffer_size(m, k);
+    std::vector<uint8_t> q8_buffer(buffer_size);
+
+    ASSERT_TRUE(tensor->quantize_to_q8_1(q8_buffer.data(), m, k));
+
+    // Dequantize and check max error
+    const llaminar2::Q8_1Block *blocks = reinterpret_cast<const llaminar2::Q8_1Block *>(q8_buffer.data());
+    int k_blocks = (k + 31) / 32;
+
+    // First, check the raw block values
+    const auto &first_block = blocks[0];
+    std::cout << "First block: d_bits=0x" << std::hex << first_block.d << std::dec
+              << " d_float=" << llaminar2::fp16_to_fp32(first_block.d)
+              << " sum_qs=" << first_block.sum_qs
+              << " qs[0]=" << (int)first_block.qs[0]
+              << std::endl;
+
+    float max_error = 0.0f;
+    for (int i = 0; i < m; ++i)
+    {
+        for (int kb = 0; kb < k_blocks; ++kb)
+        {
+            const auto &block = blocks[i * k_blocks + kb];
+            float scale = llaminar2::fp16_to_fp32(block.d);
+
+            // Skip if scale is somehow invalid
+            if (!std::isfinite(scale) || scale <= 0.0f)
+            {
+                FAIL() << "Invalid scale at block [" << i << "," << kb << "]: " << scale
+                       << " d_bits=0x" << std::hex << block.d << std::dec;
+            }
+
+            for (int j = 0; j < 32; ++j)
+            {
+                int col_idx = kb * 32 + j;
+                if (col_idx >= k)
+                    continue;
+
+                float original = data[i * k + col_idx];
+                float dequant = static_cast<float>(block.qs[j]) * scale;
+                float error = std::abs(original - dequant);
+                if (!std::isfinite(error))
+                {
+                    FAIL() << "Non-finite error at [" << i << "," << kb << "," << j
+                           << "]: original=" << original << ", dequant=" << dequant
+                           << ", scale=" << scale << ", qs=" << (int)block.qs[j];
+                }
+                max_error = std::max(max_error, error);
+            }
+        }
+    }
+
+    // Q8_1 should have ~1% max error for typical activation ranges
+    EXPECT_LT(max_error, 0.1f) << "Max quantization error too high: " << max_error;
+}
+
+TEST(Test__FP32Tensor, QuantizeToQ8_1_InvalidParams)
+{
+    auto tensor = std::make_unique<llaminar2::FP32Tensor>(std::vector<size_t>{4, 64});
+    std::vector<uint8_t> buffer(1024);
+
+    // Null buffer
+    EXPECT_FALSE(tensor->quantize_to_q8_1(nullptr, 4, 64));
+
+    // Invalid dimensions
+    EXPECT_FALSE(tensor->quantize_to_q8_1(buffer.data(), 0, 64));
+    EXPECT_FALSE(tensor->quantize_to_q8_1(buffer.data(), 4, 0));
+    EXPECT_FALSE(tensor->quantize_to_q8_1(buffer.data(), -1, 64));
+
+    // Dimensions exceeding tensor shape
+    EXPECT_FALSE(tensor->quantize_to_q8_1(buffer.data(), 10, 64)); // m > rows
+    EXPECT_FALSE(tensor->quantize_to_q8_1(buffer.data(), 4, 128)); // k > cols
+}

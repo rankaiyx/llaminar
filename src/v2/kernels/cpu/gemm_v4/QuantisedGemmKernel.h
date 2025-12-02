@@ -1,3 +1,96 @@
+/**
+ * @file QuantisedGemmKernel.h
+ * @brief High-performance quantized GEMM kernel with JIT code generation
+ * @author David Sanftenberg
+ *
+ * @details
+ * This file implements a production-grade quantized matrix multiplication kernel
+ * that leverages AVX-512 VNNI instructions through JIT-compiled code. The kernel
+ * orchestrates weight packing, activation quantization, and dispatches to either
+ * M=1 or M=2 JIT kernels based on sequence length.
+ *
+ * ## Architecture Overview
+ *
+ * ```
+ *                          QuantisedGemmKernel
+ *                                  │
+ *              ┌───────────────────┼───────────────────┐
+ *              │                   │                   │
+ *       Weight Packing      A Quantization       JIT Dispatch
+ *              │                   │                   │
+ *       IINT8Unpackable     FP32 → Q8_1      M1 or M2 Kernel
+ *              │                   │                   │
+ *       QuantisedPackedWeights   Q8_1Block[]   AVX-512 VNNI
+ * ```
+ *
+ * ## Quantization Format
+ *
+ * **Activation Quantization (Q8_1 per-block):**
+ * - Block size: 32 elements
+ * - Scale: FP16 (computed as max_abs / 127)
+ * - Sum: INT16 (sum of quantized values for asymmetric correction)
+ * - Values: INT8 (quantized activations)
+ *
+ * **Weight Packing Layout:**
+ * - Weights are repacked from native format to VNNI-optimal layout
+ * - Layout: `[N/64][K/4][64][4]` for vectorized loads
+ * - Auxiliary arrays: scales, compensation (column sums), mins (for IQ4_NL)
+ *
+ * ## Kernel Selection
+ *
+ * | Sequence Length | Kernel | Strategy |
+ * |-----------------|--------|----------|
+ * | m = 1           | M1     | Single-row, maximize ILP |
+ * | m >= 2          | M2     | Two-row, better throughput |
+ *
+ * ## Cache-Aware Blocking
+ *
+ * The kernel implements cache-aware N-dimension blocking:
+ * - L2 constraint: Block B data should fit in L2 cache
+ * - L3 constraint: All thread blocks should fit in shared L3
+ * - Block size is dynamically computed based on detected cache sizes
+ *
+ * ## Parallelization Strategy
+ *
+ * - **Quantization**: Parallelized over M (rows) or M×K for small sequences
+ * - **GEMM**: Parallelized over N-blocks for B-stationary caching
+ * - Uses OpenMP with dynamic scheduling for load balancing
+ *
+ * ## Fused Operations
+ *
+ * The kernel supports fusing the following operations into a single pass:
+ * - Bias addition
+ * - Attention mask addition
+ * - Softmax (first pass: local max and exp-sum)
+ * - SwiGLU activation (for FFN blocks)
+ *
+ * ## Usage Example
+ *
+ * ```cpp
+ * // Create kernel from quantized weights (any IINT8Unpackable type)
+ * auto kernel = std::make_unique<QuantisedGemmKernel>(weights_tensor.get());
+ *
+ * // Basic GEMM: C = A @ W
+ * kernel->multiply(A_data, C_data, m, n, k, false, 1.0f, 0.0f, nullptr, -1);
+ *
+ * // Fused GEMM with bias and softmax
+ * kernel->multiply_fused(A_data, C_data, m, n, k,
+ *                        bias, mask, true, local_max, local_sum,
+ *                        false, 1.0f, 0.0f, nullptr, -1);
+ * ```
+ *
+ * ## Performance Considerations
+ *
+ * - Weight packing is done once at kernel construction (amortized cost)
+ * - Activation quantization happens per-GEMM call (necessary for dynamic values)
+ * - JIT compilation happens once per kernel type (static instances)
+ * - Prefetching is used in inner loops for B matrix data
+ *
+ * @see QuantisedGemmJit_M1 Single-row JIT kernel implementation
+ * @see QuantisedGemmJit_M2 Two-row JIT kernel implementation
+ * @see IINT8Unpackable Interface for quantized tensor unpacking
+ */
+
 #pragma once
 
 #include <immintrin.h>
@@ -21,6 +114,27 @@ namespace llaminar2
     namespace gemm_v4
     {
 
+        /**
+         * @brief High-performance quantized GEMM kernel using AVX-512 VNNI JIT code
+         *
+         * This class implements the ITensorGemm interface and provides optimized
+         * matrix multiplication for quantized weight tensors. Weights are packed
+         * at construction time into a VNNI-optimal format, and activations are
+         * quantized on-the-fly during each multiply call.
+         *
+         * @details
+         * ## Key Features
+         * - Supports any tensor type implementing IINT8Unpackable
+         * - Dynamic activation quantization (FP32 → Q8_1)
+         * - Cache-aware N-dimension blocking
+         * - Fused post-operations (bias, mask, softmax, SwiGLU)
+         *
+         * ## Thread Safety
+         * - Construction is thread-safe (uses OpenMP for parallel packing)
+         * - multiply() is thread-safe when called from different threads with
+         *   different output buffers
+         * - JIT kernel instances are static and thread-safe
+         */
         class QuantisedGemmKernel : public ITensorGemm
         {
         public:
@@ -30,30 +144,73 @@ namespace llaminar2
              * The tensor must implement IINT8Unpackable interface. If it doesn't,
              * pack_weights_generic will print an error and the kernel will not work.
              * This allows gradual rollout as more tensor types implement IINT8Unpackable.
+             *
+             * @param weights Pointer to quantized weight tensor (must implement IINT8Unpackable)
+             *
+             * @note The weights are copied during construction; the original tensor
+             *       can be modified or destroyed after construction.
              */
             QuantisedGemmKernel(const TensorBase *weights)
             {
                 pack_weights_generic(weights);
             }
 
-            // Legacy type-specific constructors (deprecated, use generic constructor)
+            /**
+             * @brief Legacy constructor for Q8_1 tensors (deprecated)
+             * @param weights Pointer to Q8_1 quantized weight tensor
+             * @deprecated Use the generic TensorBase constructor instead
+             */
             QuantisedGemmKernel(const Q8_1Tensor *weights)
             {
                 pack_weights_generic(weights);
             }
 
+            /**
+             * @brief Legacy constructor for Q8_0 tensors (deprecated)
+             * @param weights Pointer to Q8_0 quantized weight tensor
+             * @deprecated Use the generic TensorBase constructor instead
+             */
             QuantisedGemmKernel(const Q8_0Tensor *weights)
             {
                 pack_weights_generic(weights);
             }
 
+            /**
+             * @brief Legacy constructor for Q4_0 tensors (deprecated)
+             * @param weights Pointer to Q4_0 quantized weight tensor
+             * @deprecated Use the generic TensorBase constructor instead
+             */
             QuantisedGemmKernel(const Q4_0Tensor *weights)
             {
                 pack_weights_generic(weights);
             }
 
         private:
-            // Helper to pack a single 32-element block
+            /**
+             * @brief Pack a single 32-element block into VNNI-optimal layout
+             *
+             * This helper function packs one quantization block (32 INT8 values)
+             * into the strided layout expected by the JIT kernels.
+             *
+             * @param n Row index in the weight matrix
+             * @param k_blk K-block index (each block covers 32 K elements)
+             * @param row_base_offset Base byte offset for this row in packed_data
+             * @param temp_vals 32 INT8 values to pack
+             * @param scale Block scale factor (FP32)
+             * @param min_val Block minimum value for asymmetric correction (FP32)
+             * @param N_padded Padded N dimension (multiple of 64)
+             *
+             * @details
+             * The packed layout is `[N/64][K/4][64][4]`:
+             * - Groups of 64 columns are processed together
+             * - Within each group, K is processed in steps of 4 (for vpdpbusd)
+             * - The innermost dimension holds 4 consecutive K values
+             *
+             * Additionally stores:
+             * - compensation: Sum of quantized values (for INT8→UINT8 correction)
+             * - scales: Block scale factor
+             * - mins: Minimum value for IQ4_NL asymmetric correction
+             */
             __attribute__((always_inline)) void pack_single_block(
                 int n,
                 int k_blk,
@@ -63,7 +220,8 @@ namespace llaminar2
                 float min_val,
                 int N_padded)
             {
-                // Vectorized sum
+                // Compute compensation: sum of all quantized values in block
+                // This is used to correct for the INT8→UINT8 conversion in JIT
                 int32_t sum = 0;
 #pragma omp simd reduction(+ : sum)
                 for (int i = 0; i < 32; ++i)
@@ -71,33 +229,60 @@ namespace llaminar2
                     sum += temp_vals[i];
                 }
 
-                // Pack 32 bytes into 8 groups of 4 bytes, strided by 256
-                // k_blk corresponds to 32 columns.
-                // k starts at k_blk * 32.
-                // k/4 starts at k_blk * 8.
+                // Calculate destination offset in packed layout
+                // k_blk corresponds to 32 K elements
+                // Each K step of 4 uses 256 bytes (64 columns × 4 bytes)
+                // So k_blk maps to k_blk * 8 groups of 4
                 size_t block_offset = row_base_offset + (size_t)(k_blk * 8) * 256;
-
-                // Ensure we don't write out of bounds if K is weirdly small/unaligned
-                // But packed_data is resized to K * N_padded.
-                // If K=33, K_blocks=2.
-                // k_blk=1. block_offset = ... + 2048.
-                // We write 32 bytes.
-                // If K=33, packed_data size is 33*64 = 2112.
-                // 2048 + 32 = 2080 < 2112. Safe.
 
                 int8_t *dst_ptr = packed_weights_.packed_data.data() + block_offset;
 
-                // Unroll the 8 writes
+                // Pack 32 bytes into 8 groups of 4, with stride 256 between groups
+                // This matches the access pattern in the JIT inner loop
                 for (int j = 0; j < 8; ++j)
                 {
                     std::memcpy(dst_ptr + j * 256, &temp_vals[j * 4], 4);
                 }
 
+                // Store auxiliary data for the JIT kernel
                 packed_weights_.compensation[k_blk * N_padded + n] = sum;
                 packed_weights_.scales[k_blk * N_padded + n] = scale;
                 packed_weights_.mins[k_blk * N_padded + n] = min_val;
             }
 
+            /**
+             * @brief Pack weights from any quantized tensor into VNNI-optimal layout
+             *
+             * This method converts weights from their native storage format into a
+             * layout optimized for AVX-512 VNNI computation. The tensor must implement
+             * the IINT8Unpackable interface.
+             *
+             * @param weights Quantized weight tensor to pack
+             *
+             * @details
+             * ## Packing Process
+             *
+             * 1. **Dimension Setup**: Extract N (output features) and K (input features)
+             * 2. **Buffer Allocation**: Allocate packed_data, compensation, scales, mins
+             * 3. **Block Iteration**: Process 32-element K blocks for each output row
+             * 4. **Layout Transformation**: Repack into `[N/64][K/4][64][4]` format
+             *
+             * ## Superblock Optimization
+             *
+             * For tensor formats with 256-element superblocks (like Q6_K), we process
+             * 8 blocks at a time using unpack_superblock_to_int8() for better cache
+             * utilization and fewer function calls.
+             *
+             * ## Thread Parallelization
+             *
+             * Packing is parallelized over N (output rows) using OpenMP, which provides
+             * good load balancing and cache locality since each thread works on
+             * independent rows.
+             *
+             * @note This method is called from the constructor. Weight packing is
+             *       typically the slowest part of kernel initialization, but it only
+             *       happens once per weight matrix.
+             */
             void pack_weights_generic(const TensorBase *weights)
             {
                 // Weights are typically [N, K] (out_features, in_features)
@@ -107,17 +292,18 @@ namespace llaminar2
                 packed_weights_.K = K;
                 packed_weights_.N = N;
 
-                // Pad N to multiple of 64 for blocking
+                // Pad N to multiple of 64 for SIMD blocking
                 int N_padded = (N + 63) / 64 * 64;
-                // K_blocks covers all K, including tail
+                // K_blocks covers all K elements (32 per block)
                 int K_blocks = (K + 31) / 32;
 
+                // Allocate packed weight buffers
                 packed_weights_.packed_data.resize(K * N_padded);
                 packed_weights_.compensation.resize(K_blocks * N_padded);
                 packed_weights_.scales.resize(K_blocks * N_padded);
                 packed_weights_.mins.resize(K_blocks * N_padded);
 
-                // Check for IINT8Unpackable interface
+                // Verify tensor implements IINT8Unpackable interface
                 const IINT8Unpackable *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
                 if (!unpackable)
                 {
@@ -125,33 +311,35 @@ namespace llaminar2
                     return;
                 }
 
+                // Check if tensor uses 256-element superblocks (e.g., K-quants)
                 bool use_superblock = (unpackable->superblock_size() == 256);
 
-// Iterate over N rows of weights (Parallelized)
+                // Parallel pack over N rows
 #pragma omp parallel for schedule(static)
                 for (int n = 0; n < N; ++n)
                 {
+                    // Calculate base offset for this row in packed layout
+                    // Layout: [N/64][K/4][64][4]
                     int n_blk = n / 64;
                     int n_rem = n % 64;
-                    // Base offset for this row n in the packed layout
-                    // Layout: [N/64][K/4][64][4]
-                    // Stride for K/4 is 256 bytes (64 * 4)
                     size_t row_base_offset = (size_t)n_blk * (K * 64) + n_rem * 4;
 
                     int k_blk = 0;
 
+                    // Process superblocks first (8 blocks at a time) if supported
                     if (use_superblock)
                     {
-                        // Process superblocks (8 blocks at a time)
                         int K_superblocks = K_blocks / 8;
                         for (int k_sb = 0; k_sb < K_superblocks; ++k_sb)
                         {
+                            // Unpack 256 elements (8 × 32-element blocks)
                             int8_t sb_vals[256];
                             float sb_scales[8];
                             float sb_mins[8];
 
                             unpackable->unpack_superblock_to_int8(n, k_sb, sb_vals, sb_scales, sb_mins);
 
+                            // Pack each of the 8 blocks
                             for (int i = 0; i < 8; ++i)
                             {
                                 pack_single_block(n, k_blk + i, row_base_offset, sb_vals + i * 32, sb_scales[i], sb_mins[i], N_padded);
@@ -160,9 +348,9 @@ namespace llaminar2
                         }
                     }
 
+                    // Process remaining blocks individually
                     for (; k_blk < K_blocks; ++k_blk)
                     {
-                        // Unpack block using generic interface
                         int8_t temp_vals[32];
                         unpackable->unpack_block_to_int8(n, k_blk, temp_vals);
                         float scale = unpackable->get_block_scale(n, k_blk);
@@ -174,6 +362,14 @@ namespace llaminar2
             }
 
         public:
+            /**
+             * @brief Check if this kernel supports the specified device
+             *
+             * @param device_idx Device index (-1 = CPU, ≥0 = GPU)
+             * @return true if device is supported, false otherwise
+             *
+             * @note This kernel only supports CPU execution (device_idx == -1)
+             */
             bool supports_device(int device_idx) const override
             {
                 return device_idx == -1;
@@ -192,6 +388,8 @@ namespace llaminar2
              * @param beta If 0, overwrite C. If non-zero, accumulate: C = alpha*A@B + beta*C
              * @param ctx MPI context (unused for local compute)
              * @param device_idx Device index (-1 = CPU)
+             *
+             * @return true on success, false on dimension mismatch
              */
             bool multiply(const float *A, float *C, int m, int n, int k, bool transpose_B, float alpha, float beta, const MPIContext *ctx, int device_idx) override
             {
@@ -202,46 +400,110 @@ namespace llaminar2
                 return multiply_fused(A, C, m, n, k, nullptr, nullptr, false, nullptr, nullptr, accumulate, alpha, beta, ctx, device_idx);
             }
 
+            /**
+             * @brief Fused GEMM with optional post-operations (bias, mask, softmax, SwiGLU)
+             *
+             * Performs quantized matrix multiplication with optional fused operations
+             * in a single pass through the data. This is the main workhorse method
+             * that implements the full computation pipeline.
+             *
+             * @param A Input activations [m, k] in FP32 (will be quantized internally)
+             * @param C Output matrix [m, n] in FP32
+             * @param m Batch size / sequence length
+             * @param n Output features (columns)
+             * @param k Input features (rows in weight matrix)
+             * @param bias Optional bias vector [n], added to each row of C
+             * @param mask Optional attention mask [m, n], added to C (use -inf for masking)
+             * @param do_softmax If true, compute local max and exp-sum for online softmax
+             * @param local_max Output buffer for per-row max values (required if do_softmax)
+             * @param local_sum Output buffer for per-row sum(exp) values (required if do_softmax)
+             * @param accumulate If true, add to existing C; if false, overwrite C
+             * @param alpha Scale factor for matrix product (typically 1.0)
+             * @param beta Scale factor for existing C (0.0 to overwrite, 1.0 to accumulate)
+             * @param ctx MPI context (unused, for interface compatibility)
+             * @param device_idx Device index (-1 for CPU)
+             * @param gate_input Optional gate values for SwiGLU [m, n]
+             * @param do_swiglu If true, apply SwiGLU: output *= swish(gate_input)
+             *
+             * @return true on success, false on error
+             *
+             * @details
+             * ## Computation Pipeline
+             *
+             * 1. **C Initialization**: Zero or scale C based on beta
+             * 2. **A Quantization**: FP32 → Q8_1 (parallel over M or M×K)
+             * 3. **GEMM**: Dispatch to M1 or M2 JIT kernel (parallel over N-blocks)
+             * 4. **Post-ops**: Applied in JIT kernel (bias, mask, softmax, SwiGLU)
+             *
+             * ## Softmax Notes
+             *
+             * When do_softmax=true, only the first pass of online softmax is computed:
+             * - local_max[row] = max(C[row, :])
+             * - local_sum[row] = sum(exp(C[row, :] - local_max[row]))
+             *
+             * The caller must complete softmax by computing:
+             * - global_max = max(local_max across tiles)
+             * - Rescale and normalize in a second pass
+             *
+             * ## SwiGLU Notes
+             *
+             * When do_swiglu=true, the output is element-wise multiplied by swish(gate):
+             * - output[i] = C[i] * (gate[i] * sigmoid(gate[i]))
+             *
+             * This is used in FFN blocks where up_proj is computed through this GEMM
+             * and gate_proj is passed as gate_input.
+             */
             bool multiply_fused(const float *A, float *C, int m, int n, int k,
                                 const float *bias, const float *mask, bool do_softmax,
                                 float *local_max, float *local_sum,
                                 bool accumulate, float alpha, float beta, const MPIContext *ctx, int device_idx,
                                 const float *gate_input = nullptr, bool do_swiglu = false)
             {
-                // Check dimensions
+                // Validate dimensions match packed weights
                 if (n != packed_weights_.N || k != packed_weights_.K)
                 {
                     std::cerr << "Dimension mismatch in QuantisedGemmKernel" << std::endl;
                     return false;
                 }
 
-                // Get JIT kernels
-                static QuantisedGemmJit_M1 jit;
-                static QuantisedGemmJit_M2 jit_m2;
+                // Get static JIT kernel instances (compiled once, reused)
+                static QuantisedGemmJit_M1 jit;    // Single-row kernel
+                static QuantisedGemmJit_M2 jit_m2; // Two-row kernel
                 auto kernel = jit.get_kernel();
                 auto kernel_m2 = jit_m2.get_kernel();
 
-                int k_blocks = (k + 31) / 32;
-                int blocks_per_row = (n + 63) / 64; // Added for Softmax offset calculation
+                // Compute block counts for K and N dimensions
+                int k_blocks = (k + 31) / 32;       // Number of 32-element K blocks
+                int blocks_per_row = (n + 63) / 64; // Number of 64-element N blocks
 
-                // Calculate N_padded (must match packing)
+                // N must be padded to multiple of 64 (matches packing)
                 int N_padded = (n + 63) / 64 * 64;
                 bool is_padded = (n != N_padded);
 
-                // Determine beta handling mode
-                bool needs_zero = (!accumulate || beta == 0.0f);
-                bool needs_scale = (!needs_zero && beta != 1.0f);
+                // Determine how to handle existing C values
+                bool needs_zero = (!accumulate || beta == 0.0f);  // Overwrite C
+                bool needs_scale = (!needs_zero && beta != 1.0f); // Scale C before accumulate
 
-                // Shared buffer for quantized A
+                // Allocate buffer for quantized activations (all rows, all K blocks)
+                // Add 64 bytes padding for alignment
                 std::vector<uint8_t> shared_quantized_a(m * k_blocks * sizeof(Q8_1Block) + 64);
                 Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(shared_quantized_a.data());
 
+                // =================================================================
+                // PARALLEL REGION: C init + A quantization + GEMM
+                // =================================================================
+                // All three phases run in the same parallel region to minimize
+                // OpenMP overhead (single parallel region entry).
+                //
 #pragma omp parallel
                 {
-                    // FUSED: Zero/scale C inside the same parallel region as quantize+GEMM
-                    // This eliminates one parallel region entry per GEMM call
+                    // ---------------------------------------------------------
+                    // Phase 1: Initialize/scale output matrix C
+                    // ---------------------------------------------------------
+                    // Fused into same parallel region for efficiency
                     if (needs_zero)
                     {
+                        // Zero C when not accumulating
 #pragma omp for schedule(static) nowait
                         for (int i = 0; i < m; ++i)
                         {
@@ -1065,11 +1327,13 @@ namespace llaminar2
             }
 
             /**
-             * @brief Tensor-based GEMM with type introspection
+             * @brief Tensor-based GEMM with type-aware quantization
              *
              * Optimized paths:
-             * - Q8_1Tensor activations: Skip FP32→Q8_1 quantization (zero-copy blocks)
-             * - FP32Tensor activations: Standard path with online quantization
+             * - Q8_1Tensor: Zero-copy, uses pre-quantized blocks directly
+             * - IActivationTensor (FP32, BF16, FP16, INT8): Uses tensor's quantize_to_q8_1()
+             *   for type-specific quantization (e.g., BF16→FP32→Q8_1, INT8 transcoding)
+             * - Other tensors: Fallback to FP32 path with inline quantization
              *
              * @param A Input activations tensor [m, k]
              * @param C Output tensor [m, n] (must be FP32 for now)
@@ -1096,7 +1360,7 @@ namespace llaminar2
                 int k = static_cast<int>(a_shape.size() > 1 ? a_shape[1] : 1);
                 int n = static_cast<int>(c_shape.size() > 1 ? c_shape[1] : c_shape[0]);
 
-                // Check for Q8_1 activation fast path
+                // Fast path 1: Q8_1 activation (zero-copy, already quantized)
                 if (A->native_type() == TensorType::Q8_1)
                 {
                     return multiply_q8_1_direct(
@@ -1105,7 +1369,32 @@ namespace llaminar2
                         beta != 0.0f, alpha, beta, mpi_ctx, device_idx);
                 }
 
-                // Fallback: FP32 path (with online quantization)
+                // Fast path 2: Any IActivationTensor (FP32, BF16, FP16, INT8)
+                // Use tensor's own quantize_to_q8_1() for type-specific quantization
+                const IActivationTensor *activation = dynamic_cast<const IActivationTensor *>(A);
+                if (activation)
+                {
+                    // Allocate Q8_1 buffer
+                    size_t q8_1_size = IActivationTensor::get_q8_1_buffer_size(m, k);
+                    std::vector<uint8_t> q8_1_buffer(q8_1_size + 64); // +64 for alignment
+
+                    // Quantize using tensor's type-specific implementation
+                    if (!activation->quantize_to_q8_1(q8_1_buffer.data(), m, k))
+                    {
+                        std::cerr << "quantize_to_q8_1 failed in multiply_tensor" << std::endl;
+                        return false;
+                    }
+
+                    // Use pre-quantized path
+                    return multiply_with_precomputed_q8_1(
+                        q8_1_buffer.data(), C->mutable_data(), m, n, k,
+                        nullptr, // bias
+                        beta != 0.0f, alpha, beta,
+                        mpi_ctx, device_idx,
+                        GemmFusedOps::none());
+                }
+
+                // Fallback: FP32 path with inline quantization (for non-activation tensors)
                 return multiply(A->data(), C->mutable_data(), m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
             }
 

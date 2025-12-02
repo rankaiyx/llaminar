@@ -326,7 +326,7 @@ namespace llaminar2
         std::cout << "  --activation-prec M         fp32  - 32-bit float (highest accuracy)\n";
         std::cout << "  --act-prec M                bf16  - bfloat16 (Intel AMX, 2× faster)\n";
         std::cout << "                              fp16  - 16-bit float (ARM/GPU)\n";
-        std::cout << "                              int32 - 32-bit integer (experimental)\n\n";
+        std::cout << "                              q8_1  - 8-bit quantized with per-block scaling\n\n";
 
         std::cout << "Chat Mode:\n";
         std::cout << "  --chat                    Interactive chat mode (FTXUI terminal UI)\n";

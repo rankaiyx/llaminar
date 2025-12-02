@@ -1,3 +1,58 @@
+/**
+ * @file QuantisedGemmJit_M2.h
+ * @brief JIT-compiled AVX-512 VNNI GEMM kernel optimized for two-row (M=2) matrix multiplication.
+ * @author David Sanftenberg
+ *
+ * @details
+ * This file implements a high-performance JIT-compiled GEMM kernel for quantized matrix
+ * multiplication using AVX-512 VNNI instructions. The kernel is optimized for M=2 (two query
+ * rows), which provides better throughput than the M=1 kernel when processing multiple tokens.
+ *
+ * ## Design Rationale
+ *
+ * The M=2 kernel processes two rows simultaneously using 8 ZMM accumulators (4 per row).
+ * This provides better instruction-level parallelism and memory bandwidth utilization compared
+ * to running the M=1 kernel twice, because:
+ *
+ * 1. **Shared B loads**: Each B block is loaded once and used for both rows
+ * 2. **Better cache utilization**: B data stays in L1/L2 cache across row computations
+ * 3. **Reduced loop overhead**: Single N-loop and K-loop service both rows
+ *
+ * ## Register Allocation
+ *
+ * | Register | Purpose |
+ * |----------|---------|
+ * | zmm0-3   | Row 0 FP32 accumulators (64 output columns) |
+ * | zmm4-7   | Row 1 FP32 accumulators (64 output columns) |
+ * | zmm8-11  | Row 0 INT32 temp accumulators for VNNI |
+ * | zmm12-15 | Row 1 INT32 temp accumulators for VNNI |
+ * | zmm16-19 | B scale values and temps |
+ * | zmm20-31 | Softmax/SwiGLU constants and temps |
+ *
+ * ## Memory Layout
+ *
+ * Same as M=1, but with A_stride parameter to access second row:
+ * - Row 0 A: params->A
+ * - Row 1 A: params->A + params->A_stride (where A_stride = K/32 × sizeof(Q8_1Block))
+ *
+ * ## Stack Frame
+ *
+ * The M=2 kernel allocates additional stack space for a zero buffer (256 bytes) used
+ * when mins pointer is null (symmetric quantization). This avoids conditional branches
+ * in the hot path.
+ *
+ * ## Fused Operations
+ *
+ * Same as M=1 kernel:
+ * 1. **Bias Addition**: C += bias[N] (broadcast to both rows)
+ * 2. **Attention Mask**: C += mask[M×N] (different mask per row)
+ * 3. **Softmax**: Computes per-row local max/sum (independent for row 0 and row 1)
+ * 4. **SwiGLU**: gate × sigmoid(gate) × up (different gate per row)
+ *
+ * @see QuantisedGemmJit_M1 for the single-row variant
+ * @see QuantisedGemmKernel for the high-level kernel interface
+ */
+
 #pragma once
 
 #include "../../../../../external/onednn/third_party/xbyak/xbyak.h"
@@ -10,82 +65,209 @@ namespace llaminar2
     namespace gemm_v4
     {
 
+        /**
+         * @class QuantisedGemmJit_M2
+         * @brief JIT-compiled GEMM kernel for two-row (M=2) quantized matrix multiplication.
+         *
+         * @details
+         * This class uses the Xbyak JIT assembler to generate optimized AVX-512 VNNI
+         * assembly code at runtime. The generated code is specialized for M=2 (two query
+         * rows), which provides better throughput than running M=1 twice.
+         *
+         * ## Code Generation
+         *
+         * The constructor calls `generate()` which emits x86-64 assembly code into a
+         * buffer. The generated code is then callable as a function pointer via `getCode()`.
+         *
+         * ## Buffer Size
+         *
+         * The `4096 * 64` (256KB) buffer size is larger than M=1 to accommodate:
+         * - Prologue/epilogue code (~300 bytes)
+         * - N-loop with K-loop for both rows (~4KB)
+         * - Row 0 and Row 1 softmax code (~2KB)
+         * - Row 0 and Row 1 SwiGLU code (~2KB)
+         * - Total with safety margin: ~256KB
+         *
+         * ## Usage Example
+         *
+         * ```cpp
+         * // Create kernel (generates JIT code)
+         * QuantisedGemmJit_M2 kernel;
+         *
+         * // Set up parameters (same as M1, but A has 2 rows)
+         * QuantisedGemmParams params = {...};
+         * params.A_stride = K_blocks * sizeof(Q8_1Block);  // Stride to row 1
+         *
+         * // Get function pointer and call
+         * auto fn = kernel.getCode<kernel_func_t>();
+         * fn(&params);
+         * ```
+         */
         class QuantisedGemmJit_M2 : public Xbyak::CodeGenerator
         {
         public:
+            /**
+             * @brief Construct and generate the JIT kernel.
+             *
+             * Allocates a 256KB code buffer and generates optimized AVX-512 VNNI
+             * assembly code for M=2 quantized GEMM with optional fused operations.
+             */
             QuantisedGemmJit_M2() : Xbyak::CodeGenerator(4096 * 64)
             {
                 generate();
             }
 
-            // Signature:
+            /**
+             * @brief Function pointer type for the generated kernel.
+             *
+             * The kernel takes a pointer to QuantisedGemmParams and computes
+             * C[2×N] = A[2×K] × B[K×N] with optional fused operations.
+             */
             using kernel_func_t = void (*)(const QuantisedGemmParams *params);
 
+            /**
+             * @brief Get the function pointer to the generated JIT code.
+             * @return Function pointer that can be called to execute the kernel.
+             */
             kernel_func_t get_kernel()
             {
                 return getCode<kernel_func_t>();
             }
 
         private:
+            /**
+             * @brief Generate the JIT assembly code for M=2 quantized GEMM.
+             *
+             * @details
+             * This method emits x86-64 assembly code using Xbyak. The generated code
+             * implements an optimized GEMM kernel processing two rows simultaneously.
+             *
+             * ## High-Level Algorithm
+             *
+             * ```
+             * void kernel(const QuantisedGemmParams* params) {
+             *     // Allocate stack for zero buffer (when mins is null)
+             *     float zero_buffer[64] = {0};
+             *
+             *     for (n = 0; n < N; n += 64) {           // N-loop: 64 columns per iteration
+             *         Row0_acc[0:64] = 0;                  // zmm0-3: Row 0 accumulators
+             *         Row1_acc[0:64] = 0;                  // zmm4-7: Row 1 accumulators
+             *
+             *         for (k = 0; k < K; k += 32) {        // K-loop: 32 elements per Q8_1 block
+             *             // Load A row 0 and row 1 blocks
+             *             // Load B blocks (shared between rows)
+             *             // VNNI for row 0: zmm8-11
+             *             // VNNI for row 1: zmm12-15
+             *             // Asymmetric correction for both rows
+             *             // Scale and accumulate
+             *         }
+             *
+             *         // Fused post-ops for row 0
+             *         if (bias) Row0_acc += bias[n:n+64];
+             *         if (mask) Row0_acc += mask[0, n:n+64];
+             *         if (softmax) compute_local_max_sum(Row0_acc);
+             *         if (swiglu) Row0_acc = swiglu(Row0_acc, gate[0, n:n+64]);
+             *
+             *         // Fused post-ops for row 1
+             *         if (bias) Row1_acc += bias[n:n+64];
+             *         if (mask) Row1_acc += mask[1, n:n+64];
+             *         if (softmax) compute_local_max_sum(Row1_acc);
+             *         if (swiglu) Row1_acc = swiglu(Row1_acc, gate[1, n:n+64]);
+             *
+             *         store Row0_acc to C[0, n:n+64]
+             *         store Row1_acc to C[1, n:n+64]
+             *     }
+             * }
+             * ```
+             *
+             * ## Register Allocation
+             *
+             * ### General Purpose Registers
+             * Same as M=1, with A_cursor used for row 0 and A_stride offset for row 1
+             *
+             * ### ZMM Registers (512-bit)
+             * | Register | Purpose |
+             * |----------|---------|
+             * | zmm0-3   | Row 0 FP32 accumulators |
+             * | zmm4-7   | Row 1 FP32 accumulators |
+             * | zmm8-11  | Row 0 INT32 temp accumulators |
+             * | zmm12-15 | Row 1 INT32 temp accumulators |
+             * | zmm16-19 | Scales, constants, temps |
+             * | zmm20-31 | Softmax/SwiGLU (varies by phase) |
+             */
             void generate()
             {
                 using namespace Xbyak;
 
-                // Registers
-                const Reg64 &reg_A = rdi;
-                const Reg64 &reg_B = rsi;
-                const Reg64 &reg_Comp = rdx;
-                const Reg64 &reg_Scales = rcx;
-                const Reg64 &reg_C = r8;
-                const Reg64 &reg_K_blocks = r9;
-                // N is on stack (arg 7)
-                // ldc is on stack (arg 8)
+                // ==================== REGISTER DEFINITIONS ====================
+                // System V AMD64 ABI: First 6 integer args in rdi, rsi, rdx, rcx, r8, r9
 
-                const Reg64 &reg_tmp = rax;
-                const Reg64 &reg_stride = rbx; // Stride N*4
-                const Reg64 &reg_loop_N = r10;
-                const Reg64 &reg_loop_K = r11;
-                const Reg64 &reg_B_cursor = r12;
-                const Reg64 &reg_Comp_cursor = r13;
-                const Reg64 &reg_C_cursor = r14;
-                const Reg64 &reg_A_cursor = r15;
-                const Reg64 &reg_Scales_cursor = rbp;
-                const Reg64 &reg_Mins_cursor = r8; // Use r8 for Mins cursor
+                // Parameter registers (from params struct)
+                const Reg64 &reg_A = rdi;       ///< params->A: Q8_1 activation pointer (row 0)
+                const Reg64 &reg_B = rsi;       ///< params->B_packed: packed weight pointer
+                const Reg64 &reg_Comp = rdx;    ///< params->comp: compensation pointer
+                const Reg64 &reg_Scales = rcx;  ///< params->scales: scale pointer
+                const Reg64 &reg_C = r8;        ///< params->C: output pointer
+                const Reg64 &reg_K_blocks = r9; ///< params->K_blocks: number of K blocks
+                // N is stored on stack at [rsp + 0]
+                // ldc is loaded from params struct
 
-                const Reg32 &reg_tmp_32 = eax;
+                // Working registers (callee-saved, pushed in prologue)
+                const Reg64 &reg_tmp = rax;           ///< General temporary register
+                const Reg64 &reg_stride = rbx;        ///< Stride = N * sizeof(float)
+                const Reg64 &reg_loop_N = r10;        ///< N-loop counter
+                const Reg64 &reg_loop_K = r11;        ///< K-loop counter
+                const Reg64 &reg_B_cursor = r12;      ///< Current B position in K-loop
+                const Reg64 &reg_Comp_cursor = r13;   ///< Current compensation position
+                const Reg64 &reg_C_cursor = r14;      ///< Current C position in N-loop
+                const Reg64 &reg_A_cursor = r15;      ///< Current A position for row 0
+                const Reg64 &reg_Scales_cursor = rbp; ///< Current scales position
+                const Reg64 &reg_Mins_cursor = r8;    ///< Repurposed for mins pointer during K-loop
 
-                // ZMMs
-                // C Accumulators (2 rows x 4 cols = 8 regs)
-                // Row 0: zmm0..3
-                // Row 1: zmm4..7
+                const Reg32 &reg_tmp_32 = eax; ///< 32-bit temp for immediate loading
 
-                // Temp Accumulators (int32) (2 rows x 4 cols = 8 regs)
-                // Row 0: zmm8..11
-                // Row 1: zmm12..15
+                // ==================== ZMM REGISTER ALLOCATION ====================
 
-                // B registers (4 regs)
-                const Zmm &zmm_b0 = zmm16;
-                const Zmm &zmm_b1 = zmm17;
-                const Zmm &zmm_b2 = zmm18;
-                const Zmm &zmm_b3 = zmm19;
+                // Row 0 C accumulators: 4 ZMM = 64 FP32 output columns
+                // zmm0 = C[0, n+0:n+16], zmm1 = C[0, n+16:n+32]
+                // zmm2 = C[0, n+32:n+48], zmm3 = C[0, n+48:n+64]
 
-                // A registers (2 regs)
-                const Zmm &zmm_a0 = zmm20;
-                const Zmm &zmm_a1 = zmm21;
+                // Row 1 C accumulators: 4 ZMM = 64 FP32 output columns
+                // zmm4 = C[1, n+0:n+16], zmm5 = C[1, n+16:n+32]
+                // zmm6 = C[1, n+32:n+48], zmm7 = C[1, n+48:n+64]
 
-                // Constants
-                const Zmm &zmm_scale = zmm22;
-                const Zmm &zmm_128 = zmm23;
-                const Zmm &zmm_neg_128 = zmm24;
-                const Ymm &ymm_tmp = ymm25;
-                const Zmm &zmm_scale_b0 = zmm26;
-                const Zmm &zmm_scale_b1 = zmm27;
-                const Zmm &zmm_scale_b2 = zmm28;
-                const Zmm &zmm_scale_b3 = zmm29;
-                const Zmm &zmm_bias = zmm30;
-                const Zmm &zmm_mask = zmm31;
+                // Row 0 INT32 temp accumulators for VNNI (before scale)
+                // zmm8 = acc0[0:16], zmm9 = acc0[16:32]
+                // zmm10 = acc0[32:48], zmm11 = acc0[48:64]
 
-                // Prologue
+                // Row 1 INT32 temp accumulators for VNNI
+                // zmm12 = acc1[0:16], zmm13 = acc1[16:32]
+                // zmm14 = acc1[32:48], zmm15 = acc1[48:64]
+
+                // B registers (shared between rows) - 4 blocks of 16×4 INT8
+                const Zmm &zmm_b0 = zmm16; ///< B block for columns 0-15
+                const Zmm &zmm_b1 = zmm17; ///< B block for columns 16-31
+                const Zmm &zmm_b2 = zmm18; ///< B block for columns 32-47
+                const Zmm &zmm_b3 = zmm19; ///< B block for columns 48-63
+
+                // A registers (one per row)
+                const Zmm &zmm_a0 = zmm20; ///< A[row 0] values broadcast
+                const Zmm &zmm_a1 = zmm21; ///< A[row 1] values broadcast
+
+                // Constants and workspace
+                const Zmm &zmm_scale = zmm22;    ///< Scale broadcast workspace
+                const Zmm &zmm_128 = zmm23;      ///< Constant 128 for unsigned conversion
+                const Zmm &zmm_neg_128 = zmm24;  ///< Constant -128 for correction
+                const Ymm &ymm_tmp = ymm25;      ///< Temp for FP16→FP32 conversion
+                const Zmm &zmm_scale_b0 = zmm26; ///< B scale for columns 0-15
+                const Zmm &zmm_scale_b1 = zmm27; ///< B scale for columns 16-31
+                const Zmm &zmm_scale_b2 = zmm28; ///< B scale for columns 32-47
+                const Zmm &zmm_scale_b3 = zmm29; ///< B scale for columns 48-63
+                const Zmm &zmm_bias = zmm30;     ///< Bias vector workspace
+                const Zmm &zmm_mask = zmm31;     ///< Attention mask workspace
+
+                // ==================== PROLOGUE ====================
+                // Save callee-saved registers per System V AMD64 ABI
                 push(rbx);
                 push(rbp);
                 push(r12);
@@ -93,293 +275,391 @@ namespace llaminar2
                 push(r14);
                 push(r15);
 
-                // Allocate zero buffer (256 bytes) for null mins fallback
+                // ==================== ZERO BUFFER ALLOCATION ====================
+                // Allocate 256 bytes (64 floats) of zeros on stack
+                // Used when mins pointer is null (symmetric quantization)
+                // This avoids conditional branches in the hot K-loop
                 sub(rsp, 256);
-                vpxord(zmm0, zmm0, zmm0);
-                vmovups(ptr[rsp + 0 * 64], zmm0);
-                vmovups(ptr[rsp + 1 * 64], zmm0);
-                vmovups(ptr[rsp + 2 * 64], zmm0);
-                vmovups(ptr[rsp + 3 * 64], zmm0);
+                vpxord(zmm0, zmm0, zmm0);         // Zero register
+                vmovups(ptr[rsp + 0 * 64], zmm0); // Store 64 bytes of zeros
+                vmovups(ptr[rsp + 1 * 64], zmm0); // ...
+                vmovups(ptr[rsp + 2 * 64], zmm0); // ...
+                vmovups(ptr[rsp + 3 * 64], zmm0); // Total: 256 bytes
 
-                // Save params pointer
+                // ==================== LOAD PARAMETERS ====================
+                // Save params pointer for later use
                 const Reg64 &reg_params = rdi;
                 push(reg_params);
 
-                // Load args
-                mov(reg_B, ptr[reg_params + 8]);
-                mov(reg_Comp, ptr[reg_params + 16]);
-                mov(reg_Scales, ptr[reg_params + 24]);
-                // mins is at +32
-                mov(reg_C, ptr[reg_params + 40]);
-                mov(reg_K_blocks.cvt32(), ptr[reg_params + 48]);
+                // Load struct members from params
+                mov(reg_B, ptr[reg_params + 8]);       // B_packed pointer
+                mov(reg_Comp, ptr[reg_params + 16]);   // compensation pointer
+                mov(reg_Scales, ptr[reg_params + 24]); // scales pointer
+                // mins is at offset +32, loaded later
+                mov(reg_C, ptr[reg_params + 40]);                // C (output) pointer
+                mov(reg_K_blocks.cvt32(), ptr[reg_params + 48]); // K_blocks count
 
-                // Load N and push
-                mov(reg_loop_N.cvt32(), ptr[reg_params + 52]);
+                // Push N to stack for N-loop comparison
+                mov(reg_loop_N.cvt32(), ptr[reg_params + 52]); // N dimension
                 push(reg_loop_N);
 
-                // Load ldc and shift
-                mov(reg_stride.cvt32(), ptr[reg_params + 56]);
-                shl(reg_stride, 2);
+                // Load ldc (leading dimension of C) and convert to bytes
+                mov(reg_stride.cvt32(), ptr[reg_params + 56]); // ldc
+                shl(reg_stride, 2);                            // ldc * sizeof(float)
 
-                // Check if mins is null
-                mov(rax, ptr[reg_params + 32]);
-                test(rax, rax);
-                mov(rax, reg_stride);
+                // ==================== MINS POINTER HANDLING ====================
+                // If mins is null (symmetric quantization), use stack zero buffer
+                mov(rax, ptr[reg_params + 32]); // Load mins pointer
+                test(rax, rax);                 // Check if null
+                mov(rax, reg_stride);           // Preserve stride in rax
                 Label mins_ok;
-                jnz(mins_ok, T_NEAR);
-                xor_(rax, rax); // Set Mins stride to 0 if mins is null
+                jnz(mins_ok, T_NEAR); // Jump if mins is not null
+                xor_(rax, rax);       // Set mins stride to 0 (read same zeros every K-block)
                 L(mins_ok);
-                // Store Mins stride at end of zero buffer (rsp + 16 + 248 = rsp + 264)
+                // Store mins stride at reserved location in stack frame
+                // Location: rsp + 264 (after zero buffer and pushes)
                 mov(ptr[rsp + 264], rax);
 
-                // Load A
-                mov(reg_A_cursor, reg_A); // Use reg_A_cursor as temp for A base? No, reg_A is rdi.
-                mov(reg_A, ptr[reg_params + 0]);
+                // Load A pointer (final overwrite of rdi)
+                mov(reg_A_cursor, reg_A);        // Temp use
+                mov(reg_A, ptr[reg_params + 0]); // A pointer
 
-                // Setup constants
-                mov(reg_tmp_32, 0x80808080);
+                // ==================== CONSTANT INITIALIZATION ====================
+                // vpdpbusd requires unsigned A operand (0-255 range)
+                // Q8_1 uses signed INT8 (-128 to 127), so we XOR with 0x80 to convert
+                mov(reg_tmp_32, 0x80808080); // 128 in each byte
                 vpbroadcastd(zmm_128, reg_tmp_32);
 
                 mov(reg_tmp_32, -128);
                 vpbroadcastd(zmm_neg_128, reg_tmp_32);
 
-                // Loop over N (step 64)
-                xor_(reg_loop_N, reg_loop_N);
+                // ==================== N-LOOP (64 columns per iteration) ====================
+                xor_(reg_loop_N, reg_loop_N); // Initialize N counter to 0
 
                 Label loop_N_label;
                 L(loop_N_label);
                 {
-                    // Check if we are done
-                    cmp(reg_loop_N, ptr[rsp]);
-                    jge("end_kernel", T_NEAR);
+                    // Check if we have processed all N columns
+                    cmp(reg_loop_N, ptr[rsp]); // Compare with N on stack
+                    jge("end_kernel", T_NEAR); // Exit if loop_N >= N
 
-                    // Setup cursors
+                    // Reset A cursor to start for this N-block
                     mov(reg_A_cursor, reg_A);
 
-                    // Reload params to rax to restore clobbered registers (rdx, rcx)
+                    // ==================== CURSOR SETUP FOR N-BLOCK ====================
+                    // Reload params (rdi was overwritten)
                     mov(rax, ptr[rsp + 8]);
-                    mov(reg_Comp, ptr[rax + 16]);   // Restore comp
-                    mov(reg_Scales, ptr[rax + 24]); // Restore scales
+                    mov(reg_Comp, ptr[rax + 16]);   // Restore comp pointer
+                    mov(reg_Scales, ptr[rax + 24]); // Restore scales pointer
 
-                    // Offset calculation for Comp, Scales, C: loop_N * 4
+                    // Calculate byte offset: loop_N × sizeof(float)
                     mov(reg_tmp, reg_loop_N);
                     shl(reg_tmp, 2); // loop_N * 4
 
-                    // Comp cursor: reg_Comp + offset
+                    // Set up comp cursor
                     mov(reg_Comp_cursor, reg_Comp);
                     add(reg_Comp_cursor, reg_tmp);
 
-                    // Scales cursor: reg_Scales + offset
+                    // Set up scales cursor
                     mov(reg_Scales_cursor, reg_Scales);
                     add(reg_Scales_cursor, reg_tmp);
 
-                    // Mins cursor: params->mins + offset
-                    mov(rax, ptr[rsp + 8]);              // params
-                    mov(reg_Mins_cursor, ptr[rax + 32]); // mins
+                    // ==================== MINS CURSOR (with null fallback) ====================
+                    mov(rax, ptr[rsp + 8]);              // Reload params
+                    mov(reg_Mins_cursor, ptr[rax + 32]); // Load mins pointer
 
                     test(reg_Mins_cursor, reg_Mins_cursor);
                     Label mins_null_in_loop, mins_ready_in_loop;
-                    jz(mins_null_in_loop, T_NEAR);
+                    jz(mins_null_in_loop, T_NEAR); // Jump if mins is null
 
-                    // Recalculate offset (rax was clobbered)
+                    // Mins is valid: add offset
                     mov(reg_tmp, reg_loop_N);
                     shl(reg_tmp, 2);
-                    add(reg_Mins_cursor, reg_tmp); // + loop_N * 4
+                    add(reg_Mins_cursor, reg_tmp); // mins + loop_N * 4
                     jmp(mins_ready_in_loop, T_NEAR);
 
                     L(mins_null_in_loop);
-                    lea(reg_Mins_cursor, ptr[rsp + 16]); // Point to zero buffer (rsp + 16 because of 2 pushes)
+                    lea(reg_Mins_cursor, ptr[rsp + 16]); // Point to stack zero buffer
 
                     L(mins_ready_in_loop);
 
-                    // C cursor: reg_C + offset
-                    // Reload C from params because reg_C (r8) is used for Mins cursor
-                    mov(rax, ptr[rsp + 8]);           // params
-                    mov(reg_C_cursor, ptr[rax + 40]); // C -> r14
+                    // ==================== C CURSOR FOR BOTH ROWS ====================
+                    // Reload C from params (r8 was repurposed for mins)
+                    mov(rax, ptr[rsp + 8]);           // Reload params
+                    mov(reg_C_cursor, ptr[rax + 40]); // C pointer to r14
 
-                    // Recalculate offset (rax was clobbered)
+                    // Add N offset
                     mov(reg_tmp, reg_loop_N);
-                    shl(reg_tmp, 2); // loop_N * 4
+                    shl(reg_tmp, 2);            // loop_N * 4
+                    add(reg_C_cursor, reg_tmp); // C cursor = C + loop_N * 4
 
-                    add(reg_C_cursor, reg_tmp);
-
-                    // B cursor calculation: (loop_N / 64) * (K_blocks * 2048)
+                    // ==================== B CURSOR CALCULATION ====================
+                    // B is packed in blocks of 64 columns × K elements
+                    // B cursor offset = (loop_N / 64) × K_blocks × 2048 bytes
+                    //   where 2048 = 64 columns × 32 K-elements × 1 byte
                     mov(reg_tmp, reg_loop_N);
                     shr(reg_tmp, 6);             // loop_N / 64
-                    imul(reg_tmp, reg_K_blocks); // * K_blocks
-                    shl(reg_tmp, 11);            // * 2048
+                    imul(reg_tmp, reg_K_blocks); // × K_blocks
+                    shl(reg_tmp, 11);            // × 2048
 
                     mov(reg_B_cursor, reg_B);
                     add(reg_B_cursor, reg_tmp);
 
                     // Initialize C Accumulators (zmm0..7) from memory
                     // Row 0
-                    vmovups(zmm0, ptr[reg_C_cursor + 0 * 64]);
-                    vmovups(zmm1, ptr[reg_C_cursor + 1 * 64]);
-                    vmovups(zmm2, ptr[reg_C_cursor + 2 * 64]);
-                    vmovups(zmm3, ptr[reg_C_cursor + 3 * 64]);
+                    // =====================================================================
+                    // C ACCUMULATOR INITIALIZATION
+                    // =====================================================================
+                    // For beta=1 accumulation, we load existing C values as initial accumulators.
+                    // This allows C += A * B without separate FMA.
+                    //
+                    // Memory layout for C (row-major FP32):
+                    //   Row 0: C[0, n:n+64] at reg_C_cursor + {0,64,128,192}
+                    //   Row 1: C[1, n:n+64] at reg_C_cursor + ldc*4 + {0,64,128,192}
+                    //
+                    // Load Row 0 C values (64 FP32 elements = 256 bytes)
+                    vmovups(zmm0, ptr[reg_C_cursor + 0 * 64]); // C[0, n:n+16]
+                    vmovups(zmm1, ptr[reg_C_cursor + 1 * 64]); // C[0, n+16:n+32]
+                    vmovups(zmm2, ptr[reg_C_cursor + 2 * 64]); // C[0, n+32:n+48]
+                    vmovups(zmm3, ptr[reg_C_cursor + 3 * 64]); // C[0, n+48:n+64]
 
-                    // Row 1
-                    // Load ldc
-                    mov(rax, ptr[rsp + 8]);              // params
-                    mov(reg_tmp.cvt32(), ptr[rax + 56]); // ldc
+                    // Load Row 1 C values
+                    // Row 1 offset = ldc * sizeof(float) = ldc * 4
+                    mov(rax, ptr[rsp + 8]);              // params ptr
+                    mov(reg_tmp.cvt32(), ptr[rax + 56]); // ldc (leading dimension of C)
                     shl(reg_tmp, 2);                     // ldc * 4 bytes
 
-                    vmovups(zmm4, ptr[reg_C_cursor + reg_tmp + 0 * 64]);
-                    vmovups(zmm5, ptr[reg_C_cursor + reg_tmp + 1 * 64]);
-                    vmovups(zmm6, ptr[reg_C_cursor + reg_tmp + 2 * 64]);
-                    vmovups(zmm7, ptr[reg_C_cursor + reg_tmp + 3 * 64]);
+                    vmovups(zmm4, ptr[reg_C_cursor + reg_tmp + 0 * 64]); // C[1, n:n+16]
+                    vmovups(zmm5, ptr[reg_C_cursor + reg_tmp + 1 * 64]); // C[1, n+16:n+32]
+                    vmovups(zmm6, ptr[reg_C_cursor + reg_tmp + 2 * 64]); // C[1, n+32:n+48]
+                    vmovups(zmm7, ptr[reg_C_cursor + reg_tmp + 3 * 64]); // C[1, n+48:n+64]
 
-                    // Loop over K blocks
+                    // =====================================================================
+                    // K-LOOP: Accumulate dot products over K dimension
+                    // =====================================================================
+                    // For each K block, we compute:
+                    //   C[row, n:n+64] += sum_{k in block} A[row, k] * B[k, n:n+64]
+                    //
+                    // The loop processes one Q8_1 block (32 elements) per iteration.
+                    // Total K iterations = K / 32 (stored in reg_K_blocks).
+                    //
                     mov(reg_loop_K, reg_K_blocks);
 
                     Label loop_K_label;
                     L(loop_K_label);
                     {
-                        // --- Asymmetric Weights Correction ---
-                        // 1. Load sum_qs Row 0 -> zmm30
-                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + 2]);
-                        vpmovsxwd(zmm30, ymm_tmp); // int16 -> int32
-                        vcvtdq2ps(zmm30, zmm30);   // int32 -> float
+                        // =============================================================
+                        // ASYMMETRIC QUANTIZATION CORRECTION (IQ4_NL weights)
+                        // =============================================================
+                        // IQ4_NL uses asymmetric quantization where weights can have
+                        // non-zero minimum values. The correction formula is:
+                        //
+                        //   correction[row] = sum_qs[row] * scale_A[row] * mins[n]
+                        //
+                        // Where:
+                        //   sum_qs[row] = sum of quantized activation values in block
+                        //   scale_A[row] = activation scale factor (FP16 in Q8_1 block)
+                        //   mins[n] = per-column minimum values from IQ4_NL weights
+                        //
+                        // This correction is added to C accumulators BEFORE the main VNNI
+                        // computation to account for the asymmetric quantization offset.
+                        // =============================================================
+                        // ---------------------------------------------------------
+                        // Step 1-3: Row 0 asymmetric correction preparation
+                        // ---------------------------------------------------------
+                        // Load sum_qs from Row 0's Q8_1 block (INT16 at offset 2)
+                        // Broadcast to all 16 lanes, sign-extend to INT32, convert to FP32
+                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + 2]); // sum_qs[0] -> all lanes
+                        vpmovsxwd(zmm30, ymm_tmp);                    // INT16 -> INT32
+                        vcvtdq2ps(zmm30, zmm30);                      // INT32 -> FP32
 
-                        // 2. Load scale A Row 0 -> zmm22
-                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor]);
-                        vcvtph2ps(zmm22, ymm_tmp);
+                        // Load scale from Row 0's Q8_1 block (FP16 at offset 0)
+                        // Convert FP16 -> FP32 for computation
+                        vpbroadcastw(ymm_tmp, ptr[reg_A_cursor]); // d[0] -> all lanes
+                        vcvtph2ps(zmm22, ymm_tmp);                // FP16 -> FP32
 
-                        // 3. sum_qs_0_scaled = sum_qs_0 * scale_A_0
+                        // Compute sum_qs_0_scaled = sum_qs_0 * scale_A_0
                         vmulps(zmm30, zmm30, zmm22);
 
-                        // 4. Load sum_qs Row 1 -> zmm31
-                        // Offset: A_stride
-                        mov(reg_tmp, ptr[rsp + 8]);
-                        mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // A_stride
+                        // ---------------------------------------------------------
+                        // Step 4-6: Row 1 asymmetric correction preparation
+                        // ---------------------------------------------------------
+                        // Row 1's Q8_1 block is at offset A_stride from Row 0
+                        mov(reg_tmp, ptr[rsp + 8]);               // params ptr
+                        mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // A_stride (36 bytes typically)
+
+                        // Load sum_qs from Row 1's Q8_1 block
                         vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + reg_tmp + 2]);
                         vpmovsxwd(zmm31, ymm_tmp);
                         vcvtdq2ps(zmm31, zmm31);
 
-                        // 5. Load scale A Row 1 -> zmm25
+                        // Load scale from Row 1's Q8_1 block
                         vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + reg_tmp]);
                         vcvtph2ps(zmm25, ymm_tmp);
 
-                        // 6. sum_qs_1_scaled = sum_qs_1 * scale_A_1
+                        // Compute sum_qs_1_scaled = sum_qs_1 * scale_A_1
                         vmulps(zmm31, zmm31, zmm25);
 
-                        // 7. Apply correction
-                        // Load mins (using reg_Mins_cursor)
-                        vmovups(zmm26, ptr[reg_Mins_cursor + 0 * 64]);
-                        vmovups(zmm27, ptr[reg_Mins_cursor + 1 * 64]);
-                        vmovups(zmm28, ptr[reg_Mins_cursor + 2 * 64]);
-                        vmovups(zmm29, ptr[reg_Mins_cursor + 3 * 64]);
+                        // ---------------------------------------------------------
+                        // Step 7: Apply correction to C accumulators
+                        // ---------------------------------------------------------
+                        // Load mins values for current K block (64 FP32 values)
+                        // mins pointer may be stack zero buffer if weights are symmetric
+                        vmovups(zmm26, ptr[reg_Mins_cursor + 0 * 64]); // mins[n:n+16]
+                        vmovups(zmm27, ptr[reg_Mins_cursor + 1 * 64]); // mins[n+16:n+32]
+                        vmovups(zmm28, ptr[reg_Mins_cursor + 2 * 64]); // mins[n+32:n+48]
+                        vmovups(zmm29, ptr[reg_Mins_cursor + 3 * 64]); // mins[n+48:n+64]
 
-                        // Correction Row 0 (using zmm16-19)
+                        // Row 0 correction: C[0,:] += mins[:] * sum_qs_0_scaled
+                        // Use zmm16-19 as temporaries
                         vmulps(zmm16, zmm26, zmm30);
                         vmulps(zmm17, zmm27, zmm30);
                         vmulps(zmm18, zmm28, zmm30);
                         vmulps(zmm19, zmm29, zmm30);
 
-                        vaddps(zmm0, zmm0, zmm16);
-                        vaddps(zmm1, zmm1, zmm17);
-                        vaddps(zmm2, zmm2, zmm18);
-                        vaddps(zmm3, zmm3, zmm19);
+                        vaddps(zmm0, zmm0, zmm16); // C[0, n:n+16] += correction
+                        vaddps(zmm1, zmm1, zmm17); // C[0, n+16:n+32] += correction
+                        vaddps(zmm2, zmm2, zmm18); // C[0, n+32:n+48] += correction
+                        vaddps(zmm3, zmm3, zmm19); // C[0, n+48:n+64] += correction
 
-                        // Correction Row 1 (using zmm16-19)
+                        // Row 1 correction: C[1,:] += mins[:] * sum_qs_1_scaled
                         vmulps(zmm16, zmm26, zmm31);
                         vmulps(zmm17, zmm27, zmm31);
                         vmulps(zmm18, zmm28, zmm31);
                         vmulps(zmm19, zmm29, zmm31);
 
-                        vaddps(zmm4, zmm4, zmm16);
-                        vaddps(zmm5, zmm5, zmm17);
-                        vaddps(zmm6, zmm6, zmm18);
-                        vaddps(zmm7, zmm7, zmm19);
+                        vaddps(zmm4, zmm4, zmm16); // C[1, n:n+16] += correction
+                        vaddps(zmm5, zmm5, zmm17); // C[1, n+16:n+32] += correction
+                        vaddps(zmm6, zmm6, zmm18); // C[1, n+32:n+48] += correction
+                        vaddps(zmm7, zmm7, zmm19); // C[1, n+48:n+64] += correction
 
-                        // Advance Mins cursor
-                        add(reg_Mins_cursor, ptr[rsp + 264]); // Add Mins stride (0 or reg_stride)
+                        // Advance Mins cursor for next K block
+                        // Stride is 0 for symmetric weights, reg_stride for asymmetric
+                        add(reg_Mins_cursor, ptr[rsp + 264]);
 
-                        // 1. Load Comp (4 regs) and init Temp Accumulators
+                        // =============================================================
+                        // VNNI INTEGER DOT PRODUCT COMPUTATION
+                        // =============================================================
+                        // Initialize integer accumulators with compensation term:
+                        //   comp_init = comp[n] * (-128)
+                        //
+                        // This compensates for the INT8->UINT8 conversion done to A values.
+                        // The VNNI vpdpbusd instruction expects unsigned×signed, so we add
+                        // 128 to A values (making them unsigned) and subtract 128*comp here.
+                        //
+                        // Load Comp values (4 vectors × 16 INT32 = 64 columns)
                         vmovups(zmm_b0, ptr[reg_Comp_cursor + 0 * 64]);
                         vmovups(zmm_b1, ptr[reg_Comp_cursor + 1 * 64]);
                         vmovups(zmm_b2, ptr[reg_Comp_cursor + 2 * 64]);
                         vmovups(zmm_b3, ptr[reg_Comp_cursor + 3 * 64]);
 
+                        // Multiply by -128 to get initialization bias
                         vpmulld(zmm_b0, zmm_b0, zmm_neg_128);
                         vpmulld(zmm_b1, zmm_b1, zmm_neg_128);
                         vpmulld(zmm_b2, zmm_b2, zmm_neg_128);
                         vpmulld(zmm_b3, zmm_b3, zmm_neg_128);
 
-                        // Init Row 0 Accs
+                        // Initialize Row 0 integer accumulators (zmm8-11)
                         vmovdqa64(zmm8, zmm_b0);
                         vmovdqa64(zmm9, zmm_b1);
                         vmovdqa64(zmm10, zmm_b2);
                         vmovdqa64(zmm11, zmm_b3);
 
-                        // Init Row 1 Accs
+                        // Initialize Row 1 integer accumulators (zmm12-15)
+                        // Same initialization since both rows use same B weights
                         vmovdqa64(zmm12, zmm_b0);
                         vmovdqa64(zmm13, zmm_b1);
                         vmovdqa64(zmm14, zmm_b2);
                         vmovdqa64(zmm15, zmm_b3);
 
-                        // 2. Inner loop over 32 elements (8 steps of 4)
+                        // =============================================================
+                        // INNER LOOP: 8 VNNI iterations over 32-element K block
+                        // =============================================================
+                        // Each iteration processes 4 INT8 elements using vpdpbusd.
+                        // 8 iterations × 4 elements = 32 elements per K block.
+                        //
+                        // vpdpbusd computes: acc += (uint8)a × (int8)b (4-way dot product)
+                        // This gives 4 partial sums per lane, accumulated into INT32.
+                        //
                         for (int i = 0; i < 8; ++i)
                         {
-                            // Load A Row 0
+                            // Load 4 consecutive A values from Row 0's Q8_1 block
+                            // Q8_1 layout: [d:FP16][sum_qs:INT16][qs[32]:INT8]
+                            // qs starts at offset 4, so element i*4 is at offset 4+i*4
                             vpbroadcastd(zmm_a0, ptr[reg_A_cursor + 4 + i * 4]);
-                            vpxord(zmm_a0, zmm_a0, zmm_128); // Convert to uint8
+                            vpxord(zmm_a0, zmm_a0, zmm_128); // Convert INT8 → UINT8 by XOR with 0x80808080
 
-                            // Load A Row 1
-                            // Offset: A_stride
-                            mov(reg_tmp, ptr[rsp + 8]);               // Load params ptr
-                            mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // Load A_stride
+                            // Load 4 consecutive A values from Row 1's Q8_1 block
+                            // Row 1 is at offset A_stride from Row 0
+                            mov(reg_tmp, ptr[rsp + 8]);               // params ptr
+                            mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // A_stride
                             vpbroadcastd(zmm_a1, ptr[reg_A_cursor + reg_tmp + 4 + i * 4]);
-                            vpxord(zmm_a1, zmm_a1, zmm_128);
+                            vpxord(zmm_a1, zmm_a1, zmm_128); // Convert INT8 → UINT8
 
-                            // Load B (4 regs)
-                            vmovups(zmm_b0, ptr[reg_B_cursor + 0 * 64]);
-                            vmovups(zmm_b1, ptr[reg_B_cursor + 1 * 64]);
-                            vmovups(zmm_b2, ptr[reg_B_cursor + 2 * 64]);
-                            vmovups(zmm_b3, ptr[reg_B_cursor + 3 * 64]);
+                            // Load B weights for 64 columns (4 ZMM registers)
+                            // B is packed column-major: B[k, n] for current k position
+                            vmovups(zmm_b0, ptr[reg_B_cursor + 0 * 64]); // B[k, n:n+16]
+                            vmovups(zmm_b1, ptr[reg_B_cursor + 1 * 64]); // B[k, n+16:n+32]
+                            vmovups(zmm_b2, ptr[reg_B_cursor + 2 * 64]); // B[k, n+32:n+48]
+                            vmovups(zmm_b3, ptr[reg_B_cursor + 3 * 64]); // B[k, n+48:n+64]
 
-                            // Accumulate Row 0
-                            vpdpbusd(zmm8, zmm_a0, zmm_b0);
-                            vpdpbusd(zmm9, zmm_a0, zmm_b1);
-                            vpdpbusd(zmm10, zmm_a0, zmm_b2);
-                            vpdpbusd(zmm11, zmm_a0, zmm_b3);
+                            // VNNI dot products for Row 0:
+                            // acc[col] += (uint8)A[0,k:k+4] · (int8)B[k:k+4, col]
+                            vpdpbusd(zmm8, zmm_a0, zmm_b0);  // cols [n:n+16]
+                            vpdpbusd(zmm9, zmm_a0, zmm_b1);  // cols [n+16:n+32]
+                            vpdpbusd(zmm10, zmm_a0, zmm_b2); // cols [n+32:n+48]
+                            vpdpbusd(zmm11, zmm_a0, zmm_b3); // cols [n+48:n+64]
 
-                            // Accumulate Row 1
-                            vpdpbusd(zmm12, zmm_a1, zmm_b0);
-                            vpdpbusd(zmm13, zmm_a1, zmm_b1);
-                            vpdpbusd(zmm14, zmm_a1, zmm_b2);
-                            vpdpbusd(zmm15, zmm_a1, zmm_b3);
+                            // VNNI dot products for Row 1:
+                            vpdpbusd(zmm12, zmm_a1, zmm_b0); // cols [n:n+16]
+                            vpdpbusd(zmm13, zmm_a1, zmm_b1); // cols [n+16:n+32]
+                            vpdpbusd(zmm14, zmm_a1, zmm_b2); // cols [n+32:n+48]
+                            vpdpbusd(zmm15, zmm_a1, zmm_b3); // cols [n+48:n+64]
 
-                            // Prefetch B (4 steps ahead)
+                            // Prefetch upcoming B data (4 iterations ahead = 1024 bytes)
                             prefetcht0(ptr[reg_B_cursor + 1024]);
-                            // Prefetch A (4 steps ahead)
+                            // Prefetch upcoming A data (next K block = 144 bytes ahead)
                             prefetcht0(ptr[reg_A_cursor + 144]);
 
-                            // Advance B cursor
+                            // Advance B cursor by 256 bytes (4 ZMM × 64 bytes)
                             add(reg_B_cursor, 256);
                         }
 
-                        // 3. Convert Acc to float
+                        // =============================================================
+                        // SCALE APPLICATION: Convert INT32 → FP32 and apply scales
+                        // =============================================================
+                        // The integer accumulators contain:
+                        //   sum_{k} (A_quant[row,k] * B_quant[k,col])
+                        //
+                        // To convert to floating-point result:
+                        //   C[row,col] += acc * scale_A[row] * scale_B[col]
+                        //
+                        // Convert Row 0 accumulators from INT32 to FP32
                         vcvtdq2ps(zmm8, zmm8);
                         vcvtdq2ps(zmm9, zmm9);
                         vcvtdq2ps(zmm10, zmm10);
                         vcvtdq2ps(zmm11, zmm11);
+
+                        // Convert Row 1 accumulators from INT32 to FP32
                         vcvtdq2ps(zmm12, zmm12);
                         vcvtdq2ps(zmm13, zmm13);
                         vcvtdq2ps(zmm14, zmm14);
                         vcvtdq2ps(zmm15, zmm15);
 
-                        // 4. Load Scale B (4 regs)
+                        // Load B scales for 64 columns (FP32, 4 vectors)
                         vmovups(zmm_scale_b0, ptr[reg_Scales_cursor + 0 * 64]);
                         vmovups(zmm_scale_b1, ptr[reg_Scales_cursor + 1 * 64]);
                         vmovups(zmm_scale_b2, ptr[reg_Scales_cursor + 2 * 64]);
                         vmovups(zmm_scale_b3, ptr[reg_Scales_cursor + 3 * 64]);
 
-                        // 5. Load Scale A Row 0 and multiply
+                        // ---------------------------------------------------------
+                        // Row 0 scale application: result *= scale_B * scale_A[0]
+                        // ---------------------------------------------------------
+                        // Load Row 0's scale (FP16 at offset 0 of Q8_1 block)
                         vpbroadcastw(ymm_tmp, ptr[reg_A_cursor]);
-                        vcvtph2ps(zmm_scale, ymm_tmp);
+                        vcvtph2ps(zmm_scale, ymm_tmp); // FP16 → FP32
 
+                        // Multiply by B scales first, then A scale
                         vmulps(zmm8, zmm8, zmm_scale_b0);
                         vmulps(zmm9, zmm9, zmm_scale_b1);
                         vmulps(zmm10, zmm10, zmm_scale_b2);
@@ -390,18 +670,22 @@ namespace llaminar2
                         vmulps(zmm10, zmm10, zmm_scale);
                         vmulps(zmm11, zmm11, zmm_scale);
 
-                        // Add to C Acc Row 0
+                        // Accumulate into Row 0 C accumulators
                         vaddps(zmm0, zmm0, zmm8);
                         vaddps(zmm1, zmm1, zmm9);
                         vaddps(zmm2, zmm2, zmm10);
                         vaddps(zmm3, zmm3, zmm11);
 
-                        // 6. Load Scale A Row 1 and multiply
-                        mov(reg_tmp, ptr[rsp + 8]);               // Load params ptr
-                        mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // Load A_stride
+                        // ---------------------------------------------------------
+                        // Row 1 scale application: result *= scale_B * scale_A[1]
+                        // ---------------------------------------------------------
+                        // Load Row 1's scale from Q8_1 block at A_stride offset
+                        mov(reg_tmp, ptr[rsp + 8]);               // params ptr
+                        mov(reg_tmp.cvt32(), ptr[reg_tmp + 100]); // A_stride
                         vpbroadcastw(ymm_tmp, ptr[reg_A_cursor + reg_tmp]);
-                        vcvtph2ps(zmm_scale, ymm_tmp);
+                        vcvtph2ps(zmm_scale, ymm_tmp); // FP16 → FP32
 
+                        // Multiply by B scales first, then A scale
                         vmulps(zmm12, zmm12, zmm_scale_b0);
                         vmulps(zmm13, zmm13, zmm_scale_b1);
                         vmulps(zmm14, zmm14, zmm_scale_b2);
@@ -412,98 +696,150 @@ namespace llaminar2
                         vmulps(zmm14, zmm14, zmm_scale);
                         vmulps(zmm15, zmm15, zmm_scale);
 
-                        // Add to C Acc Row 1
+                        // Accumulate into Row 1 C accumulators
                         vaddps(zmm4, zmm4, zmm12);
                         vaddps(zmm5, zmm5, zmm13);
                         vaddps(zmm6, zmm6, zmm14);
                         vaddps(zmm7, zmm7, zmm15);
 
-                        // Advance pointers
-                        add(reg_A_cursor, 36); // sizeof(Q8_1Block)
-                        add(reg_Comp_cursor, reg_stride);
-                        add(reg_Scales_cursor, reg_stride);
+                        // =============================================================
+                        // ADVANCE POINTERS FOR NEXT K BLOCK
+                        // =============================================================
+                        add(reg_A_cursor, 36);              // sizeof(Q8_1Block) = 36 bytes
+                        add(reg_Comp_cursor, reg_stride);   // Move to next K block's comp data
+                        add(reg_Scales_cursor, reg_stride); // Move to next K block's scales
 
+                        // Decrement K loop counter and continue if not done
                         dec(reg_loop_K);
                         jnz(loop_K_label, T_NEAR);
                     }
 
-                    // --- Bias & Mask ---
-                    mov(rax, ptr[rsp + 8]); // params
+                    // =================================================================
+                    // POST-PROCESSING: BIAS, MASK, SOFTMAX, SWIGLU
+                    // =================================================================
+                    // After the K-loop, zmm0-3 contain Row 0 results and zmm4-7 contain
+                    // Row 1 results. The following sections apply optional fused operations.
+                    //
+                    mov(rax, ptr[rsp + 8]); // Reload params pointer
 
-                    // 1. Bias
-                    mov(rdx, ptr[rax + 64]); // bias ptr
-                    test(rdx, rdx);
+                    // -----------------------------------------------------------------
+                    // BIAS ADDITION
+                    // -----------------------------------------------------------------
+                    // If bias pointer is non-null, add per-column bias to both rows:
+                    //   C[row, col] += bias[col]
+                    //
+                    // The same bias vector is added to both rows since it's per-column.
+                    //
+                    mov(rdx, ptr[rax + 64]); // bias ptr from params
+                    test(rdx, rdx);          // Check if null
                     Label skip_bias;
-                    jz(skip_bias, T_NEAR);
+                    jz(skip_bias, T_NEAR); // Skip if null
                     {
-                        lea(rdx, ptr[rdx + reg_loop_N * 4]);
+                        // Calculate bias offset: bias[n] where n = reg_loop_N
+                        lea(rdx, ptr[rdx + reg_loop_N * 4]); // bias + n * sizeof(float)
 
-                        vmovups(zmm_bias, ptr[rdx + 0 * 64]);
-                        vaddps(zmm0, zmm0, zmm_bias);
-                        vaddps(zmm4, zmm4, zmm_bias); // Row 1
+                        // Load bias for columns [n:n+64] and add to both rows
+                        vmovups(zmm_bias, ptr[rdx + 0 * 64]); // bias[n:n+16]
+                        vaddps(zmm0, zmm0, zmm_bias);         // Row 0
+                        vaddps(zmm4, zmm4, zmm_bias);         // Row 1
 
-                        vmovups(zmm_bias, ptr[rdx + 1 * 64]);
+                        vmovups(zmm_bias, ptr[rdx + 1 * 64]); // bias[n+16:n+32]
                         vaddps(zmm1, zmm1, zmm_bias);
                         vaddps(zmm5, zmm5, zmm_bias);
 
-                        vmovups(zmm_bias, ptr[rdx + 2 * 64]);
+                        vmovups(zmm_bias, ptr[rdx + 2 * 64]); // bias[n+32:n+48]
                         vaddps(zmm2, zmm2, zmm_bias);
                         vaddps(zmm6, zmm6, zmm_bias);
 
-                        vmovups(zmm_bias, ptr[rdx + 3 * 64]);
+                        vmovups(zmm_bias, ptr[rdx + 3 * 64]); // bias[n+48:n+64]
                         vaddps(zmm3, zmm3, zmm_bias);
                         vaddps(zmm7, zmm7, zmm_bias);
                     }
                     L(skip_bias);
 
-                    // 2. Mask
-                    mov(rdx, ptr[rax + 72]); // mask ptr
-                    test(rdx, rdx);
+                    // -----------------------------------------------------------------
+                    // ATTENTION MASK
+                    // -----------------------------------------------------------------
+                    // If mask pointer is non-null, add attention mask to results:
+                    //   C[row, col] += mask[row, col]
+                    //
+                    // The mask is typically filled with -infinity (0xFF800000) for
+                    // positions that should not attend, causing them to become 0
+                    // after softmax. Each row has a separate mask.
+                    //
+                    mov(rdx, ptr[rax + 72]); // mask ptr from params
+                    test(rdx, rdx);          // Check if null
                     Label skip_mask;
-                    jz(skip_mask, T_NEAR);
+                    jz(skip_mask, T_NEAR); // Skip if null
                     {
-                        // Row 0 mask
-                        lea(rcx, ptr[rdx + reg_loop_N * 4]);
+                        // Row 0 mask at offset [row * ldc + col]
+                        lea(rcx, ptr[rdx + reg_loop_N * 4]); // mask + n * sizeof(float)
 
-                        vmovups(zmm_mask, ptr[rcx + 0 * 64]);
+                        vmovups(zmm_mask, ptr[rcx + 0 * 64]); // mask[0, n:n+16]
                         vaddps(zmm0, zmm0, zmm_mask);
 
-                        vmovups(zmm_mask, ptr[rcx + 1 * 64]);
+                        vmovups(zmm_mask, ptr[rcx + 1 * 64]); // mask[0, n+16:n+32]
                         vaddps(zmm1, zmm1, zmm_mask);
 
-                        vmovups(zmm_mask, ptr[rcx + 2 * 64]);
+                        vmovups(zmm_mask, ptr[rcx + 2 * 64]); // mask[0, n+32:n+48]
                         vaddps(zmm2, zmm2, zmm_mask);
 
-                        vmovups(zmm_mask, ptr[rcx + 3 * 64]);
+                        vmovups(zmm_mask, ptr[rcx + 3 * 64]); // mask[0, n+48:n+64]
                         vaddps(zmm3, zmm3, zmm_mask);
 
-                        // Row 1 mask
-                        // Offset = ldc * 4 (stride)
+                        // Row 1 mask at offset [1 * ldc + col]
                         mov(rsi, ptr[rax + 56]); // ldc
-                        shl(rsi, 2);
-                        add(rcx, rsi); // rcx points to Row 1 mask
+                        shl(rsi, 2);             // ldc * sizeof(float)
+                        add(rcx, rsi);           // Advance to Row 1 mask
 
-                        vmovups(zmm_mask, ptr[rcx + 0 * 64]);
+                        vmovups(zmm_mask, ptr[rcx + 0 * 64]); // mask[1, n:n+16]
                         vaddps(zmm4, zmm4, zmm_mask);
 
-                        vmovups(zmm_mask, ptr[rcx + 1 * 64]);
+                        vmovups(zmm_mask, ptr[rcx + 1 * 64]); // mask[1, n+16:n+32]
                         vaddps(zmm5, zmm5, zmm_mask);
 
-                        vmovups(zmm_mask, ptr[rcx + 2 * 64]);
+                        vmovups(zmm_mask, ptr[rcx + 2 * 64]); // mask[1, n+32:n+48]
                         vaddps(zmm6, zmm6, zmm_mask);
 
-                        vmovups(zmm_mask, ptr[rcx + 3 * 64]);
+                        vmovups(zmm_mask, ptr[rcx + 3 * 64]); // mask[1, n+48:n+64]
                         vaddps(zmm7, zmm7, zmm_mask);
                     }
                     L(skip_mask);
 
-                    // 3. Softmax
-                    mov(al, ptr[rax + 96]); // do_softmax
-                    test(al, al);
+                    // -----------------------------------------------------------------
+                    // SOFTMAX (First Pass: Local Max and Exp-Sum)
+                    // -----------------------------------------------------------------
+                    // Implements the first pass of online softmax for attention scores.
+                    // This computes local max and sum of exp(x - max) per row.
+                    //
+                    // Algorithm for each row:
+                    //   1. Find max value across 64 columns
+                    //   2. Compute exp(x - max) for each element
+                    //   3. Sum all exp values
+                    //   4. Store local_max and local_sum for later normalization
+                    //
+                    // The exp() function uses the same polynomial approximation as M1:
+                    //   exp(x) ≈ 2^n * P(f) where n = floor(x/ln2), f = frac(x/ln2)
+                    //   P(f) = c1 + f*(c2 + f*(c3 + f*(c4 + f*c5)))
+                    //
+                    mov(al, ptr[rax + 96]); // do_softmax flag from params
+                    test(al, al);           // Check if enabled
                     Label skip_softmax;
                     jz(skip_softmax, T_NEAR);
                     {
-                        // Registers
+                        // ---------------------------------------------------------
+                        // Register Allocation for Softmax
+                        // ---------------------------------------------------------
+                        // zmm22: max value (broadcast scalar)
+                        // zmm23: running sum of exp values
+                        // zmm24: temporary for exp computation
+                        // zmm25-29: polynomial coefficients c1-c5
+                        // zmm30: 1/ln(2) = 1.44269504
+                        // zmm31: max clipping threshold (+10)
+                        // zmm8: min clipping threshold (-20)
+                        // zmm9: constant 127 for IEEE754 exponent
+                        // zmm10-12: temporaries for horizontal reduction
+                        //
                         const Zmm &zmm_max = zmm22;
                         const Zmm &zmm_sum = zmm23;
                         const Zmm &zmm_tmp = zmm24;
@@ -520,84 +856,128 @@ namespace llaminar2
                         const Zmm &zmm_p = zmm11;
                         const Zmm &zmm_fx = zmm12;
 
-                        // Load constants
-                        mov(reg_tmp_32, 0x3fb8aa3b); // 1.44269504 (inv_ln2)
+                        // ---------------------------------------------------------
+                        // Load Polynomial Coefficients
+                        // ---------------------------------------------------------
+                        // These constants implement:
+                        //   exp(x) = 2^n * P(f)
+                        // where n = floor(x * 1.44269504), f = frac(x * 1.44269504)
+                        //
+                        mov(reg_tmp_32, 0x3fb8aa3b); // 1.44269504 = 1/ln(2)
                         vpbroadcastd(zmm_inv_ln2, reg_tmp_32);
 
-                        mov(reg_tmp_32, 0x3f7ffffe); // 0.99999994 (c1)
+                        mov(reg_tmp_32, 0x3f7ffffe); // 0.99999994 ≈ 1 (c1)
                         vpbroadcastd(zmm_c1_const, reg_tmp_32);
 
-                        mov(reg_tmp_32, 0x3f317218); // 0.69314718 (c2)
+                        mov(reg_tmp_32, 0x3f317218); // 0.69314718 = ln(2) (c2)
                         vpbroadcastd(zmm_c2_const, reg_tmp_32);
 
-                        mov(reg_tmp_32, 0x3e75fdf1); // 0.24022651 (c3)
+                        mov(reg_tmp_32, 0x3e75fdf1); // 0.24022651 = ln(2)²/2 (c3)
                         vpbroadcastd(zmm_c3_coeff, reg_tmp_32);
 
-                        mov(reg_tmp_32, 0x3d6356eb); // 0.05550411 (c4)
+                        mov(reg_tmp_32, 0x3d6356eb); // 0.05550411 = ln(2)³/6 (c4)
                         vpbroadcastd(zmm_c4_const, reg_tmp_32);
 
-                        mov(reg_tmp_32, 0x3c1d9422); // 0.00961813 (c5)
+                        mov(reg_tmp_32, 0x3c1d9422); // 0.00961813 = ln(2)⁴/24 (c5)
                         vpbroadcastd(zmm_c5_const, reg_tmp_32);
 
-                        mov(reg_tmp_32, 0x41200000); // 10.0f (max_clip)
+                        // Clipping bounds to prevent overflow/underflow
+                        mov(reg_tmp_32, 0x41200000); // +10.0f (max_clip)
                         vpbroadcastd(zmm_max_clip, reg_tmp_32);
 
                         mov(reg_tmp_32, 0xc1a00000); // -20.0f (min_clip)
                         vpbroadcastd(zmm_min_clip, reg_tmp_32);
 
+                        // IEEE754 exponent bias for 2^n computation
                         mov(reg_tmp_32, 127);
                         vpbroadcastd(zmm_127, reg_tmp_32);
 
-                        // Reload params because reg_tmp_32 (eax) clobbered rax
+                        // Reload params (rax was clobbered by constant loads)
                         mov(rax, ptr[rsp + 8]);
 
+                        // ---------------------------------------------------------
+                        // Lambda: Compute exp(x - max) and accumulate to sum
+                        // ---------------------------------------------------------
+                        // This computes: sum += exp(val - max)
+                        // Using: exp(x) = 2^n * P(f)
+                        //   where n = floor(x/ln2), f = frac(x/ln2)
+                        //
                         auto compute_exp_accumulate = [&](const Zmm &zmm_val)
                         {
+                            // x = val - max (shift to make max = 0)
                             vsubps(zmm_tmp, zmm_val, zmm_max);
+
+                            // Clip to prevent exp overflow/underflow
                             vminps(zmm_tmp, zmm_tmp, zmm_max_clip);
                             vmaxps(zmm_tmp, zmm_tmp, zmm_min_clip);
+
+                            // x * (1/ln2) = x * 1.44269504
                             vmulps(zmm_tmp, zmm_tmp, zmm_inv_ln2);
-                            vrndscaleps(zmm_fx, zmm_tmp, 0x01);
+
+                            // n = floor(x/ln2) - the integer part
+                            vrndscaleps(zmm_fx, zmm_tmp, 0x01); // Round toward -∞
+
+                            // f = x/ln2 - n - the fractional part
                             vsubps(zmm_tmp, zmm_tmp, zmm_fx);
+
+                            // Horner's method: P(f) = c5*f^4 + c4*f^3 + c3*f^2 + c2*f + c1
                             vmovaps(zmm_p, zmm_c5_const);
-                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c4_const);
-                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c3_coeff);
-                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c2_const);
-                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c1_const);
-                            vcvtps2dq(zmm_fx, zmm_fx);
-                            vpaddd(zmm_fx, zmm_fx, zmm_127);
-                            vpslld(zmm_fx, zmm_fx, 23);
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c4_const); // c5*f + c4
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c3_coeff); // (c5*f + c4)*f + c3
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c2_const); // ...
+                            vfmadd213ps(zmm_p, zmm_tmp, zmm_c1_const); // final polynomial
+
+                            // 2^n via IEEE754 exponent manipulation:
+                            // float(n) → int → add 127 → shift to exponent position
+                            vcvtps2dq(zmm_fx, zmm_fx);       // Convert n to int
+                            vpaddd(zmm_fx, zmm_fx, zmm_127); // Add bias (127)
+                            vpslld(zmm_fx, zmm_fx, 23);      // Shift to exponent bits
+
+                            // exp(x) = P(f) * 2^n
                             vmulps(zmm_p, zmm_p, zmm_fx);
+
+                            // Accumulate to sum
                             vaddps(zmm_sum, zmm_sum, zmm_p);
                         };
 
-                        // --- Row 0 ---
+                        // ---------------------------------------------------------
+                        // Row 0 Softmax: Find max, compute exp-sum
+                        // ---------------------------------------------------------
+                        // Step 1: Horizontal max across 64 elements (zmm0-3)
                         vmaxps(zmm_max, zmm0, zmm1);
                         vmaxps(zmm_max, zmm_max, zmm2);
                         vmaxps(zmm_max, zmm_max, zmm3);
 
+                        // Reduce 512-bit max to scalar:
+                        // Extract high 256 bits and max with low
                         vextractf64x4(ymm10, zmm_max, 1);
                         vmaxps(ymm10, ymm10, Ymm(zmm_max.getIdx()));
+                        // Extract high 128 bits and max with low
                         vextractf128(xmm11, ymm10, 1);
                         vmaxps(xmm10, xmm10, xmm11);
-                        vpermilps(xmm11, xmm10, 0b01001110);
+                        // Shuffle and reduce to scalar
+                        vpermilps(xmm11, xmm10, 0b01001110); // Swap 64-bit halves
                         vmaxps(xmm10, xmm10, xmm11);
-                        vpermilps(xmm11, xmm10, 0b10110001);
+                        vpermilps(xmm11, xmm10, 0b10110001); // Swap 32-bit pairs
                         vmaxps(xmm10, xmm10, xmm11);
 
+                        // Broadcast scalar max back to zmm
                         vpbroadcastd(zmm_max, xmm10);
 
+                        // Store local_max for Row 0 at index n/16
                         mov(rdx, ptr[rax + 80]); // local_max ptr
                         mov(r15, reg_loop_N);
-                        shr(r15, 4); // / 16
+                        shr(r15, 4); // Column block index: n / 16
                         vmovss(ptr[rdx + r15], xmm10);
 
-                        vpxord(zmm_sum, zmm_sum, zmm_sum);
+                        // Step 2: Compute sum of exp(x - max)
+                        vpxord(zmm_sum, zmm_sum, zmm_sum); // Initialize sum = 0
                         compute_exp_accumulate(zmm0);
                         compute_exp_accumulate(zmm1);
                         compute_exp_accumulate(zmm2);
                         compute_exp_accumulate(zmm3);
 
+                        // Reduce sum to scalar (same pattern as max)
                         vextractf64x4(ymm10, zmm_sum, 1);
                         vaddps(ymm10, ymm10, Ymm(zmm_sum.getIdx()));
                         vextractf128(xmm11, ymm10, 1);
@@ -607,14 +987,19 @@ namespace llaminar2
                         vpermilps(xmm11, xmm10, 0b10110001);
                         vaddps(xmm10, xmm10, xmm11);
 
+                        // Store local_sum for Row 0
                         mov(rdx, ptr[rax + 88]); // local_sum ptr
                         vmovss(ptr[rdx + r15], xmm10);
 
-                        // --- Row 1 ---
+                        // ---------------------------------------------------------
+                        // Row 1 Softmax: Find max, compute exp-sum
+                        // ---------------------------------------------------------
+                        // Same algorithm applied to zmm4-7
                         vmaxps(zmm_max, zmm4, zmm5);
                         vmaxps(zmm_max, zmm_max, zmm6);
                         vmaxps(zmm_max, zmm_max, zmm7);
 
+                        // Reduce to scalar
                         vextractf64x4(ymm10, zmm_max, 1);
                         vmaxps(ymm10, ymm10, Ymm(zmm_max.getIdx()));
                         vextractf128(xmm11, ymm10, 1);
@@ -626,19 +1011,23 @@ namespace llaminar2
 
                         vpbroadcastd(zmm_max, xmm10);
 
-                        mov(rdx.cvt32(), ptr[rax + 52]); // N (32-bit load)
+                        // Store local_max for Row 1 at index (N/16) + (n/16)
+                        // Row 1 offset in local arrays = N / 16
+                        mov(rdx.cvt32(), ptr[rax + 52]); // N dimension
                         shr(rdx, 4);                     // N / 16
-                        add(rdx, r15);                   // offset_row1
+                        add(rdx, r15);                   // Row 1 index
 
-                        mov(rcx, ptr[rax + 80]); // local_max ptr
-                        vmovss(ptr[rcx + rdx], xmm10);
+                        mov(rcx, ptr[rax + 80]);       // local_max ptr
+                        vmovss(ptr[rcx + rdx], xmm10); // Store Row 1 local_max
 
+                        // Compute Row 1 exp-sum
                         vpxord(zmm_sum, zmm_sum, zmm_sum);
                         compute_exp_accumulate(zmm4);
                         compute_exp_accumulate(zmm5);
                         compute_exp_accumulate(zmm6);
                         compute_exp_accumulate(zmm7);
 
+                        // Reduce sum to scalar
                         vextractf64x4(ymm10, zmm_sum, 1);
                         vaddps(ymm10, ymm10, Ymm(zmm_sum.getIdx()));
                         vextractf128(xmm11, ymm10, 1);
@@ -648,18 +1037,43 @@ namespace llaminar2
                         vpermilps(xmm11, xmm10, 0b10110001);
                         vaddps(xmm10, xmm10, xmm11);
 
+                        // Store Row 1 local_sum
                         mov(rcx, ptr[rax + 88]); // local_sum ptr
                         vmovss(ptr[rcx + rdx], xmm10);
                     }
                     L(skip_softmax);
 
-                    // 4. SwiGLU
+                    // -----------------------------------------------------------------
+                    // SWIGLU ACTIVATION FUNCTION
+                    // -----------------------------------------------------------------
+                    // Implements SwiGLU (Swish-Gated Linear Unit) for FFN blocks:
+                    //   output = up_proj * sigmoid(gate_proj) * gate_proj
+                    //          = up_proj * swish(gate_proj)
+                    //
+                    // Where:
+                    //   - up_proj is the current value in zmm0-7 (result of up projection)
+                    //   - gate_proj is loaded from gate_input pointer (result of gate projection)
+                    //   - swish(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                    //
+                    // This fuses the element-wise multiplication with the gate projection.
+                    //
                     mov(rax, ptr[rsp + 8]);  // params
-                    cmp(byte[rax + 112], 1); // do_swiglu
+                    cmp(byte[rax + 112], 1); // do_swiglu flag
                     Label skip_swiglu;
-                    jne(skip_swiglu, T_NEAR);
+                    jne(skip_swiglu, T_NEAR); // Skip if not enabled
                     {
-                        // Registers
+                        // ---------------------------------------------------------
+                        // Register Allocation for SwiGLU
+                        // ---------------------------------------------------------
+                        // zmm8: gate value loaded from memory
+                        // zmm9: temporary for sigmoid computation
+                        // zmm10-14: polynomial coefficients c1-c5
+                        // zmm15: 1/ln(2)
+                        // zmm16-17: clipping bounds
+                        // zmm18: constant 127
+                        // zmm19: constant 1.0f
+                        // zmm20-21: temporaries for exp and polynomial
+                        //
                         const Zmm &zmm_gate = zmm8;
                         const Zmm &zmm_tmp = zmm9;
                         const Zmm &zmm_c1_const = zmm10;
@@ -672,76 +1086,107 @@ namespace llaminar2
                         const Zmm &zmm_min_clip = zmm17;
                         const Zmm &zmm_127 = zmm18;
                         const Zmm &zmm_one = zmm19;
-                        const Zmm &zmm_fx = zmm20; // Free
-                        const Zmm &zmm_p = zmm21;  // Free
+                        const Zmm &zmm_fx = zmm20;
+                        const Zmm &zmm_p = zmm21;
 
-                        // Load constants (same as M1)
-                        mov(reg_tmp_32, 0x3fb8aa3b);
+                        // Load polynomial constants (same as softmax exp)
+                        mov(reg_tmp_32, 0x3fb8aa3b); // 1/ln(2)
                         vpbroadcastd(zmm_inv_ln2, reg_tmp_32);
-                        mov(reg_tmp_32, 0x3f7ffffe);
+                        mov(reg_tmp_32, 0x3f7ffffe); // c1
                         vpbroadcastd(zmm_c1_const, reg_tmp_32);
-                        mov(reg_tmp_32, 0x3f317218);
+                        mov(reg_tmp_32, 0x3f317218); // c2
                         vpbroadcastd(zmm_c2_const, reg_tmp_32);
-                        mov(reg_tmp_32, 0x3e75fdf1);
+                        mov(reg_tmp_32, 0x3e75fdf1); // c3
                         vpbroadcastd(zmm_c3_coeff, reg_tmp_32);
-                        mov(reg_tmp_32, 0x3d6356eb);
+                        mov(reg_tmp_32, 0x3d6356eb); // c4
                         vpbroadcastd(zmm_c4_const, reg_tmp_32);
-                        mov(reg_tmp_32, 0x3c1d9422);
+                        mov(reg_tmp_32, 0x3c1d9422); // c5
                         vpbroadcastd(zmm_c5_const, reg_tmp_32);
-                        mov(reg_tmp_32, 0x42b00000);
+
+                        // Wider clipping bounds for SwiGLU (±88.0f)
+                        mov(reg_tmp_32, 0x42b00000); // +88.0f
                         vpbroadcastd(zmm_max_clip, reg_tmp_32);
-                        mov(reg_tmp_32, 0xc2b00000);
+                        mov(reg_tmp_32, 0xc2b00000); // -88.0f
                         vpbroadcastd(zmm_min_clip, reg_tmp_32);
-                        mov(reg_tmp_32, 0x3f800000);
+
+                        mov(reg_tmp_32, 0x3f800000); // 1.0f
                         vpbroadcastd(zmm_one, reg_tmp_32);
                         mov(reg_tmp_32, 127);
                         vpbroadcastd(zmm_127, reg_tmp_32);
 
-                        // Reload params because rax was clobbered by constants
+                        // Reload params (rax was clobbered by constant loads)
                         mov(rax, ptr[rsp + 8]);
 
                         // Load gate_input pointer
-                        mov(rdx, ptr[rax + 104]);
+                        mov(rdx, ptr[rax + 104]); // gate_input from params
 
-                        // Load ldc for Row 1
+                        // Calculate Row 1 offset (ldc * sizeof(float))
                         mov(reg_tmp.cvt32(), ptr[rax + 56]); // ldc
                         shl(reg_tmp, 2);                     // ldc * 4
 
+                        // ---------------------------------------------------------
+                        // Lambda: Compute swish(gate) and multiply with value
+                        // ---------------------------------------------------------
+                        // swish(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                        //
+                        // Algorithm:
+                        //   1. Load gate value
+                        //   2. Compute exp(-gate) using polynomial
+                        //   3. sigmoid = 1 / (1 + exp(-gate))
+                        //   4. swish = gate * sigmoid
+                        //   5. result = value * swish
+                        //
                         auto compute_swish = [&](const Zmm &zmm_val, const Reg64 &base, int offset)
                         {
-                            // Load gate
+                            // Load gate projection value
                             vmovups(zmm_gate, ptr[base + offset * 64]);
 
-                            // Compute sigmoid(gate)
-                            vxorps(zmm_tmp, zmm_tmp, zmm_tmp);
+                            // Compute sigmoid(gate) = 1 / (1 + exp(-gate))
+                            // First compute exp(-gate):
+                            vxorps(zmm_tmp, zmm_tmp, zmm_tmp);  // 0.0f
                             vsubps(zmm_tmp, zmm_tmp, zmm_gate); // -gate
+
+                            // Clip to prevent overflow
                             vminps(zmm_tmp, zmm_tmp, zmm_max_clip);
                             vmaxps(zmm_tmp, zmm_tmp, zmm_min_clip);
+
+                            // exp(-gate) using same polynomial as softmax
                             vmulps(zmm_tmp, zmm_tmp, zmm_inv_ln2);
-                            vrndscaleps(zmm_fx, zmm_tmp, 0x01);
-                            vsubps(zmm_tmp, zmm_tmp, zmm_fx);
+                            vrndscaleps(zmm_fx, zmm_tmp, 0x01); // floor
+                            vsubps(zmm_tmp, zmm_tmp, zmm_fx);   // fractional part
+
+                            // Horner's polynomial evaluation
                             vmovaps(zmm_p, zmm_c5_const);
                             vfmadd213ps(zmm_p, zmm_tmp, zmm_c4_const);
                             vfmadd213ps(zmm_p, zmm_tmp, zmm_c3_coeff);
                             vfmadd213ps(zmm_p, zmm_tmp, zmm_c2_const);
                             vfmadd213ps(zmm_p, zmm_tmp, zmm_c1_const);
+
+                            // 2^n via IEEE754 manipulation
                             vcvtps2dq(zmm_fx, zmm_fx);
                             vpaddd(zmm_fx, zmm_fx, zmm_127);
                             vpslld(zmm_fx, zmm_fx, 23);
-                            vmulps(zmm_p, zmm_p, zmm_fx);
-                            vaddps(zmm_p, zmm_p, zmm_one);
-                            vdivps(zmm_p, zmm_gate, zmm_p);
+                            vmulps(zmm_p, zmm_p, zmm_fx); // exp(-gate)
+
+                            // sigmoid = 1 / (1 + exp(-gate))
+                            // We compute: swish = gate / (1 + exp(-gate))
+                            vaddps(zmm_p, zmm_p, zmm_one);  // 1 + exp(-gate)
+                            vdivps(zmm_p, zmm_gate, zmm_p); // gate / (1 + exp(-gate)) = swish
+
+                            // output = value * swish(gate)
                             vmulps(zmm_val, zmm_val, zmm_p);
                         };
 
-                        // Row 0
-                        compute_swish(zmm0, rdx, 0);
-                        compute_swish(zmm1, rdx, 1);
-                        compute_swish(zmm2, rdx, 2);
-                        compute_swish(zmm3, rdx, 3);
+                        // Apply SwiGLU to Row 0 (zmm0-3)
+                        compute_swish(zmm0, rdx, 0); // columns [n:n+16]
+                        compute_swish(zmm1, rdx, 1); // columns [n+16:n+32]
+                        compute_swish(zmm2, rdx, 2); // columns [n+32:n+48]
+                        compute_swish(zmm3, rdx, 3); // columns [n+48:n+64]
 
-                        // Row 1
+                        // Advance to Row 1 gate values
                         add(rdx, reg_tmp); // gate_cursor += ldc * 4
+
+                        // Apply SwiGLU to Row 1 (zmm4-7)
                         compute_swish(zmm4, rdx, 0);
                         compute_swish(zmm5, rdx, 1);
                         compute_swish(zmm6, rdx, 2);
@@ -749,46 +1194,56 @@ namespace llaminar2
                     }
                     L(skip_swiglu);
 
-                    // Store C
-                    // Load ldc
+                    // =================================================================
+                    // EPILOGUE: Store results to C matrix
+                    // =================================================================
+                    // Store the computed values back to the output matrix C.
+                    // Row 0 is at reg_C_cursor, Row 1 is at reg_C_cursor + ldc * 4.
+                    //
+                    // Load ldc for row stride calculation
                     mov(rax, ptr[rsp + 8]);              // params
                     mov(reg_tmp.cvt32(), ptr[rax + 56]); // ldc
-                    shl(reg_tmp, 2);                     // ldc * 4 bytes
+                    shl(reg_tmp, 2);                     // ldc * sizeof(float)
 
-                    // Row 0
-                    vmovups(ptr[reg_C_cursor + 0 * 64], zmm0);
-                    vmovups(ptr[reg_C_cursor + 1 * 64], zmm1);
-                    vmovups(ptr[reg_C_cursor + 2 * 64], zmm2);
-                    vmovups(ptr[reg_C_cursor + 3 * 64], zmm3);
+                    // Store Row 0 results (64 FP32 values)
+                    vmovups(ptr[reg_C_cursor + 0 * 64], zmm0); // C[0, n:n+16]
+                    vmovups(ptr[reg_C_cursor + 1 * 64], zmm1); // C[0, n+16:n+32]
+                    vmovups(ptr[reg_C_cursor + 2 * 64], zmm2); // C[0, n+32:n+48]
+                    vmovups(ptr[reg_C_cursor + 3 * 64], zmm3); // C[0, n+48:n+64]
 
-                    // Row 1
-                    add(reg_C_cursor, reg_tmp); // + ldc
-                    vmovups(ptr[reg_C_cursor + 0 * 64], zmm4);
-                    vmovups(ptr[reg_C_cursor + 1 * 64], zmm5);
-                    vmovups(ptr[reg_C_cursor + 2 * 64], zmm6);
-                    vmovups(ptr[reg_C_cursor + 3 * 64], zmm7);
-                    sub(reg_C_cursor, reg_tmp); // Restore
+                    // Store Row 1 results at offset ldc * sizeof(float)
+                    add(reg_C_cursor, reg_tmp);                // Advance to Row 1
+                    vmovups(ptr[reg_C_cursor + 0 * 64], zmm4); // C[1, n:n+16]
+                    vmovups(ptr[reg_C_cursor + 1 * 64], zmm5); // C[1, n+16:n+32]
+                    vmovups(ptr[reg_C_cursor + 2 * 64], zmm6); // C[1, n+32:n+48]
+                    vmovups(ptr[reg_C_cursor + 3 * 64], zmm7); // C[1, n+48:n+64]
+                    sub(reg_C_cursor, reg_tmp);                // Restore to Row 0 position
 
-                    // Advance C cursor
+                    // Advance C cursor to next N block (64 columns = 256 bytes)
                     add(reg_C_cursor, 256);
 
-                    // Advance N loop
-                    add(reg_loop_N, 64);
-                    jmp(loop_N_label, T_NEAR);
+                    // =================================================================
+                    // N-LOOP ITERATION: Continue to next column block
+                    // =================================================================
+                    add(reg_loop_N, 64);       // Advance column index by 64
+                    jmp(loop_N_label, T_NEAR); // Continue N-loop
                 }
 
+                // =================================================================
+                // FUNCTION EPILOGUE: Restore stack and return
+                // =================================================================
                 L("end_kernel");
-                add(rsp, 16);  // Pop N and params
-                add(rsp, 256); // Free zero buffer
-                pop(r15);
+                add(rsp, 16);  // Pop saved N and params from stack
+                add(rsp, 256); // Free the zero buffer (256 bytes)
+                pop(r15);      // Restore callee-saved registers
                 pop(r14);
                 pop(r13);
                 pop(r12);
                 pop(rbp);
                 pop(rbx);
-                ret();
+                ret(); // Return to caller
             }
         };
 
-    }
-}
+    } // namespace gemm_v4
+} // namespace llaminar

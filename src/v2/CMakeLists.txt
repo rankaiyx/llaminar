@@ -536,6 +536,7 @@ add_library(llaminar2_core STATIC
     # BF16PackedGemm, FP16PackedGemm, Q8_1GemmKernelInit, VNNIGemmKernelInit
     kernels/cpu/ops/CPURoPEKernelT.cpp
     kernels/cpu/ops/CPURMSNormKernelT.cpp
+    kernels/cpu/ops/CPURMSNormTypedKernel.cpp  # Typed RMSNorm with fused precision conversion
     kernels/cpu/ops/CPUSoftmaxKernelT.cpp
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp
     kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
