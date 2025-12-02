@@ -82,6 +82,52 @@ namespace llaminar2
     };
 
     /**
+     * @brief Kernel profiling configuration group
+     *
+     * Controls per-operation timing instrumentation for performance analysis.
+     * When disabled, profiling methods have zero overhead (compile-time elimination).
+     */
+    struct ProfileConfig
+    {
+        bool enabled = false;       ///< Enable kernel profiling (LLAMINAR_PROFILE_KERNELS=1)
+        bool per_layer = false;     ///< Breakdown by layer index (LLAMINAR_PROFILE_PER_LAYER=1)
+        bool per_iteration = false; ///< Print stats per decode iteration (LLAMINAR_PROFILE_PER_ITER=1)
+        int print_interval = 0;     ///< Print every N iterations (0=only at end)
+
+        ProfileConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *enabled_env = std::getenv("LLAMINAR_PROFILE_KERNELS");
+            if (enabled_env)
+            {
+                enabled = (std::atoi(enabled_env) != 0);
+            }
+
+            const char *per_layer_env = std::getenv("LLAMINAR_PROFILE_PER_LAYER");
+            if (per_layer_env)
+            {
+                per_layer = (std::atoi(per_layer_env) != 0);
+            }
+
+            const char *per_iter_env = std::getenv("LLAMINAR_PROFILE_PER_ITER");
+            if (per_iter_env)
+            {
+                per_iteration = (std::atoi(per_iter_env) != 0);
+            }
+
+            const char *interval_env = std::getenv("LLAMINAR_PROFILE_INTERVAL");
+            if (interval_env)
+            {
+                print_interval = std::atoi(interval_env);
+            }
+        }
+    };
+
+    /**
      * @brief GEMM kernel configuration group
      */
     struct GemmConfig
@@ -183,6 +229,7 @@ namespace llaminar2
     {
         DequantConfig dequant;
         GemmConfig gemm;
+        ProfileConfig profile;
 
         // Add more config groups as needed:
         // AttentionConfig attention;
@@ -194,6 +241,7 @@ namespace llaminar2
         void reload()
         {
             gemm.reload();
+            profile.reload();
         }
     };
 

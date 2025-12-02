@@ -19,6 +19,7 @@
 #include "utils/Sampler.h"
 #include "utils/ChatUI.h"
 #include "utils/ChatTemplate.h"
+#include "utils/BenchmarkRunner.h"
 #include "backends/ComputeBackend.h"
 #include "pipelines/PipelineFactory.h"
 #include "pipelines/PipelineConfig.h"
@@ -720,6 +721,27 @@ int main(int argc, char *argv[])
 
         MPI_Finalize();
         return 0;
+    }
+
+    // ========================================================================
+    // Benchmark Mode
+    // ========================================================================
+    if (args.benchmark_mode)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_INFO("Running benchmark mode...");
+        }
+
+        // Convert unique_ptr to shared_ptr for BenchmarkRunner
+        std::shared_ptr<PipelineBase> shared_pipeline(std::move(pipeline));
+
+        BenchmarkRunner benchmark(shared_pipeline, tokenizer, mpi_ctx);
+        BenchmarkResult result = benchmark.run(args);
+        benchmark.printResults(result);
+
+        MPI_Finalize();
+        return result.success ? 0 : 1;
     }
 
     // ========================================================================

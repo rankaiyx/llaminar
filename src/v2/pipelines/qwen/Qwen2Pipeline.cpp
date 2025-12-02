@@ -15,6 +15,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugAssert.h"
 #include "../../utils/DebugEnv.h"
+#include "../../utils/KernelProfiler.h"
 #include "../PipelineFactory.h"
 #include "../../loaders/ModelLoader.h"
 #include "../../tensors/TensorFactory.h"
@@ -1014,6 +1015,8 @@ namespace llaminar2
 
     bool Qwen2Pipeline::embedding_batch(const std::vector<std::vector<int>> &token_batches, TensorBase *output)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::EMBEDDING);
+
         auto embed_table = getEmbeddingTable();
         VALIDATE_POINTER(embed_table, "embedding table");
 

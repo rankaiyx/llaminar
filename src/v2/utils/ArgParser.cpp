@@ -229,6 +229,12 @@ namespace llaminar2
                 ctx.chat_template = getNextArg(argv, argc, i, "chat-template");
             }
 
+            // Benchmark mode
+            else if (arg == "--benchmark")
+            {
+                ctx.benchmark_mode = true;
+            }
+
             // Verbose logging levels
             else if (arg == "-vv" || arg == "--vverbose")
             {
@@ -329,6 +335,11 @@ namespace llaminar2
         std::cout << "  --chat-template TEMPLATE  Override chat template:\n";
         std::cout << "                              chatml, llama3, llama2, mistral, phi3, gemma, deepseek, etc.\n\n";
 
+        std::cout << "Benchmark:\n";
+        std::cout << "  --benchmark               Run benchmark mode (separate prefill/decode timing)\n";
+        std::cout << "                            Uses greedy sampling for deterministic results\n";
+        std::cout << "                            Default: 128 tokens if -n not specified\n\n";
+
         std::cout << "Other:\n";
         std::cout << "  --list-devices            List available devices and exit\n";
         std::cout << "  -v, --verbose             Verbose logging (DEBUG level)\n";
@@ -359,6 +370,12 @@ namespace llaminar2
 
         std::cout << "  # Single-shot with chat template\n";
         std::cout << "  " << prog_name << " -m model.gguf --chat-single -p \"What is the capital of France?\"\n\n";
+
+        std::cout << "  # Benchmark mode (prefill + decode timing)\n";
+        std::cout << "  " << prog_name << " -m model.gguf --benchmark -n 50\n\n";
+
+        std::cout << "  # Benchmark with custom prompt\n";
+        std::cout << "  " << prog_name << " -m model.gguf --benchmark -p \"Your prompt here\" -n 100\n\n";
     }
 
     bool ArgParser::matchesFlag(const std::string &arg,

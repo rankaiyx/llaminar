@@ -74,6 +74,9 @@ namespace llaminar2
         bool single_shot_chat = false;  // Single prompt with chat template formatting
         std::string system_prompt = ""; // System message for chat
         std::string chat_template = ""; // Override template: "chatml", "llama3", "mistral", etc.
+
+        // Benchmark mode
+        bool benchmark_mode = false; // Run benchmark (prefill + decode timing)
     };
 
     /**

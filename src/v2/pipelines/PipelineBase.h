@@ -373,6 +373,17 @@ namespace llaminar2
          */
         int device_index() const { return device_idx_; }
 
+        /**
+         * @brief Clear KV cache and reset position counters
+         *
+         * Call this to reset the pipeline state for a new inference run.
+         * Used by benchmark mode to ensure consistent timing across iterations.
+         *
+         * Default implementation is a no-op. Derived classes should override
+         * if they maintain cached state (e.g., KV cache for attention).
+         */
+        virtual void clear_cache() {}
+
     protected:
         // Context management
         std::shared_ptr<ModelContext> model_ctx_;

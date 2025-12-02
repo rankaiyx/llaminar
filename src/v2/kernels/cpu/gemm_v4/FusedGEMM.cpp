@@ -7,6 +7,7 @@
 
 #include "FusedGEMM.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 
 namespace llaminar2
 {
@@ -127,8 +128,12 @@ namespace llaminar2
         size_t buffer_size = gemm_kernels_[0]->get_quantized_activation_buffer_size(m, k);
         std::vector<uint8_t> q8_1_buffer(buffer_size);
 
-        // Step 2: Quantize activations once
-        bool success = gemm_kernels_[0]->quantize_activations(input, q8_1_buffer.data(), m, k);
+        // Step 2: Quantize activations once (profile separately)
+        bool success;
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::QUANTIZE_Q8);
+            success = gemm_kernels_[0]->quantize_activations(input, q8_1_buffer.data(), m, k);
+        }
         if (!success)
         {
             LOG_ERROR("[FusedGEMM] Failed to quantize activations");
@@ -138,6 +143,8 @@ namespace llaminar2
         // Step 3: Execute all projections with shared quantized activations
         for (size_t i = 0; i < gemm_kernels_.size(); ++i)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::GEMM_Q8);
+
             const auto &proj = projections[i];
             const auto &name = projection_names_[i];
 

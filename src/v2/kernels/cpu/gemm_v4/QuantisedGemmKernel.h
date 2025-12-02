@@ -8,6 +8,7 @@
 #include "../../../tensors/FP16Utils.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/KernelProfiler.h"
 #include <vector>
 #include <memory>
 #include <mutex>

@@ -89,7 +89,7 @@ Llaminar provides a dedicated `--benchmark` mode for clean performance measureme
 
 ```bash
 # Recommended: Use canonical launcher (RELEASE mode)
-./run_llaminar.sh --benchmark \
+./run_llaminar.sh -- --benchmark \
   -m models/qwen2.5-0.5b-instruct-q8_0.gguf \
   -p "Your prompt here" \
   -n 50
@@ -97,86 +97,97 @@ Llaminar provides a dedicated `--benchmark` mode for clean performance measureme
 
 ### Benchmark Features
 
+- **Warmup + averaged runs** - 1 warmup run (discarded), then 3 benchmark runs averaged
 - **Separate prefill/decode timing** - Independent measurement of both phases
 - **Clean output** - Minimal logging (ERROR level only) with formatted metrics
 - **Greedy sampling** - Deterministic token selection for reproducible results
 - **MPI-aware** - Handles tokenization on rank 0 with proper broadcast to all ranks
+- **KV cache reset** - Cache cleared between runs for consistent measurements
 - **Professional formatting** - Box-drawing characters for clear metric display
 
 ### Benchmark Output Metrics
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
+║                    BENCHMARK RESULTS                         ║
+║              (average of 3 runs after warmup)                 ║
+╠══════════════════════════════════════════════════════════════╣
 ║ PREFILL PHASE                                                ║
-║   Tokens:              8 tokens                              ║
-║   Time:          1216.49 ms                                  ║
-║   Throughput:       6.58 tok/s                               ║
+║   Tokens:           596 tokens                              ║
+║   Time:         1959.28 ms                                  ║
+║   Throughput:    304.19 tok/s                               ║
 ╠══════════════════════════════════════════════════════════════╣
 ║ DECODE PHASE                                                 ║
-║   Tokens:             50 tokens                              ║
-║   Time:         48095.52 ms                                  ║
-║   Throughput:       1.04 tok/s                               ║
+║   Tokens:           128 tokens                              ║
+║   Time:         2370.41 ms                                  ║
+║   Throughput:     54.00 tok/s                               ║
+╠══════════════════════════════════════════════════════════════╣
+║ TOTAL                                                        ║
+║   Time:         4329.69 ms                                  ║
+║   Overall:       167.22 tok/s (avg)                         ║
 ╚══════════════════════════════════════════════════════════════╝
+
+✓ Benchmark completed successfully.
 ```
 
 ### Implementation Details
 
-- **Source**: `src/BenchmarkRunner.{h,cpp}` (~300 lines)
-- **Integration**: `src/Main.cpp`, `src/ArgumentParser.{h,cpp}`
+- **Source**: `src/v2/utils/BenchmarkRunner.{h,cpp}` (~460 lines)
+- **Integration**: `src/v2/Main.cpp`, `src/v2/utils/ArgParser.{h,cpp}`
 - **Key patterns**:
-  - Logits fetched via `pipeline.logits(latest_logits)` after prefill/decode
+  - 1 warmup run + 3 benchmark runs averaged
+  - `pipeline->clear_cache()` called before each run
+  - Logits fetched via `pipeline->logits()` after prefill/decode
   - Token broadcast from rank 0 to all ranks via MPI_Bcast
-  - DummyTokenizer on non-rank-0 processes for API compatibility
-  - Greedy sampling: argmax over last logits row
-
+  - Greedy sampling: argmax over last logits row (deterministic)
 ### Benchmark Defaults and Configuration
 
 **Standard Benchmark:**
 ```bash
 # Uses intelligent defaults if -p not provided:
-#   - Auto-generated ~512 token prompt (mixed technical/narrative)
+#   - Auto-generated ~512 token prompt (mixed technical/narrative), tokenizes to ~596 tokens
 #   - 128 decode tokens
-./run_llaminar.sh --benchmark -m model.gguf
+#   - 1 warmup run + 3 benchmark runs averaged
+./run_llaminar.sh -- --benchmark -m model.gguf
+``` - 128 decode tokens
+./run_llaminar.sh -- --benchmark -m model.gguf
 ```
 
 **Phase-Specific Benchmarks:**
 ```bash
 # Prefill-only (decode skipped when -n 0)
-./run_llaminar.sh --benchmark -m model.gguf -p "Long context..." -n 0
+./run_llaminar.sh -- --benchmark -m model.gguf -p "Long context..." -n 0
 
-# Decode-only (prefill skipped when -p "")
-./run_llaminar.sh --benchmark -m model.gguf -p "" -n 128
+# Custom prompt with specific decode count
+./run_llaminar.sh -- --benchmark -m model.gguf -p "Hello world" -n 50
 ```
 
 **Implementation Notes:**
-- Auto-prompt generation in `src/ArgumentParser.cpp` (lines ~189-198)
-- Conditional execution in `src/BenchmarkRunner.cpp`:
-  - Prefill: Skipped if `token_count == 0`
+- Auto-prompt generation in `src/v2/utils/BenchmarkRunner.cpp`
+- Conditional execution:
   - Decode: Skipped if `n_predict == 0`
 - Output shows "(SKIPPED)" for omitted phases
-- TOTAL section omitted when only one phase runs
 
 ### Benchmarking Best Practices
 
 ```bash
 # 1. Use Release builds for accurate timing
-cmake -B build_v2_release -S . -DCMAKE_BUILD_TYPE=Release
+cmake -B build_v2_release -S src/v2 -DCMAKE_BUILD_TYPE=Release
 cmake --build build_v2_release --parallel
 
 # 2. Disable snapshotting
 unset LLAMINAR_SNAPSHOT_STAGES
 
 # 3. Test various prompt lengths (prefill scales with tokens)
-./run_llaminar.sh --benchmark -m model.gguf -p "Short" -n 50
-./run_llaminar.sh --benchmark -m model.gguf -p "Much longer prompt..." -n 50
+./run_llaminar.sh -- --benchmark -m model.gguf -p "Short" -n 50
+./run_llaminar.sh -- --benchmark -m model.gguf -p "Much longer prompt..." -n 50
 
 # 4. Vary decode length to measure sustained performance
-./run_llaminar.sh --benchmark -m model.gguf -p "Test" -n 20   # Quick
-./run_llaminar.sh --benchmark -m model.gguf -p "Test" -n 200  # Sustained
+./run_llaminar.sh -- --benchmark -m model.gguf -p "Test" -n 20   # Quick
+./run_llaminar.sh -- --benchmark -m model.gguf -p "Test" -n 200  # Sustained
 
 # 5. Use phase-specific modes to isolate performance
-./run_llaminar.sh --benchmark -m model.gguf -p "" -n 128  # Decode-only
-./run_llaminar.sh --benchmark -m model.gguf -n 0          # Prefill-only
+./run_llaminar.sh -- --benchmark -m model.gguf -n 0          # Prefill-only (with default ~512 token prompt)
 ```
 
 ### Performance Notes
@@ -186,6 +197,56 @@ unset LLAMINAR_SNAPSHOT_STAGES
 - **Debug vs Release**: Release builds expected to be 5-10x faster
 - **Backend routing**: Small ops use OpenBLAS, large prefills may use COSMA (if threshold met)
 - **NUMA optimization**: K/V cache and activations benefit from first-touch allocation (+10-40% on large models)
+
+### Kernel Profiling
+
+Enable per-operation timing breakdown to identify bottlenecks:
+
+```bash
+# Run benchmark with kernel profiling
+LLAMINAR_PROFILE_KERNELS=1 ./run_llaminar.sh -- --benchmark -m model.gguf -n 50
+```
+
+**Profiled Operations:**
+- `GEMM_Q8`: Quantized GEMM (QKV projections, output projections)
+- `ATTENTION`: Full attention computation (Q*K^T, softmax, *V)
+- `FFN_DOWN`: FFN down projection (tracked separately)
+- `FFN_GATE`, `FFN_UP`: FFN gate/up projections
+- `LM_HEAD`: Final vocabulary projection
+- `QUANTIZE_Q8`: FP32 → Q8_1 activation quantization
+- `RMS_NORM`: RMS normalization
+- `SWIGLU`: SwiGLU activation
+- `ROPE`: Rotary position encoding
+- `RESIDUAL_ADD`: Residual connections
+- `EMBEDDING`: Token embedding lookup
+
+**Example Output:**
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         KERNEL PROFILING SUMMARY                             ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Kernel Type      │  Calls   │  Total (ms)  │  Avg (µs)  │  Min/Max (µs)     ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  GEMM_Q8         │    7128  │     8947.85  │   1255.31  │   33.47/32651.11 ║
+║  ATTENTION       │    1188  │     5915.90  │   4979.71  │  181.00/86178.09 ║
+║  FFN_DOWN        │    1188  │     3891.00  │   3275.25  │  429.99/34938.14 ║
+║  ...             │          │              │            │                   ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  TOTAL KERNEL TIME:   19993.79 ms   ( 30.31 kernel tok/s)                    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
+**Typical Profile by Model Size:**
+
+| Model Size | GEMM % | Attention % | FFN % | Notes |
+|------------|--------|-------------|-------|-------|
+| 0.5B | ~20% | ~57% | ~11% | Attention-bound |
+| 3B | ~45% | ~30% | ~20% | Compute-bound |
+| 7B+ | ~50%+ | ~25% | ~20% | Compute-bound |
+
+**Key Insight**: Smaller models are attention-bound (OpenMP overhead in Q*K^T); larger models are compute-bound (JIT GEMM dominates).
+
+**Implementation**: See `src/v2/utils/KernelProfiler.h` and `src/v2/utils/DebugEnv.h` (`ProfileConfig`).
 
 ## Development Profiling (Advanced)
 
@@ -1227,6 +1288,7 @@ For a full list of environment variables available, check
 
 | Variable | Description | Default / Activation | Primary Scope |
 |----------|-------------|----------------------|---------------|
+| `LLAMINAR_PROFILE_KERNELS` | Enable per-kernel timing breakdown in benchmark mode. | Disabled unless set to non-zero. | Performance profiling |
 | `LLAMINAR_DEQUANT_STATS` | Logs per-tensor dequant stats (min/max/mean/sample). | Disabled unless set to non-zero. | Quantized tensor loading |
 | `OMP_NUM_THREADS` / `OMP_PLACES` / `OMP_PROC_BIND` | Governs OpenMP thread placement & counts (run script sets). | Auto-set by `run_llaminar.sh` | Threading performance |
 

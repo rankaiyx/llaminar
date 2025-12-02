@@ -6,6 +6,7 @@
 
 #include "../utils/Logger.h"
 #include "../utils/DebugAssert.h"
+#include "../utils/KernelProfiler.h"
 #include "PipelineBase.h"
 #include "attention/MpiAttentionOrchestrator.h"
 #include "../tensors/TensorFactory.h"
@@ -903,6 +904,8 @@ namespace llaminar2
         int rows, int cols, float eps,
         const std::string &snapshot_key, int device)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
+
         int target_device = (device >= 0) ? device : device_idx_;
 
         if (!rmsnorm_op_(input, gamma, output, rows, cols, eps,
@@ -921,6 +924,13 @@ namespace llaminar2
         int m, int n, int k,
         const std::string &snapshot_key, int device)
     {
+        // Profile with appropriate kernel type based on operation
+        KernelType profile_type = (snapshot_key == "LM_HEAD") ? KernelType::LM_HEAD : (snapshot_key.find("FFN_GATE") != std::string::npos) ? KernelType::FFN_GATE
+                                                                                  : (snapshot_key.find("FFN_UP") != std::string::npos)     ? KernelType::FFN_UP
+                                                                                  : (snapshot_key.find("FFN_DOWN") != std::string::npos)   ? KernelType::FFN_DOWN
+                                                                                                                                           : KernelType::GEMM_Q8; // Default to Q8 GEMM (most common)
+        KERNEL_PROFILE_SCOPE(profile_type);
+
         int target_device = (device >= 0) ? device : device_idx_;
 
         if (!gemm_op_(input, weight, output, m, n, k,
@@ -940,6 +950,8 @@ namespace llaminar2
         const std::vector<int> &sequence_lengths,
         const std::string &snapshot_key)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
+
         if (!residual_op_.batched(residual, input, output,
                                   batch_size, seq_len, hidden_dim,
                                   sequence_lengths, snapshot_key.c_str()))
@@ -957,6 +969,8 @@ namespace llaminar2
         int rows, int cols,
         const std::string &snapshot_key, int device)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
+
         int target_device = (device >= 0) ? device : device_idx_;
 
         if (!swiglu_op_(gate, up, output, rows, cols,
@@ -977,6 +991,8 @@ namespace llaminar2
         float theta,
         const std::string &snapshot_prefix, int device)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
+
         int target_device = (device >= 0) ? device : device_idx_;
 
         if (!rope_op_(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
@@ -1019,6 +1035,8 @@ namespace llaminar2
         int batch_size, const std::vector<int> &sequence_lengths, int padded_seq_len,
         bool causal, const std::string &snapshot_key)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
         // Create views with actual effective_seq_len
         auto Q_view = Q->create_view({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
         auto K_view = K->create_view({static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)});
@@ -1072,9 +1090,12 @@ namespace llaminar2
         int batch_size, const std::vector<int> &sequence_lengths,
         bool causal, const std::string &snapshot_key)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
         // For now, when q_seq_len == kv_seq_len (prefill), use existing path
         if (q_seq_len == kv_seq_len)
         {
+            // Note: compute_attention already has its own profiling, but it's fine to nest
             return compute_attention(Q, K, V, output, q_seq_len, n_heads, n_kv_heads, head_dim,
                                      batch_size, sequence_lengths, q_seq_len, causal, snapshot_key);
         }
