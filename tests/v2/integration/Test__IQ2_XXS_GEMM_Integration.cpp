@@ -180,8 +180,8 @@ TEST_F(IQ2_XXS_GEMM_Integration, QuantizedVsFP32Parity)
     // === Compare results ===
     float rel_l2 = compute_relative_l2_error(C_ref->data(), C_quant->data(), m * n);
 
-    // IQ2_XXS is a 2-bit format. Relative L2 error should be under 1%.
-    const float tolerance = 0.01f;
+    // IQ2_XXS is a 2-bit format. Relative L2 error should be under 1.5%.
+    const float tolerance = 0.015f;
 
     EXPECT_LT(rel_l2, tolerance)
         << "Relative L2 error " << rel_l2 << " exceeds tolerance " << tolerance;

@@ -375,6 +375,19 @@ add_v2_test(V2_Unit_Q3_K_SIMD_Unpack
     MPI_PROCS 1
 )
 
+# Test: Q3_K Bug Repro
+add_executable(v2_test_q3k_bug unit/Test__Q3K_Bug.cpp)
+target_link_libraries(v2_test_q3k_bug 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q3KBug 
+    COMMAND $<TARGET_FILE:v2_test_q3k_bug>
+    LABELS "V2;Unit;Q3K;Bug"
+    MPI_PROCS 1
+)
+
 # Test: Q2_K Transcode (Fused Dequant/Requant)
 add_executable(v2_test_q2_k_transcode unit/tensors/Test__Q2_K_Transcode.cpp)
 target_link_libraries(v2_test_q2_k_transcode 
@@ -1117,6 +1130,58 @@ add_v2_test(V2_Unit_IQ2_XS_Views
     LABELS "V2;Unit;TensorOperations;IQ2_XS;Quantization;ViewSupport;RowSlice;IQuant;SuperBlock"
 )
 
+# Test: IQ2_XS Decode Vectorization
+add_executable(v2_test_iq2xs_decode_vectorization unit/Test__IQ2_XS_DecodeVectorization.cpp)
+target_link_libraries(v2_test_iq2xs_decode_vectorization 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ2_XS_DecodeVectorization 
+    COMMAND $<TARGET_FILE:v2_test_iq2xs_decode_vectorization>
+    LABELS "V2;Unit;TensorOperations;IQ2_XS;Quantization;SIMD;Unpack;IINT8Unpackable"
+    MPI_PROCS 1
+)
+
+# Test: IQ2_XS Unpack Vectorization (AVX512)
+add_executable(v2_test_iq2_xs_unpack_vectorization unit/Test__IQ2_XS_UnpackVectorization.cpp)
+target_link_libraries(v2_test_iq2_xs_unpack_vectorization 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ2_XS_UnpackVectorization 
+    COMMAND $<TARGET_FILE:v2_test_iq2_xs_unpack_vectorization>
+    LABELS "V2;Unit;TensorOperations;IQ2_XS;Quantization;SIMD;AVX512"
+    MPI_PROCS 1
+)
+
+# Test: IQ1_M Decode Vectorization
+add_executable(v2_test_iq1m_decode_vectorization unit/Test__IQ1_M_DecodeVectorization.cpp)
+target_link_libraries(v2_test_iq1m_decode_vectorization 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ1_M_DecodeVectorization 
+    COMMAND $<TARGET_FILE:v2_test_iq1m_decode_vectorization>
+    LABELS "V2;Unit;TensorOperations;IQ1_M;Quantization;SIMD;Unpack;IINT8Unpackable"
+    MPI_PROCS 1
+)
+
+# Test: IQ3_S Decode Vectorization
+add_executable(v2_test_iq3s_decode_vectorization unit/Test__IQ3_S_DecodeVectorization.cpp)
+target_link_libraries(v2_test_iq3s_decode_vectorization 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ3_S_DecodeVectorization 
+    COMMAND $<TARGET_FILE:v2_test_iq3s_decode_vectorization>
+    LABELS "V2;Unit;TensorOperations;IQ3_S;Quantization;SIMD;Unpack;IINT8Unpackable"
+    MPI_PROCS 1
+)
+
 # Test: IQ3_XXS Tensor Views
 add_executable(v2_test_iq3xxs_views unit/tensors/Test__IQ3_XXSTensor_Views.cpp)
 target_link_libraries(v2_test_iq3xxs_views 
@@ -1187,6 +1252,19 @@ target_link_libraries(v2_test_iq2xxs_tensor
 add_v2_test(V2_Unit_IQ2_XXSTensor 
     COMMAND $<TARGET_FILE:v2_test_iq2xxs_tensor>
     LABELS "V2;Unit;TensorOperations;IQ2_XXS;Quantization;IINT8Unpackable"
+)
+
+# Test: IQ2_XXS Unpack Vectorization (AVX512)
+add_executable(v2_test_iq2_xxs_unpack_vectorization unit/Test__IQ2_XXS_UnpackVectorization.cpp)
+target_link_libraries(v2_test_iq2_xxs_unpack_vectorization 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IQ2_XXS_UnpackVectorization 
+    COMMAND $<TARGET_FILE:v2_test_iq2_xxs_unpack_vectorization>
+    LABELS "V2;Unit;TensorOperations;IQ2_XXS;Quantization;SIMD;AVX512"
+    MPI_PROCS 1
 )
 
 # Test: IQ2_XXS GEMM Integration
@@ -1952,7 +2030,7 @@ else()
 endif()
 
 # Performance Test: GEMM Tuning Sweep
-add_executable(v2_perf_gemm_tuning_sweep performance/Perf__GemmTuningSweep.cpp)
+add_executable(v2_perf_gemm_tuning_sweep performance/kernels/cpu/gemm/Perf__GemmTuningSweep.cpp)
 target_link_libraries(v2_perf_gemm_tuning_sweep 
     llaminar2_core 
     GTest::gtest
@@ -1960,4 +2038,52 @@ target_link_libraries(v2_perf_gemm_tuning_sweep
 add_v2_test(V2_Perf_GemmTuningSweep 
     COMMAND $<TARGET_FILE:v2_perf_gemm_tuning_sweep>
     LABELS "V2;Performance;GEMM;Tuning"
+)
+
+# Performance Test: KVCache
+add_executable(v2_perf_kvcache performance/tensors/kvcache/Perf__KVCache.cpp)
+target_link_libraries(v2_perf_kvcache 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_KVCache 
+    COMMAND $<TARGET_FILE:v2_perf_kvcache>
+    LABELS "V2;Performance;KVCache;Memory"
+)
+
+# Performance Test: IINT8Unpackable (quantized tensor unpack throughput comparison)
+add_executable(v2_perf_iint8_unpackable performance/tensors/Perf__IINT8Unpackable.cpp)
+target_link_libraries(v2_perf_iint8_unpackable 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_IINT8Unpackable 
+    COMMAND $<TARGET_FILE:v2_perf_iint8_unpackable>
+    LABELS "V2;Performance;TensorOperations;Quantization;IINT8Unpackable;Unpack"
+)
+
+# Performance Test: QuantisedGemmKernel Packing (constructor time)
+add_executable(v2_perf_quantised_gemm_packing performance/kernels/Perf__QuantisedGemmPacking.cpp)
+target_link_libraries(v2_perf_quantised_gemm_packing 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_QuantisedGemmPacking 
+    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_packing>
+    LABELS "V2;Performance;Kernels;GEMM;Packing"
+)
+
+# Performance Test: Q3_K Unpack
+add_executable(v2_perf_q3k_unpack performance/Perf__Q3K_Unpack.cpp)
+target_link_libraries(v2_perf_q3k_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q3K_Unpack 
+    COMMAND $<TARGET_FILE:v2_perf_q3k_unpack>
+    LABELS "V2;Performance;Q3_K;Unpack"
 )

@@ -182,41 +182,47 @@ namespace llaminar2
         float *y = output;
 
         int is = 0; // Scale index
+        const __m256i mask3 = _mm256_set1_epi32(3);
 
         // Process 2 chunks of 128 elements each
         for (int n = 0; n < 256; n += 128)
         {
+            // Load and expand 32 bytes of q once
+            // 32 bytes -> 4 YMM registers of 32-bit ints
+            __m128i q_bytes_0 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q));      // 0..7
+            __m128i q_bytes_1 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q + 8));  // 8..15
+            __m128i q_bytes_2 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q + 16)); // 16..23
+            __m128i q_bytes_3 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(q + 24)); // 24..31
+
+            __m256i q_32_0 = _mm256_cvtepu8_epi32(q_bytes_0);
+            __m256i q_32_1 = _mm256_cvtepu8_epi32(q_bytes_1);
+            __m256i q_32_2 = _mm256_cvtepu8_epi32(q_bytes_2);
+            __m256i q_32_3 = _mm256_cvtepu8_epi32(q_bytes_3);
+
             int shift = 0;
 
             // 4 groups per chunk (4 * 32 = 128)
             for (int j = 0; j < 4; ++j)
             {
-                // First group of 16 elements - use AVX2 for vectorization
+                __m256i shift_vec = _mm256_set1_epi32(shift);
+
+                // First group of 16 elements
                 uint8_t sc = block.scales[is++];
                 __m256 vdl = _mm256_set1_ps(d * (sc & 0xF));
                 __m256 vml = _mm256_set1_ps(dmin * (sc >> 4));
 
-                // Process 16 elements in 2 batches of 8
-                for (int l = 0; l < 16; l += 8)
-                {
-                    // Load 8 bytes
-                    __m128i q_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(&q[l]));
+                // 0..7
+                __m256i q2_vals = _mm256_and_si256(_mm256_srlv_epi32(q_32_0, shift_vec), mask3);
+                __m256 vq = _mm256_cvtepi32_ps(q2_vals);
+                __m256 result = _mm256_sub_ps(_mm256_mul_ps(vdl, vq), vml);
+                _mm256_storeu_ps(y, result);
 
-                    // Zero-extend to 32-bit
-                    __m256i q_32 = _mm256_cvtepu8_epi32(q_bytes);
+                // 8..15
+                q2_vals = _mm256_and_si256(_mm256_srlv_epi32(q_32_1, shift_vec), mask3);
+                vq = _mm256_cvtepi32_ps(q2_vals);
+                result = _mm256_sub_ps(_mm256_mul_ps(vdl, vq), vml);
+                _mm256_storeu_ps(y + 8, result);
 
-                    // Shift right by current shift amount and mask to get 2-bit values
-                    __m256i shift_vec = _mm256_set1_epi32(shift);
-                    __m256i q2_vals = _mm256_and_si256(_mm256_srlv_epi32(q_32, shift_vec), _mm256_set1_epi32(3));
-
-                    // Convert to float (0-3 range, no centering needed)
-                    __m256 vq = _mm256_cvtepi32_ps(q2_vals);
-
-                    // Apply formula: dl * q2 - ml
-                    __m256 result = _mm256_sub_ps(_mm256_mul_ps(vdl, vq), vml);
-
-                    _mm256_storeu_ps(y + l, result);
-                }
                 y += 16;
 
                 // Second group of 16 elements
@@ -224,19 +230,19 @@ namespace llaminar2
                 vdl = _mm256_set1_ps(d * (sc & 0xF));
                 vml = _mm256_set1_ps(dmin * (sc >> 4));
 
-                for (int l = 0; l < 16; l += 8)
-                {
-                    __m128i q_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(&q[l + 16]));
-                    __m256i q_32 = _mm256_cvtepu8_epi32(q_bytes);
-                    __m256i shift_vec = _mm256_set1_epi32(shift);
-                    __m256i q2_vals = _mm256_and_si256(_mm256_srlv_epi32(q_32, shift_vec), _mm256_set1_epi32(3));
-                    __m256 vq = _mm256_cvtepi32_ps(q2_vals);
-                    __m256 result = _mm256_sub_ps(_mm256_mul_ps(vdl, vq), vml);
+                // 16..23
+                q2_vals = _mm256_and_si256(_mm256_srlv_epi32(q_32_2, shift_vec), mask3);
+                vq = _mm256_cvtepi32_ps(q2_vals);
+                result = _mm256_sub_ps(_mm256_mul_ps(vdl, vq), vml);
+                _mm256_storeu_ps(y, result);
 
-                    _mm256_storeu_ps(y + l, result);
-                }
+                // 24..31
+                q2_vals = _mm256_and_si256(_mm256_srlv_epi32(q_32_3, shift_vec), mask3);
+                vq = _mm256_cvtepi32_ps(q2_vals);
+                result = _mm256_sub_ps(_mm256_mul_ps(vdl, vq), vml);
+                _mm256_storeu_ps(y + 8, result);
+
                 y += 16;
-
                 shift += 2;
             }
             q += 32;
@@ -255,34 +261,34 @@ namespace llaminar2
         float *y = output;
 
         int is = 0; // Scale index
+        const __m512i mask3 = _mm512_set1_epi32(3);
 
         // Process 2 chunks of 128 elements each
         for (int n = 0; n < 256; n += 128)
         {
+            // Load and expand 32 bytes of q once
+            __m128i q_bytes_lo = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q));
+            __m128i q_bytes_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q + 16));
+
+            __m512i q_32_lo = _mm512_cvtepu8_epi32(q_bytes_lo);
+            __m512i q_32_hi = _mm512_cvtepu8_epi32(q_bytes_hi);
+
             int shift = 0;
 
             // 4 groups per chunk (4 * 32 = 128)
             for (int j = 0; j < 4; ++j)
             {
+                __m512i shift_vec = _mm512_set1_epi32(shift);
+
                 // First group of 16 elements - use AVX512 for full vectorization
                 uint8_t sc = block.scales[is++];
                 __m512 vdl = _mm512_set1_ps(d * (sc & 0xF));
                 __m512 vml = _mm512_set1_ps(dmin * (sc >> 4));
 
-                // Process all 16 elements at once with AVX512
-                __m128i q_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&q[0]));
-                __m512i q_32 = _mm512_cvtepu8_epi32(q_bytes);
-
-                // Shift and mask to get 2-bit values
-                __m512i shift_vec = _mm512_set1_epi32(shift);
-                __m512i q2_vals = _mm512_and_epi32(_mm512_srlv_epi32(q_32, shift_vec), _mm512_set1_epi32(3));
-
-                // Convert to float (0-3 range, no centering needed)
+                // Low 16
+                __m512i q2_vals = _mm512_and_epi32(_mm512_srlv_epi32(q_32_lo, shift_vec), mask3);
                 __m512 vq = _mm512_cvtepi32_ps(q2_vals);
-
-                // Apply formula: dl * q2 - ml
                 __m512 result = _mm512_sub_ps(_mm512_mul_ps(vdl, vq), vml);
-
                 _mm512_storeu_ps(y, result);
                 y += 16;
 
@@ -291,12 +297,10 @@ namespace llaminar2
                 vdl = _mm512_set1_ps(d * (sc & 0xF));
                 vml = _mm512_set1_ps(dmin * (sc >> 4));
 
-                q_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&q[16]));
-                q_32 = _mm512_cvtepu8_epi32(q_bytes);
-                q2_vals = _mm512_and_epi32(_mm512_srlv_epi32(q_32, shift_vec), _mm512_set1_epi32(3));
+                // High 16
+                q2_vals = _mm512_and_epi32(_mm512_srlv_epi32(q_32_hi, shift_vec), mask3);
                 vq = _mm512_cvtepi32_ps(q2_vals);
                 result = _mm512_sub_ps(_mm512_mul_ps(vdl, vq), vml);
-
                 _mm512_storeu_ps(y, result);
                 y += 16;
 
@@ -628,6 +632,45 @@ namespace llaminar2
         simd::transcode_q2_k_to_int8(block, sub_block_idx, temp_i8, &scale, &min_val);
 
         return min_val;
+    }
+
+    void Q2_KTensor::unpack_superblock_to_int8(
+        size_t row_idx,
+        size_t superblock_idx,
+        int8_t *output,
+        float *scales,
+        float *mins) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("Q2_KTensor::unpack_superblock_to_int8: output must not be null");
+        }
+
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q2_KTensor::unpack_superblock_to_int8: tensor must be 2D");
+        }
+
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q2_KTensor::unpack_superblock_to_int8: row index out of bounds");
+        }
+
+        const size_t cols = shape_[1];
+        const size_t super_blocks_per_row = (cols + Q2_KBlock::BLOCK_SIZE - 1) / Q2_KBlock::BLOCK_SIZE;
+
+        if (superblock_idx >= super_blocks_per_row)
+        {
+            throw std::out_of_range("Q2_KTensor::unpack_superblock_to_int8: superblock index out of bounds");
+        }
+
+        // Get Q2_K super-block
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q2_KBlock *blocks = reinterpret_cast<const Q2_KBlock *>(data_ptr);
+        const Q2_KBlock &block = blocks[row_idx * super_blocks_per_row + superblock_idx];
+
+        // Unpack all 8 sub-blocks (256 elements total)
+        simd::unpack_q2_k_superblock_to_int8(block, output, scales, mins);
     }
 
 } // namespace llaminar2

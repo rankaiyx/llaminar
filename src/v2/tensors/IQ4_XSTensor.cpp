@@ -371,4 +371,29 @@ namespace llaminar2
                                    output->qs, &output->d);
     }
 
+    void IQ4_XSTensor::unpack_superblock_to_int8(
+        size_t row_idx,
+        size_t superblock_idx,
+        int8_t *output,
+        float *scales,
+        float *mins) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("IQ4_XSTensor::unpack_superblock_to_int8: output must not be null");
+        }
+
+        const size_t blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
+        const IQ4_XSBlock &super_block = blocks[row_idx * blocks_per_row + superblock_idx];
+
+        // Use optimized fused implementation
+        simd::unpack_iq4_xs_superblock_to_int8(super_block, output, scales);
+
+        // Symmetric format - no min values
+        if (mins)
+            std::memset(mins, 0, 8 * sizeof(float));
+    }
+
 } // namespace llaminar2

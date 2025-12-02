@@ -50,6 +50,21 @@ namespace llaminar2
         using llaminar2::fp32_to_fp16;
 
         // ========================================================================
+        // SIMD Helpers
+        // ========================================================================
+
+#if defined(__AVX512F__) || defined(__AVX2__)
+        inline uint8_t hmax_epu8_128(__m128i v)
+        {
+            __m128i max1 = _mm_max_epu8(v, _mm_srli_si128(v, 8));
+            __m128i max2 = _mm_max_epu8(max1, _mm_srli_si128(max1, 4));
+            __m128i max3 = _mm_max_epu8(max2, _mm_srli_si128(max2, 2));
+            __m128i max4 = _mm_max_epu8(max3, _mm_srli_si128(max3, 1));
+            return (uint8_t)_mm_cvtsi128_si32(max4);
+        }
+#endif
+
+        // ========================================================================
         // BF16 Conversion Helpers
         // ========================================================================
 
@@ -371,7 +386,8 @@ namespace llaminar2
             if (remaining > 0)
             {
 #if defined(__AVX2__)
-                if (cpu_supports_avx2())
+                static const bool has_avx2 = cpu_supports_avx2();
+                if (has_avx2)
                 {
                     const float tail = activation_row_max_abs_avx2(row + i, remaining);
                     return std::max(max_abs, tail);
@@ -424,13 +440,15 @@ namespace llaminar2
         inline float activation_row_max_abs(const float *row, int length)
         {
 #if defined(__AVX512F__)
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 return activation_row_max_abs_avx512(row, length);
             }
 #endif
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 return activation_row_max_abs_avx2(row, length);
             }
@@ -518,7 +536,8 @@ namespace llaminar2
             if (remaining > 0)
             {
 #if defined(__AVX2__)
-                if (cpu_supports_avx2())
+                static const bool has_avx2 = cpu_supports_avx2();
+                if (has_avx2)
                 {
                     quantize_activation_row_avx2(src + i, remaining, inv_scale, dst + i);
                     return;
@@ -587,14 +606,16 @@ namespace llaminar2
         inline void quantize_activation_row(const float *src, int length, float inv_scale, int8_t *dst)
         {
 #if defined(__AVX512F__)
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 quantize_activation_row_avx512(src, length, inv_scale, dst);
                 return;
             }
 #endif
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 quantize_activation_row_avx2(src, length, inv_scale, dst);
                 return;
@@ -2427,35 +2448,110 @@ namespace llaminar2
             int8_t *q8_qs,
             uint16_t *q8_scale)
         {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
             if (subblock_idx >= 8)
             {
                 throw std::out_of_range("decode_iq2xxs_to_q8_0_avx512: subblock_idx out of range");
             }
 
-            alignas(64) float tmp[Q8_0Block::BLOCK_SIZE];
-
             const float d = fp16_to_fp32(block.d);
 
-            uint32_t aux32[2];
-            const uint8_t *aux8 = reinterpret_cast<const uint8_t *>(aux32);
-            std::memcpy(aux32, &block.qs[4 * subblock_idx], 2 * sizeof(uint32_t));
+            // Load 8 bytes (2 uint32) from block.qs
+            const uint16_t *qs_ptr = block.qs + 4 * subblock_idx;
+            uint64_t raw_data = *(const uint64_t *)qs_ptr;
+            uint32_t aux0 = (uint32_t)raw_data;
+            uint32_t aux1 = (uint32_t)(raw_data >> 32);
 
-            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+            const float db = d * (0.5f + (aux1 >> 28)) * 0.25f;
 
-            // Scalar unpacking + SIMD quantization
-            for (size_t l = 0; l < 4; ++l)
+            // Grid indices: aux0 (4 bytes) -> 4 indices
+            // aux0 contains qs[1] << 16 | qs[0].
+            // We need to extract the 4 bytes of aux0 as indices.
+            __m128i vaux0 = _mm_cvtsi32_si128(aux0);
+            __m128i vindices_32 = _mm_cvtepu8_epi32(vaux0);
+
+            // Gather 4 64-bit values (32 bytes total)
+            __m256i vgrid_64 = _mm256_i32gather_epi64((const long long int *)iq2xxs_grid, vindices_32, 8);
+
+            // Find max absolute value for scaling
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid_64);
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid_64, 1);
+
+            uint8_t max_grid_0 = hmax_epu8_128(vgrid_lo);
+            uint8_t max_grid_1 = hmax_epu8_128(vgrid_hi);
+            uint8_t max_grid = std::max(max_grid_0, max_grid_1);
+
+            float max_val = db * max_grid;
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            if (max_val < MIN_SCALE_THRESHOLD)
             {
-                const uint64_t grid_value = iq2xxs_grid[aux8[l]];
-                const uint8_t *grid = reinterpret_cast<const uint8_t *>(&grid_value);
-                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
-
-                for (size_t j = 0; j < 8; ++j)
-                {
-                    tmp[l * 8 + j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
-                }
+                *q8_scale = 0;
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), _mm256_setzero_si256());
+                return;
             }
 
-            quantize_fp32_to_q8_0_avx512(tmp, Q8_0Block::BLOCK_SIZE, q8_qs, q8_scale);
+            float scale = max_val / 127.0f;
+            if (scale > 65504.0f)
+                scale = 65504.0f;
+            *q8_scale = fp32_to_fp16(scale);
+
+            float inv_scale = 1.0f / scale;
+            int32_t ratio = (int32_t)(db * inv_scale * 65536.0f + 0.5f);
+            __m512i vratio = _mm512_set1_epi32(ratio);
+
+            // Signs
+            uint8_t s0 = ksigns_iq2xs[aux1 & 127];
+            uint8_t s1 = ksigns_iq2xs[(aux1 >> 7) & 127];
+            uint8_t s2 = ksigns_iq2xs[(aux1 >> 14) & 127];
+            uint8_t s3 = ksigns_iq2xs[(aux1 >> 21) & 127];
+
+            // Broadcast to 64-bit (8 bytes)
+            uint64_t s0_64 = 0x0101010101010101ULL * s0;
+            uint64_t s1_64 = 0x0101010101010101ULL * s1;
+            uint64_t s2_64 = 0x0101010101010101ULL * s2;
+            uint64_t s3_64 = 0x0101010101010101ULL * s3;
+
+            __m256i vsigns = _mm256_setr_epi64x(s0_64, s1_64, s2_64, s3_64);
+            __m256i vmask = _mm256_set1_epi64x(0x8040201008040201ULL); // 1, 2, 4, 8, 16, 32, 64, 128
+
+            // Check if bit is set
+            __m256i vneg = _mm256_and_si256(vsigns, vmask);
+            vneg = _mm256_cmpeq_epi8(vneg, vmask); // 0xFF where negative
+
+            // Unpack grid to 32-bit integers (split into two halves)
+            __m128i vgrid_lo_128 = _mm256_castsi256_si128(vgrid_64);
+            __m128i vgrid_hi_128 = _mm256_extracti128_si256(vgrid_64, 1);
+
+            __m512i vints_lo = _mm512_cvtepu8_epi32(vgrid_lo_128);
+            __m512i vints_hi = _mm512_cvtepu8_epi32(vgrid_hi_128);
+
+            // Multiply by ratio
+            __m512i vres_lo = _mm512_mullo_epi32(vints_lo, vratio);
+            __m512i vres_hi = _mm512_mullo_epi32(vints_hi, vratio);
+
+            vres_lo = _mm512_srli_epi32(vres_lo, 16);
+            vres_hi = _mm512_srli_epi32(vres_hi, 16);
+
+            // Apply signs
+            uint32_t neg_mask = _mm256_movemask_epi8(vneg);
+            __mmask16 kneg_lo = (__mmask16)(neg_mask & 0xFFFF);
+            __mmask16 kneg_hi = (__mmask16)(neg_mask >> 16);
+
+            // Negate where kneg is set
+            vres_lo = _mm512_mask_sub_epi32(vres_lo, kneg_lo, _mm512_setzero_si512(), vres_lo);
+            vres_hi = _mm512_mask_sub_epi32(vres_hi, kneg_hi, _mm512_setzero_si512(), vres_hi);
+
+            // Pack to int8
+            __m128i vq8_lo = _mm512_cvtepi32_epi8(vres_lo);
+            __m128i vq8_hi = _mm512_cvtepi32_epi8(vres_hi);
+
+            __m256i vq8 = _mm256_inserti128_si256(_mm256_castsi128_si256(vq8_lo), vq8_hi, 1);
+            _mm256_storeu_si256((__m256i *)q8_qs, vq8);
+#else
+            // Fallback to scalar
+            decode_iq2xxs_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+#endif
         }
 #endif
 
@@ -2511,7 +2607,8 @@ namespace llaminar2
             uint16_t *q8_scale)
         {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 decode_iq2xxs_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -2519,7 +2616,8 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 decode_iq2xxs_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -2551,6 +2649,212 @@ namespace llaminar2
             uint16_t scale_fp16;
             decode_iq2xxs_to_q8_0(block, subblock_idx, dummy_qs, &scale_fp16);
             return fp16_to_fp32(scale_fp16);
+        }
+
+        inline void unpack_iq2_xxs_superblock_to_int8_avx512(
+            const IQ2_XXSBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+            const float d = fp16_to_fp32(block.d);
+
+            // Precompute scales and signs
+            float db_arr[8];
+            uint32_t aux1_arr[8];
+
+            for (int i = 0; i < 8; ++i)
+            {
+                const uint16_t *qs_ptr = block.qs + 4 * i;
+                uint64_t raw_data = *(const uint64_t *)qs_ptr;
+                uint32_t aux1 = (uint32_t)(raw_data >> 32);
+                aux1_arr[i] = aux1;
+                db_arr[i] = d * (0.5f + (aux1 >> 28)) * 0.25f;
+            }
+
+            for (int ib = 0; ib < 8; ib += 2)
+            {
+                // Load 16 bytes (2 subblocks)
+                const uint16_t *qs_ptr = block.qs + 4 * ib;
+                __m128i vraw = _mm_loadu_si128((const __m128i *)qs_ptr);
+
+                // Extract indices (bytes 0-3 and 8-11)
+                __m128i vshuffle = _mm_setr_epi8(
+                    0, 1, 2, 3, 8, 9, 10, 11,
+                    -1, -1, -1, -1, -1, -1, -1, -1);
+                __m128i vindices_8 = _mm_shuffle_epi8(vraw, vshuffle);
+                __m256i vindices = _mm256_cvtepu8_epi32(vindices_8);
+
+                // Gather
+                __m512i vgrid = _mm512_i32gather_epi64(vindices, iq2xxs_grid, 8);
+
+                __m256i vgrid_ib = _mm512_castsi512_si256(vgrid);
+                __m256i vgrid_ib1 = _mm512_extracti64x4_epi64(vgrid, 1);
+
+                // Process ib
+                {
+                    __m128i vg0 = _mm256_castsi256_si128(vgrid_ib);
+                    __m128i vg1 = _mm256_extracti128_si256(vgrid_ib, 1);
+
+                    __m512 vf0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vg0));
+                    __m512 vf1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vg1));
+
+                    __m512 vdb = _mm512_set1_ps(db_arr[ib]);
+                    vf0 = _mm512_mul_ps(vf0, vdb);
+                    vf1 = _mm512_mul_ps(vf1, vdb);
+
+                    uint32_t aux1 = aux1_arr[ib];
+                    uint8_t s0 = ksigns_iq2xs[aux1 & 127];
+                    uint8_t s1 = ksigns_iq2xs[(aux1 >> 7) & 127];
+                    uint8_t s2 = ksigns_iq2xs[(aux1 >> 14) & 127];
+                    uint8_t s3 = ksigns_iq2xs[(aux1 >> 21) & 127];
+
+                    __mmask16 k0 = s0 | (s1 << 8);
+                    __mmask16 k1 = s2 | (s3 << 8);
+
+                    vf0 = _mm512_mask_sub_ps(vf0, k0, _mm512_setzero_ps(), vf0);
+                    vf1 = _mm512_mask_sub_ps(vf1, k1, _mm512_setzero_ps(), vf1);
+
+                    // Quantize
+                    __m512 abs0 = _mm512_abs_ps(vf0);
+                    __m512 abs1 = _mm512_abs_ps(vf1);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib] = scale;
+                    if (mins)
+                        mins[ib] = 0.0f;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + ib * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512 vq0 = _mm512_mul_ps(vf0, vinv);
+                        __m512i vi0 = _mm512_cvtps_epi32(vq0);
+
+                        __m512 vq1 = _mm512_mul_ps(vf1, vinv);
+                        __m512i vi1 = _mm512_cvtps_epi32(vq1);
+
+                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
+                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
+
+                        _mm_storeu_si128((__m128i *)(output + ib * 32), vout0);
+                        _mm_storeu_si128((__m128i *)(output + ib * 32 + 16), vout1);
+                    }
+                }
+
+                // Process ib+1
+                {
+                    __m128i vg0 = _mm256_castsi256_si128(vgrid_ib1);
+                    __m128i vg1 = _mm256_extracti128_si256(vgrid_ib1, 1);
+
+                    __m512 vf0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vg0));
+                    __m512 vf1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vg1));
+
+                    __m512 vdb = _mm512_set1_ps(db_arr[ib + 1]);
+                    vf0 = _mm512_mul_ps(vf0, vdb);
+                    vf1 = _mm512_mul_ps(vf1, vdb);
+
+                    uint32_t aux1 = aux1_arr[ib + 1];
+                    uint8_t s0 = ksigns_iq2xs[aux1 & 127];
+                    uint8_t s1 = ksigns_iq2xs[(aux1 >> 7) & 127];
+                    uint8_t s2 = ksigns_iq2xs[(aux1 >> 14) & 127];
+                    uint8_t s3 = ksigns_iq2xs[(aux1 >> 21) & 127];
+
+                    __mmask16 k0 = s0 | (s1 << 8);
+                    __mmask16 k1 = s2 | (s3 << 8);
+
+                    vf0 = _mm512_mask_sub_ps(vf0, k0, _mm512_setzero_ps(), vf0);
+                    vf1 = _mm512_mask_sub_ps(vf1, k1, _mm512_setzero_ps(), vf1);
+
+                    // Quantize
+                    __m512 abs0 = _mm512_abs_ps(vf0);
+                    __m512 abs1 = _mm512_abs_ps(vf1);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib + 1] = scale;
+                    if (mins)
+                        mins[ib + 1] = 0.0f;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + (ib + 1) * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512 vq0 = _mm512_mul_ps(vf0, vinv);
+                        __m512i vi0 = _mm512_cvtps_epi32(vq0);
+
+                        __m512 vq1 = _mm512_mul_ps(vf1, vinv);
+                        __m512i vi1 = _mm512_cvtps_epi32(vq1);
+
+                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
+                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
+
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32), vout0);
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32 + 16), vout1);
+                    }
+                }
+            }
+#else
+            unpack_iq2_xxs_superblock_to_int8(block, output, scales, mins);
+#endif
+        }
+
+        /**
+         * @brief Unpack entire IQ2_XXS super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks.
+         *
+         * @param block Source IQ2_XXS super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins (always 0 for IQ2_XXS)
+         */
+        inline void unpack_iq2_xxs_superblock_to_int8(
+            const IQ2_XXSBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_iq2_xxs_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq2xxs_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
         }
 
         // ===================================================================
@@ -2670,50 +2974,124 @@ namespace llaminar2
         inline void decode_iq2xs_to_q8_0_avx512(const IQ2_XSBlock &block, size_t subblock_idx,
                                                 int8_t *q8_qs, uint16_t *q8_scale)
         {
-            // Decode to FP32 intermediate buffer
-            alignas(64) float fp32_buffer[32];
-
-            const float d = fp16_to_fp32(block.d);
-            const size_t ib32 = subblock_idx;
-
-            const float db0 = d * (0.5f + (block.scales[ib32] & 0xf)) * 0.25f;
-            const float db1 = d * (0.5f + (block.scales[ib32] >> 4)) * 0.25f;
-
-            // Process 4 groups of 8 elements
-            for (size_t l = 0; l < 4; ++l)
+            if (subblock_idx >= 8)
             {
-                const size_t qs_idx = 4 * ib32 + l;
-                const uint16_t qs_val = block.qs[qs_idx];
-
-                const uint16_t grid_idx = qs_val & 511;
-                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2xs_grid + grid_idx);
-                const uint8_t signs = ksigns_iq2xs[qs_val >> 9];
-                const float db = (l < 2) ? db0 : db1;
-
-                // Load grid values using AVX-512 (8 elements)
-                __m256 grid_vec = _mm256_set_ps(
-                    grid[7], grid[6], grid[5], grid[4],
-                    grid[3], grid[2], grid[1], grid[0]);
-                __m256 scale_vec = _mm256_set1_ps(db);
-                __m256 values = _mm256_mul_ps(grid_vec, scale_vec);
-
-                // Apply signs
-                __m256 sign_mask = _mm256_set_ps(
-                    (signs & kmask_iq2xs[7]) ? -1.0f : 1.0f,
-                    (signs & kmask_iq2xs[6]) ? -1.0f : 1.0f,
-                    (signs & kmask_iq2xs[5]) ? -1.0f : 1.0f,
-                    (signs & kmask_iq2xs[4]) ? -1.0f : 1.0f,
-                    (signs & kmask_iq2xs[3]) ? -1.0f : 1.0f,
-                    (signs & kmask_iq2xs[2]) ? -1.0f : 1.0f,
-                    (signs & kmask_iq2xs[1]) ? -1.0f : 1.0f,
-                    (signs & kmask_iq2xs[0]) ? -1.0f : 1.0f);
-                values = _mm256_mul_ps(values, sign_mask);
-
-                _mm256_store_ps(&fp32_buffer[l * 8], values);
+                throw std::out_of_range("decode_iq2xs_to_q8_0_avx512: subblock_idx out of range");
             }
 
-            // Quantize FP32 buffer to Q8_0 format using AVX-512
-            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+            const float d = fp16_to_fp32(block.d);
+
+            // Load 4 uint16_t values (64 bits)
+            const uint16_t *qs_ptr = block.qs + 4 * subblock_idx;
+            uint64_t raw_qs = *(const uint64_t *)qs_ptr;
+
+            // Expand to 32-bit integers for gather
+            __m128i vqs_128 = _mm_cvtsi64_si128(raw_qs);
+            __m128i vqs_32 = _mm_cvtepu16_epi32(vqs_128); // 4 x 32-bit integers
+
+            // Extract grid indices (low 9 bits)
+            __m128i vindices = _mm_and_si128(vqs_32, _mm_set1_epi32(511));
+
+            // Gather grid values (4 x 64-bit)
+            // iq2xs_grid is uint64_t*
+            __m256i vgrid_64 = _mm256_i32gather_epi64((const long long int *)iq2xs_grid, vindices, 8);
+
+            // Calculate scales
+            uint8_t scales = block.scales[subblock_idx];
+            float db0 = d * (0.5f + (scales & 0xf)) * 0.25f;
+            float db1 = d * (0.5f + (scales >> 4)) * 0.25f;
+
+            // Find max grid value
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid_64);
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid_64, 1);
+
+            uint8_t max_grid_0 = hmax_epu8_128(vgrid_lo);
+            uint8_t max_grid_1 = hmax_epu8_128(vgrid_hi);
+
+            float max_val = std::max(db0 * max_grid_0, db1 * max_grid_1);
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            if (max_val < MIN_SCALE_THRESHOLD)
+            {
+                *q8_scale = 0;
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), _mm256_setzero_si256());
+                return;
+            }
+
+            float scale = max_val / 127.0f;
+            if (scale > 65504.0f)
+                scale = 65504.0f;
+            *q8_scale = fp32_to_fp16(scale);
+            float inv_scale = 1.0f / scale;
+
+            // Calculate ratios
+            __m512 vscale_0 = _mm512_set1_ps(db0 * inv_scale);
+            __m512 vscale_1 = _mm512_set1_ps(db1 * inv_scale);
+
+            // Convert grid to FP32
+            // vgrid_lo (16 bytes) -> 16 floats (512 bits)
+            __m512 vgrid_lo_ps = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vgrid_lo));
+            __m512 vgrid_hi_ps = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vgrid_hi));
+
+            // Multiply
+            __m512 vres_lo = _mm512_mul_ps(vgrid_lo_ps, vscale_0);
+            __m512 vres_hi = _mm512_mul_ps(vgrid_hi_ps, vscale_1);
+
+            // Convert to Int32
+            __m512i vint_lo = _mm512_cvtps_epi32(vres_lo);
+            __m512i vint_hi = _mm512_cvtps_epi32(vres_hi);
+
+            // Signs
+            // Extract sign indices: qs >> 9
+            __m128i vsign_idx = _mm_srli_epi32(vqs_32, 9);
+
+            uint32_t sign_idx_0 = _mm_extract_epi32(vsign_idx, 0);
+            uint32_t sign_idx_1 = _mm_extract_epi32(vsign_idx, 1);
+            uint32_t sign_idx_2 = _mm_extract_epi32(vsign_idx, 2);
+            uint32_t sign_idx_3 = _mm_extract_epi32(vsign_idx, 3);
+
+            uint8_t s0 = ksigns_iq2xs[sign_idx_0];
+            uint8_t s1 = ksigns_iq2xs[sign_idx_1];
+            uint8_t s2 = ksigns_iq2xs[sign_idx_2];
+            uint8_t s3 = ksigns_iq2xs[sign_idx_3];
+
+            // Broadcast signs
+            uint64_t s0_64 = 0x0101010101010101ULL * s0;
+            uint64_t s1_64 = 0x0101010101010101ULL * s1;
+            uint64_t s2_64 = 0x0101010101010101ULL * s2;
+            uint64_t s3_64 = 0x0101010101010101ULL * s3;
+
+            __m256i vsigns = _mm256_setr_epi64x(s0_64, s1_64, s2_64, s3_64);
+            __m256i vmask = _mm256_set1_epi64x(0x8040201008040201ULL); // 1, 2, 4, 8, 16, 32, 64, 128
+
+            __m256i vneg = _mm256_and_si256(vsigns, vmask);
+            vneg = _mm256_cmpeq_epi8(vneg, vmask); // 0xFF where negative
+
+            // Split vneg to lo/hi and expand to 32-bit
+            __m128i vneg_lo_128 = _mm256_castsi256_si128(vneg);
+            __m128i vneg_hi_128 = _mm256_extracti128_si256(vneg, 1);
+
+            __m512i vneg_lo_512 = _mm512_cvtepi8_epi32(vneg_lo_128); // 0xFF -> -1, 0x00 -> 0
+            __m512i vneg_hi_512 = _mm512_cvtepi8_epi32(vneg_hi_128);
+
+            // Apply signs: (x ^ -1) - (-1) = -x
+            vint_lo = _mm512_sub_epi32(_mm512_xor_si512(vint_lo, vneg_lo_512), vneg_lo_512);
+            vint_hi = _mm512_sub_epi32(_mm512_xor_si512(vint_hi, vneg_hi_512), vneg_hi_512);
+
+            // Clamp to [-127, 127]
+            __m512i vmin = _mm512_set1_epi32(-127);
+            __m512i vmax = _mm512_set1_epi32(127);
+            vint_lo = _mm512_max_epi32(vint_lo, vmin);
+            vint_lo = _mm512_min_epi32(vint_lo, vmax);
+            vint_hi = _mm512_max_epi32(vint_hi, vmin);
+            vint_hi = _mm512_min_epi32(vint_hi, vmax);
+
+            // Pack to 8-bit
+            __m128i vq8_lo = _mm512_cvtepi32_epi8(vint_lo);
+            __m128i vq8_hi = _mm512_cvtepi32_epi8(vint_hi);
+
+            __m256i vq8 = _mm256_inserti128_si256(_mm256_castsi128_si256(vq8_lo), vq8_hi, 1);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), vq8);
         }
 #endif
 
@@ -2724,14 +3102,16 @@ namespace llaminar2
                                          int8_t *q8_qs, uint16_t *q8_scale)
         {
 #ifdef __AVX512F__
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 decode_iq2xs_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
                 return;
             }
 #endif
 #ifdef __AVX2__
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 decode_iq2xs_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -2762,6 +3142,206 @@ namespace llaminar2
             uint16_t scale_fp16;
             decode_iq2xs_to_q8_0(block, subblock_idx, dummy_qs, &scale_fp16);
             return fp16_to_fp32(scale_fp16);
+        }
+
+        inline void unpack_iq2_xs_superblock_to_int8_avx512(
+            const IQ2_XSBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+            const float d = fp16_to_fp32(block.d);
+
+            // Precompute all 16 sub-scales (2 per subblock)
+            float db_arr[16];
+            for (int i = 0; i < 8; ++i)
+            {
+                uint8_t s = block.scales[i];
+                db_arr[2 * i + 0] = d * (0.5f + (s & 0xf)) * 0.25f;
+                db_arr[2 * i + 1] = d * (0.5f + (s >> 4)) * 0.25f;
+            }
+
+            // Process 2 subblocks (64 elements) per iteration
+            for (int ib = 0; ib < 8; ib += 2)
+            {
+                // Load 8 uint16_t values (4 per subblock, 2 subblocks)
+                const uint16_t *qs_ptr = block.qs + 4 * ib;
+                __m128i vqs = _mm_loadu_si128((const __m128i *)qs_ptr);
+
+                // Expand to 256-bit (8x32-bit integers)
+                __m256i vqs32 = _mm256_cvtepu16_epi32(vqs);
+
+                // Extract grid indices (low 9 bits)
+                __m256i vgrid_idx = _mm256_and_si256(vqs32, _mm256_set1_epi32(511));
+
+                // Extract sign indices (bits 9-15, 7 bits)
+                __m256i vsign_idx = _mm256_srli_epi32(vqs32, 9);
+
+                // Gather 8x64-bit grid values (fills full 512-bit register)
+                __m512i vgrid = _mm512_i32gather_epi64(vgrid_idx, iq2xs_grid, 8);
+
+                // Store sign indices to array for lookup (faster than extract)
+                alignas(32) int32_t sign_indices[8];
+                _mm256_store_si256((__m256i *)sign_indices, vsign_idx);
+
+                // ===== Subblock ib: first 32 elements =====
+                // Chunk 0: elements 0-15 (first half of subblock ib)
+                __m128i vchunk0 = _mm512_castsi512_si128(vgrid);
+                __m512 vfp0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk0));
+                vfp0 = _mm512_mul_ps(vfp0, _mm512_set1_ps(db_arr[2 * ib]));
+
+                // Apply signs for chunk 0 (groups 0,1 of subblock ib)
+                uint8_t s0 = ksigns_iq2xs[sign_indices[0]];
+                uint8_t s1 = ksigns_iq2xs[sign_indices[1]];
+                __mmask16 k0 = s0 | (s1 << 8);
+                vfp0 = _mm512_mask_sub_ps(vfp0, k0, _mm512_setzero_ps(), vfp0);
+
+                // Chunk 1: elements 16-31 (second half of subblock ib)
+                __m128i vchunk1 = _mm512_extracti32x4_epi32(vgrid, 1);
+                __m512 vfp1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk1));
+                vfp1 = _mm512_mul_ps(vfp1, _mm512_set1_ps(db_arr[2 * ib + 1]));
+
+                // Apply signs for chunk 1 (groups 2,3 of subblock ib)
+                uint8_t s2 = ksigns_iq2xs[sign_indices[2]];
+                uint8_t s3 = ksigns_iq2xs[sign_indices[3]];
+                __mmask16 k1 = s2 | (s3 << 8);
+                vfp1 = _mm512_mask_sub_ps(vfp1, k1, _mm512_setzero_ps(), vfp1);
+
+                // Quantize subblock ib
+                {
+                    __m512 abs0 = _mm512_abs_ps(vfp0);
+                    __m512 abs1 = _mm512_abs_ps(vfp1);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib] = scale;
+                    if (mins)
+                        mins[ib] = 0.0f;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + ib * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512i vi0 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp0, vinv));
+                        __m512i vi1 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp1, vinv));
+
+                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
+                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
+
+                        _mm_storeu_si128((__m128i *)(output + ib * 32), vout0);
+                        _mm_storeu_si128((__m128i *)(output + ib * 32 + 16), vout1);
+                    }
+                }
+
+                // ===== Subblock ib+1: next 32 elements =====
+                // Chunk 2: elements 0-15 (first half of subblock ib+1)
+                __m128i vchunk2 = _mm512_extracti32x4_epi32(vgrid, 2);
+                __m512 vfp2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk2));
+                vfp2 = _mm512_mul_ps(vfp2, _mm512_set1_ps(db_arr[2 * (ib + 1)]));
+
+                // Apply signs for chunk 2 (groups 0,1 of subblock ib+1)
+                uint8_t s4 = ksigns_iq2xs[sign_indices[4]];
+                uint8_t s5 = ksigns_iq2xs[sign_indices[5]];
+                __mmask16 k2 = s4 | (s5 << 8);
+                vfp2 = _mm512_mask_sub_ps(vfp2, k2, _mm512_setzero_ps(), vfp2);
+
+                // Chunk 3: elements 16-31 (second half of subblock ib+1)
+                __m128i vchunk3 = _mm512_extracti32x4_epi32(vgrid, 3);
+                __m512 vfp3 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk3));
+                vfp3 = _mm512_mul_ps(vfp3, _mm512_set1_ps(db_arr[2 * (ib + 1) + 1]));
+
+                // Apply signs for chunk 3 (groups 2,3 of subblock ib+1)
+                uint8_t s6 = ksigns_iq2xs[sign_indices[6]];
+                uint8_t s7 = ksigns_iq2xs[sign_indices[7]];
+                __mmask16 k3 = s6 | (s7 << 8);
+                vfp3 = _mm512_mask_sub_ps(vfp3, k3, _mm512_setzero_ps(), vfp3);
+
+                // Quantize subblock ib+1
+                {
+                    __m512 abs2 = _mm512_abs_ps(vfp2);
+                    __m512 abs3 = _mm512_abs_ps(vfp3);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs2, abs3));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib + 1] = scale;
+                    if (mins)
+                        mins[ib + 1] = 0.0f;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + (ib + 1) * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512i vi2 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp2, vinv));
+                        __m512i vi3 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp3, vinv));
+
+                        __m128i vout2 = _mm512_cvtepi32_epi8(vi2);
+                        __m128i vout3 = _mm512_cvtepi32_epi8(vi3);
+
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32), vout2);
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32 + 16), vout3);
+                    }
+                }
+            }
+#else
+            unpack_iq2_xs_superblock_to_int8(block, output, scales, mins);
+#endif
+        }
+
+        /**
+         * @brief Unpack entire IQ2_XS super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks.
+         *
+         * @param block Source IQ2_XS super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins (always 0 for IQ2_XS)
+         */
+        inline void unpack_iq2_xs_superblock_to_int8(
+            const IQ2_XSBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_iq2_xs_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq2xs_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
         }
 
         // ============================================================================
@@ -2861,10 +3441,110 @@ namespace llaminar2
             int8_t *q8_qs,
             uint16_t *q8_scale)
         {
-            float fp32_buffer[32];
-            decode_iq3xxs_subblock_to_fp32(block, subblock_idx, fp32_buffer);
+            if (subblock_idx >= 8)
+            {
+                throw std::out_of_range("decode_iq3xxs_to_q8_0_avx512: subblock_idx out of range");
+            }
 
-            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+            const float d = fp16_to_fp32(block.d);
+
+            // Load qs (8 bytes) -> 8 indices
+            const uint8_t *qs_ptr = block.qs + 8 * subblock_idx;
+            __m128i vqs_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qs_ptr));
+            __m256i vindices = _mm256_cvtepu8_epi32(vqs_8);
+
+            // Gather grid values (8 x 32-bit)
+            // iq3xxs_grid is uint32_t*
+            __m256i vgrid = _mm256_i32gather_epi32((const int *)iq3xxs_grid, vindices, 4);
+
+            // Find max grid value (across 32 bytes)
+            __m128i vgrid_lo_128 = _mm256_castsi256_si128(vgrid);
+            __m128i vgrid_hi_128 = _mm256_extracti128_si256(vgrid, 1);
+            uint8_t max_grid_0 = hmax_epu8_128(vgrid_lo_128);
+            uint8_t max_grid_1 = hmax_epu8_128(vgrid_hi_128);
+            uint8_t max_grid = std::max(max_grid_0, max_grid_1);
+
+            // Calculate db
+            const uint8_t *scales_ptr = block.qs + 64 + 4 * subblock_idx;
+            uint32_t aux32;
+            std::memcpy(&aux32, scales_ptr, 4);
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+
+            float max_val = db * max_grid;
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            if (max_val < MIN_SCALE_THRESHOLD)
+            {
+                *q8_scale = 0;
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), _mm256_setzero_si256());
+                return;
+            }
+
+            float scale = max_val / 127.0f;
+            if (scale > 65504.0f)
+                scale = 65504.0f;
+            *q8_scale = fp32_to_fp16(scale);
+
+            // Calculate scale factor for grid values
+            // q8 = grid * 127 / max_grid
+            float grid_scale = 127.0f / max_grid;
+            __m512 vscale = _mm512_set1_ps(grid_scale);
+
+            // Convert grid bytes to FP32
+            __m512 vgrid_lo_ps = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vgrid_lo_128));
+            __m512 vgrid_hi_ps = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vgrid_hi_128));
+
+            // Multiply
+            __m512 vres_lo = _mm512_mul_ps(vgrid_lo_ps, vscale);
+            __m512 vres_hi = _mm512_mul_ps(vgrid_hi_ps, vscale);
+
+            // Convert to Int32
+            __m512i vint_lo = _mm512_cvtps_epi32(vres_lo);
+            __m512i vint_hi = _mm512_cvtps_epi32(vres_hi);
+
+            // Handle signs
+            // aux32 has 4 sign indices (7 bits each).
+            uint8_t s0 = ksigns_iq2xs[aux32 & 127];
+            uint8_t s1 = ksigns_iq2xs[(aux32 >> 7) & 127];
+            uint8_t s2 = ksigns_iq2xs[(aux32 >> 14) & 127];
+            uint8_t s3 = ksigns_iq2xs[(aux32 >> 21) & 127];
+
+            uint64_t s0_64 = 0x0101010101010101ULL * s0;
+            uint64_t s1_64 = 0x0101010101010101ULL * s1;
+            uint64_t s2_64 = 0x0101010101010101ULL * s2;
+            uint64_t s3_64 = 0x0101010101010101ULL * s3;
+
+            __m256i vsigns = _mm256_setr_epi64x(s0_64, s1_64, s2_64, s3_64);
+            __m256i vmask = _mm256_set1_epi64x(0x8040201008040201ULL); // 1, 2, 4, 8, 16, 32, 64, 128
+
+            __m256i vneg = _mm256_and_si256(vsigns, vmask);
+            vneg = _mm256_cmpeq_epi8(vneg, vmask); // 0xFF where negative
+
+            // Split vneg to lo/hi and expand to 32-bit
+            __m128i vneg_lo_128 = _mm256_castsi256_si128(vneg);
+            __m128i vneg_hi_128 = _mm256_extracti128_si256(vneg, 1);
+
+            __m512i vneg_lo_512 = _mm512_cvtepi8_epi32(vneg_lo_128); // 0xFF -> -1, 0x00 -> 0
+            __m512i vneg_hi_512 = _mm512_cvtepi8_epi32(vneg_hi_128);
+
+            // Apply signs: (x ^ -1) - (-1) = -x
+            vint_lo = _mm512_sub_epi32(_mm512_xor_si512(vint_lo, vneg_lo_512), vneg_lo_512);
+            vint_hi = _mm512_sub_epi32(_mm512_xor_si512(vint_hi, vneg_hi_512), vneg_hi_512);
+
+            // Clamp to [-127, 127]
+            __m512i vmin = _mm512_set1_epi32(-127);
+            __m512i vmax = _mm512_set1_epi32(127);
+            vint_lo = _mm512_max_epi32(vint_lo, vmin);
+            vint_lo = _mm512_min_epi32(vint_lo, vmax);
+            vint_hi = _mm512_max_epi32(vint_hi, vmin);
+            vint_hi = _mm512_min_epi32(vint_hi, vmax);
+
+            // Pack to 8-bit
+            __m128i vq8_lo = _mm512_cvtepi32_epi8(vint_lo);
+            __m128i vq8_hi = _mm512_cvtepi32_epi8(vint_hi);
+
+            __m256i vq8 = _mm256_inserti128_si256(_mm256_castsi128_si256(vq8_lo), vq8_hi, 1);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), vq8);
         }
 #endif
 
@@ -2878,7 +3558,8 @@ namespace llaminar2
             uint16_t *q8_scale)
         {
 #if defined(__AVX512F__)
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 decode_iq3xxs_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -2886,7 +3567,8 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 decode_iq3xxs_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -2918,6 +3600,212 @@ namespace llaminar2
             uint16_t scale_fp16;
             decode_iq3xxs_to_q8_0(block, subblock_idx, dummy_qs, &scale_fp16);
             return fp16_to_fp32(scale_fp16);
+        }
+
+        /**
+         * @brief AVX-512 optimized IQ3_XXS superblock unpack (256 elements)
+         *
+         * Processes 2 subblocks (64 elements) per iteration for better throughput.
+         */
+        inline void unpack_iq3_xxs_superblock_to_int8_avx512(
+            const IQ3_XXSBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            const float d = fp16_to_fp32(block.d);
+
+            // Process 2 subblocks (64 elements) per iteration
+            for (int ib = 0; ib < 8; ib += 2)
+            {
+                // ===== Load data for 2 subblocks =====
+                // Load 16 bytes of qs (8 per subblock)
+                const uint8_t *qs_ptr = block.qs + 8 * ib;
+                __m128i vqs_16 = _mm_loadu_si128((const __m128i *)qs_ptr);
+
+                // Expand to 16x32-bit indices
+                __m512i vindices = _mm512_cvtepu8_epi32(vqs_16);
+
+                // Gather 16 grid values (uint32_t each = 4 bytes per element)
+                __m512i vgrid = _mm512_i32gather_epi32(vindices, (const int *)iq3xxs_grid, 4);
+
+                // Load aux32 values for both subblocks (contains scales + signs)
+                const uint8_t *scales_ptr = block.qs + 64 + 4 * ib;
+                uint32_t aux32_0, aux32_1;
+                std::memcpy(&aux32_0, scales_ptr, 4);
+                std::memcpy(&aux32_1, scales_ptr + 4, 4);
+
+                // Calculate db values
+                const float db0 = d * (0.5f + (aux32_0 >> 28)) * 0.5f;
+                const float db1 = d * (0.5f + (aux32_1 >> 28)) * 0.5f;
+
+                // ===== Process subblock ib (first 32 elements) =====
+                __m128i vgrid_0 = _mm512_castsi512_si128(vgrid);
+                __m128i vgrid_1 = _mm512_extracti32x4_epi32(vgrid, 1);
+
+                // Convert to FP32
+                __m512 vfp0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vgrid_0));
+                __m512 vfp1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vgrid_1));
+
+                // Apply scale
+                vfp0 = _mm512_mul_ps(vfp0, _mm512_set1_ps(db0));
+                vfp1 = _mm512_mul_ps(vfp1, _mm512_set1_ps(db0));
+
+                // Apply signs from aux32_0
+                uint8_t s0 = ksigns_iq2xs[aux32_0 & 127];
+                uint8_t s1 = ksigns_iq2xs[(aux32_0 >> 7) & 127];
+                uint8_t s2 = ksigns_iq2xs[(aux32_0 >> 14) & 127];
+                uint8_t s3 = ksigns_iq2xs[(aux32_0 >> 21) & 127];
+
+                __mmask16 k0 = s0 | (s1 << 8);
+                __mmask16 k1 = s2 | (s3 << 8);
+                vfp0 = _mm512_mask_sub_ps(vfp0, k0, _mm512_setzero_ps(), vfp0);
+                vfp1 = _mm512_mask_sub_ps(vfp1, k1, _mm512_setzero_ps(), vfp1);
+
+                // Quantize subblock ib
+                {
+                    __m512 abs0 = _mm512_abs_ps(vfp0);
+                    __m512 abs1 = _mm512_abs_ps(vfp1);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib] = scale;
+                    if (mins)
+                        mins[ib] = 0.0f;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + ib * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512i vi0 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp0, vinv));
+                        __m512i vi1 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp1, vinv));
+
+                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
+                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
+
+                        _mm_storeu_si128((__m128i *)(output + ib * 32), vout0);
+                        _mm_storeu_si128((__m128i *)(output + ib * 32 + 16), vout1);
+                    }
+                }
+
+                // ===== Process subblock ib+1 (next 32 elements) =====
+                __m128i vgrid_2 = _mm512_extracti32x4_epi32(vgrid, 2);
+                __m128i vgrid_3 = _mm512_extracti32x4_epi32(vgrid, 3);
+
+                // Convert to FP32
+                __m512 vfp2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vgrid_2));
+                __m512 vfp3 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vgrid_3));
+
+                // Apply scale
+                vfp2 = _mm512_mul_ps(vfp2, _mm512_set1_ps(db1));
+                vfp3 = _mm512_mul_ps(vfp3, _mm512_set1_ps(db1));
+
+                // Apply signs from aux32_1
+                uint8_t s4 = ksigns_iq2xs[aux32_1 & 127];
+                uint8_t s5 = ksigns_iq2xs[(aux32_1 >> 7) & 127];
+                uint8_t s6 = ksigns_iq2xs[(aux32_1 >> 14) & 127];
+                uint8_t s7 = ksigns_iq2xs[(aux32_1 >> 21) & 127];
+
+                __mmask16 k2 = s4 | (s5 << 8);
+                __mmask16 k3 = s6 | (s7 << 8);
+                vfp2 = _mm512_mask_sub_ps(vfp2, k2, _mm512_setzero_ps(), vfp2);
+                vfp3 = _mm512_mask_sub_ps(vfp3, k3, _mm512_setzero_ps(), vfp3);
+
+                // Quantize subblock ib+1
+                {
+                    __m512 abs2 = _mm512_abs_ps(vfp2);
+                    __m512 abs3 = _mm512_abs_ps(vfp3);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs2, abs3));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib + 1] = scale;
+                    if (mins)
+                        mins[ib + 1] = 0.0f;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + (ib + 1) * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512i vi2 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp2, vinv));
+                        __m512i vi3 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp3, vinv));
+
+                        __m128i vout2 = _mm512_cvtepi32_epi8(vi2);
+                        __m128i vout3 = _mm512_cvtepi32_epi8(vi3);
+
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32), vout2);
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32 + 16), vout3);
+                    }
+                }
+            }
+#else
+            // Fallback to scalar
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq3xxs_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
+#endif
+        }
+
+        /**
+         * @brief Unpack entire IQ3_XXS super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks.
+         *
+         * @param block Source IQ3_XXS super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins (always 0 for IQ3_XXS)
+         */
+        inline void unpack_iq3_xxs_superblock_to_int8(
+            const IQ3_XXSBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_iq3_xxs_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq3xxs_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
         }
 
         // ====================================================================
@@ -2981,6 +3869,82 @@ namespace llaminar2
 
 #ifdef __AVX2__
         /**
+         * @brief AVX2 decode IQ2_S sub-block to FP32
+         */
+        inline void decode_iq2s_subblock_to_fp32_avx2(
+            const IQ2_SBlock &block,
+            size_t subblock_idx,
+            float *output)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 4;
+            const uint8_t *signs = block.qs + 32 + subblock_idx * 4;
+            const uint8_t qh_byte = block.qh[subblock_idx];
+            const uint8_t scale_byte = block.scales[subblock_idx];
+
+            float db[2];
+            db[0] = d * (0.5f + (scale_byte & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (scale_byte >> 4)) * 0.25f;
+
+            __m256 vdb0 = _mm256_set1_ps(db[0]);
+            __m256 vdb1 = _mm256_set1_ps(db[1]);
+
+            // Compute grid indices
+            int indices[4];
+            for (int l = 0; l < 4; ++l)
+            {
+                indices[l] = qs[l] | ((qh_byte << (8 - 2 * l)) & 0x300);
+            }
+            __m128i vindices = _mm_loadu_si128((const __m128i *)indices);
+
+            // Gather 4 grid values (64-bit each)
+            __m256i vgrid_64 = _mm256_i32gather_epi64((const long long int *)iq2s_grid, vindices, 8);
+
+            // Helper to create sign mask from byte
+            auto get_sign_mask = [](uint8_t s) -> __m256
+            {
+                __m256i vs = _mm256_set1_epi32(s);
+                __m256i vmask = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+                __m256i vcmp = _mm256_cmpeq_epi32(_mm256_and_si256(vs, vmask), vmask);
+                return _mm256_castsi256_ps(_mm256_and_si256(vcmp, _mm256_set1_epi32(0x80000000)));
+            };
+
+            // Process first 16 elements (l=0,1)
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid_64);
+            __m256i vints0 = _mm256_cvtepi8_epi32(vgrid_lo);
+            __m256i vints1 = _mm256_cvtepi8_epi32(_mm_srli_si128(vgrid_lo, 8));
+
+            __m256 vfloats0 = _mm256_cvtepi32_ps(vints0);
+            __m256 vfloats1 = _mm256_cvtepi32_ps(vints1);
+
+            vfloats0 = _mm256_xor_ps(vfloats0, get_sign_mask(signs[0]));
+            vfloats1 = _mm256_xor_ps(vfloats1, get_sign_mask(signs[1]));
+
+            vfloats0 = _mm256_mul_ps(vfloats0, vdb0);
+            vfloats1 = _mm256_mul_ps(vfloats1, vdb0);
+
+            _mm256_store_ps(output, vfloats0);
+            _mm256_store_ps(output + 8, vfloats1);
+
+            // Process next 16 elements (l=2,3)
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid_64, 1);
+            __m256i vints2 = _mm256_cvtepi8_epi32(vgrid_hi);
+            __m256i vints3 = _mm256_cvtepi8_epi32(_mm_srli_si128(vgrid_hi, 8));
+
+            __m256 vfloats2 = _mm256_cvtepi32_ps(vints2);
+            __m256 vfloats3 = _mm256_cvtepi32_ps(vints3);
+
+            vfloats2 = _mm256_xor_ps(vfloats2, get_sign_mask(signs[2]));
+            vfloats3 = _mm256_xor_ps(vfloats3, get_sign_mask(signs[3]));
+
+            vfloats2 = _mm256_mul_ps(vfloats2, vdb1);
+            vfloats3 = _mm256_mul_ps(vfloats3, vdb1);
+
+            _mm256_store_ps(output + 16, vfloats2);
+            _mm256_store_ps(output + 24, vfloats3);
+        }
+
+        /**
          * @brief AVX2 decode IQ2_S to Q8_0
          */
         inline void decode_iq2s_to_q8_0_avx2(
@@ -2989,45 +3953,20 @@ namespace llaminar2
             int8_t *q8_qs,
             uint16_t *q8_scale)
         {
-            const float d = fp16_to_fp32(block.d);
-            const uint8_t *qs = block.qs + subblock_idx * 4;
-            const uint8_t *signs = block.qs + 32 + subblock_idx * 4;
-            const uint8_t qh_byte = block.qh[subblock_idx];
-            const uint8_t scale_byte = block.scales[subblock_idx];
-
-            float db[2];
-            db[0] = d * (0.5f + (scale_byte & 0xf)) * 0.25f;
-            db[1] = d * (0.5f + (scale_byte >> 4)) * 0.25f;
-
             alignas(32) float fp32_buffer[32];
-            float *output = fp32_buffer;
-
-            for (size_t l = 0; l < 4; ++l)
-            {
-                const float dl = db[l / 2];
-                const uint16_t grid_idx = qs[l] | ((qh_byte << (8 - 2 * l)) & 0x300);
-                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2s_grid + grid_idx);
-
-                for (size_t j = 0; j < 8; ++j)
-                {
-                    output[j] = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.0f : 1.0f);
-                }
-                output += 8;
-            }
-
+            decode_iq2s_subblock_to_fp32_avx2(block, subblock_idx, fp32_buffer);
             quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, q8_qs, q8_scale);
         }
 #endif
 
 #ifdef __AVX512F__
         /**
-         * @brief AVX-512 decode IQ2_S to Q8_0
+         * @brief AVX-512 decode IQ2_S sub-block to FP32
          */
-        inline void decode_iq2s_to_q8_0_avx512(
+        inline void decode_iq2s_subblock_to_fp32_avx512(
             const IQ2_SBlock &block,
             size_t subblock_idx,
-            int8_t *q8_qs,
-            uint16_t *q8_scale)
+            float *output)
         {
             const float d = fp16_to_fp32(block.d);
             const uint8_t *qs = block.qs + subblock_idx * 4;
@@ -3039,23 +3978,163 @@ namespace llaminar2
             db[0] = d * (0.5f + (scale_byte & 0xf)) * 0.25f;
             db[1] = d * (0.5f + (scale_byte >> 4)) * 0.25f;
 
-            alignas(64) float fp32_buffer[32];
-            float *output = fp32_buffer;
+            __m512 vdb0 = _mm512_set1_ps(db[0]);
+            __m512 vdb1 = _mm512_set1_ps(db[1]);
 
-            for (size_t l = 0; l < 4; ++l)
+            // Compute grid indices
+            int indices[4];
+            for (int l = 0; l < 4; ++l)
             {
-                const float dl = db[l / 2];
-                const uint16_t grid_idx = qs[l] | ((qh_byte << (8 - 2 * l)) & 0x300);
-                const uint8_t *grid = reinterpret_cast<const uint8_t *>(iq2s_grid + grid_idx);
+                indices[l] = qs[l] | ((qh_byte << (8 - 2 * l)) & 0x300);
+            }
+            __m128i vindices = _mm_loadu_si128((const __m128i *)indices);
 
-                for (size_t j = 0; j < 8; ++j)
-                {
-                    output[j] = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.0f : 1.0f);
-                }
-                output += 8;
+            // Gather 4 grid values (64-bit each) -> 256 bits
+            __m256i vgrid_64 = _mm256_i32gather_epi64((const long long int *)iq2s_grid, vindices, 8);
+
+            // Helper for signs
+            auto get_sign_mask_512 = [](uint8_t s0, uint8_t s1) -> __m512
+            {
+                __m512i vs0 = _mm512_set1_epi32(s0);
+                __m512i vs1 = _mm512_set1_epi32(s1);
+                // Blend: low 8 from vs0, high 8 from vs1. Mask 0xFF00 (high 8 bits set).
+                __m512i vs = _mm512_mask_blend_epi32(0xFF00, vs0, vs1);
+
+                __m512i vmask = _mm512_setr_epi32(
+                    1, 2, 4, 8, 16, 32, 64, 128,
+                    1, 2, 4, 8, 16, 32, 64, 128);
+
+                __mmask16 k = _mm512_cmpeq_epi32_mask(_mm512_and_si512(vs, vmask), vmask);
+                return _mm512_mask_blend_ps(k, _mm512_setzero_ps(), _mm512_set1_ps(-0.0f));
+            };
+
+            // Process first 16 elements (l=0,1)
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid_64); // g1, g0
+            __m512i vints0 = _mm512_cvtepi8_epi32(vgrid_lo);
+            __m512 vfloats0 = _mm512_cvtepi32_ps(vints0);
+
+            __m512 vsign0 = get_sign_mask_512(signs[0], signs[1]);
+            vfloats0 = _mm512_xor_ps(vfloats0, vsign0);
+            vfloats0 = _mm512_mul_ps(vfloats0, vdb0);
+            _mm512_store_ps(output, vfloats0);
+
+            // Process next 16 elements (l=2,3)
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid_64, 1); // g3, g2
+            __m512i vints1 = _mm512_cvtepi8_epi32(vgrid_hi);
+            __m512 vfloats1 = _mm512_cvtepi32_ps(vints1);
+
+            __m512 vsign1 = get_sign_mask_512(signs[2], signs[3]);
+            vfloats1 = _mm512_xor_ps(vfloats1, vsign1);
+            vfloats1 = _mm512_mul_ps(vfloats1, vdb1);
+            _mm512_store_ps(output + 16, vfloats1);
+        }
+
+        /**
+         * @brief AVX-512 decode IQ2_S to Q8_0 (Fused Transcode)
+         *
+         * Optimized implementation that avoids intermediate FP32 buffer storage.
+         * Directly computes scale from integer grid values and transcodes.
+         */
+        inline void decode_iq2s_to_q8_0_avx512(
+            const IQ2_SBlock &block,
+            size_t subblock_idx,
+            int8_t *q8_qs,
+            uint16_t *q8_scale)
+        {
+#if defined(__AVX512F__)
+            const float d = fp16_to_fp32(block.d);
+            const uint8_t *qs = block.qs + subblock_idx * 4;
+            const uint8_t *signs = block.qs + 32 + subblock_idx * 4;
+            const uint8_t qh_byte = block.qh[subblock_idx];
+            const uint8_t scale_byte = block.scales[subblock_idx];
+
+            float db[2];
+            db[0] = d * (0.5f + (scale_byte & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (scale_byte >> 4)) * 0.25f;
+
+            // Vectorized index computation
+            // Load 4 bytes of qs -> 4 ints
+            uint32_t qs_u32 = *(const uint32_t *)qs;
+            __m128i vqs = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(qs_u32));
+
+            // Broadcast qh_byte and shift
+            __m128i vqh = _mm_set1_epi32(qh_byte);
+            __m128i vshifts = _mm_setr_epi32(8, 6, 4, 2);
+            __m128i vqh_shifted = _mm_sllv_epi32(vqh, vshifts);
+            __m128i vqh_masked = _mm_and_si128(vqh_shifted, _mm_set1_epi32(0x300));
+
+            __m128i vindices = _mm_or_si128(vqs, vqh_masked);
+
+            // Gather 4 grid values (64-bit each) -> 256 bits
+            // Each 64-bit value contains 8 bytes (grid values)
+            __m256i vgrid_64 = _mm256_i32gather_epi64((const long long int *)iq2s_grid, vindices, 8);
+
+            // Find max grid value for first 16 and next 16
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid_64);
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid_64, 1);
+
+            uint8_t max_grid_0 = hmax_epu8_128(vgrid_lo);
+            uint8_t max_grid_1 = hmax_epu8_128(vgrid_hi);
+
+            float max_val_0 = db[0] * max_grid_0;
+            float max_val_1 = db[1] * max_grid_1;
+            float max_abs = std::max(max_val_0, max_val_1);
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                *q8_scale = 0;
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), _mm256_setzero_si256());
+                return;
             }
 
+            float scale = max_abs / 127.0f;
+            if (scale > 65504.0f)
+                scale = 65504.0f;
+            *q8_scale = fp32_to_fp16(scale);
+
+            float inv_scale = 1.0f / scale;
+            // Compute integer ratios (Q16 fixed point)
+            // ratio = db * inv_scale = db * 127 / max_abs
+            // ratio_int = ratio * 65536
+            int32_t ratio0 = (int32_t)(db[0] * inv_scale * 65536.0f + 0.5f);
+            int32_t ratio1 = (int32_t)(db[1] * inv_scale * 65536.0f + 0.5f);
+
+            __m512i vratio0 = _mm512_set1_epi32(ratio0);
+            __m512i vratio1 = _mm512_set1_epi32(ratio1);
+
+            // Process first 16 elements
+            // Unpack 8-bit grid to 32-bit int
+            __m512i vints0 = _mm512_cvtepu8_epi32(vgrid_lo);
+            // Multiply by ratio (Q16)
+            __m512i vres0 = _mm512_mullo_epi32(vints0, vratio0);
+            // Shift right by 16 to get integer result
+            vres0 = _mm512_srli_epi32(vres0, 16);
+
+            // Apply signs
+            __mmask16 k0 = signs[0] | (signs[1] << 8);
+            // If sign bit set, negate: 0 - val
+            vres0 = _mm512_mask_sub_epi32(vres0, k0, _mm512_setzero_si512(), vres0);
+
+            // Pack to int8
+            __m128i vq8_0 = _mm512_cvtepi32_epi8(vres0);
+            _mm_storeu_si128((__m128i *)q8_qs, vq8_0);
+
+            // Process next 16 elements
+            __m512i vints1 = _mm512_cvtepu8_epi32(vgrid_hi);
+            __m512i vres1 = _mm512_mullo_epi32(vints1, vratio1);
+            vres1 = _mm512_srli_epi32(vres1, 16);
+
+            __mmask16 k1 = signs[2] | (signs[3] << 8);
+            vres1 = _mm512_mask_sub_epi32(vres1, k1, _mm512_setzero_si512(), vres1);
+
+            __m128i vq8_1 = _mm512_cvtepi32_epi8(vres1);
+            _mm_storeu_si128((__m128i *)(q8_qs + 16), vq8_1);
+#else
+            alignas(64) float fp32_buffer[32];
+            decode_iq2s_subblock_to_fp32_avx512(block, subblock_idx, fp32_buffer);
             quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+#endif
         }
 #endif
 
@@ -3069,7 +4148,8 @@ namespace llaminar2
             uint16_t *q8_scale)
         {
 #if defined(__AVX512F__)
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 decode_iq2s_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -3077,7 +4157,8 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 decode_iq2s_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -3104,6 +4185,204 @@ namespace llaminar2
             uint16_t scale_f16;
             decode_iq2s_to_q8_0(block, subblock_idx, dummy_qs, &scale_f16);
             return fp16_to_fp32(scale_f16);
+        }
+
+        inline void unpack_iq2_s_superblock_to_int8_avx512(
+            const IQ2_SBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+            const float d = fp16_to_fp32(block.d);
+
+            // Precompute scales
+            float db_arr[16];
+            for (int i = 0; i < 8; ++i)
+            {
+                uint8_t s = block.scales[i];
+                db_arr[2 * i + 0] = d * (0.5f + (s & 0xf)) * 0.25f;
+                db_arr[2 * i + 1] = d * (0.5f + (s >> 4)) * 0.25f;
+            }
+
+            const uint8_t *qs_ptr = block.qs;
+            const uint8_t *signs_ptr = block.qs + 32;
+            const uint8_t *qh_ptr = block.qh;
+
+            // Process 2 subblocks (64 elements) per iteration
+            for (int ib = 0; ib < 8; ib += 2)
+            {
+                // 1. Construct indices
+                // Load 8 bytes of qs (2 subblocks * 4 bytes/subblock)
+                __m128i vqs_128 = _mm_loadl_epi64((const __m128i *)(qs_ptr + ib * 4));
+                __m256i vqs = _mm256_cvtepu8_epi32(vqs_128);
+
+                // Load qh bytes
+                uint8_t qh0 = qh_ptr[ib];
+                uint8_t qh1 = qh_ptr[ib + 1];
+                // Construct qh vector: [qh1, qh1, qh1, qh1, qh0, qh0, qh0, qh0]
+                __m256i vqh = _mm256_set_epi32(qh1, qh1, qh1, qh1, qh0, qh0, qh0, qh0);
+
+                // Shifts: 8, 6, 4, 2 repeated
+                __m256i vshifts = _mm256_setr_epi32(8, 6, 4, 2, 8, 6, 4, 2);
+                __m256i vqh_shifted = _mm256_sllv_epi32(vqh, vshifts);
+                __m256i vqh_masked = _mm256_and_si256(vqh_shifted, _mm256_set1_epi32(0x300));
+
+                __m256i vindices = _mm256_or_si256(vqs, vqh_masked);
+
+                // 2. Gather grid values
+                __m512i vgrid = _mm512_i32gather_epi64(vindices, iq2s_grid, 8);
+
+                // 3. Process 4 chunks of 16 elements
+                // Chunk 0: Subblock ib, first 16
+                __m128i vchunk0 = _mm512_castsi512_si128(vgrid);
+                __m512 vfp0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk0));
+                vfp0 = _mm512_mul_ps(vfp0, _mm512_set1_ps(db_arr[2 * ib]));
+
+                uint16_t s0 = *(const uint16_t *)(signs_ptr + ib * 4);
+                vfp0 = _mm512_mask_sub_ps(vfp0, s0, _mm512_setzero_ps(), vfp0);
+
+                // Chunk 1: Subblock ib, next 16
+                __m128i vchunk1 = _mm512_extracti32x4_epi32(vgrid, 1);
+                __m512 vfp1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk1));
+                vfp1 = _mm512_mul_ps(vfp1, _mm512_set1_ps(db_arr[2 * ib + 1]));
+
+                uint16_t s1 = *(const uint16_t *)(signs_ptr + ib * 4 + 2);
+                vfp1 = _mm512_mask_sub_ps(vfp1, s1, _mm512_setzero_ps(), vfp1);
+
+                // Quantize Block 1 (ib)
+                {
+                    __m512 abs0 = _mm512_abs_ps(vfp0);
+                    __m512 abs1 = _mm512_abs_ps(vfp1);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib] = scale;
+                    if (mins)
+                        mins[ib] = 0.0f;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + ib * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512 vq0 = _mm512_mul_ps(vfp0, vinv);
+                        __m512i vi0 = _mm512_cvtps_epi32(vq0);
+
+                        __m512 vq1 = _mm512_mul_ps(vfp1, vinv);
+                        __m512i vi1 = _mm512_cvtps_epi32(vq1);
+
+                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
+                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
+
+                        _mm_storeu_si128((__m128i *)(output + ib * 32), vout0);
+                        _mm_storeu_si128((__m128i *)(output + ib * 32 + 16), vout1);
+                    }
+                }
+
+                // Chunk 2: Subblock ib+1, first 16
+                __m128i vchunk2 = _mm512_extracti32x4_epi32(vgrid, 2);
+                __m512 vfp2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk2));
+                vfp2 = _mm512_mul_ps(vfp2, _mm512_set1_ps(db_arr[2 * (ib + 1)]));
+
+                uint16_t s2 = *(const uint16_t *)(signs_ptr + (ib + 1) * 4);
+                vfp2 = _mm512_mask_sub_ps(vfp2, s2, _mm512_setzero_ps(), vfp2);
+
+                // Chunk 3: Subblock ib+1, next 16
+                __m128i vchunk3 = _mm512_extracti32x4_epi32(vgrid, 3);
+                __m512 vfp3 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk3));
+                vfp3 = _mm512_mul_ps(vfp3, _mm512_set1_ps(db_arr[2 * (ib + 1) + 1]));
+
+                uint16_t s3 = *(const uint16_t *)(signs_ptr + (ib + 1) * 4 + 2);
+                vfp3 = _mm512_mask_sub_ps(vfp3, s3, _mm512_setzero_ps(), vfp3);
+
+                // Quantize Block 2 (ib+1)
+                {
+                    __m512 abs2 = _mm512_abs_ps(vfp2);
+                    __m512 abs3 = _mm512_abs_ps(vfp3);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs2, abs3));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib + 1] = scale;
+                    if (mins)
+                        mins[ib + 1] = 0.0f;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + (ib + 1) * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512 vq2 = _mm512_mul_ps(vfp2, vinv);
+                        __m512i vi2 = _mm512_cvtps_epi32(vq2);
+
+                        __m512 vq3 = _mm512_mul_ps(vfp3, vinv);
+                        __m512i vi3 = _mm512_cvtps_epi32(vq3);
+
+                        __m128i vout2 = _mm512_cvtepi32_epi8(vi2);
+                        __m128i vout3 = _mm512_cvtepi32_epi8(vi3);
+
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32), vout2);
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32 + 16), vout3);
+                    }
+                }
+            }
+#else
+            unpack_iq2_s_superblock_to_int8(block, output, scales, mins);
+#endif
+        }
+
+        /**
+         * @brief Unpack entire IQ2_S super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks.
+         *
+         * @param block Source IQ2_S super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins (always 0 for IQ2_S)
+         */
+        inline void unpack_iq2_s_superblock_to_int8(
+            const IQ2_SBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_iq2_s_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq2s_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
         }
 
         // ========================================================================
@@ -3135,7 +4414,7 @@ namespace llaminar2
          * - Grid lookup: iq3s_grid[qs | (qh << shift & 256)]
          * - Signs from signs[] using kmask_iq2xs[]
          */
-        inline void decode_iq3s_subblock_to_fp32(
+        inline void decode_iq3s_subblock_to_fp32_scalar(
             const IQ3_SBlock &block,
             size_t subblock_idx, // 0-7
             float *output)
@@ -3195,13 +4474,87 @@ namespace llaminar2
         {
             // Decode to FP32 buffer (32 elements)
             alignas(32) float fp32_buffer[32];
-            decode_iq3s_subblock_to_fp32(block, subblock_idx, fp32_buffer);
+            decode_iq3s_subblock_to_fp32_scalar(block, subblock_idx, fp32_buffer);
 
             // Quantize FP32 → Q8_0
             quantize_fp32_to_q8_0_scalar(fp32_buffer, 32, q8_qs, q8_scale);
         }
 
 #if defined(__AVX2__)
+        /**
+         * @brief AVX2 decode IQ3_S sub-block to FP32
+         */
+        inline void decode_iq3s_subblock_to_fp32_avx2(
+            const IQ3_SBlock &block,
+            size_t subblock_idx,
+            float *output)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const size_t pair_idx = subblock_idx / 2;
+            const uint8_t scale_byte = block.scales[pair_idx];
+
+            // Calculate scales
+            const float db_val = (subblock_idx % 2 == 0)
+                                     ? d * (1.0f + 2.0f * (scale_byte & 0xf))
+                                     : d * (1.0f + 2.0f * (scale_byte >> 4));
+            const __m256 vdb = _mm256_set1_ps(db_val);
+
+            const uint8_t *qs = block.qs + subblock_idx * 8;
+            const uint8_t qh_byte = block.qh[subblock_idx];
+            const uint8_t *signs = block.signs + subblock_idx * 4;
+
+            const __m256 vone = _mm256_set1_ps(1.0f);
+            const __m256 vminus_one = _mm256_set1_ps(-1.0f);
+            const __m256i vmask_bits = _mm256_set_epi32(128, 64, 32, 16, 8, 4, 2, 1);
+
+            // Load qs (8 bytes)
+            __m128i vqs_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qs));
+            __m256i vqs = _mm256_cvtepu8_epi32(vqs_8); // Expand to 8 32-bit ints (zero-extended)
+
+            // Compute indices
+            // idx[k] = qs[k] | ((qh >> k) & 1) << 8
+            __m256i vqh = _mm256_set1_epi32(qh_byte);
+            __m256i vqh_bits = _mm256_and_si256(vqh, vmask_bits);
+            __m256i vqh_mask = _mm256_cmpgt_epi32(vqh_bits, _mm256_setzero_si256());
+            __m256i vadd = _mm256_and_si256(vqh_mask, _mm256_set1_epi32(256));
+            __m256i vidx = _mm256_add_epi32(vqs, vadd);
+
+            // Gather grid values (8 uint32_t values)
+            __m256i vgrid_packed = _mm256_i32gather_epi32(reinterpret_cast<const int *>(iq3s_grid), vidx, 4);
+
+            // Split into low and high 128 bits
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid_packed);
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid_packed, 1);
+
+            for (size_t l = 0; l < 4; ++l)
+            {
+                __m128i vpacked;
+                if (l == 0)
+                    vpacked = vgrid_lo;
+                else if (l == 1)
+                    vpacked = _mm_srli_si128(vgrid_lo, 8);
+                else if (l == 2)
+                    vpacked = vgrid_hi;
+                else
+                    vpacked = _mm_srli_si128(vgrid_hi, 8);
+
+                // Convert 8 bytes to 8 int32s then to floats
+                __m256i vgrid_i32 = _mm256_cvtepi8_epi32(vpacked);
+                __m256 vgrid = _mm256_cvtepi32_ps(vgrid_i32);
+
+                // Signs
+                __m256i vsign_byte = _mm256_set1_epi32(signs[l]);
+                __m256i vsign_bits = _mm256_and_si256(vsign_byte, vmask_bits);
+                __m256i vsign_mask = _mm256_cmpgt_epi32(vsign_bits, _mm256_setzero_si256());
+                __m256 vsign = _mm256_blendv_ps(vone, vminus_one, _mm256_castsi256_ps(vsign_mask));
+
+                // Result
+                __m256 vresult = _mm256_mul_ps(vdb, _mm256_mul_ps(vgrid, vsign));
+
+                _mm256_storeu_ps(output + l * 8, vresult);
+            }
+        }
+
         /**
          * @brief AVX2 decode IQ3_S to Q8_0
          */
@@ -3213,7 +4566,7 @@ namespace llaminar2
         {
             // Decode to FP32 buffer (32 elements)
             alignas(32) float fp32_buffer[32];
-            decode_iq3s_subblock_to_fp32(block, subblock_idx, fp32_buffer);
+            decode_iq3s_subblock_to_fp32_avx2(block, subblock_idx, fp32_buffer);
 
             quantize_fp32_to_q8_0_avx2(fp32_buffer, 32, q8_qs, q8_scale);
         }
@@ -3221,19 +4574,170 @@ namespace llaminar2
 
 #if defined(__AVX512F__)
         /**
-         * @brief AVX-512 decode IQ3_S to Q8_0
+         * @brief AVX-512 decode IQ3_S sub-block to FP32
          */
-        inline void decode_iq3s_to_q8_0_avx512(
+        inline void decode_iq3s_subblock_to_fp32_avx512(
+            const IQ3_SBlock &block,
+            size_t subblock_idx,
+            float *output)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const size_t pair_idx = subblock_idx / 2;
+            const uint8_t scale_byte = block.scales[pair_idx];
+
+            // Calculate scale
+            const float db_val = (subblock_idx % 2 == 0)
+                                     ? d * (1.0f + 2.0f * (scale_byte & 0xf))
+                                     : d * (1.0f + 2.0f * (scale_byte >> 4));
+            const __m512 vdb = _mm512_set1_ps(db_val);
+
+            const uint8_t *qs = block.qs + subblock_idx * 8;
+            const uint8_t qh_byte = block.qh[subblock_idx];
+            const uint8_t *signs = block.signs + subblock_idx * 4;
+
+            // Load qs (8 bytes) -> 8 int32s
+            __m128i vqs_128 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qs));
+            __m256i vqs = _mm256_cvtepu8_epi32(vqs_128);
+
+            // Compute indices: idx[k] = qs[k] | ((qh >> k) & 1) << 8
+            // We use a shift vector to extract bits from qh
+            __m256i vqh = _mm256_set1_epi32(qh_byte);
+            __m256i vshift = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+            __m256i vqh_shifted = _mm256_srlv_epi32(vqh, vshift);
+            __m256i vqh_bit = _mm256_and_si256(vqh_shifted, _mm256_set1_epi32(1));
+            __m256i vadd = _mm256_slli_epi32(vqh_bit, 8);
+            __m256i vidx = _mm256_add_epi32(vqs, vadd);
+
+            // Gather grid values (8 uint32_t values = 32 bytes)
+            __m256i vgrid = _mm256_i32gather_epi32(reinterpret_cast<const int *>(iq3s_grid), vidx, 4);
+
+            // Split into low and high 16 bytes
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid);
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid, 1);
+
+            // Convert to floats (16 elements each)
+            __m512 vfloats0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_lo));
+            __m512 vfloats1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_hi));
+
+            // Apply signs
+            uint32_t sign_mask_bits;
+            std::memcpy(&sign_mask_bits, signs, 4);
+            __mmask16 m0 = sign_mask_bits & 0xFFFF;
+            __mmask16 m1 = (sign_mask_bits >> 16) & 0xFFFF;
+
+            // Negate where mask is set: 0 - val
+            vfloats0 = _mm512_mask_sub_ps(vfloats0, m0, _mm512_setzero_ps(), vfloats0);
+            vfloats1 = _mm512_mask_sub_ps(vfloats1, m1, _mm512_setzero_ps(), vfloats1);
+
+            // Apply scale
+            vfloats0 = _mm512_mul_ps(vfloats0, vdb);
+            vfloats1 = _mm512_mul_ps(vfloats1, vdb);
+
+            // Store
+            _mm512_storeu_ps(output, vfloats0);
+            _mm512_storeu_ps(output + 16, vfloats1);
+        }
+
+        /**
+         * @brief AVX-512 decode IQ3_S to Q8_0 (Optimized)
+         */
+        __attribute__((always_inline)) inline void decode_iq3s_to_q8_0_avx512(
             const IQ3_SBlock &block,
             size_t subblock_idx,
             int8_t *q8_qs,
             uint16_t *q8_scale)
         {
-            // Decode to FP32 buffer (32 elements)
-            alignas(64) float fp32_buffer[32];
-            decode_iq3s_subblock_to_fp32(block, subblock_idx, fp32_buffer);
+            const float d = fp16_to_fp32(block.d);
+            const size_t pair_idx = subblock_idx / 2;
+            const uint8_t scale_byte = block.scales[pair_idx];
 
-            quantize_fp32_to_q8_0_avx512(fp32_buffer, 32, q8_qs, q8_scale);
+            // Calculate scale
+            const float db_val = (subblock_idx % 2 == 0)
+                                     ? d * (1.0f + 2.0f * (scale_byte & 0xf))
+                                     : d * (1.0f + 2.0f * (scale_byte >> 4));
+            const __m512 vdb = _mm512_set1_ps(db_val);
+
+            const uint8_t *qs = block.qs + subblock_idx * 8;
+            const uint8_t qh_byte = block.qh[subblock_idx];
+            const uint8_t *signs = block.signs + subblock_idx * 4;
+
+            // Load qs (8 bytes) -> 8 int32s
+            __m128i vqs_128 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qs));
+            __m256i vqs = _mm256_cvtepu8_epi32(vqs_128);
+
+            // Compute indices: idx[k] = qs[k] | ((qh >> k) & 1) << 8
+            __m256i vqh = _mm256_set1_epi32(qh_byte);
+            __m256i vshift = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+            __m256i vqh_shifted = _mm256_srlv_epi32(vqh, vshift);
+            __m256i vqh_bit = _mm256_and_si256(vqh_shifted, _mm256_set1_epi32(1));
+            __m256i vadd = _mm256_slli_epi32(vqh_bit, 8);
+            __m256i vidx = _mm256_add_epi32(vqs, vadd);
+
+            // Gather grid values (8 uint32_t values = 32 bytes)
+            __m256i vgrid = _mm256_i32gather_epi32(reinterpret_cast<const int *>(iq3s_grid), vidx, 4);
+
+            // Split into low and high 16 bytes
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid);
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid, 1);
+
+            // Convert to floats (16 elements each)
+            __m512 vfloats0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_lo));
+            __m512 vfloats1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_hi));
+
+            // Apply signs
+            uint32_t sign_mask_bits;
+            std::memcpy(&sign_mask_bits, signs, 4);
+            __mmask16 m0 = sign_mask_bits & 0xFFFF;
+            __mmask16 m1 = (sign_mask_bits >> 16) & 0xFFFF;
+
+            // Negate where mask is set: 0 - val
+            vfloats0 = _mm512_mask_sub_ps(vfloats0, m0, _mm512_setzero_ps(), vfloats0);
+            vfloats1 = _mm512_mask_sub_ps(vfloats1, m1, _mm512_setzero_ps(), vfloats1);
+
+            // Apply scale
+            vfloats0 = _mm512_mul_ps(vfloats0, vdb);
+            vfloats1 = _mm512_mul_ps(vfloats1, vdb);
+
+            // --- Quantization Logic ---
+
+            // Find max absolute value
+            __m512 vmax_abs = _mm512_max_ps(_mm512_abs_ps(vfloats0), _mm512_abs_ps(vfloats1));
+            float max_val = _mm512_reduce_max_ps(vmax_abs);
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            if (max_val < MIN_SCALE_THRESHOLD)
+            {
+                *q8_scale = 0;
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), _mm256_setzero_si256());
+                return;
+            }
+
+            float scale = max_val / 127.0f;
+            if (scale > 65504.0f)
+                scale = 65504.0f;
+            *q8_scale = fp32_to_fp16(scale);
+            float inv_scale = 1.0f / scale;
+
+            __m512 vinv_scale = _mm512_set1_ps(inv_scale);
+
+            // Quantize
+            __m512i vqi_lo = _mm512_cvtps_epi32(_mm512_mul_ps(vfloats0, vinv_scale));
+            __m512i vqi_hi = _mm512_cvtps_epi32(_mm512_mul_ps(vfloats1, vinv_scale));
+
+            // Clamp
+            __m512i vmin = _mm512_set1_epi32(-127);
+            __m512i vmax = _mm512_set1_epi32(127);
+            vqi_lo = _mm512_max_epi32(vqi_lo, vmin);
+            vqi_lo = _mm512_min_epi32(vqi_lo, vmax);
+            vqi_hi = _mm512_max_epi32(vqi_hi, vmin);
+            vqi_hi = _mm512_min_epi32(vqi_hi, vmax);
+
+            // Pack
+            __m256i vq8 = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm512_cvtepi32_epi8(vqi_lo)),
+                _mm512_cvtepi32_epi8(vqi_hi), 1);
+
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), vq8);
         }
 #endif
 
@@ -3247,7 +4751,8 @@ namespace llaminar2
             uint16_t *q8_scale)
         {
 #if defined(__AVX512F__)
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 decode_iq3s_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -3255,7 +4760,8 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 decode_iq3s_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -3263,6 +4769,226 @@ namespace llaminar2
 #endif
 
             decode_iq3s_to_q8_0_scalar(block, subblock_idx, q8_qs, q8_scale);
+        }
+
+        /**
+         * @brief AVX-512 optimized IQ3_S superblock unpack (256 elements)
+         *
+         * Processes 2 subblocks (64 elements) per iteration for better throughput.
+         */
+        inline void unpack_iq3_s_superblock_to_int8_avx512(
+            const IQ3_SBlock &block,
+            int8_t *output,
+            float *scales)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            const float d = fp16_to_fp32(block.d);
+
+            // Precompute all 8 scale values
+            float db_arr[8];
+            for (int i = 0; i < 4; ++i)
+            {
+                uint8_t scale_byte = block.scales[i];
+                db_arr[2 * i + 0] = d * (1.0f + 2.0f * (scale_byte & 0xf));
+                db_arr[2 * i + 1] = d * (1.0f + 2.0f * (scale_byte >> 4));
+            }
+
+            // Process 2 subblocks (64 elements) per iteration
+            for (int ib = 0; ib < 8; ib += 2)
+            {
+                // ===== Load data for 2 subblocks =====
+                // Load 16 bytes of qs (8 per subblock)
+                const uint8_t *qs = block.qs + ib * 8;
+                __m128i vqs_16 = _mm_loadu_si128((const __m128i *)qs);
+                __m512i vqs_32 = _mm512_cvtepu8_epi32(vqs_16);
+
+                // Load qh bytes for both subblocks
+                uint8_t qh0 = block.qh[ib];
+                uint8_t qh1 = block.qh[ib + 1];
+
+                // Build qh vector: [qh1 x8, qh0 x8]
+                __m512i vqh = _mm512_set_epi32(
+                    qh1, qh1, qh1, qh1, qh1, qh1, qh1, qh1,
+                    qh0, qh0, qh0, qh0, qh0, qh0, qh0, qh0);
+
+                // Shifts: 0,1,2,3,4,5,6,7 repeated
+                __m512i vshift = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7);
+                __m512i vqh_shifted = _mm512_srlv_epi32(vqh, vshift);
+                __m512i vqh_bit = _mm512_and_si512(vqh_shifted, _mm512_set1_epi32(1));
+                __m512i vadd = _mm512_slli_epi32(vqh_bit, 8);
+                __m512i vidx = _mm512_add_epi32(vqs_32, vadd);
+
+                // Gather 16 grid values (uint32_t each = 4 bytes)
+                __m512i vgrid = _mm512_i32gather_epi32(vidx, (const int *)iq3s_grid, 4);
+
+                // Load signs for both subblocks (4 bytes each = 8 bytes total)
+                const uint8_t *signs = block.signs + ib * 4;
+                uint32_t sign0, sign1;
+                std::memcpy(&sign0, signs, 4);
+                std::memcpy(&sign1, signs + 4, 4);
+
+                // ===== Process subblock ib (first 32 elements) =====
+                __m128i vgrid_0 = _mm512_castsi512_si128(vgrid);
+                __m128i vgrid_1 = _mm512_extracti32x4_epi32(vgrid, 1);
+
+                // Convert grid (int8 values) to FP32
+                __m512 vfp0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_0));
+                __m512 vfp1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_1));
+
+                // Apply scale
+                vfp0 = _mm512_mul_ps(vfp0, _mm512_set1_ps(db_arr[ib]));
+                vfp1 = _mm512_mul_ps(vfp1, _mm512_set1_ps(db_arr[ib]));
+
+                // Apply signs
+                __mmask16 m0 = sign0 & 0xFFFF;
+                __mmask16 m1 = (sign0 >> 16) & 0xFFFF;
+                vfp0 = _mm512_mask_sub_ps(vfp0, m0, _mm512_setzero_ps(), vfp0);
+                vfp1 = _mm512_mask_sub_ps(vfp1, m1, _mm512_setzero_ps(), vfp1);
+
+                // Quantize subblock ib
+                {
+                    __m512 abs0 = _mm512_abs_ps(vfp0);
+                    __m512 abs1 = _mm512_abs_ps(vfp1);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib] = scale;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + ib * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512i vi0 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp0, vinv));
+                        __m512i vi1 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp1, vinv));
+
+                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
+                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
+
+                        _mm_storeu_si128((__m128i *)(output + ib * 32), vout0);
+                        _mm_storeu_si128((__m128i *)(output + ib * 32 + 16), vout1);
+                    }
+                }
+
+                // ===== Process subblock ib+1 (next 32 elements) =====
+                __m128i vgrid_2 = _mm512_extracti32x4_epi32(vgrid, 2);
+                __m128i vgrid_3 = _mm512_extracti32x4_epi32(vgrid, 3);
+
+                // Convert grid (int8 values) to FP32
+                __m512 vfp2 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_2));
+                __m512 vfp3 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_3));
+
+                // Apply scale
+                vfp2 = _mm512_mul_ps(vfp2, _mm512_set1_ps(db_arr[ib + 1]));
+                vfp3 = _mm512_mul_ps(vfp3, _mm512_set1_ps(db_arr[ib + 1]));
+
+                // Apply signs
+                __mmask16 m2 = sign1 & 0xFFFF;
+                __mmask16 m3 = (sign1 >> 16) & 0xFFFF;
+                vfp2 = _mm512_mask_sub_ps(vfp2, m2, _mm512_setzero_ps(), vfp2);
+                vfp3 = _mm512_mask_sub_ps(vfp3, m3, _mm512_setzero_ps(), vfp3);
+
+                // Quantize subblock ib+1
+                {
+                    __m512 abs2 = _mm512_abs_ps(vfp2);
+                    __m512 abs3 = _mm512_abs_ps(vfp3);
+                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs2, abs3));
+
+                    float scale = max_abs / 127.0f;
+                    if (scale > 65504.0f)
+                        scale = 65504.0f;
+                    if (max_abs < 1e-6f)
+                        scale = 0.0f;
+
+                    if (scales)
+                        scales[ib + 1] = scale;
+
+                    if (scale == 0.0f)
+                    {
+                        _mm256_storeu_si256((__m256i *)(output + (ib + 1) * 32), _mm256_setzero_si256());
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / scale;
+                        __m512 vinv = _mm512_set1_ps(inv_scale);
+
+                        __m512i vi2 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp2, vinv));
+                        __m512i vi3 = _mm512_cvtps_epi32(_mm512_mul_ps(vfp3, vinv));
+
+                        __m128i vout2 = _mm512_cvtepi32_epi8(vi2);
+                        __m128i vout3 = _mm512_cvtepi32_epi8(vi3);
+
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32), vout2);
+                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32 + 16), vout3);
+                    }
+                }
+            }
+#else
+            // Fallback to per-subblock
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t s;
+                decode_iq3s_to_q8_0(block, i, output + i * 32, &s);
+                if (scales)
+                    scales[i] = fp16_to_fp32(s);
+            }
+#endif
+        }
+
+        /**
+         * @brief Unpack entire IQ3_S super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks with single CPU dispatch.
+         *
+         * @param block Source IQ3_S super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         */
+        inline void unpack_iq3_s_superblock_to_int8(
+            const IQ3_SBlock &block,
+            int8_t *output,
+            float *scales)
+        {
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_iq3_s_superblock_to_int8_avx512(block, output, scales);
+                return;
+            }
+
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    uint16_t s;
+                    decode_iq3s_to_q8_0_avx2(block, i, output + i * 32, &s);
+                    if (scales)
+                        scales[i] = fp16_to_fp32(s);
+                }
+                return;
+            }
+#endif
+
+            // Scalar fallback
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t s;
+                decode_iq3s_to_q8_0_scalar(block, i, output + i * 32, &s);
+                if (scales)
+                    scales[i] = fp16_to_fp32(s);
+            }
         }
 
         /**
@@ -3476,7 +5202,8 @@ namespace llaminar2
             uint16_t *q8_scale)
         {
 #if defined(__AVX512F__)
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 decode_iq1s_to_q8_0_avx512(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -3484,7 +5211,8 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 decode_iq1s_to_q8_0_avx2(block, subblock_idx, q8_qs, q8_scale);
                 return;
@@ -3520,6 +5248,173 @@ namespace llaminar2
             uint16_t scale_fp16;
             decode_iq1s_to_q8_0(block, subblock_idx, dummy_output, &scale_fp16);
             return fp16_to_fp32(scale_fp16);
+        }
+
+        /**
+         * @brief Unpack entire IQ1_S super-block to int8 (256 elements) - AVX512 Optimized
+         */
+        __attribute__((always_inline)) inline void unpack_iq1_s_superblock_to_int8_avx512(
+            const IQ1_SBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__)
+            const float d = fp16_to_fp32(block.d);
+            const __m512i vmin_clamp = _mm512_set1_epi32(-127);
+            const __m512i vmax_clamp = _mm512_set1_epi32(127);
+            const __m512 v127 = _mm512_set1_ps(127.0f);
+            const __m512 veps = _mm512_set1_ps(1e-9f);
+
+            // Precompute dl and delta for all 8 subblocks
+            alignas(64) float dl_arr[8];
+            alignas(64) float delta_arr[8];
+
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t qh_val = block.qh[i];
+                dl_arr[i] = d * (2.0f * ((qh_val >> 12) & 7) + 1.0f);
+                delta_arr[i] = (qh_val & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+            }
+
+            for (int ib = 0; ib < 8; ib += 2)
+            {
+                // Subblock ib
+                const uint8_t *qs0 = block.qs + ib * 4;
+                uint16_t qh0 = block.qh[ib];
+
+                // Subblock ib+1
+                const uint8_t *qs1 = block.qs + (ib + 1) * 4;
+                uint16_t qh1 = block.qh[ib + 1];
+
+                // Indices for ib
+                alignas(16) int32_t idx0[4];
+                idx0[0] = qs0[0] | (((qh0 >> 0) & 7) << 8);
+                idx0[1] = qs0[1] | (((qh0 >> 3) & 7) << 8);
+                idx0[2] = qs0[2] | (((qh0 >> 6) & 7) << 8);
+                idx0[3] = qs0[3] | (((qh0 >> 9) & 7) << 8);
+
+                // Indices for ib+1
+                alignas(16) int32_t idx1[4];
+                idx1[0] = qs1[0] | (((qh1 >> 0) & 7) << 8);
+                idx1[1] = qs1[1] | (((qh1 >> 3) & 7) << 8);
+                idx1[2] = qs1[2] | (((qh1 >> 6) & 7) << 8);
+                idx1[3] = qs1[3] | (((qh1 >> 9) & 7) << 8);
+
+                // Gather
+                __m128i vidx0 = _mm_load_si128((const __m128i *)idx0);
+                __m128i vidx1 = _mm_load_si128((const __m128i *)idx1);
+
+                __m256i vgrid0 = _mm256_i32gather_epi64((const long long int *)iq1s_grid, vidx0, 8);
+                __m256i vgrid1 = _mm256_i32gather_epi64((const long long int *)iq1s_grid, vidx1, 8);
+
+                // Process ib
+                {
+                    __m128i vg_lo = _mm256_castsi256_si128(vgrid0);
+                    __m128i vg_hi = _mm256_extracti128_si256(vgrid0, 1);
+
+                    __m512 vf_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vg_lo));
+                    __m512 vf_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vg_hi));
+
+                    __m512 vdl = _mm512_set1_ps(dl_arr[ib]);
+                    __m512 vdelta = _mm512_set1_ps(delta_arr[ib]);
+
+                    // vals = dl * (grid + delta) = dl*grid + dl*delta
+                    __m512 vdl_delta = _mm512_mul_ps(vdl, vdelta);
+                    __m512 vals_lo = _mm512_fmadd_ps(vdl, vf_lo, vdl_delta);
+                    __m512 vals_hi = _mm512_fmadd_ps(vdl, vf_hi, vdl_delta);
+
+                    // Quantize
+                    __m512 vabs_max = _mm512_max_ps(_mm512_abs_ps(vals_lo), _mm512_abs_ps(vals_hi));
+                    float max_val = _mm512_reduce_max_ps(vabs_max);
+                    float scale_out = max_val / 127.0f;
+                    __m512 vinv = _mm512_div_ps(v127, _mm512_add_ps(_mm512_set1_ps(max_val), veps));
+
+                    __m512i vqi_lo = _mm512_cvtps_epi32(_mm512_mul_ps(vals_lo, vinv));
+                    __m512i vqi_hi = _mm512_cvtps_epi32(_mm512_mul_ps(vals_hi, vinv));
+                    vqi_lo = _mm512_max_epi32(_mm512_min_epi32(vqi_lo, vmax_clamp), vmin_clamp);
+                    vqi_hi = _mm512_max_epi32(_mm512_min_epi32(vqi_hi, vmax_clamp), vmin_clamp);
+
+                    __m256i vq8 = _mm256_inserti128_si256(
+                        _mm256_castsi128_si256(_mm512_cvtepi32_epi8(vqi_lo)),
+                        _mm512_cvtepi32_epi8(vqi_hi), 1);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + ib * 32), vq8);
+                    if (scales)
+                        scales[ib] = scale_out;
+                }
+
+                // Process ib+1
+                {
+                    __m128i vg_lo = _mm256_castsi256_si128(vgrid1);
+                    __m128i vg_hi = _mm256_extracti128_si256(vgrid1, 1);
+
+                    __m512 vf_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vg_lo));
+                    __m512 vf_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vg_hi));
+
+                    __m512 vdl = _mm512_set1_ps(dl_arr[ib + 1]);
+                    __m512 vdelta = _mm512_set1_ps(delta_arr[ib + 1]);
+
+                    __m512 vdl_delta = _mm512_mul_ps(vdl, vdelta);
+                    __m512 vals_lo = _mm512_fmadd_ps(vdl, vf_lo, vdl_delta);
+                    __m512 vals_hi = _mm512_fmadd_ps(vdl, vf_hi, vdl_delta);
+
+                    __m512 vabs_max = _mm512_max_ps(_mm512_abs_ps(vals_lo), _mm512_abs_ps(vals_hi));
+                    float max_val = _mm512_reduce_max_ps(vabs_max);
+                    float scale_out = max_val / 127.0f;
+                    __m512 vinv = _mm512_div_ps(v127, _mm512_add_ps(_mm512_set1_ps(max_val), veps));
+
+                    __m512i vqi_lo = _mm512_cvtps_epi32(_mm512_mul_ps(vals_lo, vinv));
+                    __m512i vqi_hi = _mm512_cvtps_epi32(_mm512_mul_ps(vals_hi, vinv));
+                    vqi_lo = _mm512_max_epi32(_mm512_min_epi32(vqi_lo, vmax_clamp), vmin_clamp);
+                    vqi_hi = _mm512_max_epi32(_mm512_min_epi32(vqi_hi, vmax_clamp), vmin_clamp);
+
+                    __m256i vq8 = _mm256_inserti128_si256(
+                        _mm256_castsi128_si256(_mm512_cvtepi32_epi8(vqi_lo)),
+                        _mm512_cvtepi32_epi8(vqi_hi), 1);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + (ib + 1) * 32), vq8);
+                    if (scales)
+                        scales[ib + 1] = scale_out;
+                }
+            }
+
+            if (mins)
+                _mm256_storeu_ps(mins, _mm256_setzero_ps());
+#endif
+        }
+
+        /**
+         * @brief Unpack entire IQ1_S super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks.
+         *
+         * @param block Source IQ1_S super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins (always 0 for IQ1_S)
+         */
+        inline void unpack_iq1_s_superblock_to_int8(
+            const IQ1_SBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__)
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_iq1_s_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+#endif
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq1s_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
         }
 
         // ============================================================================
@@ -3708,77 +5603,99 @@ namespace llaminar2
             int8_t *q8_qs,
             uint16_t *q8_scale)
         {
+            // 1. Load scales
             const uint16_t *sc = reinterpret_cast<const uint16_t *>(block.scales);
+            int shift = 6 * (subblock_idx % 2);
+            uint16_t sc_val = sc[subblock_idx / 2];
+            float s1 = (float)((sc_val >> shift) & 0x7);
+            float s2 = (float)((sc_val >> (shift + 3)) & 0x7);
+
+            float dl1 = global_scale * (2.0f * s1 + 1.0f);
+            float dl2 = global_scale * (2.0f * s2 + 1.0f);
+
+            // 2. Load qs and qh
             const uint8_t *qs = block.qs + subblock_idx * 4;
             const uint8_t *qh = block.qh + subblock_idx * 2;
 
-            const float dl1 = global_scale * (2.0f * ((sc[subblock_idx / 2] >> (6 * (subblock_idx % 2) + 0)) & 0x7) + 1.0f);
-            const float dl2 = global_scale * (2.0f * ((sc[subblock_idx / 2] >> (6 * (subblock_idx % 2) + 3)) & 0x7) + 1.0f);
-
-            // Grid indices
-            uint16_t idx[4];
+            // 3. Compute indices
+            int32_t idx[4];
             idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
             idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
             idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
             idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
 
-            // Delta signs
+            __m128i vindices = _mm_loadu_si128((const __m128i *)idx);
+
+            // 4. Gather grid values
+            // iq1s_grid is uint64_t*
+            __m256i vgrid = _mm256_i32gather_epi64((const long long int *)iq1s_grid, vindices, 8);
+
+            // 5. Compute Deltas
             float delta[4];
             delta[0] = (qh[0] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
             delta[1] = (qh[0] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
             delta[2] = (qh[1] & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
             delta[3] = (qh[1] & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-            float fp32_output[32];
+            // 6. Process in two halves (16 elements each)
+            __m128i vgrid_lo = _mm256_castsi256_si128(vgrid);
+            __m128i vgrid_hi = _mm256_extracti128_si256(vgrid, 1);
 
-            // Process first two groups (16 elements) with dl1
+            __m512 vgrid_lo_ps = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_lo));
+            __m512 vgrid_hi_ps = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vgrid_hi));
+
+            __m512 vdelta_lo = _mm512_set_ps(
+                delta[1], delta[1], delta[1], delta[1], delta[1], delta[1], delta[1], delta[1],
+                delta[0], delta[0], delta[0], delta[0], delta[0], delta[0], delta[0], delta[0]);
+
+            __m512 vdelta_hi = _mm512_set_ps(
+                delta[3], delta[3], delta[3], delta[3], delta[3], delta[3], delta[3], delta[3],
+                delta[2], delta[2], delta[2], delta[2], delta[2], delta[2], delta[2], delta[2]);
+
+            __m512 vdl1 = _mm512_set1_ps(dl1);
+            __m512 vdl2 = _mm512_set1_ps(dl2);
+
+            __m512 vals_lo = _mm512_mul_ps(vdl1, _mm512_add_ps(vgrid_lo_ps, vdelta_lo));
+            __m512 vals_hi = _mm512_mul_ps(vdl2, _mm512_add_ps(vgrid_hi_ps, vdelta_hi));
+
+            // 7. Find max absolute value for quantization
+            __m512 vmax_abs = _mm512_max_ps(_mm512_abs_ps(vals_lo), _mm512_abs_ps(vals_hi));
+            float max_val = _mm512_reduce_max_ps(vmax_abs);
+
+            constexpr float MIN_SCALE_THRESHOLD = 1e-6f;
+            if (max_val < MIN_SCALE_THRESHOLD)
             {
-                const int8_t *grid0 = reinterpret_cast<const int8_t *>(iq1s_grid + idx[0]);
-                const int8_t *grid1 = reinterpret_cast<const int8_t *>(iq1s_grid + idx[1]);
-
-                // Load 16 int8_t values (8 from each grid)
-                __m128i vgrid0_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid0));
-                __m128i vgrid1_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid1));
-                __m128i vgrid_i8 = _mm_unpacklo_epi64(vgrid0_i8, vgrid1_i8);
-
-                // Convert int8 → int32 → float
-                __m512i vgrid_i32 = _mm512_cvtepi8_epi32(vgrid_i8);
-                __m512 vgrid_f32 = _mm512_cvtepi32_ps(vgrid_i32);
-
-                // Apply deltas (first 8 elements use delta[0], next 8 use delta[1])
-                __m512 vdelta = _mm512_set_ps(
-                    delta[1], delta[1], delta[1], delta[1], delta[1], delta[1], delta[1], delta[1],
-                    delta[0], delta[0], delta[0], delta[0], delta[0], delta[0], delta[0], delta[0]);
-
-                // Compute: dl1 * (grid[j] + delta)
-                __m512 vdl1 = _mm512_set1_ps(dl1);
-                __m512 vresult = _mm512_mul_ps(vdl1, _mm512_add_ps(vgrid_f32, vdelta));
-                _mm512_storeu_ps(&fp32_output[0], vresult);
+                *q8_scale = 0;
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), _mm256_setzero_si256());
+                return;
             }
 
-            // Process last two groups (16 elements) with dl2
-            {
-                const int8_t *grid2 = reinterpret_cast<const int8_t *>(iq1s_grid + idx[2]);
-                const int8_t *grid3 = reinterpret_cast<const int8_t *>(iq1s_grid + idx[3]);
+            float scale = max_val / 127.0f;
+            if (scale > 65504.0f)
+                scale = 65504.0f;
+            *q8_scale = fp32_to_fp16(scale);
+            float inv_scale = 1.0f / scale;
 
-                __m128i vgrid2_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid2));
-                __m128i vgrid3_i8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(grid3));
-                __m128i vgrid_i8 = _mm_unpacklo_epi64(vgrid2_i8, vgrid3_i8);
+            __m512 vinv_scale = _mm512_set1_ps(inv_scale);
 
-                __m512i vgrid_i32 = _mm512_cvtepi8_epi32(vgrid_i8);
-                __m512 vgrid_f32 = _mm512_cvtepi32_ps(vgrid_i32);
+            // 8. Quantize
+            __m512i vqi_lo = _mm512_cvtps_epi32(_mm512_mul_ps(vals_lo, vinv_scale));
+            __m512i vqi_hi = _mm512_cvtps_epi32(_mm512_mul_ps(vals_hi, vinv_scale));
 
-                __m512 vdelta = _mm512_set_ps(
-                    delta[3], delta[3], delta[3], delta[3], delta[3], delta[3], delta[3], delta[3],
-                    delta[2], delta[2], delta[2], delta[2], delta[2], delta[2], delta[2], delta[2]);
+            // Clamp
+            __m512i vmin = _mm512_set1_epi32(-127);
+            __m512i vmax = _mm512_set1_epi32(127);
+            vqi_lo = _mm512_max_epi32(vqi_lo, vmin);
+            vqi_lo = _mm512_min_epi32(vqi_lo, vmax);
+            vqi_hi = _mm512_max_epi32(vqi_hi, vmin);
+            vqi_hi = _mm512_min_epi32(vqi_hi, vmax);
 
-                __m512 vdl2 = _mm512_set1_ps(dl2);
-                __m512 vresult = _mm512_mul_ps(vdl2, _mm512_add_ps(vgrid_f32, vdelta));
-                _mm512_storeu_ps(&fp32_output[16], vresult);
-            }
+            // Pack
+            __m256i vq8 = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm512_cvtepi32_epi8(vqi_lo)),
+                _mm512_cvtepi32_epi8(vqi_hi), 1);
 
-            // Quantize FP32 → Q8_0
-            quantize_fp32_to_q8_0_avx512(fp32_output, 32, q8_qs, q8_scale);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(q8_qs), vq8);
         }
 #endif
 
@@ -3793,7 +5710,8 @@ namespace llaminar2
             uint16_t *q8_scale)
         {
 #if defined(__AVX512F__)
-            if (cpu_supports_avx512())
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
             {
                 decode_iq1m_to_q8_0_avx512(block, subblock_idx, global_scale, q8_qs, q8_scale);
                 return;
@@ -3801,7 +5719,8 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 decode_iq1m_to_q8_0_avx2(block, subblock_idx, global_scale, q8_qs, q8_scale);
                 return;
@@ -3846,6 +5765,244 @@ namespace llaminar2
             decode_iq1m_to_q8_0(block, subblock_idx, global_scale, q8_qs, &q8_scale_u16);
 
             return fp16_to_fp32(q8_scale_u16);
+        }
+
+#ifdef __AVX512F__
+        /**
+         * @brief AVX512-optimized unpack of entire IQ1_M super-block to int8 (256 elements)
+         *
+         * APPROACH: 2x unroll with branchless delta and optimized reduction
+         *
+         * Key optimizations:
+         * 1. Precompute all 16 scale factors (dl1/dl2 × 8 subblocks)
+         * 2. 2x loop unroll for gather latency hiding
+         * 3. Branchless delta: use mask + blend instead of branches
+         * 4. FMA for scale computation: dl * (grid + delta) = fmadd(dl, grid, dl*delta)
+         * 5. Shared abs/max computation before split
+         *
+         * @param block Source IQ1_M super-block (56 bytes)
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins (always 0.0f for IQ1_M)
+         */
+        __attribute__((always_inline)) inline void unpack_iq1_m_superblock_to_int8_avx512(
+            const IQ1_MBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            // ============================================================
+            // Extract global scale and precompute all sub-scales
+            // ============================================================
+            const uint16_t *sc = reinterpret_cast<const uint16_t *>(block.scales);
+            const uint16_t scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                                       ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            const float global_scale = fp16_to_fp32(scale_u16);
+            const float gs2 = global_scale * 2.0f;
+
+            // Precompute scales: interleaved [dl1_0, dl2_0, dl1_1, dl2_1, ...]
+            alignas(64) float dl_arr[16];
+            {
+                const uint16_t sc0 = sc[0], sc1 = sc[1], sc2 = sc[2], sc3 = sc[3];
+                dl_arr[0] = gs2 * (float)((sc0 >> 0) & 0x7) + global_scale;
+                dl_arr[1] = gs2 * (float)((sc0 >> 3) & 0x7) + global_scale;
+                dl_arr[2] = gs2 * (float)((sc0 >> 6) & 0x7) + global_scale;
+                dl_arr[3] = gs2 * (float)((sc0 >> 9) & 0x7) + global_scale;
+                dl_arr[4] = gs2 * (float)((sc1 >> 0) & 0x7) + global_scale;
+                dl_arr[5] = gs2 * (float)((sc1 >> 3) & 0x7) + global_scale;
+                dl_arr[6] = gs2 * (float)((sc1 >> 6) & 0x7) + global_scale;
+                dl_arr[7] = gs2 * (float)((sc1 >> 9) & 0x7) + global_scale;
+                dl_arr[8] = gs2 * (float)((sc2 >> 0) & 0x7) + global_scale;
+                dl_arr[9] = gs2 * (float)((sc2 >> 3) & 0x7) + global_scale;
+                dl_arr[10] = gs2 * (float)((sc2 >> 6) & 0x7) + global_scale;
+                dl_arr[11] = gs2 * (float)((sc2 >> 9) & 0x7) + global_scale;
+                dl_arr[12] = gs2 * (float)((sc3 >> 0) & 0x7) + global_scale;
+                dl_arr[13] = gs2 * (float)((sc3 >> 3) & 0x7) + global_scale;
+                dl_arr[14] = gs2 * (float)((sc3 >> 6) & 0x7) + global_scale;
+                dl_arr[15] = gs2 * (float)((sc3 >> 9) & 0x7) + global_scale;
+            }
+
+            // Precompute constants
+            const __m512i vmin_clamp = _mm512_set1_epi32(-127);
+            const __m512i vmax_clamp = _mm512_set1_epi32(127);
+            const __m512 vpos_delta = _mm512_set1_ps(IQ1S_DELTA);
+            const __m512 vneg_delta = _mm512_set1_ps(-IQ1S_DELTA);
+            const __m512 v127 = _mm512_set1_ps(127.0f);
+            const __m512 veps = _mm512_set1_ps(1e-9f);
+
+            // ============================================================
+            // Main loop: 2 subblocks per iteration
+            // ============================================================
+            for (int ib = 0; ib < 8; ib += 2)
+            {
+                // ---- Extract indices for both subblocks ----
+                const uint8_t *qs0 = block.qs + ib * 4;
+                const uint8_t *qh0 = block.qh + ib * 2;
+                const uint8_t qh0_0 = qh0[0], qh0_1 = qh0[1];
+
+                const uint8_t *qs1 = block.qs + (ib + 1) * 4;
+                const uint8_t *qh1 = block.qh + (ib + 1) * 2;
+                const uint8_t qh1_0 = qh1[0], qh1_1 = qh1[1];
+
+                // Build indices
+                alignas(16) int32_t idx0[4], idx1[4];
+                idx0[0] = qs0[0] | ((qh0_0 & 0x07) << 8);
+                idx0[1] = qs0[1] | ((qh0_0 & 0x70) << 4);
+                idx0[2] = qs0[2] | ((qh0_1 & 0x07) << 8);
+                idx0[3] = qs0[3] | ((qh0_1 & 0x70) << 4);
+
+                idx1[0] = qs1[0] | ((qh1_0 & 0x07) << 8);
+                idx1[1] = qs1[1] | ((qh1_0 & 0x70) << 4);
+                idx1[2] = qs1[2] | ((qh1_1 & 0x07) << 8);
+                idx1[3] = qs1[3] | ((qh1_1 & 0x70) << 4);
+
+                // ---- Issue both gathers ----
+                __m128i vidx0 = _mm_load_si128((const __m128i *)idx0);
+                __m128i vidx1 = _mm_load_si128((const __m128i *)idx1);
+
+                __m256i vgrid0 = _mm256_i32gather_epi64((const long long int *)iq1s_grid, vidx0, 8);
+                __m256i vgrid1 = _mm256_i32gather_epi64((const long long int *)iq1s_grid, vidx1, 8);
+
+                // ---- Process subblock ib ----
+                {
+                    __m128i vg_lo = _mm256_castsi256_si128(vgrid0);
+                    __m128i vg_hi = _mm256_extracti128_si256(vgrid0, 1);
+
+                    __m512 vf_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vg_lo));
+                    __m512 vf_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vg_hi));
+
+                    // Build delta masks from sign bits
+                    __mmask16 mask_lo = ((qh0_0 & 0x08) ? 0 : 0x00FF) | ((qh0_0 & 0x80) ? 0 : 0xFF00);
+                    __mmask16 mask_hi = ((qh0_1 & 0x08) ? 0 : 0x00FF) | ((qh0_1 & 0x80) ? 0 : 0xFF00);
+
+                    __m512 vdelta_lo = _mm512_mask_blend_ps(mask_lo, vneg_delta, vpos_delta);
+                    __m512 vdelta_hi = _mm512_mask_blend_ps(mask_hi, vneg_delta, vpos_delta);
+
+                    // Load scales and compute dl*delta for FMA
+                    const float dl1 = dl_arr[ib * 2 + 0];
+                    const float dl2 = dl_arr[ib * 2 + 1];
+                    __m512 vdl1 = _mm512_set1_ps(dl1);
+                    __m512 vdl2 = _mm512_set1_ps(dl2);
+
+                    // Use FMA: vals = dl * grid + dl * delta = fmadd(dl, grid, dl*delta)
+                    __m512 vdl_delta_lo = _mm512_mul_ps(vdl1, vdelta_lo);
+                    __m512 vdl_delta_hi = _mm512_mul_ps(vdl2, vdelta_hi);
+                    __m512 vals_lo = _mm512_fmadd_ps(vdl1, vf_lo, vdl_delta_lo);
+                    __m512 vals_hi = _mm512_fmadd_ps(vdl2, vf_hi, vdl_delta_hi);
+
+                    // Quantize: find max and compute inverse scale
+                    __m512 vabs_max = _mm512_max_ps(_mm512_abs_ps(vals_lo), _mm512_abs_ps(vals_hi));
+                    float max_val = _mm512_reduce_max_ps(vabs_max);
+                    float scale_out = max_val / 127.0f;
+                    __m512 vinv = _mm512_div_ps(v127, _mm512_add_ps(_mm512_set1_ps(max_val), veps));
+
+                    __m512i vqi_lo = _mm512_cvtps_epi32(_mm512_mul_ps(vals_lo, vinv));
+                    __m512i vqi_hi = _mm512_cvtps_epi32(_mm512_mul_ps(vals_hi, vinv));
+                    vqi_lo = _mm512_max_epi32(_mm512_min_epi32(vqi_lo, vmax_clamp), vmin_clamp);
+                    vqi_hi = _mm512_max_epi32(_mm512_min_epi32(vqi_hi, vmax_clamp), vmin_clamp);
+
+                    __m256i vq8 = _mm256_inserti128_si256(
+                        _mm256_castsi128_si256(_mm512_cvtepi32_epi8(vqi_lo)),
+                        _mm512_cvtepi32_epi8(vqi_hi), 1);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + ib * 32), vq8);
+                    if (scales)
+                        scales[ib] = scale_out;
+                }
+
+                // ---- Process subblock ib+1 ----
+                {
+                    __m128i vg_lo = _mm256_castsi256_si128(vgrid1);
+                    __m128i vg_hi = _mm256_extracti128_si256(vgrid1, 1);
+
+                    __m512 vf_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vg_lo));
+                    __m512 vf_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(vg_hi));
+
+                    __mmask16 mask_lo = ((qh1_0 & 0x08) ? 0 : 0x00FF) | ((qh1_0 & 0x80) ? 0 : 0xFF00);
+                    __mmask16 mask_hi = ((qh1_1 & 0x08) ? 0 : 0x00FF) | ((qh1_1 & 0x80) ? 0 : 0xFF00);
+
+                    __m512 vdelta_lo = _mm512_mask_blend_ps(mask_lo, vneg_delta, vpos_delta);
+                    __m512 vdelta_hi = _mm512_mask_blend_ps(mask_hi, vneg_delta, vpos_delta);
+
+                    const float dl1 = dl_arr[(ib + 1) * 2 + 0];
+                    const float dl2 = dl_arr[(ib + 1) * 2 + 1];
+                    __m512 vdl1 = _mm512_set1_ps(dl1);
+                    __m512 vdl2 = _mm512_set1_ps(dl2);
+
+                    __m512 vdl_delta_lo = _mm512_mul_ps(vdl1, vdelta_lo);
+                    __m512 vdl_delta_hi = _mm512_mul_ps(vdl2, vdelta_hi);
+                    __m512 vals_lo = _mm512_fmadd_ps(vdl1, vf_lo, vdl_delta_lo);
+                    __m512 vals_hi = _mm512_fmadd_ps(vdl2, vf_hi, vdl_delta_hi);
+
+                    __m512 vabs_max = _mm512_max_ps(_mm512_abs_ps(vals_lo), _mm512_abs_ps(vals_hi));
+                    float max_val = _mm512_reduce_max_ps(vabs_max);
+                    float scale_out = max_val / 127.0f;
+                    __m512 vinv = _mm512_div_ps(v127, _mm512_add_ps(_mm512_set1_ps(max_val), veps));
+
+                    __m512i vqi_lo = _mm512_cvtps_epi32(_mm512_mul_ps(vals_lo, vinv));
+                    __m512i vqi_hi = _mm512_cvtps_epi32(_mm512_mul_ps(vals_hi, vinv));
+                    vqi_lo = _mm512_max_epi32(_mm512_min_epi32(vqi_lo, vmax_clamp), vmin_clamp);
+                    vqi_hi = _mm512_max_epi32(_mm512_min_epi32(vqi_hi, vmax_clamp), vmin_clamp);
+
+                    __m256i vq8 = _mm256_inserti128_si256(
+                        _mm256_castsi128_si256(_mm512_cvtepi32_epi8(vqi_lo)),
+                        _mm512_cvtepi32_epi8(vqi_hi), 1);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + (ib + 1) * 32), vq8);
+                    if (scales)
+                        scales[ib + 1] = scale_out;
+                }
+            }
+
+            // Set mins to zero
+            if (mins)
+            {
+                _mm256_storeu_ps(mins, _mm256_setzero_ps());
+            }
+        }
+#endif
+
+        /**
+         * @brief Unpack entire IQ1_M super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks.
+         *
+         * @param block Source IQ1_M super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins (always 0 for IQ1_M)
+         */
+        inline void unpack_iq1_m_superblock_to_int8(
+            const IQ1_MBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__)
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_iq1_m_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+#endif
+            // Fallback to per-subblock processing
+            float global_scale = extract_iq1m_global_scale(block);
+            for (int i = 0; i < 8; ++i)
+            {
+                int8_t q8_qs[32];
+                uint16_t q8_scale_u16;
+                decode_iq1m_to_q8_0(block, i, global_scale, q8_qs, &q8_scale_u16);
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+                _mm256_storeu_si256((__m256i *)(output + i * 32), _mm256_loadu_si256((const __m256i *)q8_qs));
+#else
+                std::memcpy(output + i * 32, q8_qs, 32);
+#endif
+
+                if (scales)
+                    scales[i] = fp16_to_fp32(q8_scale_u16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
         }
 
         // =====================================================================
@@ -4379,6 +6536,220 @@ namespace llaminar2
         }
 #endif
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        inline void unpack_q3_k_superblock_to_int8_avx512(
+            const Q3_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            // 1. Unpack scales (scalar is fast enough for 12 bytes)
+            const float d_all = fp16_to_fp32(block.d);
+
+            uint32_t aux[4];
+            {
+                const uint32_t kmask1 = 0x03030303;
+                const uint32_t kmask2 = 0x0f0f0f0f;
+                uint32_t tmp_aux[4];
+                memcpy(tmp_aux, block.scales, 12);
+                uint32_t tmp = tmp_aux[2];
+                aux[2] = ((tmp_aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+                aux[3] = ((tmp_aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+                aux[0] = (tmp_aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+                aux[1] = (tmp_aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+            }
+
+            // 2. Compute dl, inv_scale, bias for all 16 halves using AVX512
+            __m512 v_dl, v_inv_scale, v_bias;
+            __m512 v_out_s, v_out_m;
+
+            {
+                // Load 16 scale bytes
+                __m128i v_sc_i8 = _mm_loadu_si128((const __m128i *)aux);
+                // Convert to 16 floats
+                __m512i v_sc_i32 = _mm512_cvtepi8_epi32(v_sc_i8);
+                __m512 v_sc = _mm512_cvtepi32_ps(v_sc_i32);
+
+                // dl = d_all * (sc - 32)
+                __m512 v_d_all = _mm512_set1_ps(d_all);
+                v_dl = _mm512_mul_ps(v_d_all, _mm512_sub_ps(v_sc, _mm512_set1_ps(32.0f)));
+
+                // Compute min/max for each half
+                __mmask16 mask_pos = _mm512_cmp_ps_mask(v_dl, _mm512_setzero_ps(), _CMP_GE_OQ);
+
+                __m512 v_min = _mm512_mul_ps(v_dl, _mm512_mask_blend_ps(mask_pos, _mm512_set1_ps(3.0f), _mm512_set1_ps(-4.0f)));
+                __m512 v_max = _mm512_mul_ps(v_dl, _mm512_mask_blend_ps(mask_pos, _mm512_set1_ps(-4.0f), _mm512_set1_ps(3.0f)));
+
+                // Pair up to get global_min/max for each sub-block (8 sub-blocks)
+                // Swap adjacent pairs: 0<->1, 2<->3...
+                __m512 v_min_swap = _mm512_permute_ps(v_min, 0xB1);
+                __m512 v_max_swap = _mm512_permute_ps(v_max, 0xB1);
+
+                __m512 v_gmin = _mm512_min_ps(v_min, v_min_swap);
+                __m512 v_gmax = _mm512_max_ps(v_max, v_max_swap);
+
+                __m512 v_range = _mm512_sub_ps(v_gmax, v_gmin);
+
+                // Check range < 1e-5
+                __mmask16 mask_small = _mm512_cmp_ps_mask(v_range, _mm512_set1_ps(1e-5f), _CMP_LT_OQ);
+
+                // out_s = range / 255.0f
+                v_out_s = _mm512_div_ps(v_range, _mm512_set1_ps(255.0f));
+                // out_m = gmin + 128.0f * out_s
+                v_out_m = _mm512_add_ps(v_gmin, _mm512_mul_ps(_mm512_set1_ps(128.0f), v_out_s));
+
+                // Handle small range
+                v_out_s = _mm512_mask_blend_ps(mask_small, v_out_s, _mm512_setzero_ps());
+                v_out_m = _mm512_mask_blend_ps(mask_small, v_out_m, v_gmin);
+
+                // inv_scale = 1.0f / out_s
+                __m512 v_safe_s = _mm512_mask_blend_ps(mask_small, v_out_s, _mm512_set1_ps(1.0f));
+                v_inv_scale = _mm512_div_ps(_mm512_set1_ps(1.0f), v_safe_s);
+
+                // bias = -out_m * inv_scale
+                v_bias = _mm512_mul_ps(_mm512_sub_ps(_mm512_setzero_ps(), v_out_m), v_inv_scale);
+
+                // If small range, set bias to -128 (so result is -128)
+                v_inv_scale = _mm512_mask_blend_ps(mask_small, v_inv_scale, _mm512_setzero_ps());
+                v_bias = _mm512_mask_blend_ps(mask_small, v_bias, _mm512_set1_ps(-128.0f));
+            }
+
+            // Save scales/mins if needed
+            if (scales || mins)
+            {
+                float tmp_s[16], tmp_m[16];
+                _mm512_storeu_ps(tmp_s, v_out_s);
+                _mm512_storeu_ps(tmp_m, v_out_m);
+                for (int i = 0; i < 8; ++i)
+                {
+                    if (scales)
+                        scales[i] = tmp_s[2 * i];
+                    if (mins)
+                        mins[i] = tmp_m[2 * i];
+                }
+            }
+
+            // 3. Compute LUTs (128 bytes) in registers
+            __m512i v_lut0, v_lut1;
+            {
+                __m512 v_vals = _mm512_set_ps(
+                    -1, -2, -3, -4, 3, 2, 1, 0,
+                    -1, -2, -3, -4, 3, 2, 1, 0);
+
+                auto compute_lut_pair = [&](int k) -> __m128i
+                {
+                    __m512i v_idx = _mm512_set_epi32(
+                        2 * k + 1, 2 * k + 1, 2 * k + 1, 2 * k + 1, 2 * k + 1, 2 * k + 1, 2 * k + 1, 2 * k + 1,
+                        2 * k, 2 * k, 2 * k, 2 * k, 2 * k, 2 * k, 2 * k, 2 * k);
+
+                    __m512 v_dl_sub = _mm512_permutexvar_ps(v_idx, v_dl);
+                    __m512 v_inv_sub = _mm512_permutexvar_ps(v_idx, v_inv_scale);
+                    __m512 v_bias_sub = _mm512_permutexvar_ps(v_idx, v_bias);
+
+                    __m512 v_fval = _mm512_mul_ps(v_dl_sub, v_vals);
+                    __m512 v_res = _mm512_fmadd_ps(v_fval, v_inv_sub, v_bias_sub);
+                    __m512i v_ires = _mm512_cvtps_epi32(v_res);
+                    return _mm512_cvtepi32_epi8(v_ires);
+                };
+
+                v_lut0 = _mm512_castsi128_si512(compute_lut_pair(0));
+                v_lut0 = _mm512_inserti32x4(v_lut0, compute_lut_pair(1), 1);
+                v_lut0 = _mm512_inserti32x4(v_lut0, compute_lut_pair(2), 2);
+                v_lut0 = _mm512_inserti32x4(v_lut0, compute_lut_pair(3), 3);
+
+                v_lut1 = _mm512_castsi128_si512(compute_lut_pair(4));
+                v_lut1 = _mm512_inserti32x4(v_lut1, compute_lut_pair(5), 1);
+                v_lut1 = _mm512_inserti32x4(v_lut1, compute_lut_pair(6), 2);
+                v_lut1 = _mm512_inserti32x4(v_lut1, compute_lut_pair(7), 3);
+            }
+
+            // 4. Unpack blocks using LUT
+            // Hoist hmask loading
+            __m256i hmask_256 = _mm256_loadu_si256((const __m256i *)block.hmask);
+            __m512i hmask = _mm512_castsi256_si512(hmask_256);
+            hmask = _mm512_inserti64x4(hmask, hmask_256, 1);
+
+            // Hoist constants
+            __m512i v_half_offset = _mm512_set_epi8(
+                8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+            __m512i v_sb_offset = _mm512_set_epi8(
+                16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+                16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+// Helper macro for unrolled iteration
+#define UNPACK_Q3K_ITER(I, CHUNK_IDX, V_LUT_SRC, BASE)                               \
+    {                                                                                \
+        /* Load qs */                                                                \
+        const uint8_t *q_ptr = block.qs + (CHUNK_IDX) * 32;                          \
+        __m256i q_256 = _mm256_loadu_si256((const __m256i *)q_ptr);                  \
+        __m512i qs = _mm512_castsi256_si512(q_256);                                  \
+        qs = _mm512_inserti64x4(qs, q_256, 1);                                       \
+                                                                                     \
+        /* Shift vector */                                                           \
+        /* i=0: j0=0, j1=1 -> shift0=0, shift1=2 */                                  \
+        /* i=2: j0=2, j1=3 -> shift0=4, shift1=6 */                                  \
+        /* i=4: j0=0, j1=1 -> shift0=0, shift1=2 */                                  \
+        /* i=6: j0=2, j1=3 -> shift0=4, shift1=6 */                                  \
+        int j0 = (I) % 4;                                                            \
+        int shift0 = j0 * 2;                                                         \
+        int j1 = ((I) + 1) % 4;                                                      \
+        int shift1 = j1 * 2;                                                         \
+                                                                                     \
+        __m512i v_shift = _mm512_set_epi16(                                          \
+            shift1, shift1, shift1, shift1, shift1, shift1, shift1, shift1,          \
+            shift1, shift1, shift1, shift1, shift1, shift1, shift1, shift1,          \
+            shift0, shift0, shift0, shift0, shift0, shift0, shift0, shift0,          \
+            shift0, shift0, shift0, shift0, shift0, shift0, shift0, shift0);         \
+                                                                                     \
+        __m512i q_indices = _mm512_srlv_epi16(qs, v_shift);                          \
+        q_indices = _mm512_and_si512(q_indices, _mm512_set1_epi8(3));                \
+                                                                                     \
+        /* Mask bits */                                                              \
+        /* i=0: 1<<1, 1<<0 -> 2, 1 */                                                \
+        /* i=2: 1<<3, 1<<2 -> 8, 4 */                                                \
+        /* i=4: 1<<5, 1<<4 -> 32, 16 */                                              \
+        /* i=6: 1<<7, 1<<6 -> 128, 64 */                                             \
+        int m0 = 1 << (I);                                                           \
+        int m1 = 1 << ((I) + 1);                                                     \
+                                                                                     \
+        __m512i m_vec = _mm512_set_epi8(                                             \
+            m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1,          \
+            m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1, m1,          \
+            m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0,          \
+            m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0, m0);         \
+                                                                                     \
+        __m512i hm_bits = _mm512_and_si512(hmask, m_vec);                            \
+        __mmask64 is_zero = _mm512_cmpeq_epi8_mask(hm_bits, _mm512_setzero_si512()); \
+        __m512i offset = _mm512_mask_set1_epi8(_mm512_setzero_si512(), is_zero, 4);  \
+                                                                                     \
+        __m512i indices = _mm512_or_si512(q_indices, offset);                        \
+        indices = _mm512_add_epi8(indices, v_half_offset);                           \
+        indices = _mm512_add_epi8(indices, v_sb_offset);                             \
+                                                                                     \
+        __m512i v_perm_idx = _mm512_set_epi64(                                       \
+            (BASE) + 3, (BASE) + 2, (BASE) + 3, (BASE) + 2,                          \
+            (BASE) + 1, (BASE) + 0, (BASE) + 1, (BASE) + 0);                         \
+                                                                                     \
+        __m512i v_lut_dup = _mm512_permutexvar_epi64(v_perm_idx, V_LUT_SRC);         \
+        __m512i result = _mm512_shuffle_epi8(v_lut_dup, indices);                    \
+        _mm512_storeu_si512(output + (I) * 32, result);                              \
+    }
+
+            UNPACK_Q3K_ITER(0, 0, v_lut0, 0);
+            UNPACK_Q3K_ITER(2, 0, v_lut0, 4);
+            UNPACK_Q3K_ITER(4, 1, v_lut1, 0);
+            UNPACK_Q3K_ITER(6, 1, v_lut1, 4);
+
+#undef UNPACK_Q3K_ITER
+        }
+#endif
+
         inline void transcode_q3_k_to_int8(const Q3_KBlock &block, int sub_block_idx, int8_t *output, float *out_scale, float *out_min)
         {
 #if defined(__AVX2__)
@@ -4386,6 +6757,60 @@ namespace llaminar2
 #else
             transcode_q3_k_to_int8_scalar(block, sub_block_idx, output, out_scale, out_min);
 #endif
+        }
+
+        /**
+         * @brief Unpack entire Q3_K super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks with single CPU dispatch.
+         *
+         * @param block Source Q3_K super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins
+         */
+        inline void unpack_q3_k_superblock_to_int8(
+            const Q3_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_q3_k_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    float s, m;
+                    transcode_q3_k_to_int8_avx2(block, i, output + i * 32, &s, &m);
+                    if (scales)
+                        scales[i] = s;
+                    if (mins)
+                        mins[i] = m;
+                }
+                return;
+            }
+#endif
+
+            // Scalar fallback
+            for (int i = 0; i < 8; ++i)
+            {
+                float s, m;
+                transcode_q3_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
+                if (scales)
+                    scales[i] = s;
+                if (mins)
+                    mins[i] = m;
+            }
         }
 
         /**
@@ -4788,6 +7213,78 @@ namespace llaminar2
             transcode_q4_k_to_int8_avx2(block, subblock_idx, output, scale, min_val);
         }
 #endif
+
+        /**
+         * @brief Unpack entire Q4_K super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks with single CPU dispatch.
+         *
+         * @param block Source Q4_K super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins
+         */
+        inline void unpack_q4_k_superblock_to_int8(
+            const Q4_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                const float d = fp16_to_fp32(block.d);
+                const float dmin = fp16_to_fp32(block.dmin);
+                const __m256i mask = _mm256_set1_epi8(0xF);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    const uint8_t *q = block.qs + i * 32;
+                    const __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q));
+
+                    // Sub-block 2*i (Low nibbles)
+                    const __m256i low = _mm256_and_si256(data, mask);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + (2 * i) * 32), low);
+
+                    // Sub-block 2*i+1 (High nibbles)
+                    const __m256i high = _mm256_and_si256(_mm256_srli_epi16(data, 4), mask);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + (2 * i + 1) * 32), high);
+
+                    // Scales and mins
+                    if (scales || mins)
+                    {
+                        uint8_t sc, m;
+                        // Sub-block 2*i
+                        get_scale_min_k4(2 * i, block.scales, &sc, &m);
+                        if (scales)
+                            scales[2 * i] = d * sc;
+                        if (mins)
+                            mins[2 * i] = -dmin * m;
+
+                        // Sub-block 2*i+1
+                        get_scale_min_k4(2 * i + 1, block.scales, &sc, &m);
+                        if (scales)
+                            scales[2 * i + 1] = d * sc;
+                        if (mins)
+                            mins[2 * i + 1] = -dmin * m;
+                    }
+                }
+                return;
+            }
+#endif
+
+            // Scalar fallback
+            for (int i = 0; i < 8; ++i)
+            {
+                float s, m;
+                transcode_q4_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
+                if (scales)
+                    scales[i] = s;
+                if (mins)
+                    mins[i] = m;
+            }
+        }
 
         inline void transcode_q4_k_to_int8(
             const Q4_KBlock &block,
@@ -5571,6 +8068,323 @@ namespace llaminar2
 #endif
         }
 
+        /**
+         * @brief Unpack entire Q6_K super-block to int8 (256 elements)
+         *
+         * Q6_K layout (per 128-element half):
+         *   - ql[64]: lower 4 bits (2 nibbles per byte for 32 positions)
+         *   - qh[32]: upper 2 bits (4 x 2-bit fields per byte)
+         *   - scales[8]: per-16-element scales
+         *
+         * Output subblock mapping (for sequential 32-element subblocks):
+         *   - Subblock 0: q = (ql[l]&0xF) | ((qh[l]>>0)&3)<<4, scales 0,1
+         *   - Subblock 1: q = (ql[l+32]&0xF) | ((qh[l]>>2)&3)<<4, scales 2,3
+         *   - Subblock 2: q = (ql[l]>>4) | ((qh[l]>>4)&3)<<4, scales 4,5
+         *   - Subblock 3: q = (ql[l+32]>>4) | ((qh[l]>>6)&3)<<4, scales 6,7
+         *
+         * @param block Source Q6_K super-block
+         * @param output Output buffer for 256 int8 values (8 subblocks of 32)
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins (always 0 for Q6_K)
+         */
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        inline void unpack_q6_k_superblock_to_int8_avx512(
+            const Q6_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            const float d = fp16_to_fp32(block.d);
+
+            // Precompute scale factors for all 8 subblocks (16 half-factors)
+            alignas(64) int16_t factors_fixed[16]; // 8.8 fixed point
+            alignas(64) float out_scales[8];
+
+            for (int half = 0; half < 2; ++half)
+            {
+                const int8_t *sc_base = block.scales + half * 8;
+                for (int sb = 0; sb < 4; ++sb)
+                {
+                    const int8_t sc0 = sc_base[sb * 2 + 0];
+                    const int8_t sc1 = sc_base[sb * 2 + 1];
+                    const float max_sc = std::max(std::abs((float)sc0), std::abs((float)sc1));
+
+                    const int idx = half * 4 + sb;
+                    if (max_sc == 0.0f)
+                    {
+                        out_scales[idx] = 0.0f;
+                        factors_fixed[idx * 2 + 0] = 0;
+                        factors_fixed[idx * 2 + 1] = 0;
+                    }
+                    else
+                    {
+                        out_scales[idx] = d * max_sc * 32.0f / 127.0f;
+                        factors_fixed[idx * 2 + 0] = (int16_t)std::nearbyint((float)sc0 * 127.0f * 256.0f / (max_sc * 32.0f));
+                        factors_fixed[idx * 2 + 1] = (int16_t)std::nearbyint((float)sc1 * 127.0f * 256.0f / (max_sc * 32.0f));
+                    }
+                }
+            }
+
+            if (scales)
+                _mm256_storeu_ps(scales, _mm256_loadu_ps(out_scales));
+            if (mins)
+                _mm256_storeu_ps(mins, _mm256_setzero_ps());
+
+            // Constants
+            const __m256i v0F = _mm256_set1_epi8(0x0F);
+            const __m256i v03 = _mm256_set1_epi8(0x03);
+            const __m512i v32_16 = _mm512_set1_epi16(32);
+            const __m512i v128_16 = _mm512_set1_epi16(128);
+
+            // Load all data at once
+            const __m512i vqh = _mm512_loadu_si512(block.qh);
+            const __m256i vqh_lo = _mm512_castsi512_si256(vqh);
+            const __m256i vqh_hi = _mm512_extracti64x4_epi64(vqh, 1);
+            const __m512i vql_0 = _mm512_loadu_si512(block.ql);
+            const __m512i vql_1 = _mm512_loadu_si512(block.ql + 64);
+
+            // Process 2 subblocks at a time for better ILP (64 elements)
+            // Each pair shares the same ql 64-byte load
+
+            // === HALF 0: subblocks 0,1 then 2,3 ===
+            {
+                // Subblocks 0,1: use low nibbles of vql_0
+                const __m256i vql_lo0 = _mm512_castsi512_si256(vql_0);
+                const __m256i vql_lo1 = _mm512_extracti64x4_epi64(vql_0, 1);
+
+                // sb0: low nibbles of first 32 bytes, qh shift 0
+                __m256i vql_sb0 = _mm256_and_si256(vql_lo0, v0F);
+                __m256i vqh_sb0 = _mm256_and_si256(vqh_lo, v03);
+                __m256i vq_sb0 = _mm256_or_si256(vql_sb0, _mm256_slli_epi16(vqh_sb0, 4));
+
+                // sb1: low nibbles of second 32 bytes, qh shift 2
+                __m256i vql_sb1 = _mm256_and_si256(vql_lo1, v0F);
+                __m256i vqh_sb1 = _mm256_and_si256(_mm256_srli_epi16(vqh_lo, 2), v03);
+                __m256i vq_sb1 = _mm256_or_si256(vql_sb1, _mm256_slli_epi16(vqh_sb1, 4));
+
+                // Expand both to 16-bit, center, multiply - interleaved for ILP
+                __m512i vq16_sb0 = _mm512_sub_epi16(_mm512_cvtepu8_epi16(vq_sb0), v32_16);
+                __m512i vq16_sb1 = _mm512_sub_epi16(_mm512_cvtepu8_epi16(vq_sb1), v32_16);
+
+                __m512i vf0_0 = _mm512_set1_epi16(factors_fixed[0]);
+                __m512i vf0_1 = _mm512_set1_epi16(factors_fixed[1]);
+                __m512i vfactor_sb0 = _mm512_mask_blend_epi16(0xFFFF0000u, vf0_0, vf0_1);
+
+                __m512i vf1_0 = _mm512_set1_epi16(factors_fixed[2]);
+                __m512i vf1_1 = _mm512_set1_epi16(factors_fixed[3]);
+                __m512i vfactor_sb1 = _mm512_mask_blend_epi16(0xFFFF0000u, vf1_0, vf1_1);
+
+                __m512i vmul_sb0 = _mm512_srai_epi16(_mm512_add_epi16(_mm512_mullo_epi16(vq16_sb0, vfactor_sb0), v128_16), 8);
+                __m512i vmul_sb1 = _mm512_srai_epi16(_mm512_add_epi16(_mm512_mullo_epi16(vq16_sb1, vfactor_sb1), v128_16), 8);
+
+                _mm256_storeu_si256((__m256i *)(output + 0), _mm512_cvtepi16_epi8(vmul_sb0));
+                _mm256_storeu_si256((__m256i *)(output + 32), _mm512_cvtepi16_epi8(vmul_sb1));
+
+                // Subblocks 2,3: use high nibbles of vql_0
+                __m256i vql_hi0 = _mm256_and_si256(_mm256_srli_epi16(vql_lo0, 4), v0F);
+                __m256i vql_hi1 = _mm256_and_si256(_mm256_srli_epi16(vql_lo1, 4), v0F);
+
+                // sb2: high nibbles of first 32 bytes, qh shift 4
+                __m256i vqh_sb2 = _mm256_and_si256(_mm256_srli_epi16(vqh_lo, 4), v03);
+                __m256i vq_sb2 = _mm256_or_si256(vql_hi0, _mm256_slli_epi16(vqh_sb2, 4));
+
+                // sb3: high nibbles of second 32 bytes, qh shift 6
+                __m256i vqh_sb3 = _mm256_and_si256(_mm256_srli_epi16(vqh_lo, 6), v03);
+                __m256i vq_sb3 = _mm256_or_si256(vql_hi1, _mm256_slli_epi16(vqh_sb3, 4));
+
+                __m512i vq16_sb2 = _mm512_sub_epi16(_mm512_cvtepu8_epi16(vq_sb2), v32_16);
+                __m512i vq16_sb3 = _mm512_sub_epi16(_mm512_cvtepu8_epi16(vq_sb3), v32_16);
+
+                __m512i vf2_0 = _mm512_set1_epi16(factors_fixed[4]);
+                __m512i vf2_1 = _mm512_set1_epi16(factors_fixed[5]);
+                __m512i vfactor_sb2 = _mm512_mask_blend_epi16(0xFFFF0000u, vf2_0, vf2_1);
+
+                __m512i vf3_0 = _mm512_set1_epi16(factors_fixed[6]);
+                __m512i vf3_1 = _mm512_set1_epi16(factors_fixed[7]);
+                __m512i vfactor_sb3 = _mm512_mask_blend_epi16(0xFFFF0000u, vf3_0, vf3_1);
+
+                __m512i vmul_sb2 = _mm512_srai_epi16(_mm512_add_epi16(_mm512_mullo_epi16(vq16_sb2, vfactor_sb2), v128_16), 8);
+                __m512i vmul_sb3 = _mm512_srai_epi16(_mm512_add_epi16(_mm512_mullo_epi16(vq16_sb3, vfactor_sb3), v128_16), 8);
+
+                _mm256_storeu_si256((__m256i *)(output + 64), _mm512_cvtepi16_epi8(vmul_sb2));
+                _mm256_storeu_si256((__m256i *)(output + 96), _mm512_cvtepi16_epi8(vmul_sb3));
+            }
+
+            // === HALF 1: subblocks 4,5 then 6,7 ===
+            {
+                const __m256i vql_lo0 = _mm512_castsi512_si256(vql_1);
+                const __m256i vql_lo1 = _mm512_extracti64x4_epi64(vql_1, 1);
+
+                // sb4: low nibbles of first 32 bytes, qh shift 0
+                __m256i vql_sb4 = _mm256_and_si256(vql_lo0, v0F);
+                __m256i vqh_sb4 = _mm256_and_si256(vqh_hi, v03);
+                __m256i vq_sb4 = _mm256_or_si256(vql_sb4, _mm256_slli_epi16(vqh_sb4, 4));
+
+                // sb5: low nibbles of second 32 bytes, qh shift 2
+                __m256i vql_sb5 = _mm256_and_si256(vql_lo1, v0F);
+                __m256i vqh_sb5 = _mm256_and_si256(_mm256_srli_epi16(vqh_hi, 2), v03);
+                __m256i vq_sb5 = _mm256_or_si256(vql_sb5, _mm256_slli_epi16(vqh_sb5, 4));
+
+                __m512i vq16_sb4 = _mm512_sub_epi16(_mm512_cvtepu8_epi16(vq_sb4), v32_16);
+                __m512i vq16_sb5 = _mm512_sub_epi16(_mm512_cvtepu8_epi16(vq_sb5), v32_16);
+
+                __m512i vf4_0 = _mm512_set1_epi16(factors_fixed[8]);
+                __m512i vf4_1 = _mm512_set1_epi16(factors_fixed[9]);
+                __m512i vfactor_sb4 = _mm512_mask_blend_epi16(0xFFFF0000u, vf4_0, vf4_1);
+
+                __m512i vf5_0 = _mm512_set1_epi16(factors_fixed[10]);
+                __m512i vf5_1 = _mm512_set1_epi16(factors_fixed[11]);
+                __m512i vfactor_sb5 = _mm512_mask_blend_epi16(0xFFFF0000u, vf5_0, vf5_1);
+
+                __m512i vmul_sb4 = _mm512_srai_epi16(_mm512_add_epi16(_mm512_mullo_epi16(vq16_sb4, vfactor_sb4), v128_16), 8);
+                __m512i vmul_sb5 = _mm512_srai_epi16(_mm512_add_epi16(_mm512_mullo_epi16(vq16_sb5, vfactor_sb5), v128_16), 8);
+
+                _mm256_storeu_si256((__m256i *)(output + 128), _mm512_cvtepi16_epi8(vmul_sb4));
+                _mm256_storeu_si256((__m256i *)(output + 160), _mm512_cvtepi16_epi8(vmul_sb5));
+
+                // sb6,7: high nibbles
+                __m256i vql_hi0 = _mm256_and_si256(_mm256_srli_epi16(vql_lo0, 4), v0F);
+                __m256i vql_hi1 = _mm256_and_si256(_mm256_srli_epi16(vql_lo1, 4), v0F);
+
+                __m256i vqh_sb6 = _mm256_and_si256(_mm256_srli_epi16(vqh_hi, 4), v03);
+                __m256i vq_sb6 = _mm256_or_si256(vql_hi0, _mm256_slli_epi16(vqh_sb6, 4));
+
+                __m256i vqh_sb7 = _mm256_and_si256(_mm256_srli_epi16(vqh_hi, 6), v03);
+                __m256i vq_sb7 = _mm256_or_si256(vql_hi1, _mm256_slli_epi16(vqh_sb7, 4));
+
+                __m512i vq16_sb6 = _mm512_sub_epi16(_mm512_cvtepu8_epi16(vq_sb6), v32_16);
+                __m512i vq16_sb7 = _mm512_sub_epi16(_mm512_cvtepu8_epi16(vq_sb7), v32_16);
+
+                __m512i vf6_0 = _mm512_set1_epi16(factors_fixed[12]);
+                __m512i vf6_1 = _mm512_set1_epi16(factors_fixed[13]);
+                __m512i vfactor_sb6 = _mm512_mask_blend_epi16(0xFFFF0000u, vf6_0, vf6_1);
+
+                __m512i vf7_0 = _mm512_set1_epi16(factors_fixed[14]);
+                __m512i vf7_1 = _mm512_set1_epi16(factors_fixed[15]);
+                __m512i vfactor_sb7 = _mm512_mask_blend_epi16(0xFFFF0000u, vf7_0, vf7_1);
+
+                __m512i vmul_sb6 = _mm512_srai_epi16(_mm512_add_epi16(_mm512_mullo_epi16(vq16_sb6, vfactor_sb6), v128_16), 8);
+                __m512i vmul_sb7 = _mm512_srai_epi16(_mm512_add_epi16(_mm512_mullo_epi16(vq16_sb7, vfactor_sb7), v128_16), 8);
+
+                _mm256_storeu_si256((__m256i *)(output + 192), _mm512_cvtepi16_epi8(vmul_sb6));
+                _mm256_storeu_si256((__m256i *)(output + 224), _mm512_cvtepi16_epi8(vmul_sb7));
+            }
+        }
+#endif
+
+        inline void unpack_q6_k_superblock_to_int8(
+            const Q6_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_q6_k_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+#endif
+
+            const float d = fp16_to_fp32(block.d);
+
+            // Process 2 halves (128 elements each = 4 subblocks each)
+            for (int half = 0; half < 2; ++half)
+            {
+                const uint8_t *ql = block.ql + half * 64;
+                const uint8_t *qh = block.qh + half * 32;
+                const int8_t *sc = block.scales + half * 8;
+                int8_t *out = output + half * 128;
+
+                // For each of 4 subblocks in this half
+                for (int sb = 0; sb < 4; ++sb)
+                {
+                    // Determine bit extraction parameters based on subblock
+                    const uint8_t *ql_ptr;
+                    int ql_shift, qh_shift;
+
+                    if (sb == 0)
+                    {
+                        ql_ptr = ql;
+                        ql_shift = 0;
+                        qh_shift = 0;
+                    }
+                    else if (sb == 1)
+                    {
+                        ql_ptr = ql + 32;
+                        ql_shift = 0;
+                        qh_shift = 2;
+                    }
+                    else if (sb == 2)
+                    {
+                        ql_ptr = ql;
+                        ql_shift = 4;
+                        qh_shift = 4;
+                    }
+                    else
+                    {
+                        ql_ptr = ql + 32;
+                        ql_shift = 4;
+                        qh_shift = 6;
+                    }
+
+                    // Scales for this subblock (2 scales per 32 elements)
+                    const float scale0 = d * sc[sb * 2 + 0];
+                    const float scale1 = d * sc[sb * 2 + 1];
+
+                    // Find max for INT8 quantization (process both 16-element halves)
+                    float max_abs = 0.0f;
+                    for (int l = 0; l < 32; ++l)
+                    {
+                        uint8_t ql_val = (ql_ptr[l] >> ql_shift) & 0xF;
+                        uint8_t qh_val = (qh[l] >> qh_shift) & 3;
+                        int8_t q = static_cast<int8_t>(ql_val | (qh_val << 4)) - 32;
+                        float s = (l < 16) ? scale0 : scale1;
+                        float val = std::fabs(s * q);
+                        if (val > max_abs)
+                            max_abs = val;
+                    }
+
+                    // Compute output scale
+                    float out_scale = max_abs / 127.0f;
+                    if (out_scale < 1e-10f)
+                        out_scale = 0.0f;
+
+                    int sb_idx = half * 4 + sb;
+                    if (scales)
+                        scales[sb_idx] = out_scale;
+                    if (mins)
+                        mins[sb_idx] = 0.0f;
+
+                    // Quantize to INT8
+                    int8_t *dst = out + sb * 32;
+                    if (out_scale == 0.0f)
+                    {
+                        std::memset(dst, 0, 32);
+                    }
+                    else
+                    {
+                        float inv_scale = 1.0f / out_scale;
+                        for (int l = 0; l < 32; ++l)
+                        {
+                            uint8_t ql_val = (ql_ptr[l] >> ql_shift) & 0xF;
+                            uint8_t qh_val = (qh[l] >> qh_shift) & 3;
+                            int8_t q = static_cast<int8_t>(ql_val | (qh_val << 4)) - 32;
+                            float s = (l < 16) ? scale0 : scale1;
+                            float val = s * q * inv_scale;
+                            int32_t qi = static_cast<int32_t>(std::nearbyint(val));
+                            if (qi < -128)
+                                qi = -128;
+                            if (qi > 127)
+                                qi = 127;
+                            dst[l] = static_cast<int8_t>(qi);
+                        }
+                    }
+                }
+            }
+        }
+
         // =====================================================================
         // FP32 → Q8_0 (direct quantization, already in FP32 format)
         // =====================================================================
@@ -6225,22 +9039,145 @@ namespace llaminar2
 #if defined(__AVX512F__) && defined(__AVX512BW__)
         /**
          * @brief AVX512 implementation for Q5_0 → int8 unpacking
-         * @note Currently falls back to scalar unpacking
+         *
+         * Fully vectorized: extracts high bits using SIMD bit manipulation.
+         * - Low 4 bits from qs[16] (2 per byte)
+         * - High bit from qh[4] (32 bits total)
+         * - Result: (low4 | high_bit_in_pos4) - 16
          */
         inline void unpack_q5_0_to_int8_avx512(const Q5_0Block &block, int8_t *output)
         {
-            unpack_q5_0_to_int8_scalar(block, output);
+            // Load qs[16] bytes
+            __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+            __m128i low_mask = _mm_set1_epi8(0x0F);
+
+            // Extract low and high nibbles
+            __m128i low_nibbles = _mm_and_si128(qs, low_mask);                     // Elements 0-15 (low 4 bits)
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask); // Elements 16-31 (high 4 bits)
+
+            // Load qh as 32-bit integer
+            uint32_t qh;
+            std::memcpy(&qh, block.qh, sizeof(qh));
+
+            // Bit mapping from scalar code analysis:
+            // output[j] (j=0..15): xh_0 = ((qh >> j) << 4) & 0x10 => bit j of qh
+            // output[j+16] (j=0..15): xh_1 = ((qh >> (j+12)) & 0x10 => bit (j+16) of qh (bit 4 of shifted result)
+            //
+            // So: low nibbles use qh bits 0-15, high nibbles use qh bits 16-31
+
+            // Bit mask for testing each bit position within a byte
+            __m128i bit_mask = _mm_set_epi8(
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+
+            // Extract each byte of qh
+            uint8_t qh_byte0 = static_cast<uint8_t>(qh);       // bits 0-7
+            uint8_t qh_byte1 = static_cast<uint8_t>(qh >> 8);  // bits 8-15
+            uint8_t qh_byte2 = static_cast<uint8_t>(qh >> 16); // bits 16-23
+            uint8_t qh_byte3 = static_cast<uint8_t>(qh >> 24); // bits 24-31
+
+            // Broadcast bytes for low nibbles (output 0-15 need qh bits 0-15)
+            __m128i qh_lo = _mm_set_epi8(
+                qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1,
+                qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0);
+
+            // Broadcast bytes for high nibbles (output 16-31 need qh bits 16-31)
+            __m128i qh_hi = _mm_set_epi8(
+                qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3,
+                qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2);
+
+            // Test each bit position
+            __m128i bits_lo = _mm_and_si128(qh_lo, bit_mask);
+            __m128i bits_hi = _mm_and_si128(qh_hi, bit_mask);
+
+            // Compare to get 0xFF where bit was set, 0x00 where not
+            bits_lo = _mm_cmpeq_epi8(bits_lo, bit_mask);
+            bits_hi = _mm_cmpeq_epi8(bits_hi, bit_mask);
+
+            // Convert 0xFF to 0x10 (bit 4 position)
+            __m128i pos4_mask = _mm_set1_epi8(0x10);
+            bits_lo = _mm_and_si128(bits_lo, pos4_mask);
+            bits_hi = _mm_and_si128(bits_hi, pos4_mask);
+
+            // Combine nibbles with high bits
+            __m128i result_lo = _mm_or_si128(low_nibbles, bits_lo);
+            __m128i result_hi = _mm_or_si128(high_nibbles, bits_hi);
+
+            // Subtract 16 (Q5_0 is symmetric around 0)
+            __m128i offset = _mm_set1_epi8(16);
+            result_lo = _mm_sub_epi8(result_lo, offset);
+            result_hi = _mm_sub_epi8(result_hi, offset);
+
+            // Store results
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), result_lo);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), result_hi);
         }
 #endif
 
 #if defined(__AVX2__)
         /**
          * @brief AVX2 implementation for Q5_0 → int8 unpacking
-         * @note Currently falls back to scalar unpacking
          */
         inline void unpack_q5_0_to_int8_avx2(const Q5_0Block &block, int8_t *output)
         {
-            unpack_q5_0_to_int8_scalar(block, output);
+            // Load qs[16] bytes
+            __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+            __m128i low_mask = _mm_set1_epi8(0x0F);
+
+            // Extract low and high nibbles
+            __m128i low_nibbles = _mm_and_si128(qs, low_mask);
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask);
+
+            // Load qh as 32-bit integer
+            uint32_t qh;
+            std::memcpy(&qh, block.qh, sizeof(qh));
+
+            // Bit mask for testing each bit position within a byte
+            __m128i bit_mask = _mm_set_epi8(
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+
+            // Extract each byte of qh
+            uint8_t qh_byte0 = static_cast<uint8_t>(qh);       // bits 0-7
+            uint8_t qh_byte1 = static_cast<uint8_t>(qh >> 8);  // bits 8-15
+            uint8_t qh_byte2 = static_cast<uint8_t>(qh >> 16); // bits 16-23
+            uint8_t qh_byte3 = static_cast<uint8_t>(qh >> 24); // bits 24-31
+
+            // Broadcast bytes for low nibbles (output 0-15 need qh bits 0-15)
+            __m128i qh_lo = _mm_set_epi8(
+                qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1,
+                qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0);
+
+            // Broadcast bytes for high nibbles (output 16-31 need qh bits 16-31)
+            __m128i qh_hi = _mm_set_epi8(
+                qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3,
+                qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2);
+
+            // Test each bit position
+            __m128i bits_lo = _mm_and_si128(qh_lo, bit_mask);
+            __m128i bits_hi = _mm_and_si128(qh_hi, bit_mask);
+
+            // Compare to get 0xFF where bit was set, 0x00 where not
+            bits_lo = _mm_cmpeq_epi8(bits_lo, bit_mask);
+            bits_hi = _mm_cmpeq_epi8(bits_hi, bit_mask);
+
+            // Convert 0xFF to 0x10 (bit 4 position)
+            __m128i pos4_mask = _mm_set1_epi8(0x10);
+            bits_lo = _mm_and_si128(bits_lo, pos4_mask);
+            bits_hi = _mm_and_si128(bits_hi, pos4_mask);
+
+            // Combine nibbles with high bits
+            __m128i result_lo = _mm_or_si128(low_nibbles, bits_lo);
+            __m128i result_hi = _mm_or_si128(high_nibbles, bits_hi);
+
+            // Subtract 16 (Q5_0 is symmetric around 0)
+            __m128i offset = _mm_set1_epi8(16);
+            result_lo = _mm_sub_epi8(result_lo, offset);
+            result_hi = _mm_sub_epi8(result_hi, offset);
+
+            // Store results
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), result_lo);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), result_hi);
         }
 #endif
 
@@ -6689,6 +9626,166 @@ namespace llaminar2
         }
 #endif
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /**
+         * @brief Optimized Q2_K superblock unpacking using AVX512
+         *
+         * Q2_K layout:
+         * - 256 elements total, split into 8 sub-blocks of 32 elements each
+         * - qs[64]: packed 2-bit values (4 per byte), organized as 2 chunks of 32 bytes
+         * - scales[16]: each byte has scale (low 4 bits) and min (high 4 bits)
+         * - Sub-block i uses: qs[chunk*32:(chunk+1)*32] with shift=(i%4)*2
+         *   where chunk = i/4, and scales[i*2] for first half, scales[i*2+1] for second half
+         *
+         * Strategy: Vectorize everything - scale extraction, range computation, LUT building
+         */
+        inline void unpack_q2_k_superblock_to_int8_avx512(
+            const Q2_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+
+            // 1. Extract all 16 dl/ml values using AVX512
+            __m128i v_sc = _mm_loadu_si128((const __m128i *)block.scales);
+            __m128i v_scale_i8 = _mm_and_si128(v_sc, _mm_set1_epi8(0x0F));
+            __m128i v_min_i8 = _mm_and_si128(_mm_srli_epi16(v_sc, 4), _mm_set1_epi8(0x0F));
+
+            __m512i v_scale_i32 = _mm512_cvtepu8_epi32(v_scale_i8);
+            __m512i v_min_i32 = _mm512_cvtepu8_epi32(v_min_i8);
+            __m512 v_scale_f = _mm512_cvtepi32_ps(v_scale_i32);
+            __m512 v_min_f = _mm512_cvtepi32_ps(v_min_i32);
+
+            __m512 v_d = _mm512_set1_ps(d);
+            __m512 v_dmin = _mm512_set1_ps(dmin);
+            __m512 v_dl = _mm512_mul_ps(v_d, v_scale_f);  // 16 dl values
+            __m512 v_ml = _mm512_mul_ps(v_dmin, v_min_f); // 16 ml values
+
+            // 2. Compute range for each sub-block (pair up halves)
+            // Half i: min = -ml[i], max = 3*dl[i] - ml[i]
+            __m512 v_local_min = _mm512_sub_ps(_mm512_setzero_ps(), v_ml);
+            __m512 v_local_max = _mm512_fmsub_ps(_mm512_set1_ps(3.0f), v_dl, v_ml);
+
+            // Pair: indices 0,1 → sb0; 2,3 → sb1; etc.
+            __m512 v_local_min_swap = _mm512_permute_ps(v_local_min, 0xB1); // swap adjacent
+            __m512 v_local_max_swap = _mm512_permute_ps(v_local_max, 0xB1);
+            __m512 v_gmin = _mm512_min_ps(v_local_min, v_local_min_swap);
+            __m512 v_gmax = _mm512_max_ps(v_local_max, v_local_max_swap);
+            __m512 v_range = _mm512_sub_ps(v_gmax, v_gmin);
+
+            // 3. Compute scale/bias for each half (each half in a sub-block shares the same scale)
+            __mmask16 mask_small = _mm512_cmp_ps_mask(v_range, _mm512_set1_ps(1e-5f), _CMP_LT_OQ);
+            __m512 v_out_s = _mm512_div_ps(v_range, _mm512_set1_ps(255.0f));
+            __m512 v_out_m = _mm512_fmadd_ps(_mm512_set1_ps(128.0f), v_out_s, v_gmin);
+            v_out_s = _mm512_mask_blend_ps(mask_small, v_out_s, _mm512_setzero_ps());
+            v_out_m = _mm512_mask_blend_ps(mask_small, v_out_m, v_gmin);
+
+            __m512 v_safe_s = _mm512_mask_blend_ps(mask_small, v_out_s, _mm512_set1_ps(1.0f));
+            __m512 v_inv = _mm512_div_ps(_mm512_set1_ps(1.0f), v_safe_s);
+            __m512 v_bias = _mm512_mul_ps(_mm512_sub_ps(_mm512_setzero_ps(), v_out_m), v_inv);
+            v_inv = _mm512_mask_blend_ps(mask_small, v_inv, _mm512_setzero_ps());
+            v_bias = _mm512_mask_blend_ps(mask_small, v_bias, _mm512_set1_ps(-128.0f));
+
+            // 4. Save scales/mins if requested
+            if (scales || mins)
+            {
+                alignas(64) float tmp_s[16], tmp_m[16];
+                _mm512_store_ps(tmp_s, v_out_s);
+                _mm512_store_ps(tmp_m, v_out_m);
+                for (int i = 0; i < 8; ++i)
+                {
+                    if (scales)
+                        scales[i] = tmp_s[2 * i];
+                    if (mins)
+                        mins[i] = tmp_m[2 * i];
+                }
+            }
+
+            // 5. Build all 8 LUTs using vectorized computation
+            // For each half h (0-15), LUT[h,q] = round((dl[h] * q - ml[h]) * inv[h] + bias[h])
+            // where q ∈ {0,1,2,3}
+            alignas(64) int8_t lut_data[8 * 32]; // 8 LUTs, 32 bytes each (only first 4 and bytes 16-19 used per LUT)
+
+            // Process 2 sub-blocks (4 halves) at a time to fit in AVX512
+            __m512 v_q = _mm512_set_ps(3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0);
+
+            auto build_2_luts = [&](int sb_base)
+            {
+                // sb_base = 0 or 2 or 4 or 6
+                // Halves: sb_base*2, sb_base*2+1, (sb_base+1)*2, (sb_base+1)*2+1
+                int h0 = sb_base * 2, h1 = h0 + 1, h2 = h0 + 2, h3 = h0 + 3;
+
+                __m512i idx = _mm512_set_epi32(h3, h3, h3, h3, h2, h2, h2, h2, h1, h1, h1, h1, h0, h0, h0, h0);
+                __m512 v_dl_sel = _mm512_permutexvar_ps(idx, v_dl);
+                __m512 v_ml_sel = _mm512_permutexvar_ps(idx, v_ml);
+                __m512 v_inv_sel = _mm512_permutexvar_ps(idx, v_inv);
+                __m512 v_bias_sel = _mm512_permutexvar_ps(idx, v_bias);
+
+                // val = dl * q - ml
+                __m512 v_val = _mm512_fmsub_ps(v_dl_sel, v_q, v_ml_sel);
+                // lut = round(val * inv + bias)
+                __m512 v_lut_f = _mm512_fmadd_ps(v_val, v_inv_sel, v_bias_sel);
+                __m512i v_lut_i32 = _mm512_cvtps_epi32(v_lut_f);
+                __m128i v_lut_i8 = _mm512_cvtepi32_epi8(v_lut_i32); // 16 int8s
+
+                // Layout: [sb_base half0: q0,q1,q2,q3] [sb_base half1: q0,q1,q2,q3] [sb_base+1 half0: ...] [sb_base+1 half1: ...]
+                alignas(16) int8_t tmp[16];
+                _mm_store_si128((__m128i *)tmp, v_lut_i8);
+
+                // Copy to proper LUT positions
+                int8_t *lut0 = lut_data + sb_base * 32;
+                int8_t *lut1 = lut_data + (sb_base + 1) * 32;
+
+                // LUT0: half0 at [0-3], half1 at [16-19]
+                lut0[0] = tmp[0];
+                lut0[1] = tmp[1];
+                lut0[2] = tmp[2];
+                lut0[3] = tmp[3];
+                lut0[16] = tmp[4];
+                lut0[17] = tmp[5];
+                lut0[18] = tmp[6];
+                lut0[19] = tmp[7];
+
+                // LUT1: half0 at [0-3], half1 at [16-19]
+                lut1[0] = tmp[8];
+                lut1[1] = tmp[9];
+                lut1[2] = tmp[10];
+                lut1[3] = tmp[11];
+                lut1[16] = tmp[12];
+                lut1[17] = tmp[13];
+                lut1[18] = tmp[14];
+                lut1[19] = tmp[15];
+            };
+
+            build_2_luts(0);
+            build_2_luts(2);
+            build_2_luts(4);
+            build_2_luts(6);
+
+            // 6. Apply LUTs using AVX2 vpshufb
+            for (int chunk = 0; chunk < 2; ++chunk)
+            {
+                const uint8_t *q_ptr = block.qs + chunk * 32;
+                __m256i q_256 = _mm256_loadu_si256((const __m256i *)q_ptr);
+
+                for (int j = 0; j < 4; ++j)
+                {
+                    int sb = chunk * 4 + j;
+                    int shift = j * 2;
+
+                    __m256i lut_vec = _mm256_loadu_si256((const __m256i *)(lut_data + sb * 32));
+                    __m128i count = _mm_cvtsi32_si128(shift);
+                    __m256i q_shifted = _mm256_srl_epi16(q_256, count);
+                    __m256i q_indices = _mm256_and_si256(q_shifted, _mm256_set1_epi8(3));
+                    __m256i result = _mm256_shuffle_epi8(lut_vec, q_indices);
+                    _mm256_storeu_si256((__m256i *)(output + sb * 32), result);
+                }
+            }
+        }
+#endif
+
         inline void transcode_q2_k_to_int8(const Q2_KBlock &block, int sub_block_idx, int8_t *output, float *out_scale, float *out_min)
         {
 #if defined(__AVX2__)
@@ -6696,6 +9793,60 @@ namespace llaminar2
 #else
             transcode_q2_k_to_int8_scalar(block, sub_block_idx, output, out_scale, out_min);
 #endif
+        }
+
+        /**
+         * @brief Unpack entire Q2_K super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks with single CPU dispatch.
+         *
+         * @param block Source Q2_K super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins
+         */
+        inline void unpack_q2_k_superblock_to_int8(
+            const Q2_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_q2_k_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    float s, m;
+                    transcode_q2_k_to_int8_avx2(block, i, output + i * 32, &s, &m);
+                    if (scales)
+                        scales[i] = s;
+                    if (mins)
+                        mins[i] = m;
+                }
+                return;
+            }
+#endif
+
+            // Scalar fallback
+            for (int i = 0; i < 8; ++i)
+            {
+                float s, m;
+                transcode_q2_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
+                if (scales)
+                    scales[i] = s;
+                if (mins)
+                    mins[i] = m;
+            }
         }
 
         /**
@@ -6878,22 +10029,132 @@ namespace llaminar2
 #if defined(__AVX512F__) && defined(__AVX512BW__)
         /**
          * @brief AVX512 implementation for Q5_1 → int8 unpacking
-         * @note Currently falls back to scalar unpacking
+         *
+         * Fully vectorized - same as Q5_0 but without the -16 offset (asymmetric).
          */
         inline void unpack_q5_1_to_int8_avx512(const Q5_1Block &block, int8_t *output)
         {
-            unpack_q5_1_to_int8_scalar(block, output);
+            // Load qs[16] bytes
+            __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+            __m128i low_mask = _mm_set1_epi8(0x0F);
+
+            // Extract low and high nibbles
+            __m128i low_nibbles = _mm_and_si128(qs, low_mask);
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask);
+
+            // Load qh as 32-bit integer
+            uint32_t qh;
+            std::memcpy(&qh, block.qh, sizeof(qh));
+
+            // Bit mapping from scalar code analysis:
+            // output[j] (j=0..15): xh_0 = ((qh >> j) << 4) & 0x10 => bit j of qh
+            // output[j+16] (j=0..15): xh_1 = ((qh >> (j+12)) & 0x10 => bit (j+16) of qh
+            //
+            // So: low nibbles use qh bits 0-15, high nibbles use qh bits 16-31
+
+            // Bit mask for testing each bit position within a byte
+            __m128i bit_mask = _mm_set_epi8(
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+
+            // Extract each byte of qh
+            uint8_t qh_byte0 = static_cast<uint8_t>(qh);       // bits 0-7
+            uint8_t qh_byte1 = static_cast<uint8_t>(qh >> 8);  // bits 8-15
+            uint8_t qh_byte2 = static_cast<uint8_t>(qh >> 16); // bits 16-23
+            uint8_t qh_byte3 = static_cast<uint8_t>(qh >> 24); // bits 24-31
+
+            // Broadcast bytes for low nibbles (output 0-15 need qh bits 0-15)
+            __m128i qh_lo = _mm_set_epi8(
+                qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1,
+                qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0);
+
+            // Broadcast bytes for high nibbles (output 16-31 need qh bits 16-31)
+            __m128i qh_hi = _mm_set_epi8(
+                qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3,
+                qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2);
+
+            // Test each bit position
+            __m128i bits_lo = _mm_and_si128(qh_lo, bit_mask);
+            __m128i bits_hi = _mm_and_si128(qh_hi, bit_mask);
+
+            // Compare to get 0xFF where bit was set, 0x00 where not
+            bits_lo = _mm_cmpeq_epi8(bits_lo, bit_mask);
+            bits_hi = _mm_cmpeq_epi8(bits_hi, bit_mask);
+
+            // Convert 0xFF to 0x10 (bit 4 position)
+            __m128i pos4_mask = _mm_set1_epi8(0x10);
+            bits_lo = _mm_and_si128(bits_lo, pos4_mask);
+            bits_hi = _mm_and_si128(bits_hi, pos4_mask);
+
+            // Combine nibbles with high bits (no offset for Q5_1 - asymmetric [0,31])
+            __m128i result_lo = _mm_or_si128(low_nibbles, bits_lo);
+            __m128i result_hi = _mm_or_si128(high_nibbles, bits_hi);
+
+            // Store results
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), result_lo);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), result_hi);
         }
 #endif
 
 #if defined(__AVX2__)
         /**
          * @brief AVX2 implementation for Q5_1 → int8 unpacking
-         * @note Currently falls back to scalar unpacking
          */
         inline void unpack_q5_1_to_int8_avx2(const Q5_1Block &block, int8_t *output)
         {
-            unpack_q5_1_to_int8_scalar(block, output);
+            // Load qs[16] bytes
+            __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+            __m128i low_mask = _mm_set1_epi8(0x0F);
+
+            // Extract low and high nibbles
+            __m128i low_nibbles = _mm_and_si128(qs, low_mask);
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask);
+
+            // Load qh as 32-bit integer
+            uint32_t qh;
+            std::memcpy(&qh, block.qh, sizeof(qh));
+
+            // Bit mask for testing each bit position within a byte
+            __m128i bit_mask = _mm_set_epi8(
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+
+            // Extract each byte of qh
+            uint8_t qh_byte0 = static_cast<uint8_t>(qh);       // bits 0-7
+            uint8_t qh_byte1 = static_cast<uint8_t>(qh >> 8);  // bits 8-15
+            uint8_t qh_byte2 = static_cast<uint8_t>(qh >> 16); // bits 16-23
+            uint8_t qh_byte3 = static_cast<uint8_t>(qh >> 24); // bits 24-31
+
+            // Broadcast bytes for low nibbles (output 0-15 need qh bits 0-15)
+            __m128i qh_lo = _mm_set_epi8(
+                qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1,
+                qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0);
+
+            // Broadcast bytes for high nibbles (output 16-31 need qh bits 16-31)
+            __m128i qh_hi = _mm_set_epi8(
+                qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3,
+                qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2);
+
+            // Test each bit position
+            __m128i bits_lo = _mm_and_si128(qh_lo, bit_mask);
+            __m128i bits_hi = _mm_and_si128(qh_hi, bit_mask);
+
+            // Compare to get 0xFF where bit was set, 0x00 where not
+            bits_lo = _mm_cmpeq_epi8(bits_lo, bit_mask);
+            bits_hi = _mm_cmpeq_epi8(bits_hi, bit_mask);
+
+            // Convert 0xFF to 0x10 (bit 4 position)
+            __m128i pos4_mask = _mm_set1_epi8(0x10);
+            bits_lo = _mm_and_si128(bits_lo, pos4_mask);
+            bits_hi = _mm_and_si128(bits_hi, pos4_mask);
+
+            // Combine nibbles with high bits (no offset for Q5_1 - asymmetric [0,31])
+            __m128i result_lo = _mm_or_si128(low_nibbles, bits_lo);
+            __m128i result_hi = _mm_or_si128(high_nibbles, bits_hi);
+
+            // Store results
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), result_lo);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), result_hi);
         }
 #endif
 
@@ -7007,6 +10268,112 @@ namespace llaminar2
         }
 
         /**
+         * @brief Unpack entire Q5_K super-block to int8 (256 elements)
+         *
+         * Optimized version that processes all 8 sub-blocks with single CPU dispatch.
+         *
+         * @param block Source Q5_K super-block
+         * @param output Output buffer for 256 int8 values
+         * @param scales Optional output buffer for 8 float scales
+         * @param mins Optional output buffer for 8 float mins
+         */
+        inline void unpack_q5_k_superblock_to_int8(
+            const Q5_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                // Load high bits once (32 bytes) - contains high bits for all 8 sub-blocks
+                __m256i v_qh = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qh));
+                __m256i v_mask_0F = _mm256_set1_epi8(0x0F);
+                __m256i v_16 = _mm256_set1_epi8(16);
+                __m256i v_zero = _mm256_setzero_si256();
+
+                // Process 4 pairs of sub-blocks (8 sub-blocks total)
+                // Each iteration processes sub-blocks 2*i and 2*i+1
+                for (int i = 0; i < 4; ++i)
+                {
+                    // Load 32 bytes of qs (contains sub-blocks 2*i and 2*i+1)
+                    // qs has 128 bytes total. 32 bytes = 64 nibbles = 64 elements = 2 sub-blocks.
+                    const uint8_t *qs_ptr = block.qs + i * 32;
+                    __m256i v_qs = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qs_ptr));
+
+                    // Sub-block 2*i (Low nibbles)
+                    {
+                        int sb_idx = 2 * i;
+                        __m256i v_q_val = _mm256_and_si256(v_qs, v_mask_0F);
+
+                        // High bit extraction
+                        __m256i v_bit_mask = _mm256_set1_epi8(1 << sb_idx);
+                        __m256i v_high_bit = _mm256_and_si256(v_qh, v_bit_mask);
+                        __m256i v_is_zero = _mm256_cmpeq_epi8(v_high_bit, v_zero);
+                        __m256i v_add_16 = _mm256_andnot_si256(v_is_zero, v_16);
+                        v_q_val = _mm256_add_epi8(v_q_val, v_add_16);
+
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + sb_idx * 32), v_q_val);
+
+                        if (scales || mins)
+                        {
+                            float s, m;
+                            get_q5_k_scale_min(block, sb_idx, &s, &m);
+                            if (scales)
+                                scales[sb_idx] = s;
+                            if (mins)
+                                mins[sb_idx] = -m;
+                        }
+                    }
+
+                    // Sub-block 2*i+1 (High nibbles)
+                    {
+                        int sb_idx = 2 * i + 1;
+                        // Shift right by 4 bits (operating on 16-bit words, then masking)
+                        __m256i v_q_val = _mm256_and_si256(_mm256_srli_epi16(v_qs, 4), v_mask_0F);
+
+                        // High bit extraction
+                        __m256i v_bit_mask = _mm256_set1_epi8(1 << sb_idx);
+                        __m256i v_high_bit = _mm256_and_si256(v_qh, v_bit_mask);
+                        __m256i v_is_zero = _mm256_cmpeq_epi8(v_high_bit, v_zero);
+                        __m256i v_add_16 = _mm256_andnot_si256(v_is_zero, v_16);
+                        v_q_val = _mm256_add_epi8(v_q_val, v_add_16);
+
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + sb_idx * 32), v_q_val);
+
+                        if (scales || mins)
+                        {
+                            float s, m;
+                            get_q5_k_scale_min(block, sb_idx, &s, &m);
+                            if (scales)
+                                scales[sb_idx] = s;
+                            if (mins)
+                                mins[sb_idx] = -m;
+                        }
+                    }
+                }
+                return;
+            }
+#endif
+
+            // Scalar fallback
+            for (int i = 0; i < 8; ++i)
+            {
+                unpack_q5_k_to_int8_scalar(block, i, output + i * 32);
+                if (scales || mins)
+                {
+                    float s, m;
+                    get_q5_k_scale_min(block, i, &s, &m);
+                    if (scales)
+                        scales[i] = s;
+                    if (mins)
+                        mins[i] = -m;
+                }
+            }
+        }
+
+        /**
          * @brief Unpack IQ4_NL block to int8 values (using lookup table)
          *
          * @param block IQ4_NL block
@@ -7015,7 +10382,8 @@ namespace llaminar2
         inline void unpack_iq4_nl_to_int8(const IQ4_NLBlock &block, int8_t *output)
         {
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 // Load 16 bytes of indices
                 __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
@@ -7062,7 +10430,8 @@ namespace llaminar2
             const uint8_t *qs_ptr = block.qs + subblock_idx * 16;
 
 #if defined(__AVX2__)
-            if (cpu_supports_avx2())
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
                 // Load 16 bytes of indices
                 __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(qs_ptr));
@@ -7098,6 +10467,81 @@ namespace llaminar2
         }
 
         /**
+         * @brief Unpack entire IQ4_XS superblock (256 elements) to INT8
+         *
+         * Optimized implementation that processes all 8 sub-blocks at once.
+         * Also computes the 8 scale factors.
+         *
+         * @param block IQ4_XS super-block
+         * @param output Output buffer (256 int8_t values)
+         * @param scales Output buffer (8 float values), optional
+         */
+        inline void unpack_iq4_xs_superblock_to_int8(
+            const IQ4_XSBlock &block,
+            int8_t *output,
+            float *scales = nullptr)
+        {
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                // Load lookup table
+                __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i *>(kvalues_iq4nl_i8));
+                __m128i low_mask = _mm_set1_epi8(0x0F);
+
+                const __m128i *qs_ptr = reinterpret_cast<const __m128i *>(block.qs);
+                __m128i *out_ptr = reinterpret_cast<__m128i *>(output);
+
+                // Unroll loop for 8 sub-blocks (128 bytes input -> 8 x 16 bytes)
+                // Each 16-byte input produces 32 bytes output (2 x 16 bytes)
+                for (int i = 0; i < 8; ++i)
+                {
+                    __m128i qs = _mm_loadu_si128(qs_ptr + i);
+
+                    __m128i low_indices = _mm_and_si128(qs, low_mask);
+                    __m128i high_indices = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask);
+
+                    __m128i low_vals = _mm_shuffle_epi8(lut, low_indices);
+                    __m128i high_vals = _mm_shuffle_epi8(lut, high_indices);
+
+                    _mm_storeu_si128(out_ptr + 2 * i, low_vals);
+                    _mm_storeu_si128(out_ptr + 2 * i + 1, high_vals);
+                }
+            }
+            else
+#endif
+            {
+                // Scalar fallback
+                const uint8_t *qs_ptr = block.qs;
+                for (int i = 0; i < 8; ++i)
+                {
+                    int8_t *sub_out = output + i * 32;
+                    const uint8_t *sub_qs = qs_ptr + i * 16;
+                    for (int j = 0; j < 16; ++j)
+                    {
+                        uint8_t val = sub_qs[j];
+                        sub_out[j] = kvalues_iq4nl_i8[val & 0x0F];
+                        sub_out[j + 16] = kvalues_iq4nl_i8[val >> 4];
+                    }
+                }
+            }
+
+            // Compute scales if requested
+            if (scales)
+            {
+                const float d = fp16_to_fp32(block.d);
+
+                // Scalar scale computation (fast enough for 8 values)
+                for (int i = 0; i < 8; ++i)
+                {
+                    int ls = ((block.scales_l[i / 2] >> 4 * (i % 2)) & 0xf) |
+                             (((block.scales_h >> 2 * i) & 3) << 4);
+                    scales[i] = d * (ls - 32);
+                }
+            }
+        }
+
+        /**
          * @brief Get scale for IQ4_XS sub-block
          *
          * @param block IQ4_XS super-block
@@ -7111,6 +10555,33 @@ namespace llaminar2
             const int ls = ((block.scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) |
                            (((block.scales_h >> 2 * ib) & 3) << 4);
             return d * (ls - 32);
+        }
+
+        /**
+         * @brief Decode IQ3_S sub-block to FP32 (auto-dispatch)
+         */
+        inline void decode_iq3s_subblock_to_fp32(
+            const IQ3_SBlock &block,
+            size_t subblock_idx,
+            float *output)
+        {
+#if defined(__AVX512F__)
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                decode_iq3s_subblock_to_fp32_avx512(block, subblock_idx, output);
+                return;
+            }
+#endif
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                decode_iq3s_subblock_to_fp32_avx2(block, subblock_idx, output);
+                return;
+            }
+#endif
+            decode_iq3s_subblock_to_fp32_scalar(block, subblock_idx, output);
         }
 
     } // namespace simd

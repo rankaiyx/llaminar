@@ -199,6 +199,7 @@ namespace llaminar2
 
         size_t kv_dim = n_kv_heads_ * head_dim_;
 
+#pragma omp parallel for
         for (int layer = 0; layer < n_layers_; ++layer)
         {
             int current_cached = cache_[layer].cached_tokens;

@@ -456,6 +456,27 @@ namespace llaminar2
         simd::decode_q6_k_to_q8_0(q6k_block, sub_idx, output->qs, &output->d);
     }
 
+    void Q6_KTensor::unpack_superblock_to_int8(
+        size_t row_idx,
+        size_t superblock_idx,
+        int8_t *output,
+        float *scales,
+        float *mins) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("Q6_KTensor::unpack_superblock_to_int8: output must not be null");
+        }
+
+        const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(data_ptr);
+        const Q6_KBlock &block = blocks[row_idx * blocks_per_row + superblock_idx];
+
+        // Unpack all 8 sub-blocks (256 elements total)
+        simd::unpack_q6_k_superblock_to_int8(block, output, scales, mins);
+    }
+
     void Q6_KTensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
     {
         const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;

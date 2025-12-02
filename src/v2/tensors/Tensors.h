@@ -445,6 +445,59 @@ namespace llaminar2
         virtual float get_block_min(
             size_t row_idx,
             size_t k_block_offset) const { return 0.0f; }
+
+        /**
+         * @brief Get the super-block size for this format
+         *
+         * Returns 32 for simple formats (Q4_0, Q8_0, etc.) where each block is independent.
+         * Returns 256 for K-quant and IQuant formats that have 256-element super-blocks
+         * containing 8 sub-blocks of 32 elements each.
+         *
+         * @return 32 for simple formats, 256 for super-block formats
+         */
+        virtual size_t superblock_size() const { return 32; }
+
+        /**
+         * @brief Unpack an entire super-block to plain int8 values
+         *
+         * For super-block formats (Q4_K, Q6_K, IQ3_S, etc.), this unpacks all 256 elements
+         * of a super-block in one call, which is more efficient than 8 separate calls to
+         * unpack_block_to_int8() because:
+         * - Super-block header (scales, mins) is read once instead of 8 times
+         * - Better instruction-level parallelism
+         * - Fewer function call overhead
+         *
+         * For simple 32-element formats, the default implementation just calls
+         * unpack_block_to_int8() once.
+         *
+         * @param row_idx Row index in weight tensor
+         * @param superblock_idx Super-block index along K dimension
+         * @param output Output buffer (must have space for superblock_size() elements)
+         * @param scales Output buffer for 8 sub-block scales (must have space for 8 floats, or nullptr)
+         * @param mins Output buffer for 8 sub-block mins (must have space for 8 floats, or nullptr)
+         *
+         * @note For simple formats, superblock_idx == k_block_offset
+         * @note For super-block formats, superblock_idx indexes 256-element super-blocks
+         */
+        virtual void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const
+        {
+            // Default implementation for simple 32-element formats
+            // Just calls unpack_block_to_int8 once
+            unpack_block_to_int8(row_idx, superblock_idx, output);
+            if (scales)
+            {
+                scales[0] = get_block_scale(row_idx, superblock_idx);
+            }
+            if (mins)
+            {
+                mins[0] = get_block_min(row_idx, superblock_idx);
+            }
+        }
     };
 
     /**
@@ -1441,6 +1494,43 @@ namespace llaminar2
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
+        size_t superblock_size() const override { return 256; }
+
+        void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
+            const size_t base_block = superblock_idx * 8;
+            const IQ4_NLBlock *src = &blocks[row_idx * blocks_per_row + base_block];
+
+            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
+            for (int i = 0; i < 8; ++i)
+            {
+                simd::unpack_iq4_nl_to_int8(src[i], output + i * 32);
+            }
+
+            if (scales)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    scales[i] = fp16_to_fp32(src[i].d);
+                }
+            }
+            if (mins)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    mins[i] = 0.0f; // IQ4_NL is symmetric
+                }
+            }
+        }
+
         // Format conversion (TensorBase interface - delegates to decode methods)
         void to_fp32(float *dst) const override { decode_to_fp32(dst); }
         void to_bf16(uint16_t *dst) const override { decode_to_bf16(dst); }
@@ -1615,6 +1705,54 @@ namespace llaminar2
             return fp16_to_fp32(block->d);
         }
 
+        size_t superblock_size() const override { return 256; }
+
+        void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(data_ptr);
+            const size_t base_block = superblock_idx * 8;
+
+            // Copy 8 consecutive blocks (8 × 32 = 256 bytes)
+            const Q8_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
+#if defined(__AVX512F__)
+            // 4 × 64-byte stores = 256 bytes
+            for (int i = 0; i < 4; ++i)
+            {
+                __m512i data = _mm512_loadu_si512(reinterpret_cast<const char *>(src) + i * 64 + 2); // Skip 2-byte scale per block pair
+                // Note: Q8_0Block is 34 bytes (2 scale + 32 data), so blocks aren't contiguous
+                // Fall back to per-block copy
+            }
+#endif
+            // Blocks aren't contiguous in memory (each has a 2-byte scale header)
+            // So we copy each block's qs array separately but in one function call
+            for (int i = 0; i < 8; ++i)
+            {
+                std::memcpy(output + i * 32, src[i].qs, 32);
+            }
+
+            if (scales)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    scales[i] = fp16_to_fp32(src[i].d);
+                }
+            }
+            if (mins)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    mins[i] = 0.0f; // Q8_0 is symmetric
+                }
+            }
+        }
+
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
         std::shared_ptr<TensorBase> create_view(
@@ -1745,6 +1883,43 @@ namespace llaminar2
         {
             const Q8_1Block *block = static_cast<const Q8_1Block *>(get_raw_block_at(row_idx, k_block_offset));
             return fp16_to_fp32(block->d);
+        }
+
+        size_t superblock_size() const override { return 256; }
+
+        void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
+            const size_t base_block = superblock_idx * 8;
+
+            // Copy 8 consecutive blocks (8 × 32 = 256 bytes of int8 data)
+            const Q8_1Block *src = &blocks[row_idx * blocks_per_row + base_block];
+            for (int i = 0; i < 8; ++i)
+            {
+                std::memcpy(output + i * 32, src[i].qs, 32);
+            }
+
+            if (scales)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    scales[i] = fp16_to_fp32(src[i].d);
+                }
+            }
+            if (mins)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    mins[i] = 0.0f; // Q8_1 is symmetric (s field is sum, not min)
+                }
+            }
         }
 
         // IActivationTensor interface (Q8_1 activations)
@@ -1914,6 +2089,43 @@ namespace llaminar2
             size_t row_idx,
             size_t k_block_offset) const override;
 
+        size_t superblock_size() const override { return 256; }
+
+        void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q4_0Block *blocks = reinterpret_cast<const Q4_0Block *>(data_ptr);
+            const size_t base_block = superblock_idx * 8;
+            const Q4_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
+
+            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
+            for (int i = 0; i < 8; ++i)
+            {
+                simd::unpack_q4_0_to_int8(src[i], output + i * 32);
+            }
+
+            if (scales)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    scales[i] = fp16_to_fp32(src[i].d);
+                }
+            }
+            if (mins)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    mins[i] = 0.0f; // Q4_0 is symmetric
+                }
+            }
+        }
+
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
             const std::vector<size_t> &new_shape,
@@ -2032,6 +2244,43 @@ namespace llaminar2
             size_t row_idx,
             size_t k_block_offset) const override;
 
+        size_t superblock_size() const override { return 256; }
+
+        void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + Q4_1Block::BLOCK_SIZE - 1) / Q4_1Block::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q4_1Block *blocks = reinterpret_cast<const Q4_1Block *>(data_ptr);
+            const size_t base_block = superblock_idx * 8;
+            const Q4_1Block *src = &blocks[row_idx * blocks_per_row + base_block];
+
+            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
+            for (int i = 0; i < 8; ++i)
+            {
+                simd::unpack_q4_1_to_int8(src[i], output + i * 32);
+            }
+
+            if (scales)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    scales[i] = fp16_to_fp32(src[i].d);
+                }
+            }
+            if (mins)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    mins[i] = fp16_to_fp32(src[i].m);
+                }
+            }
+        }
+
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
             const std::vector<size_t> &new_shape,
@@ -2138,6 +2387,43 @@ namespace llaminar2
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override { return 0.0f; } // Q5_0 is symmetric
+
+        size_t superblock_size() const override { return 256; }
+
+        void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
+            const size_t base_block = superblock_idx * 8;
+            const Q5_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
+
+            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
+            for (int i = 0; i < 8; ++i)
+            {
+                simd::unpack_q5_0_to_int8(src[i], output + i * 32);
+            }
+
+            if (scales)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    scales[i] = fp16_to_fp32(src[i].d);
+                }
+            }
+            if (mins)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    mins[i] = 0.0f; // Q5_0 is symmetric
+                }
+            }
+        }
 
         // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
@@ -2249,6 +2535,43 @@ namespace llaminar2
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
 
+        size_t superblock_size() const override { return 256; }
+
+        void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const override
+        {
+            const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
+            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
+            const size_t base_block = superblock_idx * 8;
+            const Q5_1Block *src = &blocks[row_idx * blocks_per_row + base_block];
+
+            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
+            for (int i = 0; i < 8; ++i)
+            {
+                simd::unpack_q5_1_to_int8(src[i], output + i * 32);
+            }
+
+            if (scales)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    scales[i] = fp16_to_fp32(src[i].d);
+                }
+            }
+            if (mins)
+            {
+                for (int i = 0; i < 8; ++i)
+                {
+                    mins[i] = fp16_to_fp32(src[i].m);
+                }
+            }
+        }
+
         // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
@@ -2342,6 +2665,8 @@ namespace llaminar2
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2446,6 +2771,8 @@ namespace llaminar2
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2540,6 +2867,8 @@ namespace llaminar2
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
@@ -2659,6 +2988,8 @@ namespace llaminar2
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
         void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
@@ -2775,6 +3106,8 @@ namespace llaminar2
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
         float get_block_min(size_t row_idx, size_t k_block_offset) const override;
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Q8_0 quantization (for quantized GEMM)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
@@ -3052,6 +3385,9 @@ namespace llaminar2
             return simd::get_iq4_xs_scale(blocks[super_block_idx], sub_block_idx);
         }
 
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
+
         // SIMD decode methods (public for testing)
         static void decodeBlock(const IQ4_XSBlock &block, float *output);
         static void decodeBlockScalar(const IQ4_XSBlock &block, float *output);
@@ -3169,6 +3505,9 @@ namespace llaminar2
 
             return simd::get_iq2_xxs_scale(blocks[super_block_idx], sub_block_idx);
         }
+
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
@@ -3291,6 +3630,9 @@ namespace llaminar2
 
             return simd::get_iq2_xs_scale(blocks[super_block_idx], sub_block_idx);
         }
+
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
@@ -3422,6 +3764,9 @@ namespace llaminar2
             return simd::get_iq3_xxs_scale(blocks[super_block_idx], sub_block_idx);
         }
 
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
+
         // SIMD decode methods (public for testing)
         static void decodeBlock(const IQ3_XXSBlock &block, float *output);
         static void decodeBlockScalar(const IQ3_XXSBlock &block, float *output);
@@ -3539,6 +3884,9 @@ namespace llaminar2
 
             return simd::get_iq2_s_scale(blocks[super_block_idx], sub_block_idx);
         }
+
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
@@ -3666,6 +4014,9 @@ namespace llaminar2
             return simd::get_iq3_s_scale(blocks[super_block_idx], sub_block_idx);
         }
 
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
+
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return 32; }
@@ -3788,6 +4139,9 @@ namespace llaminar2
             return simd::get_iq1_s_scale(blocks[super_block_idx], sub_block_idx);
         }
 
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
+
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
         size_t block_size() const override { return IQ1_SBlock::BLOCK_SIZE; }
@@ -3909,6 +4263,9 @@ namespace llaminar2
 
             return simd::get_iq1_m_scale(blocks[super_block_idx], sub_block_idx);
         }
+
+        size_t superblock_size() const override { return 256; }
+        void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }

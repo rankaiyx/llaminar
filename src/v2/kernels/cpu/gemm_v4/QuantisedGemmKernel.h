@@ -52,6 +52,51 @@ namespace llaminar2
             }
 
         private:
+            // Helper to pack a single 32-element block
+            __attribute__((always_inline)) void pack_single_block(
+                int n,
+                int k_blk,
+                size_t row_base_offset,
+                const int8_t *temp_vals,
+                float scale,
+                float min_val,
+                int N_padded)
+            {
+                // Vectorized sum
+                int32_t sum = 0;
+#pragma omp simd reduction(+ : sum)
+                for (int i = 0; i < 32; ++i)
+                {
+                    sum += temp_vals[i];
+                }
+
+                // Pack 32 bytes into 8 groups of 4 bytes, strided by 256
+                // k_blk corresponds to 32 columns.
+                // k starts at k_blk * 32.
+                // k/4 starts at k_blk * 8.
+                size_t block_offset = row_base_offset + (size_t)(k_blk * 8) * 256;
+
+                // Ensure we don't write out of bounds if K is weirdly small/unaligned
+                // But packed_data is resized to K * N_padded.
+                // If K=33, K_blocks=2.
+                // k_blk=1. block_offset = ... + 2048.
+                // We write 32 bytes.
+                // If K=33, packed_data size is 33*64 = 2112.
+                // 2048 + 32 = 2080 < 2112. Safe.
+
+                int8_t *dst_ptr = packed_weights_.packed_data.data() + block_offset;
+
+                // Unroll the 8 writes
+                for (int j = 0; j < 8; ++j)
+                {
+                    std::memcpy(dst_ptr + j * 256, &temp_vals[j * 4], 4);
+                }
+
+                packed_weights_.compensation[k_blk * N_padded + n] = sum;
+                packed_weights_.scales[k_blk * N_padded + n] = scale;
+                packed_weights_.mins[k_blk * N_padded + n] = min_val;
+            }
+
             void pack_weights_generic(const TensorBase *weights)
             {
                 // Weights are typically [N, K] (out_features, in_features)
@@ -79,6 +124,8 @@ namespace llaminar2
                     return;
                 }
 
+                bool use_superblock = (unpackable->superblock_size() == 256);
+
 // Iterate over N rows of weights (Parallelized)
 #pragma omp parallel for schedule(static)
                 for (int n = 0; n < N; ++n)
@@ -90,7 +137,29 @@ namespace llaminar2
                     // Stride for K/4 is 256 bytes (64 * 4)
                     size_t row_base_offset = (size_t)n_blk * (K * 64) + n_rem * 4;
 
-                    for (int k_blk = 0; k_blk < K_blocks; ++k_blk)
+                    int k_blk = 0;
+
+                    if (use_superblock)
+                    {
+                        // Process superblocks (8 blocks at a time)
+                        int K_superblocks = K_blocks / 8;
+                        for (int k_sb = 0; k_sb < K_superblocks; ++k_sb)
+                        {
+                            int8_t sb_vals[256];
+                            float sb_scales[8];
+                            float sb_mins[8];
+
+                            unpackable->unpack_superblock_to_int8(n, k_sb, sb_vals, sb_scales, sb_mins);
+
+                            for (int i = 0; i < 8; ++i)
+                            {
+                                pack_single_block(n, k_blk + i, row_base_offset, sb_vals + i * 32, sb_scales[i], sb_mins[i], N_padded);
+                            }
+                            k_blk += 8;
+                        }
+                    }
+
+                    for (; k_blk < K_blocks; ++k_blk)
                     {
                         // Unpack block using generic interface
                         int8_t temp_vals[32];
@@ -98,39 +167,7 @@ namespace llaminar2
                         float scale = unpackable->get_block_scale(n, k_blk);
                         float min_val = unpackable->get_block_min(n, k_blk);
 
-                        // Vectorized sum
-                        int32_t sum = 0;
-#pragma omp simd reduction(+ : sum)
-                        for (int i = 0; i < 32; ++i)
-                        {
-                            sum += temp_vals[i];
-                        }
-
-                        // Pack 32 bytes into 8 groups of 4 bytes, strided by 256
-                        // k_blk corresponds to 32 columns.
-                        // k starts at k_blk * 32.
-                        // k/4 starts at k_blk * 8.
-                        size_t block_offset = row_base_offset + (size_t)(k_blk * 8) * 256;
-
-                        // Ensure we don't write out of bounds if K is weirdly small/unaligned
-                        // But packed_data is resized to K * N_padded.
-                        // If K=33, K_blocks=2.
-                        // k_blk=1. block_offset = ... + 2048.
-                        // We write 32 bytes.
-                        // If K=33, packed_data size is 33*64 = 2112.
-                        // 2048 + 32 = 2080 < 2112. Safe.
-
-                        int8_t *dst_ptr = packed_weights_.packed_data.data() + block_offset;
-
-                        // Unroll the 8 writes
-                        for (int j = 0; j < 8; ++j)
-                        {
-                            std::memcpy(dst_ptr + j * 256, &temp_vals[j * 4], 4);
-                        }
-
-                        packed_weights_.compensation[k_blk * N_padded + n] = sum;
-                        packed_weights_.scales[k_blk * N_padded + n] = scale;
-                        packed_weights_.mins[k_blk * N_padded + n] = min_val;
+                        pack_single_block(n, k_blk, row_base_offset, temp_vals, scale, min_val, N_padded);
                     }
                 }
             }

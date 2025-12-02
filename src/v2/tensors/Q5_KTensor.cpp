@@ -197,6 +197,45 @@ namespace llaminar2
         return -min_val;
     }
 
+    void Q5_KTensor::unpack_superblock_to_int8(
+        size_t row_idx,
+        size_t superblock_idx,
+        int8_t *output,
+        float *scales,
+        float *mins) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("Q5_KTensor::unpack_superblock_to_int8: output must not be null");
+        }
+
+        if (shape_.size() != 2)
+        {
+            throw std::runtime_error("Q5_KTensor::unpack_superblock_to_int8: tensor must be 2D");
+        }
+
+        if (row_idx >= shape_[0])
+        {
+            throw std::out_of_range("Q5_KTensor::unpack_superblock_to_int8: row index out of bounds");
+        }
+
+        const size_t cols = shape_[1];
+        const size_t super_blocks_per_row = (cols + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
+
+        if (superblock_idx >= super_blocks_per_row)
+        {
+            throw std::out_of_range("Q5_KTensor::unpack_superblock_to_int8: superblock index out of bounds");
+        }
+
+        // Get Q5_K super-block
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(data_ptr);
+        const Q5_KBlock &block = blocks[row_idx * super_blocks_per_row + superblock_idx];
+
+        // Unpack all 8 sub-blocks (256 elements total)
+        simd::unpack_q5_k_superblock_to_int8(block, output, scales, mins);
+    }
+
     void Q5_KTensor::decodeBlock(const Q5_KBlock &block, float *output)
     {
 #if defined(__AVX512F__)

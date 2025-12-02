@@ -161,8 +161,10 @@ namespace llaminar2
 #ifdef __AVX512F__
     void IQ3_STensor::decodeBlockAVX512(const IQ3_SBlock &block, float *output)
     {
-        // Stub: call scalar implementation
-        decodeBlockScalar(block, output);
+        for (size_t i = 0; i < 8; ++i)
+        {
+            simd::decode_iq3s_subblock_to_fp32_avx512(block, i, output + i * 32);
+        }
     }
 #endif
 
@@ -348,6 +350,32 @@ namespace llaminar2
         for (size_t sub_idx = 0; sub_idx < 8; ++sub_idx)
         {
             simd::decode_iq3s_to_q8_0(super_block, sub_idx, output[sub_idx].qs, &output[sub_idx].d);
+        }
+    }
+
+    void IQ3_STensor::unpack_superblock_to_int8(
+        size_t row_idx,
+        size_t superblock_idx,
+        int8_t *output,
+        float *scales,
+        float *mins) const
+    {
+        if (!output)
+        {
+            throw std::invalid_argument("IQ3_STensor::unpack_superblock_to_int8: output must not be null");
+        }
+
+        const size_t blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
+        const IQ3_SBlock &super_block = blocks[row_idx * blocks_per_row + superblock_idx];
+
+        // Unpack all 8 sub-blocks (256 elements total) - single decode call per sub-block
+        simd::unpack_iq3_s_superblock_to_int8(super_block, output, scales);
+        if (mins)
+        {
+            for (int i = 0; i < 8; ++i)
+                mins[i] = 0.0f;
         }
     }
 
