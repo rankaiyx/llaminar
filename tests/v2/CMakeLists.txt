@@ -593,6 +593,19 @@ add_v2_test(V2_Unit_KernelFactory
     MPI_PROCS 1  # Kernel factory tests, single rank
 )
 
+# Test: KernelFactory automatic cache invalidation on tensor destruction
+add_executable(v2_test_kernel_factory_cache_invalidation unit/Test__KernelFactoryCacheInvalidation.cpp)
+target_link_libraries(v2_test_kernel_factory_cache_invalidation
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
+    COMMAND $<TARGET_FILE:v2_test_kernel_factory_cache_invalidation>
+    LABELS "V2;Unit;Kernels;KernelFactory;CacheInvalidation;MemorySafety"
+    MPI_PROCS 1  # Cache invalidation tests, single rank
+)
+
 # Test: RMSNorm precision variants (FP32/BF16/FP16/INT32 scalar/AVX2/AVX512 parity)
 add_executable(v2_test_rmsnorm_precision unit/Test__RMSNormPrecision.cpp)
 target_link_libraries(v2_test_rmsnorm_precision 

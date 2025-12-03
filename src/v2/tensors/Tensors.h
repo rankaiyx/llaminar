@@ -548,7 +548,7 @@ namespace llaminar2
     class TensorBase : public std::enable_shared_from_this<TensorBase>
     {
     public:
-        virtual ~TensorBase() = default;
+        virtual ~TensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
 
         // Non-copyable: tensors contain mutexes and cached kernels
         // Use copyFrom() method to copy data between tensors

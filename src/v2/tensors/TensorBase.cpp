@@ -11,6 +11,7 @@
 #include "../utils/CPUFeatures.h"
 #include "../utils/Logger.h"
 #include "../backends/BackendManager.h"
+#include "../kernels/KernelFactory.h"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -20,6 +21,14 @@
 
 namespace llaminar2
 {
+
+    // ===== TensorBase destructor =====
+    // Clears the kernel cache entry for this tensor to prevent use-after-free
+    // when a new tensor is allocated at the same memory address.
+    TensorBase::~TensorBase()
+    {
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(this);
+    }
 
     void TensorBase::to_fp32_via_blocks(float *dst) const
     {

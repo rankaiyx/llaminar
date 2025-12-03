@@ -39,6 +39,7 @@
 
 #include "../../../../src/v2/loaders/ModelContext.h"
 #include "../../../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
+#include "../../../../src/v2/kernels/KernelFactory.h"
 #include "../../../../src/v2/utils/Logger.h"
 
 // NumPy .npz file loading (simple C++ implementation)
@@ -169,6 +170,12 @@ protected:
         model_ctx_.reset();
         pipeline_.reset();
         pytorch_snapshots_.clear();
+
+        // Clear the kernel cache explicitly as a safety measure.
+        // Note: Since 2025-01, TensorBase's destructor automatically calls
+        // KernelFactory::clearCacheFor(this), which handles cache invalidation.
+        // This explicit clearCache() is kept for defense-in-depth.
+        llaminar::v2::kernels::KernelFactory::clearCache();
     }
 
     /**
