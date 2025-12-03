@@ -13,10 +13,12 @@ V2 is a **kernel-centric, operator-free** architecture:
 - **Heterogeneous execution** – CPU / CUDA / ROCm / (future) backends can be mixed in one run.
 - **Quantization-aware kernels** – unified GEMM/attention interfaces that work with FP32/BF16 and quantized formats.
 - **MPI-aware orchestration** – multi-rank inference (tensor/sequence/pipeline parallel) lives in a small set of orchestrators.
+- **Centralized kernel dispatch** – `KernelFactory` provides unified kernel creation with caching and automatic lifecycle management.
+- **Weight sharding** – automatic tensor parallelism distributes weight matrices across MPI ranks for large model support.
 
 The mental model:
 
-> **Pipeline** (per model) calls into **device-aware tensors**, which expose **ITensor* interfaces** to create the right **kernels** for GEMM, attention, etc. MPI and multi-device routing is handled by **orchestrators**, not by kernels.
+> **Pipeline** (per model) calls into **device-aware tensors** → **KernelFactory** creates/caches **kernels** for GEMM, attention, etc. MPI and multi-device routing is handled by **orchestrators** and **WeightManager** (for sharding), not by kernels.
 
 ---
 
@@ -157,6 +159,67 @@ Location: `src/v2/backends/`
 - Pipelines ask the `DeviceManager` to pick devices for weights/activations and then rely on tensors to materialize the right kernels.
 - Today, CPU is the primary backend; the design is forward-compatible with CUDA/ROCm/Vulkan backends.
 
+### 3.4 KernelFactory: Centralized Kernel Dispatch
+
+Location: `src/v2/kernels/KernelFactory.h`, `src/v2/kernels/KernelFactory.cpp`
+
+**Purpose**: KernelFactory provides a single point of dispatch for kernel creation based on device type, eliminating duplicate switch statements across tensor types and providing a clean abstraction for adding new backends.
+
+**Design Rationale**:
+
+Before KernelFactory, each tensor's `createGemm()` had identical device routing code:
+```cpp
+// Duplicated in IQ4_NLTensor, Q4_0Tensor, Q6_KTensor, etc.
+switch (device.type) {
+#ifdef HAVE_CUDA
+case GPU_CUDA: return createCudaGemm(this);
+#endif
+default: return createCPUGemm(this);
+}
+```
+
+After KernelFactory, single dispatch:
+```cpp
+return KernelFactory::createGemm(this, KernelFactory::getDeviceType(device_idx));
+```
+
+**Key Features**:
+
+1. **Device Type Abstraction**: Simplified `DeviceType` enum groups backend variants:
+   - `CPU` – OpenBLAS/MKL backends (AVX-512 VNNI JIT kernels)
+   - `CUDA` – NVIDIA GPUs (Tensor Core / WMMA)
+   - `ROCm` – AMD GPUs (Matrix Core)
+   - `Vulkan` – Cross-platform compute shaders
+   - `Metal` – Apple Silicon
+
+2. **Kernel Caching**: The preferred API is `getOrCreateGemm()` which caches kernels by tensor pointer:
+   ```cpp
+   // Pack once, use many
+   ITensorGemm* gemm = KernelFactory::getOrCreateGemm(weight_tensor.get());
+   gemm->multiply(activations, output, m, n, k);
+   ```
+
+3. **Automatic Lifecycle Management**: 
+   - `TensorBase::~TensorBase()` calls `KernelFactory::clearCacheFor(this)`
+   - Prevents stale cache entries when tensors are destroyed and memory addresses reused
+   - Thread-safe via mutex protection
+
+**API Summary**:
+```cpp
+class KernelFactory {
+    static DeviceType getDeviceType(int device_idx);
+    static ITensorGemm* getOrCreateGemm(const TensorBase* tensor);  // Preferred
+    static void clearCacheFor(const TensorBase* tensor);            // Called by destructor
+    static void clearCache();                                        // Manual cleanup
+    static std::pair<size_t, size_t> cacheStats();                  // (cache_size, packed_bytes)
+};
+```
+
+**When to Use**:
+- **`getOrCreateGemm()`**: Standard path for weight tensors (pack once, use many times)
+- **`createGemm()`**: One-off kernel creation (no caching overhead)
+- **`clearCache()`**: Between test runs or when tensor lifetimes are uncertain
+
 ---
 
 ## 4. MPI Layer and Orchestrators
@@ -202,6 +265,72 @@ Responsibilities:
 - For sequence/pipeline/hybrid: use similar patterns (barriers + collectives), but on sequence or layer dimensions.
 
 Kernels stay oblivious to MPI; they only see local pointers.
+
+### 4.4 Weight Sharding and Tensor Parallelism
+
+Location: `src/v2/loaders/WeightManager.h`, `src/v2/loaders/WeightManager.cpp`
+
+**Purpose**: Weight sharding distributes weight matrices across MPI ranks, reducing per-rank memory usage for large models.
+
+**Default Behavior** (since December 2025):
+- Single rank: No sharding (full weights on each rank)
+- Multiple MPI ranks: Automatic weight sharding (equivalent to `--shard-weights`)
+
+**Sharding Modes**:
+
+```cpp
+enum class ShardingMode {
+    REPLICATE,        // Full copy on each rank
+    COLUMN_PARALLEL,  // Split output dimension (Phase 2, future)
+    ROW_PARALLEL      // Split input dimension (Phase 1, active)
+};
+```
+
+**Phase 1 Strategy (Row-Parallel)**:
+
+| Weight Pattern | Mode | Rationale |
+|----------------|------|-----------|
+| `attn_output.weight` (Wo) | ROW_PARALLEL | Split input dim, allreduce output |
+| `ffn_down.weight` | ROW_PARALLEL | Split input dim, allreduce output |
+| QKV, Gate/Up, norms, embeddings | REPLICATE | Attention infrastructure expects full tensors |
+
+**Implementation Flow**:
+
+1. **Loading** (`WeightManager::getShardedWeight()`):
+   - Load full tensor from GGUF
+   - Determine sharding mode via pattern matching on weight name
+   - Slice tensor: `sliceRows()` for ROW_PARALLEL
+   - Free original tensor, return sliced
+
+2. **Pipeline Integration** (`PipelineBase::project_row_parallel()`):
+   ```cpp
+   // Handles both sharded and replicated weights transparently
+   bool project_row_parallel(TensorBase* input, TensorBase* weight, TensorBase* output,
+                             int m, int n, int k, const std::string& snapshot_key);
+   ```
+   - Sharded: Local GEMM on weight slice + `MPI_Allreduce` to combine
+   - Replicated: Full GEMM (fallback path)
+
+**Memory Savings** (2 MPI ranks):
+- Wo (attention output): 50% reduction per rank
+- Down (FFN): 50% reduction per rank  
+- Overall: ~25-30% total memory reduction
+
+**CLI Usage**:
+```bash
+# Auto-enabled when world_size > 1
+mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "Hello"
+
+# Explicit flag (redundant when np > 1)
+./run_llaminar.sh -m model.gguf --shard-weights -p "Hello"
+```
+
+**Future Work (Phase 2 - Column-Parallel)**:
+
+Enabling column-parallel for QKV/Gate/Up weights requires:
+1. Modify `MpiAttentionOrchestrator` to accept pre-sharded Q/K/V
+2. Update buffer allocation for local output dimensions
+3. Update `FusedGEMM` to handle local N dimensions
 
 ---
 
@@ -943,9 +1072,11 @@ When you need to work on V2:
 1. **Find the right layer:**
    - Tensors / quantization → `src/v2/tensors/`
    - Kernels (GEMM, attention) → `src/v2/kernels/`
+   - Kernel dispatch and caching → `src/v2/kernels/KernelFactory.{h,cpp}`
    - Fused kernels (FusedGEMM) → `src/v2/kernels/cpu/fused/`
    - Operations (Ops layer) → `src/v2/pipelines/ops/`
    - MPI + attention routing → `src/v2/pipelines/attention/`
+   - Weight sharding → `src/v2/loaders/WeightManager.{h,cpp}`
    - Pipeline base class → `src/v2/pipelines/PipelineBase.{h,cpp}`
    - Model pipelines → `src/v2/pipelines/qwen/Qwen2Pipeline.cpp`
 
@@ -953,6 +1084,7 @@ When you need to work on V2:
    - **Ops** (`src/v2/pipelines/ops/`) – Low-level, stateless operations (RMSNormOp, GemmOp, etc.)
    - **PipelineBase composite methods** – High-level wrappers (rms_norm, project, swiglu, etc.)
    - **Fused kernels** – Multi-projection optimizations (FusedGEMM for Q/K/V, gate/up)
+   - **KernelFactory** – Centralized kernel dispatch with caching (pack once, use many)
    - **Child pipelines** – Model-specific orchestration using PipelineBase methods
 
 3. **Use the composite operations:**
@@ -965,19 +1097,27 @@ When you need to work on V2:
    - `FusedGEMM` for gate/up projections (2 GEMMs sharing activation quantization)
    - Fused kernels are created lazily on first use, stored in LayerWeights
 
-5. **Keep MPI out of kernels:**
+5. **Use KernelFactory for GEMM kernels:**
+   - Prefer `KernelFactory::getOrCreateGemm()` over manual kernel creation
+   - Cache invalidation is automatic via `TensorBase::~TensorBase()`
+   - Use `clearCache()` between test runs if needed
+
+6. **Keep MPI out of kernels:**
    - MPI must live in orchestrators + `MPIContext`, not in `CpuAttentionKernelT` or GEMM kernels.
+   - Weight sharding is handled by `WeightManager`, row-parallel projection by `PipelineBase::project_row_parallel()`
 
-6. **Add tests:**
+7. **Add tests:**
    - For any new feature or significant refactor, add or adjust unit tests in `tests/v2/unit/` and run the relevant suites.
+   - Weight sharding tests: `tests/v2/unit/loaders/Test__WeightManagerSharding.cpp`
+   - KernelFactory cache tests: `tests/v2/unit/Test__KernelFactoryCacheInvalidation.cpp`
 
-7. **Debug with snapshots:**
+8. **Debug with snapshots:**
    - When encountering numerical divergence or parity failures, use E2ERelease build with `enableSnapshotCapture()`
    - Compare layer-by-layer to identify first diverging operation
    - Use `capture_snapshot()` in PipelineBase for manual captures
    - See Section 9 for complete snapshot system documentation
 
-8. **Document decisions:**
+9. **Document decisions:**
    - If you change architectural boundaries (e.g. how operations are layered, how fused kernels work), update this file and any relevant `.md` plans under `.github/instructions/` and `docs/`.
 
 This architecture is intentionally modular: small, focused abstractions connected by narrow interfaces. If you keep those boundaries sharp, V2 remains easy to extend and reason about—even with advanced attention types and heterogeneous backends.

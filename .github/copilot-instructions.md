@@ -16,6 +16,8 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - [CTest Label Best Practices](#ctest-label-best-practices)
 - [Debugging with GDB](#debugging-with-gdb)
 - [Kernel Development (V2)](#kernel-development-v2)
+- [KernelFactory: Centralized Kernel Dispatch and Caching](#kernelfactory-centralized-kernel-dispatch-and-caching)
+- [Weight Sharding and Tensor Parallelism](#weight-sharding-and-tensor-parallelism)
 - [MPI Development Best Practices](#mpi-development-best-practices)
 - [Performance Optimization](#performance-optimization)
 - [Code Quality Guidelines](#code-quality-guidelines)
@@ -33,10 +35,12 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - 🎯 **Per-Tensor Device Affinity**: Each tensor knows its device placement and how to create appropriate kernels.
 - 🎯 **Heterogeneous Execution**: Designed to mix CPU, CUDA, ROCm, etc. within a single run via device backends.
 - 🎯 **IActivationTensor / ITensor* Pattern**: Activation tensors expose narrow interfaces (`ITensorGemm`, `ITensorAttention`, `ITensorRoPE`, etc.) and kernels mutate activation buffers in-place.
+- 🎯 **Centralized Kernel Dispatch**: `KernelFactory` provides unified kernel creation with caching and automatic lifecycle management.
+- 🎯 **Weight Sharding**: Automatic tensor parallelism via `--shard-weights` flag distributes weights across MPI ranks.
 
 The high-level flow is:
 
-> **Pipeline** → chooses **devices** → allocates **tensors** → tensors create **kernels** via `ITensor*` interfaces → kernels operate on local buffers. Any MPI/multi-rank work is coordinated by small **orchestrators**, not kernels.
+> **Pipeline** → chooses **devices** → allocates **tensors** → `KernelFactory` creates/caches **kernels** → kernels operate on local buffers. Any MPI/multi-rank work is coordinated by small **orchestrators**, not kernels.
 
 See `.github/instructions/llaminar-architecture-v2.instructions.md` for a full-stack walkthrough.
 
@@ -1038,6 +1042,145 @@ When writing SIMD in v2, we follow these principles:
 1. **Exploit ILP**: Unroll loops, do interleaved loads and stores to exploit dual load ports
 2. **Vectorized Tail Handling in All Loops**: AVX512 16-way, AVX2 8-way, AVX 4-way, SSE 2-way, scalar tail
 3. **Prefetch**: Prefetch upcoming sequential reads
+
+### KernelFactory: Centralized Kernel Dispatch and Caching
+
+Location: `src/v2/kernels/KernelFactory.h`, `src/v2/kernels/KernelFactory.cpp`
+
+**Purpose**: KernelFactory provides centralized kernel creation and caching, eliminating duplicate device routing code across tensor types and ensuring weight packing happens only once.
+
+#### Key Features
+
+1. **Device Type Abstraction**: Simplified `DeviceType` enum (CPU, CUDA, ROCm, Vulkan, Metal) that groups backend variants
+2. **Type-Safe Dispatch**: Template overloads for each quantized tensor type
+3. **Kernel Caching**: Pack once, use many pattern with automatic lifecycle management
+4. **Automatic Cache Invalidation**: TensorBase destructor calls `clearCacheFor(this)` to prevent stale entries
+
+#### API Reference
+
+```cpp
+namespace llaminar::v2::kernels {
+
+class KernelFactory {
+public:
+    // Device resolution
+    static DeviceType getDeviceType(int device_idx);
+    
+    // Create kernel (uncached - prefer getOrCreateGemm)
+    static std::unique_ptr<ITensorGemm> createGemm(const IQ4_NLTensor* tensor, DeviceType dev);
+    static std::unique_ptr<ITensorGemm> createGemm(const Q4_0Tensor* tensor, DeviceType dev);
+    // ... overloads for all tensor types
+    
+    // Cached GEMM API (preferred - pack once, use many)
+    static ITensorGemm* getOrCreateGemm(const TensorBase* tensor);
+    
+    // Cache management
+    static void clearCacheFor(const TensorBase* tensor);  // Called by TensorBase destructor
+    static void clearCache();                              // Clear all entries
+    static std::pair<size_t, size_t> cacheStats();         // (cache_size, packed_bytes)
+};
+
+}
+```
+
+#### Usage in Pipelines
+
+```cpp
+// Preferred pattern - cached kernel (pack once)
+ITensorGemm* gemm = KernelFactory::getOrCreateGemm(weight_tensor.get());
+gemm->multiply(activations, output, m, n, k);
+
+// Alternative - uncached (for one-off use)
+auto gemm = KernelFactory::createGemm(dynamic_cast<IQ4_NLTensor*>(tensor), DeviceType::CPU);
+```
+
+#### Cache Lifecycle
+
+The kernel cache uses `TensorBase*` pointers as keys. To prevent use-after-free bugs when tensors are destroyed and memory addresses are reused:
+
+1. **Automatic Invalidation**: `TensorBase::~TensorBase()` calls `KernelFactory::clearCacheFor(this)`
+2. **Manual Cleanup**: Call `clearCache()` when tensor lifetimes are uncertain
+3. **Thread Safety**: Cache operations protected by mutex
+
+**Unit Tests**: `tests/v2/unit/Test__KernelFactoryCacheInvalidation.cpp` (10 tests)
+
+---
+
+## Weight Sharding and Tensor Parallelism
+
+### Overview
+
+Weight sharding enables tensor parallelism by distributing weight matrices across MPI ranks, reducing per-rank memory usage for large models.
+
+**Default Behavior** (since December 2025):
+- Single rank: No sharding
+- Multiple MPI ranks: Automatic weight sharding (equivalent to `--shard-weights`)
+
+### Sharding Modes
+
+Location: `src/v2/loaders/WeightManager.h`
+
+```cpp
+enum class ShardingMode {
+    REPLICATE,        // Full copy on each rank (default for small weights)
+    COLUMN_PARALLEL,  // Split output dimension (Phase 2)
+    ROW_PARALLEL      // Split input dimension (Phase 1)
+};
+```
+
+**Phase 1 Strategy (Row-Parallel Only)**:
+| Weight Pattern | Mode | Rationale |
+|----------------|------|-----------|
+| `attn_output.weight` | ROW_PARALLEL | Split input dim, allreduce output |
+| `ffn_down.weight` | ROW_PARALLEL | Split input dim, allreduce output |
+| QKV, Gate/Up, norms, embeddings | REPLICATE | Attention expects full tensors |
+
+### CLI Usage
+
+```bash
+# Auto-enabled when world_size > 1 (default)
+mpirun -np 2 ./run_llaminar.sh -m model.gguf -p "Hello"
+
+# Explicit (redundant when np > 1)
+./run_llaminar.sh -m model.gguf --shard-weights -p "Hello"
+
+# Single-rank without sharding (no MPI)
+./run_llaminar.sh -m model.gguf -p "Hello"
+```
+
+### Memory Savings
+
+With 2 MPI ranks and row-parallel sharding:
+- **Wo (attention output)**: 50% reduction (896×896 → 896×448 per rank)
+- **Down (FFN)**: 50% reduction (4864×896 → 4864×448 per rank)
+- **Overall**: ~25-30% memory reduction for row-parallel weights
+
+### Implementation Details
+
+**Weight Loading** (`WeightManager::getShardedWeight()`):
+1. Load full tensor from GGUF
+2. Determine sharding mode from weight name pattern
+3. Slice tensor based on mode and rank position
+4. Free original tensor, return sliced
+
+**Pipeline Integration** (`PipelineBase::project_row_parallel()`):
+```cpp
+// Row-parallel projection with automatic allreduce
+bool project_row_parallel(TensorBase* input, TensorBase* weight, TensorBase* output,
+                          int m, int n, int k, const std::string& snapshot_key);
+// Handles:
+// - Sharded weights: Local slice GEMM + MPI_Allreduce
+// - Replicated weights: Full GEMM + scale factor
+```
+
+### Future Work (Phase 2)
+
+Column-parallel sharding (QKV, Gate/Up) requires:
+1. Modify `MpiAttentionOrchestrator` to accept pre-sharded Q/K/V
+2. Update buffer allocation for local dimensions
+3. Update FusedGEMM to pass local N dimensions
+
+**Documentation**: See `changelog/2025-06-30-weight-sharding-phase1.md` for detailed implementation notes.
 
 
 ## MPI Development Best Practices
