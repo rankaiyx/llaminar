@@ -17,7 +17,6 @@
 
 #include <vector>
 #include <cmath>
-#include <cstdlib>
 #include <algorithm>
 #include <array>
 
@@ -556,32 +555,14 @@ namespace llaminar2
         const size_t ucols = static_cast<size_t>(cols);
         const size_t blocks_per_row = ucols / 32;
 
-        // Use the optimized pure-integer primitive with dynamic threading (default)
-        // Legacy transient-FP32 variant available via LLAMINAR_Q8_LEGACY_RMSNORM=1
+        // Use the optimized pure-integer primitive with dynamic threading
         primitives::RMSNormExecOptions opts;
         opts.allow_parallel = want_parallel(rows, ucols);
 
-        // Check for legacy transient-FP32 path (opt-in only)
-        static bool use_legacy = []()
-        {
-            const char *env = std::getenv("LLAMINAR_Q8_LEGACY_RMSNORM");
-            return env && std::string(env) == "1";
-        }();
-
-        if (use_legacy)
-        {
-            primitives::rmsnorm_q8_1_integer(
-                input, gamma, output,
-                static_cast<size_t>(rows), blocks_per_row,
-                epsilon, opts);
-        }
-        else
-        {
-            primitives::rmsnorm_q8_1_pure_integer(
-                input, gamma, output,
-                static_cast<size_t>(rows), blocks_per_row,
-                epsilon, opts);
-        }
+        primitives::rmsnorm_q8_1_pure_integer(
+            input, gamma, output,
+            static_cast<size_t>(rows), blocks_per_row,
+            epsilon, opts);
 
         return true;
     }

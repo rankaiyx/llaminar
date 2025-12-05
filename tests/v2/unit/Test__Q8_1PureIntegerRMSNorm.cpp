@@ -180,21 +180,19 @@ TEST_F(Q8_1PureIntegerRMSNormTest, BasicCorrectness_SingleBlock)
     rmsnorm_q8_1_pure_integer_row(input_q8.data(), gamma_q8.data(),
                                   output_q8.data(), blocks_per_row, epsilon_scaled);
 
-    // Run reference (using transient-FP32 version for comparison)
-    std::vector<Q8_1Block> output_ref(blocks_per_row);
-    rmsnorm_q8_1_integer_row(input_q8.data(), gamma_fp32.data(),
-                             output_ref.data(), blocks_per_row, epsilon);
+    // Compute FP32 reference
+    std::vector<float> ref_output(cols);
+    rmsnorm_reference(input_fp32.data(), gamma_fp32.data(), ref_output.data(), cols, epsilon);
 
-    // Dequantize both outputs
-    std::vector<float> out_pure(cols), out_ref(cols);
+    // Dequantize pure-integer output
+    std::vector<float> out_pure(cols);
     dequantize_q8_1_to_fp32(output_q8.data(), out_pure.data(), cols);
-    dequantize_q8_1_to_fp32(output_ref.data(), out_ref.data(), cols);
 
-    float cosine = cosine_similarity(out_pure.data(), out_ref.data(), cols);
+    float cosine = cosine_similarity(out_pure.data(), ref_output.data(), cols);
     std::cout << "SingleBlock: cosine=" << cosine << std::endl;
 
-    // Pure integer should be reasonably close (>0.95 cosine)
-    EXPECT_GE(cosine, 0.90f) << "Pure integer implementation diverged too much";
+    // Pure integer should be very close (>0.999 cosine)
+    EXPECT_GE(cosine, 0.999f) << "Pure integer implementation diverged too much";
 }
 
 TEST_F(Q8_1PureIntegerRMSNormTest, BasicCorrectness_Qwen05B_DModel)
@@ -228,20 +226,18 @@ TEST_F(Q8_1PureIntegerRMSNormTest, BasicCorrectness_Qwen05B_DModel)
     rmsnorm_q8_1_pure_integer_row(input_q8.data(), gamma_q8.data(),
                                   output_q8.data(), blocks_per_row, epsilon_scaled);
 
-    // Run reference
-    std::vector<Q8_1Block> output_ref(blocks_per_row);
-    rmsnorm_q8_1_integer_row(input_q8.data(), gamma_fp32.data(),
-                             output_ref.data(), blocks_per_row, epsilon);
+    // Compute FP32 reference
+    std::vector<float> ref_output(cols);
+    rmsnorm_reference(input_fp32.data(), gamma_fp32.data(), ref_output.data(), cols, epsilon);
 
-    // Dequantize both outputs
-    std::vector<float> out_pure(cols), out_ref(cols);
+    // Dequantize pure-integer output
+    std::vector<float> out_pure(cols);
     dequantize_q8_1_to_fp32(output_q8.data(), out_pure.data(), cols);
-    dequantize_q8_1_to_fp32(output_ref.data(), out_ref.data(), cols);
 
-    float cosine = cosine_similarity(out_pure.data(), out_ref.data(), cols);
+    float cosine = cosine_similarity(out_pure.data(), ref_output.data(), cols);
     std::cout << "Qwen05B (d_model=896): cosine=" << cosine << std::endl;
 
-    EXPECT_GE(cosine, 0.90f);
+    EXPECT_GE(cosine, 0.999f);
 }
 
 TEST_F(Q8_1PureIntegerRMSNormTest, PerformanceComparison_SingleRow)
@@ -282,38 +278,24 @@ TEST_F(Q8_1PureIntegerRMSNormTest, PerformanceComparison_SingleRow)
     auto t1 = std::chrono::high_resolution_clock::now();
     double pure_int_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iterations;
 
-    // Benchmark transient-FP32
-    for (int i = 0; i < warmup; ++i)
-    {
-        rmsnorm_q8_1_integer_row(input_q8.data(), gamma_fp32.data(),
-                                 output_q8.data(), blocks_per_row, epsilon);
-    }
-    t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iterations; ++i)
-    {
-        rmsnorm_q8_1_integer_row(input_q8.data(), gamma_fp32.data(),
-                                 output_q8.data(), blocks_per_row, epsilon);
-    }
-    t1 = std::chrono::high_resolution_clock::now();
-    double transient_fp32_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iterations;
-
-    std::cout << "\n=== Performance Comparison (Single Row, d_model=" << cols << ") ===" << std::endl;
+    std::cout << "\n=== Performance (Single Row, d_model=" << cols << ") ===" << std::endl;
     std::cout << "Pure Integer:     " << pure_int_us << " us/row" << std::endl;
-    std::cout << "Transient FP32:   " << transient_fp32_us << " us/row" << std::endl;
-    std::cout << "Ratio (Pure/FP32): " << (pure_int_us / transient_fp32_us) << "x" << std::endl;
 
-    // Verify correctness
-    std::vector<Q8_1Block> out_pure(blocks_per_row), out_ref(blocks_per_row);
+    // Verify correctness against FP32 reference
+    std::vector<Q8_1Block> out_pure(blocks_per_row);
     rmsnorm_q8_1_pure_integer_row(input_q8.data(), gamma_q8.data(),
                                   out_pure.data(), blocks_per_row, epsilon_scaled);
-    rmsnorm_q8_1_integer_row(input_q8.data(), gamma_fp32.data(),
-                             out_ref.data(), blocks_per_row, epsilon);
 
-    std::vector<float> fp32_pure(cols), fp32_ref(cols);
+    // Compute FP32 reference
+    std::vector<float> input_fp32_for_ref(cols);
+    dequantize_q8_1_to_fp32(input_q8.data(), input_fp32_for_ref.data(), cols);
+    std::vector<float> ref_output(cols);
+    rmsnorm_reference(input_fp32_for_ref.data(), gamma_fp32.data(), ref_output.data(), cols, epsilon);
+
+    std::vector<float> fp32_pure(cols);
     dequantize_q8_1_to_fp32(out_pure.data(), fp32_pure.data(), cols);
-    dequantize_q8_1_to_fp32(out_ref.data(), fp32_ref.data(), cols);
-    float cosine = cosine_similarity(fp32_pure.data(), fp32_ref.data(), cols);
-    std::cout << "Cosine similarity: " << cosine << std::endl;
+    float cosine = cosine_similarity(fp32_pure.data(), ref_output.data(), cols);
+    std::cout << "Cosine similarity vs FP32 ref: " << cosine << std::endl;
 }
 
 TEST_F(Q8_1PureIntegerRMSNormTest, EdgeCase_AllZeros)
