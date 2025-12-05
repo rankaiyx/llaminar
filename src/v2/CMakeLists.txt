@@ -536,14 +536,12 @@ add_library(llaminar2_core STATIC
     # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,
     # BF16PackedGemm, FP16PackedGemm, Q8_1GemmKernelInit, VNNIGemmKernelInit
     kernels/cpu/ops/CPURoPEKernelT.cpp
-    kernels/cpu/ops/CPURMSNormKernelT.cpp
-    kernels/cpu/ops/CPURMSNormTypedKernel.cpp  # Typed RMSNorm with fused precision conversion
+    kernels/cpu/ops/CPURMSNormTypedKernel.cpp  # Typed RMSNorm with fused precision conversion (replaced CPURMSNormKernelT)
     kernels/cpu/ops/CPUSoftmaxKernelT.cpp
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp
     kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
     # Fused kernels (operator fusion framework)
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
-    kernels/cpu/fused/FusedDequantSwiGLU.cpp    # Phase 2: Dequant + SwiGLU activation
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
     # Testing infrastructure (Phase 3a & 3b)

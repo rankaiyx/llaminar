@@ -297,18 +297,8 @@ add_v2_test(V2_Unit_INT32Tensor
     MPI_PROCS 1  # INT32Tensor operations are CPU-only, single rank
 )
 
-# Test: INT32 RMSNorm kernel (INT32→INT8 normalization for full INT8 pipelines)
-add_executable(v2_test_int32_rmsnorm unit/Test__INT32RMSNorm.cpp)
-target_link_libraries(v2_test_int32_rmsnorm 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_INT32RMSNorm 
-    COMMAND $<TARGET_FILE:v2_test_int32_rmsnorm>
-    LABELS "V2;Unit;Kernels;RMSNorm;INT32;INT8Pipeline;Quantization;AVX512;CPU"
-    MPI_PROCS 1  # RMSNorm is CPU-only, single rank
-)
+# NOTE: INT32 RMSNorm test (Test__INT32RMSNorm.cpp) removed - was for orphaned INT8 pipeline
+# INT32→INT8 RMSNorm is no longer used; pipeline uses CPURMSNormTypedKernel<Q8_1> instead
 
 # Test: Q8_1 Pure-Integer RMSNorm (NO floating-point operations)
 add_executable(v2_test_q8_1_pure_integer_rmsnorm unit/Test__Q8_1PureIntegerRMSNorm.cpp)
@@ -525,22 +515,6 @@ add_v2_test(V2_Integration_IQ4_NLTensor
     LABELS "V2;Integration;TensorOperations;Quantization;IQ4_NL;GEMM"
 )
 
-# NOTE: FusedDequantSwiGLU tests temporarily disabled during FP32 residual migration.
-# See docs/v2/FUSION_FRAMEWORK_MIGRATION.md Phase 3 for integration timeline.
-
-# Test: FusedSwiGLU kernel (SwiGLU activation for FP32 inputs)
-add_executable(v2_test_fused_swiglu unit/Test__FusedSwiGLU.cpp)
-target_link_libraries(v2_test_fused_swiglu
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_FusedSwiGLU
-    COMMAND $<TARGET_FILE:v2_test_fused_swiglu>
-    LABELS "V2;Unit;Kernels;FusedKernels;SwiGLU;Activation;FP32;FFN;AVX512;AVX2;CPU"
-    MPI_PROCS 1  # CPU-only fused kernel, single rank
-)
-
 # Test: FusedGEMM kernel (generic N-projection fused GEMM)
 add_executable(v2_test_fused_gemm unit/Test__FusedGEMM.cpp)
 target_link_libraries(v2_test_fused_gemm
@@ -619,18 +593,8 @@ add_v2_test(V2_Unit_RMSNormINT32
     MPI_PROCS 1  # RMSNorm primitives are CPU-only, single rank
 )
 
-# Test: RMSNorm interface (demonstrates clean interface design)
-add_executable(v2_test_rmsnorm_interface unit/Test__RMSNormInterface.cpp)
-target_link_libraries(v2_test_rmsnorm_interface
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_RMSNormInterface
-    COMMAND $<TARGET_FILE:v2_test_rmsnorm_interface>
-    LABELS "V2;Unit;Kernels;RMSNorm;InterfaceDesign;FP32;BF16;FP16;INT32;INT8;TypeSafety;CPU"
-    MPI_PROCS 1  # Interface tests are CPU-only, single rank
-)
+# NOTE: RMSNorm interface test (Test__RMSNormInterface.cpp) removed - redundant with Test__CPURMSNormTypedKernel.cpp
+# The typed kernel test suite provides comprehensive coverage of all precision variants
 
 # Test: Softmax primitives (scalar/AVX2/AVX512 parity, cross-precision accuracy)
 add_executable(v2_test_softmax_primitives unit/Test__SoftmaxPrimitives.cpp)

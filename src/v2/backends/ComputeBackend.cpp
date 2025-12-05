@@ -18,8 +18,6 @@
 #include "../utils/NUMATopology.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
-
-#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include <algorithm>
 #include <cstring>

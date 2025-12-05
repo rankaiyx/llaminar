@@ -3,12 +3,11 @@
  * @brief Performance benchmark for CPURMSNormTypedKernel (typed residuals)
  *
  * This test benchmarks the typed RMSNorm kernel performance comparing:
- * 1. Original CPURMSNormKernelT<FP32Tensor> (baseline)
- * 2. CPURMSNormTypedKernel<FP32> (should match baseline)
- * 3. CPURMSNormTypedKernel<BF16> (2x memory compression)
- * 4. CPURMSNormTypedKernel<FP16> (2x memory compression)
- * 5. CPURMSNormTypedKernel<Q8_1> (3.5x compression, direct SIMD quantization)
- * 6. CPURMSNormTypedKernel<Q8_1> via IActivationTensor interface (OpenMP parallel)
+ * 1. CPURMSNormTypedKernel<FP32> (baseline)
+ * 2. CPURMSNormTypedKernel<BF16> (2x memory compression)
+ * 3. CPURMSNormTypedKernel<FP16> (2x memory compression)
+ * 4. CPURMSNormTypedKernel<Q8_1> (3.5x compression, direct SIMD quantization)
+ * 5. CPURMSNormTypedKernel<Q8_1> via IActivationTensor interface (OpenMP parallel)
  *
  * The Q8_1 benchmarks compare two quantization approaches:
  * - **Direct SIMD** (`simd::quantize_fp32_to_q8_1_blocks`): Vectorized AVX512/AVX2,
@@ -17,7 +16,6 @@
  *   scalar inner loop, optimal for large matrices with many rows
  *
  * Success Criteria:
- * - FP32 typed kernel matches original FP32 performance (±5%)
  * - BF16/FP16/Q8_1 variants have ≤20% overhead vs FP32
  *   (dequant/requant cost offset by reduced memory bandwidth)
  *
@@ -41,7 +39,6 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
-#include "kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "kernels/cpu/ops/CPURMSNormTypedKernel.h"
 #include "tensors/SIMDHelpers.h"
 #include "utils/Logger.h"
@@ -150,50 +147,7 @@ protected:
     // Benchmark Functions for Each Kernel Type
     // ========================================================================
 
-    // Original kernel (baseline)
-    BenchmarkStats bench_original_fp32(const BenchmarkConfig &config)
-    {
-        CPURMSNormKernelT<FP32Tensor> kernel;
-
-        size_t size = config.seq_len * config.d_model;
-        std::vector<float> input(size);
-        std::vector<float> gamma(config.d_model, 1.0f);
-        std::vector<float> output(size);
-
-        // Initialize with random data
-        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-        for (auto &v : input)
-            v = dist(rng_);
-
-        // Warmup
-        for (int i = 0; i < config.warmup_iters; ++i)
-        {
-            kernel.apply(input.data(), gamma.data(), output.data(),
-                         config.seq_len, config.d_model, 1e-6f);
-        }
-
-        // Benchmark
-        std::vector<double> times_ms;
-        times_ms.reserve(config.bench_iters);
-
-        for (int i = 0; i < config.bench_iters; ++i)
-        {
-            MPI_Barrier(MPI_COMM_WORLD);
-            auto start = std::chrono::high_resolution_clock::now();
-
-            kernel.apply(input.data(), gamma.data(), output.data(),
-                         config.seq_len, config.d_model, 1e-6f);
-
-            auto end = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1e6;
-            times_ms.push_back(ms);
-        }
-
-        return calculate_stats(times_ms, config.seq_len, config.d_model,
-                               sizeof(float), sizeof(float));
-    }
-
-    // Typed FP32 kernel (should match baseline)
+    // Typed FP32 kernel (baseline - no precision conversion)
     BenchmarkStats bench_typed_fp32(const BenchmarkConfig &config)
     {
         CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
@@ -398,13 +352,9 @@ protected:
         // Typed Q8_1: 3.5x compression
         auto typed_q8_1 = bench_typed_q8_1(config);
 
-        // Baseline: original FP32 kernel
-        auto baseline = bench_original_fp32(config);
-        print_result("Original FP32 (baseline)", baseline);
-
-        // Typed FP32: should match baseline
-        auto typed_fp32 = bench_typed_fp32(config);
-        print_comparison("Typed FP32", typed_fp32, baseline);
+        // Baseline: typed FP32 kernel (no precision conversion)
+        auto baseline = bench_typed_fp32(config);
+        print_result("Typed FP32 (baseline)", baseline);
 
         // Typed BF16: 2x compression
         auto typed_bf16 = bench_typed_bf16(config);
@@ -421,19 +371,6 @@ protected:
         if (rank_ == 0)
         {
             std::cout << "\n--- Validation ---" << std::endl;
-
-            // Check FP32 typed matches baseline (±10%)
-            double fp32_overhead = std::abs(typed_fp32.mean_ms / baseline.mean_ms - 1.0);
-            std::cout << "  FP32 typed vs baseline: " << std::fixed << std::setprecision(1)
-                      << (fp32_overhead * 100.0) << "% difference";
-            if (fp32_overhead < 0.10)
-            {
-                std::cout << " [PASS]" << std::endl;
-            }
-            else
-            {
-                std::cout << " [WARN: >10% difference]" << std::endl;
-            }
 
             // Check other formats ≤20% overhead (allowing some margin)
             double bf16_overhead = (typed_bf16.mean_ms / baseline.mean_ms - 1.0);

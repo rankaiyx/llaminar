@@ -14,7 +14,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/kernels/cpu/ops/CPURMSNormKernelT.h"
+#include "../../src/v2/kernels/cpu/ops/CPURMSNormTypedKernel.h"
 #include "../../src/v2/kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../../src/v2/kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../../src/v2/kernels/cpu/ops/CPUSoftmaxKernelT.h"
@@ -42,12 +42,12 @@ protected:
 };
 
 // ============================================================================
-// CPURMSNormKernel Tests
+// CPURMSNormKernel Tests (using CPURMSNormTypedKernel<FP32>)
 // ============================================================================
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceZero)
 {
-    CPURMSNormKernelT<FP32Tensor> kernel;
+    CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -56,11 +56,9 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceZero)
     std::vector<float> output(seq_len * d_model, 0.0f);
 
     // device_idx = 0 (CPU device) should work
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         input.data(), weight.data(), output.data(),
         seq_len, d_model, 1e-5f,
-        false, // use_bf16
-        mpi_ctx.get(),
         0 // device_idx = 0 (CPU)
     );
 
@@ -77,7 +75,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceZero)
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceMinusOne)
 {
-    CPURMSNormKernelT<FP32Tensor> kernel;
+    CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -86,11 +84,9 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceMinusOne)
     std::vector<float> output(seq_len * d_model, 0.0f);
 
     // device_idx = -1 (unspecified) should also work
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         input.data(), weight.data(), output.data(),
         seq_len, d_model, 1e-5f,
-        false,
-        mpi_ctx.get(),
         -1 // device_idx = -1 (unspecified)
     );
 
@@ -99,7 +95,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceMinusOne)
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_IgnoresDeviceIndex)
 {
-    CPURMSNormKernelT<FP32Tensor> kernel;
+    CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -109,12 +105,12 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_IgnoresDeviceIndex)
     std::vector<float> output1(seq_len * d_model, 0.0f);
 
     // Run with device_idx = 0
-    kernel.apply(input.data(), weight.data(), output0.data(),
-                 seq_len, d_model, 1e-5f, false, mpi_ctx.get(), 0);
+    kernel.apply_typed(input.data(), weight.data(), output0.data(),
+                       seq_len, d_model, 1e-5f, 0);
 
     // Run with device_idx = -1
-    kernel.apply(input.data(), weight.data(), output1.data(),
-                 seq_len, d_model, 1e-5f, false, mpi_ctx.get(), -1);
+    kernel.apply_typed(input.data(), weight.data(), output1.data(),
+                       seq_len, d_model, 1e-5f, -1);
 
     // Results should be identical (device_idx is ignored)
     for (size_t i = 0; i < output0.size(); ++i)
