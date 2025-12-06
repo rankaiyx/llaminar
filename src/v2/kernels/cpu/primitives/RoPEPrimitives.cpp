@@ -186,13 +186,8 @@ namespace llaminar2::primitives
         for (int i = start_idx; i < half_dim; ++i)
         {
             float angle = position * inv_freq[i];
-#if defined(__GNUC__)
-            float sin_val, cos_val;
-            sincosf(angle, &sin_val, &cos_val);
-#else
             float cos_val = std::cos(angle);
             float sin_val = std::sin(angle);
-#endif
 
             float x_first = head_ptr[i];
             float x_second = head_ptr[i + half_dim];
@@ -234,12 +229,8 @@ namespace llaminar2::primitives
             alignas(32) float sin_vals[8];
             for (int lane = 0; lane < 8; ++lane)
             {
-#if defined(__GNUC__)
-                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
-#else
                 cos_vals[lane] = std::cos(angles[lane]);
                 sin_vals[lane] = std::sin(angles[lane]);
-#endif
             }
 
             // Load and rotate
@@ -295,12 +286,8 @@ namespace llaminar2::primitives
             alignas(64) float sin_vals[16];
             for (int lane = 0; lane < 16; ++lane)
             {
-#if defined(__GNUC__)
-                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
-#else
                 cos_vals[lane] = std::cos(angles[lane]);
                 sin_vals[lane] = std::sin(angles[lane]);
-#endif
             }
 
             // Load values
@@ -379,12 +366,8 @@ namespace llaminar2::primitives
         for (int i = 0; i < half_dim; ++i)
         {
             float ang = n_past * inv_freq[i];
-#if defined(__GNUC__)
-            sincosf(ang, &sin_table[i], &cos_table[i]);
-#else
             cos_table[i] = std::cos(ang);
             sin_table[i] = std::sin(ang);
-#endif
         }
 
         // Recurrence for t > 0
@@ -468,12 +451,8 @@ namespace llaminar2::primitives
                 state.sin_delta[i] = std::sin(delta);
 
                 const float ang = target_pos * inv_freq[i];
-#if defined(__GNUC__)
-                sincosf(ang, &state.sin_curr[i], &state.cos_curr[i]);
-#else
                 state.cos_curr[i] = std::cos(ang);
                 state.sin_curr[i] = std::sin(ang);
-#endif
             }
             state.last_pos = target_pos;
         }
@@ -577,6 +556,131 @@ namespace llaminar2::primitives
     // BF16 Native Precision Implementations
     // ============================================================================
 
+#if defined(__AVX512F__)
+    void apply_rope_to_head_cached_bf16_avx512(
+        uint16_t *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+
+        for (; i + 16 <= half_dim; i += 16)
+        {
+            // Load BF16
+            __m256i bf16_first = _mm256_loadu_si256((__m256i *)(head_ptr + i));
+            __m256i bf16_second = _mm256_loadu_si256((__m256i *)(head_ptr + i + half_dim));
+
+            // Convert to FP32 (shift left 16)
+            __m512i u32_first = _mm512_slli_epi32(_mm512_cvtepu16_epi32(bf16_first), 16);
+            __m512i u32_second = _mm512_slli_epi32(_mm512_cvtepu16_epi32(bf16_second), 16);
+
+            __m512 x_first = _mm512_castsi512_ps(u32_first);
+            __m512 x_second = _mm512_castsi512_ps(u32_second);
+
+            __m512 cos_vec = _mm512_loadu_ps(cos_cache + i);
+            __m512 sin_vec = _mm512_loadu_ps(sin_cache + i);
+
+            __m512 new_first = _mm512_sub_ps(
+                _mm512_mul_ps(x_first, cos_vec),
+                _mm512_mul_ps(x_second, sin_vec));
+            __m512 new_second = _mm512_add_ps(
+                _mm512_mul_ps(x_first, sin_vec),
+                _mm512_mul_ps(x_second, cos_vec));
+
+            // Convert back to BF16 (shift right 16)
+            __m512i res_first = _mm512_srli_epi32(_mm512_castps_si512(new_first), 16);
+            __m512i res_second = _mm512_srli_epi32(_mm512_castps_si512(new_second), 16);
+
+            // Pack 32-bit integers to 16-bit integers
+            __m256i out_first = _mm512_cvtepi32_epi16(res_first);
+            __m256i out_second = _mm512_cvtepi32_epi16(res_second);
+
+            _mm256_storeu_si256((__m256i *)(head_ptr + i), out_first);
+            _mm256_storeu_si256((__m256i *)(head_ptr + i + half_dim), out_second);
+        }
+
+        // Tail
+        for (; i < half_dim; ++i)
+        {
+            float x_first = simd::bf16_to_fp32(head_ptr[i]);
+            float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
+            float c = cos_cache[i];
+            float s = sin_cache[i];
+            float n1 = x_first * c - x_second * s;
+            float n2 = x_first * s + x_second * c;
+            head_ptr[i] = simd::fp32_to_bf16(n1);
+            head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
+        }
+    }
+#endif
+
+#if defined(__AVX2__)
+    void apply_rope_to_head_cached_bf16_avx2(
+        uint16_t *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+
+        for (; i + 8 <= half_dim; i += 8)
+        {
+            // Load 8 BF16 values (128 bits)
+            __m128i bf16_first = _mm_loadu_si128((__m128i *)(head_ptr + i));
+            __m128i bf16_second = _mm_loadu_si128((__m128i *)(head_ptr + i + half_dim));
+
+            // Convert to FP32 (expand to 32-bit, shift left 16)
+            __m256i u32_first = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16_first), 16);
+            __m256i u32_second = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16_second), 16);
+
+            __m256 x_first = _mm256_castsi256_ps(u32_first);
+            __m256 x_second = _mm256_castsi256_ps(u32_second);
+
+            __m256 cos_vec = _mm256_loadu_ps(cos_cache + i);
+            __m256 sin_vec = _mm256_loadu_ps(sin_cache + i);
+
+            __m256 new_first = _mm256_sub_ps(
+                _mm256_mul_ps(x_first, cos_vec),
+                _mm256_mul_ps(x_second, sin_vec));
+            __m256 new_second = _mm256_add_ps(
+                _mm256_mul_ps(x_first, sin_vec),
+                _mm256_mul_ps(x_second, cos_vec));
+
+            // Convert back (shift right 16)
+            __m256i res_first = _mm256_srli_epi32(_mm256_castps_si256(new_first), 16);
+            __m256i res_second = _mm256_srli_epi32(_mm256_castps_si256(new_second), 16);
+
+            // Pack using packus and permute
+            __m256i packed_first = _mm256_packus_epi32(res_first, _mm256_setzero_si256());
+            __m256i permuted_first = _mm256_permute4x64_epi64(packed_first, _MM_SHUFFLE(3, 1, 2, 0));
+            __m128i out_first = _mm256_castsi256_si128(permuted_first);
+
+            __m256i packed_second = _mm256_packus_epi32(res_second, _mm256_setzero_si256());
+            __m256i permuted_second = _mm256_permute4x64_epi64(packed_second, _MM_SHUFFLE(3, 1, 2, 0));
+            __m128i out_second = _mm256_castsi256_si128(permuted_second);
+
+            _mm_storeu_si128((__m128i *)(head_ptr + i), out_first);
+            _mm_storeu_si128((__m128i *)(head_ptr + i + half_dim), out_second);
+        }
+
+        // Tail
+        for (; i < half_dim; ++i)
+        {
+            float x_first = simd::bf16_to_fp32(head_ptr[i]);
+            float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
+            float c = cos_cache[i];
+            float s = sin_cache[i];
+            float n1 = x_first * c - x_second * s;
+            float n2 = x_first * s + x_second * c;
+            head_ptr[i] = simd::fp32_to_bf16(n1);
+            head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
+        }
+    }
+#endif
+
     void apply_rope_to_head_bf16_scalar(
         uint16_t *head_ptr,
         int position,
@@ -589,13 +693,8 @@ namespace llaminar2::primitives
         for (int i = start_idx; i < half_dim; ++i)
         {
             float angle = position * inv_freq[i];
-#if defined(__GNUC__)
-            float sin_val, cos_val;
-            sincosf(angle, &sin_val, &cos_val);
-#else
             float cos_val = std::cos(angle);
             float sin_val = std::sin(angle);
-#endif
 
             // Convert BF16 → FP32
             float x_first = simd::bf16_to_fp32(head_ptr[i]);
@@ -636,35 +735,26 @@ namespace llaminar2::primitives
             alignas(32) float sin_vals[8];
             for (int lane = 0; lane < 8; ++lane)
             {
-#if defined(__GNUC__)
-                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
-#else
                 cos_vals[lane] = std::cos(angles[lane]);
                 sin_vals[lane] = std::sin(angles[lane]);
-#endif
             }
 
-            // Load BF16 values
-            alignas(32) uint16_t first_bf16[8];
-            alignas(32) uint16_t second_bf16[8];
-            std::memcpy(first_bf16, head_ptr + i, 8 * sizeof(uint16_t));
-            std::memcpy(second_bf16, head_ptr + i + half_dim, 8 * sizeof(uint16_t));
+            // Load 8 BF16 values (128 bits)
+            __m128i bf16_first = _mm_loadu_si128((__m128i *)(head_ptr + i));
+            __m128i bf16_second = _mm_loadu_si128((__m128i *)(head_ptr + i + half_dim));
 
-            // Convert BF16 → FP32
-            alignas(32) float x_first[8];
-            alignas(32) float x_second[8];
-            for (int lane = 0; lane < 8; ++lane)
-            {
-                x_first[lane] = simd::bf16_to_fp32(first_bf16[lane]);
-                x_second[lane] = simd::bf16_to_fp32(second_bf16[lane]);
-            }
+            // Convert to FP32 (expand to 32-bit, shift left 16)
+            __m256i u32_first = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16_first), 16);
+            __m256i u32_second = _mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16_second), 16);
 
-            // Load and rotate
-            __m256 x_first_vec = _mm256_loadu_ps(x_first);
-            __m256 x_second_vec = _mm256_loadu_ps(x_second);
+            __m256 x_first_vec = _mm256_castsi256_ps(u32_first);
+            __m256 x_second_vec = _mm256_castsi256_ps(u32_second);
+
+            // Load sin/cos
             __m256 cos_vec = _mm256_loadu_ps(cos_vals);
             __m256 sin_vec = _mm256_loadu_ps(sin_vals);
 
+            // Rotate
             __m256 new_first = _mm256_sub_ps(
                 _mm256_mul_ps(x_first_vec, cos_vec),
                 _mm256_mul_ps(x_second_vec, sin_vec));
@@ -672,20 +762,22 @@ namespace llaminar2::primitives
                 _mm256_mul_ps(x_first_vec, sin_vec),
                 _mm256_mul_ps(x_second_vec, cos_vec));
 
-            // Store back to FP32 buffers
-            _mm256_storeu_ps(x_first, new_first);
-            _mm256_storeu_ps(x_second, new_second);
+            // Convert back (shift right 16)
+            __m256i res_first = _mm256_srli_epi32(_mm256_castps_si256(new_first), 16);
+            __m256i res_second = _mm256_srli_epi32(_mm256_castps_si256(new_second), 16);
 
-            // Convert FP32 → BF16
-            for (int lane = 0; lane < 8; ++lane)
-            {
-                first_bf16[lane] = simd::fp32_to_bf16(x_first[lane]);
-                second_bf16[lane] = simd::fp32_to_bf16(x_second[lane]);
-            }
+            // Pack using packus and permute
+            __m256i packed_first = _mm256_packus_epi32(res_first, _mm256_setzero_si256());
+            __m256i permuted_first = _mm256_permute4x64_epi64(packed_first, _MM_SHUFFLE(3, 1, 2, 0));
+            __m128i out_first = _mm256_castsi256_si128(permuted_first);
 
-            // Write back
-            std::memcpy(head_ptr + i, first_bf16, 8 * sizeof(uint16_t));
-            std::memcpy(head_ptr + i + half_dim, second_bf16, 8 * sizeof(uint16_t));
+            __m256i packed_second = _mm256_packus_epi32(res_second, _mm256_setzero_si256());
+            __m256i permuted_second = _mm256_permute4x64_epi64(packed_second, _MM_SHUFFLE(3, 1, 2, 0));
+            __m128i out_second = _mm256_castsi256_si128(permuted_second);
+
+            // Store back
+            _mm_storeu_si128((__m128i *)(head_ptr + i), out_first);
+            _mm_storeu_si128((__m128i *)(head_ptr + i + half_dim), out_second);
         }
 
         return i;
@@ -717,57 +809,46 @@ namespace llaminar2::primitives
             alignas(64) float sin_vals[16];
             for (int lane = 0; lane < 16; ++lane)
             {
-#if defined(__GNUC__)
-                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
-#else
                 cos_vals[lane] = std::cos(angles[lane]);
                 sin_vals[lane] = std::sin(angles[lane]);
-#endif
             }
 
-            // Load BF16 values
-            alignas(64) uint16_t first_bf16[16];
-            alignas(64) uint16_t second_bf16[16];
-            std::memcpy(first_bf16, head_ptr + i, 16 * sizeof(uint16_t));
-            std::memcpy(second_bf16, head_ptr + i + half_dim, 16 * sizeof(uint16_t));
+            // Load BF16 values (16 values = 256 bits)
+            __m256i bf16_first = _mm256_loadu_si256((__m256i *)(head_ptr + i));
+            __m256i bf16_second = _mm256_loadu_si256((__m256i *)(head_ptr + i + half_dim));
 
-            // Convert BF16 → FP32
-            alignas(64) float x_first[16];
-            alignas(64) float x_second[16];
-            for (int lane = 0; lane < 16; ++lane)
-            {
-                x_first[lane] = simd::bf16_to_fp32(first_bf16[lane]);
-                x_second[lane] = simd::bf16_to_fp32(second_bf16[lane]);
-            }
+            // Convert BF16 → FP32 (vectorized)
+            // Shift left by 16 to zero-extend mantissa
+            __m512i u32_first = _mm512_slli_epi32(_mm512_cvtepu16_epi32(bf16_first), 16);
+            __m512i u32_second = _mm512_slli_epi32(_mm512_cvtepu16_epi32(bf16_second), 16);
 
-            // Load values
-            __m512 x_first_vec = _mm512_loadu_ps(x_first);
-            __m512 x_second_vec = _mm512_loadu_ps(x_second);
+            __m512 x_first = _mm512_castsi512_ps(u32_first);
+            __m512 x_second = _mm512_castsi512_ps(u32_second);
+
+            // Load sin/cos
             __m512 cos_vec = _mm512_loadu_ps(cos_vals);
             __m512 sin_vec = _mm512_loadu_ps(sin_vals);
 
             // Rotate
             __m512 new_first = _mm512_sub_ps(
-                _mm512_mul_ps(x_first_vec, cos_vec),
-                _mm512_mul_ps(x_second_vec, sin_vec));
+                _mm512_mul_ps(x_first, cos_vec),
+                _mm512_mul_ps(x_second, sin_vec));
             __m512 new_second = _mm512_add_ps(
-                _mm512_mul_ps(x_first_vec, sin_vec),
-                _mm512_mul_ps(x_second_vec, cos_vec));
+                _mm512_mul_ps(x_first, sin_vec),
+                _mm512_mul_ps(x_second, cos_vec));
 
-            // Store back to FP32 buffers
-            _mm512_storeu_ps(x_first, new_first);
-            _mm512_storeu_ps(x_second, new_second);
+            // Convert FP32 → BF16 (vectorized truncation)
+            // Shift right by 16
+            __m512i res_first = _mm512_srli_epi32(_mm512_castps_si512(new_first), 16);
+            __m512i res_second = _mm512_srli_epi32(_mm512_castps_si512(new_second), 16);
 
-            // Convert FP32 → BF16
-            for (int lane = 0; lane < 16; ++lane)
-            {
-                first_bf16[lane] = simd::fp32_to_bf16(x_first[lane]);
-                second_bf16[lane] = simd::fp32_to_bf16(x_second[lane]);
-            }
+            // Pack 32-bit integers to 16-bit integers
+            __m256i out_first = _mm512_cvtepi32_epi16(res_first);
+            __m256i out_second = _mm512_cvtepi32_epi16(res_second);
 
-            // Write back
-            std::memcpy(head_ptr + i, first_bf16, 16 * sizeof(uint16_t));
-            std::memcpy(head_ptr + i + half_dim, second_bf16, 16 * sizeof(uint16_t));
+            // Store back
+            _mm256_storeu_si256((__m256i *)(head_ptr + i), out_first);
+            _mm256_storeu_si256((__m256i *)(head_ptr + i + half_dim), out_second);
         }
 
         return i;
@@ -792,20 +873,151 @@ namespace llaminar2::primitives
         apply_rope_to_head_bf16_scalar(head_ptr, position, inv_freq, head_dim, processed);
     }
 
-    static void apply_rope_to_tensor_bf16(
+    static void apply_rope_to_tensor_bf16_recurrence(
         uint16_t *tensor,
         int seq_len, int num_heads, int head_dim,
         int n_past,
         const std::vector<float> &inv_freq)
     {
+        const int half_dim = head_dim / 2;
+
+        // 1. Pre-compute sin/cos tables for the whole sequence using recurrence
+        std::vector<float> cos_table(seq_len * half_dim);
+        std::vector<float> sin_table(seq_len * half_dim);
+
+        // Compute deltas
+        std::vector<float> cos_delta(half_dim);
+        std::vector<float> sin_delta(half_dim);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            cos_delta[i] = std::cos(inv_freq[i]);
+            sin_delta[i] = std::sin(inv_freq[i]);
+        }
+
+        // Initialize first position
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float ang = n_past * inv_freq[i];
+            cos_table[i] = std::cos(ang);
+            sin_table[i] = std::sin(ang);
+        }
+
+        // Recurrence
+        for (int t = 1; t < seq_len; ++t)
+        {
+            int prev_offset = (t - 1) * half_dim;
+            int curr_offset = t * half_dim;
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float c = cos_table[prev_offset + i];
+                float s = sin_table[prev_offset + i];
+                float cd = cos_delta[i];
+                float sd = sin_delta[i];
+
+                cos_table[curr_offset + i] = c * cd - s * sd;
+                sin_table[curr_offset + i] = s * cd + c * sd;
+            }
+        }
+
+        // 2. Apply rotation in parallel using cached tables
 #pragma omp parallel for collapse(2) schedule(static)
         for (int t = 0; t < seq_len; ++t)
         {
             for (int h = 0; h < num_heads; ++h)
             {
                 uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                int position = n_past + t;
-                apply_rope_to_head_bf16_vectorized(head_ptr, position, inv_freq, head_dim);
+                const float *cos_ptr = cos_table.data() + t * half_dim;
+                const float *sin_ptr = sin_table.data() + t * half_dim;
+
+#if defined(__AVX512F__)
+                apply_rope_to_head_cached_bf16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX2__)
+                apply_rope_to_head_cached_bf16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+#else
+                // Fallback scalar implementation
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    float x_first = simd::bf16_to_fp32(head_ptr[i]);
+                    float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
+                    float cos_val = cos_ptr[i];
+                    float sin_val = sin_ptr[i];
+
+                    float n1 = x_first * cos_val - x_second * sin_val;
+                    float n2 = x_first * sin_val + x_second * cos_val;
+
+                    head_ptr[i] = simd::fp32_to_bf16(n1);
+                    head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
+                }
+#endif
+            }
+        }
+    }
+
+    static void apply_rope_bf16_from_cache(
+        uint16_t *q, uint16_t *k,
+        int q_heads, int k_heads, int head_dim,
+        const RoPEPersistentState &state)
+    {
+        const int half_dim = head_dim / 2;
+
+        auto apply_to_heads = [&](uint16_t *tensor, int num_heads)
+        {
+            for (int h = 0; h < num_heads; ++h)
+            {
+                uint16_t *head_ptr = tensor + h * head_dim;
+#if defined(__AVX512F__)
+                apply_rope_to_head_cached_bf16_avx512(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#elif defined(__AVX2__)
+                apply_rope_to_head_cached_bf16_avx2(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#else
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    float x_first = simd::bf16_to_fp32(head_ptr[i]);
+                    float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
+                    float cos_val = state.cos_curr[i];
+                    float sin_val = state.sin_curr[i];
+
+                    float n1 = x_first * cos_val - x_second * sin_val;
+                    float n2 = x_first * sin_val + x_second * cos_val;
+
+                    head_ptr[i] = simd::fp32_to_bf16(n1);
+                    head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
+                }
+#endif
+            }
+        };
+
+        apply_to_heads(q, q_heads);
+        if (k)
+            apply_to_heads(k, k_heads);
+    }
+
+    static void apply_rope_to_tensor_bf16_direct(
+        uint16_t *tensor,
+        int seq_len, int num_heads, int head_dim,
+        int n_past,
+        const std::vector<float> &inv_freq)
+    {
+        // Avoid OpenMP overhead for single-token decode
+        if (seq_len == 1)
+        {
+            for (int h = 0; h < num_heads; ++h)
+            {
+                uint16_t *head_ptr = tensor + h * head_dim;
+                apply_rope_to_head_bf16_vectorized(head_ptr, n_past, inv_freq, head_dim);
+            }
+        }
+        else
+        {
+#pragma omp parallel for collapse(2) schedule(static)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < num_heads; ++h)
+                {
+                    uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
+                    apply_rope_to_head_bf16_vectorized(head_ptr, n_past + t, inv_freq, head_dim);
+                }
             }
         }
     }
@@ -824,15 +1036,137 @@ namespace llaminar2::primitives
 
         const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
 
-        // For BF16, we don't use persistent state optimization
-        // (Would require BF16 sin/cos storage which adds complexity)
-        apply_rope_to_tensor_bf16(q_bf16, seq_len, q_heads, head_dim, n_past, inv_freq);
-        apply_rope_to_tensor_bf16(k_bf16, seq_len, k_heads, head_dim, n_past, inv_freq);
+        // Single-token decode with persistent state optimization
+        if (seq_len == 1 && persistent_state)
+        {
+            update_rope_cache(head_dim, freq_base, n_past, *persistent_state);
+            apply_rope_bf16_from_cache(q_bf16, k_bf16, q_heads, k_heads, head_dim, *persistent_state);
+            return;
+        }
+
+        // Use direct computation for short sequences to avoid recurrence overhead
+        if (seq_len < 32)
+        {
+            apply_rope_to_tensor_bf16_direct(q_bf16, seq_len, q_heads, head_dim, n_past, inv_freq);
+            apply_rope_to_tensor_bf16_direct(k_bf16, seq_len, k_heads, head_dim, n_past, inv_freq);
+        }
+        else
+        {
+            // Use recurrence optimization for longer sequences
+            apply_rope_to_tensor_bf16_recurrence(q_bf16, seq_len, q_heads, head_dim, n_past, inv_freq);
+            apply_rope_to_tensor_bf16_recurrence(k_bf16, seq_len, k_heads, head_dim, n_past, inv_freq);
+        }
     }
 
     // ============================================================================
     // FP16 Native Precision Implementations
     // ============================================================================
+
+#if defined(__AVX512F__)
+    void apply_rope_to_head_cached_fp16_avx512(
+        uint16_t *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+
+        for (; i + 16 <= half_dim; i += 16)
+        {
+            // Load FP16 (16 values = 256 bits)
+            __m256i fp16_first = _mm256_loadu_si256((__m256i *)(head_ptr + i));
+            __m256i fp16_second = _mm256_loadu_si256((__m256i *)(head_ptr + i + half_dim));
+
+            // Convert to FP32
+            __m512 x_first = _mm512_cvtph_ps(fp16_first);
+            __m512 x_second = _mm512_cvtph_ps(fp16_second);
+
+            __m512 cos_vec = _mm512_loadu_ps(cos_cache + i);
+            __m512 sin_vec = _mm512_loadu_ps(sin_cache + i);
+
+            __m512 new_first = _mm512_sub_ps(
+                _mm512_mul_ps(x_first, cos_vec),
+                _mm512_mul_ps(x_second, sin_vec));
+            __m512 new_second = _mm512_add_ps(
+                _mm512_mul_ps(x_first, sin_vec),
+                _mm512_mul_ps(x_second, cos_vec));
+
+            // Convert back to FP16
+            __m256i out_first = _mm512_cvtps_ph(new_first, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m256i out_second = _mm512_cvtps_ph(new_second, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+            _mm256_storeu_si256((__m256i *)(head_ptr + i), out_first);
+            _mm256_storeu_si256((__m256i *)(head_ptr + i + half_dim), out_second);
+        }
+
+        // Tail
+        for (; i < half_dim; ++i)
+        {
+            float x_first = simd::fp16_to_fp32(head_ptr[i]);
+            float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
+            float c = cos_cache[i];
+            float s = sin_cache[i];
+            float n1 = x_first * c - x_second * s;
+            float n2 = x_first * s + x_second * c;
+            head_ptr[i] = simd::fp32_to_fp16(n1);
+            head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
+        }
+    }
+#endif
+
+#if defined(__AVX2__)
+    void apply_rope_to_head_cached_fp16_avx2(
+        uint16_t *head_ptr,
+        const float *cos_cache,
+        const float *sin_cache,
+        int head_dim)
+    {
+        const int half_dim = head_dim / 2;
+        int i = 0;
+
+        for (; i + 8 <= half_dim; i += 8)
+        {
+            // Load FP16 (8 values = 128 bits)
+            __m128i fp16_first = _mm_loadu_si128((__m128i *)(head_ptr + i));
+            __m128i fp16_second = _mm_loadu_si128((__m128i *)(head_ptr + i + half_dim));
+
+            // Convert to FP32
+            __m256 x_first = _mm256_cvtph_ps(fp16_first);
+            __m256 x_second = _mm256_cvtph_ps(fp16_second);
+
+            __m256 cos_vec = _mm256_loadu_ps(cos_cache + i);
+            __m256 sin_vec = _mm256_loadu_ps(sin_cache + i);
+
+            __m256 new_first = _mm256_sub_ps(
+                _mm256_mul_ps(x_first, cos_vec),
+                _mm256_mul_ps(x_second, sin_vec));
+            __m256 new_second = _mm256_add_ps(
+                _mm256_mul_ps(x_first, sin_vec),
+                _mm256_mul_ps(x_second, cos_vec));
+
+            // Convert back to FP16
+            __m128i out_first = _mm256_cvtps_ph(new_first, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m128i out_second = _mm256_cvtps_ph(new_second, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+            _mm_storeu_si128((__m128i *)(head_ptr + i), out_first);
+            _mm_storeu_si128((__m128i *)(head_ptr + i + half_dim), out_second);
+        }
+
+        // Tail
+        for (; i < half_dim; ++i)
+        {
+            float x_first = simd::fp16_to_fp32(head_ptr[i]);
+            float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
+            float c = cos_cache[i];
+            float s = sin_cache[i];
+            float n1 = x_first * c - x_second * s;
+            float n2 = x_first * s + x_second * c;
+            head_ptr[i] = simd::fp32_to_fp16(n1);
+            head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
+        }
+    }
+#endif
 
     void apply_rope_to_head_fp16_scalar(
         uint16_t *head_ptr,
@@ -846,13 +1180,8 @@ namespace llaminar2::primitives
         for (int i = start_idx; i < half_dim; ++i)
         {
             float angle = position * inv_freq[i];
-#if defined(__GNUC__)
-            float sin_val, cos_val;
-            sincosf(angle, &sin_val, &cos_val);
-#else
             float cos_val = std::cos(angle);
             float sin_val = std::sin(angle);
-#endif
 
             // Convert FP16 → FP32
             float x_first = fp16_to_fp32(head_ptr[i]);
@@ -893,12 +1222,8 @@ namespace llaminar2::primitives
             alignas(32) float sin_vals[8];
             for (int lane = 0; lane < 8; ++lane)
             {
-#if defined(__GNUC__)
-                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
-#else
                 cos_vals[lane] = std::cos(angles[lane]);
                 sin_vals[lane] = std::sin(angles[lane]);
-#endif
             }
 
             // Load FP16 values
@@ -974,12 +1299,8 @@ namespace llaminar2::primitives
             alignas(64) float sin_vals[16];
             for (int lane = 0; lane < 16; ++lane)
             {
-#if defined(__GNUC__)
-                sincosf(angles[lane], &sin_vals[lane], &cos_vals[lane]);
-#else
                 cos_vals[lane] = std::cos(angles[lane]);
                 sin_vals[lane] = std::sin(angles[lane]);
-#endif
             }
 
             // Load FP16 values
@@ -1049,20 +1370,151 @@ namespace llaminar2::primitives
         apply_rope_to_head_fp16_scalar(head_ptr, position, inv_freq, head_dim, processed);
     }
 
-    static void apply_rope_to_tensor_fp16(
+    static void apply_rope_to_tensor_fp16_recurrence(
         uint16_t *tensor,
         int seq_len, int num_heads, int head_dim,
         int n_past,
         const std::vector<float> &inv_freq)
     {
+        const int half_dim = head_dim / 2;
+
+        // 1. Pre-compute sin/cos tables for the whole sequence using recurrence
+        std::vector<float> cos_table(seq_len * half_dim);
+        std::vector<float> sin_table(seq_len * half_dim);
+
+        // Compute deltas
+        std::vector<float> cos_delta(half_dim);
+        std::vector<float> sin_delta(half_dim);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            cos_delta[i] = std::cos(inv_freq[i]);
+            sin_delta[i] = std::sin(inv_freq[i]);
+        }
+
+        // Initialize first position
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float ang = n_past * inv_freq[i];
+            cos_table[i] = std::cos(ang);
+            sin_table[i] = std::sin(ang);
+        }
+
+        // Recurrence
+        for (int t = 1; t < seq_len; ++t)
+        {
+            int prev_offset = (t - 1) * half_dim;
+            int curr_offset = t * half_dim;
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float c = cos_table[prev_offset + i];
+                float s = sin_table[prev_offset + i];
+                float cd = cos_delta[i];
+                float sd = sin_delta[i];
+
+                cos_table[curr_offset + i] = c * cd - s * sd;
+                sin_table[curr_offset + i] = s * cd + c * sd;
+            }
+        }
+
+        // 2. Apply rotation in parallel using cached tables
 #pragma omp parallel for collapse(2) schedule(static)
         for (int t = 0; t < seq_len; ++t)
         {
             for (int h = 0; h < num_heads; ++h)
             {
                 uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                int position = n_past + t;
-                apply_rope_to_head_fp16_vectorized(head_ptr, position, inv_freq, head_dim);
+                const float *cos_ptr = cos_table.data() + t * half_dim;
+                const float *sin_ptr = sin_table.data() + t * half_dim;
+
+#if defined(__AVX512F__)
+                apply_rope_to_head_cached_fp16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX2__)
+                apply_rope_to_head_cached_fp16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+#else
+                // Fallback scalar implementation
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    float x_first = simd::fp16_to_fp32(head_ptr[i]);
+                    float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
+                    float cos_val = cos_ptr[i];
+                    float sin_val = sin_ptr[i];
+
+                    float n1 = x_first * cos_val - x_second * sin_val;
+                    float n2 = x_first * sin_val + x_second * cos_val;
+
+                    head_ptr[i] = simd::fp32_to_fp16(n1);
+                    head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
+                }
+#endif
+            }
+        }
+    }
+
+    static void apply_rope_fp16_from_cache(
+        uint16_t *q, uint16_t *k,
+        int q_heads, int k_heads, int head_dim,
+        const RoPEPersistentState &state)
+    {
+        const int half_dim = head_dim / 2;
+
+        auto apply_to_heads = [&](uint16_t *tensor, int num_heads)
+        {
+            for (int h = 0; h < num_heads; ++h)
+            {
+                uint16_t *head_ptr = tensor + h * head_dim;
+#if defined(__AVX512F__)
+                apply_rope_to_head_cached_fp16_avx512(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#elif defined(__AVX2__)
+                apply_rope_to_head_cached_fp16_avx2(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#else
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    float x_first = simd::fp16_to_fp32(head_ptr[i]);
+                    float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
+                    float cos_val = state.cos_curr[i];
+                    float sin_val = state.sin_curr[i];
+
+                    float n1 = x_first * cos_val - x_second * sin_val;
+                    float n2 = x_first * sin_val + x_second * cos_val;
+
+                    head_ptr[i] = simd::fp32_to_fp16(n1);
+                    head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
+                }
+#endif
+            }
+        };
+
+        apply_to_heads(q, q_heads);
+        if (k)
+            apply_to_heads(k, k_heads);
+    }
+
+    static void apply_rope_to_tensor_fp16_direct(
+        uint16_t *tensor,
+        int seq_len, int num_heads, int head_dim,
+        int n_past,
+        const std::vector<float> &inv_freq)
+    {
+        // Avoid OpenMP overhead for single-token decode
+        if (seq_len == 1)
+        {
+            for (int h = 0; h < num_heads; ++h)
+            {
+                uint16_t *head_ptr = tensor + h * head_dim;
+                apply_rope_to_head_fp16_vectorized(head_ptr, n_past, inv_freq, head_dim);
+            }
+        }
+        else
+        {
+#pragma omp parallel for collapse(2) schedule(static)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < num_heads; ++h)
+                {
+                    uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
+                    apply_rope_to_head_fp16_vectorized(head_ptr, n_past + t, inv_freq, head_dim);
+                }
             }
         }
     }
@@ -1081,9 +1533,26 @@ namespace llaminar2::primitives
 
         const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
 
-        // For FP16, we don't use persistent state optimization
-        apply_rope_to_tensor_fp16(q_fp16, seq_len, q_heads, head_dim, n_past, inv_freq);
-        apply_rope_to_tensor_fp16(k_fp16, seq_len, k_heads, head_dim, n_past, inv_freq);
+        // Single-token decode with persistent state optimization
+        if (seq_len == 1 && persistent_state)
+        {
+            update_rope_cache(head_dim, freq_base, n_past, *persistent_state);
+            apply_rope_fp16_from_cache(q_fp16, k_fp16, q_heads, k_heads, head_dim, *persistent_state);
+            return;
+        }
+
+        // Use direct computation for short sequences to avoid recurrence overhead
+        if (seq_len < 32)
+        {
+            apply_rope_to_tensor_fp16_direct(q_fp16, seq_len, q_heads, head_dim, n_past, inv_freq);
+            apply_rope_to_tensor_fp16_direct(k_fp16, seq_len, k_heads, head_dim, n_past, inv_freq);
+        }
+        else
+        {
+            // Use recurrence optimization for longer sequences
+            apply_rope_to_tensor_fp16_recurrence(q_fp16, seq_len, q_heads, head_dim, n_past, inv_freq);
+            apply_rope_to_tensor_fp16_recurrence(k_fp16, seq_len, k_heads, head_dim, n_past, inv_freq);
+        }
     }
 
     // ============================================================================
@@ -1098,6 +1567,708 @@ namespace llaminar2::primitives
     {
         // RoPE is an activation operation and cannot be applied to quantized INT32 accumulators
         return false;
+    }
+
+    // ============================================================================
+    // Q8_1 Pure-Integer RoPE Implementation
+    // ============================================================================
+
+    void compute_rope_sincos_q15(
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim,
+        RoPESinCosQ15 &out)
+    {
+        const int half_dim = head_dim / 2;
+        out.resize(half_dim);
+
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float angle = position * inv_freq[i];
+            float cos_val, sin_val;
+#if defined(__GNUC__)
+            sincosf(angle, &sin_val, &cos_val);
+#else
+            cos_val = std::cos(angle);
+            sin_val = std::sin(angle);
+#endif
+            // Convert to Q15: multiply by 32767 and clamp
+            // Q15 range: [-32768, 32767] represents [-1.0, ~1.0)
+            out.cos_q15[i] = static_cast<int16_t>(std::max(-32767.0f, std::min(32767.0f, cos_val * 32767.0f)));
+            out.sin_q15[i] = static_cast<int16_t>(std::max(-32767.0f, std::min(32767.0f, sin_val * 32767.0f)));
+        }
+    }
+
+    /**
+     * @brief Helper: FP16 to FP32 conversion for Q8_1 scale
+     */
+    static inline float fp16_to_fp32_rope(uint16_t h)
+    {
+        // IEEE 754 half-precision to single-precision conversion
+        uint32_t sign = (h >> 15) & 0x1;
+        uint32_t exp = (h >> 10) & 0x1F;
+        uint32_t mant = h & 0x3FF;
+
+        if (exp == 0)
+        {
+            if (mant == 0)
+            {
+                // Zero
+                uint32_t result = sign << 31;
+                float f;
+                std::memcpy(&f, &result, sizeof(float));
+                return f;
+            }
+            else
+            {
+                // Subnormal
+                while ((mant & 0x400) == 0)
+                {
+                    mant <<= 1;
+                    exp--;
+                }
+                exp++;
+                mant &= 0x3FF;
+            }
+        }
+        else if (exp == 31)
+        {
+            // Inf or NaN
+            uint32_t result = (sign << 31) | 0x7F800000 | (mant << 13);
+            float f;
+            std::memcpy(&f, &result, sizeof(float));
+            return f;
+        }
+
+        exp = exp + (127 - 15);
+        uint32_t result = (sign << 31) | (exp << 23) | (mant << 13);
+        float f;
+        std::memcpy(&f, &result, sizeof(float));
+        return f;
+    }
+
+    /**
+     * @brief Helper: FP32 to FP16 conversion for Q8_1 scale
+     */
+    static inline uint16_t fp32_to_fp16_rope(float f)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(float));
+
+        uint32_t sign = (bits >> 31) & 0x1;
+        int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = (bits >> 13) & 0x3FF;
+
+        if (exp >= 31)
+        {
+            // Overflow -> Inf
+            return static_cast<uint16_t>((sign << 15) | 0x7C00);
+        }
+        else if (exp <= 0)
+        {
+            // Underflow -> zero or subnormal (we just use zero)
+            return static_cast<uint16_t>(sign << 15);
+        }
+
+        return static_cast<uint16_t>((sign << 15) | (exp << 10) | mant);
+    }
+
+    void apply_rope_q8_1_integer_head(
+        Q8_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+        // Q8_1 block size is 32 elements
+        // For RoPE, we need to pair first half of head with second half
+        // head_dim = blocks_per_head * 32
+        // half_dim = blocks_per_head * 32 / 2 = blocks_per_head * 16
+
+        // Each block pair: blocks in first half are paired with blocks in second half
+        // Block[b] elements pair with Block[b + blocks_per_head/2] elements
+        const int half_blocks = blocks_per_head / 2;
+
+        if (blocks_per_head < 2)
+        {
+            // head_dim < 64, can't do RoPE properly on Q8_1 blocks
+            // This is an edge case that shouldn't happen in practice
+            return;
+        }
+
+#if defined(__AVX512F__)
+        // Optimized AVX512 implementation using integer arithmetic to avoid dequantization overhead
+        // Process 32 elements (one full block) at a time, but in two 16-element chunks
+        for (int b = 0; b < half_blocks; ++b)
+        {
+            Q8_1Block &blockA = head_blocks[b];
+            Q8_1Block &blockB = head_blocks[b + half_blocks];
+
+            float scaleA = fp16_to_fp32_rope(blockA.d);
+            float scaleB = fp16_to_fp32_rope(blockB.d);
+
+            // Determine max scale to normalize inputs
+            float maxScale = std::max(scaleA, scaleB);
+            if (maxScale < 1e-9f)
+                maxScale = 1e-9f;
+
+            // Calculate relative scales (<= 1.0)
+            float relScaleA = scaleA / maxScale;
+            float relScaleB = scaleB / maxScale;
+
+            // We will compute coefficients in Q20 format
+            // Coeff = cos * relScale * 2^5 (since cos is Q15, total Q20)
+            // But to preserve precision of relScale, we compute in float then cast
+            // Coeff = (float(cos) * relScale) * 2^20 / 2^15 = float(cos) * relScale * 32.0f
+            // Actually, let's just do: float(cos) * relScale * 1048576.0f (2^20) -> int32
+            // Wait, cos is integer Q15. float(cos) is e.g. 32767.0.
+            // We want effective multiplier for q (int8).
+            // q * Coeff should be Q20.
+            // q is Q0. Coeff is Q20.
+            // Coeff = cos_val * relScale * (2^20 / 2^15) = cos_val * relScale * 32.0f?
+            // No. cos_val is the integer representation. Real cos is cos_val / 32767.
+            // We want q * d * cos.
+            // q * d_max * relScale * (cos_val / 32767).
+            // We want result in Q20 relative to d_max.
+            // Result = q * (relScale * cos_val / 32767 * 2^20).
+            // Multiplier = relScale * cos_val * 32.0f.
+
+            __m512 relScaleA_vec = _mm512_set1_ps(relScaleA * 32.0f);
+            __m512 relScaleB_vec = _mm512_set1_ps(relScaleB * 32.0f);
+
+            // Accumulators for sums
+            __m512i sumA_acc = _mm512_setzero_si512();
+            __m512i sumB_acc = _mm512_setzero_si512();
+
+            // Max accumulators (int32)
+            __m512i maxA_acc = _mm512_setzero_si512();
+            __m512i maxB_acc = _mm512_setzero_si512();
+
+            // Temporary storage for rotated values (int32 Q20)
+            int32_t rotA_buf[32];
+            int32_t rotB_buf[32];
+
+            for (int i = 0; i < 2; ++i)
+            { // 2 chunks of 16 elements
+                int offset = i * 16;
+
+                // Load cos/sin (Q15 int16)
+                const int16_t *cos_ptr = cos_q15 + b * 32 + offset;
+                const int16_t *sin_ptr = sin_q15 + b * 32 + offset;
+
+                __m256i cos_256 = _mm256_loadu_si256((const __m256i *)cos_ptr);
+                __m256i sin_256 = _mm256_loadu_si256((const __m256i *)sin_ptr);
+
+                __m512i cos_i32 = _mm512_cvtepi16_epi32(cos_256);
+                __m512i sin_i32 = _mm512_cvtepi16_epi32(sin_256);
+
+                // Convert to float to apply relative scale
+                __m512 cos_ps = _mm512_cvtepi32_ps(cos_i32);
+                __m512 sin_ps = _mm512_cvtepi32_ps(sin_i32);
+
+                // Compute coefficients (Q20)
+                // Coeff = cos * relScale * 32.0
+                __m512 coeffA_cos_ps = _mm512_mul_ps(cos_ps, relScaleA_vec);
+                __m512 coeffA_sin_ps = _mm512_mul_ps(sin_ps, relScaleA_vec);
+                __m512 coeffB_cos_ps = _mm512_mul_ps(cos_ps, relScaleB_vec);
+                __m512 coeffB_sin_ps = _mm512_mul_ps(sin_ps, relScaleB_vec);
+
+                // Convert back to int32
+                __m512i C_A_cos = _mm512_cvtps_epi32(coeffA_cos_ps);
+                __m512i C_A_sin = _mm512_cvtps_epi32(coeffA_sin_ps);
+                __m512i C_B_cos = _mm512_cvtps_epi32(coeffB_cos_ps);
+                __m512i C_B_sin = _mm512_cvtps_epi32(coeffB_sin_ps);
+
+                // Load q (int8) -> int32
+                __m128i qsA_128 = _mm_loadu_si128((const __m128i *)(blockA.qs + offset));
+                __m128i qsB_128 = _mm_loadu_si128((const __m128i *)(blockB.qs + offset));
+
+                __m512i qA = _mm512_cvtepi8_epi32(qsA_128);
+                __m512i qB = _mm512_cvtepi8_epi32(qsB_128);
+
+                // Rotate (integer math)
+                // x' = qA * C_A_cos - qB * C_B_sin
+                // y' = qA * C_A_sin + qB * C_B_cos
+                // Products are approx 127 * 2^20 * 32767/32767 = 1.3e8, fits in int32
+                __m512i rotA = _mm512_sub_epi32(_mm512_mullo_epi32(qA, C_A_cos), _mm512_mullo_epi32(qB, C_B_sin));
+                __m512i rotB = _mm512_add_epi32(_mm512_mullo_epi32(qA, C_A_sin), _mm512_mullo_epi32(qB, C_B_cos));
+
+                _mm512_storeu_si512(rotA_buf + offset, rotA);
+                _mm512_storeu_si512(rotB_buf + offset, rotB);
+
+                // Update max abs
+                maxA_acc = _mm512_max_epi32(maxA_acc, _mm512_abs_epi32(rotA));
+                maxB_acc = _mm512_max_epi32(maxB_acc, _mm512_abs_epi32(rotB));
+            }
+
+            // Reduce max
+            int32_t maxA = _mm512_reduce_max_epi32(maxA_acc);
+            int32_t maxB = _mm512_reduce_max_epi32(maxB_acc);
+
+            // Avoid zero
+            if (maxA == 0)
+                maxA = 1;
+            if (maxB == 0)
+                maxB = 1;
+
+            // Calculate new scales
+            // maxA corresponds to 127.0
+            // d_out = (maxA / 2^20) / 127.0 * d_max
+            float newScaleA = (static_cast<float>(maxA) / 1048576.0f) / 127.0f * maxScale;
+            float newScaleB = (static_cast<float>(maxB) / 1048576.0f) / 127.0f * maxScale;
+
+            // Requantization factor F (Q36)
+            // We want x_acc * F >> 36 to be in [-127, 127]
+            // F = 127 * 2^36 / maxA
+            // We use double for precision in calculating F
+            int64_t F_A = static_cast<int64_t>((127.0 * 68719476736.0) / static_cast<double>(maxA));
+            int64_t F_B = static_cast<int64_t>((127.0 * 68719476736.0) / static_cast<double>(maxB));
+
+            __m512i F_A_vec = _mm512_set1_epi64(F_A);
+            __m512i F_B_vec = _mm512_set1_epi64(F_B);
+
+            __m512i min_val = _mm512_set1_epi32(-127);
+            __m512i max_val = _mm512_set1_epi32(127);
+
+            // Quantize back
+            for (int i = 0; i < 2; ++i)
+            {
+                int offset = i * 16;
+
+                __m512i rotA = _mm512_loadu_si512(rotA_buf + offset);
+                __m512i rotB = _mm512_loadu_si512(rotB_buf + offset);
+
+                // Multiply by F (64-bit) and shift right by 36
+                // Even lanes
+                __m512i resA_even = _mm512_mul_epi32(rotA, F_A_vec);
+                __m512i resB_even = _mm512_mul_epi32(rotB, F_B_vec);
+
+                // Odd lanes (shift input right by 32)
+                __m512i resA_odd = _mm512_mul_epi32(_mm512_srli_epi64(rotA, 32), F_A_vec);
+                __m512i resB_odd = _mm512_mul_epi32(_mm512_srli_epi64(rotB, 32), F_B_vec);
+
+                // Shift right by 36 to get result
+                resA_even = _mm512_srai_epi64(resA_even, 36);
+                resB_even = _mm512_srai_epi64(resB_even, 36);
+                resA_odd = _mm512_srai_epi64(resA_odd, 36);
+                resB_odd = _mm512_srai_epi64(resB_odd, 36);
+
+                // Pack back to 32-bit
+                // We can use permute/shuffle or cvtepi64_epi32 if available?
+                // _mm512_cvtepi64_epi32 converts 512-bit (8 longs) to 256-bit (8 ints)
+                // We have 16 results split across even/odd
+
+                // Manual packing:
+                // Mask even lanes
+                __m512i mask = _mm512_set1_epi64(0xFFFFFFFF);
+                resA_even = _mm512_and_si512(resA_even, mask);
+                resB_even = _mm512_and_si512(resB_even, mask);
+
+                // Shift odd lanes left by 32
+                resA_odd = _mm512_slli_epi64(resA_odd, 32);
+                resB_odd = _mm512_slli_epi64(resB_odd, 32);
+
+                // Combine
+                __m512i qA_i32 = _mm512_or_si512(resA_even, resA_odd);
+                __m512i qB_i32 = _mm512_or_si512(resB_even, resB_odd);
+
+                // Clamp
+                qA_i32 = _mm512_max_epi32(min_val, _mm512_min_epi32(max_val, qA_i32));
+                qB_i32 = _mm512_max_epi32(min_val, _mm512_min_epi32(max_val, qB_i32));
+
+                // Accumulate sums
+                sumA_acc = _mm512_add_epi32(sumA_acc, qA_i32);
+                sumB_acc = _mm512_add_epi32(sumB_acc, qB_i32);
+
+                // Pack to int8
+                __m128i qA_i8 = _mm512_cvtepi32_epi8(qA_i32);
+                __m128i qB_i8 = _mm512_cvtepi32_epi8(qB_i32);
+
+                _mm_storeu_si128((__m128i *)(blockA.qs + offset), qA_i8);
+                _mm_storeu_si128((__m128i *)(blockB.qs + offset), qB_i8);
+            }
+
+            int32_t sumA = _mm512_reduce_add_epi32(sumA_acc);
+            int32_t sumB = _mm512_reduce_add_epi32(sumB_acc);
+
+            blockA.d = fp32_to_fp16_rope(newScaleA);
+            blockB.d = fp32_to_fp16_rope(newScaleB);
+            blockA.sum_qs = static_cast<int16_t>(sumA);
+            blockB.sum_qs = static_cast<int16_t>(sumB);
+        }
+#elif defined(__AVX2__)
+        // AVX2 implementation: process 16 elements at a time
+        for (int b = 0; b < half_blocks; ++b)
+        {
+            Q8_1Block &blockA = head_blocks[b];
+            Q8_1Block &blockB = head_blocks[b + half_blocks];
+
+            float scaleA = fp16_to_fp32_rope(blockA.d);
+            float scaleB = fp16_to_fp32_rope(blockB.d);
+
+            alignas(32) int32_t rotA[32];
+            alignas(32) int32_t rotB[32];
+
+            const int16_t *cos_ptr = cos_q15 + b * 32;
+            const int16_t *sin_ptr = sin_q15 + b * 32;
+
+            __m256i zero = _mm256_setzero_si256();
+
+            for (int chunk = 0; chunk < 2; ++chunk)
+            {
+                int offset = chunk * 16;
+
+                // Load 16 int8 values
+                __m128i qa = _mm_loadu_si128((const __m128i *)(blockA.qs + offset));
+                __m128i qb = _mm_loadu_si128((const __m128i *)(blockB.qs + offset));
+
+                // Interleave x, y -> [x0, y0, x1, y1...] (8-bit)
+                __m128i q_lo = _mm_unpacklo_epi8(qa, qb);
+                __m128i q_hi = _mm_unpackhi_epi8(qa, qb);
+
+                // Convert to 16-bit: [x0, y0, x1, y1...] (16-bit)
+                __m256i xy_lo = _mm256_cvtepi8_epi16(q_lo);
+                __m256i xy_hi = _mm256_cvtepi8_epi16(q_hi);
+
+                // Load cos/sin (16 values)
+                __m256i cos_vec = _mm256_loadu_si256((const __m256i *)(cos_ptr + offset));
+                __m256i sin_vec = _mm256_loadu_si256((const __m256i *)(sin_ptr + offset));
+                __m256i neg_sin_vec = _mm256_sub_epi16(zero, sin_vec);
+
+                // Prepare coefficients for dot product
+                // Real: x*cos - y*sin = x*cos + y*(-sin)
+                // Coeffs: [cos, -sin, cos, -sin...]
+                __m256i cos_sin_neg_lo = _mm256_unpacklo_epi16(cos_vec, neg_sin_vec);
+                __m256i cos_sin_neg_hi = _mm256_unpackhi_epi16(cos_vec, neg_sin_vec);
+
+                // Imag: x*sin + y*cos
+                // Coeffs: [sin, cos, sin, cos...]
+                __m256i sin_cos_lo = _mm256_unpacklo_epi16(sin_vec, cos_vec);
+                __m256i sin_cos_hi = _mm256_unpackhi_epi16(sin_vec, cos_vec);
+
+                // Compute dot products (32-bit result)
+                __m256i real_lo = _mm256_madd_epi16(xy_lo, cos_sin_neg_lo);
+                __m256i real_hi = _mm256_madd_epi16(xy_hi, cos_sin_neg_hi);
+                __m256i imag_lo = _mm256_madd_epi16(xy_lo, sin_cos_lo);
+                __m256i imag_hi = _mm256_madd_epi16(xy_hi, sin_cos_hi);
+
+                // Shift right by 15
+                real_lo = _mm256_srai_epi32(real_lo, 15);
+                real_hi = _mm256_srai_epi32(real_hi, 15);
+                imag_lo = _mm256_srai_epi32(imag_lo, 15);
+                imag_hi = _mm256_srai_epi32(imag_hi, 15);
+
+                // Store
+                _mm256_storeu_si256((__m256i *)(rotA + offset), real_lo);
+                _mm256_storeu_si256((__m256i *)(rotA + offset + 8), real_hi);
+                _mm256_storeu_si256((__m256i *)(rotB + offset), imag_lo);
+                _mm256_storeu_si256((__m256i *)(rotB + offset + 8), imag_hi);
+            }
+
+            // Find max absolute value for rescaling
+            int32_t maxA = 0, maxB = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                maxA = std::max(maxA, std::abs(rotA[i]));
+                maxB = std::max(maxB, std::abs(rotB[i]));
+            }
+
+            float newScaleA = (maxA > 0) ? scaleA * static_cast<float>(maxA) / 127.0f : 0.0f;
+            float newScaleB = (maxB > 0) ? scaleB * static_cast<float>(maxB) / 127.0f : 0.0f;
+
+            float invMaxA = (maxA > 0) ? 127.0f / static_cast<float>(maxA) : 0.0f;
+            float invMaxB = (maxB > 0) ? 127.0f / static_cast<float>(maxB) : 0.0f;
+
+            int32_t sumA = 0, sumB = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t qA = static_cast<int32_t>(std::round(rotA[i] * invMaxA));
+                qA = std::max(-127, std::min(127, qA));
+                blockA.qs[i] = static_cast<int8_t>(qA);
+                sumA += qA;
+
+                int32_t qB = static_cast<int32_t>(std::round(rotB[i] * invMaxB));
+                qB = std::max(-127, std::min(127, qB));
+                blockB.qs[i] = static_cast<int8_t>(qB);
+                sumB += qB;
+            }
+
+            blockA.d = fp32_to_fp16_rope(newScaleA);
+            blockB.d = fp32_to_fp16_rope(newScaleB);
+            blockA.sum_qs = static_cast<int16_t>(sumA);
+            blockB.sum_qs = static_cast<int16_t>(sumB);
+        }
+#else
+        // Scalar fallback
+        for (int b = 0; b < half_blocks; ++b)
+        {
+            Q8_1Block &blockA = head_blocks[b];
+            Q8_1Block &blockB = head_blocks[b + half_blocks];
+
+            float scaleA = fp16_to_fp32_rope(blockA.d);
+            float scaleB = fp16_to_fp32_rope(blockB.d);
+
+            const int16_t *cos_ptr = cos_q15 + b * 32;
+            const int16_t *sin_ptr = sin_q15 + b * 32;
+
+            int32_t rotA[32], rotB[32];
+
+            // Compute rotated values
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t x = blockA.qs[i];
+                int32_t y = blockB.qs[i];
+                int32_t c = cos_ptr[i];
+                int32_t s = sin_ptr[i];
+
+                // x' = (x * cos - y * sin) >> 15
+                // y' = (x * sin + y * cos) >> 15
+                rotA[i] = (x * c - y * s) >> 15;
+                rotB[i] = (x * s + y * c) >> 15;
+            }
+
+            // Find max and rescale
+            int32_t maxA = 0, maxB = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                maxA = std::max(maxA, std::abs(rotA[i]));
+                maxB = std::max(maxB, std::abs(rotB[i]));
+            }
+
+            float newScaleA = (maxA > 0) ? scaleA * static_cast<float>(maxA) / 127.0f : 0.0f;
+            float newScaleB = (maxB > 0) ? scaleB * static_cast<float>(maxB) / 127.0f : 0.0f;
+
+            float invMaxA = (maxA > 0) ? 127.0f / static_cast<float>(maxA) : 0.0f;
+            float invMaxB = (maxB > 0) ? 127.0f / static_cast<float>(maxB) : 0.0f;
+
+            int32_t sumA = 0, sumB = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t qA = static_cast<int32_t>(std::round(rotA[i] * invMaxA));
+                qA = std::max(-127, std::min(127, qA));
+                blockA.qs[i] = static_cast<int8_t>(qA);
+                sumA += qA;
+
+                int32_t qB = static_cast<int32_t>(std::round(rotB[i] * invMaxB));
+                qB = std::max(-127, std::min(127, qB));
+                blockB.qs[i] = static_cast<int8_t>(qB);
+                sumB += qB;
+            }
+
+            blockA.d = fp32_to_fp16_rope(newScaleA);
+            blockB.d = fp32_to_fp16_rope(newScaleB);
+            blockA.sum_qs = static_cast<int16_t>(sumA);
+            blockB.sum_qs = static_cast<int16_t>(sumB);
+        }
+#endif
+    }
+
+    void apply_rope_q8_1_integer(
+        Q8_1Block *Q,
+        Q8_1Block *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        RoPEPersistentState *persistent_state)
+    {
+        if (head_dim % 32 != 0)
+        {
+            return; // head_dim must be divisible by Q8_1 block size
+        }
+
+        const int blocks_per_head = head_dim / 32;
+        const int q_stride_blocks = n_heads * blocks_per_head;
+        const int k_stride_blocks = n_kv_heads * blocks_per_head;
+        const int half_dim = head_dim / 2;
+
+        // Get inverse frequencies
+        const auto &inv_freq = get_inv_freq_cached(head_dim, rope_theta);
+
+        // Precompute sin/cos tables (Q15)
+        // Use thread_local to avoid allocation overhead for small batches (decode)
+        thread_local std::vector<int16_t> tls_cos_table;
+        thread_local std::vector<int16_t> tls_sin_table;
+
+        size_t required_size = seq_len * half_dim;
+        if (tls_cos_table.size() < required_size)
+        {
+            tls_cos_table.resize(required_size);
+            tls_sin_table.resize(required_size);
+        }
+
+        int16_t *cos_table = tls_cos_table.data();
+        int16_t *sin_table = tls_sin_table.data();
+
+        // Optimization for single-token decode with persistent state
+        if (seq_len == 1 && persistent_state)
+        {
+            int pos = position_ids ? position_ids[0] : 0;
+            if (pos >= 0)
+            {
+                // Update persistent state (uses recurrence)
+                update_rope_cache(head_dim, rope_theta, pos, *persistent_state);
+
+                // Convert cached floats to Q15 integers
+                const float *cos_curr = persistent_state->cos_curr.data();
+                const float *sin_curr = persistent_state->sin_curr.data();
+
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    cos_table[i] = (int16_t)(cos_curr[i] * 32767.0f);
+                    sin_table[i] = (int16_t)(sin_curr[i] * 32767.0f);
+                }
+            }
+        }
+        else
+        {
+            // Check for contiguous positions
+            bool contiguous = true;
+            int start_pos = 0;
+            if (position_ids)
+            {
+                start_pos = position_ids[0];
+                if (seq_len > 1)
+                {
+                    for (int i = 1; i < seq_len; ++i)
+                    {
+                        if (position_ids[i] != start_pos + i)
+                        {
+                            contiguous = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                start_pos = 0;
+            }
+
+            // Generate tables
+            if (contiguous && seq_len > 1)
+            {
+                // Use recurrence for sequential positions
+                std::vector<float> cos_delta(half_dim);
+                std::vector<float> sin_delta(half_dim);
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    cos_delta[i] = std::cos(inv_freq[i]);
+                    sin_delta[i] = std::sin(inv_freq[i]);
+                }
+
+                // Init first row
+                std::vector<float> curr_cos(half_dim);
+                std::vector<float> curr_sin(half_dim);
+                for (int i = 0; i < half_dim; ++i)
+                {
+                    float ang = start_pos * inv_freq[i];
+                    curr_cos[i] = std::cos(ang);
+                    curr_sin[i] = std::sin(ang);
+
+                    cos_table[i] = (int16_t)(curr_cos[i] * 32767.0f);
+                    sin_table[i] = (int16_t)(curr_sin[i] * 32767.0f);
+                }
+
+                // Recurrence
+                for (int t = 1; t < seq_len; ++t)
+                {
+                    int offset = t * half_dim;
+                    for (int i = 0; i < half_dim; ++i)
+                    {
+                        float c = curr_cos[i];
+                        float s = curr_sin[i];
+                        float cd = cos_delta[i];
+                        float sd = sin_delta[i];
+
+                        float nc = c * cd - s * sd;
+                        float ns = s * cd + c * sd;
+
+                        curr_cos[i] = nc;
+                        curr_sin[i] = ns;
+
+                        cos_table[offset + i] = (int16_t)(nc * 32767.0f);
+                        sin_table[offset + i] = (int16_t)(ns * 32767.0f);
+                    }
+                }
+            }
+            else
+            {
+// Parallel compute for non-contiguous or single token (without persistent state)
+#pragma omp parallel for if (seq_len > 1)
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    int pos = position_ids ? position_ids[t] : t;
+                    int offset = t * half_dim;
+                    for (int i = 0; i < half_dim; ++i)
+                    {
+                        float ang = pos * inv_freq[i];
+                        float c = std::cos(ang);
+                        float s = std::sin(ang);
+
+                        cos_table[offset + i] = (int16_t)(c * 32767.0f);
+                        sin_table[offset + i] = (int16_t)(s * 32767.0f);
+                    }
+                }
+            }
+        }
+
+        // Apply RoPE using precomputed tables
+        // Collapse heads and tokens for better load balancing
+        if (seq_len == 1)
+        {
+            // Serial execution for single token (decode optimization)
+            int offset = 0; // t=0
+            const int16_t *c_ptr = cos_table + offset;
+            const int16_t *s_ptr = sin_table + offset;
+
+            // Apply to Q
+            for (int h = 0; h < n_heads; ++h)
+            {
+                Q8_1Block *head_ptr = Q + h * blocks_per_head;
+                apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
+            }
+
+            // Apply to K
+            if (K)
+            {
+                for (int h = 0; h < n_kv_heads; ++h)
+                {
+                    Q8_1Block *head_ptr = K + h * blocks_per_head;
+                    apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
+                }
+            }
+        }
+        else
+        {
+#pragma omp parallel for collapse(2)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    Q8_1Block *head_ptr = Q + t * q_stride_blocks + h * blocks_per_head;
+                    const int16_t *c_ptr = cos_table + t * half_dim;
+                    const int16_t *s_ptr = sin_table + t * half_dim;
+                    apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
+                }
+            }
+
+            if (K)
+            {
+#pragma omp parallel for collapse(2)
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    for (int h = 0; h < n_kv_heads; ++h)
+                    {
+                        Q8_1Block *head_ptr = K + t * k_stride_blocks + h * blocks_per_head;
+                        const int16_t *c_ptr = cos_table + t * half_dim;
+                        const int16_t *s_ptr = sin_table + t * half_dim;
+                        apply_rope_q8_1_integer_head(head_ptr, blocks_per_head, c_ptr, s_ptr);
+                    }
+                }
+            }
+        }
     }
 
 } // namespace llaminar2::primitives

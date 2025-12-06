@@ -499,51 +499,16 @@ namespace llaminar2
             Q8_1Block *Q_blocks = static_cast<Q8_1Block *>(Q_q8_1);
             Q8_1Block *K_blocks = K_q8_1 ? static_cast<Q8_1Block *>(K_q8_1) : nullptr;
 
-            int blocks_per_head = head_dim / Q8_1Block::BLOCK_SIZE;
-            int q_stride_blocks = n_heads * blocks_per_head;
-            int k_stride_blocks = n_kv_heads * blocks_per_head;
+            // Use optimized primitive (handles single-token serial path and integer math)
+            primitives::apply_rope_q8_1_integer(
+                Q_blocks, K_blocks,
+                position_ids,
+                seq_len,
+                n_heads, n_kv_heads,
+                head_dim,
+                rope_theta,
+                (seq_len == 1) ? &tls_state_ : nullptr);
 
-#pragma omp parallel for if (seq_len > 1)
-            for (int tok = 0; tok < seq_len; ++tok)
-            {
-                int position = position_ids ? position_ids[tok] : tok;
-                if (position < 0)
-                    continue;
-
-                // Ensure cache is valid for this position
-                if (tls_state_.last_pos != position)
-                {
-                    primitives::update_rope_cache(
-                        head_dim, rope_theta, position, tls_state_);
-                }
-
-                const float *cos_cache = tls_state_.cos_curr.data();
-                const float *sin_cache = tls_state_.sin_curr.data();
-
-                // Debug check
-                if (cos_cache == nullptr || sin_cache == nullptr)
-                {
-                    printf("Error: cos/sin cache is null for pos %d\n", position);
-                    continue;
-                }
-
-                // Process Q heads
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    Q8_1Block *head_ptr = Q_blocks + tok * q_stride_blocks + h * blocks_per_head;
-                    process_q8_1_head_fused(head_ptr, head_dim, cos_cache, sin_cache);
-                }
-
-                // Process K heads
-                if (K_blocks)
-                {
-                    for (int h = 0; h < n_kv_heads; ++h)
-                    {
-                        Q8_1Block *head_ptr = K_blocks + tok * k_stride_blocks + h * blocks_per_head;
-                        process_q8_1_head_fused(head_ptr, head_dim, cos_cache, sin_cache);
-                    }
-                }
-            }
             return true;
         }
         else

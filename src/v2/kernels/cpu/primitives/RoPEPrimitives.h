@@ -9,12 +9,14 @@
  * - Complex recurrence for angle advancement
  * - Inverse frequency caching
  * - Angle recurrence across tokens in prefill
+ * - Q8_1 pure-integer RoPE (no FP32 round-trips)
  */
 #pragma once
 
 #include <vector>
 #include <cstddef>
 #include <cstdint>
+#include "../../../tensors/BlockStructures.h" // For Q8_1Block
 
 namespace llaminar2::primitives
 {
@@ -32,6 +34,10 @@ namespace llaminar2::primitives
         std::vector<float> cos_delta;
         std::vector<float> sin_delta;
 
+        // Q15 cache for Q8_1 RoPE
+        std::vector<int16_t> cos_curr_q15;
+        std::vector<int16_t> sin_curr_q15;
+
         void reset()
         {
             last_pos = -1;
@@ -39,6 +45,8 @@ namespace llaminar2::primitives
             sin_curr.clear();
             cos_delta.clear();
             sin_delta.clear();
+            cos_curr_q15.clear();
+            sin_curr_q15.clear();
         }
     };
 
@@ -273,5 +281,100 @@ namespace llaminar2::primitives
         const std::vector<float> &inv_freq,
         int head_dim);
 #endif
+
+    // ============================================================================
+    // Q8_1 Pure-Integer RoPE Primitives
+    // ============================================================================
+    // These primitives perform RoPE rotation entirely in the integer domain,
+    // avoiding FP32 round-trips for the quantized data. Sin/cos values are
+    // pre-computed as FP32 but quantized to Q15 for the rotation operation.
+    //
+    // Design rationale:
+    // - Sin/cos computation is position-dependent, not data-dependent
+    // - Only head_dim/2 sin/cos values needed per position (cheap FP32 compute)
+    // - Rotation uses integer multiply: x' = (x*cos_q15 - y*sin_q15) >> 15
+    // - Avoids expensive dequant→rotate→requant per head
+    // ============================================================================
+
+    /**
+     * @brief Cached sin/cos values in Q15 fixed-point format
+     *
+     * Q15 format: value * 32768 stored as int16_t
+     * Range: [-1.0, 1.0) maps to [-32768, 32767]
+     */
+    struct RoPESinCosQ15
+    {
+        std::vector<int16_t> cos_q15;
+        std::vector<int16_t> sin_q15;
+
+        void resize(int half_dim)
+        {
+            cos_q15.resize(half_dim);
+            sin_q15.resize(half_dim);
+        }
+    };
+
+    /**
+     * @brief Compute Q15 sin/cos values for a position
+     *
+     * @param position Token position index
+     * @param inv_freq Inverse frequency array [head_dim/2]
+     * @param head_dim Dimension per head (must be even)
+     * @param out Output Q15 sin/cos arrays (pre-sized to head_dim/2)
+     */
+    void compute_rope_sincos_q15(
+        int position,
+        const std::vector<float> &inv_freq,
+        int head_dim,
+        RoPESinCosQ15 &out);
+
+    /**
+     * @brief Apply pure-integer RoPE rotation to a single Q8_1 head
+     *
+     * Performs rotation entirely in integer domain:
+     * - Q8_1 blocks contain scale (d) and int8 values (qs)
+     * - Rotation: x' = (x*cos - y*sin), y' = (x*sin + y*cos)
+     * - Uses 32-bit intermediate precision
+     * - Output blocks have updated scales and int8 values
+     *
+     * @param head_blocks Q8_1 blocks for one head [blocks_per_head]
+     * @param blocks_per_head Number of blocks (head_dim / 32)
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     */
+    void apply_rope_q8_1_integer_head(
+        Q8_1Block *head_blocks,
+        int blocks_per_head,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+
+    /**
+     * @brief Apply pure-integer RoPE to Q8_1 Q and K tensors
+     *
+     * High-level wrapper that handles:
+     * - Position ID processing (skip padding with -1)
+     * - Sin/cos computation and quantization
+     * - Parallelization across tokens
+     * - Both Q and K tensor processing
+     *
+     * @param Q Q8_1 Q tensor [seq_len * n_heads * blocks_per_head]
+     * @param K Q8_1 K tensor [seq_len * n_kv_heads * blocks_per_head] or nullptr
+     * @param position_ids Position indices [seq_len], -1 = padding
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension (must be divisible by 32)
+     * @param rope_theta RoPE base frequency (e.g., 10000.0f)
+     */
+    void apply_rope_q8_1_integer(
+        Q8_1Block *Q,
+        Q8_1Block *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        RoPEPersistentState *persistent_state = nullptr);
 
 } // namespace llaminar2::primitives

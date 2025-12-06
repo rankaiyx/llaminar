@@ -1,279 +1,641 @@
 /**
  * @file Perf__CPURoPEKernel.cpp
- * @brief Performance benchmark for CPURoPEKernel
+ * @brief Performance benchmarks comparing CPURoPEKernelT vs CPURoPEKernelTyped
+ * @author David Sanftenberg
  *
- * This test benchmarks the CPU RoPE kernel performance.
- * It measures:
- *   - Latency (ms)
- *   - Throughput (tokens/s)
+ * Measures throughput (tokens/sec, GB/s) for RoPE operations across:
+ *   - Legacy: CPURoPEKernelT<FP32Tensor>::apply()
+ *   - Typed:  CPURoPEKernelTyped<FP32>::apply_typed()
+ *   - Typed:  CPURoPEKernelTyped<BF16>::apply_typed()
+ *   - Typed:  CPURoPEKernelTyped<FP16>::apply_typed()
+ *   - Typed:  CPURoPEKernelTyped<Q8_1>::apply_typed()
  *
- * @author GitHub Copilot
+ * Test scenarios:
+ *   - Single token (decode mode)
+ *   - Small batch (prefill, seq_len=32)
+ *   - Medium batch (prefill, seq_len=128)
+ *   - Large batch (prefill, seq_len=512)
+ *   - Long context (prefill, seq_len=2048)
+ *
+ * Expected results:
+ *   1. FP32 Typed should match or exceed FP32 Legacy performance
+ *   2. BF16/FP16 should be faster than FP32 (memory bandwidth savings)
+ *   3. Q8_1 should be fastest, especially at larger sequence lengths
  */
 
 #include <gtest/gtest.h>
 #include <mpi.h>
-#include <omp.h>
+
 #include <chrono>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <memory>
-#include <vector>
-#include <cmath>
 #include <numeric>
-#include <algorithm>
+#include <random>
+#include <vector>
 
-// V2 includes
-#include "tensors/Tensors.h"
-#include "tensors/BlockStructures.h"
 #include "kernels/cpu/ops/CPURoPEKernelT.h"
-#include "utils/Logger.h"
+#include "kernels/cpu/ops/CPURoPEKernelTyped.h"
+#include "tensors/Tensors.h"
+#include "tensors/SIMDHelpers.h"
+#include "tensors/BlockStructures.h"
+#include "pipelines/PipelineConfig.h"
 
 using namespace llaminar2;
 
-struct BenchmarkConfig
-{
-    int seq_len;
-    int n_heads;
-    int n_kv_heads;
-    int head_dim;
-    int warmup_iters;
-    int bench_iters;
-    std::string description;
-};
-
-struct BenchmarkStats
-{
-    double mean_ms;
-    double stddev_ms;
-    double min_ms;
-    double max_ms;
-};
+// ============================================================================
+// Performance Test Fixture
+// ============================================================================
 
 class CPURoPEKernel_Perf : public ::testing::Test
 {
 protected:
+    // Benchmark configuration
+    static constexpr size_t WARMUP_ITERATIONS = 10;
+    static constexpr size_t BENCHMARK_ITERATIONS = 100;
+
+    // Qwen2.5 model parameters
+    static constexpr int N_HEADS = 14;              // Qwen2.5-0.5B query heads
+    static constexpr int N_KV_HEADS = 2;            // Qwen2.5-0.5B KV heads
+    static constexpr int HEAD_DIM = 64;             // Qwen2.5 head dimension
+    static constexpr float ROPE_THETA = 1000000.0f; // Qwen2.5 RoPE theta
+
+    // Larger model parameters for scaling tests
+    static constexpr int LARGE_N_HEADS = 32;   // Qwen2.5-7B query heads
+    static constexpr int LARGE_N_KV_HEADS = 8; // Qwen2.5-7B KV heads
+    static constexpr int LARGE_HEAD_DIM = 128; // Qwen2.5-7B head dimension
+
+    std::mt19937 rng_{42};
     int rank_ = 0;
-    int world_size_ = 1;
 
     void SetUp() override
     {
+        rng_.seed(42);
         MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
-        MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
     }
 
-    BenchmarkStats run_benchmark(const BenchmarkConfig &config)
+    // =========================================================================
+    // Data Generation Helpers
+    // =========================================================================
+
+    std::vector<float> generate_random_fp32(size_t count)
     {
-        if (rank_ == 0)
+        std::vector<float> data(count);
+        std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+        for (auto &v : data)
         {
-            std::cout << "\n----------------------------------------------------------------" << std::endl;
-            std::cout << "Running Benchmark: " << config.description << std::endl;
-            std::cout << "  Seq Len:    " << config.seq_len << std::endl;
-            std::cout << "  Heads:      " << config.n_heads << " (KV: " << config.n_kv_heads << ")" << std::endl;
-            std::cout << "  Head Dim:   " << config.head_dim << std::endl;
-            std::cout << "----------------------------------------------------------------" << std::endl;
+            v = dist(rng_);
+        }
+        return data;
+    }
+
+    std::vector<int> generate_position_ids(int seq_len, int start_pos = 0)
+    {
+        std::vector<int> pos(seq_len);
+        std::iota(pos.begin(), pos.end(), start_pos);
+        return pos;
+    }
+
+    // =========================================================================
+    // Benchmark Result Structures
+    // =========================================================================
+
+    struct BenchmarkResult
+    {
+        std::string name;
+        double elapsed_ms;
+        double tokens_per_sec;
+        double bandwidth_gbps; // GB/s of Q+K tensor data
+        size_t iterations;
+        int seq_len;
+    };
+
+    // =========================================================================
+    // Output Formatting
+    // =========================================================================
+
+    void print_header(const std::string &test_name, int seq_len, int n_heads, int n_kv_heads, int head_dim)
+    {
+        if (rank_ != 0)
+            return;
+
+        size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+        size_t k_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+        double fp32_mb = (q_size + k_size) * sizeof(float) / (1024.0 * 1024.0);
+
+        std::cout << "\n╔══════════════════════════════════════════════════════════════════════════════════════╗" << std::endl;
+        std::cout << "║ " << std::setw(86) << std::left << test_name << "║" << std::endl;
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════════════╣" << std::endl;
+        std::cout << "║ seq_len=" << std::setw(5) << seq_len
+                  << "  n_heads=" << std::setw(3) << n_heads
+                  << "  n_kv_heads=" << std::setw(2) << n_kv_heads
+                  << "  head_dim=" << std::setw(3) << head_dim
+                  << "  FP32 Q+K=" << std::fixed << std::setprecision(2) << std::setw(7) << fp32_mb << " MB"
+                  << "      ║" << std::endl;
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════════════╣" << std::endl;
+        std::cout << "│   Implementation    │  Time (ms)  │  Tokens/sec  │  Bandwidth GB/s  │    Speedup    │" << std::endl;
+        std::cout << "├─────────────────────┼─────────────┼──────────────┼──────────────────┼───────────────┤" << std::endl;
+    }
+
+    void print_result(const BenchmarkResult &result, double baseline_ms = 0.0)
+    {
+        if (rank_ != 0)
+            return;
+
+        double speedup = (baseline_ms > 0) ? (baseline_ms / result.elapsed_ms) : 1.0;
+        std::string speedup_str;
+        if (baseline_ms > 0)
+        {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2) << speedup << "x";
+            if (speedup >= 1.0)
+                oss << " ✓";
+            speedup_str = oss.str();
+        }
+        else
+        {
+            speedup_str = "(baseline)";
         }
 
-        // Create kernel
-        CPURoPEKernel kernel;
+        std::cout << "│ " << std::setw(19) << std::left << result.name
+                  << " │ " << std::setw(11) << std::right << std::fixed << std::setprecision(3) << result.elapsed_ms
+                  << " │ " << std::setw(12) << std::right << std::fixed << std::setprecision(0) << result.tokens_per_sec
+                  << " │ " << std::setw(16) << std::right << std::fixed << std::setprecision(2) << result.bandwidth_gbps
+                  << " │ " << std::setw(13) << std::right << speedup_str
+                  << " │" << std::endl;
+    }
 
-        // Allocate tensors
-        size_t q_size = config.seq_len * config.n_heads * config.head_dim;
-        size_t k_size = config.seq_len * config.n_kv_heads * config.head_dim;
+    void print_footer()
+    {
+        if (rank_ != 0)
+            return;
+        std::cout << "╚══════════════════════════════════════════════════════════════════════════════════════╝" << std::endl;
+    }
 
-        std::vector<float> Q(q_size, 0.1f);
-        std::vector<float> K(k_size, 0.1f);
-        std::vector<int> position_ids(config.seq_len);
-        for (int i = 0; i < config.seq_len; ++i)
-            position_ids[i] = i;
+    // =========================================================================
+    // Benchmark Functions
+    // =========================================================================
+
+    BenchmarkResult benchmark_fp32_legacy(
+        int seq_len, int n_heads, int n_kv_heads, int head_dim)
+    {
+        size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+        size_t k_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+
+        auto q_data = generate_random_fp32(q_size);
+        auto k_data = generate_random_fp32(k_size);
+        auto position_ids = generate_position_ids(seq_len);
+
+        CPURoPEKernelT<FP32Tensor> kernel;
 
         // Warmup
-        for (int i = 0; i < config.warmup_iters; ++i)
+        for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
         {
             kernel.apply(
-                Q.data(), K.data(),
+                q_data.data(), k_data.data(),
                 position_ids.data(),
-                config.seq_len, config.n_heads, config.n_kv_heads, config.head_dim,
-                10000.0f, // rope_theta
-                false,    // use_bf16
-                nullptr,  // mpi_ctx
-                -1        // device_idx
-            );
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
         }
+
+        MPI_Barrier(MPI_COMM_WORLD);
 
         // Benchmark
-        std::vector<double> times_ms;
-        times_ms.reserve(config.bench_iters);
-
-        for (int i = 0; i < config.bench_iters; ++i)
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
         {
-            MPI_Barrier(MPI_COMM_WORLD);
-            auto start = std::chrono::high_resolution_clock::now();
-
             kernel.apply(
-                Q.data(), K.data(),
+                q_data.data(), k_data.data(),
                 position_ids.data(),
-                config.seq_len, config.n_heads, config.n_kv_heads, config.head_dim,
-                10000.0f, // rope_theta
-                false,    // use_bf16
-                nullptr,  // mpi_ctx
-                -1        // device_idx
-            );
-
-            auto end = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1e6;
-            times_ms.push_back(ms);
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
         }
+        auto end = std::chrono::high_resolution_clock::now();
 
-        // Calculate stats
-        double sum = std::accumulate(times_ms.begin(), times_ms.end(), 0.0);
-        double mean = sum / times_ms.size();
-        double sq_sum = std::inner_product(times_ms.begin(), times_ms.end(), times_ms.begin(), 0.0);
-        double stddev = std::sqrt(sq_sum / times_ms.size() - mean * mean);
-        double min_val = *std::min_element(times_ms.begin(), times_ms.end());
-        double max_val = *std::max_element(times_ms.begin(), times_ms.end());
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double total_tokens = static_cast<double>(seq_len) * BENCHMARK_ITERATIONS;
+        double tokens_per_sec = total_tokens / (elapsed_ms / 1000.0);
+        double total_bytes = static_cast<double>(q_size + k_size) * sizeof(float) * BENCHMARK_ITERATIONS;
+        double bandwidth_gbps = total_bytes / (1024.0 * 1024.0 * 1024.0) / (elapsed_ms / 1000.0);
 
-        if (rank_ == 0)
+        return {"FP32 Legacy", elapsed_ms, tokens_per_sec, bandwidth_gbps, BENCHMARK_ITERATIONS, seq_len};
+    }
+
+    BenchmarkResult benchmark_fp32_typed(
+        int seq_len, int n_heads, int n_kv_heads, int head_dim)
+    {
+        size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+        size_t k_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+
+        auto q_data = generate_random_fp32(q_size);
+        auto k_data = generate_random_fp32(k_size);
+        auto position_ids = generate_position_ids(seq_len);
+
+        CPURoPEKernelTyped<ActivationPrecision::FP32> kernel;
+
+        // Warmup
+        for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
         {
-            std::cout << std::fixed << std::setprecision(3);
-            std::cout << "  Mean:   " << mean << " ms" << std::endl;
-            std::cout << "  StdDev: " << stddev << " ms" << std::endl;
-            std::cout << "  Min:    " << min_val << " ms" << std::endl;
-            std::cout << "  Max:    " << max_val << " ms" << std::endl;
+            kernel.apply_typed(
+                q_data.data(), k_data.data(),
+                position_ids.data(),
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
         }
 
-        return {mean, stddev, min_val, max_val};
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        // Benchmark
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
+        {
+            kernel.apply_typed(
+                q_data.data(), k_data.data(),
+                position_ids.data(),
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double total_tokens = static_cast<double>(seq_len) * BENCHMARK_ITERATIONS;
+        double tokens_per_sec = total_tokens / (elapsed_ms / 1000.0);
+        double total_bytes = static_cast<double>(q_size + k_size) * sizeof(float) * BENCHMARK_ITERATIONS;
+        double bandwidth_gbps = total_bytes / (1024.0 * 1024.0 * 1024.0) / (elapsed_ms / 1000.0);
+
+        return {"FP32 Typed", elapsed_ms, tokens_per_sec, bandwidth_gbps, BENCHMARK_ITERATIONS, seq_len};
+    }
+
+    BenchmarkResult benchmark_bf16_typed(
+        int seq_len, int n_heads, int n_kv_heads, int head_dim)
+    {
+        size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+        size_t k_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+
+        // Generate FP32 and convert to BF16
+        auto fp32_q = generate_random_fp32(q_size);
+        auto fp32_k = generate_random_fp32(k_size);
+
+        std::vector<uint16_t> bf16_q(q_size);
+        std::vector<uint16_t> bf16_k(k_size);
+        simd::convert_fp32_to_bf16(fp32_q.data(), bf16_q.data(), q_size);
+        simd::convert_fp32_to_bf16(fp32_k.data(), bf16_k.data(), k_size);
+
+        auto position_ids = generate_position_ids(seq_len);
+
+        CPURoPEKernelTyped<ActivationPrecision::BF16> kernel;
+
+        // Warmup
+        for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
+        {
+            kernel.apply_typed(
+                bf16_q.data(), bf16_k.data(),
+                position_ids.data(),
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        // Benchmark
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
+        {
+            kernel.apply_typed(
+                bf16_q.data(), bf16_k.data(),
+                position_ids.data(),
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double total_tokens = static_cast<double>(seq_len) * BENCHMARK_ITERATIONS;
+        double tokens_per_sec = total_tokens / (elapsed_ms / 1000.0);
+        // BF16 uses 2 bytes per element
+        double total_bytes = static_cast<double>(q_size + k_size) * sizeof(uint16_t) * BENCHMARK_ITERATIONS;
+        double bandwidth_gbps = total_bytes / (1024.0 * 1024.0 * 1024.0) / (elapsed_ms / 1000.0);
+
+        return {"BF16 Typed", elapsed_ms, tokens_per_sec, bandwidth_gbps, BENCHMARK_ITERATIONS, seq_len};
+    }
+
+    BenchmarkResult benchmark_fp16_typed(
+        int seq_len, int n_heads, int n_kv_heads, int head_dim)
+    {
+        size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+        size_t k_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+
+        // Generate FP32 and convert to FP16
+        auto fp32_q = generate_random_fp32(q_size);
+        auto fp32_k = generate_random_fp32(k_size);
+
+        std::vector<uint16_t> fp16_q(q_size);
+        std::vector<uint16_t> fp16_k(k_size);
+        simd::convert_fp32_to_fp16(fp32_q.data(), fp16_q.data(), q_size);
+        simd::convert_fp32_to_fp16(fp32_k.data(), fp16_k.data(), k_size);
+
+        auto position_ids = generate_position_ids(seq_len);
+
+        CPURoPEKernelTyped<ActivationPrecision::FP16> kernel;
+
+        // Warmup
+        for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
+        {
+            kernel.apply_typed(
+                fp16_q.data(), fp16_k.data(),
+                position_ids.data(),
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        // Benchmark
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
+        {
+            kernel.apply_typed(
+                fp16_q.data(), fp16_k.data(),
+                position_ids.data(),
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double total_tokens = static_cast<double>(seq_len) * BENCHMARK_ITERATIONS;
+        double tokens_per_sec = total_tokens / (elapsed_ms / 1000.0);
+        // FP16 uses 2 bytes per element
+        double total_bytes = static_cast<double>(q_size + k_size) * sizeof(uint16_t) * BENCHMARK_ITERATIONS;
+        double bandwidth_gbps = total_bytes / (1024.0 * 1024.0 * 1024.0) / (elapsed_ms / 1000.0);
+
+        return {"FP16 Typed", elapsed_ms, tokens_per_sec, bandwidth_gbps, BENCHMARK_ITERATIONS, seq_len};
+    }
+
+    BenchmarkResult benchmark_q8_1_typed(
+        int seq_len, int n_heads, int n_kv_heads, int head_dim)
+    {
+        // Q8_1 requires head_dim to be multiple of 32
+        if (head_dim % 32 != 0)
+        {
+            return {"Q8_1 Typed", 0.0, 0.0, 0.0, 0, seq_len};
+        }
+
+        size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+        size_t k_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+        size_t q_blocks = q_size / 32;
+        size_t k_blocks = k_size / 32;
+
+        // Generate FP32 and quantize to Q8_1
+        auto fp32_q = generate_random_fp32(q_size);
+        auto fp32_k = generate_random_fp32(k_size);
+
+        std::vector<Q8_1Block> q8_q(q_blocks);
+        std::vector<Q8_1Block> q8_k(k_blocks);
+        simd::quantize_fp32_to_q8_1_blocks(fp32_q.data(), q8_q.data(), q_size);
+        simd::quantize_fp32_to_q8_1_blocks(fp32_k.data(), q8_k.data(), k_size);
+
+        auto position_ids = generate_position_ids(seq_len);
+
+        CPURoPEKernelTyped<ActivationPrecision::Q8_1> kernel;
+
+        // Warmup
+        for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
+        {
+            kernel.apply_typed(
+                q8_q.data(), q8_k.data(),
+                position_ids.data(),
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        // Benchmark
+        auto start = std::chrono::high_resolution_clock::now();
+        for (size_t iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
+        {
+            kernel.apply_typed(
+                q8_q.data(), q8_k.data(),
+                position_ids.data(),
+                seq_len, n_heads, n_kv_heads, head_dim,
+                ROPE_THETA);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double total_tokens = static_cast<double>(seq_len) * BENCHMARK_ITERATIONS;
+        double tokens_per_sec = total_tokens / (elapsed_ms / 1000.0);
+        // Q8_1 block: 32 int8 + fp16 scale + int16 sum = 36 bytes per 32 elements = 1.125 bytes/element
+        double total_bytes = static_cast<double>(q_blocks + k_blocks) * sizeof(Q8_1Block) * BENCHMARK_ITERATIONS;
+        double bandwidth_gbps = total_bytes / (1024.0 * 1024.0 * 1024.0) / (elapsed_ms / 1000.0);
+
+        return {"Q8_1 Typed", elapsed_ms, tokens_per_sec, bandwidth_gbps, BENCHMARK_ITERATIONS, seq_len};
+    }
+
+    // =========================================================================
+    // Run All Benchmarks for a Given Configuration
+    // =========================================================================
+
+    void run_benchmark_suite(
+        const std::string &test_name,
+        int seq_len, int n_heads, int n_kv_heads, int head_dim)
+    {
+        print_header(test_name, seq_len, n_heads, n_kv_heads, head_dim);
+
+        // Run benchmarks
+        auto fp32_legacy = benchmark_fp32_legacy(seq_len, n_heads, n_kv_heads, head_dim);
+        auto fp32_typed = benchmark_fp32_typed(seq_len, n_heads, n_kv_heads, head_dim);
+        auto bf16_typed = benchmark_bf16_typed(seq_len, n_heads, n_kv_heads, head_dim);
+        auto fp16_typed = benchmark_fp16_typed(seq_len, n_heads, n_kv_heads, head_dim);
+        auto q8_1_typed = benchmark_q8_1_typed(seq_len, n_heads, n_kv_heads, head_dim);
+
+        // Print results with speedup relative to FP32 Legacy
+        print_result(fp32_legacy, 0.0); // baseline
+        print_result(fp32_typed, fp32_legacy.elapsed_ms);
+        print_result(bf16_typed, fp32_legacy.elapsed_ms);
+        print_result(fp16_typed, fp32_legacy.elapsed_ms);
+        if (q8_1_typed.elapsed_ms > 0)
+        {
+            print_result(q8_1_typed, fp32_legacy.elapsed_ms);
+        }
+        else
+        {
+            if (rank_ == 0)
+            {
+                std::cout << "│ " << std::setw(19) << std::left << "Q8_1 Typed"
+                          << " │   (head_dim must be multiple of 32)                               │" << std::endl;
+            }
+        }
+
+        print_footer();
     }
 };
 
-TEST_F(CPURoPEKernel_Perf, SingleToken_Latency)
-{
-    BenchmarkConfig config;
-    config.seq_len = 1;
-    config.n_heads = 14;
-    config.n_kv_heads = 2;
-    config.head_dim = 64;
-    config.warmup_iters = 100;
-    config.bench_iters = 1000;
-    config.description = "Qwen 2.5 0.5B Single Token (1->1)";
+// ============================================================================
+// Test Cases: Small Model (Qwen2.5-0.5B dimensions)
+// ============================================================================
 
-    run_benchmark(config);
+TEST_F(CPURoPEKernel_Perf, SmallModel_SingleToken)
+{
+    // Decode mode: single token
+    run_benchmark_suite(
+        "RoPE Performance: Single Token (Decode Mode) - Qwen2.5-0.5B",
+        1, N_HEADS, N_KV_HEADS, HEAD_DIM);
 }
 
-TEST_F(CPURoPEKernel_Perf, Prefill_128)
+TEST_F(CPURoPEKernel_Perf, SmallModel_SmallBatch)
 {
-    BenchmarkConfig config;
-    config.seq_len = 128;
-    config.n_heads = 14;
-    config.n_kv_heads = 2;
-    config.head_dim = 64;
-    config.warmup_iters = 10;
-    config.bench_iters = 100;
-    config.description = "Qwen 2.5 0.5B Prefill (128)";
-
-    run_benchmark(config);
+    // Small prefill batch
+    run_benchmark_suite(
+        "RoPE Performance: seq_len=32 (Small Prefill) - Qwen2.5-0.5B",
+        32, N_HEADS, N_KV_HEADS, HEAD_DIM);
 }
 
-TEST_F(CPURoPEKernel_Perf, Prefill_1024)
+TEST_F(CPURoPEKernel_Perf, SmallModel_MediumBatch)
 {
-    BenchmarkConfig config;
-    config.seq_len = 1024;
-    config.n_heads = 14;
-    config.n_kv_heads = 2;
-    config.head_dim = 64;
-    config.warmup_iters = 5;
-    config.bench_iters = 50;
-    config.description = "Qwen 2.5 0.5B Prefill (1024)";
-
-    run_benchmark(config);
+    // Medium prefill batch
+    run_benchmark_suite(
+        "RoPE Performance: seq_len=128 (Medium Prefill) - Qwen2.5-0.5B",
+        128, N_HEADS, N_KV_HEADS, HEAD_DIM);
 }
 
-TEST_F(CPURoPEKernel_Perf, Large_SingleToken_Latency)
+TEST_F(CPURoPEKernel_Perf, SmallModel_LargeBatch)
 {
-    BenchmarkConfig config;
-    config.seq_len = 1;
-    config.n_heads = 28;
-    config.n_kv_heads = 4;
-    config.head_dim = 128;
-    config.warmup_iters = 100;
-    config.bench_iters = 1000;
-    config.description = "Qwen 2.5 7B Single Token (1->1)";
-
-    run_benchmark(config);
+    // Large prefill batch
+    run_benchmark_suite(
+        "RoPE Performance: seq_len=512 (Large Prefill) - Qwen2.5-0.5B",
+        512, N_HEADS, N_KV_HEADS, HEAD_DIM);
 }
 
-TEST_F(CPURoPEKernel_Perf, Q8_1_SingleToken_Latency)
+TEST_F(CPURoPEKernel_Perf, SmallModel_LongContext)
+{
+    // Long context (2K tokens)
+    run_benchmark_suite(
+        "RoPE Performance: seq_len=2048 (Long Context) - Qwen2.5-0.5B",
+        2048, N_HEADS, N_KV_HEADS, HEAD_DIM);
+}
+
+// ============================================================================
+// Test Cases: Large Model (Qwen2.5-7B dimensions)
+// ============================================================================
+
+TEST_F(CPURoPEKernel_Perf, LargeModel_SingleToken)
+{
+    // Decode mode with larger model
+    run_benchmark_suite(
+        "RoPE Performance: Single Token (Decode Mode) - Qwen2.5-7B dims",
+        1, LARGE_N_HEADS, LARGE_N_KV_HEADS, LARGE_HEAD_DIM);
+}
+
+TEST_F(CPURoPEKernel_Perf, LargeModel_MediumBatch)
+{
+    // Medium prefill with larger model
+    run_benchmark_suite(
+        "RoPE Performance: seq_len=128 (Medium Prefill) - Qwen2.5-7B dims",
+        128, LARGE_N_HEADS, LARGE_N_KV_HEADS, LARGE_HEAD_DIM);
+}
+
+TEST_F(CPURoPEKernel_Perf, LargeModel_LargeBatch)
+{
+    // Large prefill with larger model
+    run_benchmark_suite(
+        "RoPE Performance: seq_len=512 (Large Prefill) - Qwen2.5-7B dims",
+        512, LARGE_N_HEADS, LARGE_N_KV_HEADS, LARGE_HEAD_DIM);
+}
+
+TEST_F(CPURoPEKernel_Perf, LargeModel_LongContext)
+{
+    // Long context with larger model
+    run_benchmark_suite(
+        "RoPE Performance: seq_len=2048 (Long Context) - Qwen2.5-7B dims",
+        2048, LARGE_N_HEADS, LARGE_N_KV_HEADS, LARGE_HEAD_DIM);
+}
+
+// ============================================================================
+// Scaling Analysis
+// ============================================================================
+
+TEST_F(CPURoPEKernel_Perf, ScalingAnalysis)
 {
     if (rank_ == 0)
     {
-        std::cout << "\n----------------------------------------------------------------" << std::endl;
-        std::cout << "Running Benchmark: Q8_1 Single Token (1->1)" << std::endl;
-        std::cout << "----------------------------------------------------------------" << std::endl;
+        std::cout << "\n";
+        std::cout << "╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗" << std::endl;
+        std::cout << "║                               SCALING ANALYSIS: Speedup vs FP32 Legacy                               ║" << std::endl;
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════════════════════════════╣" << std::endl;
+        std::cout << "║  seq_len  │  FP32 Typed  │  BF16 Typed  │  FP16 Typed  │  Q8_1 Typed  │  Best Speedup                 ║" << std::endl;
+        std::cout << "├───────────┼──────────────┼──────────────┼──────────────┼──────────────┼───────────────────────────────┤" << std::endl;
     }
 
-    // Create kernel for Q8_1
-    CPURoPEKernelT<Q8_1Tensor> kernel;
+    std::vector<int> seq_lengths = {1, 8, 32, 128, 512, 1024, 2048};
 
-    int seq_len = 1;
-    int n_heads = 14;
-    int n_kv_heads = 2;
-    int head_dim = 64;
-
-    // Allocate buffers
-    size_t q_blocks = seq_len * n_heads * head_dim / Q8_1Block::BLOCK_SIZE;
-    size_t k_blocks = seq_len * n_kv_heads * head_dim / Q8_1Block::BLOCK_SIZE;
-
-    std::vector<Q8_1Block> Q(q_blocks);
-    std::vector<Q8_1Block> K(k_blocks);
-    std::vector<int> position_ids(seq_len);
-    for (int i = 0; i < seq_len; ++i)
-        position_ids[i] = i;
-
-    // Initialize with dummy data
-    for (auto &b : Q)
+    for (int seq_len : seq_lengths)
     {
-        b.d = 1;
-        b.sum_qs = 0;
-        for (int i = 0; i < 32; ++i)
-            b.qs[i] = 1;
-    }
-    for (auto &b : K)
-    {
-        b.d = 1;
-        b.sum_qs = 0;
-        for (int i = 0; i < 32; ++i)
-            b.qs[i] = 1;
-    }
+        auto fp32_legacy = benchmark_fp32_legacy(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
+        auto fp32_typed = benchmark_fp32_typed(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
+        auto bf16_typed = benchmark_bf16_typed(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
+        auto fp16_typed = benchmark_fp16_typed(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
+        auto q8_1_typed = benchmark_q8_1_typed(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
 
-    // Warmup
-    for (int i = 0; i < 10; ++i)
-    {
-        kernel.apply_q8_1(
-            Q.data(), K.data(),
-            position_ids.data(),
-            seq_len, n_heads, n_kv_heads, head_dim,
-            10000.0f, // rope_theta
-            -1        // device_idx
-        );
-    }
+        double fp32_speedup = fp32_legacy.elapsed_ms / fp32_typed.elapsed_ms;
+        double bf16_speedup = fp32_legacy.elapsed_ms / bf16_typed.elapsed_ms;
+        double fp16_speedup = fp32_legacy.elapsed_ms / fp16_typed.elapsed_ms;
+        double q8_1_speedup = (q8_1_typed.elapsed_ms > 0)
+                                  ? fp32_legacy.elapsed_ms / q8_1_typed.elapsed_ms
+                                  : 0.0;
 
-    // Benchmark
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 1000; ++i)
-    {
-        kernel.apply_q8_1(
-            Q.data(), K.data(),
-            position_ids.data(),
-            seq_len, n_heads, n_kv_heads, head_dim,
-            10000.0f, // rope_theta
-            -1        // device_idx
-        );
+        // Find best
+        std::string best_name = "FP32 Typed";
+        double best_speedup = fp32_speedup;
+        if (bf16_speedup > best_speedup)
+        {
+            best_speedup = bf16_speedup;
+            best_name = "BF16 Typed";
+        }
+        if (fp16_speedup > best_speedup)
+        {
+            best_speedup = fp16_speedup;
+            best_name = "FP16 Typed";
+        }
+        if (q8_1_speedup > best_speedup)
+        {
+            best_speedup = q8_1_speedup;
+            best_name = "Q8_1 Typed";
+        }
+
+        if (rank_ == 0)
+        {
+            std::ostringstream best_str;
+            best_str << best_name << " (" << std::fixed << std::setprecision(2) << best_speedup << "x)";
+
+            std::cout << "║ " << std::setw(9) << std::right << seq_len
+                      << " │ " << std::setw(10) << std::right << std::fixed << std::setprecision(2) << fp32_speedup << "x "
+                      << " │ " << std::setw(10) << std::right << std::fixed << std::setprecision(2) << bf16_speedup << "x "
+                      << " │ " << std::setw(10) << std::right << std::fixed << std::setprecision(2) << fp16_speedup << "x "
+                      << " │ " << std::setw(10) << std::right;
+
+            if (q8_1_speedup > 0)
+            {
+                std::cout << std::fixed << std::setprecision(2) << q8_1_speedup << "x ";
+            }
+            else
+            {
+                std::cout << "N/A  ";
+            }
+
+            std::cout << " │ " << std::setw(29) << std::left << best_str.str()
+                      << " ║" << std::endl;
+        }
     }
-    auto end = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1000000.0 / 1000.0;
 
     if (rank_ == 0)
     {
-        std::cout << "  Mean:   " << std::fixed << std::setprecision(3) << ms << " ms" << std::endl;
+        std::cout << "╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝" << std::endl;
+        std::cout << "\nExpected patterns:" << std::endl;
+        std::cout << "  • FP32 Typed should match FP32 Legacy (~1.0x)" << std::endl;
+        std::cout << "  • BF16/FP16 should be faster than FP32 due to memory bandwidth (>1.0x)" << std::endl;
+        std::cout << "  • Q8_1 should show best scaling at larger seq_len due to integer ops" << std::endl;
     }
 }
 

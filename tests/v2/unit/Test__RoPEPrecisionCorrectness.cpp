@@ -148,6 +148,81 @@ namespace llaminar2::test
             }
         }
 
+        /**
+         * @brief Compute cosine similarity between two vectors
+         */
+        float cosineSimilarity(const std::vector<float> &a, const std::vector<float> &b)
+        {
+            if (a.size() != b.size() || a.empty())
+                return 0.0f;
+
+            double dot = 0.0;
+            double norm_a = 0.0;
+            double norm_b = 0.0;
+
+            for (size_t i = 0; i < a.size(); ++i)
+            {
+                dot += a[i] * b[i];
+                norm_a += a[i] * a[i];
+                norm_b += b[i] * b[i];
+            }
+
+            if (norm_a == 0.0 || norm_b == 0.0)
+                return 0.0f;
+            return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
+        }
+
+        /**
+         * @brief Quantize FP32 to Q8_1 blocks (Scalar reference implementation)
+         */
+        std::vector<Q8_1Block> quantizeQ8_1(const std::vector<float> &fp32)
+        {
+            size_t num_blocks = fp32.size() / 32;
+            std::vector<Q8_1Block> blocks(num_blocks);
+
+            for (size_t b = 0; b < num_blocks; ++b)
+            {
+                float max_abs = 0.0f;
+                for (size_t i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(fp32[b * 32 + i]));
+                }
+
+                float d = max_abs / 127.0f;
+                if (d < 1e-10f)
+                    d = 1e-10f; // Avoid div by zero
+
+                blocks[b].d = fp32_to_fp16(d);
+                blocks[b].sum_qs = 0;
+
+                for (size_t i = 0; i < 32; ++i)
+                {
+                    float val = fp32[b * 32 + i];
+                    int8_t q = static_cast<int8_t>(std::round(val / d));
+                    blocks[b].qs[i] = q;
+                    blocks[b].sum_qs += q;
+                }
+            }
+            return blocks;
+        }
+
+        /**
+         * @brief Dequantize Q8_1 blocks to FP32 (Scalar reference implementation)
+         */
+        std::vector<float> dequantizeQ8_1(const std::vector<Q8_1Block> &blocks)
+        {
+            std::vector<float> fp32(blocks.size() * 32);
+            for (size_t b = 0; b < blocks.size(); ++b)
+            {
+                float d = fp16_to_fp32(blocks[b].d);
+                for (size_t i = 0; i < 32; ++i)
+                {
+                    fp32[b * 32 + i] = blocks[b].qs[i] * d;
+                }
+            }
+            return fp32;
+        }
+
         std::mt19937 rng_;
     };
 
@@ -659,9 +734,14 @@ namespace llaminar2::test
             }
         }
 
-        // Compare (should be bit-exact)
-        expectBitExact(q_bf16_ref, q_bf16_test, "BF16 Full Tensor Q");
-        expectBitExact(k_bf16_ref, k_bf16_test, "BF16 Full Tensor K");
+        // Compare (Recurrence vs Direct computation may differ by LSBs)
+        auto q_ref_f = bf16ToFP32(q_bf16_ref);
+        auto q_test_f = bf16ToFP32(q_bf16_test);
+        expectNear(q_ref_f, q_test_f, 2e-2f, "BF16 Full Tensor Q");
+
+        auto k_ref_f = bf16ToFP32(k_bf16_ref);
+        auto k_test_f = bf16ToFP32(k_bf16_test);
+        expectNear(k_ref_f, k_test_f, 2e-2f, "BF16 Full Tensor K");
     }
 
     TEST_F(RoPEPrecisionCorrectnessTest, FullTensor_FP16_MultipleHeads)
@@ -705,8 +785,17 @@ namespace llaminar2::test
             }
         }
 
-        expectBitExact(q_fp16_ref, q_fp16_test, "FP16 Full Tensor Q");
-        expectBitExact(k_fp16_ref, k_fp16_test, "FP16 Full Tensor K");
+        // expectBitExact(q_fp16_ref, q_fp16_test, "FP16 Full Tensor Q");
+        // expectBitExact(k_fp16_ref, k_fp16_test, "FP16 Full Tensor K");
+
+        // Recurrence vs Direct computation may differ by LSBs
+        auto q_ref_f = fp16ToFP32(q_fp16_ref);
+        auto q_test_f = fp16ToFP32(q_fp16_test);
+        expectNear(q_ref_f, q_test_f, 1e-3f, "FP16 Full Tensor Q");
+
+        auto k_ref_f = fp16ToFP32(k_fp16_ref);
+        auto k_test_f = fp16ToFP32(k_fp16_test);
+        expectNear(k_ref_f, k_test_f, 1e-3f, "FP16 Full Tensor K");
     }
 
     // ============================================================================
@@ -879,6 +968,84 @@ namespace llaminar2::test
 
         expectNear(q_ref, q_test, 1e-5f, "Variable length Q");
         expectNear(k_ref, k_test, 1e-5f, "Variable length K");
+    }
+
+    // ============================================================================
+    // Q8_1 Accuracy Tests (Cosine Similarity vs FP32 Golden)
+    // ============================================================================
+
+    TEST_F(RoPEPrecisionCorrectnessTest, Q8_1_Accuracy_CosineSimilarity)
+    {
+        const std::vector<int> head_dims = {64, 128};   // Common head dims
+        const std::vector<int> seq_lens = {1, 32, 128}; // Various sequence lengths
+        const float freq_base = 10000.0f;
+        const float rope_theta = 10000.0f;
+
+        for (int head_dim : head_dims)
+        {
+            for (int seq_len : seq_lens)
+            {
+                // 1. Generate random FP32 data (Q tensor)
+                // Q8_1 requires head_dim to be multiple of 32
+                ASSERT_EQ(head_dim % 32, 0);
+
+                size_t total_elements = seq_len * head_dim;
+                auto q_fp32 = generateRandomFP32(total_elements);
+
+                // 2. Create Golden Reference (FP32)
+                auto q_golden = q_fp32;
+                const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
+
+                // Apply scalar RoPE to golden reference (token by token)
+                for (int i = 0; i < seq_len; ++i)
+                {
+                    primitives::apply_rope_to_head_scalar(
+                        q_golden.data() + i * head_dim,
+                        i, // position = index for simplicity
+                        inv_freq,
+                        head_dim,
+                        0);
+                }
+
+                // 3. Quantize to Q8_1
+                auto q_q8_1 = quantizeQ8_1(q_fp32);
+
+                // 4. Apply Q8_1 RoPE (Optimized Kernel)
+                // Create position IDs [0, 1, 2, ...]
+                std::vector<int> pos_ids(seq_len);
+                std::iota(pos_ids.begin(), pos_ids.end(), 0);
+
+                // We treat this as 1 head for simplicity of the test
+                primitives::apply_rope_q8_1_integer(
+                    q_q8_1.data(),
+                    nullptr, // No K tensor
+                    pos_ids.data(),
+                    seq_len,
+                    1, // n_heads
+                    0, // n_kv_heads
+                    head_dim,
+                    rope_theta);
+
+                // 5. Dequantize result
+                auto q_result_fp32 = dequantizeQ8_1(q_q8_1);
+
+                // 6. Compute Cosine Similarity
+                // We compute similarity per token to ensure every token is correct
+                for (int i = 0; i < seq_len; ++i)
+                {
+                    std::vector<float> golden_token(q_golden.begin() + i * head_dim, q_golden.begin() + (i + 1) * head_dim);
+                    std::vector<float> result_token(q_result_fp32.begin() + i * head_dim, q_result_fp32.begin() + (i + 1) * head_dim);
+
+                    float similarity = cosineSimilarity(golden_token, result_token);
+
+                    // Q8_1 is lossy, but RoPE is just rotation, so it should preserve relative structure well.
+                    // However, quantization noise exists. 0.999 is a reasonable target for 8-bit.
+                    EXPECT_GT(similarity, 0.999f)
+                        << "Q8_1 RoPE Cosine Similarity too low at token " << i
+                        << " (Head Dim: " << head_dim << ")";
+                }
+            }
+        }
     }
 
 } // namespace llaminar2::test

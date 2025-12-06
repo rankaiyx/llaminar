@@ -536,6 +536,7 @@ add_library(llaminar2_core STATIC
     # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,
     # BF16PackedGemm, FP16PackedGemm, Q8_1GemmKernelInit, VNNIGemmKernelInit
     kernels/cpu/ops/CPURoPEKernelT.cpp
+    kernels/cpu/ops/CPURoPEKernelTyped.cpp     # Typed RoPE with fused precision conversion (FP32/BF16/FP16/Q8_1)
     kernels/cpu/ops/CPURMSNormTypedKernel.cpp  # Typed RMSNorm with fused precision conversion (replaced CPURMSNormKernelT)
     kernels/cpu/ops/CPUSoftmaxKernelT.cpp
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp

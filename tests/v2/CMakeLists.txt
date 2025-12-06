@@ -700,6 +700,19 @@ add_v2_test(V2_Unit_RMSNormTypedKernel
     MPI_PROCS 1  # RMSNormTypedKernel tests are CPU-only, single rank
 )
 
+# Test: CPURoPEKernelTyped (typed RoPE with fused precision conversion)
+add_executable(v2_test_rope_typed_kernel unit/Test__CPURoPEKernelTyped.cpp)
+target_link_libraries(v2_test_rope_typed_kernel
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RoPETypedKernel
+    COMMAND $<TARGET_FILE:v2_test_rope_typed_kernel>
+    LABELS "V2;Unit;Kernels;RoPE;FP32;BF16;FP16;Q8_1;FusedPrecision;TypedResidual;CPU"
+    MPI_PROCS 1  # RoPETypedKernel tests are CPU-only, single rank
+)
+
 # Test: CpuAttentionKernelT (template-based attention kernel)
 add_executable(v2_test_cpu_attention_kernel_t unit/Test__CpuAttentionKernelT.cpp)
 target_link_libraries(v2_test_cpu_attention_kernel_t
@@ -2175,5 +2188,19 @@ add_v2_test(V2_Perf_RMSNormThreadSweep
     COMMAND $<TARGET_FILE:v2_perf_rmsnorm_thread_sweep>
     LABELS "V2;Performance;RMSNorm;ThreadSweep;Kernels"
     MPI_PROCS 1
+)
+
+
+# Performance Test: CPURoPEKernel comparison (Legacy vs Typed FP32/BF16/FP16/Q8_1)
+add_executable(v2_perf_rope_kernel performance/kernels/cpu/ops/Perf__CPURoPEKernel.cpp)
+target_link_libraries(v2_perf_rope_kernel 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CPURoPEKernel 
+    COMMAND $<TARGET_FILE:v2_perf_rope_kernel>
+    LABELS "V2;Performance;RoPE;TypedResiduals;Kernels;FP32;BF16;FP16;Q8_1"
+    MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
 )
 
