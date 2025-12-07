@@ -389,9 +389,9 @@ protected:
         std::cout << std::endl;
         */
 
-        // DEBUG: Compare raw GEMM scores (not softmax)
+        // Compare against FP32 reference WITH softmax (matches kernel output)
         std::vector<float> C_ref(S * KV);
-        compute_raw_gemm(S, KV, D, Q_deq.data(), K_deq.data(), scale, nullptr, C_ref.data());
+        compute_reference(S, KV, D, Q_deq.data(), K_deq.data(), scale, nullptr, C_ref.data());
 
         auto [l2_error, cosine_sim] = verify_correctness(S, KV, C.data(), C_ref.data());
 

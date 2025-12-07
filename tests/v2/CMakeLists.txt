@@ -1833,6 +1833,19 @@ add_v2_test(V2_Integration_QuantisedGemmFused
     LABELS "V2;Integration;Kernels;GEMM;FusedOps;Softmax;SwiGLU;Bias;Correctness"
 )
 
+# Test: Q8_1 OnlineSoftmax Kernel Correctness (Q8_1 x Q8_1 attention + fused softmax)
+# Validates correctness across model sizes (Qwen 0.5B/7B/32B) and sequence lengths
+add_executable(v2_integration_q8_1_online_softmax integration/Test__Q8_1_OnlineSoftmax.cpp)
+target_link_libraries(v2_integration_q8_1_online_softmax 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_OnlineSoftmax 
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_online_softmax>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Kernels;GEMM;Attention;Q8_1;OnlineSoftmax;Correctness"
+)
+
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
 # Validates end-to-end pipeline functionality including Q/K/V/O bias application
 add_executable(v2_integration_qwen2_pipeline integration/Test__Qwen2Pipeline.cpp)

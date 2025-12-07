@@ -467,12 +467,13 @@ namespace llaminar2
                             Ymm ymm_acc = Ymm(i * unroll_n_ + j);
 
                             // HSum YMM (8 floats) -> Scalar XMM
+                            // Note: vhaddps doesn't have EVEX encoding, so use vpermilps+vaddps
                             vextractf32x4(xmm28, ymm_acc, 1);
                             vaddps(xmm28, xmm28, Xmm(ymm_acc.getIdx()));
                             vpermilps(xmm29, xmm28, 0b01001110); // Swap pairs
                             vaddps(xmm28, xmm28, xmm29);
                             vpermilps(xmm29, xmm28, 0b10110001); // Swap odd/even
-                            vaddps(xmm28, xmm28, xmm29);         // xmm28[0] = raw dot product (with unsigned bias)
+                            vaddps(xmm28, xmm28, xmm29);         // xmm28[0] = raw dot product
 
                             // Apply correction: subtract 128 × Σ_k(sum_qs_K[k] × d_Q[k] × d_K[k])
                             // Extract correction from VecAccCorr
@@ -712,10 +713,10 @@ namespace llaminar2
                 }
 
                 L("end_pass1");
-                jmp("end_kernel", T_NEAR); // DEBUG: Skip pass2 to test raw GEMM
+                // Fall through to Pass 2 for normalization
 
                 // ============================================================
-                // PASS 2: Normalize
+                // PASS 2: Normalize (divide by sum)
                 // ============================================================
                 for (int i = 0; i < m_blocking_; ++i)
                 {
