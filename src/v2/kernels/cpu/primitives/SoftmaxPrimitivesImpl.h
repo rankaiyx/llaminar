@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -1044,6 +1045,681 @@ namespace llaminar2::primitives
         softmax_row_fp16_avx2(row, cols, causal, scale, row_idx);
 #else
         softmax_row_fp16_scalar(row, cols, causal, scale, row_idx);
+#endif
+    }
+
+    // ============================================================================
+    // Q8_1 Integer-Aware Softmax - Scalar Implementation (OPTIMIZED)
+    // ============================================================================
+    // Optimizations applied:
+    // 1. ELIMINATED HEAP ALLOCATION: Use fixed-size stack buffer (32 floats = 1 block)
+    // 2. FUSED Pass 2+3: Single pass for exp sum AND max_prob finding
+    // 3. STREAMING REQUANT: Process block-by-block to stay in cache
+    // 4. REDUCED REDUNDANT SCALE CONVERSION: Cache bf16→fp32 per block
+
+    inline void softmax_row_q8_1_scalar(
+        Q8_1Block *row,
+        int n_blocks,
+        bool causal,
+        float scale,
+        int row_idx)
+    {
+        // ========================================================================
+        // Pass 1: Find Maximum (integer-optimized)
+        // ========================================================================
+        // Find max(qs[i] * d) across all blocks
+        // Key insight: We find integer max per block, then scale and reduce
+
+        float row_max = -std::numeric_limits<float>::infinity();
+
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            const Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+
+            // Convert BF16 scale to FP32 once per block
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+
+            // Find max within block (integer comparison)
+            int8_t block_max_qs = -128;
+            for (int i = 0; i < 32; ++i)
+            {
+                const int col = col_start + i;
+                if (causal && col > row_idx)
+                    continue;
+                if (block.qs[i] > block_max_qs)
+                    block_max_qs = block.qs[i];
+            }
+
+            // Scale to FP32 and update row max
+            if (block_max_qs > -128)
+            { // Only if we found valid elements
+                float block_max = static_cast<float>(block_max_qs) * d * scale;
+                if (block_max > row_max)
+                    row_max = block_max;
+            }
+        }
+
+        if (!std::isfinite(row_max))
+            row_max = 0.0f;
+
+        // ========================================================================
+        // Pass 2 (FUSED): Compute Sum of Exponentials AND Find Max Probability
+        // ========================================================================
+        // We compute exp(v - max) and track both:
+        // - sum: total for normalization
+        // - max_prob_unnorm: max(exp(v - max)) for requantization scale
+        // Since exp is monotonic, max_prob_unnorm = exp(0) = 1.0 when v == row_max
+
+        double sum = 0.0;
+        // Note: max_prob_unnorm is always 1.0 since exp(row_max - row_max) = exp(0) = 1
+        // This is mathematically guaranteed, so we don't need to track it!
+        
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            const Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const float scaled_d = d * scale;
+
+            for (int i = 0; i < 32; ++i)
+            {
+                const int col = col_start + i;
+                if (causal && col > row_idx)
+                    continue;
+                float v = static_cast<float>(block.qs[i]) * scaled_d;
+                sum += std::exp(v - row_max);
+            }
+        }
+
+        if (sum <= 0.0)
+            sum = 1.0;
+
+        const float inv_sum = static_cast<float>(1.0 / sum);
+        
+        // max_prob = 1.0 / sum (the maximum softmax value is always exp(0)/sum = 1/sum)
+        // Wait, that's not right. max_prob = exp(max - max) * inv_sum = 1.0 * inv_sum = inv_sum
+        // But inv_sum = 1/sum, and softmax max is 1/sum only if there's one dominant element.
+        // For proper requantization, we need to find actual max prob.
+        // 
+        // OPTIMIZATION: For softmax, max_prob = inv_sum (occurs at the position where v == row_max)
+        // This is exact: prob_max = exp(row_max - row_max) / sum = 1 / sum
+        const float max_prob = inv_sum;
+
+        // ========================================================================
+        // Pass 3 (OPTIMIZED): Streaming Requantize Block-by-Block
+        // ========================================================================
+        // NO HEAP ALLOCATION: Use stack buffer for one block at a time
+        // This keeps working set in L1 cache (32 floats = 128 bytes)
+        
+        // Compute requantization scale
+        const float new_d = (max_prob > 0.0f) ? max_prob / 127.0f : 1.0f / 127.0f;
+        const float inv_d = 1.0f / new_d;
+        const uint16_t new_d_bf16 = detail::fp32_to_bf16_scalar(new_d);
+
+        // Stack buffer for one block's probabilities (32 floats = 128 bytes)
+        alignas(32) float block_probs[32];
+
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const float scaled_d = d * scale;
+
+            // Compute probabilities for this block into stack buffer
+            for (int i = 0; i < 32; ++i)
+            {
+                const int col = col_start + i;
+                if (causal && col > row_idx)
+                {
+                    block_probs[i] = 0.0f;
+                }
+                else
+                {
+                    float v = static_cast<float>(block.qs[i]) * scaled_d;
+                    block_probs[i] = std::exp(v - row_max) * inv_sum;
+                }
+            }
+
+            // Write new scale
+            block.d = new_d_bf16;
+
+            // Quantize and accumulate sum_qs
+            int16_t sum_qs = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t q = static_cast<int32_t>(std::round(block_probs[i] * inv_d));
+                q = std::max(-128, std::min(127, q));
+                block.qs[i] = static_cast<int8_t>(q);
+                sum_qs += block.qs[i];
+            }
+            block.sum_qs = sum_qs;
+        }
+    }
+
+    // ============================================================================
+    // Q8_1 Integer-Aware Softmax - AVX2 Implementation (OPTIMIZED)
+    // ============================================================================
+    // Optimizations applied:
+    // 1. ELIMINATED HEAP ALLOCATION: Use fixed-size stack buffer (32 floats = 1 block)
+    // 2. STREAMING REQUANT: Process block-by-block to stay in L1 cache
+    // 3. VECTORIZED SUM_QS: Use AVX2 horizontal sum instead of scalar loop
+    // 4. FUSED PROB→QUANT: Compute prob, quantize, accumulate in single pass
+
+    inline void softmax_row_q8_1_avx2(
+        Q8_1Block *row,
+        int n_blocks,
+        bool causal,
+        float scale,
+        int row_idx)
+    {
+#if defined(LLAMINAR_HAS_AVX2)
+        // ========================================================================
+        // Pass 1: Find Maximum using AVX2
+        // ========================================================================
+        // Use vpmaxsb for 32-way INT8 max comparison per block
+
+        float row_max = -std::numeric_limits<float>::infinity();
+        const __m256 scale_ps = _mm256_set1_ps(scale);
+
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            const Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+
+            // Load 32 INT8 values as two __m128i (AVX2 vpmaxsb works on 256-bit)
+            __m256i qs_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
+
+            // Find max within 32 bytes using horizontal reduction
+            // Split into two 128-bit halves
+            __m128i lo = _mm256_castsi256_si128(qs_vec);
+            __m128i hi = _mm256_extracti128_si256(qs_vec, 1);
+            __m128i max_16 = _mm_max_epi8(lo, hi);
+
+            // Reduce 16 bytes to 8 bytes
+            __m128i shifted = _mm_srli_si128(max_16, 8);
+            __m128i max_8 = _mm_max_epi8(max_16, shifted);
+
+            // Reduce 8 bytes to 4 bytes
+            shifted = _mm_srli_si128(max_8, 4);
+            __m128i max_4 = _mm_max_epi8(max_8, shifted);
+
+            // Reduce 4 bytes to 2 bytes
+            shifted = _mm_srli_si128(max_4, 2);
+            __m128i max_2 = _mm_max_epi8(max_4, shifted);
+
+            // Reduce 2 bytes to 1 byte
+            shifted = _mm_srli_si128(max_2, 1);
+            __m128i max_1 = _mm_max_epi8(max_2, shifted);
+
+            // Extract scalar max
+            int8_t block_max_qs = static_cast<int8_t>(_mm_extract_epi8(max_1, 0));
+
+            // Handle causal masking (may need to recompute if causal cuts this block)
+            if (causal)
+            {
+                const int causal_end = std::min(row_idx + 1, col_start + 32);
+                if (causal_end <= col_start)
+                {
+                    continue; // Entire block is masked
+                }
+                else if (causal_end < col_start + 32)
+                {
+                    // Partial block - recompute max for valid range
+                    block_max_qs = -128;
+                    for (int i = 0; i < causal_end - col_start; ++i)
+                    {
+                        if (block.qs[i] > block_max_qs)
+                            block_max_qs = block.qs[i];
+                    }
+                }
+            }
+
+            // Convert BF16 scale to FP32 and compute block max
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+            float block_max = static_cast<float>(block_max_qs) * d * scale;
+            if (block_max > row_max)
+                row_max = block_max;
+        }
+
+        if (!std::isfinite(row_max))
+            row_max = 0.0f;
+
+        // ========================================================================
+        // Pass 2: Compute Sum of Exponentials using AVX2
+        // ========================================================================
+        // Process 8 FP32 values at a time after dequantization
+
+        double sum = 0.0;
+        const __m256 max_ps = _mm256_set1_ps(row_max);
+
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            const Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const __m256 d_ps = _mm256_set1_ps(d);
+            const __m256 scaled_d_ps = _mm256_mul_ps(d_ps, scale_ps);
+
+            // Process 32 elements in 4 groups of 8
+            for (int g = 0; g < 4; ++g)
+            {
+                // Load 8 INT8 values and convert to FP32
+                __m128i qs_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + g * 8));
+                __m128i qs_16 = _mm_cvtepi8_epi16(qs_8);
+                __m256i qs_32 = _mm256_cvtepi16_epi32(qs_16);
+                __m256 v = _mm256_cvtepi32_ps(qs_32);
+
+                // Apply scale: v = v * d * scale
+                v = _mm256_mul_ps(v, scaled_d_ps);
+
+                // Subtract max
+                v = _mm256_sub_ps(v, max_ps);
+
+                // Handle causal masking
+                if (causal)
+                {
+                    const int group_start = col_start + g * 8;
+                    for (int lane = 0; lane < 8; ++lane)
+                    {
+                        if (group_start + lane > row_idx)
+                        {
+                            // Mask out this lane (set to large negative)
+                            alignas(32) float tmp[8];
+                            _mm256_store_ps(tmp, v);
+                            tmp[lane] = -100.0f; // Will exp to ~0
+                            v = _mm256_load_ps(tmp);
+                        }
+                    }
+                }
+
+                // Compute exp and accumulate (scalar for accuracy)
+                alignas(32) float tmp[8];
+                _mm256_store_ps(tmp, v);
+                for (int lane = 0; lane < 8; ++lane)
+                {
+                    const int col = col_start + g * 8 + lane;
+                    if (causal && col > row_idx)
+                        continue;
+                    sum += std::exp(tmp[lane]);
+                }
+            }
+        }
+
+        if (sum <= 0.0)
+            sum = 1.0;
+
+        const float inv_sum = static_cast<float>(1.0 / sum);
+        
+        // max_prob = inv_sum (occurs at position where v == row_max)
+        const float max_prob = inv_sum;
+
+        // ========================================================================
+        // Pass 3 (OPTIMIZED): Streaming Normalize and Requantize using AVX2
+        // ========================================================================
+        // NO HEAP ALLOCATION: Use stack buffer for one block (128 bytes)
+        // VECTORIZED SUM_QS: Use AVX2 horizontal sum
+
+        // Compute requantization scale
+        const float new_d = (max_prob > 0.0f) ? max_prob / 127.0f : 1.0f / 127.0f;
+        const float inv_d = 1.0f / new_d;
+        const uint16_t new_d_bf16 = detail::fp32_to_bf16_scalar(new_d);
+
+        // Stack buffer for one block's probabilities
+        alignas(32) float block_probs[32];
+
+        const __m256 inv_d_ps = _mm256_set1_ps(inv_d);
+        const __m256 inv_sum_ps = _mm256_set1_ps(inv_sum);
+
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const __m256 d_ps = _mm256_set1_ps(d);
+            const __m256 scaled_d_ps = _mm256_mul_ps(d_ps, scale_ps);
+
+            // Compute probabilities for this block into stack buffer
+            for (int g = 0; g < 4; ++g)
+            {
+                __m128i qs_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + g * 8));
+                __m128i qs_16 = _mm_cvtepi8_epi16(qs_8);
+                __m256i qs_32 = _mm256_cvtepi16_epi32(qs_16);
+                __m256 v = _mm256_cvtepi32_ps(qs_32);
+                v = _mm256_mul_ps(v, scaled_d_ps);
+                v = _mm256_sub_ps(v, max_ps);
+
+                // Handle causal masking
+                if (causal)
+                {
+                    const int group_start = col_start + g * 8;
+                    for (int lane = 0; lane < 8; ++lane)
+                    {
+                        if (group_start + lane > row_idx)
+                        {
+                            alignas(32) float tmp[8];
+                            _mm256_store_ps(tmp, v);
+                            tmp[lane] = -100.0f;
+                            v = _mm256_load_ps(tmp);
+                        }
+                    }
+                }
+
+                // Compute exp (scalar for accuracy) and store
+                alignas(32) float tmp[8];
+                _mm256_store_ps(tmp, v);
+                for (int lane = 0; lane < 8; ++lane)
+                {
+                    block_probs[g * 8 + lane] = std::exp(tmp[lane]) * inv_sum;
+                }
+            }
+
+            block.d = new_d_bf16;
+
+            // OPTIMIZED: Vectorized quantization with AVX2 horizontal sum
+            __m256i sum_qs_vec = _mm256_setzero_si256();
+
+            // Process 32 elements in 4 groups of 8
+            for (int g = 0; g < 4; ++g)
+            {
+                // Load 8 probabilities
+                __m256 prob_ps = _mm256_load_ps(&block_probs[g * 8]);
+
+                // Scale by inverse of new_d
+                __m256 scaled_ps = _mm256_mul_ps(prob_ps, inv_d_ps);
+
+                // Round to nearest
+                __m256 rounded_ps = _mm256_round_ps(scaled_ps, _MM_FROUND_TO_NEAREST_INT);
+
+                // Convert to INT32
+                __m256i int32_vec = _mm256_cvtps_epi32(rounded_ps);
+
+                // Pack to INT16 (with saturation)
+                __m128i lo = _mm256_castsi256_si128(int32_vec);
+                __m128i hi = _mm256_extracti128_si256(int32_vec, 1);
+                __m128i int16_vec = _mm_packs_epi32(lo, hi);
+
+                // Pack to INT8 (with saturation)
+                __m128i int8_vec = _mm_packs_epi16(int16_vec, int16_vec);
+
+                // Store 8 INT8 values
+                int64_t packed = _mm_cvtsi128_si64(int8_vec);
+                std::memcpy(block.qs + g * 8, &packed, 8);
+
+                // Accumulate sum_qs: extend INT8 to INT32 and add
+                // Use stored values for accuracy
+                __m128i qs_loaded = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + g * 8));
+                __m128i qs_16_ext = _mm_cvtepi8_epi16(qs_loaded);
+                __m256i qs_32_ext = _mm256_cvtepi16_epi32(qs_16_ext);
+                sum_qs_vec = _mm256_add_epi32(sum_qs_vec, qs_32_ext);
+            }
+
+            // Horizontal sum of sum_qs_vec (8x INT32 → 1x INT32)
+            __m128i sum_lo = _mm256_castsi256_si128(sum_qs_vec);
+            __m128i sum_hi = _mm256_extracti128_si256(sum_qs_vec, 1);
+            __m128i sum_4 = _mm_add_epi32(sum_lo, sum_hi);
+            __m128i sum_2 = _mm_add_epi32(sum_4, _mm_srli_si128(sum_4, 8));
+            __m128i sum_1 = _mm_add_epi32(sum_2, _mm_srli_si128(sum_2, 4));
+            block.sum_qs = static_cast<int16_t>(_mm_cvtsi128_si32(sum_1));
+        }
+#else
+        // Fallback to scalar if AVX2 not available
+        softmax_row_q8_1_scalar(row, n_blocks, causal, scale, row_idx);
+#endif
+    }
+
+    // ============================================================================
+    // Q8_1 Integer-Aware Softmax - AVX512 Implementation (OPTIMIZED)
+    // ============================================================================
+    // Optimizations applied:
+    // 1. ELIMINATED HEAP ALLOCATION: Use fixed-size stack buffer (32 floats = 1 block)
+    // 2. STREAMING REQUANT: Process block-by-block to stay in L1 cache
+    // 3. VECTORIZED SUM_QS: Use AVX-512 horizontal sum instead of scalar loop
+    // 4. OPTIMIZED CAUSAL MASK: Use __mmask16 blend directly
+
+    inline void softmax_row_q8_1_avx512(
+        Q8_1Block *row,
+        int n_blocks,
+        bool causal,
+        float scale,
+        int row_idx)
+    {
+#if defined(LLAMINAR_HAS_AVX512)
+        // ========================================================================
+        // Pass 1: Find Maximum using AVX-512
+        // ========================================================================
+        // Use vpmaxsb (zmm) for 64-way INT8 max, but Q8_1 block is 32 bytes
+
+        float row_max = -std::numeric_limits<float>::infinity();
+        const __m512 scale_ps = _mm512_set1_ps(scale);
+
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            const Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+
+            // Load 32 INT8 values into lower half of zmm
+            __m256i qs_256 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
+
+            // Use AVX2 horizontal reduction (32 bytes fits in ymm)
+            __m128i lo = _mm256_castsi256_si128(qs_256);
+            __m128i hi = _mm256_extracti128_si256(qs_256, 1);
+            __m128i max_16 = _mm_max_epi8(lo, hi);
+            __m128i shifted = _mm_srli_si128(max_16, 8);
+            __m128i max_8 = _mm_max_epi8(max_16, shifted);
+            shifted = _mm_srli_si128(max_8, 4);
+            __m128i max_4 = _mm_max_epi8(max_8, shifted);
+            shifted = _mm_srli_si128(max_4, 2);
+            __m128i max_2 = _mm_max_epi8(max_4, shifted);
+            shifted = _mm_srli_si128(max_2, 1);
+            __m128i max_1 = _mm_max_epi8(max_2, shifted);
+
+            int8_t block_max_qs = static_cast<int8_t>(_mm_extract_epi8(max_1, 0));
+
+            // Handle causal masking
+            if (causal)
+            {
+                const int causal_end = std::min(row_idx + 1, col_start + 32);
+                if (causal_end <= col_start)
+                {
+                    continue;
+                }
+                else if (causal_end < col_start + 32)
+                {
+                    block_max_qs = -128;
+                    for (int i = 0; i < causal_end - col_start; ++i)
+                    {
+                        if (block.qs[i] > block_max_qs)
+                            block_max_qs = block.qs[i];
+                    }
+                }
+            }
+
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+            float block_max = static_cast<float>(block_max_qs) * d * scale;
+            if (block_max > row_max)
+                row_max = block_max;
+        }
+
+        if (!std::isfinite(row_max))
+            row_max = 0.0f;
+
+        // ========================================================================
+        // Pass 2: Compute Sum of Exponentials using AVX-512
+        // ========================================================================
+        // Process 16 FP32 values at a time
+
+        double sum = 0.0;
+        const __m512 max_ps = _mm512_set1_ps(row_max);
+
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            const Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const __m512 d_ps = _mm512_set1_ps(d);
+            const __m512 scaled_d_ps = _mm512_mul_ps(d_ps, scale_ps);
+
+            // Process 32 elements in 2 groups of 16
+            for (int g = 0; g < 2; ++g)
+            {
+                // Load 16 INT8 values and convert to FP32
+                __m128i qs_8 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + g * 16));
+                __m512i qs_32 = _mm512_cvtepi8_epi32(qs_8);
+                __m512 v = _mm512_cvtepi32_ps(qs_32);
+
+                // Apply scale: v = v * d * scale
+                v = _mm512_mul_ps(v, scaled_d_ps);
+
+                // Subtract max
+                v = _mm512_sub_ps(v, max_ps);
+
+                // Handle causal masking using AVX-512 mask (OPTIMIZED)
+                if (causal)
+                {
+                    const int group_start = col_start + g * 16;
+                    // Compute mask: valid if position <= row_idx
+                    __mmask16 valid_mask = 0xFFFF;
+                    const int first_invalid = row_idx - group_start + 1;
+                    if (first_invalid < 16)
+                    {
+                        valid_mask = (first_invalid > 0) ? ((1 << first_invalid) - 1) : 0;
+                    }
+                    // Set masked lanes to large negative
+                    v = _mm512_mask_blend_ps(valid_mask, _mm512_set1_ps(-100.0f), v);
+                }
+
+                // Compute exp using AVX-512 polynomial approximation
+                __m512 exp_v = detail::exp512_ps(v);
+
+                // Horizontal sum
+                sum += static_cast<double>(_mm512_reduce_add_ps(exp_v));
+            }
+        }
+
+        if (sum <= 0.0)
+            sum = 1.0;
+
+        const float inv_sum = static_cast<float>(1.0 / sum);
+        
+        // max_prob = inv_sum (occurs at position where v == row_max)
+        const float max_prob = inv_sum;
+
+        // ========================================================================
+        // Pass 3 (OPTIMIZED): Streaming Normalize and Requantize using AVX-512
+        // ========================================================================
+        // NO HEAP ALLOCATION: Use stack buffer for one block (128 bytes)
+        // VECTORIZED SUM_QS: Use AVX-512 horizontal sum
+
+        // Compute requantization scale
+        const float new_d = (max_prob > 0.0f) ? max_prob / 127.0f : 1.0f / 127.0f;
+        const float inv_d = 1.0f / new_d;
+        const uint16_t new_d_bf16 = detail::fp32_to_bf16_scalar(new_d);
+
+        // Stack buffer for one block's probabilities
+        alignas(64) float block_probs[32];
+
+        const __m512 inv_d_ps = _mm512_set1_ps(inv_d);
+        const __m512 inv_sum_ps = _mm512_set1_ps(inv_sum);
+
+        for (int b = 0; b < n_blocks; ++b)
+        {
+            Q8_1Block &block = row[b];
+            const int col_start = b * 32;
+            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const __m512 d_ps = _mm512_set1_ps(d);
+            const __m512 scaled_d_ps = _mm512_mul_ps(d_ps, scale_ps);
+
+            // Compute probabilities for this block into stack buffer
+            for (int g = 0; g < 2; ++g)
+            {
+                __m128i qs_8 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + g * 16));
+                __m512i qs_32 = _mm512_cvtepi8_epi32(qs_8);
+                __m512 v = _mm512_cvtepi32_ps(qs_32);
+                v = _mm512_mul_ps(v, scaled_d_ps);
+                v = _mm512_sub_ps(v, max_ps);
+
+                // Handle causal masking (OPTIMIZED)
+                if (causal)
+                {
+                    const int group_start = col_start + g * 16;
+                    __mmask16 valid_mask = 0xFFFF;
+                    const int first_invalid = row_idx - group_start + 1;
+                    if (first_invalid < 16)
+                    {
+                        valid_mask = (first_invalid > 0) ? ((1 << first_invalid) - 1) : 0;
+                    }
+                    v = _mm512_mask_blend_ps(valid_mask, _mm512_set1_ps(-100.0f), v);
+                }
+
+                // Compute exp and normalize
+                __m512 exp_v = detail::exp512_ps(v);
+                __m512 prob_ps = _mm512_mul_ps(exp_v, inv_sum_ps);
+
+                // Store probabilities to stack buffer
+                _mm512_store_ps(&block_probs[g * 16], prob_ps);
+            }
+
+            block.d = new_d_bf16;
+
+            // OPTIMIZED: Vectorized quantization with AVX-512 horizontal sum
+            __m512i sum_qs_vec = _mm512_setzero_si512();
+
+            // Process 32 elements in 2 groups of 16
+            for (int g = 0; g < 2; ++g)
+            {
+                // Load 16 probabilities
+                __m512 prob_ps = _mm512_load_ps(&block_probs[g * 16]);
+
+                // Scale by inverse of new_d
+                __m512 scaled_ps = _mm512_mul_ps(prob_ps, inv_d_ps);
+
+                // Round to nearest and convert to INT32
+                __m512i int32_vec = _mm512_cvtps_epi32(scaled_ps);
+
+                // Clamp to INT8 range [-128, 127]
+                int32_vec = _mm512_max_epi32(int32_vec, _mm512_set1_epi32(-128));
+                int32_vec = _mm512_min_epi32(int32_vec, _mm512_set1_epi32(127));
+
+                // Accumulate for sum_qs before packing (INT32 precision)
+                sum_qs_vec = _mm512_add_epi32(sum_qs_vec, int32_vec);
+
+                // Pack INT32 to INT8
+                // AVX-512 doesn't have direct 32→8 pack, use two-step: 32→16→8
+                __m256i int16_lo = _mm512_cvtepi32_epi16(int32_vec);
+                __m128i int8_vec = _mm256_cvtepi16_epi8(int16_lo);
+
+                // Store 16 INT8 values
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(block.qs + g * 16), int8_vec);
+            }
+
+            // Horizontal sum of sum_qs_vec (16x INT32 → 1x INT32)
+            block.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(sum_qs_vec));
+        }
+#else
+        // Fallback to AVX2 if AVX-512 not available
+        softmax_row_q8_1_avx2(row, n_blocks, causal, scale, row_idx);
+#endif
+    }
+
+    // ============================================================================
+    // Q8_1 Integer-Aware Softmax - Compile-Time Dispatch
+    // ============================================================================
+
+    inline void softmax_row_q8_1(
+        Q8_1Block *row,
+        int n_blocks,
+        bool causal,
+        float scale,
+        int row_idx)
+    {
+#if defined(LLAMINAR_HAS_AVX512)
+        softmax_row_q8_1_avx512(row, n_blocks, causal, scale, row_idx);
+#elif defined(LLAMINAR_HAS_AVX2)
+        softmax_row_q8_1_avx2(row, n_blocks, causal, scale, row_idx);
+#else
+        softmax_row_q8_1_scalar(row, n_blocks, causal, scale, row_idx);
 #endif
     }
 

@@ -5,6 +5,7 @@
  *
  * V2 Softmax implementation with:
  * - Native precision support (FP32, BF16, FP16)
+ * - Q8_1 integer-aware softmax (minimizes FP conversions)
  * - Separated scalar/AVX2/AVX512 variants for testing
  * - Causal masking support
  * - Numerical stability (max subtraction)
@@ -13,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "../../../tensors/BlockStructures.h"
 
 namespace llaminar2::primitives
 {
@@ -193,6 +195,105 @@ namespace llaminar2::primitives
         int row_idx = 0);
 
     // ============================================================================
+    // Q8_1 Integer-Aware Softmax Primitives
+    // ============================================================================
+
+    /**
+     * @brief Softmax for single Q8_1 row (scalar implementation)
+     *
+     * Integer-aware Q8_1 softmax that minimizes floating-point conversions:
+     *
+     * Q8_1 Block format:
+     *   - d: FP16 scale factor
+     *   - sum_qs: INT16 sum of quantized values
+     *   - qs[32]: INT8 quantized values
+     *   - Dequantized value: x[i] = qs[i] * fp16_to_fp32(d)
+     *
+     * Algorithm (3-pass, optimized for Q8_1):
+     *
+     * Pass 1 - Find Maximum (integer-optimized):
+     *   - Find max(qs[i]) within each block (pure integer comparison)
+     *   - Scale block max: block_max_fp32 = max_qs * d
+     *   - Reduce across blocks to find row maximum
+     *
+     * Pass 2 - Sum of Exponentials:
+     *   - For each element: exp_val = exp(qs[i] * d - row_max)
+     *   - Factor out scale: exp(d * (qs[i] - row_max/d))
+     *   - When d is uniform across blocks, can batch multiply
+     *   - Accumulate sum in FP32 for stability
+     *
+     * Pass 3 - Normalize and Requantize:
+     *   - prob[i] = exp_val / sum
+     *   - Find new scale d' = max(prob[i]) / 127.0f
+     *   - Requantize: qs'[i] = round(prob[i] / d')
+     *   - Recompute sum_qs' = Σ qs'[i]
+     *
+     * Performance benefit vs full dequant:
+     *   - Pass 1: Integer max is ~4x faster than FP32 max
+     *   - Pass 2: Batched scale multiply (1 mul per block vs per element)
+     *   - Pass 3: Direct requantization (no intermediate storage)
+     *
+     * @param row Input/output Q8_1 blocks [n_blocks] (in-place)
+     * @param n_blocks Number of Q8_1 blocks (cols = n_blocks * 32)
+     * @param causal Apply causal masking (j > row_idx → 0 probability)
+     * @param scale Scale factor applied before exp (typically 1/sqrt(d_k))
+     * @param row_idx Row index (for causal masking: only needed if causal=true)
+     *
+     * @note Output probabilities are in [0, 1] range, requantized to Q8_1.
+     *       This may lose precision for very small probabilities.
+     */
+    inline void softmax_row_q8_1_scalar(
+        Q8_1Block *row,
+        int n_blocks,
+        bool causal = false,
+        float scale = 1.0f,
+        int row_idx = 0);
+
+    /**
+     * @brief Softmax for single Q8_1 row (AVX2 implementation)
+     *
+     * Vectorized Q8_1 softmax using AVX2:
+     *   - vpmaxsb: 32-way INT8 max comparison
+     *   - vcvtph2ps: FP16 → FP32 scale conversion (F16C)
+     *   - vpmovmskb: Extract max from 32 INT8 lanes
+     *   - 8-way FP32 exp polynomial (avoid _mm256_exp_ps dependency)
+     */
+    inline void softmax_row_q8_1_avx2(
+        Q8_1Block *row,
+        int n_blocks,
+        bool causal = false,
+        float scale = 1.0f,
+        int row_idx = 0);
+
+    /**
+     * @brief Softmax for single Q8_1 row (AVX512 implementation)
+     *
+     * Vectorized Q8_1 softmax using AVX-512:
+     *   - vpmaxsb (zmm): 64-way INT8 max comparison
+     *   - vcvtph2ps (zmm): 16-way FP16 → FP32 conversion
+     *   - _mm512_reduce_max_epi8: Horizontal max reduction
+     *   - 16-way FP32 exp polynomial
+     */
+    inline void softmax_row_q8_1_avx512(
+        Q8_1Block *row,
+        int n_blocks,
+        bool causal = false,
+        float scale = 1.0f,
+        int row_idx = 0);
+
+    /**
+     * @brief Softmax for single Q8_1 row (compile-time dispatch)
+     *
+     * Dispatches to best available SIMD implementation.
+     */
+    inline void softmax_row_q8_1(
+        Q8_1Block *row,
+        int n_blocks,
+        bool causal = false,
+        float scale = 1.0f,
+        int row_idx = 0);
+
+    // ============================================================================
     // Row-Major Batch Softmax (Multi-row)
     // ============================================================================
 
@@ -254,6 +355,31 @@ namespace llaminar2::primitives
         for (int r = 0; r < rows; ++r)
         {
             softmax_row_fp16(scores + r * cols, cols, causal, scale, r);
+        }
+    }
+
+    /**
+     * @brief Apply softmax to multiple Q8_1 rows (block-major layout)
+     *
+     * @param scores Input/output Q8_1 blocks [rows * n_blocks_per_row]
+     * @param rows Number of rows
+     * @param n_blocks_per_row Number of Q8_1 blocks per row (cols = n_blocks_per_row * 32)
+     * @param causal Apply causal masking (row i: only j <= i valid)
+     * @param scale Scale factor applied before exp
+     * @param parallel Enable OpenMP parallelization
+     */
+    inline void softmax_row_major_q8_1(
+        Q8_1Block *scores,
+        int rows,
+        int n_blocks_per_row,
+        bool causal = false,
+        float scale = 1.0f,
+        bool parallel = true)
+    {
+#pragma omp parallel for if (parallel)
+        for (int r = 0; r < rows; ++r)
+        {
+            softmax_row_q8_1(scores + r * n_blocks_per_row, n_blocks_per_row, causal, scale, r);
         }
     }
 

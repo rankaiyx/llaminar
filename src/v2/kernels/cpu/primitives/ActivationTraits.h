@@ -264,13 +264,24 @@ namespace llaminar2::primitives
         using ElementType = llaminar2::Q8_1Block;
 
         /**
-         * @brief Apply softmax to Q8_1 activation scores
+         * @brief Apply softmax to Q8_1 activation scores (integer-aware)
          *
-         * Q8_1 activations must be dequantized to FP32 for softmax.
+         * Uses the native Q8_1 softmax primitive that:
+         * - Finds max in integer domain (per-block integer max, then scale)
+         * - Computes exp() with minimal FP conversions
+         * - Requantizes output back to Q8_1 format
+         *
+         * @param scores Input/output Q8_1 blocks [rows * n_blocks_per_row]
+         * @param rows Number of rows
+         * @param cols Number of columns (must be multiple of 32)
+         * @param causal Apply causal masking
+         * @param scale Scale factor (typically 1/sqrt(d_k))
          */
         static void apply_softmax(llaminar2::Q8_1Block *scores, int rows, int cols, bool causal, float scale)
         {
-            throw std::runtime_error("Q8_1 softmax requires FP32 workspace - must dequantize first!");
+            // cols must be a multiple of 32 for Q8_1
+            const int n_blocks_per_row = cols / 32;
+            softmax_row_major_q8_1(scores, rows, n_blocks_per_row, causal, scale, true);
         }
 
         /**

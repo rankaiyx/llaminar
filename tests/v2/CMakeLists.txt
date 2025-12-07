@@ -636,6 +636,19 @@ add_v2_test(V2_Unit_SoftmaxInf
     MPI_PROCS 1
 )
 
+# Test: Q8_1 Integer-Aware Softmax primitives (native Q8_1 softmax vs FP32 reference)
+add_executable(v2_test_q8_1_softmax_primitives unit/Test__Q8_1SoftmaxPrimitives.cpp)
+target_link_libraries(v2_test_q8_1_softmax_primitives
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1SoftmaxPrimitives
+    COMMAND $<TARGET_FILE:v2_test_q8_1_softmax_primitives>
+    LABELS "V2;Unit;Primitives;Softmax;Q8_1;Quantization;SIMD;AVX2;AVX512;CPU;PrecisionTesting;IntegerDomain"
+    MPI_PROCS 1
+)
+
 # Test: Quantised JIT GEMM kernel
 add_executable(v2_test_quantised_gemm_kernel unit/kernels/gemm/Test__QuantisedGemmKernel.cpp)
 target_link_libraries(v2_test_quantised_gemm_kernel
@@ -750,6 +763,19 @@ target_link_libraries(v2_test_cpu_attention_kernel_typed
 add_v2_test(V2_Unit_CPUAttentionKernelTyped
     COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_typed>
     LABELS "V2;Unit;Kernels;Attention;FP32;BF16;FP16;TypedKernel;CPU;FactoryWiring"
+    MPI_PROCS 1
+)
+
+# Test: CPUSoftmaxKernelTyped (Enum-based softmax kernel with native precision paths)
+add_executable(v2_test_cpu_softmax_kernel_typed unit/Test__CPUSoftmaxKernelTyped.cpp)
+target_link_libraries(v2_test_cpu_softmax_kernel_typed
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUSoftmaxKernelTyped
+    COMMAND $<TARGET_FILE:v2_test_cpu_softmax_kernel_typed>
+    LABELS "V2;Unit;Kernels;Softmax;FP32;BF16;FP16;Q8_1;TypedKernel;CPU"
     MPI_PROCS 1
 )
 
@@ -2227,6 +2253,18 @@ target_link_libraries(v2_perf_rmsnorm_typed
 add_v2_test(V2_Perf_RMSNormTyped 
     COMMAND $<TARGET_FILE:v2_perf_rmsnorm_typed>
     LABELS "V2;Performance;RMSNorm;TypedResiduals;Kernels"
+    MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
+)
+
+# Performance Test: CPUSoftmaxKernelTyped (typed softmax performance)
+add_executable(v2_perf_softmax_typed performance/kernels/cpu/ops/Perf__CPUSoftmaxKernelTyped.cpp)
+target_link_libraries(v2_perf_softmax_typed 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Perf_SoftmaxTyped 
+    COMMAND $<TARGET_FILE:v2_perf_softmax_typed>
+    LABELS "V2;Performance;Softmax;TypedResiduals;Kernels;FP32;BF16;FP16;Q8_1"
     MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
 )
 
