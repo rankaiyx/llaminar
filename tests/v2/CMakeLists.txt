@@ -313,6 +313,20 @@ add_v2_test(V2_Unit_Q8_1PureIntegerRMSNorm
     MPI_PROCS 1
 )
 
+# Test: Q8_1 OnlineSoftmax JIT Kernel Unit Tests (fast, no model loading)
+# Tests the Q8_1 x Q8_1 attention kernel with fused online softmax
+add_executable(v2_test_q8_1_online_softmax_unit unit/kernels/cpu/gemm_v4/Test__Q8_1_OnlineSoftmax_Unit.cpp)
+target_link_libraries(v2_test_q8_1_online_softmax_unit 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_OnlineSoftmax 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_online_softmax_unit>
+    LABELS "V2;Unit;Kernels;GEMM;Q8_1;OnlineSoftmax;Attention;JIT;AVX512"
+    MPI_PROCS 1  # JIT kernel unit tests are CPU-only, single rank
+)
+
 # Test: Q4_1 SIMD Unpack
 add_executable(v2_test_q4_1_simd_unpack unit/tensors/Test__Q4_1_SIMD_Unpack.cpp)
 target_link_libraries(v2_test_q4_1_simd_unpack 
@@ -1896,87 +1910,64 @@ add_v2_test(V2_Unit_IQ4_NLTensor
     LABELS "V2;Unit;TensorOperations;Quantization;IQ4_NL;GEMM"
 )
 
-# Performance Test: Q8_1 GEMM
-add_executable(v2_perf_q8_1_gemm performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_GEMM.cpp)
-target_link_libraries(v2_perf_q8_1_gemm 
+# Performance Test: QuantisedGemmKernel (Q8_1 weights via M1/M2 JIT kernels)
+add_executable(v2_perf_quantised_gemm_kernel performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel.cpp)
+target_link_libraries(v2_perf_quantised_gemm_kernel 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Perf_Q8_1_GEMM 
-    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm>
-    LABELS "V2;Performance;GEMM;Q8_1"
+add_v2_test(V2_Perf_QuantisedGemmKernel 
+    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel>
+    LABELS "V2;Performance;GEMM;Q8_1;JIT;Projection"
 )
 
-# Performance Test: Q8_1 x Q8_1 JIT GEMM
-add_executable(v2_perf_q8_1_gemm_jit performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_GEMM_JIT.cpp)
-target_link_libraries(v2_perf_q8_1_gemm_jit 
+# Performance Test: QuantisedGemmKernel with Q8_1 Online Softmax (Attention kernel)
+add_executable(v2_perf_quantised_gemm_kernel_q8_1_online_softmax performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel__Q8_1_OnlineSoftmax.cpp)
+target_link_libraries(v2_perf_quantised_gemm_kernel_q8_1_online_softmax 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Perf_Q8_1_GEMM_JIT 
-    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm_jit>
-    LABELS "V2;Performance;GEMM;Q8_1;JIT"
-)
-
-# Performance Test: Q8_1 x Q8_1 Online Softmax (Attention)
-add_executable(v2_perf_q8_1_online_softmax performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_OnlineSoftmax.cpp)
-target_link_libraries(v2_perf_q8_1_online_softmax 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_Q8_1_OnlineSoftmax 
-    COMMAND $<TARGET_FILE:v2_perf_q8_1_online_softmax>
+add_v2_test(V2_Perf_QuantisedGemmKernel_Q8_1_OnlineSoftmax 
+    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel_q8_1_online_softmax>
     LABELS "V2;Performance;GEMM;Q8_1;JIT;OnlineSoftmax;Attention"
 )
 
-# Performance Test: GEMM Parameter Sweep
-add_executable(v2_perf_gemm_sweep performance/kernels/cpu/gemm/gemm_v4/Perf__GemmSweep.cpp)
-target_link_libraries(v2_perf_gemm_sweep 
+# Performance Test: QuantisedGemmKernel parameter sweep
+add_executable(v2_perf_quantised_gemm_kernel_sweep performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel__Sweep.cpp)
+target_link_libraries(v2_perf_quantised_gemm_kernel_sweep 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Perf_GemmSweep 
-    COMMAND $<TARGET_FILE:v2_perf_gemm_sweep>
+add_v2_test(V2_Perf_QuantisedGemmKernel_Sweep 
+    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel_sweep>
     LABELS "V2;Performance;GEMM;Sweep"
 )
 
-# Performance Test: Q8_0 GEMM
-add_executable(v2_perf_q8_0_gemm performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_0_GEMM.cpp)
-target_link_libraries(v2_perf_q8_0_gemm 
+# Performance Test: QuantisedGemmKernel with Q8_0 weights
+add_executable(v2_perf_quantised_gemm_kernel_q8_0 performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel__Q8_0.cpp)
+target_link_libraries(v2_perf_quantised_gemm_kernel_q8_0 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Perf_Q8_0_GEMM 
-    COMMAND $<TARGET_FILE:v2_perf_q8_0_gemm>
+add_v2_test(V2_Perf_QuantisedGemmKernel_Q8_0 
+    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel_q8_0>
     LABELS "V2;Performance;GEMM;Q8_0"
 )
 
-# Performance Test: Q4_0 GEMM
-add_executable(v2_perf_q4_0_gemm performance/kernels/cpu/gemm/gemm_v4/Perf__Q4_0_GEMM.cpp)
-target_link_libraries(v2_perf_q4_0_gemm 
+# Performance Test: QuantisedGemmKernel with Q4_0 weights
+add_executable(v2_perf_quantised_gemm_kernel_q4_0 performance/kernels/cpu/gemm/gemm_v4/Perf__QuantisedGemmKernel__Q4_0.cpp)
+target_link_libraries(v2_perf_quantised_gemm_kernel_q4_0 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Perf_Q4_0_GEMM 
-    COMMAND $<TARGET_FILE:v2_perf_q4_0_gemm>
+add_v2_test(V2_Perf_QuantisedGemmKernel_Q4_0 
+    COMMAND $<TARGET_FILE:v2_perf_quantised_gemm_kernel_q4_0>
     LABELS "V2;Performance;GEMM;Q4_0"
-)
-
-# Performance Test: Q8_1 GEMM Fused (Online Softmax)
-add_executable(v2_perf_q8_1_gemm_fused performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_GEMM_Fused.cpp)
-target_link_libraries(v2_perf_q8_1_gemm_fused 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_Perf_Q8_1_GEMM_Fused 
-    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm_fused>
-    LABELS "V2;Performance;GEMM;Q8_1;Fused;Softmax"
 )
 
 # Performance Test: Q8_1 Quantize SIMD (Scalar/AVX2/AVX512 throughput comparison)

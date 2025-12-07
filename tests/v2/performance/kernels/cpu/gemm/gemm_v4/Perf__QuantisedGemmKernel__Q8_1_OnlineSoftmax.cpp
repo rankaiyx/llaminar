@@ -1,8 +1,8 @@
 /**
- * @file Perf__Q8_1_OnlineSoftmax.cpp
- * @brief Performance benchmark for Q8_1 attention score computation (Q * K^T with softmax)
+ * @file Perf__QuantisedGemmKernel__Q8_1_OnlineSoftmax.cpp
+ * @brief Performance benchmark for QuantisedGemmKernel with Q8_1 Online Softmax (attention kernel)
  *
- * This test benchmarks the Q8_1 x Q8_1 attention pattern used in transformers.
+ * This test benchmarks the Q8_1 x Q8_1 attention JIT kernel with fused online softmax.
  * It measures throughput and correctness for:
  *   - Single token decode (S=1)
  *   - Batched prefill (S=128, 512, 1024)

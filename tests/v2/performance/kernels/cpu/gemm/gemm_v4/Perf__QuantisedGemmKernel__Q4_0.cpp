@@ -1,6 +1,6 @@
 /**
- * @file Perf__Q4_0_GEMM.cpp
- * @brief Performance benchmark for Q4_0 quantized GEMM operations
+ * @file Perf__QuantisedGemmKernel__Q4_0.cpp
+ * @brief Performance benchmark for QuantisedGemmKernel with Q4_0 weights
  *
  * This test benchmarks Q4_0 quantized matrix multiplication performance
  * (Q4_0 weights x Q8_1 activations). It measures:

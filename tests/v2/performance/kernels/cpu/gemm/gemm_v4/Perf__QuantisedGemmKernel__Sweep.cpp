@@ -1,6 +1,6 @@
 /**
- * @file Perf__GemmSweep.cpp
- * @brief Parameter sweep for Q8_1 GEMM tuning
+ * @file Perf__QuantisedGemmKernel__Sweep.cpp
+ * @brief Parameter sweep for QuantisedGemmKernel tuning
  * @author David Sanftenberg
  */
 
