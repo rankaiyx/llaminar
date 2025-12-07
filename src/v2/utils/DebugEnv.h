@@ -153,6 +153,14 @@ namespace llaminar2
         int gemm_m_unroll_factor = 2;          ///< M-dimension loop unroll factor (default: 2)
         int gemm_quant_parallel_threshold = 0; ///< Threshold for parallel quantization (0=auto)
 
+        // JIT tuning parameters (tuned empirically - see Perf__GemmSweep results)
+        int gemm_jit_prefetch_distance = 0; ///< Prefetch distance in cache lines (0=disabled, hw prefetch is better)
+        int gemm_jit_unroll_n = 8;          ///< JIT N-dimension unroll factor (optimal: 8 for batch prefill)
+        int gemm_jit_unroll_k = 1;          ///< JIT K-dimension unroll factor (default: 1)
+        int gemm_jit_m_blocking = 1;        ///< M-rows per JIT call (default: 1, try 2/4 for B-reuse)
+        bool gemm_dynamic_schedule = false; ///< Use dynamic OMP scheduling (static is better)
+        int gemm_n_tile = 0;                ///< N-dimension tile size (0=no tiling is optimal for large batches)
+
         GemmConfig()
         {
             reload();
@@ -197,6 +205,30 @@ namespace llaminar2
             const char *min_block_env = std::getenv("LLAMINAR_GEMM_MIN_BLOCK_SIZE");
             if (min_block_env)
                 gemm_min_block_size = std::atoi(min_block_env);
+
+            const char *jit_prefetch_env = std::getenv("LLAMINAR_GEMM_JIT_PREFETCH_DISTANCE");
+            if (jit_prefetch_env)
+                gemm_jit_prefetch_distance = std::atoi(jit_prefetch_env);
+
+            const char *jit_unroll_env = std::getenv("LLAMINAR_GEMM_JIT_UNROLL_N");
+            if (jit_unroll_env)
+                gemm_jit_unroll_n = std::atoi(jit_unroll_env);
+
+            const char *jit_unroll_k_env = std::getenv("LLAMINAR_GEMM_JIT_UNROLL_K");
+            if (jit_unroll_k_env)
+                gemm_jit_unroll_k = std::atoi(jit_unroll_k_env);
+
+            const char *jit_m_blocking_env = std::getenv("LLAMINAR_GEMM_JIT_M_BLOCKING");
+            if (jit_m_blocking_env)
+                gemm_jit_m_blocking = std::atoi(jit_m_blocking_env);
+
+            const char *dynamic_sched_env = std::getenv("LLAMINAR_GEMM_DYNAMIC_SCHEDULE");
+            if (dynamic_sched_env)
+                gemm_dynamic_schedule = (std::atoi(dynamic_sched_env) != 0);
+
+            const char *n_tile_env = std::getenv("LLAMINAR_GEMM_N_TILE");
+            if (n_tile_env)
+                gemm_n_tile = std::atoi(n_tile_env);
 
             const char *k_min_env = std::getenv("LLAMINAR_GEMM_K_TILE_MIN_BLOCKS");
             if (k_min_env)

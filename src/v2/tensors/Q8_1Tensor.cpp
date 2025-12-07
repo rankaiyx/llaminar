@@ -11,6 +11,7 @@
 
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
+#include "../kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../utils/Logger.h"
 #include "SIMDHelpers.h"
@@ -220,8 +221,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorAttention> Q8_1Tensor::createAttention()
     {
-        // Attention operates on dequantized FP32 data
-        return std::make_unique<CpuAttentionKernelT<FP32Tensor>>();
+        // Q8_1 tensors use typed CPU attention kernel
+        return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::Q8_1>>();
     }
 
     bool Q8_1Tensor::applyRoPE(

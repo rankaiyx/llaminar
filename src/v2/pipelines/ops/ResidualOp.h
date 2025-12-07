@@ -8,6 +8,11 @@
  *
  * Handles batch padding by zeroing out padding positions to prevent NaN propagation.
  *
+ * Native Q8_1 Support (June 2025):
+ * - When all three tensors are Q8_1, uses native q8_1_add_q8_1 SIMD primitive
+ * - Avoids unnecessary FP32 dequant/requant overhead
+ * - Falls back to FP32 for mixed precision operations
+ *
  * Usage:
  * @code
  * ResidualOp residual;
@@ -28,6 +33,7 @@
 #pragma once
 
 #include "Op.h"
+#include "../../tensors/SIMDHelpers.h"
 #include <omp.h>
 
 namespace llaminar2
@@ -59,6 +65,14 @@ namespace llaminar2
         /**
          * @brief Execute simple residual connection: output = residual + input
          *
+         * Supports native Q8_1 precision when all tensors are Q8_1:
+         * - Uses q8_1_add_q8_1 SIMD primitive (AVX512/AVX2 optimized)
+         * - Avoids FP32 dequant/requant overhead
+         *
+         * Falls back to FP32 for:
+         * - Mixed precision (different tensor types)
+         * - Non-Q8_1 tensors
+         *
          * @param residual Saved residual tensor [rows, cols]
          * @param input Projection output to add [rows, cols]
          * @param output Destination tensor [rows, cols] (can be same as input)
@@ -86,8 +100,40 @@ namespace llaminar2
             if (!validateDimensions(rows, cols, "residual"))
                 return false;
 
-            // 2. Execute residual addition
             const size_t elements = static_cast<size_t>(rows) * cols;
+
+            // 2. Check for native Q8_1 path (all three tensors must be Q8_1)
+            if (residual->native_type() == TensorType::Q8_1 &&
+                input->native_type() == TensorType::Q8_1 &&
+                output->native_type() == TensorType::Q8_1)
+            {
+                // Native Q8_1 path: no FP32 conversion
+                auto *q8_1_residual = dynamic_cast<const Q8_1Tensor *>(residual);
+                auto *q8_1_input = dynamic_cast<const Q8_1Tensor *>(input);
+                auto *q8_1_output = dynamic_cast<Q8_1Tensor *>(output);
+
+                if (q8_1_residual && q8_1_input && q8_1_output)
+                {
+                    // Validate element count is multiple of 32 (Q8_1 block size)
+                    if (elements % 32 != 0)
+                    {
+                        LOG_ERROR(name() << ": Q8_1 residual requires element count multiple of 32, got " << elements);
+                        return false;
+                    }
+
+                    // mutable_q8_1_blocks() already invalidates the FP32 dequant cache
+                    simd::q8_1_add_q8_1(
+                        q8_1_residual->q8_1_blocks(),
+                        q8_1_input->q8_1_blocks(),
+                        q8_1_output->mutable_q8_1_blocks(),
+                        elements);
+
+                    (void)snapshot_key;
+                    return true;
+                }
+            }
+
+            // 3. FP32 fallback path
             const float *res_data = residual->data();
             const float *in_data = input->data();
             float *out_data = output->mutable_data();
@@ -109,6 +155,11 @@ namespace llaminar2
          *
          * Zeros out padding positions to prevent NaN propagation through layers.
          * Critical for batched inference with variable-length sequences.
+         *
+         * NOTE: Currently uses FP32 path even for Q8_1 tensors because:
+         * - Padding mask handling requires per-element granularity
+         * - Q8_1 blocks are 32 elements, making partial zeroing complex
+         * - Could optimize with block-aligned padding in future
          *
          * @param residual Saved residual tensor [batch_size * padded_seq_len, cols]
          * @param input Projection output [batch_size * padded_seq_len, cols]

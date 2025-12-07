@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
+#include "tensors/SIMDHelpers.h"
 #include <vector>
 #include <random>
 #include <cstring>
@@ -179,4 +180,101 @@ TEST(Test__Q8_1Tensor, QuantizedVsFP32Parity)
     // 1% tolerance for quantization error
     EXPECT_LT(rel_l2_error, 0.01f)
         << "Q8_1 quantized GEMM error exceeds 1% threshold";
+}
+
+/**
+ * @brief Test q8_1_add_q8_1 SIMD primitive for native Q8_1 residual addition
+ *
+ * Tests the Q8_1 + Q8_1 -> Q8_1 operation used by TypedResidualOp:
+ * 1. Create two Q8_1 tensors from FP32 data
+ * 2. Add using q8_1_add_q8_1 SIMD primitive
+ * 3. Dequantize result and compare to FP32 reference
+ *
+ * Expected error: Slightly higher than single-tensor quantization due to
+ * two quantization operations (A and B) plus one requantization (output).
+ */
+TEST(Test__Q8_1Tensor, NativeQ8_1Addition)
+{
+    using namespace llaminar2;
+
+    const int rows = 4;
+    const int cols = 64; // Must be multiple of 32 (Q8_1 block size)
+    const size_t elements = static_cast<size_t>(rows) * cols;
+
+    // Generate random FP32 data for A and B
+    std::vector<float> fp32_a(elements);
+    std::vector<float> fp32_b(elements);
+    std::mt19937 gen(12345);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    for (size_t i = 0; i < elements; ++i)
+    {
+        fp32_a[i] = dist(gen);
+        fp32_b[i] = dist(gen);
+    }
+
+    // Compute FP32 reference: expected = A + B
+    std::vector<float> expected(elements);
+    for (size_t i = 0; i < elements; ++i)
+    {
+        expected[i] = fp32_a[i] + fp32_b[i];
+    }
+
+    // Quantize A and B to Q8_1
+    auto q8_1_a = Q8_1Tensor::quantize_from_fp32(
+        fp32_a.data(),
+        {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+    auto q8_1_b = Q8_1Tensor::quantize_from_fp32(
+        fp32_b.data(),
+        {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    ASSERT_NE(q8_1_a, nullptr);
+    ASSERT_NE(q8_1_b, nullptr);
+
+    // Create output tensor
+    const size_t n_blocks = elements / 32;
+    std::vector<uint8_t> raw_output(n_blocks * sizeof(Q8_1Block), 0);
+    auto q8_1_output = std::make_shared<Q8_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        raw_output);
+
+    // Use q8_1_add_q8_1 SIMD primitive
+    simd::q8_1_add_q8_1(
+        q8_1_a->q8_1_blocks(),
+        q8_1_b->q8_1_blocks(),
+        q8_1_output->mutable_q8_1_blocks(),
+        elements);
+
+    // Dequantize output and compare to FP32 reference
+    std::vector<float> actual(elements);
+    q8_1_output->to_fp32(actual.data());
+
+    // Compute relative L2 error
+    double sum_sq_diff = 0.0, sum_sq_ref = 0.0;
+    for (size_t i = 0; i < elements; ++i)
+    {
+        double diff = static_cast<double>(actual[i]) - static_cast<double>(expected[i]);
+        sum_sq_diff += diff * diff;
+        sum_sq_ref += static_cast<double>(expected[i]) * static_cast<double>(expected[i]);
+    }
+    float rel_l2_error = (sum_sq_ref > 0) ? static_cast<float>(std::sqrt(sum_sq_diff / sum_sq_ref)) : 0.0f;
+
+    std::cout << "[Q8_1 Addition] Relative L2 error: " << (rel_l2_error * 100.0f) << "%" << std::endl;
+
+    // 3% tolerance (accounts for 3 quantization ops: A quant + B quant + output requant)
+    EXPECT_LT(rel_l2_error, 0.03f)
+        << "Q8_1 native addition error exceeds 3% threshold";
+
+    // Also verify per-element error is bounded
+    float max_abs_error = 0.0f;
+    for (size_t i = 0; i < elements; ++i)
+    {
+        float abs_err = std::abs(actual[i] - expected[i]);
+        max_abs_error = std::max(max_abs_error, abs_err);
+    }
+    std::cout << "[Q8_1 Addition] Max abs error: " << max_abs_error << std::endl;
+
+    // Max error should be < 0.1 for values in [-2, 2] range
+    EXPECT_LT(max_abs_error, 0.15f)
+        << "Q8_1 native addition max error exceeds 0.15 threshold";
 }

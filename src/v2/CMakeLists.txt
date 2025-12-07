@@ -541,6 +541,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUSoftmaxKernelT.cpp
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp
     kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
+    kernels/cpu/attention/CPUAttentionKernelTyped.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
     # Fused kernels (operator fusion framework)
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)

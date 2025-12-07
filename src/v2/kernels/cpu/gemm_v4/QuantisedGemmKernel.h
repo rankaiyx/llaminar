@@ -96,6 +96,7 @@
 #include <immintrin.h>
 #include "QuantisedGemmJit_M1.h"
 #include "QuantisedGemmJit_M2.h"
+#include "QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/FP16Utils.h"
@@ -1151,6 +1152,85 @@ namespace llaminar2
                 return false;
             }
 
+            /**
+             * @brief Strided GEMM + softmax for Q8_1 x Q8_1 attention (Q @ K^T)
+             *
+             * Optimized for attention score computation where Q and K are Q8_1 tensors
+             * with per-head striding. Computes:
+             *   C = softmax(scale * Q @ K^T + mask)
+             *
+             * @param A Q tensor head pointer (Q8_1 blocks)
+             * @param B K tensor head pointer (Q8_1 blocks)
+             * @param C Output attention scores (FP32)
+             * @param m seq_len (number of query positions)
+             * @param n kv_len (number of key positions)
+             * @param k head_dim (must be multiple of 32)
+             * @param lda Stride between Q rows in elements (n_heads * head_dim)
+             * @param ldb Stride between K rows in elements (n_kv_heads * head_dim)
+             * @param ldc Stride of output (typically kv_len)
+             * @param scale Attention scale (1/sqrt(d_k))
+             * @param transpose_B Must be true (K^T)
+             * @param softmax_axis 1 (row-wise)
+             * @param mask Optional additive mask
+             * @param is_causal Apply causal masking
+             * @param mpi_ctx MPI context (unused)
+             * @param device_idx Device index (-1 for CPU)
+             * @param format_A Activation format (must be Q8_1)
+             * @param format_B Activation format (must be Q8_1)
+             */
+            bool multiply_with_softmax_strided_typed_impl(
+                const void *A, const void *B, float *C,
+                int m, int n, int k,
+                int lda, int ldb, int ldc,
+                float scale,
+                bool transpose_B,
+                int softmax_axis,
+                const float *mask,
+                bool is_causal,
+                const MPIContext *mpi_ctx,
+                int device_idx,
+                ActivationFormat format_A,
+                ActivationFormat format_B) override
+            {
+                (void)mpi_ctx;
+                (void)device_idx;
+                (void)softmax_axis; // Always row-wise
+
+                // Validate inputs
+                if (!transpose_B)
+                {
+                    LOG_ERROR("[QuantisedGemmKernel] multiply_with_softmax_strided_typed_impl: transpose_B must be true for attention");
+                    return false;
+                }
+
+                // Check for Q8_1 format
+                if (format_A != ActivationFormat::Q8_1 || format_B != ActivationFormat::Q8_1)
+                {
+                    LOG_ERROR("[QuantisedGemmKernel] multiply_with_softmax_strided_typed_impl: requires Q8_1 format, got A="
+                              << static_cast<int>(format_A) << " B=" << static_cast<int>(format_B));
+                    return false;
+                }
+
+                // Convert element strides to byte strides for Q8_1
+                // lda/ldb are in elements (floats), but Q8_1 packs 32 elements per block
+                // So stride in blocks = stride_elements / 32, stride in bytes = blocks * sizeof(Q8_1Block)
+                int k_blocks = (k + 31) / 32;
+
+                // For attention: Q is [seq_len, n_heads, head_dim], K is [kv_len, n_kv_heads, head_dim]
+                // lda = n_heads * head_dim (elements), ldb = n_kv_heads * head_dim (elements)
+                // In Q8_1 representation: stride = (n_heads * head_dim) / 32 * sizeof(Q8_1Block)
+                // But head_dim must be multiple of 32, so: stride = n_heads * k_blocks * sizeof(Q8_1Block)
+
+                int stride_q_bytes = (lda / k) * k_blocks * static_cast<int>(sizeof(Q8_1Block));
+                int stride_k_bytes = (ldb / k) * k_blocks * static_cast<int>(sizeof(Q8_1Block));
+
+                return compute_q8_1_strided_gemm_softmax(
+                    A, B, C,
+                    m, n, k,
+                    stride_q_bytes, stride_k_bytes,
+                    scale, mask, is_causal, 0); // causal_offset=0 for prefill
+            }
+
             // =============================================================================
             // Fused Multi-GEMM Interface Implementation (Activation Sharing)
             // =============================================================================
@@ -1524,6 +1604,69 @@ namespace llaminar2
             }
 
         private:
+            bool compute_q8_1_strided_gemm_softmax(
+                const void *A, const void *B, float *C,
+                int m, int n, int k,
+                int stride_q_bytes, int stride_k_bytes,
+                float scale, const float *mask, bool is_causal, int causal_offset)
+            {
+                static QuantisedGemmJit_Q8_1_OnlineSoftmax kernel_m4(4);
+                static QuantisedGemmJit_Q8_1_OnlineSoftmax kernel_m1(1);
+
+                int m_blocking = 4;
+
+// Parallelize over M blocks
+#pragma omp parallel for schedule(dynamic)
+                for (int i = 0; i < m; i += m_blocking)
+                {
+                    int current_m = std::min(m_blocking, m - i);
+
+                    OnlineSoftmaxParams params;
+                    params.Q = static_cast<const char *>(A) + i * stride_q_bytes;
+                    params.K = B;
+                    params.C = C + i * n;
+                    params.M = current_m;
+                    params.N = n;
+                    params.K_blocks = (k + 31) / 32;
+                    params.Q_stride_bytes = stride_q_bytes;
+                    params.K_stride_bytes = stride_k_bytes;
+                    params.C_stride_bytes = n * sizeof(float);
+                    params.scale = scale;
+
+                    if (mask)
+                    {
+                        params.mask = mask + i * n;
+                        params.mask_stride_bytes = n * sizeof(float);
+                    }
+                    else
+                    {
+                        params.mask = nullptr;
+                        params.mask_stride_bytes = 0;
+                    }
+
+                    if (current_m == 4)
+                    {
+                        auto func = kernel_m4.get_kernel();
+                        func(&params);
+                    }
+                    else
+                    {
+                        // Handle tail with M1 kernel loop
+                        auto func = kernel_m1.get_kernel();
+                        for (int j = 0; j < current_m; ++j)
+                        {
+                            OnlineSoftmaxParams p = params;
+                            p.Q = static_cast<const char *>(params.Q) + j * stride_q_bytes;
+                            p.C = static_cast<float *>(params.C) + j * n;
+                            if (mask)
+                                p.mask = static_cast<const float *>(params.mask) + j * n;
+                            func(&p);
+                        }
+                    }
+                }
+                return true;
+            }
+
             /**
              * @brief Direct Q8_1 activation path (no float conversion)
              *

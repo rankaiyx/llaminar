@@ -10,6 +10,7 @@
 #include "../utils/DebugEnv.h"
 #include "../kernels/cpu/ops/CPURMSNormTypedKernel.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
+#include "../kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
@@ -212,8 +213,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorAttention> FP16Tensor::createAttention()
     {
-        // FP16 tensors use templated CPU attention kernel
-        return std::make_unique<CpuAttentionKernelT<FP16Tensor>>();
+        // FP16 tensors use typed CPU attention kernel
+        return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP16>>();
     }
 
     // ========== FP16-Specific Interface ==========

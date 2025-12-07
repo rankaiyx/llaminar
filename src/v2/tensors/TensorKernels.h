@@ -1045,29 +1045,92 @@ namespace llaminar2
     class TensorBase;
 
     /**
-     * @brief Attention computation kernel
+     * @brief Attention computation kernel interface
+     *
+     * Computes scaled dot-product attention with optional causal masking:
+     *   output = softmax(Q @ K^T / sqrt(d_k) + mask) @ V
+     *
+     * Supports:
+     * - Grouped Query Attention (GQA): n_heads != n_kv_heads
+     * - Multi-Query Attention (MQA): n_kv_heads == 1
+     * - Causal masking with optional sliding window
+     * - Multiple activation precisions via typed implementations
+     *
+     * Implementations:
+     * - CpuAttentionKernelT<TensorT>: Template-based CPU kernel (legacy)
+     * - CPUAttentionKernelTyped<Precision>: Precision-enum based kernel (preferred)
      */
     class ITensorAttention : public ITensorKernel
     {
     public:
+        /**
+         * @brief Compute single-sequence attention
+         *
+         * @param Q Query tensor [seq_len, n_heads, head_dim] (float* for interface, cast internally)
+         * @param K Key tensor [seq_len, n_kv_heads, head_dim]
+         * @param V Value tensor [seq_len, n_kv_heads, head_dim]
+         * @param output Output tensor [seq_len, n_heads, head_dim]
+         * @param seq_len Sequence length (number of tokens)
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads (GQA: n_heads % n_kv_heads == 0)
+         * @param head_dim Dimension per head
+         * @param causal Apply causal (lower-triangular) masking
+         * @param window_size Sliding window size (-1 = disabled)
+         * @param workspace_scores Workspace for attention scores [n_heads, seq_len, seq_len]
+         * @param workspace_buffer Workspace for intermediate buffers (unused with Virtual GQA)
+         * @param workspace_context Workspace for context output (optional)
+         * @param workspace_mask Pre-built attention mask [seq_len, seq_len] or nullptr
+         * @param use_bf16 Hint for BF16 precision path (deprecated, use typed kernel)
+         * @param mpi_ctx MPI context for distributed execution
+         * @param device_idx Device index (-1 = CPU)
+         * @return true on success
+         */
         virtual bool compute(
             const float *Q, const float *K, const float *V, float *output,
-            int batch_size, int num_heads, int seq_len, int head_dim,
-            bool is_causal, int rot_offset,
-            TensorBase *k_cache, TensorBase *v_cache,
-            TensorBase *k_rope, TensorBase *v_rope,
-            bool use_cache,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_buffer = nullptr,
+            TensorBase *workspace_context = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
 
+        /**
+         * @brief Compute batched attention
+         *
+         * @param Q Query tensor [batch_size * seq_len, n_heads, head_dim]
+         * @param K Key tensor [batch_size * seq_len, n_kv_heads, head_dim]
+         * @param V Value tensor [batch_size * seq_len, n_kv_heads, head_dim]
+         * @param output Output tensor [batch_size * seq_len, n_heads, head_dim]
+         * @param batch_size Number of sequences in batch
+         * @param seq_len Sequence length per batch item
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads
+         * @param head_dim Dimension per head
+         * @param causal Apply causal masking
+         * @param window_size Sliding window size (-1 = disabled)
+         * @param workspace_scores Workspace for attention scores
+         * @param workspace_buffer Workspace for intermediate buffers
+         * @param workspace_context Workspace for context output
+         * @param workspace_mask Pre-built attention mask or nullptr
+         * @param use_bf16 Hint for BF16 precision path
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         * @return true on success
+         */
         virtual bool compute_batch(
             const float *Q, const float *K, const float *V, float *output,
-            int batch_size, int num_heads, int seq_len, int head_dim,
-            int kv_seq_len,
-            bool is_causal, int rot_offset,
-            TensorBase *k_cache, TensorBase *v_cache,
-            TensorBase *k_rope, TensorBase *v_rope,
-            bool use_cache,
+            int batch_size, int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_buffer = nullptr,
+            TensorBase *workspace_context = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
     };

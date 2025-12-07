@@ -726,6 +726,19 @@ add_v2_test(V2_Unit_CpuAttentionKernelT
     MPI_PROCS 1  # CpuAttentionKernelT tests are CPU-only, single rank
 )
 
+# Test: CPUAttentionKernelTyped (Enum-based attention kernel via Factory)
+add_executable(v2_test_cpu_attention_kernel_typed unit/Test__CPUAttentionKernelTyped.cpp)
+target_link_libraries(v2_test_cpu_attention_kernel_typed
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUAttentionKernelTyped
+    COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_typed>
+    LABELS "V2;Unit;Kernels;Attention;FP32;BF16;FP16;TypedKernel;CPU;FactoryWiring"
+    MPI_PROCS 1
+)
+
 # Test: CpuAttentionKernelT Batch Attention (comprehensive batch testing)
 add_executable(v2_test_cpu_attention_kernel_t_batch unit/Test__CpuAttentionKernelT_Batch.cpp)
 target_link_libraries(v2_test_cpu_attention_kernel_t_batch
@@ -1880,6 +1893,42 @@ target_link_libraries(v2_perf_q8_1_gemm
 add_v2_test(V2_Perf_Q8_1_GEMM 
     COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm>
     LABELS "V2;Performance;GEMM;Q8_1"
+)
+
+# Performance Test: Q8_1 x Q8_1 JIT GEMM
+add_executable(v2_perf_q8_1_gemm_jit performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_GEMM_JIT.cpp)
+target_link_libraries(v2_perf_q8_1_gemm_jit 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q8_1_GEMM_JIT 
+    COMMAND $<TARGET_FILE:v2_perf_q8_1_gemm_jit>
+    LABELS "V2;Performance;GEMM;Q8_1;JIT"
+)
+
+# Performance Test: Q8_1 x Q8_1 Online Softmax (Attention)
+add_executable(v2_perf_q8_1_online_softmax performance/kernels/cpu/gemm/gemm_v4/Perf__Q8_1_OnlineSoftmax.cpp)
+target_link_libraries(v2_perf_q8_1_online_softmax 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_Q8_1_OnlineSoftmax 
+    COMMAND $<TARGET_FILE:v2_perf_q8_1_online_softmax>
+    LABELS "V2;Performance;GEMM;Q8_1;JIT;OnlineSoftmax;Attention"
+)
+
+# Performance Test: GEMM Parameter Sweep
+add_executable(v2_perf_gemm_sweep performance/kernels/cpu/gemm/gemm_v4/Perf__GemmSweep.cpp)
+target_link_libraries(v2_perf_gemm_sweep 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_GemmSweep 
+    COMMAND $<TARGET_FILE:v2_perf_gemm_sweep>
+    LABELS "V2;Performance;GEMM;Sweep"
 )
 
 # Performance Test: Q8_0 GEMM

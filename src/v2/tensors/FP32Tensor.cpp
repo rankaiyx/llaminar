@@ -20,6 +20,7 @@
 
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
+#include "../kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include <cstring>
 #include <stdexcept>
@@ -147,8 +148,8 @@ namespace llaminar2
 
     std::unique_ptr<ITensorAttention> FP32Tensor::createAttention()
     {
-        // FP32 tensors use templated CPU attention kernel
-        return std::make_unique<CpuAttentionKernelT<FP32Tensor>>();
+        // FP32 tensors use typed CPU attention kernel
+        return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP32>>();
     }
 
     bool FP32Tensor::sync_to_device()
