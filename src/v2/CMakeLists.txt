@@ -541,6 +541,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUSoftmaxKernelT.cpp
     kernels/cpu/ops/CPUSoftmaxKernelTyped.cpp  # Typed Softmax with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp
+    kernels/cpu/ops/CPUSwiGLUKernelTyped.cpp   # Typed SwiGLU with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
     kernels/cpu/attention/CPUAttentionKernelTyped.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
     # Fused kernels (operator fusion framework)

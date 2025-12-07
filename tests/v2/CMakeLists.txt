@@ -876,6 +876,19 @@ add_v2_test(V2_Unit_CPUSwiGLUKernelT
     MPI_PROCS 1
 )
 
+# Test: CPUSwiGLUKernelTyped (Enum-based SwiGLU kernel with native precision paths)
+add_executable(v2_test_cpu_swiglu_kernel_typed unit/Test__CPUSwiGLUKernelTyped.cpp)
+target_link_libraries(v2_test_cpu_swiglu_kernel_typed
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUSwiGLUKernelTyped
+    COMMAND $<TARGET_FILE:v2_test_cpu_swiglu_kernel_typed>
+    LABELS "V2;Unit;Kernels;SwiGLU;TypedPrecision;FP32;BF16;FP16;Q8_1;CPU"
+    MPI_PROCS 1
+)
+
 # Test: Native Format Decode (Q4_0→int8 without requantization)
 add_executable(v2_test_native_format_decode unit/kernels/Test__NativeFormatDecode.cpp)
 target_link_libraries(v2_test_native_format_decode
@@ -2265,6 +2278,18 @@ target_link_libraries(v2_perf_softmax_typed
 add_v2_test(V2_Perf_SoftmaxTyped 
     COMMAND $<TARGET_FILE:v2_perf_softmax_typed>
     LABELS "V2;Performance;Softmax;TypedResiduals;Kernels;FP32;BF16;FP16;Q8_1"
+    MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
+)
+
+# Performance Test: CPUSwiGLUKernelTyped (typed SwiGLU performance)
+add_executable(v2_perf_swiglu_typed performance/kernels/cpu/ops/Perf__CPUSwiGLUKernelTyped.cpp)
+target_link_libraries(v2_perf_swiglu_typed 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Perf_SwiGLUTyped 
+    COMMAND $<TARGET_FILE:v2_perf_swiglu_typed>
+    LABELS "V2;Performance;SwiGLU;TypedResiduals;Kernels;FP32;BF16;FP16;Q8_1"
     MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
 )
 
