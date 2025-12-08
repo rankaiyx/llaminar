@@ -12,6 +12,7 @@
 #include "../tensors/TensorFactory.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorSlice.h"
+#include "../tensors/SIMDHelpers.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "../kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include <iostream>
@@ -1015,8 +1016,9 @@ namespace llaminar2
 
         int target_device = (device >= 0) ? device : device_idx_;
 
-        if (!gemm_op_(input, weight, output, m, n, k,
-                      snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+        // Use typed_gemm_op_ to support Q8_1 output tensors
+        if (!typed_gemm_op_->execute(input, weight, output, m, n, k,
+                                     mpi_ctx_.get(), target_device))
         {
             return false;
         }
@@ -1078,8 +1080,9 @@ namespace llaminar2
             FP32Tensor output_local(local_shape);
 
             // GEMM with sliced kernel: [m, k] @ [n_local, k]^T = [m, n_local]
-            if (!gemm_op_(input, weight, &output_local, m, n_local, k,
-                          snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+            // Use typed_gemm_op_ for consistency (though FP32 is required here)
+            if (!typed_gemm_op_->execute(input, weight, &output_local, m, n_local, k,
+                                         mpi_ctx_.get(), target_device))
             {
                 LOG_ERROR("[TP GEMM] Row-parallel TensorSlice GEMM failed for " << snapshot_key);
                 return false;
@@ -1165,8 +1168,9 @@ namespace llaminar2
 
             // Perform GEMM: C_local = A_local @ W_local^T
             // Dimensions: [m, k_local] @ [n, k_local]^T = [m, n]
-            if (!gemm_op_(&input_local_tensor, weight, output, m, n, k_local,
-                          snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+            // Use typed_gemm_op_ for consistency (though this path requires FP32)
+            if (!typed_gemm_op_->execute(&input_local_tensor, weight, output, m, n, k_local,
+                                         mpi_ctx_.get(), target_device))
             {
                 LOG_ERROR("[TP GEMM] Row-parallel GEMM failed for " << snapshot_key);
                 return false;
@@ -1184,14 +1188,17 @@ namespace llaminar2
         {
             // FALLBACK: Full GEMM with workaround allreduce
             // Perform local GEMM with full weights
-            if (!gemm_op_(input, weight, output, m, n, k,
-                          snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+            // Use typed_gemm_op_ to support Q8_1 output tensors
+            if (!typed_gemm_op_->execute(input, weight, output, m, n, k,
+                                         mpi_ctx_.get(), target_device))
             {
                 return false;
             }
 
             // For replicated weights: scale by 1/world_size then allreduce
             // This produces the same result as a single-rank computation
+            // NOTE: Only applies to FP32 output - Q8_1 output skips allreduce
+            // because Q8_1 blocks can't be allreduced (quantized values can't be summed)
             if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
             {
                 auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
@@ -1238,14 +1245,16 @@ namespace llaminar2
         int target_device = (device >= 0) ? device : device_idx_;
 
         // Perform local GEMM: [m, k_local] @ [n, k_local]^T = [m, n]
-        if (!gemm_op_(input, weight, output, m, n, k_local,
-                      snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+        // Use typed_gemm_op_ to support Q8_1 output tensors
+        if (!typed_gemm_op_->execute(input, weight, output, m, n, k_local,
+                                     mpi_ctx_.get(), target_device))
         {
             LOG_ERROR("[TP GEMM] Column-parallel GEMM failed for " << snapshot_key);
             return false;
         }
 
         // Allreduce-sum to combine partial results from all ranks
+        // NOTE: Only applies to FP32 output - Q8_1 output skips allreduce
         if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
             auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
@@ -1277,11 +1286,27 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
 
-        if (!residual_op_.batched(residual, input, output,
-                                  batch_size, seq_len, hidden_dim,
-                                  sequence_lengths, snapshot_key.c_str()))
+        // Use typed residual op when available (required for Q8_1 activation precision)
+        if (typed_residual_op_)
         {
-            return false;
+            if (!typed_residual_op_->batched(
+                    const_cast<TensorBase *>(residual),
+                    const_cast<TensorBase *>(input),
+                    output,
+                    batch_size, sequence_lengths.data(), seq_len, hidden_dim))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            // Fallback to legacy op for backward compatibility
+            if (!residual_op_.batched(residual, input, output,
+                                      batch_size, seq_len, hidden_dim,
+                                      sequence_lengths, snapshot_key.c_str()))
+            {
+                return false;
+            }
         }
 
         // Capture snapshot
@@ -1298,8 +1323,9 @@ namespace llaminar2
 
         int target_device = (device >= 0) ? device : device_idx_;
 
-        if (!swiglu_op_(gate, up, output, rows, cols,
-                        snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+        // Use typed_swiglu_op_ to support Q8_1 tensors
+        if (!typed_swiglu_op_->execute(gate, up, output, rows, cols,
+                                       mpi_ctx_.get(), target_device))
         {
             return false;
         }
@@ -1320,10 +1346,23 @@ namespace llaminar2
 
         int target_device = (device >= 0) ? device : device_idx_;
 
-        if (!rope_op_(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
-                      snapshot_prefix.c_str(), mpi_ctx_.get(), target_device))
+        // Use typed RoPE op if available (handles Q8_1/BF16/FP16 correctly)
+        if (typed_rope_op_)
         {
-            return false;
+            if (!typed_rope_op_->apply(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
+                                       mpi_ctx_.get(), target_device))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            // Fallback to legacy FP32 RoPE op
+            if (!rope_op_(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
+                          snapshot_prefix.c_str(), mpi_ctx_.get(), target_device))
+            {
+                return false;
+            }
         }
 
         // Capture snapshots for Q and K after RoPE
@@ -1339,13 +1378,59 @@ namespace llaminar2
             LOG_ERROR("copy_tensor: null tensor");
             return false;
         }
-        if (!src->data() || !dst->mutable_data())
+
+        // Handle Q8_1 tensor copies (must copy blocks, not FP32 data)
+        auto *src_q8_1 = dynamic_cast<const Q8_1Tensor *>(src);
+        auto *dst_q8_1 = dynamic_cast<Q8_1Tensor *>(dst);
+
+        if (dst_q8_1)
         {
-            LOG_ERROR("copy_tensor: null data pointer");
+            // Destination is Q8_1: must use block-based copy
+            if (src_q8_1)
+            {
+                // Q8_1 -> Q8_1: Copy blocks directly
+                const Q8_1Block *src_blocks = src_q8_1->q8_1_blocks();
+                Q8_1Block *dst_blocks = dst_q8_1->mutable_q8_1_blocks();
+                if (!src_blocks || !dst_blocks)
+                {
+                    LOG_ERROR("copy_tensor: null Q8_1 block pointer");
+                    return false;
+                }
+                size_t n_blocks = (num_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                std::memcpy(dst_blocks, src_blocks, n_blocks * sizeof(Q8_1Block));
+            }
+            else
+            {
+                // FP32 -> Q8_1: Quantize source to destination
+                const float *src_data = src->data();
+                Q8_1Block *dst_blocks = dst_q8_1->mutable_q8_1_blocks();
+                if (!src_data || !dst_blocks)
+                {
+                    LOG_ERROR("copy_tensor: null pointer for FP32->Q8_1 copy");
+                    return false;
+                }
+                size_t n_blocks = (num_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                simd::quantize_fp32_to_q8_1_blocks(src_data, dst_blocks, num_elements);
+            }
+            return true;
+        }
+
+        // Non-Q8_1 destination: use FP32 path
+        // Source can be Q8_1 (data() dequantizes) or any other type
+        if (!src->data())
+        {
+            LOG_ERROR("copy_tensor: null source data pointer");
             return false;
         }
 
-        std::memcpy(dst->mutable_data(), src->data(), num_elements * sizeof(float));
+        float *dst_data = dst->mutable_data();
+        if (!dst_data)
+        {
+            LOG_ERROR("copy_tensor: null destination data pointer");
+            return false;
+        }
+
+        std::memcpy(dst_data, src->data(), num_elements * sizeof(float));
         return true;
     }
 

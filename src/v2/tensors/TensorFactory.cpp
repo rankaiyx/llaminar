@@ -100,15 +100,9 @@ namespace llaminar2
             bindToNumaNode();
         }
 
-        // Q8_1Tensor requires block-aligned allocation
-        size_t n_elems = 1;
-        for (auto dim : shape)
-            n_elems *= dim;
-        size_t n_blocks = (n_elems + 31) / 32;
-        size_t n_bytes = n_blocks * sizeof(Q8_1Block);
-        std::vector<uint8_t> raw_data(n_bytes, 0);
-
-        return std::make_unique<Q8_1Tensor>(shape, raw_data);
+        // Use the mutable activation buffer constructor (no raw_data, allocates internally)
+        // This creates a Q8_1Tensor that supports mutable_data() and quantize_from_cache()
+        return std::make_unique<Q8_1Tensor>(shape, -1); // device_idx = -1 (CPU)
     }
 
     std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape,

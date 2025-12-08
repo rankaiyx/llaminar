@@ -127,7 +127,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRoPE> FP32Tensor::createRoPE()
     {
-        return std::make_unique<CPURoPEKernel>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createRoPE(this, dev_type);
     }
 
     std::unique_ptr<ITensorSwiGLU> FP32Tensor::createSwiGLU()

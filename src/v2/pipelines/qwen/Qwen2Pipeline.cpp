@@ -23,6 +23,7 @@
 #include "../../utils/BatchPaddingUtils.h"
 #include "../../kernels/cpu/ops/CPURMSNormTypedKernel.h"
 #include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
+#include "../ops/EmbeddingOp.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -90,6 +91,9 @@ namespace llaminar2
           batch_size_(batch_size)
     {
         LOG_INFO("Initializing Qwen 2.x pipeline (batch_size=" << batch_size << ")");
+
+        // Initialize typed ops for the configured activation precision (Q8_1, BF16, etc.)
+        initializeTypedOps();
 
         // Read architecture from GGUF metadata
         const GGUFModel &model = model_ctx_->model();
@@ -246,6 +250,12 @@ namespace llaminar2
             return tensor_factory_->createActivation(shape, precision, device_idx);
         };
 
+        // Helper to create FP32 tensors (for operations that need high precision)
+        auto createFP32 = [&](const std::vector<size_t> &shape) -> std::shared_ptr<TensorBase>
+        {
+            return tensor_factory_->createActivation(shape, ActivationPrecision::FP32, device_idx);
+        };
+
         // Residual (d_model) - sized for batch
         buffers.residual = createActivation(
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
@@ -255,14 +265,19 @@ namespace llaminar2
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
 
         // Attention buffers (Qwen-specific dimensions) - sized for batch
+        // Q/K/V can be low precision (Q8_1 supports dequant via data() for attention input)
         buffers.Q = createActivation(
             {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)});
         buffers.K = createActivation(
             {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)});
         buffers.V = createActivation(
             {static_cast<size_t>(effective_max), static_cast<size_t>(n_kv_heads_ * head_dim_)});
-        buffers.attn_output = createActivation(
+
+        // attn_output MUST be FP32: attention computation (softmax) requires high precision
+        // Q8_1's quantization noise would accumulate badly through softmax
+        buffers.attn_output = createFP32(
             {static_cast<size_t>(effective_max), static_cast<size_t>(n_heads_ * head_dim_)});
+
         buffers.attn_proj = createActivation(
             {static_cast<size_t>(effective_max), static_cast<size_t>(d_model_)});
 
@@ -653,17 +668,50 @@ namespace llaminar2
                 v_bias_ptr = v_bias_fp32->data();
         }
 
-        VALIDATE_OP(layer.qkv_fused->execute(
-                        buffers.normalized->data(),
-                        buffers.Q->mutable_data(),
-                        buffers.K->mutable_data(),
-                        buffers.V->mutable_data(),
-                        q_bias_ptr, k_bias_ptr, v_bias_ptr,
-                        effective_seq_len,
-                        n_heads_ * head_dim_, n_kv_heads_ * head_dim_, n_kv_heads_ * head_dim_,
-                        d_model_,
-                        mpi_ctx_.get(), attn_device),
-                    "Fused Q/K/V projection");
+        // Execute Q/K/V projection based on activation precision
+        if (config_.activation_precision == ActivationPrecision::Q8_1)
+        {
+            // Q8_1 path: Output directly to Q8_1 blocks with optional bias
+            // Bias is added to FP32 GEMM result before Q8_1 requantization
+
+            // Get Q8_1 block pointers from activation tensors
+            auto *Q_q8_1 = dynamic_cast<Q8_1Tensor *>(buffers.Q.get());
+            auto *K_q8_1 = dynamic_cast<Q8_1Tensor *>(buffers.K.get());
+            auto *V_q8_1 = dynamic_cast<Q8_1Tensor *>(buffers.V.get());
+
+            if (!Q_q8_1 || !K_q8_1 || !V_q8_1)
+            {
+                LOG_ERROR("Q8_1 activation precision configured but buffers are not Q8_1Tensor");
+                return false;
+            }
+
+            VALIDATE_OP(layer.qkv_fused->execute_to_q8_1(
+                            buffers.normalized->data(),
+                            Q_q8_1->mutable_q8_1_blocks(),
+                            K_q8_1->mutable_q8_1_blocks(),
+                            V_q8_1->mutable_q8_1_blocks(),
+                            q_bias_ptr, k_bias_ptr, v_bias_ptr,
+                            effective_seq_len,
+                            n_heads_ * head_dim_, n_kv_heads_ * head_dim_,
+                            d_model_,
+                            mpi_ctx_.get(), attn_device),
+                        "Fused Q/K/V projection (Q8_1)");
+        }
+        else
+        {
+            // FP32/BF16/FP16 path: Standard execute
+            VALIDATE_OP(layer.qkv_fused->execute(
+                            buffers.normalized->data(),
+                            buffers.Q->mutable_data(),
+                            buffers.K->mutable_data(),
+                            buffers.V->mutable_data(),
+                            q_bias_ptr, k_bias_ptr, v_bias_ptr,
+                            effective_seq_len,
+                            n_heads_ * head_dim_, n_kv_heads_ * head_dim_, n_kv_heads_ * head_dim_,
+                            d_model_,
+                            mpi_ctx_.get(), attn_device),
+                        "Fused Q/K/V projection");
+        }
 
         // Capture Q/K/V projections
         capture_snapshot(layer_prefix + "_Q_PROJECTION", buffers.Q.get(), effective_seq_len, n_heads_ * head_dim_);
@@ -745,56 +793,60 @@ namespace llaminar2
         if (kv_cache_ && batch_size_ == 1)
         {
             // Single-sequence KV cache path
-            // Cast buffers.K and buffers.V to FP32Tensor for cache append
-            auto *K_fp32 = dynamic_cast<FP32Tensor *>(buffers.K.get());
-            auto *V_fp32 = dynamic_cast<FP32Tensor *>(buffers.V.get());
+            // For Q8_1 activations, we use data() to get dequantized FP32 values for the cache
+            // since the KV cache is stored in FP32 for accuracy.
 
-            if (K_fp32 && V_fp32)
+            // Get FP32 data from K/V (dequantizes if Q8_1, returns raw data if FP32)
+            const float *K_data = buffers.K->data();
+            const float *V_data = buffers.V->data();
+
+            if (K_data && V_data)
             {
-                // Create view of current K/V with correct shape for cache append
-                // Use effective_seq_len (which equals padded_seq_len_ for batch_size_==1)
-                auto K_view = K_fp32->create_view({static_cast<size_t>(effective_seq_len),
-                                                   static_cast<size_t>(n_kv_heads_ * head_dim_)});
-                auto V_view = V_fp32->create_view({static_cast<size_t>(effective_seq_len),
-                                                   static_cast<size_t>(n_kv_heads_ * head_dim_)});
+                // Create temporary FP32 tensors to wrap the data for cache append
+                // Note: For Q8_1, data() returns pointer to internal dequant cache
+                // For FP32, data() returns the raw data pointer
+                size_t kv_size = static_cast<size_t>(effective_seq_len) * n_kv_heads_ * head_dim_;
 
-                if (K_view && V_view)
+                // Create wrapper tensors that share the data
+                auto K_wrapper = std::make_shared<FP32Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(effective_seq_len),
+                                        static_cast<size_t>(n_kv_heads_ * head_dim_)});
+                auto V_wrapper = std::make_shared<FP32Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(effective_seq_len),
+                                        static_cast<size_t>(n_kv_heads_ * head_dim_)});
+
+                // Copy dequantized data to wrappers
+                std::memcpy(K_wrapper->mutable_data(), K_data, kv_size * sizeof(float));
+                std::memcpy(V_wrapper->mutable_data(), V_data, kv_size * sizeof(float));
+
+                // Append to cache
+                if (!kv_cache_->append_kv(layer_idx, K_wrapper.get(), V_wrapper.get()))
                 {
-                    auto *K_view_fp32 = dynamic_cast<FP32Tensor *>(K_view.get());
-                    auto *V_view_fp32 = dynamic_cast<FP32Tensor *>(V_view.get());
+                    LOG_ERROR("Failed to append K/V to cache for layer " << layer_idx);
+                    return false;
+                }
 
-                    if (K_view_fp32 && V_view_fp32)
+                // Get full cached K/V for attention
+                auto cached_K = kv_cache_->get_k(layer_idx);
+                auto cached_V = kv_cache_->get_v(layer_idx);
+                int cached_tokens = kv_cache_->get_cached_tokens(layer_idx);
+
+                if (cached_K && cached_V && cached_tokens > 0)
+                {
+                    K_for_attention = cached_K.get();
+                    V_for_attention = cached_V.get();
+                    kv_seq_len = cached_tokens;
+                    use_kv_cache = true;
+
+                    // Debug: Log KV cache usage for layer 0
+                    if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
                     {
-                        // Append to cache
-                        if (!kv_cache_->append_kv(layer_idx, K_view_fp32, V_view_fp32))
-                        {
-                            LOG_ERROR("Failed to append K/V to cache for layer " << layer_idx);
-                            return false;
-                        }
-
-                        // Get full cached K/V for attention
-                        auto cached_K = kv_cache_->get_k(layer_idx);
-                        auto cached_V = kv_cache_->get_v(layer_idx);
-                        int cached_tokens = kv_cache_->get_cached_tokens(layer_idx);
-
-                        if (cached_K && cached_V && cached_tokens > 0)
-                        {
-                            K_for_attention = cached_K.get();
-                            V_for_attention = cached_V.get();
-                            kv_seq_len = cached_tokens;
-                            use_kv_cache = true;
-
-                            // Debug: Log KV cache usage for layer 0
-                            if (layer_idx == 0 && mpi_ctx_ && mpi_ctx_->rank() == 0)
-                            {
-                                LOG_TRACE("KV Cache using cached K/V: cached_tokens=" << cached_tokens
-                                                                                      << ", Q tokens=" << effective_seq_len);
-                            }
-
-                            LOG_TRACE("[KVCache] Layer " << layer_idx << ": using cached K/V with "
-                                                         << cached_tokens << " tokens for attention (Q has " << effective_seq_len << " tokens)");
-                        }
+                        LOG_TRACE("KV Cache using cached K/V: cached_tokens=" << cached_tokens
+                                                                              << ", Q tokens=" << effective_seq_len);
                     }
+
+                    LOG_TRACE("[KVCache] Layer " << layer_idx << ": using cached K/V with "
+                                                 << cached_tokens << " tokens for attention (Q has " << effective_seq_len << " tokens)");
                 }
             }
         }
@@ -928,13 +980,32 @@ namespace llaminar2
                 layer.gate_proj.get(), layer.up_proj.get());
         }
 
-        VALIDATE_OP(layer.gate_up_fused->execute(
-                        buffers.normalized->data(),
-                        {{buffers.gate->mutable_data(), nullptr, ffn_output_dim, "gate"},
-                         {buffers.up->mutable_data(), nullptr, ffn_output_dim, "up", nullptr, false}},
-                        effective_seq_len, d_model_,
-                        mpi_ctx_.get(), ffn_device),
-                    "Fused Gate/Up projection");
+        // For Q8_1 activation mode, use Q8_1 output path
+        auto *gate_q8_1 = dynamic_cast<Q8_1Tensor *>(buffers.gate.get());
+        auto *up_q8_1 = dynamic_cast<Q8_1Tensor *>(buffers.up.get());
+
+        if (gate_q8_1 && up_q8_1)
+        {
+            // Q8_1 output path: use execute_to_q8_1 with Q8_1Block* outputs
+            VALIDATE_OP(layer.gate_up_fused->execute_to_q8_1(
+                            buffers.normalized->data(),
+                            {{gate_q8_1->mutable_q8_1_blocks(), nullptr, ffn_output_dim, "gate"},
+                             {up_q8_1->mutable_q8_1_blocks(), nullptr, ffn_output_dim, "up"}},
+                            effective_seq_len, d_model_,
+                            mpi_ctx_.get(), ffn_device),
+                        "Fused Gate/Up projection (Q8_1)");
+        }
+        else
+        {
+            // FP32 output path: use standard execute with FP32 output pointers
+            VALIDATE_OP(layer.gate_up_fused->execute(
+                            buffers.normalized->data(),
+                            {{buffers.gate->mutable_data(), nullptr, ffn_output_dim, "gate"},
+                             {buffers.up->mutable_data(), nullptr, ffn_output_dim, "up", nullptr, false}},
+                            effective_seq_len, d_model_,
+                            mpi_ctx_.get(), ffn_device),
+                        "Fused Gate/Up projection (FP32)");
+        }
 
         // Capture gate/up projections (with actual output dimension)
         capture_snapshot(layer_prefix + "_FFN_GATE", buffers.gate.get(), effective_seq_len, ffn_output_dim);
@@ -1187,15 +1258,19 @@ namespace llaminar2
         auto embed_table = getEmbeddingTable();
         VALIDATE_POINTER(embed_table, "embedding table");
 
-        const float *embed_data = embed_table->data();
-        float *output_data = output->mutable_data();
+        // Use EmbeddingOp for typed tensor support (FP32 and Q8_1)
+        EmbeddingOp embedding_op;
+        if (!embedding_op(embed_table.get(), token_batches, padded_seq_len_, d_model_, output))
+        {
+            LOG_ERROR("EmbeddingOp failed");
+            return false;
+        }
 
+        // Debug logging
         static const bool debug_embedding = std::getenv("LLAMINAR_DEBUG_EMBEDDING") != nullptr;
-        static const bool debug_batch = std::getenv("LLAMINAR_DEBUG_BATCH") != nullptr;
-
-        // DEBUG: Print first 10 values of embedding table for token 785 and 9906
         if (debug_embedding && mpi_ctx_ && mpi_ctx_->rank() == 0)
         {
+            const float *embed_data = embed_table->data();
             int test_tokens[] = {785, 9906};
             for (int token_id : test_tokens)
             {
@@ -1205,33 +1280,6 @@ namespace llaminar2
                 {
                     LOG_DEBUG("  emb[" << i << "] = " << emb[i]);
                 }
-            }
-        }
-
-        // Process each sequence in the batch
-        int global_idx = 0;
-        for (int b = 0; b < batch_size_; ++b)
-        {
-            const auto &tokens = token_batches[b];
-            int seq_len = tokens.size();
-
-            // Lookup embeddings for this sequence
-            for (int i = 0; i < seq_len; ++i)
-            {
-                int token_id = tokens[i];
-
-                std::memcpy(output_data + global_idx * d_model_,
-                            embed_data + token_id * d_model_,
-                            d_model_ * sizeof(float));
-
-                global_idx++;
-            }
-
-            // Pad remaining positions with zeros (or pad token embedding)
-            for (int i = seq_len; i < padded_seq_len_; ++i)
-            {
-                std::memset(output_data + global_idx * d_model_, 0, d_model_ * sizeof(float));
-                global_idx++;
             }
         }
 
@@ -1263,6 +1311,30 @@ namespace llaminar2
             hidden, lm_head.get(), logits_buffer_.get(),
             effective_seq_len, vocab_size_, d_model_,
             "LM_HEAD", device_idx_));
+
+        // DEBUG: Check logits after LM head
+        {
+            const float *logits = logits_buffer_->data();
+            float min_val = logits[0], max_val = logits[0];
+            for (int i = 0; i < 100; ++i)
+            {
+                min_val = std::min(min_val, logits[i]);
+                max_val = std::max(max_val, logits[i]);
+            }
+            LOG_DEBUG("[LM_HEAD] After projection: logits[0:100] min=" << min_val
+                                                                       << " max=" << max_val << " first=" << logits[0]);
+
+            // Also check the hidden state input
+            const float *hidden_data = hidden->data();
+            float h_min = hidden_data[0], h_max = hidden_data[0];
+            for (int i = 0; i < 100; ++i)
+            {
+                h_min = std::min(h_min, hidden_data[i]);
+                h_max = std::max(h_max, hidden_data[i]);
+            }
+            LOG_DEBUG("[LM_HEAD] Hidden input: hidden[0:100] min=" << h_min
+                                                                   << " max=" << h_max << " first=" << hidden_data[0]);
+        }
 
         VALIDATE_TENSOR(logits_buffer_, spec_logits(effective_seq_len), "after_lm_head");
 

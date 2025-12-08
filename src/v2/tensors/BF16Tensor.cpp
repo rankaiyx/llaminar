@@ -193,7 +193,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRoPE> BF16Tensor::createRoPE()
     {
-        return std::make_unique<CPURoPEKernelT<BF16Tensor>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createRoPE(this, dev_type);
     }
 
     std::unique_ptr<ITensorSwiGLU> BF16Tensor::createSwiGLU()

@@ -43,3 +43,4 @@
 #include "SwiGLUOp.h"
 #include "RoPEOp.h"
 #include "ResidualOp.h"
+// TypedOps.h removed - typed ops merged into individual op files

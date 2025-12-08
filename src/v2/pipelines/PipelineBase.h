@@ -1206,11 +1206,40 @@ namespace llaminar2
 
         // ===== Reusable Operations (stateless, self-validating) =====
         // These are used by the declarative compute graph methods above
+        // Legacy ops (kept for backward compatibility)
         RMSNormOp rmsnorm_op_;
         GemmOp gemm_op_;
         SwiGLUOp swiglu_op_;
         RoPEOp rope_op_;
         ResidualOp residual_op_;
+
+        // ===== Typed Operations (zero-overhead precision dispatch) =====
+        // Created once at initialization based on config_.activation_precision
+        // These are used for Q8_1/BF16/FP16 native paths without runtime dispatch
+        std::unique_ptr<IGemmOp> typed_gemm_op_;
+        std::unique_ptr<IRMSNormOp> typed_rmsnorm_op_;
+        std::unique_ptr<IResidualOp> typed_residual_op_;
+        std::unique_ptr<ISwiGLUOp> typed_swiglu_op_;
+        std::unique_ptr<IRoPEOp> typed_rope_op_;
+
+    protected:
+        /**
+         * @brief Initialize typed ops based on activation precision
+         *
+         * Called during pipeline construction after config_ is set.
+         * Creates typed ops that match the configured activation precision.
+         */
+        void initializeTypedOps()
+        {
+            typed_gemm_op_ = createGemmOp(config_.activation_precision);
+            typed_rmsnorm_op_ = createRMSNormOp(config_.activation_precision);
+            typed_residual_op_ = createResidualOp(config_.activation_precision);
+            typed_swiglu_op_ = createSwiGLUOp(config_.activation_precision);
+            typed_rope_op_ = createRoPEOp(config_.activation_precision);
+
+            LOG_DEBUG("[PipelineBase] Initialized typed ops for precision: "
+                      << static_cast<int>(config_.activation_precision));
+        }
     };
 
 } // namespace llaminar2

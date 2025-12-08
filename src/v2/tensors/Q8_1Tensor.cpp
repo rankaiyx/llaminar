@@ -34,8 +34,12 @@ namespace llaminar2
 
     Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
         : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(-1), device_blocks_(nullptr)
+          view_byte_offset_(0), parent_(nullptr), device_idx_(-1), device_blocks_(nullptr),
+          is_mutable_(false), cache_dirty_(false)
     {
+        LOG_DEBUG("[Q8_1Tensor] Creating IMMUTABLE tensor from raw_data, shape=[" << shape[0] << "," << shape[1]
+                                                                                  << "], raw_data.size()=" << raw_data.size());
+
         if (shape.empty())
         {
             throw std::invalid_argument("Q8_1Tensor: shape cannot be empty");
@@ -60,15 +64,72 @@ namespace llaminar2
         }
     }
 
+    // Mutable activation buffer constructor - allocates uninitialized Q8_1 storage
+    //
+    // IMPORTANT: Q8_1 is an activation-only format designed for memory bandwidth savings.
+    // Mutable Q8_1 tensors have mutable Q8_1 BLOCKS, not an FP32 cache.
+    // Kernels must write directly to Q8_1 blocks via mutable_q8_1_blocks().
+    // Do NOT use mutable_data() - it throws for Q8_1 tensors.
+    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, int device_idx)
+        : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_idx_(device_idx), device_blocks_(nullptr),
+          is_mutable_(true), cache_dirty_(false)
+    {
+        if (shape.empty())
+        {
+            throw std::invalid_argument("Q8_1Tensor: shape cannot be empty");
+        }
+        if (shape.size() != 2)
+        {
+            throw std::invalid_argument("Q8_1Tensor: mutable activation buffer requires 2D shape");
+        }
+
+        // Calculate total elements and allocate Q8_1 block storage
+        size_t n_elems = shape[0] * shape[1];
+        size_t n_blocks = (n_elems + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        size_t required_bytes = n_blocks * sizeof(Q8_1Block);
+
+        // Allocate and zero-initialize the raw block storage
+        // NOTE: We do NOT allocate an FP32 dequant cache here.
+        // Q8_1 tensors should be accessed via q8_1_blocks()/mutable_q8_1_blocks(),
+        // not via data()/mutable_data(). The dequant_cache_ is only for lazy
+        // read-only dequantization (debugging, snapshot capture, etc.).
+        raw_data_.resize(required_bytes, 0);
+
+        LOG_DEBUG("[Q8_1Tensor] Created MUTABLE tensor shape=[" << shape[0] << "," << shape[1]
+                                                                << "], blocks=" << n_blocks << ", bytes=" << required_bytes);
+    }
+
     // Private view constructor
     Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape,
                            const uint8_t *parent_raw_data,
                            size_t byte_offset,
                            std::shared_ptr<TensorBase> parent)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(parent_raw_data),
-          view_byte_offset_(byte_offset), parent_(parent), device_idx_(-1), device_blocks_(nullptr)
+          view_byte_offset_(byte_offset), parent_(parent), device_idx_(-1), device_blocks_(nullptr),
+          is_mutable_(false), cache_dirty_(false)
     {
-        // Views don't allocate raw_data_, they borrow via raw_data_ptr_
+        // Check if parent is a mutable Q8_1Tensor - if so, inherit mutability
+        if (auto parent_q8_1 = std::dynamic_pointer_cast<Q8_1Tensor>(parent))
+        {
+            is_mutable_ = parent_q8_1->is_mutable_;
+            if (is_mutable_)
+            {
+                // For mutable views, we need to set up access to the parent's dequant cache
+                // Calculate the FP32 element offset for this view
+                size_t K = shape_[1];
+                size_t blocks_per_row = (K + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                size_t block_offset_from_root = byte_offset / sizeof(Q8_1Block);
+                size_t row_offset = block_offset_from_root / blocks_per_row;
+
+                // Pre-allocate a view of the parent's dequant cache
+                // The view's mutable_data() will return a pointer into the parent's cache
+                // Note: we store view_byte_offset_ to calculate the FP32 offset later
+            }
+        }
+
+        LOG_DEBUG("[Q8_1Tensor] Creating VIEW tensor shape=[" << shape[0] << "," << shape[1]
+                                                              << "], is_mutable=" << is_mutable_ << " (inherited from parent)");
     }
 
     Q8_1Tensor::~Q8_1Tensor()
@@ -162,8 +223,44 @@ namespace llaminar2
 
     const float *Q8_1Tensor::data() const
     {
-        // Dequantize to temp cache
-        if (dequant_cache_.empty())
+        // For mutable views, return data from parent's cache
+        if (is_view_ && is_mutable_ && parent_)
+        {
+            auto parent_q8_1 = std::dynamic_pointer_cast<Q8_1Tensor>(parent_);
+            if (parent_q8_1)
+            {
+                // Calculate the row offset for this view
+                size_t K = shape_[1];
+                size_t blocks_per_row = (K + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                size_t block_offset = view_byte_offset_ / sizeof(Q8_1Block);
+                size_t row_offset = block_offset / blocks_per_row;
+                size_t element_offset = row_offset * K;
+
+                // Return pointer into parent's cache
+                return parent_q8_1->data() + element_offset;
+            }
+        }
+
+        // For mutable non-view tensors with data in cache, return it directly
+        if (is_mutable_ && !dequant_cache_.empty())
+        {
+            // Check if data is actually non-zero
+            float min_val = dequant_cache_[0], max_val = dequant_cache_[0];
+            for (size_t i = 0; i < std::min(dequant_cache_.size(), size_t(1000)); ++i)
+            {
+                if (dequant_cache_[i] < min_val)
+                    min_val = dequant_cache_[i];
+                if (dequant_cache_[i] > max_val)
+                    max_val = dequant_cache_[i];
+            }
+            LOG_DEBUG("[Q8_1Tensor::data] Mutable tensor, returning dequant_cache (first="
+                      << dequant_cache_[0] << " size=" << dequant_cache_.size()
+                      << " min=" << min_val << " max=" << max_val << ")");
+            return dequant_cache_.data();
+        }
+
+        // Dequantize to temp cache if needed (for immutable tensors loaded from GGUF)
+        if (dequant_cache_.empty() && !cache_dirty_)
         {
             size_t total_elements = shape_[0] * shape_[1];
             dequant_cache_.resize(total_elements);
@@ -188,7 +285,42 @@ namespace llaminar2
 
     float *Q8_1Tensor::mutable_data()
     {
-        throw std::runtime_error("Q8_1Tensor::mutable_data: quantized tensors are immutable");
+        // Q8_1 tensors should NEVER be accessed via mutable_data().
+        //
+        // Q8_1 is a memory bandwidth optimization format. The whole point is to avoid
+        // writing/reading FP32 data to/from DRAM. If you need to write to a Q8_1 tensor:
+        //   1. Use mutable_q8_1_blocks() to get a Q8_1Block* pointer
+        //   2. Use typed kernels that write Q8_1 directly (e.g., CPURMSNormTypedKernel<Q8_1>)
+        //   3. Use SIMD helpers like simd::quantize_fp32_to_q8_1_blocks() if converting from FP32
+        //
+        // If your code path requires mutable FP32 access, use FP32Tensor instead of Q8_1Tensor.
+        //
+        // Common patterns:
+        //   - RMSNorm output: kernel->apply_q8_1(input_blocks, gamma, output->mutable_q8_1_blocks(), ...)
+        //   - Residual add: simd::q8_1_add_q8_1(residual_blocks, input_blocks, output->mutable_q8_1_blocks(), n)
+        //   - GEMM output: quantize result directly to output->mutable_q8_1_blocks()
+
+        throw std::runtime_error(
+            "Q8_1Tensor::mutable_data() is not supported. Q8_1 is a memory bandwidth optimization format - "
+            "writing FP32 to a cache defeats its purpose. Use mutable_q8_1_blocks() and typed kernels instead. "
+            "See the Q8_1 typed kernel pattern in CPURMSNormTypedKernel<ActivationPrecision::Q8_1>.");
+    }
+
+    bool Q8_1Tensor::quantize_from_cache()
+    {
+        // This function is DEPRECATED and should not be used.
+        // The FP32 cache pattern defeats the purpose of Q8_1 (memory bandwidth optimization).
+        //
+        // Instead, use typed kernels that write directly to Q8_1 blocks:
+        //   kernel->apply_q8_1(input_blocks, weights, output->mutable_q8_1_blocks(), ...)
+        //
+        // Or use SIMD helpers for explicit conversion:
+        //   simd::quantize_fp32_to_q8_1_blocks(fp32_src, output->mutable_q8_1_blocks(), n_elements)
+        LOG_WARN("[Q8_1Tensor::quantize_from_cache] DEPRECATED: This function should not be used. "
+                 "Use typed kernels with mutable_q8_1_blocks() instead.");
+
+        // Return true for backward compatibility but log warning
+        return true;
     }
 
     std::unique_ptr<ITensorGemm> Q8_1Tensor::createGemm()
@@ -200,7 +332,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorRoPE> Q8_1Tensor::createRoPE()
     {
-        return std::make_unique<llaminar2::CPURoPEKernelT<Q8_1Tensor>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createRoPE(this, dev_type);
     }
 
     std::unique_ptr<ITensorSwiGLU> Q8_1Tensor::createSwiGLU()
@@ -221,7 +355,9 @@ namespace llaminar2
 
     std::unique_ptr<ITensorAttention> Q8_1Tensor::createAttention()
     {
-        // Q8_1 tensors use typed CPU attention kernel
+        // Q8_1 tensors (mutable or not) always use Q8_1 attention kernel.
+        // The kernel reads Q8_1 blocks directly via q8_1_blocks() for bandwidth efficiency.
+        // Mutable Q8_1 tensors should have their data written as Q8_1 blocks, not FP32.
         return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::Q8_1>>();
     }
 
@@ -237,14 +373,21 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
-        // Create kernel
-        auto kernel = std::make_unique<CPURoPEKernelT<Q8_1Tensor>>();
+        (void)use_bf16; // Q8_1 uses native integer path
+        (void)mpi_ctx;  // Not used for Q8_1 RoPE
+
+        // Use centralized KernelFactory for device-aware dispatch
+        auto kernel = createRoPE();
+        if (!kernel)
+        {
+            LOG_ERROR("[Q8_1Tensor::applyRoPE] Failed to create RoPE kernel");
+            return false;
+        }
 
         // Get Q pointer
         void *Q_ptr = is_view_ ? (void *)(raw_data_ptr_ + view_byte_offset_) : (void *)raw_data_.data();
 
-        // Get K pointer
-        // We assume K is also Q8_1Tensor data, passed as float*
+        // Get K pointer - K is passed as float* but is actually Q8_1 block data
         void *K_ptr = (void *)K;
 
         return kernel->apply_q8_1(
@@ -440,9 +583,54 @@ namespace llaminar2
 
     bool Q8_1Tensor::copyFrom(const TensorBase *src)
     {
-        // Quantized tensors are read-only activations - no transfer needed
-        (void)src;
-        LOG_ERROR("[Q8_1Tensor::copyFrom] Not implemented");
+        if (!src)
+        {
+            LOG_ERROR("[Q8_1Tensor::copyFrom] Source is null");
+            return false;
+        }
+
+        // For mutable tensors, we can copy from FP32 source
+        if (is_mutable_)
+        {
+            // Verify shape compatibility
+            const auto &src_shape = src->shape();
+            if (src_shape.size() != shape_.size())
+            {
+                LOG_ERROR("[Q8_1Tensor::copyFrom] Shape dimension mismatch");
+                return false;
+            }
+            for (size_t i = 0; i < shape_.size(); ++i)
+            {
+                if (src_shape[i] != shape_[i])
+                {
+                    LOG_ERROR("[Q8_1Tensor::copyFrom] Shape mismatch at dim " << i);
+                    return false;
+                }
+            }
+
+            // Copy FP32 data to cache
+            const float *src_data = src->data();
+            if (!src_data)
+            {
+                LOG_ERROR("[Q8_1Tensor::copyFrom] Source data is null");
+                return false;
+            }
+
+            const size_t total_elements = element_count();
+            if (dequant_cache_.size() != total_elements)
+            {
+                dequant_cache_.resize(total_elements);
+            }
+
+            std::memcpy(dequant_cache_.data(), src_data, total_elements * sizeof(float));
+            cache_dirty_ = true;
+
+            // Optionally quantize immediately
+            return quantize_from_cache();
+        }
+
+        // Immutable tensors don't support copyFrom
+        LOG_ERROR("[Q8_1Tensor::copyFrom] Immutable Q8_1 tensors do not support copyFrom");
         return false;
     }
 

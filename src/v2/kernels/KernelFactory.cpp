@@ -7,6 +7,7 @@
 #include "KernelFactory.h"
 #include "cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "cpu/ops/CPURoPEKernelT.h"
 
 #include "../tensors/Tensors.h"
 #include "../backends/ComputeBackend.h"
@@ -619,6 +620,87 @@ namespace llaminar
                         throwUnsupportedBackend(dev_type, "BF16");
                     }
                     throw std::runtime_error("Unreachable");
+                }
+            }
+
+            // ==========================================================================
+            // RoPE Kernel Creation - Device-aware dispatch
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor; // RoPE kernels don't need tensor state for creation
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::FP32Tensor>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    // TODO: return createCudaRoPE<FP32>();
+                    throwUnsupportedBackend(dev_type, "FP32 RoPE");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP32 RoPE");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::BF16Tensor>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "BF16 RoPE");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "BF16 RoPE");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::FP16Tensor>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP16 RoPE");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP16 RoPE");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::Q8_1Tensor>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "Q8_1 RoPE");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "Q8_1 RoPE");
                 }
             }
 

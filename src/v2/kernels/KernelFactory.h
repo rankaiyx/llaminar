@@ -56,6 +56,7 @@ namespace llaminar2
 {
     class TensorBase;
     class ITensorGemm;
+    class ITensorRoPE;
     class IQ4_NLTensor;
     class Q4_0Tensor;
     class Q4_1Tensor;
@@ -303,6 +304,37 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
                     const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                // ==========================================================================
+                // RoPE Kernel Creation - Device-aware dispatch
+                // ==========================================================================
+
+                /**
+                 * @brief Create RoPE kernel for FP32 activation tensor
+                 * @param tensor Pointer to FP32 tensor
+                 * @param dev_type Target device type
+                 * @return ITensorRoPE implementation for the device
+                 */
+                static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create RoPE kernel for BF16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create RoPE kernel for FP16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create RoPE kernel for Q8_1 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
 
                 // ==========================================================================
                 // Cached GEMM Kernel API - Pack Once, Use Many

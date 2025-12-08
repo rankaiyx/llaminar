@@ -227,4 +227,118 @@ namespace llaminar2
             m, k, ctx, device_idx);
     }
 
+    // =========================================================================
+    // Q8_1 Output Implementation
+    // =========================================================================
+
+    bool FusedGEMM::execute_to_q8_1(
+        const float *input,
+        const std::vector<GEMMProjectionQ8_1> &projections,
+        int m, int k,
+        const MPIContext *ctx,
+        int device_idx)
+    {
+        // Validate inputs
+        if (!input)
+        {
+            LOG_ERROR("[FusedGEMM::execute_to_q8_1] Input pointer is null");
+            return false;
+        }
+
+        if (projections.size() != gemm_kernels_.size())
+        {
+            LOG_ERROR("[FusedGEMM::execute_to_q8_1] Number of projections (" << projections.size()
+                                                                             << ") doesn't match number of weights (" << gemm_kernels_.size() << ")");
+            return false;
+        }
+
+        if (m <= 0 || k <= 0)
+        {
+            LOG_ERROR("[FusedGEMM::execute_to_q8_1] Invalid dimensions: m=" << m << " k=" << k);
+            return false;
+        }
+
+        for (size_t i = 0; i < projections.size(); ++i)
+        {
+            if (!projections[i].output_q8_1)
+            {
+                LOG_ERROR("[FusedGEMM::execute_to_q8_1] Output pointer for " << projection_names_[i] << " is null");
+                return false;
+            }
+            if (projections[i].n <= 0)
+            {
+                LOG_ERROR("[FusedGEMM::execute_to_q8_1] Invalid n dimension for " << projection_names_[i] << ": " << projections[i].n);
+                return false;
+            }
+        }
+
+        // =====================================================================
+        // FUSED PATH: Quantize activations once, reuse for all GEMMs with Q8_1 output
+        // =====================================================================
+
+        // Step 1: Allocate shared Q8_1 buffer for quantized activations
+        size_t buffer_size = gemm_kernels_[0]->get_quantized_activation_buffer_size(m, k);
+        std::vector<uint8_t> q8_1_buffer(buffer_size);
+
+        // Step 2: Quantize activations once (profile separately)
+        bool success;
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::QUANTIZE_Q8);
+            success = gemm_kernels_[0]->quantize_activations(input, q8_1_buffer.data(), m, k);
+        }
+        if (!success)
+        {
+            LOG_ERROR("[FusedGEMM::execute_to_q8_1] Failed to quantize activations");
+            return false;
+        }
+
+        // Step 3: Execute all projections with Q8_1 output
+        for (size_t i = 0; i < gemm_kernels_.size(); ++i)
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::GEMM_Q8);
+
+            const auto &proj = projections[i];
+            const auto &name = projection_names_[i];
+
+            success = gemm_kernels_[i]->multiply_with_precomputed_q8_1_to_q8_1(
+                q8_1_buffer.data(),
+                proj.output_q8_1,
+                m, proj.n, k,
+                proj.bias, // Fused bias (added before Q8_1 requantization)
+                false,     // No accumulation for Q8_1 output
+                ctx, device_idx);
+
+            if (!success)
+            {
+                LOG_ERROR("[FusedGEMM::execute_to_q8_1] " << name << " GEMM failed");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool FusedGEMM::execute_to_q8_1(
+        const float *input,
+        void *output_q, void *output_k, void *output_v,
+        const float *bias_q, const float *bias_k, const float *bias_v,
+        int m, int n_q, int n_kv, int k,
+        const MPIContext *ctx,
+        int device_idx)
+    {
+        if (gemm_kernels_.size() != 3)
+        {
+            LOG_ERROR("[FusedGEMM::execute_to_q8_1] 3-projection execute_to_q8_1() called but kernel has "
+                      << gemm_kernels_.size() << " projections");
+            return false;
+        }
+
+        return execute_to_q8_1(
+            input,
+            {{output_q, bias_q, n_q, projection_names_[0]},
+             {output_k, bias_k, n_kv, projection_names_[1]},
+             {output_v, bias_v, n_kv, projection_names_[2]}},
+            m, k, ctx, device_idx);
+    }
+
 } // namespace llaminar2

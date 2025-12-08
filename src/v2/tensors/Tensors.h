@@ -2069,26 +2069,49 @@ namespace llaminar2
 
     // Implementation: Q8_1Tensor.cpp
     /**
-     * @brief Q8_1 quantized tensor (8-bit uniform quantization with pre-computed sum)
+     * @brief Q8_1 quantized tensor - ACTIVATION-ONLY format for memory bandwidth optimization
      *
-     * Block format: 32 elements per block, FP16 scale + FP16 sum + int8[32] values
-     * Compression: 4× vs FP32 (slight overhead vs Q8_0 for pre-computed sum)
+     * Block format: 32 elements per block, FP16 scale + INT16 sum + int8[32] values
+     * Compression: ~3.5× vs FP32 (36 bytes per 32 elements vs 128 bytes)
      *
-     * This format is used as an intermediate activation format (matching CUDA pattern):
-     * - Pre-computes sum during quantization: s = d × sum(qs[i])
+     * IMPORTANT: Q8_1 is strictly an activation format, NEVER for weights.
+     * There are no models stored in Q8_1 format - it exists purely to reduce
+     * memory bandwidth during inference by keeping activations compressed.
+     *
+     * Design principles:
+     * - Kernels read/write Q8_1 blocks directly via q8_1_blocks()/mutable_q8_1_blocks()
+     * - mutable_data() THROWS - never expose FP32 for writes (defeats bandwidth savings)
+     * - data() returns lazy dequantized FP32 for debugging/snapshots only
+     * - Typed kernels (CPURMSNormTypedKernel<Q8_1>, etc.) operate directly on blocks
+     *
+     * Q8_1 block enables "quantize once, use many times" pattern:
+     * - Pre-computes sum during quantization: sum_qs = sum(qs[i])
      * - Eliminates expensive horizontal reductions in GEMM K-loop
-     * - "Quantize once, use many times" amortization
+     * - VNNI/DP4A can use pre-computed sum for zero-point compensation
      *
-     * Typical usage:
-     *   FP32/FP16/BF16 activations → Q8_1 (quantize once per panel)
-     *   → Q8_1 activations × quantized weights (many dot products, no sum computation!)
+     * Usage pattern:
+     *   // Write to Q8_1 buffer
+     *   auto output = tensor_factory->createQ8_1(shape);
+     *   kernel->apply_q8_1(input->q8_1_blocks(), weights, output->mutable_q8_1_blocks(), ...);
+     *
+     *   // Read from Q8_1 buffer (next kernel)
+     *   next_kernel->apply_q8_1(output->q8_1_blocks(), ...);
      */
     class Q8_1Tensor : public TensorBase, public IActivationTensor, public ITensorGemmTileDataProvider, public IQ8_1Decodable, public IINT8Unpackable
     {
     public:
         using value_type = Q8_1Block;
 
+        /// Construct from existing raw Q8_1 block data (for rare cases like loaded data)
+        /// Most Q8_1 tensors should be created as mutable activation buffers.
         Q8_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+
+        /// Construct mutable Q8_1 activation buffer - the primary use case
+        /// Use mutable_q8_1_blocks() to write Q8_1 data, NOT mutable_data().
+        /// @param shape Tensor dimensions [rows, cols]
+        /// @param device_idx Device index (-1 for CPU)
+        explicit Q8_1Tensor(const std::vector<size_t> &shape, int device_idx = -1);
+
         ~Q8_1Tensor() override;
 
         // TensorBase interface
@@ -2222,6 +2245,13 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
+
+        /**
+         * @brief Check if tensor is mutable (activation buffer with FP32 cache)
+         * @return true if tensor was created as mutable activation buffer
+         */
+        bool is_mutable() const { return is_mutable_; }
+
         std::shared_ptr<TensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
@@ -2305,6 +2335,19 @@ namespace llaminar2
          */
         void clear_dequant_cache() { dequant_cache_.clear(); }
 
+        /**
+         * @brief Re-quantize the FP32 dequant cache back to Q8_1 blocks
+         *
+         * Call this after writing to mutable_data() to commit FP32 changes
+         * back to the native Q8_1 block storage. This enables the pattern:
+         *   1. kernel writes FP32 to mutable_data()
+         *   2. quantize_from_cache() converts to Q8_1
+         *   3. next kernel reads native Q8_1 via q8_1_blocks()
+         *
+         * @return true on success
+         */
+        bool quantize_from_cache();
+
         // Public decode methods for testing
         static void decodeBlock(const Q8_1Block &block, float *output);
         static void decodeBlockScalar(const Q8_1Block &block, float *output);
@@ -2356,7 +2399,9 @@ namespace llaminar2
         int device_idx_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
-        bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
+        bool raw_data_released_ = false;   // Track if raw data was released after GEMM pack
+        bool is_mutable_ = false;          // True if constructed as mutable activation buffer
+        mutable bool cache_dirty_ = false; // True if dequant_cache_ has uncommitted writes
 
         // Private view constructor
         Q8_1Tensor(const std::vector<size_t> &shape,

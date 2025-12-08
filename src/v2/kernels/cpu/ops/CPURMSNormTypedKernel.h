@@ -536,19 +536,7 @@ namespace llaminar2
             float epsilon = 1e-6f,
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
-        {
-            (void)input;
-            (void)weight;
-            (void)output;
-            (void)rows;
-            (void)cols;
-            (void)epsilon;
-            (void)use_bf16;
-            (void)mpi_ctx;
-            (void)device_idx;
-            return false; // Q8_1 kernel doesn't handle FP32
-        }
+            int device_idx = -1) override; // Implemented in .cpp for mutable Q8_1 tensors
 
         bool apply_bf16(
             const uint16_t *input, const float *weight, uint16_t *output,

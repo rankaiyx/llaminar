@@ -166,6 +166,22 @@ namespace llaminar2
         };
 
         /**
+         * @enum GemmOutputFormat
+         * @brief Output format for quantized GEMM kernels
+         *
+         * Controls how the GEMM result is written to memory. FP32 is the default
+         * for compatibility. Q8_1 enables fused requantization for bandwidth savings
+         * in the Q8_1 activation pipeline.
+         */
+        enum class GemmOutputFormat : uint8_t
+        {
+            FP32 = 0, ///< Output as FP32 (default, 4 bytes per value)
+            Q8_1 = 1, ///< Output as Q8_1 blocks (fused requantization, ~1.125 bytes per value)
+            BF16 = 2, ///< Output as BF16 (future, 2 bytes per value)
+            FP16 = 3  ///< Output as FP16 (future, 2 bytes per value)
+        };
+
+        /**
          * @struct QuantisedGemmParams
          * @brief Runtime parameters passed to the JIT-compiled GEMM kernel.
          *
@@ -273,6 +289,36 @@ namespace llaminar2
 
             /** @brief Flag to enable SwiGLU activation after GEMM. */
             bool do_swiglu;
+
+            // ================================================================
+            // Output Format Control (for fused requantization)
+            // ================================================================
+
+            /**
+             * @brief Output format for GEMM result.
+             *
+             * When set to Q8_1, the kernel performs fused requantization and writes
+             * Q8_1 blocks to C_q8_1 instead of FP32 to C. This eliminates a separate
+             * quantization pass for the Q8_1 activation pipeline.
+             */
+            GemmOutputFormat output_format = GemmOutputFormat::FP32;
+
+            /**
+             * @brief Pointer to Q8_1 output buffer [M, N/32 blocks].
+             *
+             * Used when output_format == Q8_1. Each row contains N/32 Q8_1Block
+             * structures (36 bytes each: FP16 scale + INT16 sum + 32×INT8 values).
+             * When output_format == FP32, this field is ignored.
+             */
+            void *C_q8_1 = nullptr;
+
+            /**
+             * @brief Stride between output rows in bytes (for Q8_1 output).
+             *
+             * Specifies the byte offset from one output row to the next in C_q8_1.
+             * Typically: (N / 32) * sizeof(Q8_1Block) = (N / 32) * 36.
+             */
+            int C_q8_1_stride = 0;
         };
 
         /**
@@ -592,10 +638,27 @@ namespace llaminar2
                     // ==================== LOAD INITIAL C VALUES ====================
                     // For beta=1 semantics: C = alpha*A*B + beta*C
                     // Load existing C values as initial accumulator values
+                    //
+                    // IMPORTANT: When output_format is Q8_1, C pointer is nullptr.
+                    // In that case, we zero-initialize the accumulators instead.
+                    mov(rax, ptr[rsp + 8]); // Reload params (reg_tmp=rax was clobbered)
+                    cmp(byte[rax + 113], static_cast<uint8_t>(GemmOutputFormat::Q8_1));
+                    Label load_c_values;
+                    jne(load_c_values, T_NEAR); // If not Q8_1, load from C
+                    {
+                        // Q8_1 output: Zero-initialize accumulators
+                        vxorps(zmm_c0, zmm_c0, zmm_c0);
+                        vxorps(zmm_c1, zmm_c1, zmm_c1);
+                        vxorps(zmm_c2, zmm_c2, zmm_c2);
+                        vxorps(zmm_c3, zmm_c3, zmm_c3);
+                        jmp("after_c_load", T_NEAR);
+                    }
+                    L(load_c_values);
                     vmovups(zmm_c0, ptr[reg_C_cursor + 0 * 64]); // C[0, n+0:n+16]
                     vmovups(zmm_c1, ptr[reg_C_cursor + 1 * 64]); // C[0, n+16:n+32]
                     vmovups(zmm_c2, ptr[reg_C_cursor + 2 * 64]); // C[0, n+32:n+48]
                     vmovups(zmm_c3, ptr[reg_C_cursor + 3 * 64]); // C[0, n+48:n+64]
+                    L("after_c_load");
 
                     // ==================== MINS CURSOR FOR ASYMMETRIC CORRECTION ====================
                     // Repurpose reg_C_cursor (r14) temporarily for mins pointer
@@ -1164,11 +1227,162 @@ namespace llaminar2
                     L(skip_swiglu);
 
                     // ==================== STORE OUTPUT ====================
-                    // Write final C values back to memory
+                    // Check output format: FP32 (default) or Q8_1 (fused requantization)
+                    mov(rax, ptr[rsp + 8]); // Reload params pointer
+                    // output_format is at offset 113 (after do_swiglu at 112)
+                    cmp(byte[rax + 113], static_cast<uint8_t>(GemmOutputFormat::Q8_1));
+                    Label store_fp32;
+                    jne(store_fp32, T_NEAR); // If not Q8_1, use FP32 store
+                    {
+                        // ==================== Q8_1 REQUANTIZATION STORE ====================
+                        // Convert 64 FP32 values (zmm_c0..zmm_c3) to 2 Q8_1 blocks
+                        // Each Q8_1Block: FP16 scale + INT16 sum + 32 INT8 values = 36 bytes
+                        //
+                        // IMPORTANT: Use xmm4-xmm15 for VEX-only operations (vrcpss, etc.)
+                        // Extended registers (xmm16+) require EVEX encoding which some
+                        // instructions don't support.
+
+                        // Load Q8_1 output pointer
+                        mov(rdx, ptr[rax + 120]); // C_q8_1 pointer
+
+                        // Compute output address: C_q8_1 + (loop_N / 32) * 36
+                        mov(r8, reg_loop_N);
+                        shr(r8, 5);       // loop_N / 32 = block index
+                        imul(r8, r8, 36); // block_index * 36 bytes per block
+                        add(rdx, r8);     // rdx = output pointer for first block
+
+                        // ============ BLOCK 0: zmm_c0 + zmm_c1 (32 values) ============
+                        // Find max absolute value across 32 floats
+                        vrangeps(zmm16, zmm_c0, zmm_c0, 0x0B); // abs(c0)
+                        vrangeps(zmm17, zmm_c1, zmm_c1, 0x0B); // abs(c1)
+                        vmaxps(zmm16, zmm16, zmm17);
+
+                        // Horizontal max reduction
+                        vextractf32x8(ymm17, zmm16, 1);
+                        vmaxps(ymm16, ymm16, ymm17);
+                        vextractf32x4(xmm17, ymm16, 1);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0x4E);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0xB1);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        // xmm16[0] = max_abs
+
+                        // Copy to low register for VEX operations
+                        vmovaps(xmm4, xmm16); // xmm4 = max_abs
+
+                        // Compute scale: d = max_abs / 127.0
+                        mov(eax, 0x42FE0000); // 127.0f
+                        vmovd(xmm5, eax);
+                        vdivss(xmm6, xmm4, xmm5); // xmm6 = d = max_abs / 127
+
+                        // Convert scale to FP16 and store
+                        vcvtps2ph(xmm7, xmm6, 0);
+                        vpextrw(ptr[rdx + 0], xmm7, 0); // Store d (FP16, 2 bytes)
+
+                        // Compute inverse scale for quantization (VEX-only vrcpss)
+                        vrcpss(xmm8, xmm6, xmm6);  // xmm8 = inv_d ≈ 1/d
+                        vbroadcastss(zmm24, xmm8); // Broadcast to zmm24
+
+                        // Quantize: qs[i] = round(ctx[i] * inv_d)
+                        vmulps(zmm20, zmm_c0, zmm24);
+                        vmulps(zmm21, zmm_c1, zmm24);
+
+                        // Round to nearest and convert to int32
+                        vcvtps2dq(zmm20, zmm20);
+                        vcvtps2dq(zmm21, zmm21);
+
+                        // Pack to int8 with saturation using vpmovdb
+                        vpmovdb(xmm20, zmm20);                // 16 int32 -> 16 int8
+                        vpmovdb(xmm21, zmm21);                // 16 int32 -> 16 int8
+                        vinserti32x4(ymm20, ymm20, xmm21, 1); // Combine into 32 int8
+
+                        // Compute sum_qs (sum of int8 values)
+                        vpmovsxbd(zmm22, xmm20);
+                        vextracti32x4(xmm23, ymm20, 1);
+                        vpmovsxbd(zmm23, xmm23);
+                        vpaddd(zmm22, zmm22, zmm23);
+
+                        // Horizontal sum
+                        vextracti32x8(ymm23, zmm22, 1);
+                        vpaddd(ymm22, ymm22, ymm23);
+                        vextracti32x4(xmm23, ymm22, 1);
+                        vpaddd(xmm22, xmm22, xmm23);
+                        vpshufd(xmm23, xmm22, 0x4E);
+                        vpaddd(xmm22, xmm22, xmm23);
+                        vpshufd(xmm23, xmm22, 0xB1);
+                        vpaddd(xmm22, xmm22, xmm23);
+                        vmovd(eax, xmm22);
+                        mov(ptr[rdx + 2], ax); // Store sum_qs (INT16, 2 bytes)
+
+                        // Store quantized values (32 int8)
+                        vmovdqu32(ptr[rdx + 4], ymm20);
+
+                        // ============ BLOCK 1: zmm_c2 + zmm_c3 (32 values) ============
+                        vrangeps(zmm16, zmm_c2, zmm_c2, 0x0B);
+                        vrangeps(zmm17, zmm_c3, zmm_c3, 0x0B);
+                        vmaxps(zmm16, zmm16, zmm17);
+
+                        vextractf32x8(ymm17, zmm16, 1);
+                        vmaxps(ymm16, ymm16, ymm17);
+                        vextractf32x4(xmm17, ymm16, 1);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0x4E);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0xB1);
+                        vmaxps(xmm16, xmm16, xmm17);
+
+                        // Copy to low register for VEX operations
+                        vmovaps(xmm4, xmm16);
+
+                        mov(eax, 0x42FE0000);
+                        vmovd(xmm5, eax);
+                        vdivss(xmm6, xmm4, xmm5);
+
+                        vcvtps2ph(xmm7, xmm6, 0);
+                        vpextrw(ptr[rdx + 36 + 0], xmm7, 0);
+
+                        vrcpss(xmm8, xmm6, xmm6);
+                        vbroadcastss(zmm24, xmm8);
+
+                        vmulps(zmm20, zmm_c2, zmm24);
+                        vmulps(zmm21, zmm_c3, zmm24);
+
+                        vcvtps2dq(zmm20, zmm20);
+                        vcvtps2dq(zmm21, zmm21);
+
+                        vpmovdb(xmm20, zmm20);
+                        vpmovdb(xmm21, zmm21);
+                        vinserti32x4(ymm20, ymm20, xmm21, 1);
+
+                        vpmovsxbd(zmm22, xmm20);
+                        vextracti32x4(xmm23, ymm20, 1);
+                        vpmovsxbd(zmm23, xmm23);
+                        vpaddd(zmm22, zmm22, zmm23);
+
+                        vextracti32x8(ymm23, zmm22, 1);
+                        vpaddd(ymm22, ymm22, ymm23);
+                        vextracti32x4(xmm23, ymm22, 1);
+                        vpaddd(xmm22, xmm22, xmm23);
+                        vpshufd(xmm23, xmm22, 0x4E);
+                        vpaddd(xmm22, xmm22, xmm23);
+                        vpshufd(xmm23, xmm22, 0xB1);
+                        vpaddd(xmm22, xmm22, xmm23);
+                        vmovd(eax, xmm22);
+                        mov(ptr[rdx + 36 + 2], ax);
+
+                        vmovdqu32(ptr[rdx + 36 + 4], ymm20);
+
+                        jmp("after_store");
+                    }
+                    L(store_fp32);
+                    // ==================== FP32 STORE (default) ====================
+                    // Write final C values back to memory as FP32
                     vmovups(ptr[reg_C_cursor + 0 * 64], zmm_c0); // C[0, n+0:n+16]
                     vmovups(ptr[reg_C_cursor + 1 * 64], zmm_c1); // C[0, n+16:n+32]
                     vmovups(ptr[reg_C_cursor + 2 * 64], zmm_c2); // C[0, n+32:n+48]
                     vmovups(ptr[reg_C_cursor + 3 * 64], zmm_c3); // C[0, n+48:n+64]
+                    L("after_store");
 
                     // ==================== ADVANCE N-LOOP ====================
                     add(reg_loop_N, 64);       // Move to next 64-column block

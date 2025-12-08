@@ -659,4 +659,46 @@ namespace llaminar2
         return true;
     }
 
+    // =========================================================================
+    // Q8_1 FP32 Path Implementation (for mutable Q8_1 tensors)
+    // =========================================================================
+
+    /**
+     * @brief FP32 path for Q8_1 kernel - supports mutable Q8_1 tensors
+     *
+     * When Q8_1 tensors are used as mutable activation buffers, they store
+     * FP32 data in a dequant cache rather than actual Q8_1 blocks. This
+     * method enables RMSNorm to work with such tensors by using the same
+     * vectorized FP32 primitive as the FP32 specialization.
+     */
+    bool CPURMSNormTypedKernel<ActivationPrecision::Q8_1>::apply(
+        const float *input,
+        const float *gamma,
+        float *output,
+        int rows,
+        int cols,
+        float epsilon,
+        bool use_bf16,
+        const MPIContext *mpi_ctx,
+        int device_idx)
+    {
+        (void)use_bf16;
+        (void)mpi_ctx;
+        (void)device_idx;
+
+        if (!input || !gamma || !output || rows <= 0 || cols <= 0)
+        {
+            return false;
+        }
+
+        // Use the same FP32 primitive as the FP32 specialization
+        primitives::rmsnorm_fused_vectorized(
+            input, gamma, output,
+            static_cast<size_t>(rows),
+            static_cast<size_t>(cols),
+            epsilon);
+
+        return true;
+    }
+
 } // namespace llaminar2

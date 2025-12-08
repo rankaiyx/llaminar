@@ -689,6 +689,19 @@ add_v2_test(V2_Unit_QuantisedGemmKernel_Repro
     MPI_PROCS 1
 )
 
+# Test: Quantised GEMM Kernel Q8_1 Output Epilogue
+add_executable(v2_test_quantised_gemm_q8_1_output unit/kernels/gemm/Test__QuantisedGemmKernel_Q8_1_Output.cpp)
+target_link_libraries(v2_test_quantised_gemm_q8_1_output
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_QuantisedGemmKernel_Q8_1_Output
+    COMMAND $<TARGET_FILE:v2_test_quantised_gemm_q8_1_output>
+    LABELS "V2;Unit;Kernels;GEMM;Quantised;Q8_1;Epilogue"
+    MPI_PROCS 1
+)
+
 # Test: Quantised JIT GEMM Fused Operations (Bias, Mask, Softmax)
 add_executable(v2_test_quantised_gemm_fused unit/kernels/gemm/Test__QuantisedGemmFused.cpp)
 target_link_libraries(v2_test_quantised_gemm_fused
@@ -1950,6 +1963,19 @@ target_link_libraries(v2_integration_kv_cache
 add_v2_test(V2_Integration_KVCache
     COMMAND $<TARGET_FILE:v2_integration_kv_cache>
     LABELS "V2;Integration;KVCache;AutoregressiveDecode;Attention;Pipeline"
+)
+
+# Test: Q8_1 vs FP32 Activation Precision Parity
+# Validates Q8_1 activation precision produces equivalent results to FP32
+# Tests Top-5 token overlap, KL divergence, and greedy sampling equivalence
+add_executable(v2_integration_q8_1_vs_fp32_parity integration/Test__Q8_1_vs_FP32_Parity.cpp)
+target_link_libraries(v2_integration_q8_1_vs_fp32_parity
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_vs_FP32_Parity
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_vs_fp32_parity>
+    LABELS "V2;Integration;Pipeline;ActivationPrecision;Q8_1;FP32;Parity;TopK;KLDivergence"
 )
 
 # Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)

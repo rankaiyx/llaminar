@@ -5,7 +5,7 @@
  * Fuses N GEMM projections by:
  * 1. Quantizing activations once (FP32 → Q8_1)
  * 2. Executing all N GEMMs with the shared quantized buffer
- * 3. All GEMMs output FP32 (via QuantisedGemmKernel)
+ * 3. All GEMMs output FP32 (via QuantisedGemmKernel) OR Q8_1 (via fused epilogue)
  *
  * Use Cases:
  * - FFN gate/up projections (2 GEMMs)
@@ -15,7 +15,7 @@
  * Performance Benefits:
  * - Saves N-1 activation quantization passes
  * - Better cache locality (input stays hot across GEMMs)
- * - Consistent FP32 residual stream
+ * - Optional Q8_1 output for memory bandwidth savings
  *
  * @author David Sanftenberg
  * @date 2025-11-26
@@ -36,7 +36,7 @@
 namespace llaminar2
 {
     /**
-     * @brief Single projection descriptor for FusedGEMM
+     * @brief Single projection descriptor for FusedGEMM (FP32 output)
      */
     struct GEMMProjection
     {
@@ -46,6 +46,20 @@ namespace llaminar2
         std::string name;                  ///< Name for error messages (optional)
         const float *gate_input = nullptr; ///< Optional gate input for SwiGLU [m, n]
         bool do_swiglu = false;            ///< Whether to apply SwiGLU fusion
+    };
+
+    /**
+     * @brief Single projection descriptor for FusedGEMM with Q8_1 output
+     *
+     * Used when the GEMM result should be fused-requantized to Q8_1 format,
+     * saving memory bandwidth for subsequent Q8_1-input kernels (e.g., fused attention).
+     */
+    struct GEMMProjectionQ8_1
+    {
+        void *output_q8_1; ///< Output Q8_1 buffer [m, ceil(n/32)] Q8_1Blocks
+        const float *bias; ///< Optional bias [n] to add before requantization (nullptr if none)
+        int n;             ///< Output dimension (rounded up to 32 for Q8_1)
+        std::string name;  ///< Name for error messages (optional)
     };
 
     /**
@@ -132,6 +146,57 @@ namespace llaminar2
             float *output1, float *output2, float *output3,
             const float *bias1, const float *bias2, const float *bias3,
             int m, int n1, int n2, int n3, int k,
+            const MPIContext *ctx = nullptr,
+            int device_idx = -1);
+
+        // =============================================================================
+        // Q8_1 Output Interface (for fused Q8_1 activation pipeline)
+        // =============================================================================
+
+        /**
+         * @brief Execute fused multi-GEMM with Q8_1 output
+         *
+         * Quantizes input once, then executes all projections with shared Q8_1 buffer,
+         * outputting Q8_1 blocks instead of FP32. This is used when subsequent kernels
+         * consume Q8_1 activations (e.g., QuantisedAttentionJit_Q8_1_Fused).
+         *
+         * @param input Input activations [m, k] FP32
+         * @param projections Vector of Q8_1 projection descriptors (output_q8_1, n)
+         * @param m Batch size (sequence length)
+         * @param k Input features (must match weight input dimension)
+         * @param ctx MPI context (optional)
+         * @param device_idx Device index (-1 for CPU)
+         * @return true on success, false on error
+         */
+        bool execute_to_q8_1(
+            const float *input,
+            const std::vector<GEMMProjectionQ8_1> &projections,
+            int m, int k,
+            const MPIContext *ctx = nullptr,
+            int device_idx = -1);
+
+        /**
+         * @brief Convenience execute for 3 Q8_1 projections (Attention Q/K/V pattern)
+         *
+         * @param input Input activations [m, k] FP32
+         * @param output_q [m, ceil(n_q/32)] Q8_1 blocks for Q projection
+         * @param output_k [m, ceil(n_kv/32)] Q8_1 blocks for K projection
+         * @param output_v [m, ceil(n_kv/32)] Q8_1 blocks for V projection
+         * @param bias_q Optional bias [n_q] for Q projection (nullptr if none)
+         * @param bias_k Optional bias [n_kv] for K projection (nullptr if none)
+         * @param bias_v Optional bias [n_kv] for V projection (nullptr if none)
+         * @param m Batch size
+         * @param n_q Q output dimension
+         * @param n_kv K/V output dimension
+         * @param k Input dimension
+         * @param ctx MPI context
+         * @param device_idx Device index
+         */
+        bool execute_to_q8_1(
+            const float *input,
+            void *output_q, void *output_k, void *output_v,
+            const float *bias_q, const float *bias_k, const float *bias_v,
+            int m, int n_q, int n_kv, int k,
             const MPIContext *ctx = nullptr,
             int device_idx = -1);
 

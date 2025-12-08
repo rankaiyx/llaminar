@@ -417,6 +417,25 @@ namespace llaminar2
                     //   Row 0: C[0, n:n+64] at reg_C_cursor + {0,64,128,192}
                     //   Row 1: C[1, n:n+64] at reg_C_cursor + ldc*4 + {0,64,128,192}
                     //
+                    // IMPORTANT: When output_format is Q8_1, C pointer is nullptr.
+                    // In that case, we zero-initialize the accumulators instead.
+                    mov(rax, ptr[rsp + 8]); // params ptr
+                    cmp(byte[rax + 113], static_cast<uint8_t>(GemmOutputFormat::Q8_1));
+                    Label load_c_values;
+                    jne(load_c_values, T_NEAR); // If not Q8_1, load from C
+                    {
+                        // Q8_1 output: Zero-initialize all 8 accumulators (2 rows × 64 columns)
+                        vxorps(zmm0, zmm0, zmm0);
+                        vxorps(zmm1, zmm1, zmm1);
+                        vxorps(zmm2, zmm2, zmm2);
+                        vxorps(zmm3, zmm3, zmm3);
+                        vxorps(zmm4, zmm4, zmm4);
+                        vxorps(zmm5, zmm5, zmm5);
+                        vxorps(zmm6, zmm6, zmm6);
+                        vxorps(zmm7, zmm7, zmm7);
+                        jmp("after_c_load", T_NEAR);
+                    }
+                    L(load_c_values);
                     // Load Row 0 C values (64 FP32 elements = 256 bytes)
                     vmovups(zmm0, ptr[reg_C_cursor + 0 * 64]); // C[0, n:n+16]
                     vmovups(zmm1, ptr[reg_C_cursor + 1 * 64]); // C[0, n+16:n+32]
@@ -433,6 +452,7 @@ namespace llaminar2
                     vmovups(zmm5, ptr[reg_C_cursor + reg_tmp + 1 * 64]); // C[1, n+16:n+32]
                     vmovups(zmm6, ptr[reg_C_cursor + reg_tmp + 2 * 64]); // C[1, n+32:n+48]
                     vmovups(zmm7, ptr[reg_C_cursor + reg_tmp + 3 * 64]); // C[1, n+48:n+64]
+                    L("after_c_load");
 
                     // =====================================================================
                     // K-LOOP: Accumulate dot products over K dimension
@@ -1197,11 +1217,19 @@ namespace llaminar2
                     // =================================================================
                     // EPILOGUE: Store results to C matrix
                     // =================================================================
-                    // Store the computed values back to the output matrix C.
+                    // =================================================================
+                    // OUTPUT STORE: Either FP32 or Q8_1 format based on output_format
+                    // =================================================================
+                    // Check output_format from params (offset 113)
+                    mov(rax, ptr[rsp + 8]);      // params
+                    movzx(ecx, byte[rax + 113]); // output_format (uint8_t)
+                    test(ecx, ecx);              // 0 = FP32, 1 = Q8_1
+                    jnz("q8_1_store_m2", T_NEAR);
+
+                    // -----------------------------------------------------------------
+                    // FP32 OUTPUT PATH (output_format == 0)
+                    // -----------------------------------------------------------------
                     // Row 0 is at reg_C_cursor, Row 1 is at reg_C_cursor + ldc * 4.
-                    //
-                    // Load ldc for row stride calculation
-                    mov(rax, ptr[rsp + 8]);              // params
                     mov(reg_tmp.cvt32(), ptr[rax + 56]); // ldc
                     shl(reg_tmp, 2);                     // ldc * sizeof(float)
 
@@ -1221,6 +1249,304 @@ namespace llaminar2
 
                     // Advance C cursor to next N block (64 columns = 256 bytes)
                     add(reg_C_cursor, 256);
+                    jmp("after_store_m2", T_NEAR);
+
+                    // -----------------------------------------------------------------
+                    // Q8_1 OUTPUT PATH (output_format == 1)
+                    // -----------------------------------------------------------------
+                    // Convert 64 FP32 values per row → 2 Q8_1 blocks per row
+                    // Q8_1Block = { float16 d (scale), int16 sum_qs, int8 qs[32] } = 36 bytes
+                    // Row 0: zmm0-zmm3 → blocks at C_q8_1 + (n/32) * 36
+                    // Row 1: zmm4-zmm7 → blocks at C_q8_1 + C_q8_1_stride + (n/32) * 36
+                    //
+                    // IMPORTANT: Use xmm8-xmm15 for VEX-only operations (vrcpss, etc.)
+                    // Extended registers (xmm16+) require EVEX encoding which some
+                    // instructions don't support.
+                    L("q8_1_store_m2");
+                    {
+                        // Load Q8_1 output pointer and stride
+                        mov(rdx, ptr[rax + 120]); // C_q8_1 pointer (row 0)
+                        mov(ebx, ptr[rax + 128]); // C_q8_1_stride (int, 4 bytes!)
+
+                        // Calculate block offset: (n_iter * 64 / 32) * 36 = n_iter * 2 * 36 = n_iter * 72
+                        // reg_loop_N contains current n value, divide by 64 to get iteration
+                        mov(rax, reg_loop_N); // Current n
+                        shr(rax, 5);          // n / 32 = block index for first of the 2 blocks
+                        imul(rax, rax, 36);   // block_index * 36 bytes
+                        add(rdx, rax);        // rdx = C_q8_1 + block_offset (row 0)
+
+                        // Save row 1 base address in r9
+                        lea(r9, ptr[rdx + rbx]); // r9 = C_q8_1 + stride + block_offset (row 1)
+
+                        // =============================================================
+                        // ROW 0, BLOCK 0: zmm0 (16 floats) + zmm1 (16 floats) → 32 INT8 + scale
+                        // =============================================================
+                        // Find max absolute value across zmm0 and zmm1
+                        vrangeps(zmm16, zmm0, zmm0, 0x0B); // |zmm0|
+                        vrangeps(zmm17, zmm1, zmm1, 0x0B); // |zmm1|
+                        vmaxps(zmm16, zmm16, zmm17);       // max(|zmm0|, |zmm1|)
+
+                        // Horizontal reduce to find max across zmm16
+                        vextractf32x8(ymm17, zmm16, 1); // Upper 256 bits
+                        vmaxps(ymm16, ymm16, ymm17);
+                        vextractf32x4(xmm17, ymm16, 1); // EVEX: vextractf32x4 for extended regs
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0x4E); // Swap pairs
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0xB1); // Swap elements
+                        vmaxps(xmm16, xmm16, xmm17);        // xmm16[0] = max_abs
+
+                        // Copy to low register for VEX operations
+                        vmovaps(xmm8, xmm16); // xmm8 = max_abs
+
+                        // Compute scale: d = max_abs / 127.0f
+                        mov(eax, 0x42FE0000); // 127.0f in hex
+                        vmovd(xmm9, eax);
+                        vdivss(xmm10, xmm8, xmm9); // xmm10 = d = max_abs / 127
+
+                        // Handle zero case: if max_abs == 0, set d = 1.0 to avoid div by zero
+                        vxorps(xmm11, xmm11, xmm11);
+                        vucomiss(xmm8, xmm11);
+                        mov(eax, 0x3F800000); // 1.0f
+                        vmovd(xmm11, eax);
+                        jnz("r0_b0_scale_ok", T_NEAR);
+                        vmovss(xmm10, xmm11); // d = 1.0f if max_abs == 0
+                        L("r0_b0_scale_ok");
+
+                        // Compute id = 1.0f / d for quantization (VEX-only vrcpss)
+                        vrcpss(xmm12, xmm10, xmm10); // xmm12 = id ≈ 1.0f / d
+                        vbroadcastss(zmm20, xmm12);  // Broadcast id to zmm20
+
+                        // Quantize: qs[i] = round(x[i] * id)
+                        vmulps(zmm21, zmm0, zmm20); // zmm0 * id
+                        vmulps(zmm22, zmm1, zmm20); // zmm1 * id
+
+                        // Convert to INT32 with rounding
+                        vcvtps2dq(zmm21, zmm21);
+                        vcvtps2dq(zmm22, zmm22);
+
+                        // Pack INT32 → INT8 using vpmovdb (saturating)
+                        vpmovdb(xmm24, zmm21); // 16 int32 → 16 int8
+                        vpmovdb(xmm25, zmm22); // 16 int32 → 16 int8
+
+                        // Combine two xmm into ymm
+                        vinserti32x4(ymm24, ymm24, xmm25, 1); // ymm24 = [xmm24, xmm25]
+
+                        // Compute sum_qs using sign-extended INT32 values
+                        vpmovsxbd(zmm26, xmm24);        // Sign-extend low 16 bytes
+                        vextracti32x4(xmm27, ymm24, 1); // EVEX: Get upper 16 bytes
+                        vpmovsxbd(zmm28, xmm27);        // Sign-extend to 16 INT32
+                        vpaddd(zmm26, zmm26, zmm28);    // Sum both halves
+
+                        // Horizontal sum reduction
+                        vextracti32x8(ymm27, zmm26, 1);
+                        vpaddd(ymm26, ymm26, ymm27);
+                        vextracti32x4(xmm27, ymm26, 1); // EVEX: vextracti32x4 for extended regs
+                        vpaddd(xmm26, xmm26, xmm27);
+                        vpshufd(xmm27, xmm26, 0x4E);
+                        vpaddd(xmm26, xmm26, xmm27);
+                        vpshufd(xmm27, xmm26, 0xB1);
+                        vpaddd(xmm26, xmm26, xmm27); // xmm26[0] = sum_qs
+
+                        // Store Q8_1Block for Row 0, Block 0 at rdx
+                        vcvtps2ph(xmm23, xmm10, 0x00);   // FP32 → FP16 (use xmm10 which has d)
+                        vpextrw(ptr[rdx + 0], xmm23, 0); // d (2 bytes)
+
+                        vmovd(eax, xmm26);
+                        mov(word[rdx + 2], ax); // sum_qs (2 bytes)
+
+                        vmovdqu32(ptr[rdx + 4], ymm24); // 32 bytes of qs (EVEX for ymm24)
+
+                        // =============================================================
+                        // ROW 0, BLOCK 1: zmm2 (16 floats) + zmm3 (16 floats) → 32 INT8 + scale
+                        // =============================================================
+                        vrangeps(zmm16, zmm2, zmm2, 0x0B);
+                        vrangeps(zmm17, zmm3, zmm3, 0x0B);
+                        vmaxps(zmm16, zmm16, zmm17);
+
+                        vextractf32x8(ymm17, zmm16, 1);
+                        vmaxps(ymm16, ymm16, ymm17);
+                        vextractf32x4(xmm17, ymm16, 1); // EVEX
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0x4E);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0xB1);
+                        vmaxps(xmm16, xmm16, xmm17);
+
+                        vmovaps(xmm8, xmm16);
+                        mov(eax, 0x42FE0000);
+                        vmovd(xmm9, eax);
+                        vdivss(xmm10, xmm8, xmm9);
+
+                        vxorps(xmm11, xmm11, xmm11);
+                        vucomiss(xmm8, xmm11);
+                        mov(eax, 0x3F800000);
+                        vmovd(xmm11, eax);
+                        jnz("r0_b1_scale_ok", T_NEAR);
+                        vmovss(xmm10, xmm11);
+                        L("r0_b1_scale_ok");
+
+                        vrcpss(xmm12, xmm10, xmm10);
+                        vbroadcastss(zmm20, xmm12);
+
+                        vmulps(zmm21, zmm2, zmm20);
+                        vmulps(zmm22, zmm3, zmm20);
+                        vcvtps2dq(zmm21, zmm21);
+                        vcvtps2dq(zmm22, zmm22);
+
+                        vpmovdb(xmm24, zmm21);
+                        vpmovdb(xmm25, zmm22);
+                        vinserti32x4(ymm24, ymm24, xmm25, 1);
+
+                        vpmovsxbd(zmm26, xmm24);
+                        vextracti32x4(xmm27, ymm24, 1);
+                        vpmovsxbd(zmm28, xmm27);
+                        vpaddd(zmm26, zmm26, zmm28);
+                        vextracti32x8(ymm27, zmm26, 1);
+                        vpaddd(ymm26, ymm26, ymm27);
+                        vextracti32x4(xmm27, ymm26, 1);
+                        vpaddd(xmm26, xmm26, xmm27);
+                        vpshufd(xmm27, xmm26, 0x4E);
+                        vpaddd(xmm26, xmm26, xmm27);
+                        vpshufd(xmm27, xmm26, 0xB1);
+                        vpaddd(xmm26, xmm26, xmm27);
+
+                        vcvtps2ph(xmm23, xmm10, 0x00);
+                        vpextrw(ptr[rdx + 36 + 0], xmm23, 0);
+                        vmovd(eax, xmm26);
+                        mov(word[rdx + 36 + 2], ax);
+                        vmovdqu32(ptr[rdx + 36 + 4], ymm24); // EVEX for ymm24
+
+                        // =============================================================
+                        // ROW 1, BLOCK 0: zmm4 (16 floats) + zmm5 (16 floats) → 32 INT8 + scale
+                        // =============================================================
+                        vrangeps(zmm16, zmm4, zmm4, 0x0B);
+                        vrangeps(zmm17, zmm5, zmm5, 0x0B);
+                        vmaxps(zmm16, zmm16, zmm17);
+
+                        vextractf32x8(ymm17, zmm16, 1);
+                        vmaxps(ymm16, ymm16, ymm17);
+                        vextractf32x4(xmm17, ymm16, 1);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0x4E);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0xB1);
+                        vmaxps(xmm16, xmm16, xmm17);
+
+                        vmovaps(xmm8, xmm16);
+                        mov(eax, 0x42FE0000);
+                        vmovd(xmm9, eax);
+                        vdivss(xmm10, xmm8, xmm9);
+
+                        vxorps(xmm11, xmm11, xmm11);
+                        vucomiss(xmm8, xmm11);
+                        mov(eax, 0x3F800000);
+                        vmovd(xmm11, eax);
+                        jnz("r1_b0_scale_ok", T_NEAR);
+                        vmovss(xmm10, xmm11);
+                        L("r1_b0_scale_ok");
+
+                        vrcpss(xmm12, xmm10, xmm10);
+                        vbroadcastss(zmm20, xmm12);
+
+                        vmulps(zmm21, zmm4, zmm20);
+                        vmulps(zmm22, zmm5, zmm20);
+                        vcvtps2dq(zmm21, zmm21);
+                        vcvtps2dq(zmm22, zmm22);
+
+                        vpmovdb(xmm24, zmm21);
+                        vpmovdb(xmm25, zmm22);
+                        vinserti32x4(ymm24, ymm24, xmm25, 1);
+
+                        vpmovsxbd(zmm26, xmm24);
+                        vextracti32x4(xmm27, ymm24, 1);
+                        vpmovsxbd(zmm28, xmm27);
+                        vpaddd(zmm26, zmm26, zmm28);
+                        vextracti32x8(ymm27, zmm26, 1);
+                        vpaddd(ymm26, ymm26, ymm27);
+                        vextracti32x4(xmm27, ymm26, 1);
+                        vpaddd(xmm26, xmm26, xmm27);
+                        vpshufd(xmm27, xmm26, 0x4E);
+                        vpaddd(xmm26, xmm26, xmm27);
+                        vpshufd(xmm27, xmm26, 0xB1);
+                        vpaddd(xmm26, xmm26, xmm27);
+
+                        vcvtps2ph(xmm23, xmm10, 0x00);
+                        vpextrw(ptr[r9 + 0], xmm23, 0);
+                        vmovd(eax, xmm26);
+                        mov(word[r9 + 2], ax);
+                        vmovdqu32(ptr[r9 + 4], ymm24); // EVEX for ymm24
+
+                        // =============================================================
+                        // ROW 1, BLOCK 1: zmm6 (16 floats) + zmm7 (16 floats) → 32 INT8 + scale
+                        // =============================================================
+                        vrangeps(zmm16, zmm6, zmm6, 0x0B);
+                        vrangeps(zmm17, zmm7, zmm7, 0x0B);
+                        vmaxps(zmm16, zmm16, zmm17);
+
+                        vextractf32x8(ymm17, zmm16, 1);
+                        vmaxps(ymm16, ymm16, ymm17);
+                        vextractf32x4(xmm17, ymm16, 1);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0x4E);
+                        vmaxps(xmm16, xmm16, xmm17);
+                        vshufps(xmm17, xmm16, xmm16, 0xB1);
+                        vmaxps(xmm16, xmm16, xmm17);
+
+                        vmovaps(xmm8, xmm16);
+                        mov(eax, 0x42FE0000);
+                        vmovd(xmm9, eax);
+                        vdivss(xmm10, xmm8, xmm9);
+
+                        vxorps(xmm11, xmm11, xmm11);
+                        vucomiss(xmm8, xmm11);
+                        mov(eax, 0x3F800000);
+                        vmovd(xmm11, eax);
+                        jnz("r1_b1_scale_ok", T_NEAR);
+                        vmovss(xmm10, xmm11);
+                        L("r1_b1_scale_ok");
+
+                        vrcpss(xmm12, xmm10, xmm10);
+                        vbroadcastss(zmm20, xmm12);
+
+                        vmulps(zmm21, zmm6, zmm20);
+                        vmulps(zmm22, zmm7, zmm20);
+                        vcvtps2dq(zmm21, zmm21);
+                        vcvtps2dq(zmm22, zmm22);
+
+                        vpmovdb(xmm24, zmm21);
+                        vpmovdb(xmm25, zmm22);
+                        vinserti32x4(ymm24, ymm24, xmm25, 1);
+
+                        vpmovsxbd(zmm26, xmm24);
+                        vextracti32x4(xmm27, ymm24, 1);
+                        vpmovsxbd(zmm28, xmm27);
+                        vpaddd(zmm26, zmm26, zmm28);
+                        vextracti32x8(ymm27, zmm26, 1);
+                        vpaddd(ymm26, ymm26, ymm27);
+                        vextracti32x4(xmm27, ymm26, 1);
+                        vpaddd(xmm26, xmm26, xmm27);
+                        vpshufd(xmm27, xmm26, 0x4E);
+                        vpaddd(xmm26, xmm26, xmm27);
+                        vpshufd(xmm27, xmm26, 0xB1);
+                        vpaddd(xmm26, xmm26, xmm27);
+
+                        vcvtps2ph(xmm23, xmm10, 0x00);
+                        vpextrw(ptr[r9 + 36 + 0], xmm23, 0);
+                        vmovd(eax, xmm26);
+                        mov(word[r9 + 36 + 2], ax);
+                        vmovdqu32(ptr[r9 + 36 + 4], ymm24); // EVEX for ymm24
+
+                        // Restore reg_stride (rbx) for next N-loop iteration
+                        // Q8_1 store clobbered rbx with C_q8_1_stride
+                        mov(rax, ptr[rsp + 8]);                 // Reload params
+                        mov(reg_stride.cvt32(), ptr[rax + 56]); // ldc
+                        shl(reg_stride, 2);                     // ldc * sizeof(float)
+                    }
+                    // No cursor advance needed for Q8_1 - block offset computed from loop_N
+                    jmp("after_store_m2", T_NEAR);
+
+                    L("after_store_m2");
 
                     // =================================================================
                     // N-LOOP ITERATION: Continue to next column block

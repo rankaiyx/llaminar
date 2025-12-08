@@ -389,6 +389,43 @@ namespace llaminar2
         }
 
         /**
+         * @brief GEMM with FP32 input, outputting to Q8_1 format
+         *
+         * Performs GEMM and requantizes the output directly to Q8_1 blocks.
+         * This is more efficient than separate GEMM + quantization passes.
+         *
+         * @param A FP32 activation matrix [m, k] (will be quantized internally)
+         * @param C_q8_1 Output Q8_1 blocks buffer [m, (n+31)/32 blocks]
+         * @param m Number of rows (sequence length)
+         * @param n Output features (columns)
+         * @param k Input features
+         * @param mpi_ctx MPI context for distributed execution
+         * @param device_idx Device index for execution
+         *
+         * @return true on success, false if not supported
+         *
+         * @note Default implementation returns false (not supported).
+         *       Kernels like QuantisedGemmKernel override with optimized implementation.
+         */
+        virtual bool multiply_to_q8_1(
+            const float *A,
+            void *C_q8_1,
+            int m, int n, int k,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            // Default: not supported
+            (void)A;
+            (void)C_q8_1;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
+
+        /**
          * @brief Activation-activation matrix multiplication: C = alpha * A @ B^T + beta * C
          *
          * This variant supports both A and B as activation buffers (not weight tensors).
