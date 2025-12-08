@@ -327,6 +327,20 @@ add_v2_test(V2_Unit_Q8_1_OnlineSoftmax
     MPI_PROCS 1  # JIT kernel unit tests are CPU-only, single rank
 )
 
+# Test: Q8_1 Fused Attention JIT Kernel Unit Tests
+# Tests the fully fused Q8_1 attention kernel with dynamic head_dim support
+add_executable(v2_test_q8_1_fused_attention_unit unit/kernels/cpu/gemm_v4/Test__QuantisedAttentionJit_Q8_1_Fused.cpp)
+target_link_libraries(v2_test_q8_1_fused_attention_unit 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8_1_FusedAttention 
+    COMMAND $<TARGET_FILE:v2_test_q8_1_fused_attention_unit>
+    LABELS "V2;Unit;Kernels;GEMM;Q8_1;FusedAttention;Attention;JIT;AVX512;StackLayout"
+    MPI_PROCS 1  # JIT kernel unit tests are CPU-only, single rank
+)
+
 # Test: Q4_1 SIMD Unpack
 add_executable(v2_test_q4_1_simd_unpack unit/tensors/Test__Q4_1_SIMD_Unpack.cpp)
 target_link_libraries(v2_test_q4_1_simd_unpack 
@@ -1897,6 +1911,20 @@ add_v2_test(V2_Integration_Q8_1_OnlineSoftmax
     COMMAND $<TARGET_FILE:v2_integration_q8_1_online_softmax>
     MPI_PROCS 1
     LABELS "V2;Integration;Kernels;GEMM;Attention;Q8_1;OnlineSoftmax;Correctness"
+)
+
+# Test: Q8_1 Fully Fused Attention Kernel Correctness
+# Validates the fused Q8_1 attention kernel (Q@K^T + softmax + @V + requant)
+# against pure FP32 reference implementation (FP32 GEMM + softmax + FP32 GEMM)
+add_executable(v2_integration_q8_1_fused_attention integration/Test__Q8_1_FusedAttention.cpp)
+target_link_libraries(v2_integration_q8_1_fused_attention 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_FusedAttention 
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_fused_attention>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Kernels;Attention;Q8_1;FusedOps;Correctness"
 )
 
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)

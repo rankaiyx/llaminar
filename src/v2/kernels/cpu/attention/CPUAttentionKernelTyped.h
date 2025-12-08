@@ -22,6 +22,9 @@
 #include "../CPUKernelBase.h"
 #include "../primitives/ActivationTraits.h"
 #include "../primitives/SoftmaxPrimitivesImpl.h"
+#include "../gemm_v4/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
+#include "../gemm_v4/QuantisedGemmJit_FP32_x_Q8_1.h"
+#include "../gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
 #include "../../../pipelines/AttentionUtils.h"
 #include "../../../pipelines/PipelineConfig.h"
 #include "../../../utils/Logger.h"
@@ -31,6 +34,7 @@
 #include <cmath>
 #include <limits>
 #include <algorithm>
+#include <mutex>
 #include <omp.h>
 
 namespace llaminar2
@@ -232,6 +236,149 @@ namespace llaminar2
 
     private:
         /**
+         * @brief Q8_1-native FULLY FUSED attention computation
+         *
+         * Uses the QuantisedAttentionJit_Q8_1_Fused kernel which fuses:
+         * 1. Q8_1 × Q8_1 dot product (Q @ K^T)
+         * 2. Online softmax (NO intermediate score storage!)
+         * 3. Online weighted V accumulation (on-the-fly dequant)
+         * 4. Online requantization to Q8_1 output
+         *
+         * Benefits:
+         * - NO intermediate FP32 scores matrix (saves O(seq×kv) memory)
+         * - V values read once while cache-hot
+         * - Output directly in Q8_1 format for downstream ops
+         *
+         * @note output parameter is reinterpreted as Q8_1Block* for this path!
+         */
+        bool compute_q8_1_native(
+            const Q8_1Block *Q, const Q8_1Block *K, const Q8_1Block *V,
+            float *output, // Actually Q8_1Block* in disguise!
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal,
+            int window_size,
+            float *scores,
+            float *context,
+            const float *mask,
+            int kv_len,
+            ITensorGemm *gemm_fallback) const
+        {
+            (void)window_size;
+            (void)context;
+            (void)scores; // NOT USED - fused kernel has no intermediate scores!
+            (void)gemm_fallback;
+
+            // Output is actually Q8_1Block*, reinterpret
+            Q8_1Block *output_q8 = reinterpret_cast<Q8_1Block *>(output);
+
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            const int heads_per_kv = n_heads / n_kv_heads;
+
+            // Q8_1 block layout: head_dim elements = head_dim/32 blocks per head
+            const int head_dim_blocks = (head_dim + 31) / 32;
+            const int q_blocks_per_row = n_heads * head_dim_blocks;    // Q row stride in blocks
+            const int k_blocks_per_row = n_kv_heads * head_dim_blocks; // K row stride in blocks
+            const int out_blocks_per_row = n_heads * head_dim_blocks;  // Output row stride
+
+            // Get or create the fused JIT kernel for this head_dim
+            // Note: head_dim is typically 64 or 128, so we use a simple cache
+            static std::unique_ptr<gemm_v4::QuantisedAttentionJit_Q8_1_Fused> jit_fused_64;
+            static std::unique_ptr<gemm_v4::QuantisedAttentionJit_Q8_1_Fused> jit_fused_128;
+            static std::mutex jit_mutex;
+
+            gemm_v4::QuantisedAttentionJit_Q8_1_Fused *jit_kernel = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(jit_mutex);
+                if (head_dim == 64)
+                {
+                    if (!jit_fused_64)
+                    {
+                        jit_fused_64 = std::make_unique<gemm_v4::QuantisedAttentionJit_Q8_1_Fused>(64);
+                    }
+                    jit_kernel = jit_fused_64.get();
+                }
+                else if (head_dim == 128)
+                {
+                    if (!jit_fused_128)
+                    {
+                        jit_fused_128 = std::make_unique<gemm_v4::QuantisedAttentionJit_Q8_1_Fused>(128);
+                    }
+                    jit_kernel = jit_fused_128.get();
+                }
+            }
+
+            // Fallback to reference implementation for unsupported head_dim
+            if (!jit_kernel)
+            {
+                LOG_WARN("[CPUAttentionKernelTyped] head_dim=" << head_dim
+                                                               << " not supported by fused JIT, using reference implementation");
+
+                // Use reference implementation
+#pragma omp parallel for
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    int kv_h = h / heads_per_kv;
+                    const Q8_1Block *Q_h = Q + h * head_dim_blocks;
+                    const Q8_1Block *K_h = K + kv_h * head_dim_blocks;
+                    const Q8_1Block *V_h = V + kv_h * head_dim_blocks;
+                    Q8_1Block *out_h = output_q8 + h * head_dim_blocks;
+
+                    gemm_v4::fused_q8_1_attention_reference(
+                        Q_h, K_h, V_h, out_h,
+                        seq_len, kv_len, head_dim,
+                        q_blocks_per_row, k_blocks_per_row, k_blocks_per_row, out_blocks_per_row,
+                        scale, mask, kv_len);
+                }
+                return true;
+            }
+
+            // Parallelism: parallelize over heads for small seq_len
+            const int max_threads = omp_get_max_threads();
+            bool parallelize_heads = (seq_len < 128) || (n_heads * 2 >= max_threads);
+
+#pragma omp parallel for if (parallelize_heads)
+            for (int h = 0; h < n_heads; ++h)
+            {
+                // Virtual GQA: Map head h to kv_head
+                int kv_h = h / heads_per_kv;
+
+                // Pointers to head-specific Q8_1 blocks
+                const Q8_1Block *Q_h = Q + h * head_dim_blocks;
+                const Q8_1Block *K_h = K + kv_h * head_dim_blocks;
+                const Q8_1Block *V_h = V + kv_h * head_dim_blocks;
+                Q8_1Block *out_h = output_q8 + h * head_dim_blocks;
+
+                // Strides in bytes
+                const int q_stride_bytes = q_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+                const int k_stride_bytes = k_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+                const int out_stride_bytes = out_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+
+                // Build params for fused kernel
+                gemm_v4::FusedQ8_1AttentionParams params;
+                params.Q = Q_h;
+                params.K = K_h;
+                params.V = V_h;
+                params.output = out_h;
+                params.M = seq_len;
+                params.N = kv_len;
+                params.head_dim = head_dim;
+                params.Q_stride_bytes = q_stride_bytes;
+                params.K_stride_bytes = k_stride_bytes;
+                params.V_stride_bytes = k_stride_bytes; // V has same stride as K
+                params.output_stride_bytes = out_stride_bytes;
+                params.scale = scale;
+                params.mask = mask;
+                params.mask_stride = kv_len;
+
+                // Execute fused kernel
+                auto func = jit_kernel->get_kernel();
+                func(&params);
+            }
+
+            return true;
+        }
+
+        /**
          * @brief Typed implementation of attention
          *
          * @param Q Input Q [seq_len, n_heads, head_dim]
@@ -283,6 +430,21 @@ namespace llaminar2
 
             // Create GEMM kernel once (reused across heads) using ActivationTraits!
             auto gemm = Traits::create_activation_gemm();
+
+            // ================================================================
+            // Q8_1-Native Path: Fully quantized attention computation
+            // ================================================================
+            // Uses JIT-optimized Q8_1 × Q8_1 GEMM with online softmax for Q @ K^T
+            // Uses optimized FP32 scores × Q8_1 V → FP32 for context computation
+            if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
+            {
+                return compute_q8_1_native(
+                    Q, K, V, output,
+                    seq_len, n_heads, n_kv_heads, head_dim,
+                    causal, window_size,
+                    scores, context, mask,
+                    kv_len, gemm.get());
+            }
 
             // Optimized path for FP32, BF16, FP16 (Native & Mixed Precision)
             if constexpr (std::is_same_v<TensorT, FP32Tensor> ||
