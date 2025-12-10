@@ -24,6 +24,7 @@ out/
 *.exe
 *.pyc
 *.npz
+*.bin
 
 # CMake generated files
 CMakeCache.txt
@@ -33,6 +34,7 @@ Makefile
 compile_commands.json
 **/generated/*
 **/*.gcov
+**/metadata.txt
 
 # Debug files
 *.dSYM/
