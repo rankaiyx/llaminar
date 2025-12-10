@@ -200,6 +200,56 @@ namespace llaminar2
             const MPIContext *ctx = nullptr,
             int device_idx = -1);
 
+        // =============================================================================
+        // Q8_1-to-Q8_1 Interface (for pure Q8_1 activation pipeline)
+        // =============================================================================
+
+        /**
+         * @brief Execute fused multi-GEMM with Q8_1 input and Q8_1 output
+         *
+         * Takes pre-quantized Q8_1 activations and outputs Q8_1 blocks.
+         * This avoids double quantization when both input and output are Q8_1.
+         *
+         * @param input_q8_1 Input Q8_1 blocks [m, k/32]
+         * @param projections Vector of Q8_1 projection descriptors (output_q8_1, n)
+         * @param m Batch size (sequence length)
+         * @param k Input features (must match weight input dimension)
+         * @param ctx MPI context (optional)
+         * @param device_idx Device index (-1 for CPU)
+         * @return true on success, false on error
+         */
+        bool execute_q8_1_to_q8_1(
+            const void *input_q8_1,
+            const std::vector<GEMMProjectionQ8_1> &projections,
+            int m, int k,
+            const MPIContext *ctx = nullptr,
+            int device_idx = -1);
+
+        /**
+         * @brief Convenience execute for 3 Q8_1-to-Q8_1 projections (Attention Q/K/V pattern)
+         *
+         * @param input_q8_1 Input Q8_1 blocks [m, k/32]
+         * @param output_q [m, ceil(n_q/32)] Q8_1 blocks for Q projection
+         * @param output_k [m, ceil(n_kv/32)] Q8_1 blocks for K projection
+         * @param output_v [m, ceil(n_kv/32)] Q8_1 blocks for V projection
+         * @param bias_q Optional bias [n_q] for Q projection (nullptr if none)
+         * @param bias_k Optional bias [n_kv] for K projection (nullptr if none)
+         * @param bias_v Optional bias [n_kv] for V projection (nullptr if none)
+         * @param m Batch size
+         * @param n_q Q output dimension
+         * @param n_kv K/V output dimension
+         * @param k Input dimension
+         * @param ctx MPI context
+         * @param device_idx Device index
+         */
+        bool execute_q8_1_to_q8_1(
+            const void *input_q8_1,
+            void *output_q, void *output_k, void *output_v,
+            const float *bias_q, const float *bias_k, const float *bias_v,
+            int m, int n_q, int n_kv, int k,
+            const MPIContext *ctx = nullptr,
+            int device_idx = -1);
+
         /**
          * @brief Get number of projections
          */

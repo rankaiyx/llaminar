@@ -25,6 +25,9 @@
 
 using namespace llaminar2;
 
+// Type alias for backward compatibility in tests
+using CPURoPEKernel = CPURoPEKernelT<ActivationPrecision::FP32>;
+
 namespace
 {
     /**
@@ -131,10 +134,10 @@ namespace
         K_llama->copyFrom(K.get());
 
         CPURoPEKernel rope_kernel_llama;
-        ASSERT_TRUE(rope_kernel_llama.apply(
+        ASSERT_TRUE(rope_kernel_llama.apply_typed(
             Q_llama->mutable_data(), K_llama->mutable_data(), position_ids.data(),
             seq_len_, n_heads_, n_kv_heads_, head_dim_,
-            rope_theta_llama_, false, nullptr, -1))
+            rope_theta_llama_, -1))
             << "RoPE with LLaMA theta failed";
 
         // Apply RoPE with Qwen2.5 theta (1000000.0)
@@ -144,10 +147,10 @@ namespace
         K_qwen->copyFrom(K.get());
 
         CPURoPEKernel rope_kernel_qwen;
-        ASSERT_TRUE(rope_kernel_qwen.apply(
+        ASSERT_TRUE(rope_kernel_qwen.apply_typed(
             Q_qwen->mutable_data(), K_qwen->mutable_data(), position_ids.data(),
             seq_len_, n_heads_, n_kv_heads_, head_dim_,
-            rope_theta_qwen25_, false, nullptr, -1))
+            rope_theta_qwen25_, -1))
             << "RoPE with Qwen2.5 theta failed";
 
         // Verify outputs DIFFER significantly (100× theta difference)
@@ -437,10 +440,10 @@ namespace
         }
 
         CPURoPEKernel rope_kernel;
-        ASSERT_TRUE(rope_kernel.apply(
+        ASSERT_TRUE(rope_kernel.apply_typed(
             Q_dummy->mutable_data(), K_dummy->mutable_data(), position_ids.data(),
             seq_len_, n_heads_, n_kv_heads_, head_dim_,
-            rope_theta_qwen25_, false, nullptr, -1))
+            rope_theta_qwen25_, -1))
             << "RoPE failed";
 
         // Verify V is unchanged (RoPE interface doesn't touch V)

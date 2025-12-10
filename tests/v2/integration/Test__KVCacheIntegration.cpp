@@ -23,6 +23,9 @@
 #include <memory>
 #include <vector>
 #include <cmath>
+
+// Use FP32 KVCache for integration tests
+using TestKVCache = llaminar2::KVCache<llaminar2::ActivationPrecision::FP32>;
 #include <algorithm>
 #include <numeric>
 
@@ -662,7 +665,7 @@ TEST_F(KVCacheIntegrationTest, KVCacheDataIntegrity)
     int max_seq_len = 256;
 
     // Create KV cache directly with MPI context for NUMA-aware allocation
-    auto cache = std::make_shared<KVCache>(*mpi_ctx_, n_layers, max_seq_len, n_kv_heads, head_dim);
+    auto cache = std::make_shared<TestKVCache>(*mpi_ctx_, n_layers, max_seq_len, n_kv_heads, head_dim);
 
     if (rank_ == 0)
     {

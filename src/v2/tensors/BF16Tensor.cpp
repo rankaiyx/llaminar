@@ -12,12 +12,10 @@
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
 #include "../backends/ComputeBackend.h"
-#include "../kernels/cpu/ops/CPURMSNormTypedKernel.h"
+#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "../kernels/cpu/attention/CPUAttentionKernelTyped.h"
-#include "../kernels/cpu/ops/CPURoPEKernelT.h"
-#include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
-#include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
+#include "../kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
@@ -200,24 +198,37 @@ namespace llaminar2
 
     std::unique_ptr<ITensorSwiGLU> BF16Tensor::createSwiGLU()
     {
-        return std::make_unique<CPUSwiGLUKernelT<BF16Tensor>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createSwiGLU(this, dev_type);
     }
 
     std::unique_ptr<ITensorSoftmax> BF16Tensor::createSoftmax()
     {
-        return std::make_unique<CPUSoftmaxKernelT<BF16Tensor>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createSoftmax(this, dev_type);
     }
 
     std::unique_ptr<ITensorRMSNorm> BF16Tensor::createRMSNorm()
     {
-        // BF16 tensors use typed RMSNorm kernel
-        return std::make_unique<CPURMSNormTypedKernel<ActivationPrecision::BF16>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createRMSNorm(this, dev_type);
     }
 
     std::unique_ptr<ITensorAttention> BF16Tensor::createAttention()
     {
-        // BF16 tensors use typed CPU attention kernel
-        return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::BF16>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createAttention(this, dev_type);
+    }
+
+    std::unique_ptr<ITensorEmbedding> BF16Tensor::createEmbedding()
+    {
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createEmbedding(this, dev_type);
     }
 
     // ========== BF16-Specific Interface ==========

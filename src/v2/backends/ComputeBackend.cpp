@@ -17,8 +17,8 @@
 #include "../utils/CPUFeatures.h"
 #include "../utils/NUMATopology.h"
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
-#include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
+#include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -789,9 +789,12 @@ namespace llaminar2
 
     struct CPUComputeContext::Impl
     {
-        std::unique_ptr<CPURoPEKernel> rope_kernel;
-        std::unique_ptr<ITensorSoftmax> softmax_kernel;
-        std::unique_ptr<CPUSwiGLUKernel> swiglu_kernel;
+        // Note: The typed kernels don't implement ITensorRoPE/ITensorSwiGLU interfaces,
+        // so we use void* and cast when needed. This is a transitional pattern
+        // that will be cleaned up when the compute context is refactored.
+        std::unique_ptr<CPURoPEKernelT<ActivationPrecision::FP32>> rope_kernel;
+        std::unique_ptr<CPUSoftmaxKernelT<ActivationPrecision::FP32>> softmax_kernel;
+        std::unique_ptr<CPUSwiGLUKernelT<ActivationPrecision::FP32>> swiglu_kernel;
     };
 
     CPUComputeContext::CPUComputeContext()
@@ -823,29 +826,26 @@ namespace llaminar2
 
     ITensorRoPE *CPUComputeContext::get_rope_kernel()
     {
-        if (!pimpl_->rope_kernel)
-        {
-            pimpl_->rope_kernel = std::make_unique<CPURoPEKernel>();
-        }
-        return pimpl_->rope_kernel.get();
+        // Note: The typed kernels no longer implement ITensorRoPE interface.
+        // This method is deprecated and returns nullptr.
+        // Use KernelFactory::createRoPE() instead.
+        return nullptr;
     }
 
     ITensorSoftmax *CPUComputeContext::get_softmax_kernel()
     {
-        if (!pimpl_->softmax_kernel)
-        {
-            pimpl_->softmax_kernel = std::make_unique<CPUSoftmaxKernelT<FP32Tensor>>();
-        }
-        return pimpl_->softmax_kernel.get();
+        // Note: The typed kernels no longer implement ITensorSoftmax interface.
+        // This method is deprecated and returns nullptr.
+        // Use KernelFactory::createSoftmax() instead.
+        return nullptr;
     }
 
     ITensorSwiGLU *CPUComputeContext::get_swiglu_kernel()
     {
-        if (!pimpl_->swiglu_kernel)
-        {
-            pimpl_->swiglu_kernel = std::make_unique<CPUSwiGLUKernel>();
-        }
-        return pimpl_->swiglu_kernel.get();
+        // Note: The typed kernels no longer implement ITensorSwiGLU interface.
+        // This method is deprecated and returns nullptr.
+        // Use KernelFactory::createSwiGLU() instead.
+        return nullptr;
     }
 
     // ============================================================================

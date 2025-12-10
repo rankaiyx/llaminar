@@ -13,6 +13,7 @@
 #include "../../tensors/Tensors.h"
 #include "../../tensors/SIMDHelpers.h"
 #include "../../kernels/cpu/primitives/SoftmaxPrimitives.h"
+#include "../../kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include <cstring>
 #include <cmath>
 #include <sstream>
@@ -21,6 +22,31 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Factory function to create attention kernel based on precision
+         *
+         * This decouples kernel selection from output tensor type, allowing
+         * Q8_1 inputs with FP32 output to still use the Q8_1 kernel.
+         */
+        std::unique_ptr<ITensorAttention> createAttentionKernelForPrecision(ActivationPrecision precision)
+        {
+            switch (precision)
+            {
+            case ActivationPrecision::Q8_1:
+                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::Q8_1>>();
+            case ActivationPrecision::BF16:
+                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::BF16>>();
+            case ActivationPrecision::FP16:
+                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP16>>();
+            case ActivationPrecision::FP32:
+            default:
+                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP32>>();
+            }
+        }
+    } // namespace
+
     namespace
     {
         bool should_build_mask(const GQAAttentionConfig &config,
@@ -136,6 +162,8 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
+        LOG_DEBUG("[GQAAttention::compute] Called with precision=" << static_cast<int>(config.precision));
+
         if (!validate_inputs(Q, K, V, output, config))
         {
             return false;
@@ -160,17 +188,13 @@ namespace llaminar2
 
         const int seq_len = total_tokens / effective_batch_size;
 
-        auto *activation_output = dynamic_cast<IActivationTensor *>(output);
-        if (!activation_output)
-        {
-            LOG_ERROR("[GQAAttention] compute: output tensor does not implement IActivationTensor");
-            return false;
-        }
-
-        auto attention_kernel = activation_output->createAttention();
+        // Create attention kernel based on config.precision, NOT output tensor type
+        // This allows Q8_1 inputs to use the Q8_1 kernel even with FP32 output
+        auto attention_kernel = createAttentionKernelForPrecision(config.precision);
         if (!attention_kernel)
         {
-            LOG_ERROR("[GQAAttention] compute: failed to create attention kernel");
+            LOG_ERROR("[GQAAttention] compute: failed to create attention kernel for precision "
+                      << static_cast<int>(config.precision));
             return false;
         }
 
@@ -196,43 +220,78 @@ namespace llaminar2
         // This handles the case where Q is Q8_1 but K/V come from FP32 KV cache
         ActivationPrecision effective_precision = config.precision;
 
-        // Temporary buffer for mixed precision output (Q8_1 output but FP32 computation)
-        std::unique_ptr<FP32Tensor> temp_output_buffer;
-        Q8_1Tensor *out_q8_1_for_requant = nullptr;
+        // Temporary buffers for mixed precision scenarios
+        std::unique_ptr<FP32Tensor> temp_fp32_output_buffer; // For FP32 fallback with Q8_1 output tensor
+        std::unique_ptr<Q8_1Tensor> temp_q8_1_output_buffer; // For Q8_1 compute with FP32 output tensor
+        Q8_1Tensor *out_q8_1_for_requant = nullptr;          // Q8_1 output needing requant from FP32
+        FP32Tensor *out_fp32_for_dequant = nullptr;          // FP32 output needing dequant from Q8_1
 
         if (config.precision == ActivationPrecision::Q8_1)
         {
+            LOG_DEBUG("[GQAAttention] Q8_1 precision requested - checking tensor types");
+
             // Check if tensors are actually Q8_1
             auto *Q_q8_1 = dynamic_cast<Q8_1Tensor *>(Q);
             auto *K_q8_1 = dynamic_cast<Q8_1Tensor *>(K);
             auto *V_q8_1 = dynamic_cast<Q8_1Tensor *>(V);
             auto *out_q8_1 = dynamic_cast<Q8_1Tensor *>(output);
+            auto *out_fp32 = dynamic_cast<FP32Tensor *>(output);
 
-            if (Q_q8_1 && K_q8_1 && V_q8_1 && out_q8_1)
+            LOG_DEBUG("[GQAAttention] Tensor types: Q=" << (Q_q8_1 ? "Q8_1" : "other")
+                                                        << ", K=" << (K_q8_1 ? "Q8_1" : "other")
+                                                        << ", V=" << (V_q8_1 ? "Q8_1" : "other")
+                                                        << ", output=" << (out_q8_1 ? "Q8_1" : (out_fp32 ? "FP32" : "other")));
+
+            if (Q_q8_1 && K_q8_1 && V_q8_1)
             {
-                // All tensors are Q8_1: use native Q8_1 path
+                // All inputs are Q8_1: use native Q8_1 path
                 Q_ptr = reinterpret_cast<const float *>(Q_q8_1->q8_1_blocks());
                 K_ptr = reinterpret_cast<const float *>(K_q8_1->q8_1_blocks());
                 V_ptr = reinterpret_cast<const float *>(V_q8_1->q8_1_blocks());
-                output_ptr = reinterpret_cast<float *>(out_q8_1->mutable_q8_1_blocks());
+
+                if (out_q8_1)
+                {
+                    // All tensors Q8_1: native Q8_1 throughout
+                    LOG_TRACE("[GQAAttention] Native Q8_1 path: Q/K/V/output all Q8_1");
+                    output_ptr = reinterpret_cast<float *>(out_q8_1->mutable_q8_1_blocks());
+                }
+                else if (out_fp32)
+                {
+                    // Q/K/V are Q8_1 but output is FP32: run Q8_1 kernel to temp, then dequant
+                    LOG_TRACE("[GQAAttention] Q8_1 compute with FP32 output: using temp Q8_1 buffer + dequant");
+                    const auto &out_shape = output->shape();
+                    temp_q8_1_output_buffer = std::make_unique<Q8_1Tensor>(out_shape);
+                    output_ptr = reinterpret_cast<float *>(temp_q8_1_output_buffer->mutable_q8_1_blocks());
+                    out_fp32_for_dequant = out_fp32;
+                }
+                else
+                {
+                    // Unknown output type: fall back to FP32
+                    LOG_WARN("[GQAAttention] Q8_1 inputs but unknown output type: falling back to FP32");
+                    effective_precision = ActivationPrecision::FP32;
+                    Q_ptr = Q->fp32_data(); // Explicit dequantization
+                    K_ptr = K->fp32_data();
+                    V_ptr = V->fp32_data();
+                    output_ptr = output->mutable_data();
+                }
             }
             else
             {
                 // Mixed precision case: Q/K/V might be Q8_1 or FP32 (from KV cache)
-                // Fall back to FP32 path using data() which dequantizes Q8_1 automatically
-                LOG_TRACE("[GQAAttention] Mixed precision detected: using FP32 path with Q8_1 dequantization");
+                // Use fp32_data() for explicit dequantization (also works for FP32 tensors)
+                LOG_TRACE("[GQAAttention] Mixed precision detected: using FP32 path with explicit dequantization");
                 effective_precision = ActivationPrecision::FP32;
-                Q_ptr = Q->data(); // Dequantizes if Q8_1
-                K_ptr = K->data(); // Already FP32 (from cache) or dequantizes
-                V_ptr = V->data();
+                Q_ptr = Q->fp32_data(); // Explicit dequantization if Q8_1
+                K_ptr = K->fp32_data(); // Already FP32 (from cache) or explicitly dequantizes
+                V_ptr = V->fp32_data();
 
                 // Check if output is Q8_1 - if so, need temp buffer and requantization
                 if (out_q8_1)
                 {
                     // Output is Q8_1: create temp FP32 buffer, requantize after kernel
                     const auto &out_shape = output->shape();
-                    temp_output_buffer = std::make_unique<FP32Tensor>(out_shape);
-                    output_ptr = temp_output_buffer->mutable_data();
+                    temp_fp32_output_buffer = std::make_unique<FP32Tensor>(out_shape);
+                    output_ptr = temp_fp32_output_buffer->mutable_data();
                     out_q8_1_for_requant = out_q8_1;
                 }
                 else
@@ -244,10 +303,11 @@ namespace llaminar2
         }
         else
         {
-            // FP32/BF16/FP16 path: Use data() which returns appropriately typed pointer as float*
-            Q_ptr = Q->data();
-            K_ptr = K->data();
-            V_ptr = V->data();
+            // FP32/BF16/FP16 path: Use fp32_data() which returns FP32 pointer
+            // For non-Q8_1 tensors, this is equivalent to data()
+            Q_ptr = Q->fp32_data();
+            K_ptr = K->fp32_data();
+            V_ptr = V->fp32_data();
             output_ptr = output->mutable_data();
         }
 
@@ -305,18 +365,34 @@ namespace llaminar2
             return false;
         }
 
-        // Requantize output to Q8_1 if we used mixed precision fallback
-        if (out_q8_1_for_requant && temp_output_buffer)
+        // Post-compute precision conversions
+
+        // Case 1: FP32 compute with Q8_1 output → requantize
+        if (out_q8_1_for_requant && temp_fp32_output_buffer)
         {
             // Quantize FP32 output to Q8_1
-            const float *fp32_data = temp_output_buffer->data();
+            const float *fp32_data = temp_fp32_output_buffer->data();
             Q8_1Block *out_blocks = out_q8_1_for_requant->mutable_q8_1_blocks();
-            const auto &shape = temp_output_buffer->shape();
+            const auto &shape = temp_fp32_output_buffer->shape();
             size_t n_elements = 1;
             for (size_t d : shape)
                 n_elements *= d;
             simd::quantize_fp32_to_q8_1_blocks(fp32_data, out_blocks, n_elements);
             LOG_TRACE("[GQAAttention] Requantized attention output to Q8_1 (" << n_elements << " elements)");
+        }
+
+        // Case 2: Q8_1 compute with FP32 output → dequantize
+        if (out_fp32_for_dequant && temp_q8_1_output_buffer)
+        {
+            // Dequantize Q8_1 output to FP32
+            const Q8_1Block *q8_blocks = temp_q8_1_output_buffer->q8_1_blocks();
+            float *fp32_data = out_fp32_for_dequant->mutable_data();
+            const auto &shape = temp_q8_1_output_buffer->shape();
+            size_t n_elements = 1;
+            for (size_t d : shape)
+                n_elements *= d;
+            simd::dequantize_q8_1_to_fp32(q8_blocks, fp32_data, n_elements);
+            LOG_TRACE("[GQAAttention] Dequantized Q8_1 attention output to FP32 (" << n_elements << " elements)");
         }
 
         return success;
@@ -361,17 +437,12 @@ namespace llaminar2
             return false;
         }
 
-        auto *activation_output = dynamic_cast<IActivationTensor *>(output);
-        if (!activation_output)
-        {
-            LOG_ERROR("[GQAAttention] compute_batch: output tensor does not implement IActivationTensor");
-            return false;
-        }
-
-        auto attention_kernel = activation_output->createAttention();
+        // Create attention kernel based on config.precision, NOT output tensor type
+        auto attention_kernel = createAttentionKernelForPrecision(config.precision);
         if (!attention_kernel)
         {
-            LOG_ERROR("[GQAAttention] compute_batch: failed to create attention kernel");
+            LOG_ERROR("[GQAAttention] compute_batch: failed to create attention kernel for precision "
+                      << static_cast<int>(config.precision));
             return false;
         }
 
@@ -392,6 +463,10 @@ namespace llaminar2
         const float *V_ptr = nullptr;
         float *output_ptr = nullptr;
 
+        // Temporary buffer for Q8_1 compute with FP32 output
+        std::unique_ptr<Q8_1Tensor> temp_q8_1_output_buffer;
+        FP32Tensor *out_fp32_for_dequant = nullptr;
+
         if (config.precision == ActivationPrecision::Q8_1)
         {
             // Q8_1 path: Pass raw Q8_1 block pointers
@@ -399,23 +474,43 @@ namespace llaminar2
             auto *K_q8_1 = dynamic_cast<Q8_1Tensor *>(K);
             auto *V_q8_1 = dynamic_cast<Q8_1Tensor *>(V);
             auto *out_q8_1 = dynamic_cast<Q8_1Tensor *>(output);
+            auto *out_fp32 = dynamic_cast<FP32Tensor *>(output);
 
-            if (!Q_q8_1 || !K_q8_1 || !V_q8_1 || !out_q8_1)
+            if (!Q_q8_1 || !K_q8_1 || !V_q8_1)
             {
-                LOG_ERROR("[GQAAttention] compute_batch: Q8_1 precision configured but tensors are not Q8_1Tensor");
+                LOG_ERROR("[GQAAttention] compute_batch: Q8_1 precision configured but input tensors are not Q8_1Tensor");
                 return false;
             }
 
             Q_ptr = reinterpret_cast<const float *>(Q_q8_1->q8_1_blocks());
             K_ptr = reinterpret_cast<const float *>(K_q8_1->q8_1_blocks());
             V_ptr = reinterpret_cast<const float *>(V_q8_1->q8_1_blocks());
-            output_ptr = reinterpret_cast<float *>(out_q8_1->mutable_q8_1_blocks());
+
+            if (out_q8_1)
+            {
+                // All tensors Q8_1: native path
+                output_ptr = reinterpret_cast<float *>(out_q8_1->mutable_q8_1_blocks());
+            }
+            else if (out_fp32)
+            {
+                // Q/K/V are Q8_1 but output is FP32: compute to temp Q8_1, then dequant
+                LOG_TRACE("[GQAAttention] compute_batch: Q8_1 compute with FP32 output");
+                const auto &out_shape = output->shape();
+                temp_q8_1_output_buffer = std::make_unique<Q8_1Tensor>(out_shape);
+                output_ptr = reinterpret_cast<float *>(temp_q8_1_output_buffer->mutable_q8_1_blocks());
+                out_fp32_for_dequant = out_fp32;
+            }
+            else
+            {
+                LOG_ERROR("[GQAAttention] compute_batch: Q8_1 precision but unknown output type");
+                return false;
+            }
         }
         else
         {
-            Q_ptr = Q->data();
-            K_ptr = K->data();
-            V_ptr = V->data();
+            Q_ptr = Q->fp32_data(); // Use explicit dequantization for non-Q8_1 paths
+            K_ptr = K->fp32_data();
+            V_ptr = V->fp32_data();
             output_ptr = output->mutable_data();
         }
 
@@ -442,6 +537,20 @@ namespace llaminar2
         if (!success)
         {
             LOG_ERROR("[GQAAttention] compute_batch: attention kernel invocation failed");
+            return false;
+        }
+
+        // Dequantize Q8_1 temp output to FP32 if needed
+        if (out_fp32_for_dequant && temp_q8_1_output_buffer)
+        {
+            const Q8_1Block *q8_blocks = temp_q8_1_output_buffer->q8_1_blocks();
+            float *fp32_data = out_fp32_for_dequant->mutable_data();
+            const auto &shape = temp_q8_1_output_buffer->shape();
+            size_t n_elements = 1;
+            for (size_t d : shape)
+                n_elements *= d;
+            simd::dequantize_q8_1_to_fp32(q8_blocks, fp32_data, n_elements);
+            LOG_TRACE("[GQAAttention] compute_batch: Dequantized Q8_1 output to FP32 (" << n_elements << " elements)");
         }
 
         return success;

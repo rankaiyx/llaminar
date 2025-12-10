@@ -226,7 +226,8 @@ protected:
 TEST_F(Test__Q8_1_vs_FP32_Parity, PrefillParity)
 {
     // Test prompt tokens (Qwen 2.5 tokenization of "Hello, world!")
-    std::vector<int> prompt_tokens = {9906, 11, 1879, 0}; // "Hello, world!"
+    // 9707="Hello", 11=",", 1879=" world", 0="!"
+    std::vector<int> prompt_tokens = {9707, 11, 1879, 0}; // "Hello, world!"
 
     const size_t vocab_size = model_ctx_->model().vocab_size;
 
@@ -332,6 +333,18 @@ TEST_F(Test__Q8_1_vs_FP32_Parity, PrefillParity)
         // Get top-5 predictions
         auto top5_fp32 = getTopK(last_logits_fp32, vocab_size, 5);
         auto top5_q8_1 = getTopK(last_logits_q8_1, vocab_size, 5);
+
+        // Debug: Print top-5 with scores
+        LOG_INFO("[FP32 Top-5] tokens=[" << top5_fp32[0] << "," << top5_fp32[1] << "," << top5_fp32[2]
+                                         << "," << top5_fp32[3] << "," << top5_fp32[4] << "] "
+                                         << "scores=[" << last_logits_fp32[top5_fp32[0]] << "," << last_logits_fp32[top5_fp32[1]]
+                                         << "," << last_logits_fp32[top5_fp32[2]] << "," << last_logits_fp32[top5_fp32[3]]
+                                         << "," << last_logits_fp32[top5_fp32[4]] << "]");
+        LOG_INFO("[Q8_1 Top-5] tokens=[" << top5_q8_1[0] << "," << top5_q8_1[1] << "," << top5_q8_1[2]
+                                         << "," << top5_q8_1[3] << "," << top5_q8_1[4] << "] "
+                                         << "scores=[" << last_logits_q8_1[top5_q8_1[0]] << "," << last_logits_q8_1[top5_q8_1[1]]
+                                         << "," << last_logits_q8_1[top5_q8_1[2]] << "," << last_logits_q8_1[top5_q8_1[3]]
+                                         << "," << last_logits_q8_1[top5_q8_1[4]] << "]");
 
         // Compute overlap
         double overlap = computeTopKOverlap(top5_fp32, top5_q8_1);
@@ -694,6 +707,231 @@ TEST_F(Test__Q8_1_vs_FP32_Parity, GreedySamplingEquivalence)
 
     mpi_ctx_->barrier();
 }
+
+/**
+ * @brief Compute cosine similarity between two vectors
+ */
+static double computeCosineSimilarity(const float *a, const float *b, size_t n)
+{
+    double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+        norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+    }
+    if (norm_a < 1e-12 || norm_b < 1e-12)
+        return 0.0;
+    return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
+}
+
+/**
+ * @brief Compute max absolute difference between two vectors
+ */
+static float computeMaxAbsDiff(const float *a, const float *b, size_t n)
+{
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < n; ++i)
+    {
+        max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
+    }
+    return max_diff;
+}
+
+/**
+ * @brief Compute mean absolute difference between two vectors
+ */
+static float computeMeanAbsDiff(const float *a, const float *b, size_t n)
+{
+    double sum = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        sum += std::abs(a[i] - b[i]);
+    }
+    return static_cast<float>(sum / n);
+}
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+/**
+ * @test LayerByLayerSnapshotComparison
+ * @brief Identifies WHERE Q8_1 diverges from FP32 using intermediate snapshots
+ *
+ * Enables snapshot capture on both pipelines, runs the same input,
+ * and compares intermediate activations at each stage to pinpoint
+ * where the divergence first exceeds tolerance.
+ *
+ * This is a diagnostic test to help understand the source of numerical drift.
+ */
+TEST_F(Test__Q8_1_vs_FP32_Parity, LayerByLayerSnapshotComparison)
+{
+    // Test prompt tokens (short for fast testing)
+    std::vector<int> prompt_tokens = {9906, 11, 1879}; // "Hello, world"
+
+    // ======== FP32 Pipeline with Snapshots ========
+    PipelineConfig config_fp32;
+    config_fp32.activation_precision = ActivationPrecision::FP32;
+    config_fp32.max_seq_len = 512;
+
+    auto pipeline_fp32 = std::make_unique<Qwen2Pipeline>(
+        model_ctx_, mpi_ctx_, -1, nullptr, config_fp32, /*batch_size=*/1);
+
+    // Enable snapshot capture
+    pipeline_fp32->enableSnapshotCapture();
+
+    bool success_fp32 = pipeline_fp32->forward(prompt_tokens.data(), prompt_tokens.size());
+
+    int local_ok = success_fp32 ? 1 : 0;
+    int global_ok;
+    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_ok, 1) << "FP32 prefill failed";
+
+    // ======== Q8_1 Pipeline with Snapshots ========
+    PipelineConfig config_q8_1;
+    config_q8_1.activation_precision = ActivationPrecision::Q8_1;
+    config_q8_1.max_seq_len = 512;
+
+    std::unique_ptr<Qwen2Pipeline> pipeline_q8_1;
+    try
+    {
+        pipeline_q8_1 = std::make_unique<Qwen2Pipeline>(
+            model_ctx_, mpi_ctx_, -1, nullptr, config_q8_1, /*batch_size=*/1);
+
+        // Enable snapshot capture
+        pipeline_q8_1->enableSnapshotCapture();
+
+        bool success_q8_1 = pipeline_q8_1->forward(prompt_tokens.data(), prompt_tokens.size());
+        local_ok = success_q8_1 ? 1 : 0;
+    }
+    catch (const std::exception &e)
+    {
+        if (rank_ == 0)
+        {
+            LOG_WARN("[LayerByLayer] Q8_1 path threw exception: " << e.what());
+        }
+        GTEST_SKIP() << "Q8_1 activation precision not yet implemented: " << e.what();
+    }
+
+    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (global_ok != 1)
+    {
+        GTEST_SKIP() << "Q8_1 prefill failed on some rank";
+    }
+
+    // ======== Compare Snapshots (Rank 0 only) ========
+    if (rank_ == 0)
+    {
+        auto keys_fp32 = pipeline_fp32->getSnapshotKeys();
+        auto keys_q8_1 = pipeline_q8_1->getSnapshotKeys();
+
+        LOG_INFO("\n========================================");
+        LOG_INFO("    Q8_1 vs FP32 Layer-by-Layer Comparison");
+        LOG_INFO("========================================");
+        LOG_INFO("FP32 snapshot count: " << keys_fp32.size());
+        LOG_INFO("Q8_1 snapshot count: " << keys_q8_1.size());
+        LOG_INFO("");
+
+        // Find the first stage where divergence exceeds threshold
+        bool found_first_divergence = false;
+        std::string first_divergence_stage;
+        double first_divergence_cosine = 1.0;
+
+        // Tolerance thresholds
+        constexpr double COSINE_WARN_THRESHOLD = 0.999; // Log warning if below this
+        constexpr double COSINE_ERROR_THRESHOLD = 0.99; // Consider diverged if below this
+
+        // Print header
+        LOG_INFO(std::setw(45) << std::left << "Stage"
+                               << std::setw(12) << "Cosine Sim"
+                               << std::setw(12) << "Max Diff"
+                               << std::setw(12) << "Mean Diff"
+                               << "Status");
+        LOG_INFO(std::string(85, '-'));
+
+        // Iterate through FP32 keys and find matching Q8_1 keys
+        for (const auto &key : keys_fp32)
+        {
+            // Check if Q8_1 has this key
+            bool has_key = std::find(keys_q8_1.begin(), keys_q8_1.end(), key) != keys_q8_1.end();
+            if (!has_key)
+            {
+                LOG_DEBUG("[LayerByLayer] Key '" << key << "' not found in Q8_1 snapshots (may be skipped)");
+                continue;
+            }
+
+            // Get snapshot data
+            size_t size_fp32 = 0, size_q8_1 = 0;
+            const float *data_fp32 = pipeline_fp32->getSnapshot(key, size_fp32);
+            const float *data_q8_1 = pipeline_q8_1->getSnapshot(key, size_q8_1);
+
+            if (!data_fp32 || !data_q8_1)
+            {
+                LOG_WARN("[LayerByLayer] Null snapshot data for key: " << key);
+                continue;
+            }
+
+            if (size_fp32 != size_q8_1)
+            {
+                LOG_WARN("[LayerByLayer] Size mismatch for key '" << key
+                                                                  << "': FP32=" << size_fp32 << ", Q8_1=" << size_q8_1);
+                continue;
+            }
+
+            // Compute metrics
+            double cosine = computeCosineSimilarity(data_fp32, data_q8_1, size_fp32);
+            float max_diff = computeMaxAbsDiff(data_fp32, data_q8_1, size_fp32);
+            float mean_diff = computeMeanAbsDiff(data_fp32, data_q8_1, size_fp32);
+
+            // Determine status
+            std::string status;
+            if (cosine >= COSINE_WARN_THRESHOLD)
+            {
+                status = "OK";
+            }
+            else if (cosine >= COSINE_ERROR_THRESHOLD)
+            {
+                status = "WARN";
+            }
+            else
+            {
+                status = "**DIVERGED**";
+                if (!found_first_divergence)
+                {
+                    found_first_divergence = true;
+                    first_divergence_stage = key;
+                    first_divergence_cosine = cosine;
+                }
+            }
+
+            // Print row
+            LOG_INFO(std::setw(45) << std::left << key
+                                   << std::setw(12) << std::fixed << std::setprecision(6) << cosine
+                                   << std::setw(12) << std::scientific << std::setprecision(2) << max_diff
+                                   << std::setw(12) << mean_diff
+                                   << status);
+        }
+
+        LOG_INFO(std::string(85, '-'));
+        LOG_INFO("");
+
+        if (found_first_divergence)
+        {
+            LOG_ERROR("FIRST DIVERGENCE at stage: " << first_divergence_stage);
+            LOG_ERROR("Cosine similarity: " << first_divergence_cosine);
+            LOG_INFO("");
+            LOG_INFO("This indicates the first point where Q8_1 activations significantly");
+            LOG_INFO("diverge from FP32. Investigate the kernel producing this output.");
+        }
+        else
+        {
+            LOG_INFO("All stages within tolerance - no significant divergence detected.");
+        }
+
+        LOG_INFO("\n========================================\n");
+    }
+
+    mpi_ctx_->barrier();
+}
+#endif // ENABLE_PIPELINE_SNAPSHOTS
 
 // Main function for MPI initialization
 int main(int argc, char **argv)

@@ -584,9 +584,12 @@ namespace llaminar2
                 jz("no_mask", T_NEAR);
                 {
                     // mask_val = mask[m * mask_stride + n]
+                    // NOTE: reg_n is aliased to rax, which we need as scratch here.
+                    // reg_n was saved to [rsp + reg_n_offset_] earlier, so load it into reg_tmp.
+                    mov(reg_tmp, ptr[rsp + reg_n_offset_]); // reg_tmp = n (from stack)
                     mov(rax, reg_m);
                     imul(rax, reg_mask_stride);
-                    add(rax, reg_n);
+                    add(rax, reg_tmp); // rax = m * mask_stride + n
                     vaddss(xmm_score_acc, xmm_score_acc, ptr[reg_mask + rax * 4]);
                 }
                 L("no_mask");

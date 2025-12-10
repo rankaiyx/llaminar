@@ -24,6 +24,9 @@
 
 using namespace llaminar2;
 
+// Type alias for backward compatibility in tests
+using CPUSwiGLUKernel = CPUSwiGLUKernelT<ActivationPrecision::FP32>;
+
 /**
  * @brief SwiGLU parity test fixture
  *
@@ -101,10 +104,10 @@ TEST_F(SwiGLUParityTest, KernelMatchesReference)
 
     // Run kernel
     CPUSwiGLUKernel kernel;
-    bool success = kernel.apply(
+    bool success = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        1, static_cast<int>(gate.size()), // 1 sequence, d_ff elements
-        false, nullptr, -1);
+        static_cast<int>(gate.size()), // size
+        -1);
 
     ASSERT_TRUE(success) << "SwiGLU kernel execution failed";
 
@@ -182,10 +185,10 @@ TEST_F(SwiGLUParityTest, RealisticNeuralNetworkValues)
 
     // Run kernel
     CPUSwiGLUKernel kernel;
-    bool success = kernel.apply(
+    bool success = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        4, 8, // seq_len=4, d_ff=8
-        false, nullptr, -1);
+        static_cast<int>(gate.size()), // size (seq_len * d_ff = 4 * 8 = 32)
+        -1);
 
     ASSERT_TRUE(success) << "SwiGLU kernel execution failed";
 
@@ -216,10 +219,10 @@ TEST_F(SwiGLUParityTest, EdgeCases)
 
     // Run kernel
     CPUSwiGLUKernel kernel;
-    bool success = kernel.apply(
+    bool success = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        1, static_cast<int>(gate.size()),
-        false, nullptr, -1);
+        static_cast<int>(gate.size()), // size
+        -1);
 
     ASSERT_TRUE(success) << "SwiGLU kernel execution failed";
 
@@ -259,10 +262,10 @@ TEST_F(SwiGLUParityTest, LargeBatch)
 
     // Run kernel
     CPUSwiGLUKernel kernel;
-    bool success = kernel.apply(
+    bool success = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        seq_len, d_ff,
-        false, nullptr, -1);
+        total, // size
+        -1);
 
     ASSERT_TRUE(success) << "SwiGLU kernel execution failed";
 

@@ -1563,10 +1563,10 @@ namespace llaminar2
                 const void *q8_1_activations,
                 void *C_q8_1,
                 int m, int n, int k,
-                const float *bias,
-                bool accumulate,
-                const MPIContext *mpi_ctx,
-                int device_idx)
+                const float *bias = nullptr,
+                bool accumulate = false,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
             {
                 (void)device_idx;
                 (void)accumulate; // Q8_1 output doesn't support accumulate (would need dequant+add+requant)
@@ -1698,15 +1698,51 @@ namespace llaminar2
 
                                 // Q8_1 output parameters
                                 params.output_format = GemmOutputFormat::Q8_1;
-                                // Output block pointer: row i, starting at n_blk/32 blocks
-                                params.C_q8_1 = reinterpret_cast<uint8_t *>(
-                                    output_blocks + i * output_blocks_per_row + (n_blk / 32));
-                                params.C_q8_1_stride = output_stride;
+
+                                // Handle tail case: N < 64 or remaining columns < 64
+                                // JIT kernel always writes 64 columns (2 Q8_1 blocks per row)
+                                // Use temp buffer if we don't have space for full 64 columns
+                                bool is_tail = (n_blk + 64 > n);
+                                Q8_1Block temp_blocks[4]; // 2 blocks per row * 2 rows max
+
+                                if (is_tail)
+                                {
+                                    // Write to temporary buffer, then copy valid blocks
+                                    params.C_q8_1 = reinterpret_cast<uint8_t *>(temp_blocks);
+                                    params.C_q8_1_stride = 2 * sizeof(Q8_1Block); // Always 2 blocks per row in temp
+                                }
+                                else
+                                {
+                                    // Direct write: output block pointer at row i, starting at n_blk/32 blocks
+                                    params.C_q8_1 = reinterpret_cast<uint8_t *>(
+                                        output_blocks + i * output_blocks_per_row + (n_blk / 32));
+                                    params.C_q8_1_stride = output_stride;
+                                }
 
                                 if (rows_to_process == 2)
                                     kernel_m2(&params);
                                 else
                                     kernel(&params);
+
+                                // Copy valid blocks from temp buffer for tail case
+                                if (is_tail)
+                                {
+                                    int valid_cols = n - n_blk;
+                                    int valid_blocks = (valid_cols + 31) / 32; // 1 or 2 blocks
+                                    int start_block = n_blk / 32;
+
+                                    for (int r = 0; r < rows_to_process; ++r)
+                                    {
+                                        for (int b = 0; b < valid_blocks; ++b)
+                                        {
+                                            if (start_block + b < output_blocks_per_row)
+                                            {
+                                                output_blocks[(i + r) * output_blocks_per_row + start_block + b] =
+                                                    temp_blocks[r * 2 + b];
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1754,18 +1790,23 @@ namespace llaminar2
             }
 
             /**
-             * @brief Tensor-based GEMM with type-aware quantization
+             * @brief Tensor-based GEMM with full type-aware dispatch
              *
-             * Optimized paths:
+             * Handles all input/output tensor type combinations:
+             *
+             * **Input (A) dispatch**:
              * - Q8_1Tensor: Zero-copy, uses pre-quantized blocks directly
-             * - IActivationTensor (FP32, BF16, FP16, INT8): Uses tensor's quantize_to_q8_1()
-             *   for type-specific quantization (e.g., BF16→FP32→Q8_1, INT8 transcoding)
-             * - Other tensors: Fallback to FP32 path with inline quantization
+             * - IActivationTensor (FP32, BF16, FP16): Uses tensor's quantize_to_q8_1()
+             * - Other tensors: Fallback to FP32 path via data()
+             *
+             * **Output (C) dispatch**:
+             * - Q8_1Tensor: Output directly to Q8_1 blocks (avoids dequant→requant)
+             * - FP32/BF16/FP16: Output to FP32 via mutable_data()
              *
              * @param A Input activations tensor [m, k]
-             * @param C Output tensor [m, n] (must be FP32 for now)
+             * @param C Output tensor [m, n] (Q8_1, FP32, BF16, or FP16)
              * @param transpose_B Whether B is transposed (ignored, weights pre-packed)
-             * @param alpha Scale factor (must be 1.0 for now)
+             * @param alpha Scale factor for result
              * @param beta Accumulate factor (0.0 = overwrite, 1.0 = add)
              * @param mpi_ctx MPI context
              * @param device_idx Device index
@@ -1787,21 +1828,57 @@ namespace llaminar2
                 int k = static_cast<int>(a_shape.size() > 1 ? a_shape[1] : 1);
                 int n = static_cast<int>(c_shape.size() > 1 ? c_shape[1] : c_shape[0]);
 
-                // Fast path 1: Q8_1 activation (zero-copy, already quantized)
-                if (A->native_type() == TensorType::Q8_1)
+                // Determine input/output types
+                const TensorType a_type = A->native_type();
+                const TensorType c_type = C->native_type();
+
+                // =====================================================================
+                // Q8_1 output paths (avoid dequant→requant roundtrip)
+                // =====================================================================
+                if (c_type == TensorType::Q8_1)
                 {
+                    auto *C_q8 = static_cast<Q8_1Tensor *>(C);
+
+                    if (a_type == TensorType::Q8_1)
+                    {
+                        // Q8_1 → Q8_1: Optimal path, both quantized
+                        auto *A_q8 = static_cast<const Q8_1Tensor *>(A);
+                        return multiply_with_precomputed_q8_1_to_q8_1(
+                            A_q8->q8_1_blocks(),
+                            C_q8->mutable_q8_1_blocks(),
+                            m, n, k,
+                            nullptr, // bias
+                            false,   // accumulate (not supported for Q8_1 output)
+                            mpi_ctx, device_idx);
+                    }
+                    else
+                    {
+                        // FP32/BF16/FP16 → Q8_1: Quantize input on-the-fly, output to Q8_1
+                        return multiply_to_q8_1(
+                            A->data(), // Dequant to FP32 if needed
+                            C_q8->mutable_q8_1_blocks(),
+                            m, n, k,
+                            mpi_ctx, device_idx);
+                    }
+                }
+
+                // =====================================================================
+                // FP32 output paths
+                // =====================================================================
+                if (a_type == TensorType::Q8_1)
+                {
+                    // Q8_1 → FP32: Use pre-quantized blocks, output FP32
                     return multiply_q8_1_direct(
                         static_cast<const Q8_1Tensor *>(A),
                         C->mutable_data(), m, n, k,
                         beta != 0.0f, alpha, beta, mpi_ctx, device_idx);
                 }
 
-                // Fast path 2: Any IActivationTensor (FP32, BF16, FP16, INT8)
-                // Use tensor's own quantize_to_q8_1() for type-specific quantization
+                // Any IActivationTensor → FP32: Use tensor's quantize_to_q8_1()
                 const IActivationTensor *activation = dynamic_cast<const IActivationTensor *>(A);
                 if (activation)
                 {
-                    // Allocate Q8_1 buffer
+                    // Allocate Q8_1 buffer for input quantization
                     size_t q8_1_size = IActivationTensor::get_q8_1_buffer_size(m, k);
                     std::vector<uint8_t> q8_1_buffer(q8_1_size + 64); // +64 for alignment
 
@@ -1812,7 +1889,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    // Use pre-quantized path
+                    // Use pre-quantized path → FP32 output
                     return multiply_with_precomputed_q8_1(
                         q8_1_buffer.data(), C->mutable_data(), m, n, k,
                         nullptr, // bias
@@ -1821,7 +1898,113 @@ namespace llaminar2
                         GemmFusedOps::none());
                 }
 
-                // Fallback: FP32 path with inline quantization (for non-activation tensors)
+                // Fallback: FP32 path with inline quantization
+                return multiply(A->data(), C->mutable_data(), m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
+            }
+
+            /**
+             * @brief Tensor-based GEMM with explicit dimensions
+             *
+             * This overload uses caller-provided m, n, k instead of inferring from tensor shapes.
+             * Essential for:
+             * - Pre-allocated buffers (tensor shape > actual data)
+             * - Row-parallel GEMM (local n differs from tensor allocation)
+             * - Processing subset of batched buffers
+             *
+             * @param A Input activations tensor [>=m, >=k]
+             * @param C Output tensor [>=m, >=n]
+             * @param m Number of rows to process
+             * @param n Number of output columns
+             * @param k Number of input columns
+             * @param transpose_B Whether B is transposed (ignored, weights pre-packed)
+             * @param alpha Scale factor
+             * @param beta Accumulate factor
+             * @param mpi_ctx MPI context
+             * @param device_idx Device index
+             *
+             * @return true on success
+             */
+            bool multiply_tensor(
+                const TensorBase *A, TensorBase *C,
+                int m, int n, int k,
+                bool transpose_B = true,
+                float alpha = 1.0f, float beta = 0.0f,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)transpose_B; // Weights are pre-packed
+
+                // Determine input/output types
+                const TensorType a_type = A->native_type();
+                const TensorType c_type = C->native_type();
+
+                // =====================================================================
+                // Q8_1 output paths (avoid dequant→requant roundtrip)
+                // =====================================================================
+                if (c_type == TensorType::Q8_1)
+                {
+                    auto *C_q8 = static_cast<Q8_1Tensor *>(C);
+
+                    if (a_type == TensorType::Q8_1)
+                    {
+                        // Q8_1 → Q8_1: Optimal path, both quantized
+                        auto *A_q8 = static_cast<const Q8_1Tensor *>(A);
+                        return multiply_with_precomputed_q8_1_to_q8_1(
+                            A_q8->q8_1_blocks(),
+                            C_q8->mutable_q8_1_blocks(),
+                            m, n, k,
+                            nullptr, // bias
+                            false,   // accumulate (not supported for Q8_1 output)
+                            mpi_ctx, device_idx);
+                    }
+                    else
+                    {
+                        // FP32/BF16/FP16 → Q8_1: Quantize input on-the-fly, output to Q8_1
+                        return multiply_to_q8_1(
+                            A->data(), // Dequant to FP32 if needed
+                            C_q8->mutable_q8_1_blocks(),
+                            m, n, k,
+                            mpi_ctx, device_idx);
+                    }
+                }
+
+                // =====================================================================
+                // FP32 output paths
+                // =====================================================================
+                if (a_type == TensorType::Q8_1)
+                {
+                    // Q8_1 → FP32: Use pre-quantized blocks, output FP32
+                    return multiply_q8_1_direct(
+                        static_cast<const Q8_1Tensor *>(A),
+                        C->mutable_data(), m, n, k,
+                        beta != 0.0f, alpha, beta, mpi_ctx, device_idx);
+                }
+
+                // Any IActivationTensor → FP32: Use tensor's quantize_to_q8_1()
+                const IActivationTensor *activation = dynamic_cast<const IActivationTensor *>(A);
+                if (activation)
+                {
+                    // Allocate Q8_1 buffer for input quantization
+                    size_t q8_1_size = IActivationTensor::get_q8_1_buffer_size(m, k);
+                    std::vector<uint8_t> q8_1_buffer(q8_1_size + 64); // +64 for alignment
+
+                    // Quantize using tensor's type-specific implementation
+                    if (!activation->quantize_to_q8_1(q8_1_buffer.data(), m, k))
+                    {
+                        LOG_ERROR("quantize_to_q8_1 failed in multiply_tensor (explicit dims)");
+                        return false;
+                    }
+
+                    // Use pre-quantized path → FP32 output
+                    return multiply_with_precomputed_q8_1(
+                        q8_1_buffer.data(), C->mutable_data(), m, n, k,
+                        nullptr, // bias
+                        beta != 0.0f, alpha, beta,
+                        mpi_ctx, device_idx,
+                        GemmFusedOps::none());
+                }
+
+                // Fallback: FP32 path with inline quantization
                 return multiply(A->data(), C->mutable_data(), m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
             }
 

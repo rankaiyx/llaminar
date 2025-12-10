@@ -959,6 +959,98 @@ namespace llaminar2
                 }
             }
 
+            /**
+             * @brief Tensor-based GEMM with explicit dimensions
+             *
+             * This overload uses caller-provided m, n, k instead of inferring from tensor shapes.
+             * Essential for pre-allocated buffers where tensor shape > actual data size.
+             *
+             * @param A Input activations tensor [>=m, >=k]
+             * @param C Output tensor [>=m, >=n]
+             * @param m Number of rows to process
+             * @param n Number of output columns
+             * @param k Number of input columns
+             * @param transpose_B Whether B is transposed (typical: true for weights)
+             * @param alpha Scale factor
+             * @param beta Accumulate factor
+             * @param mpi_ctx MPI context
+             * @param device_idx Device index
+             *
+             * @return true on success
+             */
+            bool multiply_tensor(
+                const TensorBase *A, TensorBase *C,
+                int m, int n, int k,
+                bool transpose_B = true,
+                float alpha = 1.0f, float beta = 0.0f,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)mpi_ctx;
+                (void)device_idx;
+
+                if (!weight_tensor_ || !A || !C)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] Null tensor pointer");
+                    return false;
+                }
+
+                const TensorType act_type = A->native_type();
+
+                // Validate type match
+                if (act_type != weight_type_)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] Activation type (" << static_cast<int>(act_type)
+                                                                            << ") must match weight type (" << static_cast<int>(weight_type_) << ")");
+                    return false;
+                }
+
+                switch (weight_type_)
+                {
+                case TensorType::FP32:
+                {
+                    const float *A_data = A->data();
+                    float *C_data = C->mutable_data();
+                    const float *B_data = weight_tensor_->data();
+                    return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                }
+
+                case TensorType::FP16:
+                {
+                    const auto *A_fp16 = dynamic_cast<const FP16Tensor *>(A);
+                    const auto *B_fp16 = dynamic_cast<const FP16Tensor *>(weight_tensor_);
+                    if (!A_fp16 || !B_fp16)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to FP16Tensor");
+                        return false;
+                    }
+                    const uint16_t *A_data = A_fp16->fp16_data();
+                    const uint16_t *B_data = B_fp16->fp16_data();
+                    float *C_data = C->mutable_data();
+                    return run_onednn_fp16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                }
+
+                case TensorType::BF16:
+                {
+                    const auto *A_bf16 = dynamic_cast<const BF16Tensor *>(A);
+                    const auto *B_bf16 = dynamic_cast<const BF16Tensor *>(weight_tensor_);
+                    if (!A_bf16 || !B_bf16)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to BF16Tensor");
+                        return false;
+                    }
+                    const uint16_t *A_data = A_bf16->bf16_data();
+                    const uint16_t *B_data = B_bf16->bf16_data();
+                    float *C_data = C->mutable_data();
+                    return run_onednn_bf16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                }
+
+                default:
+                    LOG_ERROR("[FloatingPointGemmKernel] Unsupported weight type: " << static_cast<int>(weight_type_));
+                    return false;
+                }
+            }
+
             // ========== Typed Activation Interface ==========
 
             /**
@@ -1086,6 +1178,82 @@ namespace llaminar2
                     return multiply(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
                 }
                 return run_onednn_fp32_matmul(A, B, C, m, n, k, transpose_B, alpha, beta);
+            }
+
+            /**
+             * @brief Tensor-based activation×activation GEMM with type-aware dispatch
+             *
+             * Handles all input tensor type combinations:
+             * - FP32 × FP32: Direct FP32 matmul
+             * - BF16 × BF16: OneDNN bf16bf16f32
+             * - FP16 × FP16: OneDNN fp16fp16f32
+             * - Q8_1 × Q8_1: Dequant to FP32, then FP32 matmul (attention scores always FP32)
+             *
+             * Output is always written to C via mutable_data() (FP32 for attention scores).
+             */
+            bool multiply_activations_tensor(
+                const TensorBase *A, const TensorBase *B, TensorBase *C,
+                bool transpose_B = true,
+                float alpha = 1.0f, float beta = 0.0f,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                const auto &a_shape = A->shape();
+                const auto &b_shape = B->shape();
+                int m = static_cast<int>(a_shape[0]);
+                int k = static_cast<int>(a_shape.size() > 1 ? a_shape[1] : 1);
+                int n = transpose_B ? static_cast<int>(b_shape[0]) : static_cast<int>(b_shape.size() > 1 ? b_shape[1] : 1);
+
+                const TensorType a_type = A->native_type();
+                const TensorType b_type = B->native_type();
+
+                // FP32 path (most common for attention)
+                if (a_type == TensorType::FP32 && b_type == TensorType::FP32)
+                {
+                    return run_onednn_fp32_matmul(
+                        A->data(), B->data(), C->mutable_data(),
+                        m, n, k, transpose_B, alpha, beta);
+                }
+
+                // BF16 path
+                if (a_type == TensorType::BF16 && b_type == TensorType::BF16)
+                {
+                    const auto *A_bf16 = dynamic_cast<const BF16Tensor *>(A);
+                    const auto *B_bf16 = dynamic_cast<const BF16Tensor *>(B);
+                    if (A_bf16 && B_bf16)
+                    {
+                        return run_onednn_bf16_matmul(
+                            A_bf16->bf16_data(), B_bf16->bf16_data(), C->mutable_data(),
+                            m, n, k, transpose_B, alpha, beta);
+                    }
+                }
+
+                // FP16 path
+                if (a_type == TensorType::FP16 && b_type == TensorType::FP16)
+                {
+                    const auto *A_fp16 = dynamic_cast<const FP16Tensor *>(A);
+                    const auto *B_fp16 = dynamic_cast<const FP16Tensor *>(B);
+                    if (A_fp16 && B_fp16)
+                    {
+                        return run_onednn_fp16_matmul(
+                            A_fp16->fp16_data(), B_fp16->fp16_data(), C->mutable_data(),
+                            m, n, k, transpose_B, alpha, beta);
+                    }
+                }
+
+                // Q8_1 path: Use fp32_data() for explicit dequantization
+                // Attention scores are always FP32 (softmax needs FP32 precision)
+                if (a_type == TensorType::Q8_1 && b_type == TensorType::Q8_1)
+                {
+                    return run_onednn_fp32_matmul(
+                        A->fp32_data(), B->fp32_data(), C->mutable_data(),
+                        m, n, k, transpose_B, alpha, beta);
+                }
+
+                // Fallback: Convert to FP32 via data()
+                return run_onednn_fp32_matmul(
+                    A->data(), B->data(), C->mutable_data(),
+                    m, n, k, transpose_B, alpha, beta);
             }
 
             bool multiply_with_softmax(

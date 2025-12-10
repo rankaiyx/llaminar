@@ -57,6 +57,11 @@ namespace llaminar2
     class TensorBase;
     class ITensorGemm;
     class ITensorRoPE;
+    class ITensorSwiGLU;
+    class ITensorSoftmax;
+    class ITensorRMSNorm;
+    class ITensorAttention;
+    class ITensorEmbedding;
     class IQ4_NLTensor;
     class Q4_0Tensor;
     class Q4_1Tensor;
@@ -334,6 +339,146 @@ namespace llaminar
                  * @brief Create RoPE kernel for Q8_1 activation tensor
                  */
                 static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+
+                // ==========================================================================
+                // SwiGLU Kernel Creation - Device-aware dispatch
+                // ==========================================================================
+
+                /**
+                 * @brief Create SwiGLU kernel for FP32 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create SwiGLU kernel for BF16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create SwiGLU kernel for FP16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create SwiGLU kernel for Q8_1 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+
+                // ==========================================================================
+                // Softmax Kernel Creation - Device-aware dispatch
+                // ==========================================================================
+
+                /**
+                 * @brief Create Softmax kernel for FP32 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Softmax kernel for BF16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Softmax kernel for FP16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Softmax kernel for Q8_1 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorSoftmax> createSoftmax(
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+
+                // ==========================================================================
+                // RMSNorm Kernel Creation - Device-aware dispatch
+                // ==========================================================================
+
+                /**
+                 * @brief Create RMSNorm kernel for FP32 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create RMSNorm kernel for BF16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create RMSNorm kernel for FP16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create RMSNorm kernel for Q8_1 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+
+                // ==========================================================================
+                // Attention Kernel Creation - Device-aware dispatch
+                // ==========================================================================
+
+                /**
+                 * @brief Create Attention kernel for FP32 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Attention kernel for BF16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Attention kernel for FP16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Attention kernel for Q8_1 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
+                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
+
+                // ==========================================================================
+                // Embedding Kernel Creation - Device-aware dispatch
+                // ==========================================================================
+
+                /**
+                 * @brief Create Embedding kernel for FP32 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorEmbedding> createEmbedding(
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Embedding kernel for BF16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorEmbedding> createEmbedding(
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Embedding kernel for FP16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorEmbedding> createEmbedding(
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Embedding kernel for Q8_1 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorEmbedding> createEmbedding(
                     const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
 
                 // ==========================================================================

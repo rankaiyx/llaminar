@@ -1,12 +1,12 @@
 /**
- * @file Perf__CPUSwiGLUKernelTyped.cpp
- * @brief Performance benchmark for CPUSwiGLUKernelTyped (typed SwiGLU kernels)
+ * @file Perf__CPUSwiGLUKernelT.cpp
+ * @brief Performance benchmark for CPUSwiGLUKernelT (typed SwiGLU kernels)
  *
  * This test benchmarks the typed SwiGLU kernel performance comparing:
- * 1. CPUSwiGLUKernelTyped<FP32> (baseline)
- * 2. CPUSwiGLUKernelTyped<BF16> (2x memory compression)
- * 3. CPUSwiGLUKernelTyped<FP16> (2x memory compression)
- * 4. CPUSwiGLUKernelTyped<Q8_1> (4x compression, integer-aware SwiGLU)
+ * 1. CPUSwiGLUKernelT<FP32> (baseline)
+ * 2. CPUSwiGLUKernelT<BF16> (2x memory compression)
+ * 3. CPUSwiGLUKernelT<FP16> (2x memory compression)
+ * 4. CPUSwiGLUKernelT<Q8_1> (4x compression, integer-aware SwiGLU)
  *
  * SwiGLU computational complexity:
  *   - For each element: silu(gate) * up
@@ -41,7 +41,7 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
-#include "kernels/cpu/ops/CPUSwiGLUKernelTyped.h"
+#include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "tensors/SIMDHelpers.h"
 #include "utils/Logger.h"
 
@@ -166,7 +166,7 @@ namespace
 // Test Fixture
 // ============================================================================
 
-class CPUSwiGLUKernelTyped_Perf : public ::testing::Test
+class CPUSwiGLUKernelT_Perf : public ::testing::Test
 {
 protected:
     int rank_ = 0;
@@ -180,7 +180,7 @@ protected:
 
         if (rank_ == 0)
         {
-            std::cout << "\n[Performance Test] CPUSwiGLUKernelTyped Benchmark" << std::endl;
+            std::cout << "\n[Performance Test] CPUSwiGLUKernelT Benchmark" << std::endl;
             std::cout << "[Performance Test] OpenMP threads: " << omp_get_max_threads() << std::endl;
         }
     }
@@ -335,10 +335,10 @@ protected:
         }
 
         // Create kernels
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSwiGLUKernelTyped<ActivationPrecision::BF16> kernel_bf16;
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP16> kernel_fp16;
-        CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSwiGLUKernelT<ActivationPrecision::BF16> kernel_bf16;
+        CPUSwiGLUKernelT<ActivationPrecision::FP16> kernel_fp16;
+        CPUSwiGLUKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         // ================================================================
         // FP32 Benchmark (baseline)
@@ -449,7 +449,7 @@ protected:
 // Benchmark Test Cases
 // ============================================================================
 
-TEST_F(CPUSwiGLUKernelTyped_Perf, SmallFFN_1K)
+TEST_F(CPUSwiGLUKernelT_Perf, SmallFFN_1K)
 {
     run_benchmark({
         .size = 1024,
@@ -459,7 +459,7 @@ TEST_F(CPUSwiGLUKernelTyped_Perf, SmallFFN_1K)
     });
 }
 
-TEST_F(CPUSwiGLUKernelTyped_Perf, MediumFFN_32K)
+TEST_F(CPUSwiGLUKernelT_Perf, MediumFFN_32K)
 {
     run_benchmark({
         .size = 32 * 1024,
@@ -469,7 +469,7 @@ TEST_F(CPUSwiGLUKernelTyped_Perf, MediumFFN_32K)
     });
 }
 
-TEST_F(CPUSwiGLUKernelTyped_Perf, LargeFFN_256K)
+TEST_F(CPUSwiGLUKernelT_Perf, LargeFFN_256K)
 {
     run_benchmark({
         .size = 256 * 1024,
@@ -479,7 +479,7 @@ TEST_F(CPUSwiGLUKernelTyped_Perf, LargeFFN_256K)
     });
 }
 
-TEST_F(CPUSwiGLUKernelTyped_Perf, VeryLargeFFN_1M)
+TEST_F(CPUSwiGLUKernelT_Perf, VeryLargeFFN_1M)
 {
     run_benchmark({
         .size = 1024 * 1024,
@@ -489,7 +489,7 @@ TEST_F(CPUSwiGLUKernelTyped_Perf, VeryLargeFFN_1M)
     });
 }
 
-TEST_F(CPUSwiGLUKernelTyped_Perf, Qwen05B_FFN)
+TEST_F(CPUSwiGLUKernelT_Perf, Qwen05B_FFN)
 {
     // Qwen 0.5B: d_model=896, d_ff=4864
     // FFN intermediate size: batch * seq_len * d_ff
@@ -502,7 +502,7 @@ TEST_F(CPUSwiGLUKernelTyped_Perf, Qwen05B_FFN)
     });
 }
 
-TEST_F(CPUSwiGLUKernelTyped_Perf, Qwen7B_FFN)
+TEST_F(CPUSwiGLUKernelT_Perf, Qwen7B_FFN)
 {
     // Qwen 7B: d_model=4096, d_ff=11008
     // For seq_len=128: 128 * 11008 = 1,409,024
@@ -514,7 +514,7 @@ TEST_F(CPUSwiGLUKernelTyped_Perf, Qwen7B_FFN)
     });
 }
 
-TEST_F(CPUSwiGLUKernelTyped_Perf, BatchDecoding_SmallBatch)
+TEST_F(CPUSwiGLUKernelT_Perf, BatchDecoding_SmallBatch)
 {
     // Small batch decode: 8 sequences × d_ff
     // d_ff = 4864 (Qwen 0.5B)
@@ -526,7 +526,7 @@ TEST_F(CPUSwiGLUKernelTyped_Perf, BatchDecoding_SmallBatch)
     });
 }
 
-TEST_F(CPUSwiGLUKernelTyped_Perf, BatchDecoding_LargeBatch)
+TEST_F(CPUSwiGLUKernelT_Perf, BatchDecoding_LargeBatch)
 {
     // Large batch decode: 64 sequences × d_ff
     run_benchmark({

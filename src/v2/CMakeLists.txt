@@ -535,13 +535,11 @@ add_library(llaminar2_core STATIC
     # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm_v4 (OneDNN) remains
     # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,
     # BF16PackedGemm, FP16PackedGemm, Q8_1GemmKernelInit, VNNIGemmKernelInit
-    kernels/cpu/ops/CPURoPEKernelT.cpp
-    kernels/cpu/ops/CPURoPEKernelTyped.cpp     # Typed RoPE with fused precision conversion (FP32/BF16/FP16/Q8_1)
-    kernels/cpu/ops/CPURMSNormTypedKernel.cpp  # Typed RMSNorm with fused precision conversion (replaced CPURMSNormKernelT)
-    kernels/cpu/ops/CPUSoftmaxKernelT.cpp
-    kernels/cpu/ops/CPUSoftmaxKernelTyped.cpp  # Typed Softmax with native precision paths (FP32/BF16/FP16/Q8_1)
-    kernels/cpu/ops/CPUSwiGLUKernelT.cpp
-    kernels/cpu/ops/CPUSwiGLUKernelTyped.cpp   # Typed SwiGLU with native precision paths (FP32/BF16/FP16/Q8_1)
+    kernels/cpu/ops/CPURoPEKernelT.cpp     # Typed RoPE with fused precision conversion (FP32/BF16/FP16/Q8_1)
+    kernels/cpu/ops/CPURMSNormKernelT.cpp  # Typed RMSNorm with fused precision conversion (replaced CPURMSNormKernelT)
+    kernels/cpu/ops/CPUSoftmaxKernelT.cpp  # Typed Softmax with native precision paths (FP32/BF16/FP16/Q8_1)
+    kernels/cpu/ops/CPUSwiGLUKernelT.cpp   # Typed SwiGLU with native precision paths (FP32/BF16/FP16/Q8_1)
+    kernels/cpu/ops/CPUEmbeddingKernelT.cpp    # Typed Embedding lookup with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
     kernels/cpu/attention/CPUAttentionKernelTyped.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
     # Fused kernels (operator fusion framework)

@@ -21,7 +21,7 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
-#include "kernels/cpu/ops/CPURMSNormTypedKernel.h"
+#include "kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "kernels/cpu/primitives/RMSNormPrimitives.h"
 #include "tensors/SIMDHelpers.h"
 

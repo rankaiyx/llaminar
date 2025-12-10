@@ -24,9 +24,6 @@
  * TRY_OP(gemm->execute(hidden, layer.wq.get(), Q_buf, seq_len, n_heads * head_dim, d_model,
  *                      nullptr, device));
  *
- * // Legacy operator() syntax still works for backward compatibility
- * GemmOp legacy_gemm;
- * TRY_OP(legacy_gemm(hidden, layer.wq.get(), Q_buf, seq_len, q_dim, k_dim, nullptr, mpi, device));
  * @endcode
  *
  * @author David Sanftenberg
@@ -191,6 +188,23 @@ namespace llaminar2
         const char *name() const override { return "GemmOpTyped"; }
         ActivationPrecision precision() const override { return Precision; }
 
+        /**
+         * @brief Get the expected TensorType for this precision
+         */
+        static constexpr TensorType expected_tensor_type()
+        {
+            if constexpr (Precision == ActivationPrecision::FP32)
+                return TensorType::FP32;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
+            else
+                return TensorType::FP32;
+        }
+
         bool execute(
             const TensorBase *A,
             TensorBase *W,
@@ -213,7 +227,32 @@ namespace llaminar2
             if (!validateDimensions(m, n, "output C"))
                 return false;
 
-            // 2. Get cached kernel from KernelFactory
+            // 2. Type validation: ensure activation tensor matches expected precision
+            //    Output tensor can be either the expected type OR FP32.
+            //    FP32 output is allowed for:
+            //    - LM head logits (always FP32 for sampling accuracy)
+            //    - Mixed-precision paths where kernel dequantizes on output
+            constexpr TensorType expected = expected_tensor_type();
+            if (A->native_type() != expected)
+            {
+                logError(("activation tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + ", got " +
+                          std::to_string(static_cast<int>(A->native_type())))
+                             .c_str());
+                return false;
+            }
+            // Allow output to be either the expected type or FP32
+            // (kernel handles dequantization when output is FP32)
+            if (C->native_type() != expected && C->native_type() != TensorType::FP32)
+            {
+                logError(("output tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + " or FP32, got " +
+                          std::to_string(static_cast<int>(C->native_type())))
+                             .c_str());
+                return false;
+            }
+
+            // 3. Get cached kernel from KernelFactory
             auto *gemm_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(W);
             if (!gemm_kernel)
             {
@@ -221,90 +260,18 @@ namespace llaminar2
                 return false;
             }
 
-            // 3. Execute based on precision
-            if constexpr (Precision == ActivationPrecision::Q8_1)
+            // 4. Delegate to kernel's multiply_tensor with explicit dimensions
+            //    CRITICAL: Use m,n,k parameters, NOT tensor shapes!
+            //    Tensor shapes may be larger (pre-allocated buffers) than actual data.
+            //    The kernel inspects A->native_type() and C->native_type() to choose optimal path:
+            //    - Q8_1 → Q8_1: Zero-copy quantized path
+            //    - Q8_1 → FP32: Direct Q8_1 input, FP32 output
+            //    - FP32 → Q8_1: Quantize output on-the-fly
+            //    - FP32 → FP32: Standard path
+            if (!gemm_kernel->multiply_tensor(A, C, m, n, k, true, alpha, beta, mpi_ctx, device_idx))
             {
-                // Q8_1 path: Use native Q8_1 activation inputs, output to Q8_1
-                auto *A_q8 = dynamic_cast<const Q8_1Tensor *>(A);
-                auto *C_q8 = dynamic_cast<Q8_1Tensor *>(C);
-
-                if (A_q8 && C_q8)
-                {
-                    // Both A and C are Q8_1: use native Q8_1 output
-                    if (!gemm_kernel->multiply_to_q8_1(
-                            A->data(), // Dequantized FP32 for computation
-                            C_q8->mutable_q8_1_blocks(),
-                            m, n, k,
-                            mpi_ctx, device_idx))
-                    {
-                        logError("Q8_1 GEMM kernel execution failed");
-                        return false;
-                    }
-                }
-                else if (C_q8)
-                {
-                    // A is FP32 (e.g., from attention), C is Q8_1: use FP32 input, Q8_1 output
-                    if (!gemm_kernel->multiply_to_q8_1(
-                            A->data(), // Already FP32
-                            C_q8->mutable_q8_1_blocks(),
-                            m, n, k,
-                            mpi_ctx, device_idx))
-                    {
-                        logError("Q8_1 GEMM kernel (FP32->Q8_1) execution failed");
-                        return false;
-                    }
-                }
-                else if (A_q8)
-                {
-                    // A is Q8_1, C is FP32: dequantize A, output FP32
-                    if (!gemm_kernel->multiply_activations(
-                            A->data(), // Dequantized FP32 for computation
-                            nullptr,   // B is packed in kernel
-                            C->mutable_data(),
-                            m, n, k,
-                            true, // transpose_B
-                            alpha, beta,
-                            mpi_ctx,
-                            device_idx))
-                    {
-                        logError("GEMM kernel (Q8_1->FP32) execution failed");
-                        return false;
-                    }
-                }
-                else
-                {
-                    // Both A and C are FP32: standard FP32 path (shouldn't happen in Q8_1 mode, but handle gracefully)
-                    if (!gemm_kernel->multiply_activations(
-                            A->data(),
-                            nullptr, // B is packed in kernel
-                            C->mutable_data(),
-                            m, n, k,
-                            true, // transpose_B
-                            alpha, beta,
-                            mpi_ctx,
-                            device_idx))
-                    {
-                        logError("FP32 GEMM kernel execution failed");
-                        return false;
-                    }
-                }
-            }
-            else
-            {
-                // FP32/BF16/FP16 path: Standard GEMM with type conversion via data()
-                if (!gemm_kernel->multiply_activations(
-                        A->data(),
-                        nullptr, // B is packed in kernel
-                        C->mutable_data(),
-                        m, n, k,
-                        true, // transpose_B
-                        alpha, beta,
-                        mpi_ctx,
-                        device_idx))
-                {
-                    logError("GEMM kernel execution failed");
-                    return false;
-                }
+                logError("GEMM kernel multiply_tensor failed");
+                return false;
             }
 
             return true;
@@ -331,7 +298,27 @@ namespace llaminar2
             if (!validateDimensions(m, k, "input A"))
                 return false;
 
-            // 2. Create kernel from A
+            // 2. Type validation: ensure A and B match expected precision
+            //    Note: C is typically FP32 for attention scores regardless of activation precision
+            constexpr TensorType expected = expected_tensor_type();
+            if (A->native_type() != expected)
+            {
+                logError(("activation A tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + ", got " +
+                          std::to_string(static_cast<int>(A->native_type())))
+                             .c_str());
+                return false;
+            }
+            if (B->native_type() != expected)
+            {
+                logError(("activation B tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + ", got " +
+                          std::to_string(static_cast<int>(B->native_type())))
+                             .c_str());
+                return false;
+            }
+
+            // 3. Create kernel from A
             auto gemm_kernel = A->createGemm();
             if (!gemm_kernel)
             {
@@ -339,50 +326,14 @@ namespace llaminar2
                 return false;
             }
 
-            // 3. Execute based on precision
-            if constexpr (Precision == ActivationPrecision::Q8_1)
+            // 4. Delegate to kernel's multiply_activations_tensor - handles all type dispatch
+            //    The kernel inspects A/B/C native_type() to choose optimal path:
+            //    - FP32 × FP32: Direct FP32 matmul
+            //    - BF16 × BF16: OneDNN bf16bf16f32
+            //    - Q8_1 × Q8_1: Dequant to FP32 (attention scores always FP32)
+            if (!gemm_kernel->multiply_activations_tensor(A, B, C, transpose_B, alpha, beta, mpi_ctx, device_idx))
             {
-                // Q8_1 activation × activation path
-                // Use native Q8_1 paths when available
-                auto *A_q8 = dynamic_cast<Q8_1Tensor *>(A);
-                auto *B_q8 = dynamic_cast<Q8_1Tensor *>(B);
-                auto *C_q8 = dynamic_cast<Q8_1Tensor *>(C);
-
-                if (A_q8 && B_q8 && C_q8)
-                {
-                    // Native Q8_1 path available
-                    if (!gemm_kernel->multiply_activations(
-                            A->data(), // Dequant for now (TODO: native Q8_1 × Q8_1)
-                            B->data(),
-                            C->mutable_data(),
-                            m, n, k,
-                            transpose_B,
-                            alpha, beta,
-                            mpi_ctx,
-                            device_idx))
-                    {
-                        logError("Q8_1 activation GEMM execution failed");
-                        return false;
-                    }
-
-                    // Requantize output
-                    C_q8->quantize_from_cache();
-                    return true;
-                }
-            }
-
-            // FP32/BF16/FP16 path: Standard activation GEMM
-            if (!gemm_kernel->multiply_activations(
-                    A->data(),
-                    B->data(),
-                    C->mutable_data(),
-                    m, n, k,
-                    transpose_B,
-                    alpha, beta,
-                    mpi_ctx,
-                    device_idx))
-            {
-                logError("activation GEMM execution failed");
+                logError("activation GEMM kernel multiply_activations_tensor failed");
                 return false;
             }
 
@@ -432,69 +383,6 @@ namespace llaminar2
 
             return true;
         }
-    };
-
-    // =========================================================================
-    // Legacy GemmOp (backward compatibility)
-    // =========================================================================
-
-    /**
-     * @brief Legacy untyped GEMM operation (backward compatibility)
-     *
-     * Delegates to GemmOpTyped<FP32> for runtime type dispatch.
-     * Prefer using createGemmOp() for new code.
-     */
-    class GemmOp : public OpBase
-    {
-    public:
-        const char *name() const override { return "GemmOp"; }
-
-        bool operator()(
-            const TensorBase *A,
-            TensorBase *W,
-            TensorBase *C,
-            int m, int n, int k,
-            const char *snapshot_key = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1,
-            float alpha = 1.0f,
-            float beta = 0.0f)
-        {
-            (void)snapshot_key; // Handled by pipeline
-            return impl_.execute(A, W, C, m, n, k, mpi_ctx, device_idx, alpha, beta);
-        }
-
-        bool activations(
-            TensorBase *A,
-            TensorBase *B,
-            TensorBase *C,
-            int m, int n, int k,
-            bool transpose_B = true,
-            float alpha = 1.0f,
-            float beta = 0.0f,
-            const char *snapshot_key = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            (void)snapshot_key; // Handled by pipeline
-            return impl_.activations(A, B, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
-        }
-
-        bool operator()(
-            const float *A_data,
-            TensorBase *W,
-            float *C_data,
-            int m, int n, int k,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1,
-            float alpha = 1.0f,
-            float beta = 0.0f)
-        {
-            return impl_.execute_raw(A_data, W, C_data, m, n, k, mpi_ctx, device_idx, alpha, beta);
-        }
-
-    private:
-        GemmOpTyped<ActivationPrecision::FP32> impl_;
     };
 
     // =========================================================================

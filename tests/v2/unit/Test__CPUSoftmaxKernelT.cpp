@@ -1,6 +1,6 @@
 /**
- * @file Test__CPUSoftmaxKernelTyped.cpp
- * @brief Unit tests for CPUSoftmaxKernelTyped (FP32/BF16/FP16/Q8_1 specializations)
+ * @file Test__CPUSoftmaxKernelT.cpp
+ * @brief Unit tests for CPUSoftmaxKernelT (FP32/BF16/FP16/Q8_1 specializations)
  * @author David Sanftenberg
  *
  * Tests verify:
@@ -19,7 +19,7 @@
 #include <random>
 #include <algorithm>
 
-#include "kernels/cpu/ops/CPUSoftmaxKernelTyped.h"
+#include "kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "tensors/BlockStructures.h"
 
 namespace llaminar2
@@ -241,9 +241,9 @@ namespace llaminar2
     // FP32 Softmax Tests
     // ============================================================================
 
-    TEST(CPUSoftmaxKernelTyped_FP32, BasicFunctionality)
+    TEST(CPUSoftmaxKernelT_FP32, BasicFunctionality)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
         // Create test data
         std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -262,9 +262,9 @@ namespace llaminar2
         EXPECT_TRUE(is_valid_softmax(data));
     }
 
-    TEST(CPUSoftmaxKernelTyped_FP32, CausalMasking)
+    TEST(CPUSoftmaxKernelT_FP32, CausalMasking)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
         // 4 rows, 4 columns with causal masking
         std::vector<float> data(16);
@@ -286,9 +286,9 @@ namespace llaminar2
         EXPECT_NEAR(data[4] + data[5], 1.0f, 0.01f);
     }
 
-    TEST(CPUSoftmaxKernelTyped_FP32, ScaleFactor)
+    TEST(CPUSoftmaxKernelT_FP32, ScaleFactor)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
         std::vector<float> data1 = {1.0f, 2.0f, 3.0f, 4.0f};
         std::vector<float> data2 = data1;
@@ -308,9 +308,9 @@ namespace llaminar2
         EXPECT_LT(range2, range1);
     }
 
-    TEST(CPUSoftmaxKernelTyped_FP32, MultipleRows)
+    TEST(CPUSoftmaxKernelT_FP32, MultipleRows)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
         const int rows = 8;
         const int cols = 64;
@@ -336,9 +336,9 @@ namespace llaminar2
     // BF16 Softmax Tests
     // ============================================================================
 
-    TEST(CPUSoftmaxKernelTyped_BF16, BasicFunctionality)
+    TEST(CPUSoftmaxKernelT_BF16, BasicFunctionality)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::BF16> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::BF16> kernel;
 
         // Create test data
         std::vector<float> fp32_data = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -361,10 +361,10 @@ namespace llaminar2
         EXPECT_TRUE(is_valid_softmax(result, 0.02f)); // Slightly larger tolerance for BF16
     }
 
-    TEST(CPUSoftmaxKernelTyped_BF16, ConsistencyWithFP32)
+    TEST(CPUSoftmaxKernelT_BF16, ConsistencyWithFP32)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSoftmaxKernelTyped<ActivationPrecision::BF16> kernel_bf16;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSoftmaxKernelT<ActivationPrecision::BF16> kernel_bf16;
 
         // Create same input data
         std::vector<float> fp32_input = {-1.5f, 0.5f, 1.0f, 2.5f, -0.5f, 1.5f, 0.0f, 3.0f};
@@ -394,9 +394,9 @@ namespace llaminar2
     // FP16 Softmax Tests
     // ============================================================================
 
-    TEST(CPUSoftmaxKernelTyped_FP16, BasicFunctionality)
+    TEST(CPUSoftmaxKernelT_FP16, BasicFunctionality)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP16> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP16> kernel;
 
         // Create test data
         std::vector<float> fp32_data = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -419,10 +419,10 @@ namespace llaminar2
         EXPECT_TRUE(is_valid_softmax(result, 0.02f)); // Slightly larger tolerance for FP16
     }
 
-    TEST(CPUSoftmaxKernelTyped_FP16, ConsistencyWithFP32)
+    TEST(CPUSoftmaxKernelT_FP16, ConsistencyWithFP32)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP16> kernel_fp16;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSoftmaxKernelT<ActivationPrecision::FP16> kernel_fp16;
 
         // Create same input data
         std::vector<float> fp32_input = {-1.5f, 0.5f, 1.0f, 2.5f, -0.5f, 1.5f, 0.0f, 3.0f};
@@ -452,9 +452,9 @@ namespace llaminar2
     // Q8_1 Softmax Tests
     // ============================================================================
 
-    TEST(CPUSoftmaxKernelTyped_Q8_1, BasicFunctionality)
+    TEST(CPUSoftmaxKernelT_Q8_1, BasicFunctionality)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel;
 
         // Create test data: 1 row with 2 blocks (64 elements)
         std::vector<float> fp32_data(64);
@@ -490,10 +490,10 @@ namespace llaminar2
         EXPECT_NEAR(sum, 1.0f, 0.1f) << "Probabilities should sum to ~1";
     }
 
-    TEST(CPUSoftmaxKernelTyped_Q8_1, ConsistencyWithFP32)
+    TEST(CPUSoftmaxKernelT_Q8_1, ConsistencyWithFP32)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         // Create test data: 1 row with 2 blocks (64 elements)
         std::vector<float> fp32_data(64);
@@ -532,9 +532,9 @@ namespace llaminar2
         EXPECT_GT(sim, 0.95f) << "Q8_1 result diverges significantly from FP32 reference";
     }
 
-    TEST(CPUSoftmaxKernelTyped_Q8_1, CausalMasking)
+    TEST(CPUSoftmaxKernelT_Q8_1, CausalMasking)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel;
 
         // Create test data: 2 rows with 2 blocks each (64 elements per row)
         const int rows = 2;
@@ -582,9 +582,9 @@ namespace llaminar2
         EXPECT_NEAR(row0_sum, 1.0f, 0.15f) << "Row 0 probabilities should sum to ~1";
     }
 
-    TEST(CPUSoftmaxKernelTyped_Q8_1, MultipleRowsStability)
+    TEST(CPUSoftmaxKernelT_Q8_1, MultipleRowsStability)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel;
 
         // Create larger test: 8 rows, 4 blocks per row (128 elements per row)
         const int rows = 8;
@@ -638,12 +638,12 @@ namespace llaminar2
     // Cross-Precision Consistency Tests
     // ============================================================================
 
-    TEST(CPUSoftmaxKernelTyped_CrossPrecision, AllPrecisionsProduceSimilarResults)
+    TEST(CPUSoftmaxKernelT_CrossPrecision, AllPrecisionsProduceSimilarResults)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSoftmaxKernelTyped<ActivationPrecision::BF16> kernel_bf16;
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP16> kernel_fp16;
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSoftmaxKernelT<ActivationPrecision::BF16> kernel_bf16;
+        CPUSoftmaxKernelT<ActivationPrecision::FP16> kernel_fp16;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         // Create base FP32 data
         std::vector<float> base_data = {-2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f,
@@ -701,10 +701,10 @@ namespace llaminar2
     // Edge Cases
     // ============================================================================
 
-    TEST(CPUSoftmaxKernelTyped_EdgeCases, EmptyInput)
+    TEST(CPUSoftmaxKernelT_EdgeCases, EmptyInput)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         float fp32_data[1] = {0.0f};
         Q8_1Block q8_data[1] = {};
@@ -716,19 +716,19 @@ namespace llaminar2
         EXPECT_TRUE(kernel_q8.apply_typed(q8_data, 1, 0, false, 1.0f));
     }
 
-    TEST(CPUSoftmaxKernelTyped_EdgeCases, NullPointer)
+    TEST(CPUSoftmaxKernelT_EdgeCases, NullPointer)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         // Null pointers should fail
         EXPECT_FALSE(kernel_fp32.apply_typed(nullptr, 1, 4, false, 1.0f));
         EXPECT_FALSE(kernel_q8.apply_typed(nullptr, 1, 2, false, 1.0f));
     }
 
-    TEST(CPUSoftmaxKernelTyped_EdgeCases, SingleElement)
+    TEST(CPUSoftmaxKernelT_EdgeCases, SingleElement)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
         std::vector<float> data = {5.0f};
         ASSERT_TRUE(kernel.apply_typed(data.data(), 1, 1, false, 1.0f));
@@ -737,9 +737,9 @@ namespace llaminar2
         EXPECT_NEAR(data[0], 1.0f, 1e-5f);
     }
 
-    TEST(CPUSoftmaxKernelTyped_EdgeCases, LargeValues)
+    TEST(CPUSoftmaxKernelT_EdgeCases, LargeValues)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
         // Large values that could cause overflow without proper max subtraction
         std::vector<float> data = {100.0f, 101.0f, 102.0f, 103.0f};
@@ -754,9 +754,9 @@ namespace llaminar2
         }
     }
 
-    TEST(CPUSoftmaxKernelTyped_EdgeCases, NegativeValues)
+    TEST(CPUSoftmaxKernelT_EdgeCases, NegativeValues)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
         std::vector<float> data = {-100.0f, -50.0f, -1.0f, 0.0f};
         ASSERT_TRUE(kernel.apply_typed(data.data(), 1, 4, false, 1.0f));
@@ -769,26 +769,26 @@ namespace llaminar2
     // Metadata and Interface Tests
     // ============================================================================
 
-    TEST(CPUSoftmaxKernelTyped_Metadata, PrecisionNames)
+    TEST(CPUSoftmaxKernelT_Metadata, PrecisionNames)
     {
-        EXPECT_STREQ(CPUSoftmaxKernelTyped<ActivationPrecision::FP32>::precision_name(), "FP32");
-        EXPECT_STREQ(CPUSoftmaxKernelTyped<ActivationPrecision::BF16>::precision_name(), "BF16");
-        EXPECT_STREQ(CPUSoftmaxKernelTyped<ActivationPrecision::FP16>::precision_name(), "FP16");
-        EXPECT_STREQ(CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1>::precision_name(), "Q8_1");
+        EXPECT_STREQ(CPUSoftmaxKernelT<ActivationPrecision::FP32>::precision_name(), "FP32");
+        EXPECT_STREQ(CPUSoftmaxKernelT<ActivationPrecision::BF16>::precision_name(), "BF16");
+        EXPECT_STREQ(CPUSoftmaxKernelT<ActivationPrecision::FP16>::precision_name(), "FP16");
+        EXPECT_STREQ(CPUSoftmaxKernelT<ActivationPrecision::Q8_1>::precision_name(), "Q8_1");
     }
 
-    TEST(CPUSoftmaxKernelTyped_Metadata, CompressionRatios)
+    TEST(CPUSoftmaxKernelT_Metadata, CompressionRatios)
     {
-        EXPECT_FLOAT_EQ(CPUSoftmaxKernelTyped<ActivationPrecision::FP32>::compression_ratio(), 1.0f);
-        EXPECT_FLOAT_EQ(CPUSoftmaxKernelTyped<ActivationPrecision::BF16>::compression_ratio(), 2.0f);
-        EXPECT_FLOAT_EQ(CPUSoftmaxKernelTyped<ActivationPrecision::FP16>::compression_ratio(), 2.0f);
-        EXPECT_FLOAT_EQ(CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1>::compression_ratio(), 4.0f);
+        EXPECT_FLOAT_EQ(CPUSoftmaxKernelT<ActivationPrecision::FP32>::compression_ratio(), 1.0f);
+        EXPECT_FLOAT_EQ(CPUSoftmaxKernelT<ActivationPrecision::BF16>::compression_ratio(), 2.0f);
+        EXPECT_FLOAT_EQ(CPUSoftmaxKernelT<ActivationPrecision::FP16>::compression_ratio(), 2.0f);
+        EXPECT_FLOAT_EQ(CPUSoftmaxKernelT<ActivationPrecision::Q8_1>::compression_ratio(), 4.0f);
     }
 
-    TEST(CPUSoftmaxKernelTyped_Metadata, DeviceSupport)
+    TEST(CPUSoftmaxKernelT_Metadata, DeviceSupport)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         // CPU only (device -1)
         EXPECT_TRUE(kernel_fp32.supports_device(-1));

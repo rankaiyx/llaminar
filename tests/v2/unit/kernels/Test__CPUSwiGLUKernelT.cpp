@@ -1,6 +1,8 @@
 /**
  * @file Test__CPUSwiGLUKernelT.cpp
  * @brief Unit tests for CPUSwiGLUKernelT class
+ *
+ * Migrated from old CPUSwiGLUKernelT tests to use the new typed kernel API.
  */
 
 #include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
@@ -32,7 +34,7 @@ protected:
 
 TEST_F(CPUSwiGLUKernelTest, FP32_Apply_Basic)
 {
-    CPUSwiGLUKernelT<FP32Tensor> kernel;
+    CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
     int rows = 1;
     int cols = 10;
     int size = rows * cols;
@@ -41,12 +43,10 @@ TEST_F(CPUSwiGLUKernelTest, FP32_Apply_Basic)
     std::vector<float> up(size, 2.0f);
     std::vector<float> output(size);
 
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        rows, cols,
-        false,   // add_residual
-        nullptr, // mpi_ctx
-        -1       // device_idx
+        size,
+        -1 // device_idx
     );
 
     EXPECT_TRUE(result);
@@ -60,7 +60,7 @@ TEST_F(CPUSwiGLUKernelTest, FP32_Apply_Basic)
 
 TEST_F(CPUSwiGLUKernelTest, BF16_Apply_Basic)
 {
-    CPUSwiGLUKernelT<BF16Tensor> kernel;
+    CPUSwiGLUKernelT<ActivationPrecision::BF16> kernel;
     int rows = 1;
     int cols = 10;
     int size = rows * cols;
@@ -75,11 +75,9 @@ TEST_F(CPUSwiGLUKernelTest, BF16_Apply_Basic)
         up[i] = simd::fp32_to_bf16(2.0f);
     }
 
-    bool result = kernel.apply_bf16(
+    bool result = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        rows, cols,
-        false,
-        nullptr,
+        size,
         -1);
 
     EXPECT_TRUE(result);
@@ -96,7 +94,7 @@ TEST_F(CPUSwiGLUKernelTest, BF16_Apply_Basic)
 
 TEST_F(CPUSwiGLUKernelTest, FP16_Apply_Basic)
 {
-    CPUSwiGLUKernelT<FP16Tensor> kernel;
+    CPUSwiGLUKernelT<ActivationPrecision::FP16> kernel;
     int rows = 1;
     int cols = 10;
     int size = rows * cols;
@@ -111,11 +109,9 @@ TEST_F(CPUSwiGLUKernelTest, FP16_Apply_Basic)
         up[i] = simd::fp32_to_fp16(2.0f);
     }
 
-    bool result = kernel.apply_fp16(
+    bool result = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        rows, cols,
-        false,
-        nullptr,
+        size,
         -1);
 
     EXPECT_TRUE(result);
@@ -132,7 +128,7 @@ TEST_F(CPUSwiGLUKernelTest, FP16_Apply_Basic)
 
 TEST_F(CPUSwiGLUKernelTest, Q8_1_Apply_Basic)
 {
-    CPUSwiGLUKernelT<Q8_1Tensor> kernel;
+    CPUSwiGLUKernelT<ActivationPrecision::Q8_1> kernel;
     int rows = 1;
     int cols = 32; // Must be multiple of 32
     int size = rows * cols;
@@ -158,11 +154,9 @@ TEST_F(CPUSwiGLUKernelTest, Q8_1_Apply_Basic)
             b.qs[i] = 2; // Value = 2.0
     }
 
-    bool result = kernel.apply_q8_1(
+    bool result = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        rows, cols,
-        false,
-        nullptr,
+        size,
         -1);
 
     EXPECT_TRUE(result);

@@ -447,11 +447,14 @@ TEST(Test__QuantisedGemmKernel_Q8_1_Output, PrecomputedQ8_1_WithBias)
  * @brief Test Q8_1 scale/sum computation correctness
  *
  * Verifies that the Q8_1 block metadata (scale d, sum sum_qs) is computed correctly.
+ *
+ * NOTE: This test uses N=32 which is less than the JIT kernel's 64-column block size.
+ * This specifically tests the tail handling logic added to multiply_with_precomputed_q8_1_to_q8_1.
  */
 TEST(Test__QuantisedGemmKernel_Q8_1_Output, ScaleAndSumComputation)
 {
     const int M = 1;
-    const int N = 32; // Single Q8_1 block output
+    const int N = 32; // Single Q8_1 block output - tests N<64 tail handling
     const int K = 32;
 
     // Use simple weights: identity-like (first 32 cols of 32x32 identity)
@@ -474,11 +477,30 @@ TEST(Test__QuantisedGemmKernel_Q8_1_Output, ScaleAndSumComputation)
         A[i] = static_cast<float>(i) / K; // Range [0, 1)
     }
 
-    std::vector<Q8_1Block> output_q8(1);
-    std::memset(output_q8.data(), 0, sizeof(Q8_1Block));
+    // Allocate output buffer with guard bytes to detect buffer overflow
+    // JIT kernel processes 64 columns at a time, but N=32 means only 1 block per row
+    // If tail handling is broken, it would overwrite the guard bytes
+    const int output_blocks_per_row = (N + 31) / 32; // = 1 for N=32
+    const uint8_t GUARD_PATTERN = 0xDE;
+    const size_t GUARD_SIZE = 2 * sizeof(Q8_1Block); // Space for 2 extra blocks (what kernel would write without tail handling)
 
-    bool ok = q_kernel->multiply_to_q8_1(A.data(), output_q8.data(), M, N, K, nullptr, -1);
+    std::vector<uint8_t> output_buffer(M * output_blocks_per_row * sizeof(Q8_1Block) + GUARD_SIZE);
+    std::memset(output_buffer.data() + M * output_blocks_per_row * sizeof(Q8_1Block), GUARD_PATTERN, GUARD_SIZE);
+
+    Q8_1Block *output_q8 = reinterpret_cast<Q8_1Block *>(output_buffer.data());
+    std::memset(output_q8, 0, M * output_blocks_per_row * sizeof(Q8_1Block));
+
+    bool ok = q_kernel->multiply_to_q8_1(A.data(), output_q8, M, N, K, nullptr, -1);
     ASSERT_TRUE(ok);
+
+    // Check guard bytes weren't overwritten (would indicate buffer overflow)
+    const uint8_t *guard_ptr = output_buffer.data() + M * output_blocks_per_row * sizeof(Q8_1Block);
+    for (size_t i = 0; i < GUARD_SIZE; ++i)
+    {
+        ASSERT_EQ(guard_ptr[i], GUARD_PATTERN)
+            << "Buffer overflow detected at guard byte " << i
+            << " - JIT kernel wrote beyond allocated buffer (N<64 tail handling broken)";
+    }
 
     // Check that output block has valid scale
     const Q8_1Block &block = output_q8[0];

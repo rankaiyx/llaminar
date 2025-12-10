@@ -298,7 +298,7 @@ add_v2_test(V2_Unit_INT32Tensor
 )
 
 # NOTE: INT32 RMSNorm test (Test__INT32RMSNorm.cpp) removed - was for orphaned INT8 pipeline
-# INT32→INT8 RMSNorm is no longer used; pipeline uses CPURMSNormTypedKernel<Q8_1> instead
+# INT32→INT8 RMSNorm is no longer used; pipeline uses CPURMSNormKernelT<Q8_1> instead
 
 # Test: Q8_1 Pure-Integer RMSNorm (NO floating-point operations)
 add_executable(v2_test_q8_1_pure_integer_rmsnorm unit/Test__Q8_1PureIntegerRMSNorm.cpp)
@@ -621,7 +621,7 @@ add_v2_test(V2_Unit_RMSNormINT32
     MPI_PROCS 1  # RMSNorm primitives are CPU-only, single rank
 )
 
-# NOTE: RMSNorm interface test (Test__RMSNormInterface.cpp) removed - redundant with Test__CPURMSNormTypedKernel.cpp
+# NOTE: RMSNorm interface test (Test__RMSNormInterface.cpp) removed - redundant with Test__CPURMSNormKernelT.cpp
 # The typed kernel test suite provides comprehensive coverage of all precision variants
 
 # Test: Softmax primitives (scalar/AVX2/AVX512 parity, cross-precision accuracy)
@@ -741,30 +741,30 @@ add_v2_test(V2_Unit_ActivationTraits
     MPI_PROCS 1  # ActivationTraits tests are CPU-only, single rank
 )
 
-# Test: CPURMSNormTypedKernel (typed RMSNorm with fused precision conversion)
-add_executable(v2_test_rmsnorm_typed_kernel unit/Test__CPURMSNormTypedKernel.cpp)
+# Test: CPURMSNormKernelT (typed RMSNorm with fused precision conversion)
+add_executable(v2_test_rmsnorm_typed_kernel unit/Test__CPURMSNormKernelT.cpp)
 target_link_libraries(v2_test_rmsnorm_typed_kernel
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_RMSNormTypedKernel
+add_v2_test(V2_Unit_CPURMSNormKernelT
     COMMAND $<TARGET_FILE:v2_test_rmsnorm_typed_kernel>
     LABELS "V2;Unit;Kernels;RMSNorm;FP32;BF16;FP16;Q8_1;FusedPrecision;TypedResidual;CPU"
-    MPI_PROCS 1  # RMSNormTypedKernel tests are CPU-only, single rank
+    MPI_PROCS 1  # CPURMSNormKernelT tests are CPU-only, single rank
 )
 
-# Test: CPURoPEKernelTyped (typed RoPE with fused precision conversion)
-add_executable(v2_test_rope_typed_kernel unit/Test__CPURoPEKernelTyped.cpp)
+# Test: CPURoPEKernelT (typed RoPE with fused precision conversion)
+add_executable(v2_test_rope_typed_kernel unit/Test__CPURoPEKernelT.cpp)
 target_link_libraries(v2_test_rope_typed_kernel
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_RoPETypedKernel
+add_v2_test(V2_Unit_CPURoPEKernelT
     COMMAND $<TARGET_FILE:v2_test_rope_typed_kernel>
     LABELS "V2;Unit;Kernels;RoPE;FP32;BF16;FP16;Q8_1;FusedPrecision;TypedResidual;CPU"
-    MPI_PROCS 1  # RoPETypedKernel tests are CPU-only, single rank
+    MPI_PROCS 1  # CPURoPEKernelT tests are CPU-only, single rank
 )
 
 # Test: CpuAttentionKernelT (template-based attention kernel)
@@ -793,14 +793,14 @@ add_v2_test(V2_Unit_CPUAttentionKernelTyped
     MPI_PROCS 1
 )
 
-# Test: CPUSoftmaxKernelTyped (Enum-based softmax kernel with native precision paths)
-add_executable(v2_test_cpu_softmax_kernel_typed unit/Test__CPUSoftmaxKernelTyped.cpp)
+# Test: CPUSoftmaxKernelT (Enum-based softmax kernel with native precision paths)
+add_executable(v2_test_cpu_softmax_kernel_typed unit/Test__CPUSoftmaxKernelT.cpp)
 target_link_libraries(v2_test_cpu_softmax_kernel_typed
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_CPUSoftmaxKernelTyped
+add_v2_test(V2_Unit_CPUSoftmaxKernelT
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax_kernel_typed>
     LABELS "V2;Unit;Kernels;Softmax;FP32;BF16;FP16;Q8_1;TypedKernel;CPU"
     MPI_PROCS 1
@@ -884,7 +884,7 @@ target_link_libraries(v2_test_cpu_rope_kernel
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_CPURoPEKernelT 
+add_v2_test(V2_Unit_CPURoPEKernelT_Interface 
     COMMAND $<TARGET_FILE:v2_test_cpu_rope_kernel>
     LABELS "V2;Unit;Kernels;RoPE;CPU"
     MPI_PROCS 1
@@ -903,14 +903,14 @@ add_v2_test(V2_Unit_CPUSwiGLUKernelT
     MPI_PROCS 1
 )
 
-# Test: CPUSwiGLUKernelTyped (Enum-based SwiGLU kernel with native precision paths)
-add_executable(v2_test_cpu_swiglu_kernel_typed unit/Test__CPUSwiGLUKernelTyped.cpp)
+# Test: CPUSwiGLUKernelT (Enum-based SwiGLU kernel with native precision paths)
+add_executable(v2_test_cpu_swiglu_kernel_typed unit/Test__CPUSwiGLUKernelT.cpp)
 target_link_libraries(v2_test_cpu_swiglu_kernel_typed
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_CPUSwiGLUKernelTyped
+add_v2_test(V2_Unit_CPUSwiGLUKernelT_Precision
     COMMAND $<TARGET_FILE:v2_test_cpu_swiglu_kernel_typed>
     LABELS "V2;Unit;Kernels;SwiGLU;TypedPrecision;FP32;BF16;FP16;Q8_1;CPU"
     MPI_PROCS 1
@@ -1838,6 +1838,37 @@ add_v2_test(V2_Unit_PipelinePrecisionMode
     LABELS "V2;Unit;PipelineExecution;PrecisionConfiguration;WeightPrecision;ActivationPrecision"
 )
 
+# Test: ResidualOpTyped (typed residual connections FP32/BF16/FP16/Q8_1)
+# Tests the typed residual connection operations that add projection outputs back to residual stream
+# Critical for verifying Q8_1 native residual addition (dequant-add-requant via SIMD)
+add_executable(v2_test_residual_op_typed unit/pipelines/ops/Test__ResidualOpTyped.cpp)
+target_link_libraries(v2_test_residual_op_typed llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ResidualOpTyped
+    COMMAND $<TARGET_FILE:v2_test_residual_op_typed>
+    LABELS "V2;Unit;PipelineOps;ResidualConnection;Q8_1;FP32;TypedResiduals;Quantization;SIMD"
+    MPI_PROCS 1
+)
+
+# Test: RMSNormOpTyped (Q8_1 native RMSNorm)
+# Critical for verifying Q8_1 native RMSNorm (dequant-normalize-requant)
+add_executable(v2_test_rmsnorm_op_typed unit/pipelines/ops/Test__RMSNormOpTyped.cpp)
+target_link_libraries(v2_test_rmsnorm_op_typed llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_RMSNormOpTyped
+    COMMAND $<TARGET_FILE:v2_test_rmsnorm_op_typed>
+    LABELS "V2;Unit;PipelineOps;RMSNorm;Q8_1;FP32;TypedNorm;Quantization;SIMD"
+    MPI_PROCS 1
+)
+
+# Test: GemmOpTyped (Q8_1 native GEMM for QKV projection)
+# Critical for verifying Q8_1 native GEMM (Q8_1→Q8_1 and FP32→Q8_1 paths)
+add_executable(v2_test_gemm_op_typed unit/pipelines/ops/Test__GemmOpTyped.cpp)
+target_link_libraries(v2_test_gemm_op_typed llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GemmOpTyped
+    COMMAND $<TARGET_FILE:v2_test_gemm_op_typed>
+    LABELS "V2;Unit;PipelineOps;GEMM;Q8_1;FP32;TypedGemm;Quantization;QKVProjection"
+    MPI_PROCS 1
+)
+
 # Test: GQAAttention Second Sequence Handling
 # Tests that sequence 1 in batched attention is handled correctly
 # Validates buffer offsets, mask application, and cross-sequence isolation
@@ -1965,9 +1996,24 @@ add_v2_test(V2_Integration_KVCache
     LABELS "V2;Integration;KVCache;AutoregressiveDecode;Attention;Pipeline"
 )
 
+# Test: Q8_1 KV Cache Integration Tests
+# Validates Q8_1 attention kernel correctly integrates with typed KV cache
+# Tests: roundtrip, attention with cache, direct vs cached K/V, GQA path, block copy semantics
+add_executable(v2_integration_q8_1_kvcache integration/Test__Q8_1_KVCache_Integration.cpp)
+target_link_libraries(v2_integration_q8_1_kvcache
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_KVCache
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_kvcache>
+    MPI_PROCS 1
+    LABELS "V2;Integration;KVCache;Q8_1;Attention;Pipeline;Correctness"
+)
+
 # Test: Q8_1 vs FP32 Activation Precision Parity
 # Validates Q8_1 activation precision produces equivalent results to FP32
 # Tests Top-5 token overlap, KL divergence, and greedy sampling equivalence
+# NOTE: Runs with MPI_PROCS 1 since it compares precision modes, not MPI parallelism
 add_executable(v2_integration_q8_1_vs_fp32_parity integration/Test__Q8_1_vs_FP32_Parity.cpp)
 target_link_libraries(v2_integration_q8_1_vs_fp32_parity
     llaminar2_core
@@ -1976,6 +2022,38 @@ target_link_libraries(v2_integration_q8_1_vs_fp32_parity
 add_v2_test(V2_Integration_Q8_1_vs_FP32_Parity
     COMMAND $<TARGET_FILE:v2_integration_q8_1_vs_fp32_parity>
     LABELS "V2;Integration;Pipeline;ActivationPrecision;Q8_1;FP32;Parity;TopK;KLDivergence"
+    MPI_PROCS 1
+)
+
+# Test: Layer-by-layer Q8_1 vs FP32 divergence analysis
+# Compares intermediate activations at each pipeline stage to identify divergence points
+# NOTE: Runs with MPI_PROCS 1 since it compares precision modes, not MPI parallelism
+add_executable(v2_integration_q8_1_layer_divergence integration/Test__Q8_1_LayerByLayer_Divergence.cpp)
+target_link_libraries(v2_integration_q8_1_layer_divergence
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_LayerByLayer_Divergence
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_layer_divergence>
+    LABELS "V2;Integration;Pipeline;ActivationPrecision;Q8_1;FP32;Divergence;Debug"
+    MPI_PROCS 1
+)
+
+# Test: Q8_1 MPI Tensor-Parallel Attention
+# Tests the MPI tensor-parallel path for Q8_1 attention:
+#   - Head slicing (sliceQ8_1HeadBlocks)
+#   - K/V GQA broadcast (broadcastQ8_1KVHeads)
+#   - Fused attention kernel execution
+#   - Allgatherv result combination
+add_executable(v2_integration_q8_1_mpi_tp integration/Test__Q8_1_MPI_TensorParallel.cpp)
+target_link_libraries(v2_integration_q8_1_mpi_tp
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q8_1_MPI_TensorParallel
+    COMMAND $<TARGET_FILE:v2_integration_q8_1_mpi_tp>
+    MPI_PROCS 2
+    LABELS "V2;Integration;Attention;MPI;TensorParallel;Q8_1;GQA;Orchestration"
 )
 
 # Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)
@@ -2310,38 +2388,38 @@ add_v2_test(V2_Perf_Q3K_Unpack
 )
 
 
-# Performance Test: CPURMSNormTypedKernel (typed residuals performance)
-add_executable(v2_perf_rmsnorm_typed performance/kernels/cpu/ops/Perf__CPURMSNormTypedKernel.cpp)
+# Performance Test: CPURMSNormKernelT (typed residuals performance)
+add_executable(v2_perf_rmsnorm_typed performance/kernels/cpu/ops/Perf__CPURMSNormKernelT.cpp)
 target_link_libraries(v2_perf_rmsnorm_typed 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Perf_RMSNormTyped 
+add_v2_test(V2_Perf_CPURMSNormKernelT 
     COMMAND $<TARGET_FILE:v2_perf_rmsnorm_typed>
     LABELS "V2;Performance;RMSNorm;TypedResiduals;Kernels"
     MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
 )
 
-# Performance Test: CPUSoftmaxKernelTyped (typed softmax performance)
-add_executable(v2_perf_softmax_typed performance/kernels/cpu/ops/Perf__CPUSoftmaxKernelTyped.cpp)
+# Performance Test: CPUSoftmaxKernelT (typed softmax performance)
+add_executable(v2_perf_softmax_typed performance/kernels/cpu/ops/Perf__CPUSoftmaxKernelT.cpp)
 target_link_libraries(v2_perf_softmax_typed 
     llaminar2_core 
     GTest::gtest
 )
-add_v2_test(V2_Perf_SoftmaxTyped 
+add_v2_test(V2_Perf_CPUSoftmaxKernelT 
     COMMAND $<TARGET_FILE:v2_perf_softmax_typed>
     LABELS "V2;Performance;Softmax;TypedResiduals;Kernels;FP32;BF16;FP16;Q8_1"
     MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
 )
 
-# Performance Test: CPUSwiGLUKernelTyped (typed SwiGLU performance)
-add_executable(v2_perf_swiglu_typed performance/kernels/cpu/ops/Perf__CPUSwiGLUKernelTyped.cpp)
+# Performance Test: CPUSwiGLUKernelT (typed SwiGLU performance)
+add_executable(v2_perf_swiglu_typed performance/kernels/cpu/ops/Perf__CPUSwiGLUKernelT.cpp)
 target_link_libraries(v2_perf_swiglu_typed 
     llaminar2_core 
     GTest::gtest
 )
-add_v2_test(V2_Perf_SwiGLUTyped 
+add_v2_test(V2_Perf_CPUSwiGLUKernelT 
     COMMAND $<TARGET_FILE:v2_perf_swiglu_typed>
     LABELS "V2;Performance;SwiGLU;TypedResiduals;Kernels;FP32;BF16;FP16;Q8_1"
     MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking

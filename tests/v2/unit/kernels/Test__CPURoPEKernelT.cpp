@@ -1,6 +1,8 @@
 /**
  * @file Test__CPURoPEKernelT.cpp
  * @brief Unit tests for CPURoPEKernelT class
+ *
+ * Migrated from old CPURoPEKernelT tests to use the new typed kernel API.
  */
 
 #include "kernels/cpu/ops/CPURoPEKernelT.h"
@@ -21,7 +23,7 @@ protected:
 
 TEST_F(CPURoPEKernelTest, FP32_Apply_Basic)
 {
-    CPURoPEKernelT<FP32Tensor> kernel;
+    CPURoPEKernelT<ActivationPrecision::FP32> kernel;
     int seq_len = 1;
     int n_heads = 2;
     int n_kv_heads = 2;
@@ -32,14 +34,12 @@ TEST_F(CPURoPEKernelTest, FP32_Apply_Basic)
     std::vector<float> K(seq_len * n_kv_heads * head_dim, 1.0f);
     std::vector<int> pos_ids = {0};
 
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         Q.data(), K.data(),
         pos_ids.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
         rope_theta,
-        false,   // use_bf16
-        nullptr, // mpi_ctx
-        -1       // device_idx
+        -1 // device_idx
     );
 
     EXPECT_TRUE(result);
@@ -47,7 +47,7 @@ TEST_F(CPURoPEKernelTest, FP32_Apply_Basic)
 
 TEST_F(CPURoPEKernelTest, FP32_Apply_Padding)
 {
-    CPURoPEKernelT<FP32Tensor> kernel;
+    CPURoPEKernelT<ActivationPrecision::FP32> kernel;
     int seq_len = 2;
     int n_heads = 1;
     int n_kv_heads = 1;
@@ -58,14 +58,12 @@ TEST_F(CPURoPEKernelTest, FP32_Apply_Padding)
     std::vector<float> K(seq_len * n_kv_heads * head_dim, 1.0f);
     std::vector<int> pos_ids = {0, -1}; // Second token is padding
 
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         Q.data(), K.data(),
         pos_ids.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
         rope_theta,
-        false,   // use_bf16
-        nullptr, // mpi_ctx
-        -1       // device_idx
+        -1 // device_idx
     );
 
     EXPECT_TRUE(result);
@@ -85,7 +83,7 @@ TEST_F(CPURoPEKernelTest, FP32_Apply_Padding)
 
 TEST_F(CPURoPEKernelTest, Q8_1_Apply_Basic)
 {
-    CPURoPEKernelT<Q8_1Tensor> kernel;
+    CPURoPEKernelT<ActivationPrecision::Q8_1> kernel;
     int seq_len = 1;
     int n_heads = 2;
     int n_kv_heads = 2;
@@ -113,7 +111,7 @@ TEST_F(CPURoPEKernelTest, Q8_1_Apply_Basic)
             b.qs[i] = 1;
     }
 
-    bool result = kernel.apply_q8_1(
+    bool result = kernel.apply_typed(
         Q.data(), K.data(),
         pos_ids.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -126,7 +124,7 @@ TEST_F(CPURoPEKernelTest, Q8_1_Apply_Basic)
 
 TEST_F(CPURoPEKernelTest, Q8_1_Apply_InvalidHeadDim)
 {
-    CPURoPEKernelT<Q8_1Tensor> kernel;
+    CPURoPEKernelT<ActivationPrecision::Q8_1> kernel;
     int seq_len = 1;
     int n_heads = 1;
     int n_kv_heads = 1;
@@ -137,7 +135,7 @@ TEST_F(CPURoPEKernelTest, Q8_1_Apply_InvalidHeadDim)
     std::vector<Q8_1Block> K(10);
     std::vector<int> pos_ids = {0};
 
-    bool result = kernel.apply_q8_1(
+    bool result = kernel.apply_typed(
         Q.data(), K.data(),
         pos_ids.data(),
         seq_len, n_heads, n_kv_heads, head_dim,

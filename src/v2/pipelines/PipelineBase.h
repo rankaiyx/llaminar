@@ -488,8 +488,11 @@ namespace llaminar2
          * Stores past key/value projections for incremental generation.
          * Initialized by initializeKVCache() with per-layer device placement.
          * Per-layer device affinity enables heterogeneous execution.
+         *
+         * December 2025: Now uses IKVCache interface for typed precision support.
+         * Cache precision matches pipeline's ActivationPrecision by default.
          */
-        std::shared_ptr<KVCache> kv_cache_;
+        std::unique_ptr<IKVCache> kv_cache_;
 
         /**
          * @brief Current position per sequence (for incremental decode, batch-aware)
@@ -1203,15 +1206,6 @@ namespace llaminar2
         std::string snapshot_output_dir_;                     // Optional directory for saving
         std::map<std::string, std::vector<float>> snapshots_; // In-memory snapshot storage
 #endif
-
-        // ===== Reusable Operations (stateless, self-validating) =====
-        // These are used by the declarative compute graph methods above
-        // Legacy ops (kept for backward compatibility)
-        RMSNormOp rmsnorm_op_;
-        GemmOp gemm_op_;
-        SwiGLUOp swiglu_op_;
-        RoPEOp rope_op_;
-        ResidualOp residual_op_;
 
         // ===== Typed Operations (zero-overhead precision dispatch) =====
         // Created once at initialization based on config_.activation_precision

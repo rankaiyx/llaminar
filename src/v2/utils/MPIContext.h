@@ -94,6 +94,41 @@ namespace llaminar2
         }
 
         /**
+         * @brief All-gather bytes operation (type-agnostic)
+         *
+         * Used for Q8_1 block communication where we want to avoid
+         * dequant→allreduce→requant round trips. Each rank sends its
+         * local bytes to all other ranks.
+         *
+         * @param send_data Local data (raw bytes)
+         * @param recv_data Global data (concatenated from all ranks)
+         * @param byte_count Number of bytes per rank
+         */
+        void allgather_bytes(const void *send_data, void *recv_data, size_t byte_count) const
+        {
+            MPI_Allgather(send_data, byte_count, MPI_BYTE, recv_data, byte_count, MPI_BYTE, comm_);
+        }
+
+        /**
+         * @brief All-gather with variable counts per rank (bytes)
+         *
+         * Each rank can contribute a different number of bytes.
+         * Used for Q8_1 attention where ranks may have different head counts.
+         *
+         * @param send_data Local data (raw bytes)
+         * @param send_count Number of bytes this rank is sending
+         * @param recv_data Global data buffer (must be pre-sized)
+         * @param recv_counts Array of counts from each rank
+         * @param displs Array of displacements in recv_data for each rank
+         */
+        void allgatherv_bytes(const void *send_data, int send_count,
+                              void *recv_data, const int *recv_counts, const int *displs) const
+        {
+            MPI_Allgatherv(send_data, send_count, MPI_BYTE,
+                           recv_data, recv_counts, displs, MPI_BYTE, comm_);
+        }
+
+        /**
          * @brief Synchronization barrier
          *
          * Blocks until all ranks reach this point.

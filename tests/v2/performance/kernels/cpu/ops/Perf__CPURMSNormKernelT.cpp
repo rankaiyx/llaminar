@@ -1,13 +1,13 @@
 /**
- * @file Perf__CPURMSNormTypedKernel.cpp
- * @brief Performance benchmark for CPURMSNormTypedKernel (typed residuals)
+ * @file Perf__CPURMSNormKernelT.cpp
+ * @brief Performance benchmark for CPURMSNormKernelT (typed residuals)
  *
  * This test benchmarks the typed RMSNorm kernel performance comparing:
- * 1. CPURMSNormTypedKernel<FP32> (baseline)
- * 2. CPURMSNormTypedKernel<BF16> (2x memory compression)
- * 3. CPURMSNormTypedKernel<FP16> (2x memory compression)
- * 4. CPURMSNormTypedKernel<Q8_1> (3.5x compression, direct SIMD quantization)
- * 5. CPURMSNormTypedKernel<Q8_1> via IActivationTensor interface (OpenMP parallel)
+ * 1. CPURMSNormKernelT<FP32> (baseline)
+ * 2. CPURMSNormKernelT<BF16> (2x memory compression)
+ * 3. CPURMSNormKernelT<FP16> (2x memory compression)
+ * 4. CPURMSNormKernelT<Q8_1> (3.5x compression, direct SIMD quantization)
+ * 5. CPURMSNormKernelT<Q8_1> via IActivationTensor interface (OpenMP parallel)
  *
  * The Q8_1 benchmarks compare two quantization approaches:
  * - **Direct SIMD** (`simd::quantize_fp32_to_q8_1_blocks`): Vectorized AVX512/AVX2,
@@ -39,7 +39,7 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
-#include "kernels/cpu/ops/CPURMSNormTypedKernel.h"
+#include "kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "tensors/SIMDHelpers.h"
 #include "utils/Logger.h"
 
@@ -72,7 +72,7 @@ struct BenchmarkStats
 // Test Fixture
 // ============================================================================
 
-class CPURMSNormTypedKernel_Perf : public ::testing::Test
+class CPURMSNormKernelT_Perf : public ::testing::Test
 {
 protected:
     int rank_ = 0;
@@ -150,7 +150,7 @@ protected:
     // Typed FP32 kernel (baseline - no precision conversion)
     BenchmarkStats bench_typed_fp32(const BenchmarkConfig &config)
     {
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
 
         size_t size = config.seq_len * config.d_model;
         std::vector<float> input(size);
@@ -192,7 +192,7 @@ protected:
     // Typed BF16 kernel (2x compression)
     BenchmarkStats bench_typed_bf16(const BenchmarkConfig &config)
     {
-        CPURMSNormTypedKernel<ActivationPrecision::BF16> kernel;
+        CPURMSNormKernelT<ActivationPrecision::BF16> kernel;
 
         size_t size = config.seq_len * config.d_model;
         std::vector<uint16_t> input(size);
@@ -238,7 +238,7 @@ protected:
     // Typed FP16 kernel (2x compression)
     BenchmarkStats bench_typed_fp16(const BenchmarkConfig &config)
     {
-        CPURMSNormTypedKernel<ActivationPrecision::FP16> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP16> kernel;
 
         size_t size = config.seq_len * config.d_model;
         std::vector<uint16_t> input(size);
@@ -284,7 +284,7 @@ protected:
     // Typed Q8_1 kernel (3.5x compression)
     BenchmarkStats bench_typed_q8_1(const BenchmarkConfig &config)
     {
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
 
         // Q8_1: 36 bytes per block of 32 elements
         // Number of blocks per row = ceil(d_model / 32)
@@ -397,7 +397,7 @@ protected:
 // ============================================================================
 
 // Single token decode (latency-critical path)
-TEST_F(CPURMSNormTypedKernel_Perf, SingleToken_Qwen05B)
+TEST_F(CPURMSNormKernelT_Perf, SingleToken_Qwen05B)
 {
     BenchmarkConfig config;
     config.seq_len = 1;
@@ -409,7 +409,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, SingleToken_Qwen05B)
     run_comparison_benchmark(config);
 }
 
-TEST_F(CPURMSNormTypedKernel_Perf, SingleToken_Qwen7B)
+TEST_F(CPURMSNormKernelT_Perf, SingleToken_Qwen7B)
 {
     BenchmarkConfig config;
     config.seq_len = 1;
@@ -422,7 +422,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, SingleToken_Qwen7B)
 }
 
 // Small batch (typical prefill)
-TEST_F(CPURMSNormTypedKernel_Perf, Prefill_32_Qwen7B)
+TEST_F(CPURMSNormKernelT_Perf, Prefill_32_Qwen7B)
 {
     BenchmarkConfig config;
     config.seq_len = 32;
@@ -435,7 +435,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_32_Qwen7B)
 }
 
 // Medium batch prefill
-TEST_F(CPURMSNormTypedKernel_Perf, Prefill_128_Qwen7B)
+TEST_F(CPURMSNormKernelT_Perf, Prefill_128_Qwen7B)
 {
     BenchmarkConfig config;
     config.seq_len = 128;
@@ -448,7 +448,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_128_Qwen7B)
 }
 
 // Large batch prefill (stress test)
-TEST_F(CPURMSNormTypedKernel_Perf, Prefill_512_Qwen7B)
+TEST_F(CPURMSNormKernelT_Perf, Prefill_512_Qwen7B)
 {
     BenchmarkConfig config;
     config.seq_len = 512;
@@ -461,7 +461,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_512_Qwen7B)
 }
 
 // Very large prefill (max typical context)
-TEST_F(CPURMSNormTypedKernel_Perf, Prefill_2048_Qwen7B)
+TEST_F(CPURMSNormKernelT_Perf, Prefill_2048_Qwen7B)
 {
     BenchmarkConfig config;
     config.seq_len = 2048;
@@ -478,7 +478,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_2048_Qwen7B)
 // ============================================================================
 
 // Single token decode - Qwen 32B
-TEST_F(CPURMSNormTypedKernel_Perf, SingleToken_Qwen32B)
+TEST_F(CPURMSNormKernelT_Perf, SingleToken_Qwen32B)
 {
     BenchmarkConfig config;
     config.seq_len = 1;
@@ -491,7 +491,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, SingleToken_Qwen32B)
 }
 
 // Small batch prefill - Qwen 32B
-TEST_F(CPURMSNormTypedKernel_Perf, Prefill_32_Qwen32B)
+TEST_F(CPURMSNormKernelT_Perf, Prefill_32_Qwen32B)
 {
     BenchmarkConfig config;
     config.seq_len = 32;
@@ -504,7 +504,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_32_Qwen32B)
 }
 
 // Medium batch prefill - Qwen 32B
-TEST_F(CPURMSNormTypedKernel_Perf, Prefill_128_Qwen32B)
+TEST_F(CPURMSNormKernelT_Perf, Prefill_128_Qwen32B)
 {
     BenchmarkConfig config;
     config.seq_len = 128;
@@ -517,7 +517,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_128_Qwen32B)
 }
 
 // Large batch prefill - Qwen 32B
-TEST_F(CPURMSNormTypedKernel_Perf, Prefill_512_Qwen32B)
+TEST_F(CPURMSNormKernelT_Perf, Prefill_512_Qwen32B)
 {
     BenchmarkConfig config;
     config.seq_len = 512;
@@ -530,7 +530,7 @@ TEST_F(CPURMSNormTypedKernel_Perf, Prefill_512_Qwen32B)
 }
 
 // Very large prefill - Qwen 32B
-TEST_F(CPURMSNormTypedKernel_Perf, Prefill_2048_Qwen32B)
+TEST_F(CPURMSNormKernelT_Perf, Prefill_2048_Qwen32B)
 {
     BenchmarkConfig config;
     config.seq_len = 2048;

@@ -35,8 +35,13 @@
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
 #include "kernels/cpu/gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
-#include "kernels/cpu/ops/CPUSoftmaxKernelTyped.h"
+#include "kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "utils/CPUFeatures.h"
+#include "loaders/ModelContext.h"
+#include "loaders/ModelLoader.h"
+#include "tensors/TensorFactory.h"
+#include "utils/MPIContext.h"
+#include "kernels/KernelFactory.h"
 
 using namespace llaminar2;
 using namespace llaminar2::gemm_v4;
@@ -81,7 +86,7 @@ protected:
     /**
      * @brief Compute pure FP32 reference attention
      *
-     * Implements: output = softmax(Q @ K^T * scale) @ V
+     * Implements: output = softmax(Q @ K^T * scale + mask) @ V
      *
      * @param M Sequence length (Q rows)
      * @param N KV length (K/V rows)
@@ -91,12 +96,16 @@ protected:
      * @param V_fp32 Value [N, D]
      * @param scale Attention scale (1/sqrt(D))
      * @param output_fp32 Output [M, D]
+     * @param mask Optional attention mask [M, N] (nullptr if none)
+     * @param mask_stride Stride between mask rows (in floats)
      */
     void compute_fp32_reference(
         int M, int N, int D,
         const float *Q_fp32, const float *K_fp32, const float *V_fp32,
         float scale,
-        float *output_fp32)
+        float *output_fp32,
+        const float *mask = nullptr,
+        int mask_stride = 0)
     {
         // Step 1: Compute Q @ K^T -> scores [M, N]
         std::vector<float> scores(M * N);
@@ -109,7 +118,13 @@ protected:
                 {
                     dot += Q_fp32[i * D + d] * K_fp32[j * D + d];
                 }
-                scores[i * N + j] = dot * scale;
+                float score = dot * scale;
+                // Apply mask if provided
+                if (mask)
+                {
+                    score += mask[i * mask_stride + j];
+                }
+                scores[i * N + j] = score;
             }
         }
 
@@ -150,6 +165,27 @@ protected:
                     acc += scores[i * N + j] * V_fp32[j * D + d];
                 }
                 output_fp32[i * D + d] = acc;
+            }
+        }
+    }
+
+    /**
+     * @brief Create causal attention mask (lower triangular)
+     *
+     * mask[i][j] = 0.0 if j <= i, -inf otherwise
+     *
+     * @param M Sequence length
+     * @param N KV length
+     * @param mask Output mask [M, N]
+     */
+    void create_causal_mask(int M, int N, float *mask)
+    {
+        const float NEG_INF = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < M; ++i)
+        {
+            for (int j = 0; j < N; ++j)
+            {
+                mask[i * N + j] = (j <= i) ? 0.0f : NEG_INF;
             }
         }
     }
@@ -1333,6 +1369,584 @@ TEST_F(Test__Q8_1_FusedAttention, JIT_vs_CppReference_M1_TwoCalls)
             jit_output.data() + m * D, cpp_output.data() + m * D, D);
         EXPECT_GE(row_cos, 0.9999) << "Row " << m << " should match";
     }
+}
+
+/**
+ * @test JIT_vs_FP32_Strided_Qwen05B_Layout
+ * @brief Tests with the exact stride layout used by Qwen 2.5 0.5B pipeline
+ *
+ * This test recreates the exact memory layout used in the real pipeline:
+ * - n_heads = 14, n_kv_heads = 2, head_dim = 64
+ * - Q stride = 14 * 2 blocks = 28 blocks per row
+ * - K/V stride = 2 * 2 blocks = 4 blocks per row
+ * - Output stride = 14 * 2 blocks = 28 blocks per row
+ *
+ * The JIT kernel receives pointers to head-specific data within the larger buffer.
+ * Tests verify correctness when iterating through heads with these strides.
+ */
+TEST_F(Test__Q8_1_FusedAttention, JIT_vs_FP32_Strided_Qwen05B_Layout)
+{
+    // Qwen 2.5 0.5B parameters
+    const int n_heads = 14;
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int seq_len = 9; // Test prompt length: "The quick brown fox jumps over the lazy dog"
+    const int kv_len = 9;
+
+    const int heads_per_kv = n_heads / n_kv_heads;
+    const int head_dim_blocks = head_dim / 32;
+
+    // Multi-head tensor strides (as used in pipeline)
+    const int q_blocks_per_row = n_heads * head_dim_blocks;    // 14 * 2 = 28
+    const int k_blocks_per_row = n_kv_heads * head_dim_blocks; // 2 * 2 = 4
+    const int out_blocks_per_row = n_heads * head_dim_blocks;  // 14 * 2 = 28
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    // Allocate multi-head buffers
+    std::vector<float> Q_fp32(seq_len * n_heads * head_dim);
+    std::vector<float> K_fp32(kv_len * n_kv_heads * head_dim);
+    std::vector<float> V_fp32(kv_len * n_kv_heads * head_dim);
+    std::vector<float> ref_output(seq_len * n_heads * head_dim, 0.0f);
+
+    // Random init
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    for (auto &x : Q_fp32)
+        x = dist(gen);
+    for (auto &x : K_fp32)
+        x = dist(gen);
+    for (auto &x : V_fp32)
+        x = dist(gen);
+
+    // Compute FP32 reference for ALL heads
+    for (int h = 0; h < n_heads; ++h)
+    {
+        int kv_h = h / heads_per_kv;
+
+        // Extract head-specific data (strided access)
+        std::vector<float> Q_h(seq_len * head_dim);
+        std::vector<float> K_h(kv_len * head_dim);
+        std::vector<float> V_h(kv_len * head_dim);
+
+        for (int s = 0; s < seq_len; ++s)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                Q_h[s * head_dim + d] = Q_fp32[s * n_heads * head_dim + h * head_dim + d];
+            }
+        }
+        for (int k = 0; k < kv_len; ++k)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                K_h[k * head_dim + d] = K_fp32[k * n_kv_heads * head_dim + kv_h * head_dim + d];
+                V_h[k * head_dim + d] = V_fp32[k * n_kv_heads * head_dim + kv_h * head_dim + d];
+            }
+        }
+
+        // Compute reference attention for this head
+        std::vector<float> head_output(seq_len * head_dim);
+        compute_fp32_reference(seq_len, kv_len, head_dim, Q_h.data(), K_h.data(), V_h.data(), scale, head_output.data());
+
+        // Copy back to output (strided)
+        for (int s = 0; s < seq_len; ++s)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                ref_output[s * n_heads * head_dim + h * head_dim + d] = head_output[s * head_dim + d];
+            }
+        }
+    }
+
+    // Quantize inputs to Q8_1 with multi-head layout
+    std::vector<Q8_1Block> Q_q8(seq_len * q_blocks_per_row);
+    std::vector<Q8_1Block> K_q8(kv_len * k_blocks_per_row);
+    std::vector<Q8_1Block> V_q8(kv_len * k_blocks_per_row);
+    std::vector<Q8_1Block> output_q8(seq_len * out_blocks_per_row);
+    std::memset(output_q8.data(), 0, output_q8.size() * sizeof(Q8_1Block));
+
+    // Quantize Q (multi-head layout)
+    for (int s = 0; s < seq_len; ++s)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            const float *fp32_head = Q_fp32.data() + s * n_heads * head_dim + h * head_dim;
+            Q8_1Block *q8_head = Q_q8.data() + s * q_blocks_per_row + h * head_dim_blocks;
+            quantize_fp32_to_q8_1(fp32_head, 1, head_dim, q8_head);
+        }
+    }
+
+    // Quantize K (multi-head layout)
+    for (int k = 0; k < kv_len; ++k)
+    {
+        for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+        {
+            const float *fp32_head = K_fp32.data() + k * n_kv_heads * head_dim + kv_h * head_dim;
+            Q8_1Block *q8_head = K_q8.data() + k * k_blocks_per_row + kv_h * head_dim_blocks;
+            quantize_fp32_to_q8_1(fp32_head, 1, head_dim, q8_head);
+        }
+    }
+
+    // Quantize V (multi-head layout)
+    for (int k = 0; k < kv_len; ++k)
+    {
+        for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+        {
+            const float *fp32_head = V_fp32.data() + k * n_kv_heads * head_dim + kv_h * head_dim;
+            Q8_1Block *q8_head = V_q8.data() + k * k_blocks_per_row + kv_h * head_dim_blocks;
+            quantize_fp32_to_q8_1(fp32_head, 1, head_dim, q8_head);
+        }
+    }
+
+    // Run JIT kernel for each head with proper striding
+    QuantisedAttentionJit_Q8_1_Fused jit_kernel(head_dim, false);
+    auto kernel_func = jit_kernel.get_kernel();
+
+    const int q_stride_bytes = q_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+    const int k_stride_bytes = k_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+    const int out_stride_bytes = out_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+
+    for (int h = 0; h < n_heads; ++h)
+    {
+        int kv_h = h / heads_per_kv;
+
+        // Head-specific pointers (same as pipeline)
+        const Q8_1Block *Q_h = Q_q8.data() + h * head_dim_blocks;
+        const Q8_1Block *K_h = K_q8.data() + kv_h * head_dim_blocks;
+        const Q8_1Block *V_h = V_q8.data() + kv_h * head_dim_blocks;
+        Q8_1Block *out_h = output_q8.data() + h * head_dim_blocks;
+
+        FusedQ8_1AttentionParams params;
+        params.Q = Q_h;
+        params.K = K_h;
+        params.V = V_h;
+        params.output = out_h;
+        params.M = seq_len;
+        params.N = kv_len;
+        params.head_dim = head_dim;
+        params.Q_stride_bytes = q_stride_bytes;
+        params.K_stride_bytes = k_stride_bytes;
+        params.V_stride_bytes = k_stride_bytes;
+        params.output_stride_bytes = out_stride_bytes;
+        params.scale = scale;
+        params.mask = nullptr;
+        params.mask_stride = 0;
+
+        kernel_func(&params);
+    }
+
+    // Dequantize output
+    std::vector<float> jit_output(seq_len * n_heads * head_dim);
+    for (int s = 0; s < seq_len; ++s)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            const Q8_1Block *q8_head = output_q8.data() + s * out_blocks_per_row + h * head_dim_blocks;
+            float *fp32_head = jit_output.data() + s * n_heads * head_dim + h * head_dim;
+            dequant_q8_1_to_fp32(q8_head, 1, head_dim, fp32_head);
+        }
+    }
+
+    // Compare per-head
+    if (rank_ == 0)
+    {
+        std::cerr << "\n=== Strided Layout Test (Qwen 0.5B parameters) ===" << std::endl;
+        std::cerr << "  n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
+                  << " head_dim=" << head_dim << " seq_len=" << seq_len << std::endl;
+        std::cerr << "  Q stride=" << q_blocks_per_row << " K stride=" << k_blocks_per_row << " blocks/row" << std::endl;
+    }
+
+    double min_cosine = 1.0;
+    double max_l2 = 0.0;
+    int worst_head = -1;
+
+    for (int h = 0; h < n_heads; ++h)
+    {
+        // Extract head output for comparison
+        std::vector<float> head_ref(seq_len * head_dim);
+        std::vector<float> head_jit(seq_len * head_dim);
+
+        for (int s = 0; s < seq_len; ++s)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                head_ref[s * head_dim + d] = ref_output[s * n_heads * head_dim + h * head_dim + d];
+                head_jit[s * head_dim + d] = jit_output[s * n_heads * head_dim + h * head_dim + d];
+            }
+        }
+
+        auto [rel_l2, cosine] = compute_metrics(head_jit.data(), head_ref.data(), seq_len * head_dim);
+
+        if (cosine < min_cosine)
+        {
+            min_cosine = cosine;
+            worst_head = h;
+        }
+        max_l2 = std::max(max_l2, rel_l2);
+
+        if (rank_ == 0 && (cosine < 0.98 || h < 3))
+        {
+            std::cerr << "  Head " << h << " (kv_h=" << (h / heads_per_kv) << "): "
+                      << "Cosine=" << std::fixed << std::setprecision(6) << cosine
+                      << " RelL2=" << rel_l2 << std::endl;
+        }
+    }
+
+    if (rank_ == 0)
+    {
+        std::cerr << "  Worst head: " << worst_head << " (cosine=" << min_cosine << ")" << std::endl;
+        std::cerr << "  Max L2: " << max_l2 << std::endl;
+    }
+
+    // Q8_1 attention should achieve >=0.98 cosine sim vs FP32
+    EXPECT_GE(min_cosine, 0.98)
+        << "Strided attention: worst head " << worst_head << " cosine " << min_cosine << " below 0.98";
+    EXPECT_LE(max_l2, 0.15)
+        << "Strided attention: max L2 error " << max_l2 << " above 0.15";
+}
+
+/**
+ * @test JIT_vs_FP32_Strided_Qwen05B_CausalMask_RealWeights
+ * @brief Tests with causal masking using REAL model weights from GGUF
+ *
+ * This test loads the actual Qwen 2.5 0.5B model, computes QKV projections
+ * from real embeddings, and tests the fused attention kernel with realistic
+ * data. This replicates the exact data distribution seen in actual inference.
+ *
+ * Uses the same model as the E2E parity tests: models/qwen2.5-0.5b-instruct-q4_0.gguf
+ */
+TEST_F(Test__Q8_1_FusedAttention, JIT_vs_FP32_Strided_Qwen05B_CausalMask)
+{
+    // ========================================================================
+    // Load real model weights
+    // ========================================================================
+    const std::string model_path = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+    auto mpi_ctx = std::make_shared<MPIContext>(rank_, world_size_, MPI_COMM_WORLD);
+    auto model_ctx = ModelContext::create(model_path, mpi_ctx);
+    if (!model_ctx)
+    {
+        GTEST_SKIP() << "Model not found: " << model_path;
+    }
+
+    const auto &metadata = model_ctx->model();
+
+    // Qwen 2.5 0.5B parameters (from model metadata)
+    const int n_heads = static_cast<int>(metadata.head_count);       // 14
+    const int n_kv_heads = static_cast<int>(metadata.head_count_kv); // 2
+    const int d_model = static_cast<int>(metadata.embedding_length); // 896
+    const int head_dim = d_model / n_heads;                          // 896/14 = 64
+
+    // Test tokens: "Hello, world" (same as E2E test)
+    const std::vector<int> test_tokens = {9906, 11, 1879};
+    const int seq_len = static_cast<int>(test_tokens.size());
+    const int kv_len = seq_len;
+
+    const int heads_per_kv = n_heads / n_kv_heads;
+    const int head_dim_blocks = head_dim / 32;
+
+    // Multi-head tensor strides (as used in pipeline)
+    const int q_blocks_per_row = n_heads * head_dim_blocks;    // 14 * 2 = 28
+    const int k_blocks_per_row = n_kv_heads * head_dim_blocks; // 2 * 2 = 4
+    const int out_blocks_per_row = n_heads * head_dim_blocks;  // 14 * 2 = 28
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    // Create causal mask
+    std::vector<float> causal_mask(seq_len * kv_len);
+    create_causal_mask(seq_len, kv_len, causal_mask.data());
+
+    // ========================================================================
+    // Load embedding and QKV projection weights from layer 0
+    // ========================================================================
+    auto embd_weight = model_ctx->getWeight("token_embd.weight", -1);
+    auto wq = model_ctx->getWeight("blk.0.attn_q.weight", -1);
+    auto wk = model_ctx->getWeight("blk.0.attn_k.weight", -1);
+    auto wv = model_ctx->getWeight("blk.0.attn_v.weight", -1);
+
+    if (!embd_weight || !wq || !wk || !wv)
+    {
+        GTEST_SKIP() << "Failed to load model weights";
+    }
+
+    if (rank_ == 0)
+    {
+        std::cerr << "\n=== Loading real model weights ===" << std::endl;
+        std::cerr << "  Model: " << model_path << std::endl;
+        std::cerr << "  d_model=" << d_model << " n_heads=" << n_heads
+                  << " n_kv_heads=" << n_kv_heads << " head_dim=" << head_dim << std::endl;
+        std::cerr << "  Embedding shape: [" << embd_weight->shape()[0] << ", " << embd_weight->shape()[1] << "]" << std::endl;
+        std::cerr << "  Embedding type: " << static_cast<int>(embd_weight->native_type()) << std::endl;
+        std::cerr << "  Wq shape: [" << wq->shape()[0] << ", " << wq->shape()[1] << "]" << std::endl;
+        std::cerr << "  Wq type: " << static_cast<int>(wq->native_type()) << std::endl;
+        std::cerr << "  Wk shape: [" << wk->shape()[0] << ", " << wk->shape()[1] << "]" << std::endl;
+        std::cerr << "  Wk type: " << static_cast<int>(wk->native_type()) << std::endl;
+        std::cerr << "  Wv shape: [" << wv->shape()[0] << ", " << wv->shape()[1] << "]" << std::endl;
+        std::cerr << "  Wv type: " << static_cast<int>(wv->native_type()) << std::endl;
+    }
+
+    // ========================================================================
+    // Compute embeddings for test tokens (row-wise dequant to avoid 544MB alloc)
+    // ========================================================================
+    std::vector<float> embeddings(seq_len * d_model);
+    for (int t = 0; t < seq_len; ++t)
+    {
+        int token_id = test_tokens[t];
+        // Use row-wise dequantization - only dequant the rows we need
+        embd_weight->to_fp32_row(static_cast<size_t>(token_id), &embeddings[t * d_model]);
+    }
+
+    // ========================================================================
+    // Compute QKV projections using GEMM kernels (weights are already packed)
+    // ========================================================================
+    std::vector<float> Q_fp32(seq_len * n_heads * head_dim);
+    std::vector<float> K_fp32(kv_len * n_kv_heads * head_dim);
+    std::vector<float> V_fp32(kv_len * n_kv_heads * head_dim);
+    std::vector<float> ref_output(seq_len * n_heads * head_dim, 0.0f);
+
+    // Get cached GEMM kernels (weights already packed during getWeight())
+    auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq.get());
+    auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk.get());
+    auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv.get());
+
+    if (!gemm_q || !gemm_k || !gemm_v)
+    {
+        GTEST_SKIP() << "Failed to create GEMM kernels for weights";
+    }
+
+    if (rank_ == 0)
+        std::cerr << "  Computing Q projection via GEMM kernel..." << std::endl;
+
+    // Q = embeddings @ Wq^T  ->  [seq_len, d_model] @ [n_heads*head_dim, d_model]^T = [seq_len, n_heads*head_dim]
+    // m=seq_len, n=n_heads*head_dim, k=d_model
+    bool ok_q = gemm_q->multiply(embeddings.data(), Q_fp32.data(),
+                                 seq_len, n_heads * head_dim, d_model,
+                                 /*transpose_B=*/true);
+    ASSERT_TRUE(ok_q) << "Q projection GEMM failed";
+
+    if (rank_ == 0)
+        std::cerr << "  Computing K projection via GEMM kernel..." << std::endl;
+
+    // K = embeddings @ Wk^T  ->  [seq_len, d_model] @ [n_kv_heads*head_dim, d_model]^T = [seq_len, n_kv_heads*head_dim]
+    bool ok_k = gemm_k->multiply(embeddings.data(), K_fp32.data(),
+                                 seq_len, n_kv_heads * head_dim, d_model,
+                                 /*transpose_B=*/true);
+    ASSERT_TRUE(ok_k) << "K projection GEMM failed";
+
+    if (rank_ == 0)
+        std::cerr << "  Computing V projection via GEMM kernel..." << std::endl;
+
+    // V = embeddings @ Wv^T  ->  [seq_len, d_model] @ [n_kv_heads*head_dim, d_model]^T = [seq_len, n_kv_heads*head_dim]
+    bool ok_v = gemm_v->multiply(embeddings.data(), V_fp32.data(),
+                                 seq_len, n_kv_heads * head_dim, d_model,
+                                 /*transpose_B=*/true);
+    ASSERT_TRUE(ok_v) << "V projection GEMM failed";
+
+    if (rank_ == 0)
+    {
+        // Print Q/K/V stats
+        auto print_stats = [](const std::vector<float> &v, const char *name)
+        {
+            float min_v = *std::min_element(v.begin(), v.end());
+            float max_v = *std::max_element(v.begin(), v.end());
+            double sum = std::accumulate(v.begin(), v.end(), 0.0);
+            std::cerr << "  " << name << ": min=" << min_v << " max=" << max_v
+                      << " mean=" << (sum / v.size()) << std::endl;
+        };
+        print_stats(Q_fp32, "Q");
+        print_stats(K_fp32, "K");
+        print_stats(V_fp32, "V");
+    }
+
+    // Compute FP32 reference for ALL heads WITH causal mask
+    for (int h = 0; h < n_heads; ++h)
+    {
+        int kv_h = h / heads_per_kv;
+
+        // Extract head-specific data (strided access)
+        std::vector<float> Q_h(seq_len * head_dim);
+        std::vector<float> K_h(kv_len * head_dim);
+        std::vector<float> V_h(kv_len * head_dim);
+
+        for (int s = 0; s < seq_len; ++s)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                Q_h[s * head_dim + d] = Q_fp32[s * n_heads * head_dim + h * head_dim + d];
+            }
+        }
+        for (int k = 0; k < kv_len; ++k)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                K_h[k * head_dim + d] = K_fp32[k * n_kv_heads * head_dim + kv_h * head_dim + d];
+                V_h[k * head_dim + d] = V_fp32[k * n_kv_heads * head_dim + kv_h * head_dim + d];
+            }
+        }
+
+        // Compute reference attention for this head WITH causal mask
+        std::vector<float> head_output(seq_len * head_dim);
+        compute_fp32_reference(seq_len, kv_len, head_dim,
+                               Q_h.data(), K_h.data(), V_h.data(), scale, head_output.data(),
+                               causal_mask.data(), kv_len);
+
+        // Copy back to output (strided)
+        for (int s = 0; s < seq_len; ++s)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                ref_output[s * n_heads * head_dim + h * head_dim + d] = head_output[s * head_dim + d];
+            }
+        }
+    }
+
+    // Quantize inputs to Q8_1 with multi-head layout
+    std::vector<Q8_1Block> Q_q8(seq_len * q_blocks_per_row);
+    std::vector<Q8_1Block> K_q8(kv_len * k_blocks_per_row);
+    std::vector<Q8_1Block> V_q8(kv_len * k_blocks_per_row);
+    std::vector<Q8_1Block> output_q8(seq_len * out_blocks_per_row);
+    std::memset(output_q8.data(), 0, output_q8.size() * sizeof(Q8_1Block));
+
+    // Quantize Q (multi-head layout)
+    for (int s = 0; s < seq_len; ++s)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            const float *fp32_head = Q_fp32.data() + s * n_heads * head_dim + h * head_dim;
+            Q8_1Block *q8_head = Q_q8.data() + s * q_blocks_per_row + h * head_dim_blocks;
+            quantize_fp32_to_q8_1(fp32_head, 1, head_dim, q8_head);
+        }
+    }
+
+    // Quantize K (multi-head layout)
+    for (int k = 0; k < kv_len; ++k)
+    {
+        for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+        {
+            const float *fp32_head = K_fp32.data() + k * n_kv_heads * head_dim + kv_h * head_dim;
+            Q8_1Block *q8_head = K_q8.data() + k * k_blocks_per_row + kv_h * head_dim_blocks;
+            quantize_fp32_to_q8_1(fp32_head, 1, head_dim, q8_head);
+        }
+    }
+
+    // Quantize V (multi-head layout)
+    for (int k = 0; k < kv_len; ++k)
+    {
+        for (int kv_h = 0; kv_h < n_kv_heads; ++kv_h)
+        {
+            const float *fp32_head = V_fp32.data() + k * n_kv_heads * head_dim + kv_h * head_dim;
+            Q8_1Block *q8_head = V_q8.data() + k * k_blocks_per_row + kv_h * head_dim_blocks;
+            quantize_fp32_to_q8_1(fp32_head, 1, head_dim, q8_head);
+        }
+    }
+
+    // Run JIT kernel for each head with proper striding AND causal mask
+    QuantisedAttentionJit_Q8_1_Fused jit_kernel(head_dim, false);
+    auto kernel_func = jit_kernel.get_kernel();
+
+    const int q_stride_bytes = q_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+    const int k_stride_bytes = k_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+    const int out_stride_bytes = out_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
+
+    for (int h = 0; h < n_heads; ++h)
+    {
+        int kv_h = h / heads_per_kv;
+
+        // Head-specific pointers (same as pipeline)
+        const Q8_1Block *Q_h = Q_q8.data() + h * head_dim_blocks;
+        const Q8_1Block *K_h = K_q8.data() + kv_h * head_dim_blocks;
+        const Q8_1Block *V_h = V_q8.data() + kv_h * head_dim_blocks;
+        Q8_1Block *out_h = output_q8.data() + h * head_dim_blocks;
+
+        FusedQ8_1AttentionParams params;
+        params.Q = Q_h;
+        params.K = K_h;
+        params.V = V_h;
+        params.output = out_h;
+        params.M = seq_len;
+        params.N = kv_len;
+        params.head_dim = head_dim;
+        params.Q_stride_bytes = q_stride_bytes;
+        params.K_stride_bytes = k_stride_bytes;
+        params.V_stride_bytes = k_stride_bytes;
+        params.output_stride_bytes = out_stride_bytes;
+        params.scale = scale;
+        params.mask = causal_mask.data(); // Causal mask!
+        params.mask_stride = kv_len;
+
+        kernel_func(&params);
+    }
+
+    // Dequantize output
+    std::vector<float> jit_output(seq_len * n_heads * head_dim);
+    for (int s = 0; s < seq_len; ++s)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            const Q8_1Block *q8_head = output_q8.data() + s * out_blocks_per_row + h * head_dim_blocks;
+            float *fp32_head = jit_output.data() + s * n_heads * head_dim + h * head_dim;
+            dequant_q8_1_to_fp32(q8_head, 1, head_dim, fp32_head);
+        }
+    }
+
+    // Compare per-head
+    if (rank_ == 0)
+    {
+        std::cerr << "\n=== Q8_1 Fused Attention with REAL MODEL WEIGHTS ===" << std::endl;
+        std::cerr << "  Model: " << model_path << std::endl;
+        std::cerr << "  n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
+                  << " head_dim=" << head_dim << " seq_len=" << seq_len << std::endl;
+        std::cerr << "  Q stride=" << q_blocks_per_row << " K stride=" << k_blocks_per_row << " blocks/row" << std::endl;
+    }
+
+    double min_cosine = 1.0;
+    double max_l2 = 0.0;
+    int worst_head = -1;
+
+    for (int h = 0; h < n_heads; ++h)
+    {
+        // Extract head output for comparison
+        std::vector<float> head_ref(seq_len * head_dim);
+        std::vector<float> head_jit(seq_len * head_dim);
+
+        for (int s = 0; s < seq_len; ++s)
+        {
+            for (int d = 0; d < head_dim; ++d)
+            {
+                head_ref[s * head_dim + d] = ref_output[s * n_heads * head_dim + h * head_dim + d];
+                head_jit[s * head_dim + d] = jit_output[s * n_heads * head_dim + h * head_dim + d];
+            }
+        }
+
+        auto [rel_l2, cosine] = compute_metrics(head_jit.data(), head_ref.data(), seq_len * head_dim);
+
+        if (cosine < min_cosine)
+        {
+            min_cosine = cosine;
+            worst_head = h;
+        }
+        max_l2 = std::max(max_l2, rel_l2);
+
+        if (rank_ == 0 && (cosine < 0.98 || h < 3))
+        {
+            std::cerr << "  Head " << h << " (kv_h=" << (h / heads_per_kv) << "): "
+                      << "Cosine=" << std::fixed << std::setprecision(6) << cosine
+                      << " RelL2=" << rel_l2 << std::endl;
+        }
+    }
+
+    if (rank_ == 0)
+    {
+        std::cerr << "  Worst head: " << worst_head << " (cosine=" << min_cosine << ")" << std::endl;
+        std::cerr << "  Max L2: " << max_l2 << std::endl;
+    }
+
+    // Q8_1 attention with causal mask should achieve >=0.98 cosine sim vs FP32
+    EXPECT_GE(min_cosine, 0.98)
+        << "Causal mask attention: worst head " << worst_head << " cosine " << min_cosine << " below 0.98";
+    EXPECT_LE(max_l2, 0.15)
+        << "Causal mask attention: max L2 error " << max_l2 << " above 0.15";
 }
 
 // Main function for GoogleTest with MPI

@@ -1,5 +1,5 @@
 /**
- * @file CPURMSNormTypedKernel.h
+ * @file CPURMSNormKernelT.h
  * @brief Typed RMSNorm kernel with fused precision conversion
  *
  * This kernel implements the "kernel black-box model" for typed residuals:
@@ -9,7 +9,7 @@
  * - Fused requant on output (if output precision != FP32)
  *
  * Design Contract:
- * - Pipeline instantiates CPURMSNormTypedKernel<Precision> based on config
+ * - Pipeline instantiates CPURMSNormKernelT<Precision> based on config
  * - Kernel accepts input/output buffers in that precision format
  * - All precision conversion is internal and transparent to caller
  *
@@ -27,6 +27,7 @@
 #include "../../../pipelines/PipelineConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
+#include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, etc. (apply_tensor)
 #include "../CPUKernelBase.h"
 #include <memory>
 #include <cstdint>
@@ -87,21 +88,21 @@ namespace llaminar2
      * Usage:
      * @code
      * // Pipeline creates kernel based on configured precision
-     * auto kernel = std::make_unique<CPURMSNormTypedKernel<ActivationPrecision::BF16>>();
+     * auto kernel = std::make_unique<CPURMSNormKernelT<ActivationPrecision::BF16>>();
      *
      * // Kernel takes BF16 input, computes in FP32, outputs BF16
      * kernel->apply_typed(bf16_input, gamma, bf16_output, rows, cols, epsilon);
      * @endcode
      */
     template <ActivationPrecision Precision>
-    class CPURMSNormTypedKernel : public CPUKernelBase
+    class CPURMSNormKernelT : public CPUKernelBase
     {
     public:
         using Metadata = detail::PrecisionMetadata<Precision>;
         using StorageType = typename Metadata::StorageType;
 
-        CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() = default;
+        CPURMSNormKernelT() = default;
+        ~CPURMSNormKernelT() = default;
 
         bool supports_device(int device_idx) const
         {
@@ -193,13 +194,13 @@ namespace llaminar2
      * No dequant/requant overhead.
      */
     template <>
-    class CPURMSNormTypedKernel<ActivationPrecision::FP32> : public ITensorRMSNorm, public CPUKernelBase
+    class CPURMSNormKernelT<ActivationPrecision::FP32> : public ITensorRMSNorm, public CPUKernelBase
     {
     public:
         using StorageType = float;
 
-        CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() override = default;
+        CPURMSNormKernelT() = default;
+        ~CPURMSNormKernelT() override = default;
 
         bool supports_device(int device_idx) const override
         {
@@ -262,6 +263,27 @@ namespace llaminar2
             return false; // FP32 kernel doesn't handle Q8_1
         }
 
+        // ===== Tensor-based API (type-checked dispatch) =====
+        bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *weight,
+            TensorBase *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            // Type check: this kernel only handles FP32
+            if (!input || !weight || !output)
+                return false;
+            if (input->native_type() != TensorType::FP32 ||
+                output->native_type() != TensorType::FP32)
+                return false;
+            return apply_typed(input->data(), weight->data(), output->mutable_data(),
+                               rows, cols, epsilon, device_idx);
+        }
+
         // ===== Typed API =====
         /**
          * @brief Apply RMSNorm with FP32 input/output (no conversion)
@@ -298,13 +320,13 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPURMSNormTypedKernel<ActivationPrecision::BF16> : public ITensorRMSNorm, public CPUKernelBase
+    class CPURMSNormKernelT<ActivationPrecision::BF16> : public ITensorRMSNorm, public CPUKernelBase
     {
     public:
         using StorageType = uint16_t; // BF16 stored as uint16_t
 
-        CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() override = default;
+        CPURMSNormKernelT() = default;
+        ~CPURMSNormKernelT() override = default;
 
         bool supports_device(int device_idx) const override
         {
@@ -367,6 +389,29 @@ namespace llaminar2
             return false; // BF16 kernel doesn't handle Q8_1
         }
 
+        // ===== Tensor-based API (type-checked dispatch) =====
+        bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *weight,
+            TensorBase *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            // Type check: this kernel only handles BF16
+            if (!input || !weight || !output)
+                return false;
+            if (input->native_type() != TensorType::BF16 ||
+                output->native_type() != TensorType::BF16)
+                return false;
+            auto *bf16_in = static_cast<const BF16Tensor *>(input);
+            auto *bf16_out = static_cast<BF16Tensor *>(output);
+            return apply_typed(bf16_in->bf16_data(), weight->data(), bf16_out->mutable_bf16_data(),
+                               rows, cols, epsilon, device_idx);
+        }
+
         // ===== Typed API =====
         /**
          * @brief Apply RMSNorm with BF16 input/output
@@ -408,13 +453,13 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    class CPURMSNormTypedKernel<ActivationPrecision::FP16> : public ITensorRMSNorm, public CPUKernelBase
+    class CPURMSNormKernelT<ActivationPrecision::FP16> : public ITensorRMSNorm, public CPUKernelBase
     {
     public:
         using StorageType = uint16_t; // FP16 stored as uint16_t
 
-        CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() override = default;
+        CPURMSNormKernelT() = default;
+        ~CPURMSNormKernelT() override = default;
 
         bool supports_device(int device_idx) const override
         {
@@ -477,6 +522,29 @@ namespace llaminar2
             return false; // FP16 kernel doesn't handle Q8_1
         }
 
+        // ===== Tensor-based API (type-checked dispatch) =====
+        bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *weight,
+            TensorBase *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            // Type check: this kernel only handles FP16
+            if (!input || !weight || !output)
+                return false;
+            if (input->native_type() != TensorType::FP16 ||
+                output->native_type() != TensorType::FP16)
+                return false;
+            auto *fp16_in = static_cast<const FP16Tensor *>(input);
+            auto *fp16_out = static_cast<FP16Tensor *>(output);
+            return apply_typed(fp16_in->fp16_data(), weight->data(), fp16_out->mutable_fp16_data(),
+                               rows, cols, epsilon, device_idx);
+        }
+
         // ===== Typed API =====
         /**
          * @brief Apply RMSNorm with FP16 input/output
@@ -516,13 +584,13 @@ namespace llaminar2
     struct Q8_1Block;
 
     template <>
-    class CPURMSNormTypedKernel<ActivationPrecision::Q8_1> : public ITensorRMSNorm, public CPUKernelBase
+    class CPURMSNormKernelT<ActivationPrecision::Q8_1> : public ITensorRMSNorm, public CPUKernelBase
     {
     public:
         using StorageType = Q8_1Block;
 
-        CPURMSNormTypedKernel() = default;
-        ~CPURMSNormTypedKernel() override = default;
+        CPURMSNormKernelT() = default;
+        ~CPURMSNormKernelT() override = default;
 
         bool supports_device(int device_idx) const override
         {
@@ -571,6 +639,29 @@ namespace llaminar2
             int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) override
         {
             return apply_typed(input, weight, output, rows, cols, epsilon, device_idx);
+        }
+
+        // ===== Tensor-based API (type-checked dispatch) =====
+        bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *weight,
+            TensorBase *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            // Type check: this kernel only handles Q8_1
+            if (!input || !weight || !output)
+                return false;
+            if (input->native_type() != TensorType::Q8_1 ||
+                output->native_type() != TensorType::Q8_1)
+                return false;
+            auto *q8_in = static_cast<const Q8_1Tensor *>(input);
+            auto *q8_out = static_cast<Q8_1Tensor *>(output);
+            return apply_typed(q8_in->q8_1_blocks(), weight->data(), q8_out->mutable_q8_1_blocks(),
+                               rows, cols, epsilon, device_idx);
         }
 
         // ===== Typed API =====

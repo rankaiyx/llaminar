@@ -1,6 +1,6 @@
 /**
- * @file Test__CPUSwiGLUKernelTyped.cpp
- * @brief Unit tests for CPUSwiGLUKernelTyped (FP32/BF16/FP16/Q8_1 specializations)
+ * @file Test__CPUSwiGLUKernelT.cpp
+ * @brief Unit tests for CPUSwiGLUKernelT (FP32/BF16/FP16/Q8_1 specializations)
  * @author David Sanftenberg
  *
  * Tests verify:
@@ -19,7 +19,7 @@
 #include <random>
 #include <algorithm>
 
-#include "kernels/cpu/ops/CPUSwiGLUKernelTyped.h"
+#include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "tensors/BlockStructures.h"
 
 namespace llaminar2
@@ -207,9 +207,9 @@ namespace llaminar2
     // FP32 Tests
     // ============================================================================
 
-    TEST(CPUSwiGLUKernelTyped_FP32, BasicFunctionality)
+    TEST(CPUSwiGLUKernelT_FP32, BasicFunctionality)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
         EXPECT_STREQ(kernel.precision_name(), "FP32");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 1.0f);
         EXPECT_TRUE(kernel.supports_device(-1));
@@ -234,9 +234,9 @@ namespace llaminar2
         }
     }
 
-    TEST(CPUSwiGLUKernelTyped_FP32, ZeroInputs)
+    TEST(CPUSwiGLUKernelT_FP32, ZeroInputs)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
         const int size = 64;
         std::vector<float> gate(size, 0.0f), up(size, 0.0f), output(size);
 
@@ -249,9 +249,9 @@ namespace llaminar2
         }
     }
 
-    TEST(CPUSwiGLUKernelTyped_FP32, NegativeGate)
+    TEST(CPUSwiGLUKernelT_FP32, NegativeGate)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
         const int size = 32;
         std::vector<float> gate(size), up(size, 1.0f), output(size);
 
@@ -272,9 +272,9 @@ namespace llaminar2
         }
     }
 
-    TEST(CPUSwiGLUKernelTyped_FP32, LargeValues)
+    TEST(CPUSwiGLUKernelT_FP32, LargeValues)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
         const int size = 32;
         std::vector<float> gate(size), up(size), output(size);
 
@@ -301,9 +301,9 @@ namespace llaminar2
     // BF16 Tests
     // ============================================================================
 
-    TEST(CPUSwiGLUKernelTyped_BF16, BasicFunctionality)
+    TEST(CPUSwiGLUKernelT_BF16, BasicFunctionality)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::BF16> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::BF16> kernel;
         EXPECT_STREQ(kernel.precision_name(), "BF16");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
 
@@ -331,10 +331,10 @@ namespace llaminar2
         }
     }
 
-    TEST(CPUSwiGLUKernelTyped_BF16, ConsistencyWithFP32)
+    TEST(CPUSwiGLUKernelT_BF16, ConsistencyWithFP32)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSwiGLUKernelTyped<ActivationPrecision::BF16> kernel_bf16;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSwiGLUKernelT<ActivationPrecision::BF16> kernel_bf16;
 
         const int size = 256;
         std::vector<float> gate_fp32(size), up_fp32(size), output_fp32(size);
@@ -369,9 +369,9 @@ namespace llaminar2
     // FP16 Tests
     // ============================================================================
 
-    TEST(CPUSwiGLUKernelTyped_FP16, BasicFunctionality)
+    TEST(CPUSwiGLUKernelT_FP16, BasicFunctionality)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP16> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::FP16> kernel;
         EXPECT_STREQ(kernel.precision_name(), "FP16");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
 
@@ -399,10 +399,10 @@ namespace llaminar2
         }
     }
 
-    TEST(CPUSwiGLUKernelTyped_FP16, ConsistencyWithFP32)
+    TEST(CPUSwiGLUKernelT_FP16, ConsistencyWithFP32)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP16> kernel_fp16;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSwiGLUKernelT<ActivationPrecision::FP16> kernel_fp16;
 
         const int size = 256;
         std::vector<float> gate_fp32(size), up_fp32(size), output_fp32(size);
@@ -437,9 +437,9 @@ namespace llaminar2
     // Q8_1 Tests
     // ============================================================================
 
-    TEST(CPUSwiGLUKernelTyped_Q8_1, BasicFunctionality)
+    TEST(CPUSwiGLUKernelT_Q8_1, BasicFunctionality)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::Q8_1> kernel;
         EXPECT_STREQ(kernel.precision_name(), "Q8_1");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 4.0f);
 
@@ -496,10 +496,10 @@ namespace llaminar2
         EXPECT_GT(cos_sim, 0.98f) << "Q8_1 output should be reasonably close to reference";
     }
 
-    TEST(CPUSwiGLUKernelTyped_Q8_1, ConsistencyWithFP32)
+    TEST(CPUSwiGLUKernelT_Q8_1, ConsistencyWithFP32)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSwiGLUKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         const int n_blocks = 8;
         const int size = n_blocks * 32;
@@ -538,9 +538,9 @@ namespace llaminar2
         EXPECT_GT(cos_sim, 0.95f) << "Q8_1 output should be reasonably close to FP32";
     }
 
-    TEST(CPUSwiGLUKernelTyped_Q8_1, MultipleBlocks)
+    TEST(CPUSwiGLUKernelT_Q8_1, MultipleBlocks)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::Q8_1> kernel;
 
         const int n_blocks = 16;
         const int size = n_blocks * 32;
@@ -580,12 +580,12 @@ namespace llaminar2
     // Cross-Precision Tests
     // ============================================================================
 
-    TEST(CPUSwiGLUKernelTyped_CrossPrecision, AllPrecisionsProduceSimilarResults)
+    TEST(CPUSwiGLUKernelT_CrossPrecision, AllPrecisionsProduceSimilarResults)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSwiGLUKernelTyped<ActivationPrecision::BF16> kernel_bf16;
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP16> kernel_fp16;
-        CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSwiGLUKernelT<ActivationPrecision::BF16> kernel_bf16;
+        CPUSwiGLUKernelT<ActivationPrecision::FP16> kernel_fp16;
+        CPUSwiGLUKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         const int n_blocks = 4;
         const int size = n_blocks * 32;
@@ -650,27 +650,27 @@ namespace llaminar2
     // Edge Cases Tests
     // ============================================================================
 
-    TEST(CPUSwiGLUKernelTyped_EdgeCases, EmptyInput)
+    TEST(CPUSwiGLUKernelT_EdgeCases, EmptyInput)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
         // Use non-null but unused pointers with size=0
         float dummy[1] = {0.0f};
         EXPECT_TRUE(kernel.apply_typed(dummy, dummy, dummy, 0));
     }
 
-    TEST(CPUSwiGLUKernelTyped_EdgeCases, NullPointer)
+    TEST(CPUSwiGLUKernelT_EdgeCases, NullPointer)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSwiGLUKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         EXPECT_FALSE(kernel_fp32.apply_typed(nullptr, nullptr, nullptr, 10));
         EXPECT_FALSE(kernel_q8.apply_typed(nullptr, nullptr, nullptr, 32));
     }
 
-    TEST(CPUSwiGLUKernelTyped_EdgeCases, SingleElement)
+    TEST(CPUSwiGLUKernelT_EdgeCases, SingleElement)
     {
         // Note: Q8_1 requires multiples of 32, so this only tests FP32/BF16/FP16
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
         std::vector<float> gate = {1.5f}, up = {2.0f}, output(1);
 
         ASSERT_TRUE(kernel.apply_typed(gate.data(), up.data(), output.data(), 1));
@@ -679,28 +679,28 @@ namespace llaminar2
         EXPECT_NEAR(output[0], expected, 1e-5f);
     }
 
-    TEST(CPUSwiGLUKernelTyped_Metadata, PrecisionNames)
+    TEST(CPUSwiGLUKernelT_Metadata, PrecisionNames)
     {
-        EXPECT_STREQ(CPUSwiGLUKernelTyped<ActivationPrecision::FP32>::precision_name(), "FP32");
-        EXPECT_STREQ(CPUSwiGLUKernelTyped<ActivationPrecision::BF16>::precision_name(), "BF16");
-        EXPECT_STREQ(CPUSwiGLUKernelTyped<ActivationPrecision::FP16>::precision_name(), "FP16");
-        EXPECT_STREQ(CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1>::precision_name(), "Q8_1");
+        EXPECT_STREQ(CPUSwiGLUKernelT<ActivationPrecision::FP32>::precision_name(), "FP32");
+        EXPECT_STREQ(CPUSwiGLUKernelT<ActivationPrecision::BF16>::precision_name(), "BF16");
+        EXPECT_STREQ(CPUSwiGLUKernelT<ActivationPrecision::FP16>::precision_name(), "FP16");
+        EXPECT_STREQ(CPUSwiGLUKernelT<ActivationPrecision::Q8_1>::precision_name(), "Q8_1");
     }
 
-    TEST(CPUSwiGLUKernelTyped_Metadata, CompressionRatios)
+    TEST(CPUSwiGLUKernelT_Metadata, CompressionRatios)
     {
-        EXPECT_FLOAT_EQ(CPUSwiGLUKernelTyped<ActivationPrecision::FP32>::compression_ratio(), 1.0f);
-        EXPECT_FLOAT_EQ(CPUSwiGLUKernelTyped<ActivationPrecision::BF16>::compression_ratio(), 2.0f);
-        EXPECT_FLOAT_EQ(CPUSwiGLUKernelTyped<ActivationPrecision::FP16>::compression_ratio(), 2.0f);
-        EXPECT_FLOAT_EQ(CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1>::compression_ratio(), 4.0f);
+        EXPECT_FLOAT_EQ(CPUSwiGLUKernelT<ActivationPrecision::FP32>::compression_ratio(), 1.0f);
+        EXPECT_FLOAT_EQ(CPUSwiGLUKernelT<ActivationPrecision::BF16>::compression_ratio(), 2.0f);
+        EXPECT_FLOAT_EQ(CPUSwiGLUKernelT<ActivationPrecision::FP16>::compression_ratio(), 2.0f);
+        EXPECT_FLOAT_EQ(CPUSwiGLUKernelT<ActivationPrecision::Q8_1>::compression_ratio(), 4.0f);
     }
 
-    TEST(CPUSwiGLUKernelTyped_Metadata, DeviceSupport)
+    TEST(CPUSwiGLUKernelT_Metadata, DeviceSupport)
     {
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP32> kernel_fp32;
-        CPUSwiGLUKernelTyped<ActivationPrecision::BF16> kernel_bf16;
-        CPUSwiGLUKernelTyped<ActivationPrecision::FP16> kernel_fp16;
-        CPUSwiGLUKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel_fp32;
+        CPUSwiGLUKernelT<ActivationPrecision::BF16> kernel_bf16;
+        CPUSwiGLUKernelT<ActivationPrecision::FP16> kernel_fp16;
+        CPUSwiGLUKernelT<ActivationPrecision::Q8_1> kernel_q8;
 
         // All kernels should support CPU (device_idx = -1)
         EXPECT_TRUE(kernel_fp32.supports_device(-1));

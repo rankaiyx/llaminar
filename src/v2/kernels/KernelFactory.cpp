@@ -8,6 +8,11 @@
 #include "cpu/gemm_v4/QuantisedGemmKernel.h"
 #include "cpu/gemm_v4/FloatingPointGemmKernel.h"
 #include "cpu/ops/CPURoPEKernelT.h"
+#include "cpu/ops/CPUSwiGLUKernelT.h"
+#include "cpu/ops/CPUSoftmaxKernelT.h"
+#include "cpu/ops/CPURMSNormKernelT.h"
+#include "cpu/ops/CPUEmbeddingKernelT.h"
+#include "cpu/attention/CPUAttentionKernelTyped.h"
 
 #include "../tensors/Tensors.h"
 #include "../backends/ComputeBackend.h"
@@ -86,6 +91,362 @@ namespace llaminar
                     throw std::runtime_error(std::string(tensor_type) + " GEMM not supported on " +
                                              to_string(dev_type));
                 }
+
+                // =========================================================================
+                // Adapter: CPURoPEKernelT<FP32> -> ITensorRoPE
+                // Only FP32 is supported through this interface (other precisions use
+                // their native typed kernels directly).
+                // =========================================================================
+                class RoPEKernelAdapter : public llaminar2::ITensorRoPE
+                {
+                public:
+                    bool supports_device(int device_idx) const override
+                    {
+                        return kernel_.supports_device(device_idx);
+                    }
+
+                    // Original raw pointer interface (legacy)
+                    bool apply(
+                        float *data, float *output,
+                        const int *pos_ids,
+                        int batch_size, int seq_len, int head_dim, int num_heads,
+                        float theta_base, bool interleaved,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)interleaved; // Not used in typed kernel
+                        (void)mpi_ctx;     // Not used in typed kernel
+                        // Legacy interface treats data as Q and output as K
+                        // Treat batch_size * seq_len as total seq_len
+                        return kernel_.apply_typed(data, output, pos_ids,
+                                                   batch_size * seq_len, num_heads, num_heads, head_dim,
+                                                   theta_base, device_idx);
+                    }
+
+                    // Tensor-based interface (used by RoPEOpTyped)
+                    bool apply_tensor(
+                        llaminar2::TensorBase *Q,
+                        llaminar2::TensorBase *K,
+                        const int *position_ids,
+                        int seq_len,
+                        int n_heads,
+                        int n_kv_heads,
+                        int head_dim,
+                        float rope_theta,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)mpi_ctx; // Not used in typed kernel
+
+                        // Validate tensors are FP32
+                        if (!Q)
+                        {
+                            LOG_ERROR("[RoPEKernelAdapter] Q tensor is null");
+                            return false;
+                        }
+                        if (Q->native_type() != llaminar2::TensorType::FP32)
+                        {
+                            LOG_ERROR("[RoPEKernelAdapter] Q tensor must be FP32, got " << static_cast<int>(Q->native_type()));
+                            return false;
+                        }
+                        if (K && K->native_type() != llaminar2::TensorType::FP32)
+                        {
+                            LOG_ERROR("[RoPEKernelAdapter] K tensor must be FP32, got " << static_cast<int>(K->native_type()));
+                            return false;
+                        }
+
+                        // Get raw pointers from tensors
+                        float *Q_data = Q->mutable_data();
+                        float *K_data = K ? K->mutable_data() : nullptr;
+
+                        return kernel_.apply_typed(Q_data, K_data, position_ids,
+                                                   seq_len, n_heads, n_kv_heads, head_dim,
+                                                   rope_theta, device_idx);
+                    }
+
+                private:
+                    llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::FP32> kernel_;
+                };
+
+                // =========================================================================
+                // Adapter: CPURoPEKernelT<Q8_1> -> ITensorRoPE
+                // =========================================================================
+                class Q8_1RoPEKernelAdapter : public llaminar2::ITensorRoPE
+                {
+                public:
+                    bool supports_device(int device_idx) const override
+                    {
+                        return kernel_.supports_device(device_idx);
+                    }
+
+                    // Original raw pointer interface (legacy) - not supported for Q8_1
+                    bool apply(
+                        float *data, float *output,
+                        const int *pos_ids,
+                        int batch_size, int seq_len, int head_dim, int num_heads,
+                        float theta_base, bool interleaved,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)data;
+                        (void)output;
+                        (void)pos_ids;
+                        (void)batch_size;
+                        (void)seq_len;
+                        (void)head_dim;
+                        (void)num_heads;
+                        (void)theta_base;
+                        (void)interleaved;
+                        (void)mpi_ctx;
+                        (void)device_idx;
+                        LOG_ERROR("[Q8_1RoPEKernelAdapter] Raw float* interface not supported for Q8_1");
+                        return false;
+                    }
+
+                    // Tensor-based interface (used by RoPEOpTyped)
+                    bool apply_tensor(
+                        llaminar2::TensorBase *Q,
+                        llaminar2::TensorBase *K,
+                        const int *position_ids,
+                        int seq_len,
+                        int n_heads,
+                        int n_kv_heads,
+                        int head_dim,
+                        float rope_theta,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)mpi_ctx; // Not used in typed kernel
+
+                        // Validate tensors are Q8_1
+                        if (!Q)
+                        {
+                            LOG_ERROR("[Q8_1RoPEKernelAdapter] Q tensor is null");
+                            return false;
+                        }
+                        if (Q->native_type() != llaminar2::TensorType::Q8_1)
+                        {
+                            LOG_ERROR("[Q8_1RoPEKernelAdapter] Q tensor must be Q8_1, got " << static_cast<int>(Q->native_type()));
+                            return false;
+                        }
+                        if (K && K->native_type() != llaminar2::TensorType::Q8_1)
+                        {
+                            LOG_ERROR("[Q8_1RoPEKernelAdapter] K tensor must be Q8_1, got " << static_cast<int>(K->native_type()));
+                            return false;
+                        }
+
+                        // Cast to Q8_1Tensor to access Q8_1 blocks
+                        auto *Q_q8 = dynamic_cast<llaminar2::Q8_1Tensor *>(Q);
+                        auto *K_q8 = K ? dynamic_cast<llaminar2::Q8_1Tensor *>(K) : nullptr;
+
+                        if (!Q_q8)
+                        {
+                            LOG_ERROR("[Q8_1RoPEKernelAdapter] Failed to cast Q to Q8_1Tensor");
+                            return false;
+                        }
+                        if (K && !K_q8)
+                        {
+                            LOG_ERROR("[Q8_1RoPEKernelAdapter] Failed to cast K to Q8_1Tensor");
+                            return false;
+                        }
+
+                        // Get Q8_1 block pointers
+                        llaminar2::Q8_1Block *Q_blocks = Q_q8->mutable_q8_1_blocks();
+                        llaminar2::Q8_1Block *K_blocks = K_q8 ? K_q8->mutable_q8_1_blocks() : nullptr;
+
+                        return kernel_.apply_typed(Q_blocks, K_blocks, position_ids,
+                                                   seq_len, n_heads, n_kv_heads, head_dim,
+                                                   rope_theta, device_idx);
+                    }
+
+                private:
+                    llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::Q8_1> kernel_;
+                };
+
+                // =========================================================================
+                // Adapter: CPUSwiGLUKernelT<FP32> -> ITensorSwiGLU
+                // =========================================================================
+                class SwiGLUKernelAdapter : public llaminar2::ITensorSwiGLU
+                {
+                public:
+                    bool supports_device(int device_idx) const override
+                    {
+                        return kernel_.supports_device(device_idx);
+                    }
+
+                    // Original raw pointer interface (legacy)
+                    bool apply(
+                        const float *gate, const float *up, float *output,
+                        int rows, int cols,
+                        bool add_residual,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)add_residual; // Not used in typed kernel
+                        (void)mpi_ctx;      // Not used in typed kernel
+                        return kernel_.apply_typed(gate, up, output, rows * cols, device_idx);
+                    }
+
+                    // Tensor-based interface (used by SwiGLUOpTyped)
+                    bool apply_tensor(
+                        llaminar2::TensorBase *gate,
+                        llaminar2::TensorBase *up,
+                        llaminar2::TensorBase *output,
+                        int rows, int cols,
+                        bool add_residual,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)add_residual; // Not used in typed kernel
+                        (void)mpi_ctx;      // Not used in typed kernel
+
+                        // Validate tensors are FP32
+                        if (!gate || gate->native_type() != llaminar2::TensorType::FP32)
+                        {
+                            LOG_ERROR("[SwiGLUKernelAdapter] gate tensor must be FP32");
+                            return false;
+                        }
+                        if (!up || up->native_type() != llaminar2::TensorType::FP32)
+                        {
+                            LOG_ERROR("[SwiGLUKernelAdapter] up tensor must be FP32");
+                            return false;
+                        }
+                        if (!output || output->native_type() != llaminar2::TensorType::FP32)
+                        {
+                            LOG_ERROR("[SwiGLUKernelAdapter] output tensor must be FP32");
+                            return false;
+                        }
+
+                        // Get raw pointers from tensors
+                        const float *gate_data = gate->data();
+                        const float *up_data = up->data();
+                        float *output_data = output->mutable_data();
+
+                        return kernel_.apply_typed(gate_data, up_data, output_data, rows * cols, device_idx);
+                    }
+
+                private:
+                    llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::FP32> kernel_;
+                };
+
+                // =========================================================================
+                // Adapter: CPUSwiGLUKernelT<Q8_1> -> ITensorSwiGLU
+                // =========================================================================
+                class Q8_1SwiGLUKernelAdapter : public llaminar2::ITensorSwiGLU
+                {
+                public:
+                    bool supports_device(int device_idx) const override
+                    {
+                        return kernel_.supports_device(device_idx);
+                    }
+
+                    // Original raw pointer interface (legacy) - not supported for Q8_1
+                    bool apply(
+                        const float *gate, const float *up, float *output,
+                        int rows, int cols,
+                        bool add_residual,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)gate;
+                        (void)up;
+                        (void)output;
+                        (void)rows;
+                        (void)cols;
+                        (void)add_residual;
+                        (void)mpi_ctx;
+                        (void)device_idx;
+                        LOG_ERROR("[Q8_1SwiGLUKernelAdapter] Raw float* interface not supported for Q8_1");
+                        return false;
+                    }
+
+                    // Tensor-based interface (used by SwiGLUOpTyped)
+                    bool apply_tensor(
+                        llaminar2::TensorBase *gate,
+                        llaminar2::TensorBase *up,
+                        llaminar2::TensorBase *output,
+                        int rows, int cols,
+                        bool add_residual,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)add_residual; // Not used in typed kernel
+                        (void)mpi_ctx;      // Not used in typed kernel
+
+                        // Validate tensors are Q8_1
+                        if (!gate || gate->native_type() != llaminar2::TensorType::Q8_1)
+                        {
+                            LOG_ERROR("[Q8_1SwiGLUKernelAdapter] gate tensor must be Q8_1, got "
+                                      << (gate ? static_cast<int>(gate->native_type()) : -1));
+                            return false;
+                        }
+                        if (!up || up->native_type() != llaminar2::TensorType::Q8_1)
+                        {
+                            LOG_ERROR("[Q8_1SwiGLUKernelAdapter] up tensor must be Q8_1, got "
+                                      << (up ? static_cast<int>(up->native_type()) : -1));
+                            return false;
+                        }
+                        if (!output || output->native_type() != llaminar2::TensorType::Q8_1)
+                        {
+                            LOG_ERROR("[Q8_1SwiGLUKernelAdapter] output tensor must be Q8_1, got "
+                                      << (output ? static_cast<int>(output->native_type()) : -1));
+                            return false;
+                        }
+
+                        // Cast to Q8_1Tensor to access Q8_1 blocks
+                        auto *gate_q8 = dynamic_cast<llaminar2::Q8_1Tensor *>(gate);
+                        auto *up_q8 = dynamic_cast<llaminar2::Q8_1Tensor *>(up);
+                        auto *output_q8 = dynamic_cast<llaminar2::Q8_1Tensor *>(output);
+
+                        if (!gate_q8 || !up_q8 || !output_q8)
+                        {
+                            LOG_ERROR("[Q8_1SwiGLUKernelAdapter] Failed to cast tensors to Q8_1Tensor");
+                            return false;
+                        }
+
+                        // Get Q8_1 block pointers
+                        const llaminar2::Q8_1Block *gate_blocks = gate_q8->q8_1_blocks();
+                        const llaminar2::Q8_1Block *up_blocks = up_q8->q8_1_blocks();
+                        llaminar2::Q8_1Block *output_blocks = output_q8->mutable_q8_1_blocks();
+
+                        return kernel_.apply_typed(gate_blocks, up_blocks, output_blocks, rows * cols, device_idx);
+                    }
+
+                private:
+                    llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::Q8_1> kernel_;
+                };
+
+                // =========================================================================
+                // Adapter: CPUSoftmaxKernelT<FP32> -> ITensorSoftmax
+                // =========================================================================
+                class SoftmaxKernelAdapter : public llaminar2::ITensorSoftmax
+                {
+                public:
+                    bool supports_device(int device_idx) const override
+                    {
+                        return kernel_.supports_device(device_idx);
+                    }
+
+                    bool apply(
+                        const float *input, float *output,
+                        int rows, int cols,
+                        bool use_causal_mask,
+                        const llaminar2::MPIContext *mpi_ctx,
+                        int device_idx) override
+                    {
+                        (void)mpi_ctx; // Not used in typed kernel
+                        // Copy input to output for in-place operation if different buffers
+                        if (input != output)
+                        {
+                            std::memcpy(output, input, rows * cols * sizeof(float));
+                        }
+                        return kernel_.apply_typed(output, rows, cols, use_causal_mask, 1.0f, device_idx);
+                    }
+
+                private:
+                    llaminar2::CPUSoftmaxKernelT<llaminar2::ActivationPrecision::FP32> kernel_;
+                };
+
             } // namespace
 
             // ==========================================================================
@@ -625,6 +986,7 @@ namespace llaminar
 
             // ==========================================================================
             // RoPE Kernel Creation - Device-aware dispatch
+            // Now returns typed kernels directly (they implement ITensorRoPE)
             // ==========================================================================
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
@@ -634,7 +996,8 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::FP32Tensor>>();
+                    // Return typed kernel directly - it implements ITensorRoPE
+                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::FP32>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -654,7 +1017,8 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::BF16Tensor>>();
+                    // Return typed kernel directly - it implements ITensorRoPE
+                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::BF16>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -673,7 +1037,8 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::FP16Tensor>>();
+                    // Return typed kernel directly - it implements ITensorRoPE
+                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::FP16>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -692,7 +1057,8 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::Q8_1Tensor>>();
+                    // Return typed kernel directly - it implements ITensorRoPE
+                    return std::make_unique<llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::Q8_1>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -701,6 +1067,376 @@ namespace llaminar
 
                 default:
                     throwUnsupportedBackend(dev_type, "Q8_1 RoPE");
+                }
+            }
+
+            // ==========================================================================
+            // SwiGLU Kernel Creation - Device-aware dispatch
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor; // SwiGLU kernels don't need tensor state for creation
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::FP32>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP32 SwiGLU");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP32 SwiGLU");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::BF16>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "BF16 SwiGLU");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "BF16 SwiGLU");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::FP16>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP16 SwiGLU");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP16 SwiGLU");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUSwiGLUKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "Q8_1 SwiGLU");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "Q8_1 SwiGLU");
+                }
+            }
+
+            // ==========================================================================
+            // Softmax Kernel Creation - Device-aware dispatch
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<SoftmaxKernelAdapter>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP32 Softmax");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP32 Softmax");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                // BF16 Softmax through ITensorSoftmax interface not supported - use typed kernel directly
+                LOG_ERROR("[KernelFactory] BF16 Softmax through ITensorSoftmax interface not supported");
+                throwUnsupportedBackend(dev_type, "BF16 Softmax (use typed kernel)");
+            }
+
+            std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                // FP16 Softmax through ITensorSoftmax interface not supported - use typed kernel directly
+                LOG_ERROR("[KernelFactory] FP16 Softmax through ITensorSoftmax interface not supported");
+                throwUnsupportedBackend(dev_type, "FP16 Softmax (use typed kernel)");
+            }
+
+            std::unique_ptr<llaminar2::ITensorSoftmax> KernelFactory::createSoftmax(
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                // Q8_1 Softmax through ITensorSoftmax interface not supported - use typed kernel directly
+                LOG_ERROR("[KernelFactory] Q8_1 Softmax through ITensorSoftmax interface not supported");
+                throwUnsupportedBackend(dev_type, "Q8_1 Softmax (use typed kernel)");
+            }
+
+            // ==========================================================================
+            // RMSNorm Kernel Creation - Device-aware dispatch
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::FP32>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP32 RMSNorm");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP32 RMSNorm");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::BF16>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "BF16 RMSNorm");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "BF16 RMSNorm");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::FP16>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP16 RMSNorm");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP16 RMSNorm");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPURMSNormKernelT<llaminar2::ActivationPrecision::Q8_1>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "Q8_1 RMSNorm");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "Q8_1 RMSNorm");
+                }
+            }
+
+            // ==========================================================================
+            // Attention Kernel Creation - Device-aware dispatch
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP32>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP32 Attention");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP32 Attention");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::BF16>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "BF16 Attention");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "BF16 Attention");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP16>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP16 Attention");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP16 Attention");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::Q8_1>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "Q8_1 Attention");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "Q8_1 Attention");
+                }
+            }
+
+            // ==========================================================================
+            // Embedding Kernel Creation - Device-aware dispatch
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
+                const llaminar2::FP32Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::FP32Tensor>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP32 Embedding");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP32 Embedding");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
+                const llaminar2::BF16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::BF16Tensor>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "BF16 Embedding");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "BF16 Embedding");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
+                const llaminar2::FP16Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::FP16Tensor>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "FP16 Embedding");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "FP16 Embedding");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorEmbedding> KernelFactory::createEmbedding(
+                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type)
+            {
+                (void)tensor;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUEmbeddingKernelT<llaminar2::Q8_1Tensor>>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedBackend(dev_type, "Q8_1 Embedding");
+#endif
+
+                default:
+                    throwUnsupportedBackend(dev_type, "Q8_1 Embedding");
                 }
             }
 

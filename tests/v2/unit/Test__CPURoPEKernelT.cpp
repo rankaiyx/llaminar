@@ -1,6 +1,6 @@
 /**
- * @file Test__CPURoPEKernelTyped.cpp
- * @brief Unit tests for CPURoPEKernelTyped with typed precision conversion
+ * @file Test__CPURoPEKernelT.cpp
+ * @brief Unit tests for CPURoPEKernelT with typed precision conversion
  *
  * Tests the typed RoPE kernel with FP32, BF16, FP16, and Q8_1 precision types.
  * The Q8_1 implementation uses pure-integer operations without FP32 round-trips.
@@ -11,7 +11,7 @@
 
 #include <gtest/gtest.h>
 
-#include "v2/kernels/cpu/ops/CPURoPEKernelTyped.h"
+#include "v2/kernels/cpu/ops/CPURoPEKernelT.h"
 #include "v2/kernels/cpu/primitives/RoPEPrimitives.h"
 #include "v2/tensors/SIMDHelpers.h"
 #include "v2/tensors/BlockStructures.h"
@@ -144,7 +144,7 @@ namespace llaminar2
     // Test Fixture
     // =========================================================================
 
-    class CPURoPEKernelTypedTest : public ::testing::Test
+    class CPURoPEKernelTTest : public ::testing::Test
     {
     protected:
         static constexpr float ROPE_THETA = 10000.0f;
@@ -181,7 +181,7 @@ namespace llaminar2
     // FP32 Specialization Tests
     // =========================================================================
 
-    TEST_F(CPURoPEKernelTypedTest, FP32_apply_typed_matches_reference)
+    TEST_F(CPURoPEKernelTTest, FP32_apply_typed_matches_reference)
     {
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
         const size_t k_size = seq_len_ * n_kv_heads_ * head_dim_;
@@ -205,7 +205,7 @@ namespace llaminar2
                        position_ids.data(), ROPE_THETA);
 
         // Test typed kernel (operates in-place)
-        CPURoPEKernelTyped<ActivationPrecision::FP32> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
 
         // Call the kernel's apply_typed method
         ASSERT_TRUE(kernel.apply_typed(
@@ -225,15 +225,15 @@ namespace llaminar2
             << "FP32 RoPE K max diff: " << k_max_diff;
     }
 
-    TEST_F(CPURoPEKernelTypedTest, FP32_precision_metadata)
+    TEST_F(CPURoPEKernelTTest, FP32_precision_metadata)
     {
-        CPURoPEKernelTyped<ActivationPrecision::FP32> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
         EXPECT_EQ(kernel.precision(), ActivationPrecision::FP32);
         EXPECT_STREQ(kernel.precision_name(), "FP32");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 1.0f);
     }
 
-    TEST_F(CPURoPEKernelTypedTest, FP32_single_token_single_head)
+    TEST_F(CPURoPEKernelTTest, FP32_single_token_single_head)
     {
         // Minimal test case: 1 token, 1 head
         int local_seq_len = 1;
@@ -248,7 +248,7 @@ namespace llaminar2
         reference_rope(q_expected.data(), local_seq_len, local_n_heads, head_dim_,
                        position_ids.data(), ROPE_THETA);
 
-        CPURoPEKernelTyped<ActivationPrecision::FP32> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             q_data.data(), nullptr,
             position_ids.data(),
@@ -263,7 +263,7 @@ namespace llaminar2
     // BF16 Specialization Tests
     // =========================================================================
 
-    TEST_F(CPURoPEKernelTypedTest, BF16_apply_typed_with_conversion)
+    TEST_F(CPURoPEKernelTTest, BF16_apply_typed_with_conversion)
     {
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
 
@@ -285,7 +285,7 @@ namespace llaminar2
                        position_ids.data(), ROPE_THETA);
 
         // Apply RoPE to BF16 data using the kernel
-        CPURoPEKernelTyped<ActivationPrecision::BF16> kernel;
+        CPURoPEKernelT<ActivationPrecision::BF16> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             bf16_q.data(), nullptr,
             position_ids.data(),
@@ -306,9 +306,9 @@ namespace llaminar2
             << "BF16 RoPE cosine similarity: " << cosine;
     }
 
-    TEST_F(CPURoPEKernelTypedTest, BF16_precision_metadata)
+    TEST_F(CPURoPEKernelTTest, BF16_precision_metadata)
     {
-        CPURoPEKernelTyped<ActivationPrecision::BF16> kernel;
+        CPURoPEKernelT<ActivationPrecision::BF16> kernel;
         EXPECT_EQ(kernel.precision(), ActivationPrecision::BF16);
         EXPECT_STREQ(kernel.precision_name(), "BF16");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
@@ -318,7 +318,7 @@ namespace llaminar2
     // FP16 Specialization Tests
     // =========================================================================
 
-    TEST_F(CPURoPEKernelTypedTest, FP16_apply_typed_with_conversion)
+    TEST_F(CPURoPEKernelTTest, FP16_apply_typed_with_conversion)
     {
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
 
@@ -340,7 +340,7 @@ namespace llaminar2
                        position_ids.data(), ROPE_THETA);
 
         // Apply RoPE to FP16 data using the kernel
-        CPURoPEKernelTyped<ActivationPrecision::FP16> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP16> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             fp16_q.data(), nullptr,
             position_ids.data(),
@@ -361,9 +361,9 @@ namespace llaminar2
             << "FP16 RoPE cosine similarity: " << cosine;
     }
 
-    TEST_F(CPURoPEKernelTypedTest, FP16_precision_metadata)
+    TEST_F(CPURoPEKernelTTest, FP16_precision_metadata)
     {
-        CPURoPEKernelTyped<ActivationPrecision::FP16> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP16> kernel;
         EXPECT_EQ(kernel.precision(), ActivationPrecision::FP16);
         EXPECT_STREQ(kernel.precision_name(), "FP16");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
@@ -373,7 +373,7 @@ namespace llaminar2
     // Q8_1 Specialization Tests
     // =========================================================================
 
-    TEST_F(CPURoPEKernelTypedTest, Q8_1_apply_typed_with_conversion)
+    TEST_F(CPURoPEKernelTTest, Q8_1_apply_typed_with_conversion)
     {
         // Q8_1 requires head_dim divisible by 32
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
@@ -420,15 +420,15 @@ namespace llaminar2
             << "Q8_1 RoPE max diff: " << max_diff;
     }
 
-    TEST_F(CPURoPEKernelTypedTest, Q8_1_precision_metadata)
+    TEST_F(CPURoPEKernelTTest, Q8_1_precision_metadata)
     {
-        CPURoPEKernelTyped<ActivationPrecision::Q8_1> kernel;
+        CPURoPEKernelT<ActivationPrecision::Q8_1> kernel;
         EXPECT_EQ(kernel.precision(), ActivationPrecision::Q8_1);
         EXPECT_STREQ(kernel.precision_name(), "Q8_1");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 4.0f);
     }
 
-    TEST_F(CPURoPEKernelTypedTest, Q8_1_requires_head_dim_multiple_of_32)
+    TEST_F(CPURoPEKernelTTest, Q8_1_requires_head_dim_multiple_of_32)
     {
         // Test that Q8_1 RoPE requires head_dim divisible by 32
         // This is enforced by the apply_rope_q8_1_integer function
@@ -453,7 +453,7 @@ namespace llaminar2
         // No assertion - just verifying no crash
     }
 
-    TEST_F(CPURoPEKernelTypedTest, Q8_1_with_both_Q_and_K)
+    TEST_F(CPURoPEKernelTTest, Q8_1_with_both_Q_and_K)
     {
         // Test with both Q and K tensors
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
@@ -513,7 +513,7 @@ namespace llaminar2
     // Cross-Precision Consistency Tests
     // =========================================================================
 
-    TEST_F(CPURoPEKernelTypedTest, AllPrecisions_SameInput_SimilarOutput)
+    TEST_F(CPURoPEKernelTTest, AllPrecisions_SameInput_SimilarOutput)
     {
         // Verify that all precisions produce similar results for the same input
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
@@ -525,7 +525,7 @@ namespace llaminar2
 
         // FP32 result (ground truth)
         std::vector<float> fp32_q = fp32_original;
-        CPURoPEKernelTyped<ActivationPrecision::FP32> kernel_fp32;
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel_fp32;
         kernel_fp32.apply_typed(
             fp32_q.data(), nullptr,
             position_ids.data(),
@@ -535,7 +535,7 @@ namespace llaminar2
         // BF16 result
         std::vector<uint16_t> bf16_q(q_size);
         simd::convert_fp32_to_bf16(fp32_original.data(), bf16_q.data(), q_size);
-        CPURoPEKernelTyped<ActivationPrecision::BF16> kernel_bf16;
+        CPURoPEKernelT<ActivationPrecision::BF16> kernel_bf16;
         kernel_bf16.apply_typed(
             bf16_q.data(), nullptr,
             position_ids.data(),
@@ -547,7 +547,7 @@ namespace llaminar2
         // FP16 result
         std::vector<uint16_t> fp16_q(q_size);
         simd::convert_fp32_to_fp16(fp32_original.data(), fp16_q.data(), q_size);
-        CPURoPEKernelTyped<ActivationPrecision::FP16> kernel_fp16;
+        CPURoPEKernelT<ActivationPrecision::FP16> kernel_fp16;
         kernel_fp16.apply_typed(
             fp16_q.data(), nullptr,
             position_ids.data(),
@@ -560,7 +560,7 @@ namespace llaminar2
         const size_t num_blocks = q_size / 32;
         std::vector<Q8_1Block> q8_q(num_blocks);
         simd::quantize_fp32_to_q8_1_blocks(fp32_original.data(), q8_q.data(), q_size);
-        CPURoPEKernelTyped<ActivationPrecision::Q8_1> kernel_q8;
+        CPURoPEKernelT<ActivationPrecision::Q8_1> kernel_q8;
         kernel_q8.apply_typed(
             q8_q.data(), nullptr,
             position_ids.data(),
@@ -588,7 +588,7 @@ namespace llaminar2
     // Edge Case Tests
     // =========================================================================
 
-    TEST_F(CPURoPEKernelTypedTest, FP32_skip_negative_position)
+    TEST_F(CPURoPEKernelTTest, FP32_skip_negative_position)
     {
         // Negative position IDs should be skipped (padding tokens)
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
@@ -598,7 +598,7 @@ namespace llaminar2
         // Mark position 1 as padding (-1)
         std::vector<int> position_ids = {0, -1, 2, 3};
 
-        CPURoPEKernelTyped<ActivationPrecision::FP32> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
         kernel.apply_typed(
             q_data.data(), nullptr,
             position_ids.data(),
@@ -614,7 +614,7 @@ namespace llaminar2
         }
     }
 
-    TEST_F(CPURoPEKernelTypedTest, FP32_different_rope_theta)
+    TEST_F(CPURoPEKernelTTest, FP32_different_rope_theta)
     {
         // Test with different rope_theta values
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
@@ -630,7 +630,7 @@ namespace llaminar2
             reference_rope(expected.data(), seq_len_, n_heads_, head_dim_,
                            position_ids.data(), theta);
 
-            CPURoPEKernelTyped<ActivationPrecision::FP32> kernel;
+            CPURoPEKernelT<ActivationPrecision::FP32> kernel;
             kernel.apply_typed(
                 q_data.data(), nullptr,
                 position_ids.data(),
@@ -643,7 +643,7 @@ namespace llaminar2
         }
     }
 
-    TEST_F(CPURoPEKernelTypedTest, FP32_large_position_ids)
+    TEST_F(CPURoPEKernelTTest, FP32_large_position_ids)
     {
         // Test with large position IDs (long context)
         const size_t q_size = seq_len_ * n_heads_ * head_dim_;
@@ -656,7 +656,7 @@ namespace llaminar2
         reference_rope(expected.data(), seq_len_, n_heads_, head_dim_,
                        position_ids.data(), ROPE_THETA);
 
-        CPURoPEKernelTyped<ActivationPrecision::FP32> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
         kernel.apply_typed(
             q_data.data(), nullptr,
             position_ids.data(),

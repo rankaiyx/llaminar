@@ -1,6 +1,6 @@
 /**
  * @file Perf__CPUSwiGLUKernel.cpp
- * @brief Performance benchmark for CPUSwiGLUKernel
+ * @brief Performance benchmark for CPUSwiGLUKernelT
  *
  * This test benchmarks the CPU SwiGLU kernel performance.
  * It measures:
@@ -28,6 +28,9 @@
 #include "utils/Logger.h"
 
 using namespace llaminar2;
+
+// Type alias for backward compatibility
+using CPUSwiGLUKernel = CPUSwiGLUKernelT<ActivationPrecision::FP32>;
 
 struct BenchmarkConfig
 {
@@ -81,12 +84,10 @@ protected:
         // Warmup
         for (int i = 0; i < config.warmup_iters; ++i)
         {
-            kernel.apply(
+            kernel.apply_typed(
                 gate.data(), up.data(), output.data(),
-                config.seq_len, config.d_ff,
-                false,   // use_bf16
-                nullptr, // mpi_ctx
-                -1       // device_idx
+                static_cast<int>(size),
+                -1 // device_idx
             );
         }
 
@@ -99,12 +100,10 @@ protected:
             MPI_Barrier(MPI_COMM_WORLD);
             auto start = std::chrono::high_resolution_clock::now();
 
-            kernel.apply(
+            kernel.apply_typed(
                 gate.data(), up.data(), output.data(),
-                config.seq_len, config.d_ff,
-                false,   // use_bf16
-                nullptr, // mpi_ctx
-                -1       // device_idx
+                static_cast<int>(size),
+                -1 // device_idx
             );
 
             auto end = std::chrono::high_resolution_clock::now();

@@ -234,6 +234,134 @@ namespace llaminar2
                 kv_len);
         }
 
+        /**
+         * @brief Native Q8_1 single-sequence attention (override for Q8_1 specialization)
+         *
+         * Only implemented for Q8_1 precision - returns false for all other precisions.
+         * This avoids ugly reinterpret_cast at the call site.
+         */
+        bool compute_q8_1(
+            const void *Q, const void *K, const void *V, void *output,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+
+            // Only Q8_1 precision supports this path
+            if constexpr (!std::is_same_v<TensorT, Q8_1Tensor>)
+            {
+                LOG_ERROR("[CPUAttentionKernelTyped] compute_q8_1 called on non-Q8_1 kernel");
+                return false;
+            }
+            else
+            {
+                const Q8_1Block *Q_blocks = static_cast<const Q8_1Block *>(Q);
+                const Q8_1Block *K_blocks = static_cast<const Q8_1Block *>(K);
+                const Q8_1Block *V_blocks = static_cast<const Q8_1Block *>(V);
+                Q8_1Block *output_blocks = static_cast<Q8_1Block *>(output);
+
+                const float *mask_ptr = workspace_mask ? workspace_mask->data() : nullptr;
+
+                return compute_q8_1_native(
+                    Q_blocks, K_blocks, V_blocks,
+                    reinterpret_cast<float *>(output_blocks), // Internal API still uses float*
+                    seq_len, n_heads, n_kv_heads, head_dim,
+                    causal, window_size,
+                    nullptr, // scores (not used by fused kernel)
+                    nullptr, // context (not used)
+                    mask_ptr,
+                    seq_len,  // kv_len = seq_len
+                    nullptr); // gemm_fallback (not used)
+            }
+        }
+
+        /**
+         * @brief Native Q8_1 batched attention (override for Q8_1 specialization)
+         *
+         * Only implemented for Q8_1 precision - returns false for all other precisions.
+         */
+        bool compute_batch_q8_1(
+            const void *Q, const void *K, const void *V, void *output,
+            int batch_size, int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            (void)device_idx;
+
+            // Only Q8_1 precision supports this path
+            if constexpr (!std::is_same_v<TensorT, Q8_1Tensor>)
+            {
+                LOG_ERROR("[CPUAttentionKernelTyped] compute_batch_q8_1 called on non-Q8_1 kernel");
+                return false;
+            }
+            else
+            {
+                const Q8_1Block *Q_blocks = static_cast<const Q8_1Block *>(Q);
+                const Q8_1Block *K_blocks = static_cast<const Q8_1Block *>(K);
+                const Q8_1Block *V_blocks = static_cast<const Q8_1Block *>(V);
+                Q8_1Block *output_blocks = static_cast<Q8_1Block *>(output);
+
+                const float *mask_ptr = workspace_mask ? workspace_mask->data() : nullptr;
+
+                // Process each batch item
+                const int head_dim_blocks = head_dim / Q8_1Block::BLOCK_SIZE;
+                const size_t q_batch_stride = seq_len * n_heads * head_dim_blocks;
+                const size_t kv_batch_stride = seq_len * n_kv_heads * head_dim_blocks;
+                const size_t out_batch_stride = seq_len * n_heads * head_dim_blocks;
+                const int total_tokens = batch_size * seq_len;
+
+                // Mask tile buffer for extracting per-batch mask
+                std::vector<float> mask_tile(mask_ptr ? seq_len * seq_len : 0);
+
+                for (int b = 0; b < batch_size; ++b)
+                {
+                    const Q8_1Block *Q_slice = Q_blocks + b * q_batch_stride;
+                    const Q8_1Block *K_slice = K_blocks + b * kv_batch_stride;
+                    const Q8_1Block *V_slice = V_blocks + b * kv_batch_stride;
+                    Q8_1Block *out_slice = output_blocks + b * out_batch_stride;
+
+                    // Extract per-batch mask tile if needed
+                    const float *mask_slice = nullptr;
+                    if (mask_ptr)
+                    {
+                        const int row_offset = b * seq_len;
+                        const int col_offset = b * seq_len;
+                        for (int i = 0; i < seq_len; ++i)
+                        {
+                            for (int j = 0; j < seq_len; ++j)
+                            {
+                                mask_tile[i * seq_len + j] = mask_ptr[(row_offset + i) * total_tokens + (col_offset + j)];
+                            }
+                        }
+                        mask_slice = mask_tile.data();
+                    }
+
+                    bool success = compute_q8_1_native(
+                        Q_slice, K_slice, V_slice,
+                        reinterpret_cast<float *>(out_slice),
+                        seq_len, n_heads, n_kv_heads, head_dim,
+                        causal, window_size,
+                        nullptr, nullptr, mask_slice,
+                        seq_len, nullptr);
+
+                    if (!success)
+                        return false;
+                }
+
+                return true;
+            }
+        }
+
     private:
         /**
          * @brief Q8_1-native FULLY FUSED attention computation
@@ -335,6 +463,18 @@ namespace llaminar2
             // Parallelism: parallelize over heads for small seq_len
             const int max_threads = omp_get_max_threads();
             bool parallelize_heads = (seq_len < 128) || (n_heads * 2 >= max_threads);
+
+            // Debug: Print params once per call (outside parallel region)
+            static bool debug_printed = false;
+            if (!debug_printed && mask != nullptr)
+            {
+                LOG_INFO("[compute_q8_1_native] seq_len=" << seq_len << " kv_len=" << kv_len
+                                                          << " n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
+                                                          << " head_dim=" << head_dim << " heads_per_kv=" << heads_per_kv
+                                                          << " q_blocks_per_row=" << q_blocks_per_row << " k_blocks_per_row=" << k_blocks_per_row
+                                                          << " mask=" << (mask ? "yes" : "no") << " mask_stride=" << kv_len);
+                debug_printed = true;
+            }
 
 #pragma omp parallel for if (parallelize_heads)
             for (int h = 0; h < n_heads; ++h)

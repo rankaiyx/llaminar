@@ -1,14 +1,13 @@
 /**
  * @file Perf__CPURoPEKernel.cpp
- * @brief Performance benchmarks comparing CPURoPEKernelT vs CPURoPEKernelTyped
+ * @brief Performance benchmarks for CPURoPEKernelT
  * @author David Sanftenberg
  *
  * Measures throughput (tokens/sec, GB/s) for RoPE operations across:
- *   - Legacy: CPURoPEKernelT<FP32Tensor>::apply()
- *   - Typed:  CPURoPEKernelTyped<FP32>::apply_typed()
- *   - Typed:  CPURoPEKernelTyped<BF16>::apply_typed()
- *   - Typed:  CPURoPEKernelTyped<FP16>::apply_typed()
- *   - Typed:  CPURoPEKernelTyped<Q8_1>::apply_typed()
+ *   - Typed:  CPURoPEKernelT<FP32>::apply_typed()
+ *   - Typed:  CPURoPEKernelT<BF16>::apply_typed()
+ *   - Typed:  CPURoPEKernelT<FP16>::apply_typed()
+ *   - Typed:  CPURoPEKernelT<Q8_1>::apply_typed()
  *
  * Test scenarios:
  *   - Single token (decode mode)
@@ -18,9 +17,8 @@
  *   - Long context (prefill, seq_len=2048)
  *
  * Expected results:
- *   1. FP32 Typed should match or exceed FP32 Legacy performance
- *   2. BF16/FP16 should be faster than FP32 (memory bandwidth savings)
- *   3. Q8_1 should be fastest, especially at larger sequence lengths
+ *   1. BF16/FP16 should be faster than FP32 (memory bandwidth savings)
+ *   2. Q8_1 should be fastest, especially at larger sequence lengths
  */
 
 #include <gtest/gtest.h>
@@ -35,7 +33,6 @@
 #include <vector>
 
 #include "kernels/cpu/ops/CPURoPEKernelT.h"
-#include "kernels/cpu/ops/CPURoPEKernelTyped.h"
 #include "tensors/Tensors.h"
 #include "tensors/SIMDHelpers.h"
 #include "tensors/BlockStructures.h"
@@ -176,51 +173,6 @@ protected:
     // Benchmark Functions
     // =========================================================================
 
-    BenchmarkResult benchmark_fp32_legacy(
-        int seq_len, int n_heads, int n_kv_heads, int head_dim)
-    {
-        size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
-        size_t k_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
-
-        auto q_data = generate_random_fp32(q_size);
-        auto k_data = generate_random_fp32(k_size);
-        auto position_ids = generate_position_ids(seq_len);
-
-        CPURoPEKernelT<FP32Tensor> kernel;
-
-        // Warmup
-        for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
-        {
-            kernel.apply(
-                q_data.data(), k_data.data(),
-                position_ids.data(),
-                seq_len, n_heads, n_kv_heads, head_dim,
-                ROPE_THETA);
-        }
-
-        MPI_Barrier(MPI_COMM_WORLD);
-
-        // Benchmark
-        auto start = std::chrono::high_resolution_clock::now();
-        for (size_t iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
-        {
-            kernel.apply(
-                q_data.data(), k_data.data(),
-                position_ids.data(),
-                seq_len, n_heads, n_kv_heads, head_dim,
-                ROPE_THETA);
-        }
-        auto end = std::chrono::high_resolution_clock::now();
-
-        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        double total_tokens = static_cast<double>(seq_len) * BENCHMARK_ITERATIONS;
-        double tokens_per_sec = total_tokens / (elapsed_ms / 1000.0);
-        double total_bytes = static_cast<double>(q_size + k_size) * sizeof(float) * BENCHMARK_ITERATIONS;
-        double bandwidth_gbps = total_bytes / (1024.0 * 1024.0 * 1024.0) / (elapsed_ms / 1000.0);
-
-        return {"FP32 Legacy", elapsed_ms, tokens_per_sec, bandwidth_gbps, BENCHMARK_ITERATIONS, seq_len};
-    }
-
     BenchmarkResult benchmark_fp32_typed(
         int seq_len, int n_heads, int n_kv_heads, int head_dim)
     {
@@ -231,7 +183,7 @@ protected:
         auto k_data = generate_random_fp32(k_size);
         auto position_ids = generate_position_ids(seq_len);
 
-        CPURoPEKernelTyped<ActivationPrecision::FP32> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
 
         // Warmup
         for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
@@ -283,7 +235,7 @@ protected:
 
         auto position_ids = generate_position_ids(seq_len);
 
-        CPURoPEKernelTyped<ActivationPrecision::BF16> kernel;
+        CPURoPEKernelT<ActivationPrecision::BF16> kernel;
 
         // Warmup
         for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
@@ -336,7 +288,7 @@ protected:
 
         auto position_ids = generate_position_ids(seq_len);
 
-        CPURoPEKernelTyped<ActivationPrecision::FP16> kernel;
+        CPURoPEKernelT<ActivationPrecision::FP16> kernel;
 
         // Warmup
         for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
@@ -397,7 +349,7 @@ protected:
 
         auto position_ids = generate_position_ids(seq_len);
 
-        CPURoPEKernelTyped<ActivationPrecision::Q8_1> kernel;
+        CPURoPEKernelT<ActivationPrecision::Q8_1> kernel;
 
         // Warmup
         for (size_t w = 0; w < WARMUP_ITERATIONS; ++w)
@@ -443,21 +395,19 @@ protected:
     {
         print_header(test_name, seq_len, n_heads, n_kv_heads, head_dim);
 
-        // Run benchmarks
-        auto fp32_legacy = benchmark_fp32_legacy(seq_len, n_heads, n_kv_heads, head_dim);
+        // Run benchmarks (FP32 Typed is now the baseline)
         auto fp32_typed = benchmark_fp32_typed(seq_len, n_heads, n_kv_heads, head_dim);
         auto bf16_typed = benchmark_bf16_typed(seq_len, n_heads, n_kv_heads, head_dim);
         auto fp16_typed = benchmark_fp16_typed(seq_len, n_heads, n_kv_heads, head_dim);
         auto q8_1_typed = benchmark_q8_1_typed(seq_len, n_heads, n_kv_heads, head_dim);
 
-        // Print results with speedup relative to FP32 Legacy
-        print_result(fp32_legacy, 0.0); // baseline
-        print_result(fp32_typed, fp32_legacy.elapsed_ms);
-        print_result(bf16_typed, fp32_legacy.elapsed_ms);
-        print_result(fp16_typed, fp32_legacy.elapsed_ms);
+        // Print results with speedup relative to FP32 Typed (baseline)
+        print_result(fp32_typed, 0.0); // baseline
+        print_result(bf16_typed, fp32_typed.elapsed_ms);
+        print_result(fp16_typed, fp32_typed.elapsed_ms);
         if (q8_1_typed.elapsed_ms > 0)
         {
-            print_result(q8_1_typed, fp32_legacy.elapsed_ms);
+            print_result(q8_1_typed, fp32_typed.elapsed_ms);
         }
         else
         {
@@ -562,7 +512,7 @@ TEST_F(CPURoPEKernel_Perf, ScalingAnalysis)
     {
         std::cout << "\n";
         std::cout << "╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗" << std::endl;
-        std::cout << "║                               SCALING ANALYSIS: Speedup vs FP32 Legacy                               ║" << std::endl;
+        std::cout << "║                               SCALING ANALYSIS: Speedup vs FP32 Typed                                ║" << std::endl;
         std::cout << "╠══════════════════════════════════════════════════════════════════════════════════════════════════════╣" << std::endl;
         std::cout << "║  seq_len  │  FP32 Typed  │  BF16 Typed  │  FP16 Typed  │  Q8_1 Typed  │  Best Speedup                 ║" << std::endl;
         std::cout << "├───────────┼──────────────┼──────────────┼──────────────┼──────────────┼───────────────────────────────┤" << std::endl;
@@ -572,17 +522,16 @@ TEST_F(CPURoPEKernel_Perf, ScalingAnalysis)
 
     for (int seq_len : seq_lengths)
     {
-        auto fp32_legacy = benchmark_fp32_legacy(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
         auto fp32_typed = benchmark_fp32_typed(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
         auto bf16_typed = benchmark_bf16_typed(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
         auto fp16_typed = benchmark_fp16_typed(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
         auto q8_1_typed = benchmark_q8_1_typed(seq_len, N_HEADS, N_KV_HEADS, HEAD_DIM);
 
-        double fp32_speedup = fp32_legacy.elapsed_ms / fp32_typed.elapsed_ms;
-        double bf16_speedup = fp32_legacy.elapsed_ms / bf16_typed.elapsed_ms;
-        double fp16_speedup = fp32_legacy.elapsed_ms / fp16_typed.elapsed_ms;
+        double fp32_speedup = 1.0; // baseline
+        double bf16_speedup = fp32_typed.elapsed_ms / bf16_typed.elapsed_ms;
+        double fp16_speedup = fp32_typed.elapsed_ms / fp16_typed.elapsed_ms;
         double q8_1_speedup = (q8_1_typed.elapsed_ms > 0)
-                                  ? fp32_legacy.elapsed_ms / q8_1_typed.elapsed_ms
+                                  ? fp32_typed.elapsed_ms / q8_1_typed.elapsed_ms
                                   : 0.0;
 
         // Find best
@@ -633,7 +582,7 @@ TEST_F(CPURoPEKernel_Perf, ScalingAnalysis)
     {
         std::cout << "╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝" << std::endl;
         std::cout << "\nExpected patterns:" << std::endl;
-        std::cout << "  • FP32 Typed should match FP32 Legacy (~1.0x)" << std::endl;
+        std::cout << "  • FP32 Typed is baseline (1.0x)" << std::endl;
         std::cout << "  • BF16/FP16 should be faster than FP32 due to memory bandwidth (>1.0x)" << std::endl;
         std::cout << "  • Q8_1 should show best scaling at larger seq_len due to integer ops" << std::endl;
     }

@@ -118,6 +118,23 @@ namespace llaminar2
         const char *name() const override { return "SwiGLUOpTyped"; }
         ActivationPrecision precision() const override { return Precision; }
 
+        /**
+         * @brief Get the expected TensorType for this precision
+         */
+        static constexpr TensorType expected_tensor_type()
+        {
+            if constexpr (Precision == ActivationPrecision::FP32)
+                return TensorType::FP32;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
+            else
+                return TensorType::FP32;
+        }
+
         bool execute(
             TensorBase *gate,
             TensorBase *up,
@@ -126,6 +143,10 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            // Compile-time validation: ensure TensorT trait is defined
+            static_assert(sizeof(TensorT) > 0,
+                          "PrecisionTensor trait must be defined for this ActivationPrecision");
+
             // 1. Validate inputs
             if (!validateTensor(gate, "gate"))
                 return false;
@@ -136,7 +157,34 @@ namespace llaminar2
             if (!validateDimensions(rows, cols, "SwiGLU"))
                 return false;
 
-            // 2. Create kernel from output tensor
+            // 2. Type validation: ensure gate/up/output match expected precision
+            constexpr TensorType expected = expected_tensor_type();
+            if (gate->native_type() != expected)
+            {
+                logError(("gate tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + ", got " +
+                          std::to_string(static_cast<int>(gate->native_type())))
+                             .c_str());
+                return false;
+            }
+            if (up->native_type() != expected)
+            {
+                logError(("up tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + ", got " +
+                          std::to_string(static_cast<int>(up->native_type())))
+                             .c_str());
+                return false;
+            }
+            if (output->native_type() != expected)
+            {
+                logError(("output tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + ", got " +
+                          std::to_string(static_cast<int>(output->native_type())))
+                             .c_str());
+                return false;
+            }
+
+            // 3. Create kernel from output tensor
             auto *activation = dynamic_cast<IActivationTensor *>(output);
             if (!activation)
             {
@@ -151,65 +199,14 @@ namespace llaminar2
                 return false;
             }
 
-            // 3. Execute based on precision
-            bool success = false;
-
-            if constexpr (Precision == ActivationPrecision::Q8_1)
-            {
-                // Q8_1: Native Q8_1 path
-                auto *q8_gate = dynamic_cast<Q8_1Tensor *>(gate);
-                auto *q8_up = dynamic_cast<Q8_1Tensor *>(up);
-                auto *q8_output = dynamic_cast<Q8_1Tensor *>(output);
-
-                if (!q8_gate || !q8_up || !q8_output)
-                {
-                    logError("Q8_1 SwiGLU requires Q8_1 tensors");
-                    return false;
-                }
-
-                success = kernel->apply_q8_1(
-                    q8_gate->q8_1_blocks(),
-                    q8_up->q8_1_blocks(),
-                    q8_output->mutable_q8_1_blocks(),
-                    rows, cols, device_idx);
-            }
-            else if constexpr (Precision == ActivationPrecision::BF16)
-            {
-                // BF16: Native BF16 path
-                auto *bf16_gate = dynamic_cast<BF16Tensor *>(gate);
-                auto *bf16_up = dynamic_cast<BF16Tensor *>(up);
-                auto *bf16_output = dynamic_cast<BF16Tensor *>(output);
-
-                if (!bf16_gate || !bf16_up || !bf16_output)
-                {
-                    logError("BF16 SwiGLU requires BF16 tensors");
-                    return false;
-                }
-
-                success = kernel->apply_bf16(
-                    bf16_gate->bf16_data(),
-                    bf16_up->bf16_data(),
-                    bf16_output->mutable_bf16_data(),
-                    rows, cols, device_idx);
-            }
-            else
-            {
-                // FP32/FP16: Standard path (FP16 uses data() conversion)
-                success = kernel->apply(
-                    gate->data(),
-                    up->data(),
-                    output->mutable_data(),
-                    rows, cols,
-                    false, // no residual
-                    mpi_ctx,
-                    device_idx);
-            }
-
-            if (!success)
+            // 4. Delegate to kernel's apply_tensor - handles all type dispatch internally
+            if (!kernel->apply_tensor(gate, up, output, rows, cols, false, mpi_ctx, device_idx))
             {
                 logError("kernel execution failed");
+                return false;
             }
-            return success;
+
+            return true;
         }
 
         bool execute_raw(
@@ -230,14 +227,12 @@ namespace llaminar2
             if (!validateDimensions(rows, cols, "SwiGLU"))
                 return false;
 
-            // 2. Execute using FP32 kernel
-            if (!swiglu_kernel_.apply(
+            // 2. Execute using FP32 typed kernel
+            if (!swiglu_kernel_.apply_typed(
                     gate_data,
                     up_data,
                     output_data,
-                    rows, cols,
-                    false,
-                    mpi_ctx,
+                    rows * cols, // size
                     device_idx))
             {
                 logError("SwiGLU kernel execution failed");
@@ -248,76 +243,7 @@ namespace llaminar2
         }
 
     private:
-        CPUSwiGLUKernelT<FP32Tensor> swiglu_kernel_;
-    };
-
-    // =========================================================================
-    // Legacy SwiGLUOp (backward compatibility)
-    // =========================================================================
-
-    /**
-     * @brief Legacy untyped SwiGLU operation (backward compatibility)
-     *
-     * Uses runtime type dispatch based on output tensor type.
-     * Prefer using createSwiGLUOp() for new code.
-     */
-    class SwiGLUOp : public OpBase
-    {
-    public:
-        const char *name() const override { return "SwiGLUOp"; }
-
-        bool operator()(
-            const TensorBase *gate,
-            const TensorBase *up,
-            TensorBase *output,
-            int rows, int cols,
-            const char *snapshot_key = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            (void)snapshot_key; // Handled by pipeline
-
-            // 1. Validate inputs
-            if (!validateTensor(gate, "gate"))
-                return false;
-            if (!validateTensor(up, "up"))
-                return false;
-            if (!validateTensor(output, "output"))
-                return false;
-            if (!validateDimensions(rows, cols, "SwiGLU"))
-                return false;
-
-            // 2. Execute SwiGLU kernel using FP32 path
-            if (!swiglu_kernel_.apply(
-                    gate->data(),
-                    up->data(),
-                    output->mutable_data(),
-                    rows, cols,
-                    false,
-                    mpi_ctx,
-                    device_idx))
-            {
-                logError("SwiGLU kernel execution failed");
-                return false;
-            }
-
-            return true;
-        }
-
-        bool operator()(
-            const float *gate_data,
-            const float *up_data,
-            float *output_data,
-            int rows, int cols,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            return impl_.execute_raw(gate_data, up_data, output_data, rows, cols, mpi_ctx, device_idx);
-        }
-
-    private:
-        CPUSwiGLUKernelT<FP32Tensor> swiglu_kernel_;
-        SwiGLUOpTyped<ActivationPrecision::FP32> impl_;
+        CPUSwiGLUKernelT<ActivationPrecision::FP32> swiglu_kernel_;
     };
 
     // =========================================================================

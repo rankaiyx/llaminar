@@ -1,12 +1,12 @@
 /**
- * @file Perf__CPUSoftmaxKernelTyped.cpp
- * @brief Performance benchmark for CPUSoftmaxKernelTyped (typed softmax kernels)
+ * @file Perf__CPUSoftmaxKernelT.cpp
+ * @brief Performance benchmark for CPUSoftmaxKernelT (typed softmax kernels)
  *
  * This test benchmarks the typed Softmax kernel performance comparing:
- * 1. CPUSoftmaxKernelTyped<FP32> (baseline)
- * 2. CPUSoftmaxKernelTyped<BF16> (2x memory compression)
- * 3. CPUSoftmaxKernelTyped<FP16> (2x memory compression)
- * 4. CPUSoftmaxKernelTyped<Q8_1> (3.5x compression, integer-aware softmax)
+ * 1. CPUSoftmaxKernelT<FP32> (baseline)
+ * 2. CPUSoftmaxKernelT<BF16> (2x memory compression)
+ * 3. CPUSoftmaxKernelT<FP16> (2x memory compression)
+ * 4. CPUSoftmaxKernelT<Q8_1> (3.5x compression, integer-aware softmax)
  *
  * Softmax computational complexity:
  *   - Pass 1: Find max (N comparisons per row)
@@ -43,7 +43,7 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
-#include "kernels/cpu/ops/CPUSoftmaxKernelTyped.h"
+#include "kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "tensors/SIMDHelpers.h"
 #include "utils/Logger.h"
 
@@ -79,7 +79,7 @@ struct BenchmarkStats
 // Test Fixture
 // ============================================================================
 
-class CPUSoftmaxKernelTyped_Perf : public ::testing::Test
+class CPUSoftmaxKernelT_Perf : public ::testing::Test
 {
 protected:
     int rank_ = 0;
@@ -93,7 +93,7 @@ protected:
 
         if (rank_ == 0)
         {
-            std::cout << "\n[Performance Test] CPUSoftmaxKernelTyped Benchmark" << std::endl;
+            std::cout << "\n[Performance Test] CPUSoftmaxKernelT Benchmark" << std::endl;
             std::cout << "[Performance Test] OpenMP threads: " << omp_get_max_threads() << std::endl;
         }
     }
@@ -203,7 +203,7 @@ protected:
      */
     BenchmarkStats bench_fp32(const BenchmarkConfig &config)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP32> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
         size_t size = static_cast<size_t>(config.rows) * config.cols;
         std::vector<float> data(size);
@@ -252,7 +252,7 @@ protected:
      */
     BenchmarkStats bench_bf16(const BenchmarkConfig &config)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::BF16> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::BF16> kernel;
 
         size_t size = static_cast<size_t>(config.rows) * config.cols;
         std::vector<uint16_t> data(size);
@@ -303,7 +303,7 @@ protected:
      */
     BenchmarkStats bench_fp16(const BenchmarkConfig &config)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::FP16> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::FP16> kernel;
 
         size_t size = static_cast<size_t>(config.rows) * config.cols;
         std::vector<uint16_t> data(size);
@@ -354,7 +354,7 @@ protected:
      */
     BenchmarkStats bench_q8_1(const BenchmarkConfig &config)
     {
-        CPUSoftmaxKernelTyped<ActivationPrecision::Q8_1> kernel;
+        CPUSoftmaxKernelT<ActivationPrecision::Q8_1> kernel;
 
         // Q8_1: 36 bytes per block of 32 elements
         // Number of blocks per row = ceil(cols / 32)
@@ -478,7 +478,7 @@ protected:
  * - Rows: num_heads (e.g., 14 for Qwen 0.5B)
  * - Cols: current_seq_len (grows during generation)
  */
-TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_ShortContext)
+TEST_F(CPUSoftmaxKernelT_Perf, SingleTokenDecode_ShortContext)
 {
     BenchmarkConfig config{
         .rows = 14,  // Qwen 0.5B num_heads
@@ -491,7 +491,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_ShortContext)
     run_comparison_benchmark(config);
 }
 
-TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_MediumContext)
+TEST_F(CPUSoftmaxKernelT_Perf, SingleTokenDecode_MediumContext)
 {
     BenchmarkConfig config{
         .rows = 14,
@@ -504,7 +504,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_MediumContext)
     run_comparison_benchmark(config);
 }
 
-TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_LongContext)
+TEST_F(CPUSoftmaxKernelT_Perf, SingleTokenDecode_LongContext)
 {
     BenchmarkConfig config{
         .rows = 14,
@@ -524,7 +524,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, SingleTokenDecode_LongContext)
  * - Rows: seq_len * num_heads (each position attends to all previous)
  * - Cols: seq_len (for square attention matrix pattern)
  */
-TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_SmallPrompt)
+TEST_F(CPUSoftmaxKernelT_Perf, Prefill_SmallPrompt)
 {
     // 64 tokens × 14 heads = 896 rows, each attending to up to 64 positions
     BenchmarkConfig config{
@@ -538,7 +538,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_SmallPrompt)
     run_comparison_benchmark(config);
 }
 
-TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_MediumPrompt)
+TEST_F(CPUSoftmaxKernelT_Perf, Prefill_MediumPrompt)
 {
     // 256 tokens × 14 heads = 3584 rows
     BenchmarkConfig config{
@@ -552,7 +552,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_MediumPrompt)
     run_comparison_benchmark(config);
 }
 
-TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_LargePrompt)
+TEST_F(CPUSoftmaxKernelT_Perf, Prefill_LargePrompt)
 {
     // 512 tokens × 14 heads = 7168 rows
     BenchmarkConfig config{
@@ -573,7 +573,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Prefill_LargePrompt)
 /**
  * @brief Qwen 7B-like model (larger head count)
  */
-TEST_F(CPUSoftmaxKernelTyped_Perf, Qwen7B_SingleTokenDecode)
+TEST_F(CPUSoftmaxKernelT_Perf, Qwen7B_SingleTokenDecode)
 {
     // Qwen 7B: 32 heads, head_dim=128
     BenchmarkConfig config{
@@ -587,7 +587,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Qwen7B_SingleTokenDecode)
     run_comparison_benchmark(config);
 }
 
-TEST_F(CPUSoftmaxKernelTyped_Perf, Qwen7B_Prefill)
+TEST_F(CPUSoftmaxKernelT_Perf, Qwen7B_Prefill)
 {
     // 128 tokens × 32 heads = 4096 rows
     BenchmarkConfig config{
@@ -605,7 +605,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, Qwen7B_Prefill)
 // Test Cases - Non-Causal (Encoder-style)
 // ============================================================================
 
-TEST_F(CPUSoftmaxKernelTyped_Perf, NonCausal_Bidirectional)
+TEST_F(CPUSoftmaxKernelT_Perf, NonCausal_Bidirectional)
 {
     // Encoder-style attention (no causal masking)
     BenchmarkConfig config{
@@ -623,7 +623,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, NonCausal_Bidirectional)
 // Test Cases - Stress Tests
 // ============================================================================
 
-TEST_F(CPUSoftmaxKernelTyped_Perf, StressTest_VeryLongContext)
+TEST_F(CPUSoftmaxKernelT_Perf, StressTest_VeryLongContext)
 {
     // Very long context (32K-like)
     BenchmarkConfig config{
@@ -637,7 +637,7 @@ TEST_F(CPUSoftmaxKernelTyped_Perf, StressTest_VeryLongContext)
     run_comparison_benchmark(config);
 }
 
-TEST_F(CPUSoftmaxKernelTyped_Perf, StressTest_ManyHeads)
+TEST_F(CPUSoftmaxKernelT_Perf, StressTest_ManyHeads)
 {
     // Many heads (large model)
     BenchmarkConfig config{

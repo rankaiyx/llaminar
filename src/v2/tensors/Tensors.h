@@ -181,6 +181,7 @@ namespace llaminar2
         virtual std::unique_ptr<ITensorSoftmax> createSoftmax() = 0;
         virtual std::unique_ptr<ITensorRMSNorm> createRMSNorm() = 0;
         virtual std::unique_ptr<ITensorAttention> createAttention() = 0;
+        virtual std::unique_ptr<ITensorEmbedding> createEmbedding() = 0;
 
         /**
          * @brief Quantize activations to INT8 with per-row scales
@@ -634,6 +635,21 @@ namespace llaminar2
         virtual const float *data() const = 0; // Returns host pointer (syncs from device if needed)
         virtual float *mutable_data() = 0;     // Returns host pointer, marks dirty
 
+        /**
+         * @brief Explicit FP32 dequantization accessor
+         *
+         * For most tensor types, this is equivalent to data(). For Q8_1Tensor,
+         * this performs explicit dequantization while data() throws to prevent
+         * accidental implicit dequantization that defeats the purpose of Q8_1.
+         *
+         * Use this method when you INTENTIONALLY need FP32 data from a Q8_1 tensor
+         * (e.g., for snapshot capture, debugging, or interop with FP32-only code).
+         *
+         * @return Const pointer to FP32 data (may be cached/lazily computed)
+         * @note Default implementation calls data() - overridden by Q8_1Tensor
+         */
+        virtual const float *fp32_data() const { return data(); }
+
         // Device transfers (Phase 4.2)
         virtual bool copyFrom(const TensorBase *src) = 0; // Copy data from another tensor (handles device transfers)
 
@@ -901,6 +917,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        std::unique_ptr<ITensorEmbedding> createEmbedding() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
         bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
 
@@ -1081,6 +1098,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        std::unique_ptr<ITensorEmbedding> createEmbedding() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
         bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
 
@@ -1268,6 +1286,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        std::unique_ptr<ITensorEmbedding> createEmbedding() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
         bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
 
@@ -2082,7 +2101,7 @@ namespace llaminar2
      * - Kernels read/write Q8_1 blocks directly via q8_1_blocks()/mutable_q8_1_blocks()
      * - mutable_data() THROWS - never expose FP32 for writes (defeats bandwidth savings)
      * - data() returns lazy dequantized FP32 for debugging/snapshots only
-     * - Typed kernels (CPURMSNormTypedKernel<Q8_1>, etc.) operate directly on blocks
+     * - Typed kernels (CPURMSNormKernelT<Q8_1>, etc.) operate directly on blocks
      *
      * Q8_1 block enables "quantize once, use many times" pattern:
      * - Pre-computes sum during quantization: sum_qs = sum(qs[i])
@@ -2122,7 +2141,25 @@ namespace llaminar2
         bool set_device(int device_idx) override;
         bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
+        /**
+         * @brief DEPRECATED: Do not use data() on Q8_1Tensor - throws std::runtime_error
+         * @note This override intentionally throws to catch accidental FP32 dequantization.
+         *       Use fp32_data() if you explicitly need FP32 values, or q8_1_blocks() for
+         *       native Q8_1 block access in performance-critical code.
+         * @see fp32_data(), q8_1_blocks()
+         */
         const float *data() const override;
+
+        /**
+         * @brief Explicitly dequantize Q8_1 blocks to FP32 buffer
+         * @return Pointer to cached FP32 buffer containing dequantized values
+         * @note This method explicitly acknowledges the precision conversion.
+         *       Results are cached until Q8_1 blocks are modified via mutable_q8_1_blocks().
+         *       Prefer q8_1_blocks() for kernels that can operate on Q8_1 natively.
+         * @see q8_1_blocks() for native Q8_1 access without dequantization
+         */
+        const float *fp32_data() const override;
+
         float *mutable_data() override;
 
         bool copyFrom(const TensorBase *src) override;
@@ -2212,6 +2249,7 @@ namespace llaminar2
         std::unique_ptr<ITensorSoftmax> createSoftmax() override;
         std::unique_ptr<ITensorRMSNorm> createRMSNorm() override;
         std::unique_ptr<ITensorAttention> createAttention() override;
+        std::unique_ptr<ITensorEmbedding> createEmbedding() override;
         ActivationPack to_int8_activation_pack(int rows, int cols) const override;
         bool quantize_to_q8_1(void *q8_1_buffer, int m, int k) const override;
 
@@ -2303,6 +2341,18 @@ namespace llaminar2
         {
             // Invalidate dequant cache since blocks are being modified
             dequant_cache_.clear();
+
+            // For views, also invalidate parent's cache since we share underlying storage
+            // and any modification through this view invalidates the parent's cached dequantized data
+            if (is_view_ && parent_)
+            {
+                auto parent_q8_1 = std::dynamic_pointer_cast<Q8_1Tensor>(parent_);
+                if (parent_q8_1)
+                {
+                    parent_q8_1->clear_dequant_cache();
+                }
+            }
+
             uint8_t *data_ptr = is_view_
                                     ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
                                     : raw_data_.data();

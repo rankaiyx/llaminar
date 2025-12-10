@@ -6,13 +6,11 @@
 
 #include "Tensors.h"
 #include "../kernels/KernelFactory.h"
-#include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
-#include "../kernels/cpu/ops/CPURMSNormTypedKernel.h"
+#include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 
-#include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
+#include "../kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "../kernels/cpu/attention/CpuAttentionKernelT.h"
 #include "../kernels/cpu/attention/CPUAttentionKernelTyped.h"
-#include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../utils/Logger.h"
 #include "SIMDHelpers.h"
 #include "FP16Utils.h"
@@ -223,6 +221,28 @@ namespace llaminar2
 
     const float *Q8_1Tensor::data() const
     {
+        // Q8_1Tensor::data() is DEPRECATED and now throws to catch accidental FP32 dequantization.
+        //
+        // The whole point of Q8_1 is memory bandwidth optimization - silently converting to FP32
+        // defeats this purpose and hides precision issues from developers.
+        //
+        // If you need FP32 data:
+        //   1. Use fp32_data() - explicit acknowledgment of dequantization
+        //   2. Prefer q8_1_blocks() for kernels that can operate on Q8_1 natively
+        //   3. Use typed kernels (e.g., CPUAttentionKernel_Q8_1) for best performance
+        //
+        // This change surfaces places where Q8_1 precision is being silently degraded.
+
+        throw std::runtime_error(
+            "Q8_1Tensor::data() is deprecated - use fp32_data() if you explicitly need FP32 values, "
+            "or q8_1_blocks() for native Q8_1 access. data() throws to catch accidental dequantization "
+            "that defeats the purpose of Q8_1 (memory bandwidth optimization).");
+    }
+
+    const float *Q8_1Tensor::fp32_data() const
+    {
+        // Explicit FP32 dequantization - the caller acknowledges the precision conversion.
+
         // For mutable views, return data from parent's cache
         if (is_view_ && is_mutable_ && parent_)
         {
@@ -237,7 +257,7 @@ namespace llaminar2
                 size_t element_offset = row_offset * K;
 
                 // Return pointer into parent's cache
-                return parent_q8_1->data() + element_offset;
+                return parent_q8_1->fp32_data() + element_offset;
             }
         }
 
@@ -253,9 +273,11 @@ namespace llaminar2
                 if (dequant_cache_[i] > max_val)
                     max_val = dequant_cache_[i];
             }
-            LOG_DEBUG("[Q8_1Tensor::data] Mutable tensor, returning dequant_cache (first="
-                      << dequant_cache_[0] << " size=" << dequant_cache_.size()
-                      << " min=" << min_val << " max=" << max_val << ")");
+            LOG_DEBUG("[Q8_1Tensor::fp32_data] Mutable tensor shape=[" << shape_[0] << "," << shape_[1]
+                                                                       << "] this=" << reinterpret_cast<const void *>(this)
+                                                                       << " returning dequant_cache (first=" << dequant_cache_[0]
+                                                                       << " size=" << dequant_cache_.size()
+                                                                       << " min=" << min_val << " max=" << max_val << ")");
             return dequant_cache_.data();
         }
 
@@ -264,6 +286,11 @@ namespace llaminar2
         {
             size_t total_elements = shape_[0] * shape_[1];
             dequant_cache_.resize(total_elements);
+
+            LOG_DEBUG("[Q8_1Tensor::fp32_data] POPULATING cache: shape=[" << shape_[0] << "," << shape_[1]
+                                                                          << "] this=" << reinterpret_cast<const void *>(this)
+                                                                          << " is_mutable=" << is_mutable_
+                                                                          << " total_elements=" << total_elements);
 
             // Decode all blocks (parallelized for large tensors)
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
@@ -290,7 +317,7 @@ namespace llaminar2
         // Q8_1 is a memory bandwidth optimization format. The whole point is to avoid
         // writing/reading FP32 data to/from DRAM. If you need to write to a Q8_1 tensor:
         //   1. Use mutable_q8_1_blocks() to get a Q8_1Block* pointer
-        //   2. Use typed kernels that write Q8_1 directly (e.g., CPURMSNormTypedKernel<Q8_1>)
+        //   2. Use typed kernels that write Q8_1 directly (e.g., CPURMSNormKernelT<Q8_1>)
         //   3. Use SIMD helpers like simd::quantize_fp32_to_q8_1_blocks() if converting from FP32
         //
         // If your code path requires mutable FP32 access, use FP32Tensor instead of Q8_1Tensor.
@@ -303,7 +330,7 @@ namespace llaminar2
         throw std::runtime_error(
             "Q8_1Tensor::mutable_data() is not supported. Q8_1 is a memory bandwidth optimization format - "
             "writing FP32 to a cache defeats its purpose. Use mutable_q8_1_blocks() and typed kernels instead. "
-            "See the Q8_1 typed kernel pattern in CPURMSNormTypedKernel<ActivationPrecision::Q8_1>.");
+            "See the Q8_1 typed kernel pattern in CPURMSNormKernelT<ActivationPrecision::Q8_1>.");
     }
 
     bool Q8_1Tensor::quantize_from_cache()
@@ -339,26 +366,37 @@ namespace llaminar2
 
     std::unique_ptr<ITensorSwiGLU> Q8_1Tensor::createSwiGLU()
     {
-        return std::make_unique<llaminar2::CPUSwiGLUKernelT<Q8_1Tensor>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createSwiGLU(this, dev_type);
     }
 
     std::unique_ptr<ITensorSoftmax> Q8_1Tensor::createSoftmax()
     {
-        return std::make_unique<CPUSoftmaxKernelT<Q8_1Tensor>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createSoftmax(this, dev_type);
     }
 
     std::unique_ptr<ITensorRMSNorm> Q8_1Tensor::createRMSNorm()
     {
-        // Q8_1 tensors use typed RMSNorm kernel with pure-integer path
-        return std::make_unique<CPURMSNormTypedKernel<ActivationPrecision::Q8_1>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createRMSNorm(this, dev_type);
     }
 
     std::unique_ptr<ITensorAttention> Q8_1Tensor::createAttention()
     {
-        // Q8_1 tensors (mutable or not) always use Q8_1 attention kernel.
-        // The kernel reads Q8_1 blocks directly via q8_1_blocks() for bandwidth efficiency.
-        // Mutable Q8_1 tensors should have their data written as Q8_1 blocks, not FP32.
-        return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::Q8_1>>();
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createAttention(this, dev_type);
+    }
+
+    std::unique_ptr<ITensorEmbedding> Q8_1Tensor::createEmbedding()
+    {
+        // Use centralized KernelFactory for device-aware dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        return llaminar::v2::kernels::KernelFactory::createEmbedding(this, dev_type);
     }
 
     bool Q8_1Tensor::applyRoPE(
@@ -384,18 +422,22 @@ namespace llaminar2
             return false;
         }
 
-        // Get Q pointer
-        void *Q_ptr = is_view_ ? (void *)(raw_data_ptr_ + view_byte_offset_) : (void *)raw_data_.data();
+        // Get Q pointer (this tensor) - use mutable_q8_1_blocks() to invalidate cache
+        void *Q_ptr = mutable_q8_1_blocks();
 
         // Get K pointer - K is passed as float* but is actually Q8_1 block data
+        // Note: K's cache should have been invalidated by the caller via mutable_q8_1_blocks()
         void *K_ptr = (void *)K;
 
-        return kernel->apply_q8_1(
+        bool success = kernel->apply_q8_1(
             Q_ptr, K_ptr,
             position_ids,
             seq_len, n_heads, n_kv_heads, head_dim,
             rope_theta,
             device_idx);
+
+        // Cache was already cleared by mutable_q8_1_blocks() call above
+        return success;
     }
 
     bool Q8_1Tensor::from_int32_with_scales(

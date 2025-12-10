@@ -476,13 +476,14 @@ Pipeline operations encapsulate the **validate-execute-capture** pattern that re
 
 | Op Class | Purpose | Key Method |
 |----------|---------|------------|
-| `RMSNormOp` | RMS normalization (pre-attention, pre-FFN, final) | `operator()(input, weight, output, rows, cols, eps, snapshot, mpi, device)` |
-| `GemmOp` | Weight projections (Q/K/V, output, FFN) | `operator()(A, W, C, m, n, k, snapshot, mpi, device)` |
-| `GemmOp::activations` | Activation matmul (attention scores) | `activations(A, B, C, m, n, k, transpose, alpha, beta, snapshot, mpi, device)` |
-| `SwiGLUOp` | SwiGLU activation (FFN) | `operator()(gate, up, output, rows, cols, snapshot, mpi, device)` |
-| `RoPEOp` | Rotary position embeddings | `operator()(Q, K, positions, seq_len, heads, kv_heads, dim, theta, prefix, mpi, device)` |
-| `ResidualOp` | Residual connections | `operator()(residual, input, output, rows, cols, snapshot)` |
-| `ResidualOp::batched` | Batched residual with padding mask | `batched(residual, input, output, batch, seq, cols, lengths, snapshot)` |
+| `RMSNormOpTyped<P>` | RMS normalization (pre-attention, pre-FFN, final) | `execute(input, weight, output, rows, cols, eps, mpi, device)` |
+| `GemmOpTyped<P>` | Weight projections (Q/K/V, output, FFN) | `execute(A, W, C, m, n, k, mpi, device)` |
+| `GemmOpTyped<P>::activations` | Activation matmul (attention scores) | `activations(A, B, C, m, n, k, transpose, alpha, beta, mpi, device)` |
+| `SwiGLUOpTyped<P>` | SwiGLU activation (FFN) | `execute(gate, up, output, rows, cols, mpi, device)` |
+| `RoPEOpTyped<P>` | Rotary position embeddings | `execute(Q, K, positions, seq_len, heads, kv_heads, dim, theta, prefix, mpi, device)` |
+| `ResidualOpTyped<P>` | Residual connections | `execute(residual, input, output, rows, cols)` |
+
+**Note**: All typed ops are created via factory functions (e.g., `createGemmOp(ActivationPrecision::Q8_1)`).
 
 ### 6.4 PipelineBase Composite Operations
 
@@ -494,11 +495,11 @@ Location: `src/v2/pipelines/PipelineBase.h` (lines 880-1045)
 
 | Method | Purpose | Internal Op |
 |--------|---------|-------------|
-| `rms_norm()` | RMSNorm with snapshot | `rmsnorm_op_` |
-| `project()` | Weight projection (GEMM) with snapshot | `gemm_op_` |
-| `add_residual()` | Batch-aware residual connection | `residual_op_` |
-| `swiglu()` | SwiGLU activation with snapshot | `swiglu_op_` |
-| `apply_rope()` | RoPE to Q/K with snapshots | `rope_op_` |
+| `rms_norm()` | RMSNorm with snapshot | `typed_rmsnorm_op_` |
+| `project()` | Weight projection (GEMM) with snapshot | `typed_gemm_op_` |
+| `add_residual()` | Batch-aware residual connection | `typed_residual_op_` |
+| `swiglu()` | SwiGLU activation with snapshot | `typed_swiglu_op_` |
+| `apply_rope()` | RoPE to Q/K with snapshots | `typed_rope_op_` |
 | `compute_attention()` | GQA attention with snapshot | Direct kernel call |
 | `save_residual()` | Copy tensor for residual | memcpy wrapper |
 | `capture_snapshot()` | Manual snapshot capture | Direct macro call |
@@ -508,12 +509,13 @@ Location: `src/v2/pipelines/PipelineBase.h` (lines 880-1045)
 ```cpp
 class PipelineBase {
 private:
-    // Reusable operations (stateless, self-validating)
-    RMSNormOp rmsnorm_op_;
-    GemmOp gemm_op_;
-    SwiGLUOp swiglu_op_;
-    RoPEOp rope_op_;
-    ResidualOp residual_op_;
+    // Typed operations (zero-overhead precision dispatch)
+    // Created once at initialization based on config_.activation_precision
+    std::unique_ptr<IGemmOp> typed_gemm_op_;
+    std::unique_ptr<IRMSNormOp> typed_rmsnorm_op_;
+    std::unique_ptr<IResidualOp> typed_residual_op_;
+    std::unique_ptr<ISwiGLUOp> typed_swiglu_op_;
+    std::unique_ptr<IRoPEOp> typed_rope_op_;
 
 protected:
     // High-level composite operations for child pipelines

@@ -341,4 +341,102 @@ namespace llaminar2
             m, k, ctx, device_idx);
     }
 
+    // =========================================================================
+    // Q8_1-to-Q8_1 Implementation (avoids double quantization)
+    // =========================================================================
+
+    bool FusedGEMM::execute_q8_1_to_q8_1(
+        const void *input_q8_1,
+        const std::vector<GEMMProjectionQ8_1> &projections,
+        int m, int k,
+        const MPIContext *ctx,
+        int device_idx)
+    {
+        // Validate inputs
+        if (!input_q8_1)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_to_q8_1] Input Q8_1 pointer is null");
+            return false;
+        }
+
+        if (projections.size() != gemm_kernels_.size())
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_to_q8_1] Number of projections (" << projections.size()
+                                                                                  << ") doesn't match number of weights (" << gemm_kernels_.size() << ")");
+            return false;
+        }
+
+        if (m <= 0 || k <= 0)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_to_q8_1] Invalid dimensions: m=" << m << " k=" << k);
+            return false;
+        }
+
+        for (size_t i = 0; i < projections.size(); ++i)
+        {
+            if (!projections[i].output_q8_1)
+            {
+                LOG_ERROR("[FusedGEMM::execute_q8_1_to_q8_1] Output pointer for " << projection_names_[i] << " is null");
+                return false;
+            }
+            if (projections[i].n <= 0)
+            {
+                LOG_ERROR("[FusedGEMM::execute_q8_1_to_q8_1] Invalid n dimension for " << projection_names_[i] << ": " << projections[i].n);
+                return false;
+            }
+        }
+
+        // =====================================================================
+        // FUSED PATH: Use pre-quantized Q8_1 input directly (no requantization)
+        // =====================================================================
+
+        // Execute all projections with Q8_1→Q8_1 path
+        for (size_t i = 0; i < gemm_kernels_.size(); ++i)
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::GEMM_Q8);
+
+            const auto &proj = projections[i];
+            const auto &name = projection_names_[i];
+
+            bool success = gemm_kernels_[i]->multiply_with_precomputed_q8_1_to_q8_1(
+                input_q8_1,
+                proj.output_q8_1,
+                m, proj.n, k,
+                proj.bias, // Fused bias (added before Q8_1 requantization)
+                false,     // No accumulation for Q8_1 output
+                ctx, device_idx);
+
+            if (!success)
+            {
+                LOG_ERROR("[FusedGEMM::execute_q8_1_to_q8_1] " << name << " GEMM failed");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool FusedGEMM::execute_q8_1_to_q8_1(
+        const void *input_q8_1,
+        void *output_q, void *output_k, void *output_v,
+        const float *bias_q, const float *bias_k, const float *bias_v,
+        int m, int n_q, int n_kv, int k,
+        const MPIContext *ctx,
+        int device_idx)
+    {
+        if (gemm_kernels_.size() != 3)
+        {
+            LOG_ERROR("[FusedGEMM::execute_q8_1_to_q8_1] 3-projection execute_q8_1_to_q8_1() called but kernel has "
+                      << gemm_kernels_.size() << " projections");
+            return false;
+        }
+
+        return execute_q8_1_to_q8_1(
+            input_q8_1,
+            {{output_q, bias_q, n_q, projection_names_[0]},
+             {output_k, bias_k, n_kv, projection_names_[1]},
+             {output_v, bias_v, n_kv, projection_names_[2]}},
+            m, k, ctx, device_idx);
+    }
+
 } // namespace llaminar2

@@ -14,7 +14,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../src/v2/kernels/cpu/ops/CPURMSNormTypedKernel.h"
+#include "../../src/v2/kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../../src/v2/kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../../src/v2/kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../../src/v2/kernels/cpu/ops/CPUSoftmaxKernelT.h"
@@ -42,12 +42,12 @@ protected:
 };
 
 // ============================================================================
-// CPURMSNormKernel Tests (using CPURMSNormTypedKernel<FP32>)
+// CPURMSNormKernel Tests (using CPURMSNormKernelT<FP32>)
 // ============================================================================
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceZero)
 {
-    CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+    CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -75,7 +75,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceZero)
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceMinusOne)
 {
-    CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+    CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -95,7 +95,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_AcceptsDeviceMinusOne)
 
 TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_IgnoresDeviceIndex)
 {
-    CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+    CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 4;
     const int d_model = 8;
@@ -121,12 +121,12 @@ TEST_F(Test__DeviceIndexCPUKernels, RMSNorm_IgnoresDeviceIndex)
 }
 
 // ============================================================================
-// CPURoPEKernel Tests
+// CPURoPEKernel Tests (using CPURoPEKernelT<FP32>)
 // ============================================================================
 
 TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceZero)
 {
-    CPURoPEKernel kernel;
+    CPURoPEKernelT<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 2;
     const int n_heads = 4;
@@ -138,14 +138,12 @@ TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceZero)
     std::vector<int> position_ids = {0, 1};
 
     // device_idx = 0 (CPU device) should work
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         Q.data(), K.data(),
         position_ids.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
         10000.0f, // rope_theta
-        false,    // use_bf16
-        mpi_ctx.get(),
-        0 // device_idx = 0 (CPU)
+        0         // device_idx = 0 (CPU)
     );
 
     EXPECT_TRUE(result) << "RoPE should accept device_idx = 0 (CPU device)";
@@ -153,7 +151,7 @@ TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceZero)
 
 TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceMinusOne)
 {
-    CPURoPEKernel kernel;
+    CPURoPEKernelT<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 2;
     const int n_heads = 4;
@@ -165,13 +163,11 @@ TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceMinusOne)
     std::vector<int> position_ids = {0, 1};
 
     // device_idx = -1 (unspecified) should work
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         Q.data(), K.data(),
         position_ids.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
         10000.0f,
-        false,
-        mpi_ctx.get(),
         -1 // device_idx = -1 (unspecified)
     );
 
@@ -179,25 +175,24 @@ TEST_F(Test__DeviceIndexCPUKernels, RoPE_AcceptsDeviceMinusOne)
 }
 
 // ============================================================================
-// CPUSwiGLUKernel Tests
+// CPUSwiGLUKernel Tests (using CPUSwiGLUKernelT<FP32>)
 // ============================================================================
 
 TEST_F(Test__DeviceIndexCPUKernels, SwiGLU_AcceptsDeviceZero)
 {
-    CPUSwiGLUKernel kernel;
+    CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 4;
     const int d_ff = 8;
-    std::vector<float> gate(seq_len * d_ff, 1.0f);
-    std::vector<float> up(seq_len * d_ff, 1.0f);
-    std::vector<float> output(seq_len * d_ff, 0.0f);
+    const int size = seq_len * d_ff;
+    std::vector<float> gate(size, 1.0f);
+    std::vector<float> up(size, 1.0f);
+    std::vector<float> output(size, 0.0f);
 
     // device_idx = 0 (CPU device) should work
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        seq_len, d_ff,
-        false, // use_bf16
-        mpi_ctx.get(),
+        size,
         0 // device_idx = 0 (CPU)
     );
 
@@ -214,20 +209,19 @@ TEST_F(Test__DeviceIndexCPUKernels, SwiGLU_AcceptsDeviceZero)
 
 TEST_F(Test__DeviceIndexCPUKernels, SwiGLU_AcceptsDeviceMinusOne)
 {
-    CPUSwiGLUKernel kernel;
+    CPUSwiGLUKernelT<ActivationPrecision::FP32> kernel;
 
     const int seq_len = 4;
     const int d_ff = 8;
-    std::vector<float> gate(seq_len * d_ff, 1.0f);
-    std::vector<float> up(seq_len * d_ff, 1.0f);
-    std::vector<float> output(seq_len * d_ff, 0.0f);
+    const int size = seq_len * d_ff;
+    std::vector<float> gate(size, 1.0f);
+    std::vector<float> up(size, 1.0f);
+    std::vector<float> output(size, 0.0f);
 
     // device_idx = -1 (unspecified) should work
-    bool result = kernel.apply(
+    bool result = kernel.apply_typed(
         gate.data(), up.data(), output.data(),
-        seq_len, d_ff,
-        false,
-        mpi_ctx.get(),
+        size,
         -1 // device_idx = -1 (unspecified)
     );
 
@@ -235,31 +229,31 @@ TEST_F(Test__DeviceIndexCPUKernels, SwiGLU_AcceptsDeviceMinusOne)
 }
 
 // ============================================================================
-// CPUSoftmaxKernel Tests
+// CPUSoftmaxKernel Tests (using CPUSoftmaxKernelT<FP32>)
 // ============================================================================
 
 TEST_F(Test__DeviceIndexCPUKernels, Softmax_AcceptsDeviceZero)
 {
-    CPUSoftmaxKernelT<FP32Tensor> kernel;
+    CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
     const int rows = 4;
     const int cols = 8;
-    std::vector<float> input(rows * cols);
-    std::vector<float> output(rows * cols, 0.0f);
+    std::vector<float> data(rows * cols);
 
     // Fill with simple values
-    for (size_t i = 0; i < input.size(); ++i)
+    for (size_t i = 0; i < data.size(); ++i)
     {
-        input[i] = static_cast<float>(i % cols);
+        data[i] = static_cast<float>(i % cols);
     }
 
     // device_idx = 0 (CPU device) should work
-    bool result = kernel.apply(
-        input.data(), output.data(),
+    // Note: Typed kernel applies softmax in-place
+    bool result = kernel.apply_typed(
+        data.data(),
         rows, cols,
-        false, // use_bf16
-        mpi_ctx.get(),
-        0 // device_idx = 0 (CPU)
+        false, // use_causal_mask
+        1.0f,  // scale
+        0      // device_idx = 0 (CPU)
     );
 
     EXPECT_TRUE(result) << "Softmax should accept device_idx = 0 (CPU device)";
@@ -270,7 +264,7 @@ TEST_F(Test__DeviceIndexCPUKernels, Softmax_AcceptsDeviceZero)
         float row_sum = 0.0f;
         for (int c = 0; c < cols; ++c)
         {
-            row_sum += output[r * cols + c];
+            row_sum += data[r * cols + c];
         }
         EXPECT_NEAR(row_sum, 1.0f, 1e-5f) << "Softmax row " << r << " should sum to 1.0";
     }
@@ -278,20 +272,20 @@ TEST_F(Test__DeviceIndexCPUKernels, Softmax_AcceptsDeviceZero)
 
 TEST_F(Test__DeviceIndexCPUKernels, Softmax_AcceptsDeviceMinusOne)
 {
-    CPUSoftmaxKernelT<FP32Tensor> kernel;
+    CPUSoftmaxKernelT<ActivationPrecision::FP32> kernel;
 
     const int rows = 4;
     const int cols = 8;
-    std::vector<float> input(rows * cols, 1.0f);
-    std::vector<float> output(rows * cols, 0.0f);
+    std::vector<float> data(rows * cols, 1.0f);
 
     // device_idx = -1 (unspecified) should work
-    bool result = kernel.apply(
-        input.data(), output.data(),
+    // Note: Typed kernel applies softmax in-place
+    bool result = kernel.apply_typed(
+        data.data(),
         rows, cols,
-        false,
-        mpi_ctx.get(),
-        -1 // device_idx = -1 (unspecified)
+        false, // use_causal_mask
+        1.0f,  // scale
+        -1     // device_idx = -1 (unspecified)
     );
 
     EXPECT_TRUE(result) << "Softmax should accept device_idx = -1 (unspecified)";

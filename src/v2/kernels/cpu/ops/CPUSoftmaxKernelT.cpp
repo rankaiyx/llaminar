@@ -1,103 +1,206 @@
 /**
  * @file CPUSoftmaxKernelT.cpp
- * @brief Implementation of templated CPU Softmax kernel
- *
+ * @brief Implementation of typed Softmax kernel with ActivationPrecision support
  * @author David Sanftenberg
+ *
+ * This file implements the CPUSoftmaxKernelT template specializations for
+ * FP32, BF16, FP16, and Q8_1 precision types.
+ *
+ * Each precision uses native primitives without unnecessary type conversions:
+ * - FP32: Direct FP32 softmax
+ * - BF16: Native BF16 softmax (converts to FP32 only for exp/div)
+ * - FP16: Native FP16 softmax (converts to FP32 only for exp/div)
+ * - Q8_1: Integer-aware softmax (minimizes FP32 usage, direct requantization)
  */
 
 #include "CPUSoftmaxKernelT.h"
-#include "../../../tensors/Tensors.h"
-#include <omp.h>
-#include <cstring>
+#include "../primitives/SoftmaxPrimitives_New.h"
+#include "../../../utils/Logger.h"
 
 namespace llaminar2
 {
 
-    template <typename TensorT>
-    bool CPUSoftmaxKernelT<TensorT>::apply(
-        const float *input, float *output,
-        int rows, int cols,
+    // ============================================================================
+    // FP32 Specialization Implementation
+    // ============================================================================
+
+    bool CPUSoftmaxKernelT<ActivationPrecision::FP32>::apply_typed(
+        float *data,
+        int rows,
+        int cols,
         bool use_causal_mask,
-        const MPIContext *mpi_ctx,
+        float scale,
         int device_idx)
     {
-        (void)mpi_ctx;
-        (void)device_idx;
+        (void)device_idx; // Unused for CPU kernel
 
-        // If input != output, copy first (primitives are in-place)
-        if (input != output)
+        if (!data)
         {
-            std::memcpy(output, input, rows * cols * sizeof(float));
+            LOG_ERROR("CPUSoftmaxKernelT<FP32>: Null data pointer");
+            return false;
         }
 
-// Parallelize over rows
-#pragma omp parallel for if (rows * cols > 8192)
-        for (int i = 0; i < rows; ++i)
+        if (rows <= 0 || cols <= 0)
         {
-            float *row_ptr = output + i * cols;
-            primitives::softmax_row_fp32(row_ptr, cols, use_causal_mask, 1.0f, i);
+            LOG_DEBUG("CPUSoftmaxKernelT<FP32>: Empty input (rows=" << rows << ", cols=" << cols << ")");
+            return true; // Nothing to do
         }
+
+        // Use row-major batch softmax primitive with OpenMP parallelization
+        primitives::softmax_row_major_fp32(
+            data,
+            rows,
+            cols,
+            use_causal_mask,
+            scale,
+            true // parallel
+        );
 
         return true;
     }
 
-    template <typename TensorT>
-    bool CPUSoftmaxKernelT<TensorT>::apply_bf16(
-        const uint16_t *input, uint16_t *output,
-        int rows, int cols,
+    // ============================================================================
+    // BF16 Specialization Implementation
+    // ============================================================================
+
+    bool CPUSoftmaxKernelT<ActivationPrecision::BF16>::apply_typed(
+        uint16_t *data,
+        int rows,
+        int cols,
         bool use_causal_mask,
-        const MPIContext *mpi_ctx,
+        float scale,
         int device_idx)
     {
-        (void)mpi_ctx;
-        (void)device_idx;
+        (void)device_idx; // Unused for CPU kernel
 
-        if (input != output)
+        if (!data)
         {
-            std::memcpy(output, input, rows * cols * sizeof(uint16_t));
+            LOG_ERROR("CPUSoftmaxKernelT<BF16>: Null data pointer");
+            return false;
         }
 
-#pragma omp parallel for if (rows * cols > 8192)
-        for (int i = 0; i < rows; ++i)
+        if (rows <= 0 || cols <= 0)
         {
-            uint16_t *row_ptr = output + i * cols;
-            primitives::softmax_row_bf16(row_ptr, cols, use_causal_mask, 1.0f, i);
+            LOG_DEBUG("CPUSoftmaxKernelT<BF16>: Empty input (rows=" << rows << ", cols=" << cols << ")");
+            return true; // Nothing to do
         }
+
+        // Use native BF16 softmax primitive
+        // Internally converts to FP32 only for exp/div, accumulates in FP32,
+        // then converts back to BF16 for output
+        primitives::softmax_row_major_bf16(
+            data,
+            rows,
+            cols,
+            use_causal_mask,
+            scale,
+            true // parallel
+        );
 
         return true;
     }
 
-    template <typename TensorT>
-    bool CPUSoftmaxKernelT<TensorT>::apply_fp16(
-        const uint16_t *input, uint16_t *output,
-        int rows, int cols,
+    // ============================================================================
+    // FP16 Specialization Implementation
+    // ============================================================================
+
+    bool CPUSoftmaxKernelT<ActivationPrecision::FP16>::apply_typed(
+        uint16_t *data,
+        int rows,
+        int cols,
         bool use_causal_mask,
-        const MPIContext *mpi_ctx,
+        float scale,
         int device_idx)
     {
-        (void)mpi_ctx;
-        (void)device_idx;
+        (void)device_idx; // Unused for CPU kernel
 
-        if (input != output)
+        if (!data)
         {
-            std::memcpy(output, input, rows * cols * sizeof(uint16_t));
+            LOG_ERROR("CPUSoftmaxKernelT<FP16>: Null data pointer");
+            return false;
         }
 
-#pragma omp parallel for if (rows * cols > 8192)
-        for (int i = 0; i < rows; ++i)
+        if (rows <= 0 || cols <= 0)
         {
-            uint16_t *row_ptr = output + i * cols;
-            primitives::softmax_row_fp16(row_ptr, cols, use_causal_mask, 1.0f, i);
+            LOG_DEBUG("CPUSoftmaxKernelT<FP16>: Empty input (rows=" << rows << ", cols=" << cols << ")");
+            return true; // Nothing to do
         }
+
+        // Use native FP16 softmax primitive
+        // Internally converts to FP32 only for exp/div, accumulates in FP32,
+        // then converts back to FP16 for output
+        primitives::softmax_row_major_fp16(
+            data,
+            rows,
+            cols,
+            use_causal_mask,
+            scale,
+            true // parallel
+        );
 
         return true;
     }
 
-    // Explicit instantiations
-    template class CPUSoftmaxKernelT<FP32Tensor>;
-    template class CPUSoftmaxKernelT<BF16Tensor>;
-    template class CPUSoftmaxKernelT<FP16Tensor>;
-    template class CPUSoftmaxKernelT<Q8_1Tensor>;
-    template class CPUSoftmaxKernelT<INT32Tensor>;
+    // ============================================================================
+    // Q8_1 Specialization Implementation (Integer-Aware)
+    // ============================================================================
+
+    bool CPUSoftmaxKernelT<ActivationPrecision::Q8_1>::apply_typed(
+        Q8_1Block *data,
+        int rows,
+        int n_blocks_per_row,
+        bool use_causal_mask,
+        float scale,
+        int device_idx)
+    {
+        (void)device_idx; // Unused for CPU kernel
+
+        if (!data)
+        {
+            LOG_ERROR("CPUSoftmaxKernelT<Q8_1>: Null data pointer");
+            return false;
+        }
+
+        if (rows <= 0 || n_blocks_per_row <= 0)
+        {
+            LOG_DEBUG("CPUSoftmaxKernelT<Q8_1>: Empty input (rows=" << rows
+                                                                        << ", n_blocks_per_row=" << n_blocks_per_row << ")");
+            return true; // Nothing to do
+        }
+
+        // Use integer-aware Q8_1 softmax primitive
+        // This uses:
+        //   - Integer max-finding in Q8_1 blocks (compare qs values)
+        //   - Batched scale multiplication (1 mul per block instead of per element)
+        //   - Direct requantization to Q8_1 output (no intermediate FP32 storage)
+        primitives::softmax_row_major_q8_1(
+            data,
+            rows,
+            n_blocks_per_row,
+            use_causal_mask,
+            scale,
+            true // parallel
+        );
+
+        return true;
+    }
+
+    // ============================================================================
+    // Destructor Definitions (required for vtable emission)
+    // ============================================================================
+
+    CPUSoftmaxKernelT<ActivationPrecision::FP32>::~CPUSoftmaxKernelT() = default;
+    CPUSoftmaxKernelT<ActivationPrecision::BF16>::~CPUSoftmaxKernelT() = default;
+    CPUSoftmaxKernelT<ActivationPrecision::FP16>::~CPUSoftmaxKernelT() = default;
+    CPUSoftmaxKernelT<ActivationPrecision::Q8_1>::~CPUSoftmaxKernelT() = default;
+
+    // ============================================================================
+    // Explicit Template Instantiations
+    // ============================================================================
+
+    template class CPUSoftmaxKernelT<ActivationPrecision::FP32>;
+    template class CPUSoftmaxKernelT<ActivationPrecision::BF16>;
+    template class CPUSoftmaxKernelT<ActivationPrecision::FP16>;
+    template class CPUSoftmaxKernelT<ActivationPrecision::Q8_1>;
 
 } // namespace llaminar2

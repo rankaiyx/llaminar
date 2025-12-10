@@ -752,12 +752,17 @@ namespace llaminar2
 
         // Phase 3: Use placement map to detect attention devices per layer
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
-        kv_cache_ = std::make_shared<KVCache>(effective_mpi_ctx, n_layers_, max_seq_len, n_kv_heads_, head_dim_, attention_devices);
+
+        // Create typed KV cache matching pipeline's activation precision
+        kv_cache_ = createKVCache(config_.activation_precision, effective_mpi_ctx,
+                                  n_layers_, max_seq_len, n_kv_heads_, head_dim_,
+                                  attention_devices);
         current_positions_.clear(); // Will be resized to batch_size in forward_batch()
 
         LOG_INFO("Initialized KV cache: " << n_layers_ << " layers, "
                                           << max_seq_len << " max_seq_len, "
-                                          << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim");
+                                          << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim"
+                                          << ", precision: " << static_cast<int>(config_.activation_precision));
     }
 
     // ===== Snapshot Capture Implementation =====
@@ -991,8 +996,9 @@ namespace llaminar2
 
         int target_device = (device >= 0) ? device : device_idx_;
 
-        if (!rmsnorm_op_(input, gamma, output, rows, cols, eps,
-                         snapshot_key.c_str(), mpi_ctx_.get(), target_device))
+        if (!typed_rmsnorm_op_ || !typed_rmsnorm_op_->execute(
+                                      input, gamma, output, rows, cols, eps,
+                                      mpi_ctx_.get(), target_device))
         {
             return false;
         }
@@ -1286,27 +1292,14 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
 
-        // Use typed residual op when available (required for Q8_1 activation precision)
-        if (typed_residual_op_)
+        // Use typed residual op (supports Q8_1/BF16/FP16 activation precision)
+        if (!typed_residual_op_->batched(
+                const_cast<TensorBase *>(residual),
+                const_cast<TensorBase *>(input),
+                output,
+                batch_size, sequence_lengths.data(), seq_len, hidden_dim))
         {
-            if (!typed_residual_op_->batched(
-                    const_cast<TensorBase *>(residual),
-                    const_cast<TensorBase *>(input),
-                    output,
-                    batch_size, sequence_lengths.data(), seq_len, hidden_dim))
-            {
-                return false;
-            }
-        }
-        else
-        {
-            // Fallback to legacy op for backward compatibility
-            if (!residual_op_.batched(residual, input, output,
-                                      batch_size, seq_len, hidden_dim,
-                                      sequence_lengths, snapshot_key.c_str()))
-            {
-                return false;
-            }
+            return false;
         }
 
         // Capture snapshot
@@ -1346,23 +1339,11 @@ namespace llaminar2
 
         int target_device = (device >= 0) ? device : device_idx_;
 
-        // Use typed RoPE op if available (handles Q8_1/BF16/FP16 correctly)
-        if (typed_rope_op_)
+        // Use typed RoPE op (supports Q8_1/BF16/FP16 activation precision)
+        if (!typed_rope_op_->apply(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
+                                   mpi_ctx_.get(), target_device))
         {
-            if (!typed_rope_op_->apply(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
-                                       mpi_ctx_.get(), target_device))
-            {
-                return false;
-            }
-        }
-        else
-        {
-            // Fallback to legacy FP32 RoPE op
-            if (!rope_op_(Q, K, position_ids, seq_len, n_heads, n_kv_heads, head_dim, theta,
-                          snapshot_prefix.c_str(), mpi_ctx_.get(), target_device))
-            {
-                return false;
-            }
+            return false;
         }
 
         // Capture snapshots for Q and K after RoPE
@@ -1445,6 +1426,7 @@ namespace llaminar2
         int batch_size, const std::vector<int> &sequence_lengths, int padded_seq_len,
         bool causal, const std::string &snapshot_key)
     {
+        LOG_DEBUG("[PipelineBase::compute_attention] seq_len=" << seq_len << ", precision=" << static_cast<int>(config_.activation_precision));
         KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
         // Create views with actual effective_seq_len
@@ -1523,8 +1505,37 @@ namespace llaminar2
             return false;
         }
 
-        // Get attention kernel from output tensor
-        auto *activation_output = dynamic_cast<IActivationTensor *>(out_view.get());
+        // Determine output handling based on input type:
+        // - Q8_1 input: Q8_1 native kernel outputs Q8_1 blocks directly, no conversion needed
+        // - Other inputs: kernel outputs FP32, may need post-quantization
+        std::shared_ptr<FP32Tensor> fp32_output_temp;
+        TensorBase *effective_output = out_view.get();
+        const TensorType input_type = Q->native_type();
+        const TensorType output_type = output->native_type();
+
+        // For Q8_1 input with Q8_1 output: native path writes Q8_1 directly
+        // For Q8_1 input with non-Q8_1 output: would need dequant (not implemented)
+        // For non-Q8_1 input with Q8_1 output: need FP32 temp + quantize
+        bool needs_quantize = false;
+        if (input_type == TensorType::Q8_1)
+        {
+            // Q8_1 native attention writes Q8_1 blocks directly to output
+            // No temp buffer needed - just use the output tensor
+            effective_output = out_view.get();
+            needs_quantize = false; // Q8_1 kernel handles quantization internally
+        }
+        else if (output_type == TensorType::Q8_1)
+        {
+            // Non-Q8_1 input (FP32/BF16/FP16) with Q8_1 output
+            // Need FP32 temp buffer, then quantize
+            fp32_output_temp = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(q_seq_len), static_cast<size_t>(n_heads * head_dim)});
+            effective_output = fp32_output_temp.get();
+            needs_quantize = true;
+        }
+
+        // Get attention kernel from effective output tensor (FP32 for Q8_1 path)
+        auto *activation_output = dynamic_cast<IActivationTensor *>(effective_output);
         if (!activation_output)
         {
             LOG_ERROR("compute_attention_with_kv_cache: output tensor does not implement IActivationTensor");
@@ -1574,16 +1585,48 @@ namespace llaminar2
 
         // Use CPUAttentionKernelTyped's compute_decode which handles asymmetric lengths
         // Since ITensorAttention doesn't expose compute_decode, we need to cast to the concrete type
-        // Note: FP32Tensor::createAttention() returns CPUAttentionKernelTyped<ActivationPrecision::FP32>
-        auto *typed_kernel = dynamic_cast<CPUAttentionKernelTyped<ActivationPrecision::FP32> *>(attention_kernel.get());
-        if (typed_kernel)
+
+        // IMPORTANT: Dispatch based on INPUT tensor type, not kernel type
+        // This ensures we use native precision operations without unnecessary dequantization
+
+        bool success = false;
+        // input_type already defined above for output handling
+
+        if (input_type == TensorType::Q8_1)
         {
-            // Pass -1 for device_idx since CPUAttentionKernelTyped expects -1 for CPU execution
-            bool success = typed_kernel->compute_decode(
-                Q_view->data(),
-                K_view->data(),
-                V_view->data(),
-                out_view->mutable_data(),
+            // Q8_1 input path: Use Q8_1 kernel with native Q8_1 blocks
+            auto *q8_1_kernel = dynamic_cast<CPUAttentionKernelTyped<ActivationPrecision::Q8_1> *>(attention_kernel.get());
+            if (!q8_1_kernel)
+            {
+                // Create Q8_1 kernel if we got a different type
+                static CPUAttentionKernelTyped<ActivationPrecision::Q8_1> q8_1_kernel_static;
+                q8_1_kernel = &q8_1_kernel_static;
+            }
+
+            // Cast to Q8_1 blocks - the kernel expects Q8_1Block* cast to float*
+            auto *Q_q8_1 = dynamic_cast<Q8_1Tensor *>(Q_view.get());
+            auto *K_q8_1 = dynamic_cast<Q8_1Tensor *>(K_view.get());
+            auto *V_q8_1 = dynamic_cast<Q8_1Tensor *>(V_view.get());
+
+            if (!Q_q8_1 || !K_q8_1 || !V_q8_1)
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: Q8_1 input type but failed to cast views");
+                return false;
+            }
+
+            // Output must also be Q8_1 for native path (kernel writes Q8_1 blocks)
+            auto *out_q8_1 = dynamic_cast<Q8_1Tensor *>(effective_output);
+            if (!out_q8_1)
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: Q8_1 input requires Q8_1 output tensor");
+                return false;
+            }
+
+            success = q8_1_kernel->compute_decode(
+                reinterpret_cast<const float *>(Q_q8_1->q8_1_blocks()),
+                reinterpret_cast<const float *>(K_q8_1->q8_1_blocks()),
+                reinterpret_cast<const float *>(V_q8_1->q8_1_blocks()),
+                reinterpret_cast<float *>(out_q8_1->mutable_q8_1_blocks()),
                 q_seq_len, kv_seq_len, n_heads, n_kv_heads, head_dim,
                 causal, /*window_size=*/-1,
                 scores_workspace.get(),
@@ -1596,42 +1639,165 @@ namespace llaminar2
 
             if (!success)
             {
-                LOG_ERROR("compute_attention_with_kv_cache: compute_decode failed");
+                LOG_ERROR("compute_attention_with_kv_cache: compute_decode failed (Q8_1 native)");
+                return false;
+            }
+        }
+        else if (input_type == TensorType::BF16)
+        {
+            // BF16 input path: Use BF16 kernel with native BF16 data
+            auto *bf16_kernel = dynamic_cast<CPUAttentionKernelTyped<ActivationPrecision::BF16> *>(attention_kernel.get());
+            if (!bf16_kernel)
+            {
+                static CPUAttentionKernelTyped<ActivationPrecision::BF16> bf16_kernel_static;
+                bf16_kernel = &bf16_kernel_static;
+            }
+
+            auto *Q_bf16 = dynamic_cast<BF16Tensor *>(Q_view.get());
+            auto *K_bf16 = dynamic_cast<BF16Tensor *>(K_view.get());
+            auto *V_bf16 = dynamic_cast<BF16Tensor *>(V_view.get());
+
+            if (!Q_bf16 || !K_bf16 || !V_bf16)
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: BF16 input type but failed to cast views");
+                return false;
+            }
+
+            success = bf16_kernel->compute_decode(
+                reinterpret_cast<const float *>(Q_bf16->bf16_data()),
+                reinterpret_cast<const float *>(K_bf16->bf16_data()),
+                reinterpret_cast<const float *>(V_bf16->bf16_data()),
+                effective_output->mutable_data(),
+                q_seq_len, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                causal, /*window_size=*/-1,
+                scores_workspace.get(),
+                nullptr, // workspace_buffer
+                nullptr, // workspace_context
+                mask_tensor.get(),
+                true, // use_bf16
+                mpi_ctx_.get(),
+                -1);
+
+            if (!success)
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: compute_decode failed (BF16 native)");
+                return false;
+            }
+        }
+        else if (input_type == TensorType::FP16)
+        {
+            // FP16 input path: Use FP16 kernel with native FP16 data
+            auto *fp16_kernel = dynamic_cast<CPUAttentionKernelTyped<ActivationPrecision::FP16> *>(attention_kernel.get());
+            if (!fp16_kernel)
+            {
+                static CPUAttentionKernelTyped<ActivationPrecision::FP16> fp16_kernel_static;
+                fp16_kernel = &fp16_kernel_static;
+            }
+
+            auto *Q_fp16 = dynamic_cast<FP16Tensor *>(Q_view.get());
+            auto *K_fp16 = dynamic_cast<FP16Tensor *>(K_view.get());
+            auto *V_fp16 = dynamic_cast<FP16Tensor *>(V_view.get());
+
+            if (!Q_fp16 || !K_fp16 || !V_fp16)
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: FP16 input type but failed to cast views");
+                return false;
+            }
+
+            success = fp16_kernel->compute_decode(
+                reinterpret_cast<const float *>(Q_fp16->fp16_data()),
+                reinterpret_cast<const float *>(K_fp16->fp16_data()),
+                reinterpret_cast<const float *>(V_fp16->fp16_data()),
+                effective_output->mutable_data(),
+                q_seq_len, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                causal, /*window_size=*/-1,
+                scores_workspace.get(),
+                nullptr, // workspace_buffer
+                nullptr, // workspace_context
+                mask_tensor.get(),
+                false, // use_bf16
+                mpi_ctx_.get(),
+                -1);
+
+            if (!success)
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: compute_decode failed (FP16 native)");
                 return false;
             }
         }
         else
         {
-            // Fallback: try legacy CpuAttentionKernelT for backwards compatibility
-            auto *legacy_kernel = dynamic_cast<CpuAttentionKernelT<FP32Tensor> *>(attention_kernel.get());
-            if (legacy_kernel)
+            // FP32 input path (default): Use FP32 kernel with native FP32 data
+            auto *fp32_kernel = dynamic_cast<CPUAttentionKernelTyped<ActivationPrecision::FP32> *>(attention_kernel.get());
+            if (!fp32_kernel)
             {
-                bool success = legacy_kernel->compute_decode(
+                // Try legacy kernel for backwards compatibility
+                auto *legacy_kernel = dynamic_cast<CpuAttentionKernelT<FP32Tensor> *>(attention_kernel.get());
+                if (legacy_kernel)
+                {
+                    success = legacy_kernel->compute_decode(
+                        Q_view->data(),
+                        K_view->data(),
+                        V_view->data(),
+                        effective_output->mutable_data(),
+                        q_seq_len, kv_seq_len, n_heads, n_kv_heads, head_dim,
+                        causal, /*window_size=*/-1,
+                        scores_workspace.get(),
+                        nullptr,
+                        nullptr,
+                        mask_tensor.get(),
+                        false,
+                        mpi_ctx_.get(),
+                        -1);
+                }
+                else
+                {
+                    static CPUAttentionKernelTyped<ActivationPrecision::FP32> fp32_kernel_static;
+                    fp32_kernel = &fp32_kernel_static;
+                }
+            }
+
+            if (fp32_kernel)
+            {
+                success = fp32_kernel->compute_decode(
                     Q_view->data(),
                     K_view->data(),
                     V_view->data(),
-                    out_view->mutable_data(),
+                    effective_output->mutable_data(),
                     q_seq_len, kv_seq_len, n_heads, n_kv_heads, head_dim,
                     causal, /*window_size=*/-1,
                     scores_workspace.get(),
-                    nullptr, // workspace_buffer
-                    nullptr, // workspace_context
+                    nullptr,
+                    nullptr,
                     mask_tensor.get(),
-                    false, // use_bf16
+                    false,
                     mpi_ctx_.get(),
-                    -1); // CPU device index for kernel
-
-                if (!success)
-                {
-                    LOG_ERROR("compute_attention_with_kv_cache: compute_decode failed");
-                    return false;
-                }
+                    -1);
             }
-            else
+
+            if (!success)
             {
-                LOG_ERROR("compute_attention_with_kv_cache: could not get CPUAttentionKernelTyped or CpuAttentionKernelT");
+                LOG_ERROR("compute_attention_with_kv_cache: compute_decode failed (FP32)");
                 return false;
             }
+        }
+
+        // If we computed to a temporary FP32 buffer, quantize to Q8_1 output
+        if (needs_quantize && fp32_output_temp)
+        {
+            auto *q8_1_output = dynamic_cast<Q8_1Tensor *>(out_view.get());
+            if (!q8_1_output)
+            {
+                LOG_ERROR("compute_attention_with_kv_cache: expected Q8_1 output but cast failed");
+                return false;
+            }
+
+            // Quantize FP32 to Q8_1
+            const size_t n_elements = static_cast<size_t>(q_seq_len) * static_cast<size_t>(n_heads * head_dim);
+            simd::quantize_fp32_to_q8_1_blocks(
+                fp32_output_temp->data(),
+                q8_1_output->mutable_q8_1_blocks(),
+                n_elements);
         }
 
         // Capture snapshot

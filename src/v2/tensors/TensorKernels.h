@@ -389,6 +389,49 @@ namespace llaminar2
         }
 
         /**
+         * @brief Tensor-based matrix multiplication with explicit dimensions
+         *
+         * This overload accepts explicit m, n, k dimensions, essential for:
+         * - **Pre-allocated buffers**: Tensor shapes may be larger than actual data
+         * - **Row-parallel GEMM**: Local output size differs from tensor allocation
+         * - **Batched execution**: Processing subset of pre-allocated batch buffer
+         *
+         * @param A Input activations tensor [>=m, >=k] (actual data in first m rows)
+         * @param C Output tensor [>=m, >=n] (writes to first m rows)
+         * @param m Number of rows to process (may be < A->shape()[0])
+         * @param n Number of output columns (may be < C->shape()[1])
+         * @param k Number of input columns (may be < A->shape()[1])
+         * @param transpose_B Whether B (packed weights) is transposed (typical: true)
+         * @param alpha Scale factor for A@B
+         * @param beta Scale factor for existing C (for fused add)
+         * @param mpi_ctx MPI context for distributed execution
+         * @param device_idx Device index for execution
+         *
+         * @return true on success, false if format combination not supported
+         */
+        virtual bool multiply_tensor(
+            const TensorBase *A, TensorBase *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            // Default: not supported
+            (void)A;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)transpose_B;
+            (void)alpha;
+            (void)beta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
+
+        /**
          * @brief GEMM with FP32 input, outputting to Q8_1 format
          *
          * Performs GEMM and requantizes the output directly to Q8_1 blocks.
@@ -426,6 +469,46 @@ namespace llaminar2
         }
 
         /**
+         * @brief GEMM with pre-quantized Q8_1 activations, outputting Q8_1
+         *
+         * This method takes Q8_1 blocks as input and produces Q8_1 blocks as output,
+         * avoiding double quantization that would occur if using FP32 intermediate values.
+         *
+         * @param q8_1_activations Pre-quantized Q8_1 blocks [m, k/32]
+         * @param C_q8_1 Output Q8_1 blocks buffer [m, (n+31)/32 blocks]
+         * @param m Number of rows (sequence length)
+         * @param n Output features (columns)
+         * @param k Input features
+         * @param bias Optional bias vector [n] to add before requantization (nullptr = no bias)
+         * @param accumulate Unused (Q8_1 output doesn't support accumulation)
+         * @param mpi_ctx MPI context for distributed execution
+         * @param device_idx Device index for execution
+         *
+         * @return true on success, false if not supported
+         */
+        virtual bool multiply_with_precomputed_q8_1_to_q8_1(
+            const void *q8_1_activations,
+            void *C_q8_1,
+            int m, int n, int k,
+            const float *bias = nullptr,
+            bool accumulate = false,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            // Default: not supported
+            (void)q8_1_activations;
+            (void)C_q8_1;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)bias;
+            (void)accumulate;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
+
+        /**
          * @brief Activation-activation matrix multiplication: C = alpha * A @ B^T + beta * C
          *
          * This variant supports both A and B as activation buffers (not weight tensors).
@@ -456,6 +539,49 @@ namespace llaminar2
             float alpha = 1.0f, float beta = 0.0f,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Tensor-based activation-activation matmul: C = alpha * A @ B^T + beta * C
+         *
+         * Type-aware dispatch based on tensor native_type():
+         * - FP32 × FP32 → FP32: Standard OpenBLAS/OneDNN path
+         * - BF16 × BF16 → FP32: OneDNN bf16bf16f32
+         * - FP16 × FP16 → FP32: OneDNN fp16fp16f32
+         * - Q8_1 × Q8_1 → FP32: Dequant both, FP32 matmul (attention scores are always FP32)
+         *
+         * @param A Left activation tensor [m, k]
+         * @param B Right activation tensor [n, k] if transpose_B, [k, n] otherwise
+         * @param C Output tensor [m, n]
+         * @param transpose_B Whether to transpose B (true for Q@K^T)
+         * @param alpha Scale factor (e.g., 1/sqrt(d_k) for attention)
+         * @param beta Scale factor for existing C
+         * @param mpi_ctx MPI context (nullptr = single node)
+         * @param device_idx Device index (-1 = CPU, ≥0 = GPU)
+         *
+         * @return true on success, false if type combination not supported
+         *
+         * @note Default implementation returns false.
+         *       Subclasses that include Tensors.h can override with type-aware dispatch.
+         */
+        virtual bool multiply_activations_tensor(
+            const TensorBase *A, const TensorBase *B, TensorBase *C,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            // Default: not supported (TensorBase is only forward-declared here)
+            // Subclasses that include Tensors.h can override with real implementation
+            (void)A;
+            (void)B;
+            (void)C;
+            (void)transpose_B;
+            (void)alpha;
+            (void)beta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false;
+        }
 
         /**
          * @brief Strided activation-activation GEMM with custom leading dimensions
@@ -1170,6 +1296,90 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Compute single-sequence Q8_1 native attention
+         *
+         * Native Q8_1 path that avoids float* casts. Implementations that don't
+         * support Q8_1 should return false (default behavior).
+         *
+         * @param Q Q8_1Block* cast to void* [seq_len, n_heads, head_dim_blocks]
+         * @param K Q8_1Block* cast to void* [seq_len, n_kv_heads, head_dim_blocks]
+         * @param V Q8_1Block* cast to void* [seq_len, n_kv_heads, head_dim_blocks]
+         * @param output Q8_1Block* cast to void* [seq_len, n_heads, head_dim_blocks]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads
+         * @param head_dim Head dimension (must be multiple of 32 for Q8_1)
+         * @param causal Apply causal masking
+         * @param window_size Sliding window size (-1 = disabled)
+         * @param workspace_scores Workspace for attention scores
+         * @param workspace_mask Pre-built attention mask or nullptr
+         * @param mpi_ctx MPI context
+         * @param device_idx Device index
+         * @return true on success, false if Q8_1 not supported
+         */
+        virtual bool compute_q8_1(
+            const void *Q, const void *K, const void *V, void *output,
+            int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)output;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)workspace_scores;
+            (void)workspace_mask;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Default: Q8_1 not supported
+        }
+
+        /**
+         * @brief Compute batched Q8_1 native attention
+         *
+         * Native Q8_1 batch path. See compute_q8_1() for parameter details.
+         *
+         * @return true on success, false if Q8_1 not supported
+         */
+        virtual bool compute_batch_q8_1(
+            const void *Q, const void *K, const void *V, void *output,
+            int batch_size, int seq_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)output;
+            (void)batch_size;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)workspace_scores;
+            (void)workspace_mask;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Default: Q8_1 not supported
+        }
     };
 
     /**
@@ -1203,6 +1413,51 @@ namespace llaminar2
             const int *pos_ids,
             int batch_size, int seq_len, int head_dim, int num_heads,
             float theta_base, int device_idx) { return false; }
+
+        /**
+         * @brief Apply RoPE using tensor objects with automatic type dispatch
+         *
+         * Inspects Q/K tensor native_type() and dispatches to the appropriate
+         * typed method (apply, apply_bf16, apply_fp16, apply_q8_1).
+         *
+         * @param Q Query tensor [seq_len, n_heads * head_dim] - modified in-place
+         * @param K Key tensor [seq_len, n_kv_heads * head_dim] - modified in-place
+         * @param position_ids Position indices [seq_len]
+         * @param seq_len Sequence length
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of KV heads
+         * @param head_dim Head dimension
+         * @param rope_theta RoPE frequency base
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success, false on failure or unsupported type
+         *
+         * @note Default returns false. Subclasses should override with type-aware dispatch.
+         */
+        virtual bool apply_tensor(
+            TensorBase *Q,
+            TensorBase *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)Q;
+            (void)K;
+            (void)position_ids;
+            (void)seq_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)rope_theta;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Subclasses override with type-aware dispatch
+        }
     };
 
     /**
@@ -1236,6 +1491,135 @@ namespace llaminar2
             const void *gate, const void *up, void *output,
             int rows, int cols,
             bool add_residual,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        /**
+         * @brief Apply SwiGLU using tensor objects with automatic type dispatch
+         *
+         * Inspects gate/up/output tensor native_type() and dispatches to the appropriate
+         * typed method (apply, apply_bf16, apply_fp16, apply_q8_1).
+         *
+         * @param gate Gate tensor [rows, cols]
+         * @param up Up tensor [rows, cols]
+         * @param output Output tensor [rows, cols]
+         * @param rows Number of rows
+         * @param cols Number of columns
+         * @param add_residual Whether to add residual
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success, false on failure or unsupported type combination
+         *
+         * @note Default returns false. Subclasses should override with type-aware dispatch.
+         */
+        virtual bool apply_tensor(
+            TensorBase *gate,
+            TensorBase *up,
+            TensorBase *output,
+            int rows, int cols,
+            bool add_residual,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+    };
+
+    /**
+     * @brief Embedding lookup kernel
+     *
+     * Handles embedding table lookup with typed output:
+     * - FP32 output: Direct memcpy from embedding table
+     * - BF16/FP16 output: Lookup FP32 embeddings, then convert
+     * - Q8_1 output: Lookup FP32 embeddings, then quantize to Q8_1 format
+     *
+     * The embedding table is always FP32 (stored in model weights).
+     * Output format is determined by activation precision configuration.
+     */
+    class ITensorEmbedding : public ITensorKernel
+    {
+    public:
+        /**
+         * @brief Execute embedding lookup with FP32 output
+         *
+         * @param embed_data Embedding table data [vocab_size, d_model] (FP32)
+         * @param token_ids Token IDs to look up
+         * @param num_tokens Number of tokens
+         * @param d_model Embedding dimension
+         * @param output Output buffer [num_tokens, d_model] (FP32)
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success
+         */
+        virtual bool apply(
+            const float *embed_data,
+            const int *token_ids,
+            int num_tokens,
+            int d_model,
+            float *output,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) = 0;
+
+        /**
+         * @brief Execute embedding lookup with BF16 output
+         */
+        virtual bool apply_bf16(
+            const float *embed_data,
+            const int *token_ids,
+            int num_tokens,
+            int d_model,
+            uint16_t *output,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        /**
+         * @brief Execute embedding lookup with FP16 output
+         */
+        virtual bool apply_fp16(
+            const float *embed_data,
+            const int *token_ids,
+            int num_tokens,
+            int d_model,
+            uint16_t *output,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        /**
+         * @brief Execute embedding lookup with Q8_1 output
+         *
+         * @param embed_data Embedding table data [vocab_size, d_model] (FP32)
+         * @param token_ids Token IDs to look up
+         * @param num_tokens Number of tokens
+         * @param d_model Embedding dimension (must be multiple of 32)
+         * @param output Output Q8_1 blocks [num_tokens * blocks_per_row]
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success
+         */
+        virtual bool apply_q8_1(
+            const float *embed_data,
+            const int *token_ids,
+            int num_tokens,
+            int d_model,
+            void *output,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        /**
+         * @brief Apply embedding lookup using tensor objects with automatic type dispatch
+         *
+         * @param embed_table Embedding table tensor [vocab_size, d_model] (FP32)
+         * @param token_ids Token IDs to look up
+         * @param num_tokens Number of tokens
+         * @param d_model Embedding dimension
+         * @param output Output tensor [num_tokens, d_model]
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success, false on failure or unsupported type
+         */
+        virtual bool apply_tensor(
+            const TensorBase *embed_table,
+            const int *token_ids,
+            int num_tokens,
+            int d_model,
+            TensorBase *output,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) { return false; }
     };
@@ -1297,6 +1681,44 @@ namespace llaminar2
         virtual bool apply_int32_to_int8(
             const int32_t *input, const float *weight, int8_t *output,
             float *scales, int rows, int cols, float epsilon = 1e-6f, int device_idx = -1) { return false; }
+
+        /**
+         * @brief Apply RMSNorm using tensor objects with automatic type dispatch
+         *
+         * Inspects input/output tensor native_type() and dispatches to the appropriate
+         * typed method (apply, apply_bf16, apply_fp16, apply_q8_1).
+         *
+         * @param input Input tensor [rows, cols]
+         * @param weight Weight tensor (gamma) [cols] - always FP32
+         * @param output Output tensor [rows, cols] - must match input type
+         * @param rows Number of rows
+         * @param cols Number of columns
+         * @param epsilon RMSNorm epsilon
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success, false on failure or unsupported type combination
+         *
+         * @note Default returns false. Subclasses should override with type-aware dispatch.
+         */
+        virtual bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *weight,
+            TensorBase *output,
+            int rows, int cols,
+            float epsilon = 1e-6f,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)input;
+            (void)weight;
+            (void)output;
+            (void)rows;
+            (void)cols;
+            (void)epsilon;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Subclasses override with type-aware dispatch
+        }
 
         /**
          * @brief Execute fused RMSNorm + INT8 quantization (operator fusion API)

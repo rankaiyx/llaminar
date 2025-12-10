@@ -7,8 +7,6 @@
 #include "Tensors.h"
 #include "../kernels/KernelFactory.h"
 #include "Tensors.h"
-#include "../kernels/cpu/ops/CPURoPEKernelT.h"
-#include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"

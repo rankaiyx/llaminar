@@ -1,6 +1,6 @@
 /**
- * @file Test__CPURMSNormTypedKernel.cpp
- * @brief Unit tests for CPURMSNormTypedKernel with typed precision conversion
+ * @file Test__CPURMSNormKernelT.cpp
+ * @brief Unit tests for CPURMSNormKernelT with typed precision conversion
  *
  * Tests the "kernel black-box model" where:
  * - External interface uses configured ActivationPrecision
@@ -13,7 +13,7 @@
 
 #include <gtest/gtest.h>
 
-#include "v2/kernels/cpu/ops/CPURMSNormTypedKernel.h"
+#include "v2/kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "v2/kernels/cpu/primitives/RMSNormPrimitives.h"
 #include "v2/tensors/SIMDHelpers.h"
 #include "v2/tensors/BlockStructures.h"
@@ -117,7 +117,7 @@ namespace llaminar2
     // Test Fixture
     // =========================================================================
 
-    class CPURMSNormTypedKernelTest : public ::testing::Test
+    class CPURMSNormKernelTTest : public ::testing::Test
     {
     protected:
         static constexpr float EPSILON = 1e-6f;
@@ -143,7 +143,7 @@ namespace llaminar2
     // FP32 Specialization Tests
     // =========================================================================
 
-    TEST_F(CPURMSNormTypedKernelTest, FP32_apply_typed_matches_reference)
+    TEST_F(CPURMSNormKernelTTest, FP32_apply_typed_matches_reference)
     {
         // Generate test data
         auto input = generate_random_fp32(rows_ * cols_);
@@ -155,7 +155,7 @@ namespace llaminar2
         reference_rmsnorm(input.data(), gamma.data(), expected.data(), rows_, cols_, EPSILON);
 
         // Test typed kernel
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             input.data(), gamma.data(), output.data(),
             rows_, cols_, EPSILON));
@@ -166,7 +166,7 @@ namespace llaminar2
             << "FP32 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, FP32_apply_with_residual_add)
+    TEST_F(CPURMSNormKernelTTest, FP32_apply_with_residual_add)
     {
         // Generate test data
         auto residual = generate_random_fp32(rows_ * cols_);
@@ -184,7 +184,7 @@ namespace llaminar2
         reference_rmsnorm(fused.data(), gamma.data(), expected.data(), rows_, cols_, EPSILON);
 
         // Test typed kernel
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
         ASSERT_TRUE(kernel.apply_with_residual_add(
             residual.data(), input.data(), gamma.data(), output.data(),
             rows_, cols_, EPSILON));
@@ -195,9 +195,9 @@ namespace llaminar2
             << "FP32 RMSNorm with residual max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, FP32_precision_metadata)
+    TEST_F(CPURMSNormKernelTTest, FP32_precision_metadata)
     {
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
         EXPECT_EQ(kernel.precision(), ActivationPrecision::FP32);
         EXPECT_STREQ(kernel.precision_name(), "FP32");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 1.0f);
@@ -207,7 +207,7 @@ namespace llaminar2
     // BF16 Specialization Tests
     // =========================================================================
 
-    TEST_F(CPURMSNormTypedKernelTest, BF16_apply_typed_with_conversion)
+    TEST_F(CPURMSNormKernelTTest, BF16_apply_typed_with_conversion)
     {
         // Generate FP32 test data and convert to BF16
         auto fp32_input = generate_random_fp32(rows_ * cols_);
@@ -223,7 +223,7 @@ namespace llaminar2
         std::vector<float> fp32_output(rows_ * cols_);
 
         // Test typed kernel
-        CPURMSNormTypedKernel<ActivationPrecision::BF16> kernel;
+        CPURMSNormKernelT<ActivationPrecision::BF16> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             bf16_input.data(), gamma.data(), bf16_output.data(),
             rows_, cols_, EPSILON));
@@ -246,7 +246,7 @@ namespace llaminar2
             << "BF16 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, BF16_apply_with_residual_add)
+    TEST_F(CPURMSNormKernelTTest, BF16_apply_with_residual_add)
     {
         // Generate test data
         auto fp32_residual = generate_random_fp32(rows_ * cols_);
@@ -263,7 +263,7 @@ namespace llaminar2
         std::vector<float> fp32_output(rows_ * cols_);
 
         // Test typed kernel
-        CPURMSNormTypedKernel<ActivationPrecision::BF16> kernel;
+        CPURMSNormKernelT<ActivationPrecision::BF16> kernel;
         ASSERT_TRUE(kernel.apply_with_residual_add(
             bf16_residual.data(), fp32_input.data(), gamma.data(), bf16_output.data(),
             rows_, cols_, EPSILON));
@@ -292,9 +292,9 @@ namespace llaminar2
             << "BF16 RMSNorm with residual max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, BF16_precision_metadata)
+    TEST_F(CPURMSNormKernelTTest, BF16_precision_metadata)
     {
-        CPURMSNormTypedKernel<ActivationPrecision::BF16> kernel;
+        CPURMSNormKernelT<ActivationPrecision::BF16> kernel;
         EXPECT_EQ(kernel.precision(), ActivationPrecision::BF16);
         EXPECT_STREQ(kernel.precision_name(), "BF16");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
@@ -304,7 +304,7 @@ namespace llaminar2
     // FP16 Specialization Tests
     // =========================================================================
 
-    TEST_F(CPURMSNormTypedKernelTest, FP16_apply_typed_with_conversion)
+    TEST_F(CPURMSNormKernelTTest, FP16_apply_typed_with_conversion)
     {
         // Generate FP32 test data and convert to FP16
         auto fp32_input = generate_random_fp32(rows_ * cols_);
@@ -320,7 +320,7 @@ namespace llaminar2
         std::vector<float> fp32_output(rows_ * cols_);
 
         // Test typed kernel
-        CPURMSNormTypedKernel<ActivationPrecision::FP16> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP16> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             fp16_input.data(), gamma.data(), fp16_output.data(),
             rows_, cols_, EPSILON));
@@ -343,9 +343,9 @@ namespace llaminar2
             << "FP16 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, FP16_precision_metadata)
+    TEST_F(CPURMSNormKernelTTest, FP16_precision_metadata)
     {
-        CPURMSNormTypedKernel<ActivationPrecision::FP16> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP16> kernel;
         EXPECT_EQ(kernel.precision(), ActivationPrecision::FP16);
         EXPECT_STREQ(kernel.precision_name(), "FP16");
         EXPECT_FLOAT_EQ(kernel.compression_ratio(), 2.0f);
@@ -355,7 +355,7 @@ namespace llaminar2
     // Q8_1 Specialization Tests
     // =========================================================================
 
-    TEST_F(CPURMSNormTypedKernelTest, Q8_1_apply_typed_with_conversion)
+    TEST_F(CPURMSNormKernelTTest, Q8_1_apply_typed_with_conversion)
     {
         // Generate FP32 test data and convert to Q8_1
         auto fp32_input = generate_random_fp32(rows_ * cols_);
@@ -371,7 +371,7 @@ namespace llaminar2
             fp32_input.data(), q8_input.data(), rows_ * cols_);
 
         // Test typed kernel
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             q8_input.data(), gamma.data(), q8_output.data(),
             rows_, cols_, EPSILON));
@@ -395,7 +395,7 @@ namespace llaminar2
             << "Q8_1 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, Q8_1_apply_with_residual_add)
+    TEST_F(CPURMSNormKernelTTest, Q8_1_apply_with_residual_add)
     {
         // Generate test data
         auto fp32_residual = generate_random_fp32(rows_ * cols_);
@@ -412,7 +412,7 @@ namespace llaminar2
             fp32_residual.data(), q8_residual.data(), rows_ * cols_);
 
         // Test typed kernel
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
         ASSERT_TRUE(kernel.apply_with_residual_add(
             q8_residual.data(), fp32_input.data(), gamma.data(), q8_output.data(),
             rows_, cols_, EPSILON));
@@ -442,7 +442,7 @@ namespace llaminar2
             << "Q8_1 RMSNorm with residual max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, Q8_1_requires_multiple_of_32_cols)
+    TEST_F(CPURMSNormKernelTTest, Q8_1_requires_multiple_of_32_cols)
     {
         // Test with cols not multiple of 32
         int bad_cols = 100; // Not multiple of 32
@@ -453,16 +453,16 @@ namespace llaminar2
         std::vector<Q8_1Block> q8_input(n_blocks);
         std::vector<Q8_1Block> q8_output(n_blocks);
 
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
         EXPECT_FALSE(kernel.apply_typed(
             q8_input.data(), gamma.data(), q8_output.data(),
             rows_, bad_cols, EPSILON))
             << "Q8_1 kernel should reject cols not multiple of 32";
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, Q8_1_precision_metadata)
+    TEST_F(CPURMSNormKernelTTest, Q8_1_precision_metadata)
     {
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
         EXPECT_EQ(kernel.precision(), ActivationPrecision::Q8_1);
         EXPECT_STREQ(kernel.precision_name(), "Q8_1");
         EXPECT_NEAR(kernel.compression_ratio(), 3.556f, 0.01f);
@@ -472,46 +472,46 @@ namespace llaminar2
     // Edge Cases and Error Handling
     // =========================================================================
 
-    TEST_F(CPURMSNormTypedKernelTest, FP32_rejects_null_input)
+    TEST_F(CPURMSNormKernelTTest, FP32_rejects_null_input)
     {
         auto gamma = generate_random_fp32(cols_);
         std::vector<float> output(rows_ * cols_);
 
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
         EXPECT_FALSE(kernel.apply_typed(
             nullptr, gamma.data(), output.data(),
             rows_, cols_, EPSILON));
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, FP32_rejects_null_gamma)
+    TEST_F(CPURMSNormKernelTTest, FP32_rejects_null_gamma)
     {
         auto input = generate_random_fp32(rows_ * cols_);
         std::vector<float> output(rows_ * cols_);
 
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
         EXPECT_FALSE(kernel.apply_typed(
             input.data(), nullptr, output.data(),
             rows_, cols_, EPSILON));
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, FP32_rejects_null_output)
+    TEST_F(CPURMSNormKernelTTest, FP32_rejects_null_output)
     {
         auto input = generate_random_fp32(rows_ * cols_);
         auto gamma = generate_random_fp32(cols_);
 
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
         EXPECT_FALSE(kernel.apply_typed(
             input.data(), gamma.data(), nullptr,
             rows_, cols_, EPSILON));
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, FP32_rejects_invalid_dimensions)
+    TEST_F(CPURMSNormKernelTTest, FP32_rejects_invalid_dimensions)
     {
         auto input = generate_random_fp32(rows_ * cols_);
         auto gamma = generate_random_fp32(cols_);
         std::vector<float> output(rows_ * cols_);
 
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
 
         // Zero rows
         EXPECT_FALSE(kernel.apply_typed(
@@ -538,7 +538,7 @@ namespace llaminar2
     // Large Scale Tests
     // =========================================================================
 
-    TEST_F(CPURMSNormTypedKernelTest, FP32_large_batch)
+    TEST_F(CPURMSNormKernelTTest, FP32_large_batch)
     {
         int large_rows = 64;
         int large_cols = 4096;
@@ -553,7 +553,7 @@ namespace llaminar2
                           large_rows, large_cols, EPSILON);
 
         // Test kernel
-        CPURMSNormTypedKernel<ActivationPrecision::FP32> kernel;
+        CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             input.data(), gamma.data(), output.data(),
             large_rows, large_cols, EPSILON));
@@ -564,7 +564,7 @@ namespace llaminar2
             << "Large batch FP32 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, BF16_large_batch)
+    TEST_F(CPURMSNormKernelTTest, BF16_large_batch)
     {
         int large_rows = 32;
         int large_cols = 2048;
@@ -579,7 +579,7 @@ namespace llaminar2
             fp32_input.data(), bf16_input.data(), large_rows * large_cols);
 
         // Test kernel
-        CPURMSNormTypedKernel<ActivationPrecision::BF16> kernel;
+        CPURMSNormKernelT<ActivationPrecision::BF16> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             bf16_input.data(), gamma.data(), bf16_output.data(),
             large_rows, large_cols, EPSILON));
@@ -602,7 +602,7 @@ namespace llaminar2
             << "Large batch BF16 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, Q8_1_large_batch)
+    TEST_F(CPURMSNormKernelTTest, Q8_1_large_batch)
     {
         int large_rows = 32;
         int large_cols = 2048;
@@ -620,7 +620,7 @@ namespace llaminar2
             fp32_input.data(), q8_input.data(), large_rows * large_cols);
 
         // Test typed kernel
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             q8_input.data(), gamma.data(), q8_output.data(),
             large_rows, large_cols, EPSILON));
@@ -645,7 +645,7 @@ namespace llaminar2
             << "Large batch Q8_1 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, Q8_1_minimum_size)
+    TEST_F(CPURMSNormKernelTTest, Q8_1_minimum_size)
     {
         int min_rows = 1;
         int min_cols = 32;
@@ -660,7 +660,7 @@ namespace llaminar2
         simd::quantize_fp32_to_q8_1_blocks(
             fp32_input.data(), q8_input.data(), min_rows * min_cols);
 
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             q8_input.data(), gamma.data(), q8_output.data(),
             min_rows, min_cols, EPSILON));
@@ -682,7 +682,7 @@ namespace llaminar2
             << "Minimum size Q8_1 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, Q8_1_odd_rows)
+    TEST_F(CPURMSNormKernelTTest, Q8_1_odd_rows)
     {
         int odd_rows = 7;
         int test_cols = 128;
@@ -697,7 +697,7 @@ namespace llaminar2
         simd::quantize_fp32_to_q8_1_blocks(
             fp32_input.data(), q8_input.data(), odd_rows * test_cols);
 
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             q8_input.data(), gamma.data(), q8_output.data(),
             odd_rows, test_cols, EPSILON));
@@ -719,7 +719,7 @@ namespace llaminar2
             << "Odd rows Q8_1 RMSNorm max diff: " << max_diff;
     }
 
-    TEST_F(CPURMSNormTypedKernelTest, Q8_1_zero_input)
+    TEST_F(CPURMSNormKernelTTest, Q8_1_zero_input)
     {
         // All zeros input
         std::vector<float> fp32_input(rows_ * cols_, 0.0f);
@@ -732,7 +732,7 @@ namespace llaminar2
         simd::quantize_fp32_to_q8_1_blocks(
             fp32_input.data(), q8_input.data(), rows_ * cols_);
 
-        CPURMSNormTypedKernel<ActivationPrecision::Q8_1> kernel;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
         ASSERT_TRUE(kernel.apply_typed(
             q8_input.data(), gamma.data(), q8_output.data(),
             rows_, cols_, EPSILON));

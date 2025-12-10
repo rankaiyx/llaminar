@@ -24,10 +24,6 @@
  *
  * // Execute (polymorphic call, type-specific implementation)
  * TRY_OP(rmsnorm->execute(input, weight, output, rows, cols, eps, nullptr, device));
- *
- * // Legacy operator() syntax still works
- * RMSNormOp legacy;
- * TRY_OP(legacy(input, weight, output, rows, cols, eps, nullptr, mpi, device));
  * @endcode
  *
  * @author David Sanftenberg
@@ -121,6 +117,23 @@ namespace llaminar2
         const char *name() const override { return "RMSNormOpTyped"; }
         ActivationPrecision precision() const override { return Precision; }
 
+        /**
+         * @brief Get the expected TensorType for this precision
+         */
+        static constexpr TensorType expected_tensor_type()
+        {
+            if constexpr (Precision == ActivationPrecision::FP32)
+                return TensorType::FP32;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
+            else
+                return TensorType::FP32;
+        }
+
         bool execute(
             const TensorBase *input,
             const TensorBase *weight,
@@ -130,6 +143,10 @@ namespace llaminar2
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
+            // Compile-time validation: ensure TensorT trait is defined
+            static_assert(sizeof(TensorT) > 0,
+                          "PrecisionTensor trait must be defined for this ActivationPrecision");
+
             // 1. Validate inputs
             if (!validateTensor(input, "input"))
                 return false;
@@ -140,7 +157,26 @@ namespace llaminar2
             if (!validateDimensions(rows, cols, "RMSNorm"))
                 return false;
 
-            // 2. Create kernel from output tensor
+            // 2. Type validation: ensure input/output match expected precision
+            constexpr TensorType expected = expected_tensor_type();
+            if (input->native_type() != expected)
+            {
+                logError(("input tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + ", got " +
+                          std::to_string(static_cast<int>(input->native_type())))
+                             .c_str());
+                return false;
+            }
+            if (output->native_type() != expected)
+            {
+                logError(("output tensor type mismatch: expected " +
+                          std::to_string(static_cast<int>(expected)) + ", got " +
+                          std::to_string(static_cast<int>(output->native_type())))
+                             .c_str());
+                return false;
+            }
+
+            // 3. Create kernel from output tensor
             auto *activation = dynamic_cast<IActivationTensor *>(output);
             if (!activation)
             {
@@ -155,76 +191,14 @@ namespace llaminar2
                 return false;
             }
 
-            // 3. Execute based on precision
-            bool success = false;
-
-            if constexpr (Precision == ActivationPrecision::Q8_1)
-            {
-                // Q8_1: Native Q8_1 path
-                auto *q8_input = dynamic_cast<const Q8_1Tensor *>(input);
-                auto *q8_output = dynamic_cast<Q8_1Tensor *>(output);
-                if (!q8_input || !q8_output)
-                {
-                    logError("Q8_1 RMSNorm requires Q8_1 input and output tensors");
-                    return false;
-                }
-                success = kernel->apply_q8_1(
-                    q8_input->q8_1_blocks(),
-                    weight->data(),
-                    q8_output->mutable_q8_1_blocks(),
-                    rows, cols, eps, device_idx);
-            }
-            else if constexpr (Precision == ActivationPrecision::BF16)
-            {
-                // BF16: Native BF16 path
-                auto *bf16_input = dynamic_cast<const BF16Tensor *>(input);
-                auto *bf16_output = dynamic_cast<BF16Tensor *>(output);
-                if (!bf16_input || !bf16_output)
-                {
-                    logError("BF16 RMSNorm requires BF16 input and output tensors");
-                    return false;
-                }
-                success = kernel->apply_bf16(
-                    bf16_input->bf16_data(),
-                    weight->data(),
-                    bf16_output->mutable_bf16_data(),
-                    rows, cols, eps, device_idx);
-            }
-            else if constexpr (Precision == ActivationPrecision::FP16)
-            {
-                // FP16: Native FP16 path
-                auto *fp16_input = dynamic_cast<const FP16Tensor *>(input);
-                auto *fp16_output = dynamic_cast<FP16Tensor *>(output);
-                if (!fp16_input || !fp16_output)
-                {
-                    logError("FP16 RMSNorm requires FP16 input and output tensors");
-                    return false;
-                }
-                success = kernel->apply_fp16(
-                    fp16_input->fp16_data(),
-                    weight->data(),
-                    fp16_output->mutable_fp16_data(),
-                    rows, cols, eps, device_idx);
-            }
-            else
-            {
-                // FP32: Standard path
-                success = kernel->apply(
-                    input->data(),
-                    weight->data(),
-                    output->mutable_data(),
-                    rows, cols,
-                    eps,
-                    false, // use_bf16
-                    mpi_ctx,
-                    device_idx);
-            }
-
-            if (!success)
+            // 4. Delegate to kernel's apply_tensor - handles all type dispatch internally
+            if (!kernel->apply_tensor(input, weight, output, rows, cols, eps, mpi_ctx, device_idx))
             {
                 logError("kernel execution failed");
+                return false;
             }
-            return success;
+
+            return true;
         }
 
         bool execute_raw(
@@ -285,157 +259,6 @@ namespace llaminar2
 
             return true;
         }
-    };
-
-    // =========================================================================
-    // Legacy RMSNormOp (backward compatibility)
-    // =========================================================================
-
-    /**
-     * @brief Legacy untyped RMSNorm operation (backward compatibility)
-     *
-     * Uses runtime type dispatch based on output tensor type.
-     * Prefer using createRMSNormOp() for new code.
-     */
-    class RMSNormOp : public OpBase
-    {
-    public:
-        const char *name() const override { return "RMSNormOp"; }
-
-        bool operator()(
-            const TensorBase *input,
-            const TensorBase *weight,
-            TensorBase *output,
-            int rows, int cols,
-            float eps = 1e-6f,
-            const char *snapshot_key = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            (void)snapshot_key; // Handled by pipeline
-
-            // 1. Validate inputs
-            if (!validateTensor(input, "input"))
-                return false;
-            if (!validateTensor(weight, "weight"))
-                return false;
-            if (!validateTensor(output, "output"))
-                return false;
-            if (!validateDimensions(rows, cols, "RMSNorm"))
-                return false;
-
-            // 2. Create kernel from output tensor
-            auto *activation = dynamic_cast<IActivationTensor *>(output);
-            if (!activation)
-            {
-                logError("output tensor must be IActivationTensor");
-                return false;
-            }
-
-            auto kernel = activation->createRMSNorm();
-            if (!kernel)
-            {
-                logError("failed to create RMSNorm kernel");
-                return false;
-            }
-
-            // 3. Execute based on output tensor type (runtime dispatch)
-            bool success = false;
-            const TensorType out_type = output->native_type();
-
-            switch (out_type)
-            {
-            case TensorType::FP32:
-                success = kernel->apply(
-                    input->data(),
-                    weight->data(),
-                    output->mutable_data(),
-                    rows, cols,
-                    eps,
-                    false,
-                    mpi_ctx,
-                    device_idx);
-                break;
-
-            case TensorType::BF16:
-            {
-                auto *bf16_input = dynamic_cast<const BF16Tensor *>(input);
-                auto *bf16_output = dynamic_cast<BF16Tensor *>(output);
-                if (!bf16_input || !bf16_output)
-                {
-                    logError("BF16 RMSNorm requires BF16 input and output tensors");
-                    return false;
-                }
-                success = kernel->apply_bf16(
-                    bf16_input->bf16_data(),
-                    weight->data(),
-                    bf16_output->mutable_bf16_data(),
-                    rows, cols, eps, device_idx);
-                break;
-            }
-
-            case TensorType::FP16:
-            {
-                auto *fp16_input = dynamic_cast<const FP16Tensor *>(input);
-                auto *fp16_output = dynamic_cast<FP16Tensor *>(output);
-                if (!fp16_input || !fp16_output)
-                {
-                    logError("FP16 RMSNorm requires FP16 input and output tensors");
-                    return false;
-                }
-                success = kernel->apply_fp16(
-                    fp16_input->fp16_data(),
-                    weight->data(),
-                    fp16_output->mutable_fp16_data(),
-                    rows, cols, eps, device_idx);
-                break;
-            }
-
-            case TensorType::Q8_1:
-            {
-                auto *q8_input = dynamic_cast<const Q8_1Tensor *>(input);
-                auto *q8_output = dynamic_cast<Q8_1Tensor *>(output);
-                if (!q8_input || !q8_output)
-                {
-                    logError("Q8_1 RMSNorm requires Q8_1 input and output tensors");
-                    return false;
-                }
-                success = kernel->apply_q8_1(
-                    q8_input->q8_1_blocks(),
-                    weight->data(),
-                    q8_output->mutable_q8_1_blocks(),
-                    rows, cols, eps, device_idx);
-                break;
-            }
-
-            default:
-                logError("unsupported output tensor type for RMSNorm");
-                return false;
-            }
-
-            if (!success)
-            {
-                logError("kernel execution failed");
-            }
-            return success;
-        }
-
-        bool operator()(
-            const float *input_data,
-            const float *weight_data,
-            TensorBase *output,
-            int rows, int cols,
-            float eps = 1e-6f,
-            const char *snapshot_key = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
-        {
-            (void)snapshot_key;
-            return impl_.execute_raw(input_data, weight_data, output, rows, cols, eps, mpi_ctx, device_idx);
-        }
-
-    private:
-        RMSNormOpTyped<ActivationPrecision::FP32> impl_;
     };
 
     // =========================================================================

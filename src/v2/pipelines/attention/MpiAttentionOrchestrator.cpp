@@ -13,6 +13,7 @@
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/Tensors.h"
 #include "../../kernels/cpu/primitives/SoftmaxPrimitives.h"
+#include "../../kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include <cstring>
 #include <cmath>
 #include <sstream>
@@ -21,6 +22,620 @@
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        /**
+         * @brief Factory function to create attention kernel based on precision
+         *
+         * This decouples kernel selection from output tensor type, allowing
+         * Q8_1 inputs with FP32 output to still use the Q8_1 kernel.
+         */
+        std::unique_ptr<ITensorAttention> createAttentionKernelForPrecision(ActivationPrecision precision)
+        {
+            switch (precision)
+            {
+            case ActivationPrecision::Q8_1:
+                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::Q8_1>>();
+            case ActivationPrecision::BF16:
+                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::BF16>>();
+            case ActivationPrecision::FP16:
+                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP16>>();
+            case ActivationPrecision::FP32:
+            default:
+                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP32>>();
+            }
+        }
+
+        /**
+         * @brief Detect the actual precision of input tensors
+         *
+         * Returns the precision that matches the actual tensor types.
+         * This allows us to select the appropriate native path based on
+         * the runtime tensor types, not just the config setting.
+         */
+        ActivationPrecision detectTensorPrecision(const TensorBase *tensor)
+        {
+            if (!tensor)
+            {
+                LOG_DEBUG("[detectTensorPrecision] tensor is null, returning FP32");
+                return ActivationPrecision::FP32;
+            }
+
+            if (dynamic_cast<const Q8_1Tensor *>(tensor))
+            {
+                LOG_DEBUG("[detectTensorPrecision] detected Q8_1Tensor");
+                return ActivationPrecision::Q8_1;
+            }
+            if (dynamic_cast<const BF16Tensor *>(tensor))
+            {
+                LOG_DEBUG("[detectTensorPrecision] detected BF16Tensor");
+                return ActivationPrecision::BF16;
+            }
+            if (dynamic_cast<const FP16Tensor *>(tensor))
+            {
+                LOG_DEBUG("[detectTensorPrecision] detected FP16Tensor");
+                return ActivationPrecision::FP16;
+            }
+            // Default to FP32 (FP32Tensor or any other type that provides float data())
+            LOG_DEBUG("[detectTensorPrecision] defaulting to FP32, tensor type=" << typeid(*tensor).name());
+            return ActivationPrecision::FP32;
+        }
+
+        /**
+         * @brief Check if native tensor-parallel path should be used for the given precision
+         *
+         * Returns true if:
+         * - Q, K, V all have the same precision type
+         * - output tensor matches (or can receive) that precision
+         * - head_dim meets precision-specific requirements
+         *
+         * For Q8_1: head_dim must be multiple of 32, and 64 or 128 (JIT kernel)
+         * For BF16/FP16: no special requirements (element-wise ops)
+         * For FP32: always supported
+         */
+        bool shouldUseNativeTensorParallel(
+            const TensorBase *Q, const TensorBase *K, const TensorBase *V,
+            const TensorBase *output,
+            const MpiAttentionConfig &config,
+            ActivationPrecision &detected_precision)
+        {
+            // Detect input precision from Q tensor
+            detected_precision = detectTensorPrecision(Q);
+
+            // Verify K and V match
+            if (detectTensorPrecision(K) != detected_precision ||
+                detectTensorPrecision(V) != detected_precision)
+            {
+                // Mixed precision inputs - fall back to FP32
+                detected_precision = ActivationPrecision::FP32;
+                return false;
+            }
+
+            // Check output tensor compatibility
+            ActivationPrecision output_precision = detectTensorPrecision(output);
+
+            // Native path requires matching input/output precision
+            // (or FP32 output for precision types that don't have native output support yet)
+            if (output_precision != detected_precision && output_precision != ActivationPrecision::FP32)
+            {
+                detected_precision = ActivationPrecision::FP32;
+                return false;
+            }
+
+            // Precision-specific requirements
+            switch (detected_precision)
+            {
+            case ActivationPrecision::Q8_1:
+                // Q8_1 requires block-aligned head_dim
+                if (config.head_dim % Q8_1Block::BLOCK_SIZE != 0)
+                    return false;
+                // JIT kernel only supports 64 or 128
+                if (config.head_dim != 64 && config.head_dim != 128)
+                    return false;
+                return true;
+
+            case ActivationPrecision::BF16:
+            case ActivationPrecision::FP16:
+                // BF16/FP16 native paths require even head_dim for SIMD
+                if (config.head_dim % 2 != 0)
+                    return false;
+                return true;
+
+            case ActivationPrecision::FP32:
+                // FP32 always supported
+                return true;
+
+            default:
+                return false;
+            }
+        }
+
+        /**
+         * @brief Slice Q8_1 blocks for a range of heads
+         *
+         * Q8_1 tensor layout: [seq_len, n_heads * head_dim_blocks] where head_dim_blocks = head_dim / 32
+         * This extracts blocks for heads [start_head, start_head + local_n_heads).
+         *
+         * @param src Source Q8_1 blocks (full tensor)
+         * @param dst Destination Q8_1 blocks (local heads only)
+         * @param seq_len Sequence length
+         * @param n_heads Total number of heads
+         * @param head_dim Head dimension (must be multiple of 32)
+         * @param start_head First head index for this rank
+         * @param local_n_heads Number of heads for this rank
+         */
+        void sliceQ8_1HeadBlocks(
+            const Q8_1Block *src, Q8_1Block *dst,
+            int seq_len, int n_heads, int head_dim,
+            size_t start_head, size_t local_n_heads)
+        {
+            const int head_dim_blocks = head_dim / Q8_1Block::BLOCK_SIZE; // blocks per head
+            const int src_blocks_per_row = n_heads * head_dim_blocks;
+            const int dst_blocks_per_row = static_cast<int>(local_n_heads) * head_dim_blocks;
+
+#pragma omp parallel for
+            for (int t = 0; t < seq_len; ++t)
+            {
+                const Q8_1Block *src_row = src + t * src_blocks_per_row;
+                Q8_1Block *dst_row = dst + t * dst_blocks_per_row;
+
+                for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                {
+                    size_t global_h = start_head + local_h;
+                    const Q8_1Block *src_head = src_row + global_h * head_dim_blocks;
+                    Q8_1Block *dst_head = dst_row + local_h * head_dim_blocks;
+
+                    // Copy all blocks for this head
+                    std::memcpy(dst_head, src_head, head_dim_blocks * sizeof(Q8_1Block));
+                }
+            }
+        }
+
+        /**
+         * @brief Dequantize Q8_1 blocks to FP32
+         *
+         * Converts Q8_1 block array to FP32 float array.
+         * output[i] = q8_1.qs[i % 32] * fp16_to_fp32(q8_1.d)
+         *
+         * @param src Q8_1 blocks
+         * @param dst FP32 output
+         * @param total_blocks Total number of Q8_1 blocks
+         */
+        void dequantizeQ8_1ToFP32(const Q8_1Block *src, float *dst, size_t total_blocks)
+        {
+#pragma omp parallel for
+            for (size_t b = 0; b < total_blocks; ++b)
+            {
+                const Q8_1Block &block = src[b];
+                float *out = dst + b * Q8_1Block::BLOCK_SIZE;
+                float d = fp16_to_fp32(block.d);
+                for (int i = 0; i < 32; ++i)
+                {
+                    out[i] = static_cast<float>(block.qs[i]) * d;
+                }
+            }
+        }
+
+        /**
+         * @brief Broadcast K/V Q8_1 blocks to match Q heads (GQA expansion)
+         *
+         * When n_heads > n_kv_heads (GQA/MQA), each KV head is replicated to multiple Q heads.
+         * This creates local K/V buffers where each KV head is broadcast to match local_n_heads.
+         *
+         * @param K_src Source K blocks [seq_len, n_kv_heads, head_dim_blocks]
+         * @param V_src Source V blocks [seq_len, n_kv_heads, head_dim_blocks]
+         * @param K_dst Destination K blocks [seq_len, local_n_heads, head_dim_blocks]
+         * @param V_dst Destination V blocks [seq_len, local_n_heads, head_dim_blocks]
+         * @param seq_len Sequence length
+         * @param n_kv_heads Number of KV heads in source
+         * @param head_dim Head dimension (must be multiple of 32)
+         * @param start_head First Q head index for this rank
+         * @param local_n_heads Number of Q heads for this rank
+         * @param n_heads Total number of Q heads
+         */
+        void broadcastQ8_1KVHeads(
+            const Q8_1Block *K_src, const Q8_1Block *V_src,
+            Q8_1Block *K_dst, Q8_1Block *V_dst,
+            int seq_len, int n_kv_heads, int head_dim,
+            size_t start_head, size_t local_n_heads, int n_heads)
+        {
+            const int head_dim_blocks = head_dim / Q8_1Block::BLOCK_SIZE;
+            const int kv_blocks_per_row = n_kv_heads * head_dim_blocks;
+            const int dst_blocks_per_row = static_cast<int>(local_n_heads) * head_dim_blocks;
+            const int heads_per_kv = n_heads / n_kv_heads;
+
+#pragma omp parallel for
+            for (int t = 0; t < seq_len; ++t)
+            {
+                const Q8_1Block *K_row = K_src + t * kv_blocks_per_row;
+                const Q8_1Block *V_row = V_src + t * kv_blocks_per_row;
+                Q8_1Block *K_dst_row = K_dst + t * dst_blocks_per_row;
+                Q8_1Block *V_dst_row = V_dst + t * dst_blocks_per_row;
+
+                for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                {
+                    size_t global_h = start_head + local_h;
+                    int kv_h = static_cast<int>(global_h) / heads_per_kv; // Which KV head to use
+
+                    const Q8_1Block *K_head = K_row + kv_h * head_dim_blocks;
+                    const Q8_1Block *V_head = V_row + kv_h * head_dim_blocks;
+                    Q8_1Block *K_dst_head = K_dst_row + local_h * head_dim_blocks;
+                    Q8_1Block *V_dst_head = V_dst_row + local_h * head_dim_blocks;
+
+                    // Copy all blocks for this head
+                    std::memcpy(K_dst_head, K_head, head_dim_blocks * sizeof(Q8_1Block));
+                    std::memcpy(V_dst_head, V_head, head_dim_blocks * sizeof(Q8_1Block));
+                }
+            }
+        }
+
+        /**
+         * @brief Native Q8_1 tensor-parallel attention implementation
+         *
+         * Performs tensor-parallel attention entirely in Q8_1 domain:
+         *   1. Slices Q Q8_1 blocks for local heads (no dequantization)
+         *   2. Broadcasts K/V Q8_1 blocks to match local Q heads (GQA expansion)
+         *   3. Runs native Q8_1 attention kernel (JIT GEMM with fused softmax)
+         *   4. Uses MPI_Allgatherv to combine Q8_1 blocks from all ranks
+         *   5. Output remains in Q8_1 format (no dequant→requant round trip!)
+         *
+         * This avoids the expensive FP32 dequantization of Q/K/V tensors AND
+         * keeps the output in Q8_1 format, eliminating quantization noise from
+         * unnecessary format conversions.
+         */
+        bool compute_tensor_parallel_q8_1_native(
+            TensorBase *Q, TensorBase *K, TensorBase *V, TensorBase *output,
+            const MpiAttentionConfig &config,
+            int rank, int world_size,
+            int total_tokens, int effective_batch_size, int seq_len, int padded_seq_len,
+            size_t start_head, size_t local_n_heads,
+            const std::vector<int> *sequence_lengths)
+        {
+            (void)padded_seq_len; // Not used in Q8_1 path yet
+
+            // Cast inputs to Q8_1Tensor
+            auto *Q_q8 = dynamic_cast<Q8_1Tensor *>(Q);
+            auto *K_q8 = dynamic_cast<Q8_1Tensor *>(K);
+            auto *V_q8 = dynamic_cast<Q8_1Tensor *>(V);
+            auto *output_q8 = dynamic_cast<Q8_1Tensor *>(output);
+
+            if (!Q_q8 || !K_q8 || !V_q8)
+            {
+                LOG_ERROR("[MPI TP Q8_1] Input tensors are not Q8_1Tensor");
+                return false;
+            }
+
+            // Check if output supports Q8_1 native path
+            const bool output_is_q8_1 = (output_q8 != nullptr);
+            LOG_DEBUG("[MPI TP Q8_1] Output tensor type: " << (output_is_q8_1 ? "Q8_1" : "FP32"));
+
+            // Get Q8_1 block pointers (native format, no dequantization!)
+            const Q8_1Block *Q_blocks = Q_q8->q8_1_blocks();
+            const Q8_1Block *K_blocks = K_q8->q8_1_blocks();
+            const Q8_1Block *V_blocks = V_q8->q8_1_blocks();
+
+            if (!Q_blocks || !K_blocks || !V_blocks)
+            {
+                LOG_ERROR("[MPI TP Q8_1] Null Q8_1 block pointers");
+                return false;
+            }
+
+            // Block layout parameters
+            const int head_dim_blocks = config.head_dim / Q8_1Block::BLOCK_SIZE; // blocks per head
+
+            // Calculate local buffer sizes (in blocks)
+            // Q: sliced to local_n_heads
+            // K/V: broadcast from n_kv_heads to local_n_heads (GQA expansion)
+            const size_t q_local_blocks = total_tokens * local_n_heads * head_dim_blocks;
+            const size_t kv_local_blocks = total_tokens * local_n_heads * head_dim_blocks; // Broadcast to match Q!
+
+            // Allocate local Q8_1 buffers
+            std::vector<Q8_1Block> Q_local(q_local_blocks);
+            std::vector<Q8_1Block> K_local(kv_local_blocks);
+            std::vector<Q8_1Block> V_local(kv_local_blocks);
+            std::vector<Q8_1Block> output_q8_local(q_local_blocks);
+
+            // Slice Q heads for this rank
+            sliceQ8_1HeadBlocks(Q_blocks, Q_local.data(), total_tokens, config.n_heads, config.head_dim, start_head, local_n_heads);
+
+            // Broadcast K/V from n_kv_heads to local_n_heads (GQA expansion)
+            // This replicates each KV head to the corresponding Q heads
+            broadcastQ8_1KVHeads(
+                K_blocks, V_blocks, K_local.data(), V_local.data(),
+                total_tokens, config.n_kv_heads, config.head_dim,
+                start_head, local_n_heads, config.n_heads);
+
+            LOG_DEBUG("[MPI TP Q8_1] Rank " << rank << ": sliced Q to " << q_local_blocks
+                                            << " blocks, broadcast K/V to " << kv_local_blocks << " blocks (GQA ratio="
+                                            << (config.n_heads / config.n_kv_heads) << ")");
+
+            // Create attention mask if needed
+            const bool needs_mask = config.causal || (sequence_lengths && !sequence_lengths->empty());
+            TensorBase *mask_tensor = config.workspace_mask.get();
+            LOG_DEBUG("[MPI TP Q8_1] needs_mask=" << needs_mask << " config.causal=" << config.causal
+                                                  << " mask_tensor=" << (mask_tensor ? "valid" : "nullptr"));
+            if (needs_mask && !mask_tensor)
+            {
+                LOG_ERROR("[MPI TP Q8_1] workspace_mask is required for causal/padded attention");
+                return false;
+            }
+
+            if (needs_mask)
+            {
+                float *mask_data = mask_tensor->mutable_data();
+                if (effective_batch_size == 1)
+                {
+                    if (config.causal)
+                    {
+                        LOG_DEBUG("[MPI TP Q8_1] Creating causal mask for " << total_tokens << " tokens");
+                        attention_utils::create_causal_mask(mask_data, total_tokens, config.window_size);
+                        // Debug: print mask contents for 3x3
+                        if (total_tokens <= 5 && rank == 0)
+                        {
+                            std::ostringstream oss;
+                            oss << "[MPI TP Q8_1] Causal mask contents (first " << total_tokens << " rows):" << std::endl;
+                            for (int i = 0; i < total_tokens; ++i)
+                            {
+                                oss << "  row " << i << ": [";
+                                for (int j = 0; j < total_tokens; ++j)
+                                {
+                                    float val = mask_data[i * total_tokens + j];
+                                    if (std::isinf(val))
+                                        oss << "-inf";
+                                    else
+                                        oss << val;
+                                    if (j < total_tokens - 1)
+                                        oss << ", ";
+                                }
+                                oss << "]" << std::endl;
+                            }
+                            LOG_INFO(oss.str());
+                        }
+                    }
+                    else
+                    {
+                        std::fill_n(mask_data, total_tokens * total_tokens, 0.0f);
+                    }
+                }
+                else
+                {
+                    const int *seq_lens_ptr = sequence_lengths ? sequence_lengths->data() : nullptr;
+                    if (config.causal)
+                    {
+                        attention_utils::create_batch_causal_mask(
+                            mask_data, effective_batch_size, seq_len, seq_lens_ptr, config.window_size);
+                    }
+                    else
+                    {
+                        attention_utils::create_batch_padding_mask(
+                            mask_data, effective_batch_size, seq_len, seq_lens_ptr, config.window_size);
+                    }
+                }
+            }
+
+            // Create Q8_1 attention kernel
+            auto attention_kernel = std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::Q8_1>>();
+
+            // Execute native Q8_1 attention using the clean Q8_1 API
+            // IMPORTANT: K/V are already broadcast to local_n_heads, so pass local_n_heads for both!
+            bool local_success;
+            if (effective_batch_size > 1)
+            {
+                // Batch path - use native Q8_1 batch API
+                local_success = attention_kernel->compute_batch_q8_1(
+                    Q_local.data(),
+                    K_local.data(),
+                    V_local.data(),
+                    output_q8_local.data(),
+                    effective_batch_size,
+                    seq_len,
+                    static_cast<int>(local_n_heads),
+                    static_cast<int>(local_n_heads), // K/V already broadcast per head!
+                    config.head_dim,
+                    config.causal,
+                    config.window_size,
+                    config.workspace_scores.get(),
+                    mask_tensor,
+                    config.mpi_ctx.get(),
+                    -1);
+            }
+            else
+            {
+                // Single sequence path - use native Q8_1 API
+                local_success = attention_kernel->compute_q8_1(
+                    Q_local.data(),
+                    K_local.data(),
+                    V_local.data(),
+                    output_q8_local.data(),
+                    total_tokens,
+                    static_cast<int>(local_n_heads),
+                    static_cast<int>(local_n_heads), // K/V already broadcast per head!
+                    config.head_dim,
+                    config.causal,
+                    config.window_size,
+                    config.workspace_scores.get(),
+                    mask_tensor,
+                    config.mpi_ctx.get(),
+                    -1);
+            }
+
+            // Check for kernel failures across all ranks
+            float local_ok_flag = local_success ? 1.0f : 0.0f;
+            float global_ok_flag = 0.0f;
+            config.mpi_ctx->allreduce_sum(&local_ok_flag, &global_ok_flag, 1);
+            bool global_success = (global_ok_flag == static_cast<float>(world_size));
+            if (!global_success)
+            {
+                if (rank == 0)
+                {
+                    LOG_ERROR("[MPI TP Q8_1] Aborting due to kernel failure on at least one rank");
+                }
+                return false;
+            }
+
+            // ============================================================================
+            // MPI Communication: Allgather Q8_1 blocks from all ranks
+            // ============================================================================
+            // Each rank computed local_n_heads worth of output. We need to gather all heads
+            // from all ranks into the output tensor.
+            //
+            // For Q8_1 output: Use byte-level allgatherv to avoid dequant→requant round trip
+            // For FP32 output: Dequantize and use float allreduce (legacy path)
+
+            if (output_is_q8_1)
+            {
+                // Native Q8_1 path: Use allgatherv to gather Q8_1 blocks directly
+                Q8_1Block *output_blocks = output_q8->mutable_q8_1_blocks();
+                if (!output_blocks)
+                {
+                    LOG_ERROR("[MPI TP Q8_1] Null output Q8_1 block pointer");
+                    return false;
+                }
+
+                // Calculate per-rank block counts and displacements
+                // Each rank contributes: total_tokens * local_n_heads * head_dim_blocks blocks
+                // Block layout in output: [total_tokens, n_heads, head_dim_blocks]
+                const size_t blocks_per_rank = q_local_blocks;
+                const size_t bytes_per_rank = blocks_per_rank * sizeof(Q8_1Block);
+
+                // Prepare send buffer with correct layout for allgatherv
+                // Need to rearrange from [tokens, local_heads, blocks] to fit into global layout
+                std::vector<Q8_1Block> send_blocks(blocks_per_rank);
+
+                // Copy local output blocks (already in correct per-token, per-head layout)
+                std::memcpy(send_blocks.data(), output_q8_local.data(), bytes_per_rank);
+
+                // Calculate recv_counts and displacements for each rank
+                std::vector<int> recv_counts(world_size);
+                std::vector<int> displs(world_size);
+
+                // Each rank sends the same number of bytes (assuming equal head distribution)
+                for (int r = 0; r < world_size; ++r)
+                {
+                    recv_counts[r] = static_cast<int>(bytes_per_rank);
+                    displs[r] = r * static_cast<int>(bytes_per_rank);
+                }
+
+                // Allocate temporary receive buffer for allgatherv
+                // Layout after gather: [world_size, total_tokens, local_n_heads, head_dim_blocks]
+                std::vector<Q8_1Block> recv_buffer(world_size * blocks_per_rank);
+
+                // Perform byte-level allgatherv
+                config.mpi_ctx->allgatherv_bytes(
+                    send_blocks.data(), static_cast<int>(bytes_per_rank),
+                    recv_buffer.data(), recv_counts.data(), displs.data());
+
+                // Rearrange from [world_size, tokens, local_heads, blocks] to [tokens, n_heads, blocks]
+                // This interleaves the heads from each rank into the correct global positions
+                const size_t output_head_stride = head_dim_blocks;
+                const size_t output_token_stride = config.n_heads * head_dim_blocks;
+
+#pragma omp parallel for collapse(3) if (total_tokens * world_size * local_n_heads > 64)
+                for (int t = 0; t < total_tokens; ++t)
+                {
+                    for (int r = 0; r < world_size; ++r)
+                    {
+                        for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                        {
+                            // Source: recv_buffer[r * blocks_per_rank + t * local_n_heads * head_dim_blocks + local_h * head_dim_blocks]
+                            size_t src_offset = r * blocks_per_rank +
+                                                t * local_n_heads * head_dim_blocks +
+                                                local_h * head_dim_blocks;
+
+                            // Destination: output_blocks[t * n_heads * head_dim_blocks + (r * local_n_heads + local_h) * head_dim_blocks]
+                            size_t global_head = r * local_n_heads + local_h;
+                            size_t dst_offset = t * output_token_stride + global_head * output_head_stride;
+
+                            // Copy head_dim_blocks worth of Q8_1Block
+                            std::memcpy(&output_blocks[dst_offset], &recv_buffer[src_offset],
+                                        head_dim_blocks * sizeof(Q8_1Block));
+                        }
+                    }
+                }
+
+                LOG_DEBUG("[MPI TP Q8_1] Rank " << rank << ": Q8_1 allgatherv complete, "
+                                                << blocks_per_rank << " blocks per rank");
+            }
+            else
+            {
+                // Legacy FP32 path: Dequantize and use float allreduce
+                float *output_data = output->mutable_data();
+                if (!output_data)
+                {
+                    LOG_ERROR("[MPI TP Q8_1] Null FP32 output data pointer");
+                    return false;
+                }
+
+                // Dequantize local Q8_1 output to FP32 for allreduce
+                std::vector<float> local_output_fp32(total_tokens * local_n_heads * config.head_dim);
+                dequantizeQ8_1ToFP32(output_q8_local.data(), local_output_fp32.data(), q_local_blocks);
+
+                LOG_DEBUG("[MPI TP Q8_1] Rank " << rank << ": using FP32 fallback (output tensor is FP32)");
+
+                // Prepare send buffer for allreduce (full size, only local heads filled)
+                std::vector<float> send_buffer(total_tokens * config.n_heads * config.head_dim, 0.0f);
+
+                // Copy local heads to correct position in send buffer
+                if (effective_batch_size > 1)
+                {
+                    // Batch path: local_output is [batch_size, seq_len, local_n_heads, head_dim]
+                    const size_t seq_head_stride = static_cast<size_t>(config.n_heads) * config.head_dim;
+                    const size_t batch_stride = static_cast<size_t>(seq_len) * seq_head_stride;
+                    const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
+                    const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
+
+#pragma omp parallel for collapse(3) if (effective_batch_size * seq_len * local_n_heads > 64)
+                    for (int b = 0; b < effective_batch_size; ++b)
+                    {
+                        for (int s = 0; s < seq_len; ++s)
+                        {
+                            for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                            {
+                                size_t global_h = start_head + local_h;
+                                const float *src = local_output_fp32.data() + b * local_batch_stride + s * local_seq_head_stride + local_h * config.head_dim;
+                                float *dst = send_buffer.data() + b * batch_stride + s * seq_head_stride + global_h * config.head_dim;
+#pragma omp simd
+                                for (int d = 0; d < config.head_dim; ++d)
+                                {
+                                    dst[d] = src[d];
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Single-sequence path
+#pragma omp parallel for collapse(2) if (total_tokens * local_n_heads > 64)
+                    for (int t = 0; t < total_tokens; ++t)
+                    {
+                        for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
+                        {
+                            size_t global_h = start_head + local_h;
+#pragma omp simd
+                            for (int d = 0; d < config.head_dim; ++d)
+                            {
+                                send_buffer[t * config.n_heads * config.head_dim + global_h * config.head_dim + d] =
+                                    local_output_fp32[t * local_n_heads * config.head_dim + local_h * config.head_dim + d];
+                            }
+                        }
+                    }
+                }
+
+                // Allreduce to combine results (zeros + local values = concatenation effect)
+                config.mpi_ctx->allreduce_sum(
+                    send_buffer.data(),
+                    output_data,
+                    total_tokens * config.n_heads * config.head_dim);
+            }
+
+            // Barrier to ensure all ranks complete
+            config.mpi_ctx->barrier();
+
+            return true;
+        }
+    } // namespace
 
     namespace
     {
@@ -134,6 +749,11 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
+        LOG_INFO("[MpiAttentionOrchestrator::compute_tensor_parallel] precision="
+                 << static_cast<int>(config.precision)
+                 << ", Q type=" << (dynamic_cast<Q8_1Tensor *>(Q) ? "Q8_1" : "FP32")
+                 << ", output type=" << (dynamic_cast<Q8_1Tensor *>(output) ? "Q8_1" : "FP32"));
+
         // Validate MPI context
         if (!config.mpi_ctx)
         {
@@ -178,6 +798,52 @@ namespace llaminar2
 
         // Distribute attention heads across ranks
         auto [start_head, local_n_heads] = config.mpi_ctx->get_local_slice(static_cast<size_t>(config.n_heads));
+
+        // ============================================================================
+        // Native Precision Tensor-Parallel Path
+        // ============================================================================
+        // Check if we can use a native precision path which avoids unnecessary
+        // format conversions. The native path:
+        //   1. Operates on tensors in their native format (Q8_1, BF16, FP16, FP32)
+        //   2. Uses precision-appropriate MPI communication (byte-level for non-FP32)
+        //   3. Keeps output in native format when output tensor matches input precision
+        //
+        // This eliminates dequant→allreduce→requant round trips that add noise.
+        //
+        ActivationPrecision detected_precision;
+        if (shouldUseNativeTensorParallel(Q, K, V, output, config, detected_precision))
+        {
+            LOG_DEBUG("[MPI TP] Using native " << static_cast<int>(detected_precision)
+                                               << " tensor-parallel path");
+
+            switch (detected_precision)
+            {
+            case ActivationPrecision::Q8_1:
+                return compute_tensor_parallel_q8_1_native(
+                    Q, K, V, output,
+                    config, rank, world_size,
+                    total_tokens, effective_batch_size, seq_len, padded_seq_len,
+                    start_head, local_n_heads, sequence_lengths);
+
+            case ActivationPrecision::BF16:
+            case ActivationPrecision::FP16:
+                // TODO: Implement native BF16/FP16 tensor-parallel paths
+                // For now, fall through to FP32 path (data() handles conversion)
+                LOG_DEBUG("[MPI TP] BF16/FP16 native path not yet implemented, using FP32 fallback");
+                break;
+
+            case ActivationPrecision::FP32:
+                // FP32 uses the standard path below
+                break;
+            }
+        }
+
+        // ============================================================================
+        // FP32 Fallback Path (also handles BF16/FP16 via dequantization)
+        // ============================================================================
+        // This path converts inputs to FP32 via data() calls, then uses FP32 kernels.
+        // Works for all precision types but may not be optimal for non-FP32.
+        LOG_DEBUG("[MPI TP] Using FP32 fallback tensor-parallel path");
 
         // Get tensor data pointers
         const float *Q_data = Q->data();
@@ -268,17 +934,17 @@ namespace llaminar2
         copy_head_slice(K_expanded, K_local.data());
         copy_head_slice(V_expanded, V_local.data());
 
-        auto *activation_output = dynamic_cast<IActivationTensor *>(output);
-        if (!activation_output)
-        {
-            LOG_ERROR("[MpiAttentionOrchestrator] Tensor-parallel attention requires activation tensor output");
-            return false;
-        }
-
-        auto attention_kernel = activation_output->createAttention();
+        // NOTE: For tensor-parallel attention, we extract raw float data from Q/K/V
+        // and create local float buffers. This means Q8_1 tensors are dequantized
+        // via data() calls above. The kernel type still matters for internal
+        // operations like softmax precision.
+        //
+        // Create kernel based on config.precision, not output tensor type
+        auto attention_kernel = createAttentionKernelForPrecision(config.precision);
         if (!attention_kernel)
         {
-            LOG_ERROR("[MpiAttentionOrchestrator] Failed to create attention kernel for tensor-parallel path");
+            LOG_ERROR("[MpiAttentionOrchestrator] Failed to create attention kernel for tensor-parallel path (precision="
+                      << static_cast<int>(config.precision) << ")");
             return false;
         }
 
@@ -387,6 +1053,26 @@ namespace llaminar2
                 LOG_ERROR("[MpiAttentionOrchestrator] Aborting tensor-parallel attention due to kernel failure on at least one rank");
             }
             return false;
+        }
+
+        // Debug: Check FP32 local output stats
+        if (rank == 0 && Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+        {
+            float min_val = local_output[0], max_val = local_output[0];
+            double sum = 0.0;
+            for (size_t i = 0; i < local_output.size(); ++i)
+            {
+                min_val = std::min(min_val, local_output[i]);
+                max_val = std::max(max_val, local_output[i]);
+                sum += local_output[i];
+            }
+            LOG_DEBUG("[MPI TP FP32] Rank " << rank << ": local_output min=" << min_val
+                                            << " max=" << max_val << " mean=" << (sum / local_output.size())
+                                            << " first10=[" << local_output[0] << "," << local_output[1]
+                                            << "," << local_output[2] << "," << local_output[3]
+                                            << "," << local_output[4] << "," << local_output[5]
+                                            << "," << local_output[6] << "," << local_output[7]
+                                            << "," << local_output[8] << "," << local_output[9] << "]");
         }
 
         LOG_DEBUG("[MPI TP] Rank " << rank << ": local_output[0]=" << local_output[0]);

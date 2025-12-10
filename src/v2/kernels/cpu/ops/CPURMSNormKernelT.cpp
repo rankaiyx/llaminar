@@ -1,5 +1,5 @@
 /**
- * @file CPURMSNormTypedKernel.cpp
+ * @file CPURMSNormKernelT.cpp
  * @brief Typed RMSNorm kernel implementation with fused precision conversion
  *
  * Key optimization: Process data in row-sized chunks that fit in L1/L2 cache.
@@ -9,7 +9,7 @@
  * @date 2025-12-04
  */
 
-#include "CPURMSNormTypedKernel.h"
+#include "CPURMSNormKernelT.h"
 #include "../primitives/RMSNormPrimitives.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../tensors/BlockStructures.h"
@@ -82,7 +82,7 @@ namespace llaminar2
     // FP32 Specialization Implementation
     // =========================================================================
 
-    bool CPURMSNormTypedKernel<ActivationPrecision::FP32>::apply_typed(
+    bool CPURMSNormKernelT<ActivationPrecision::FP32>::apply_typed(
         const float *input,
         const float *gamma,
         float *output,
@@ -108,7 +108,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CPURMSNormTypedKernel<ActivationPrecision::FP32>::apply_with_residual_add(
+    bool CPURMSNormKernelT<ActivationPrecision::FP32>::apply_with_residual_add(
         const float *residual,
         const float *fp32_input,
         const float *gamma,
@@ -189,7 +189,7 @@ namespace llaminar2
     // BF16 Specialization Implementation (Cache-Streaming)
     // =========================================================================
 
-    bool CPURMSNormTypedKernel<ActivationPrecision::BF16>::apply_typed(
+    bool CPURMSNormKernelT<ActivationPrecision::BF16>::apply_typed(
         const uint16_t *input,
         const float *gamma,
         uint16_t *output,
@@ -271,7 +271,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CPURMSNormTypedKernel<ActivationPrecision::BF16>::apply_with_residual_add(
+    bool CPURMSNormKernelT<ActivationPrecision::BF16>::apply_with_residual_add(
         const uint16_t *residual,
         const float *fp32_input,
         const float *gamma,
@@ -359,7 +359,7 @@ namespace llaminar2
     // FP16 Specialization Implementation (Cache-Streaming)
     // =========================================================================
 
-    bool CPURMSNormTypedKernel<ActivationPrecision::FP16>::apply_typed(
+    bool CPURMSNormKernelT<ActivationPrecision::FP16>::apply_typed(
         const uint16_t *input,
         const float *gamma,
         uint16_t *output,
@@ -441,7 +441,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CPURMSNormTypedKernel<ActivationPrecision::FP16>::apply_with_residual_add(
+    bool CPURMSNormKernelT<ActivationPrecision::FP16>::apply_with_residual_add(
         const uint16_t *residual,
         const float *fp32_input,
         const float *gamma,
@@ -529,7 +529,7 @@ namespace llaminar2
     // Q8_1 Specialization Implementation (Cache-Streaming)
     // =========================================================================
 
-    bool CPURMSNormTypedKernel<ActivationPrecision::Q8_1>::apply_typed(
+    bool CPURMSNormKernelT<ActivationPrecision::Q8_1>::apply_typed(
         const Q8_1Block *input,
         const float *gamma,
         Q8_1Block *output,
@@ -567,7 +567,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CPURMSNormTypedKernel<ActivationPrecision::Q8_1>::apply_with_residual_add(
+    bool CPURMSNormKernelT<ActivationPrecision::Q8_1>::apply_with_residual_add(
         const Q8_1Block *residual,
         const float *fp32_input,
         const float *gamma,
@@ -671,7 +671,7 @@ namespace llaminar2
      * method enables RMSNorm to work with such tensors by using the same
      * vectorized FP32 primitive as the FP32 specialization.
      */
-    bool CPURMSNormTypedKernel<ActivationPrecision::Q8_1>::apply(
+    bool CPURMSNormKernelT<ActivationPrecision::Q8_1>::apply(
         const float *input,
         const float *gamma,
         float *output,
