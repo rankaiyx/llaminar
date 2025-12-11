@@ -1,0 +1,4 @@
+Test project /workspaces/llaminar/build_v2_e2e_release
+    Start   1: V2_FetchModelsFixture
+1/2 Test   #1: V2_FetchModelsFixture ................   Passed    0.01 sec
+    Start 147: V2_Integration_Q8_1_vs_FP32_Parity

@@ -342,6 +342,13 @@ add_v2_test(V2_Unit_Q8_1_OnlineSoftmax
 
 # Test: Q8_1 Fused Attention JIT Kernel Unit Tests
 # Tests the fully fused Q8_1 attention kernel with dynamic head_dim support
+add_executable(v2_test_xbyak_vpmovdb unit/Test__Xbyak_VPMOVDB.cpp)
+target_link_libraries(v2_test_xbyak_vpmovdb llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_Xbyak_VPMOVDB
+    COMMAND v2_test_xbyak_vpmovdb
+    LABELS "V2;Unit;Xbyak;VPMOVDB"
+)
+
 add_executable(v2_test_q8_1_fused_attention_unit unit/kernels/cpu/gemm_v4/Test__QuantisedAttentionJit_Q8_1_Fused.cpp)
 target_link_libraries(v2_test_q8_1_fused_attention_unit 
     llaminar2_core 

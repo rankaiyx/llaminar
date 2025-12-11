@@ -41,7 +41,7 @@ namespace llaminar2
                 strategy_name = "INTERLEAVED (NUMA-aware global)";
                 break;
             }
-            LOG_INFO("[WeightManager] Initialized with strategy: " << strategy_name);
+            LOG_DEBUG("[WeightManager] Initialized with strategy: " << strategy_name);
 
             // Log weight precision mode
             const char *precision_name = "UNKNOWN";
@@ -63,15 +63,15 @@ namespace llaminar2
                 precision_name = "CONVERT_TO_INT8 (all weights dequantized to INT8 at load)";
                 break;
             }
-            LOG_INFO("[WeightManager] Weight precision: " << precision_name);
+            LOG_DEBUG("[WeightManager] Weight precision: " << precision_name);
 
             if (strategy_ == WeightDistributionStrategy::SHARDED && mpi_ctx_)
             {
-                LOG_INFO("[WeightManager] Sharding enabled with " << mpi_ctx_->world_size() << " ranks");
-                LOG_INFO("[WeightManager] Column-parallel: Gate/Up (split output dim, local output)");
-                LOG_INFO("[WeightManager] Input-parallel: Down (split input dim to match Gate/Up, allreduce after)");
-                LOG_INFO("[WeightManager] Row-parallel: Wo (split output dim, allreduce after)");
-                LOG_INFO("[WeightManager] Replicated: QKV, norms, biases, embeddings, LM head");
+                LOG_DEBUG("[WeightManager] Sharding enabled with " << mpi_ctx_->world_size() << " ranks");
+                LOG_DEBUG("[WeightManager] Column-parallel: Gate/Up (split output dim, local output)");
+                LOG_DEBUG("[WeightManager] Input-parallel: Down (split input dim to match Gate/Up, allreduce after)");
+                LOG_DEBUG("[WeightManager] Row-parallel: Wo (split output dim, allreduce after)");
+                LOG_DEBUG("[WeightManager] Replicated: QKV, norms, biases, embeddings, LM head");
             }
         }
     }

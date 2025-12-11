@@ -162,7 +162,7 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
-        LOG_DEBUG("[GQAAttention::compute] Called with precision=" << static_cast<int>(config.precision));
+        LOG_TRACE("[GQAAttention::compute] Called with precision=" << static_cast<int>(config.precision));
 
         if (!validate_inputs(Q, K, V, output, config))
         {
@@ -228,7 +228,7 @@ namespace llaminar2
 
         if (config.precision == ActivationPrecision::Q8_1)
         {
-            LOG_DEBUG("[GQAAttention] Q8_1 precision requested - checking tensor types");
+            LOG_TRACE("[GQAAttention] Q8_1 precision requested - checking tensor types");
 
             // Check if tensors are actually Q8_1
             auto *Q_q8_1 = dynamic_cast<Q8_1Tensor *>(Q);
@@ -237,7 +237,7 @@ namespace llaminar2
             auto *out_q8_1 = dynamic_cast<Q8_1Tensor *>(output);
             auto *out_fp32 = dynamic_cast<FP32Tensor *>(output);
 
-            LOG_DEBUG("[GQAAttention] Tensor types: Q=" << (Q_q8_1 ? "Q8_1" : "other")
+            LOG_TRACE("[GQAAttention] Tensor types: Q=" << (Q_q8_1 ? "Q8_1" : "other")
                                                         << ", K=" << (K_q8_1 ? "Q8_1" : "other")
                                                         << ", V=" << (V_q8_1 ? "Q8_1" : "other")
                                                         << ", output=" << (out_q8_1 ? "Q8_1" : (out_fp32 ? "FP32" : "other")));

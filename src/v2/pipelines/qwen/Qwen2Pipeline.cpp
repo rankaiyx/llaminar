@@ -324,7 +324,7 @@ namespace llaminar2
                 ss << current_positions_[i] << (i < current_positions_.size() - 1 ? ", " : "");
             }
             ss << "]";
-            LOG_DEBUG("[Position State] current_positions_: " << ss.str());
+            LOG_TRACE("[Position State] current_positions_: " << ss.str());
         }
 
         // Pad sequences to uniform length
@@ -333,7 +333,7 @@ namespace llaminar2
         sequence_lengths_ = padded.actual_lengths;
         int effective_seq_len = batch_size_ * padded_seq_len_;
 
-        LOG_DEBUG("Forward pass: batch_size=" << batch_size_
+        LOG_TRACE("Forward pass: batch_size=" << batch_size_
                                               << ", padded_seq_len=" << padded_seq_len_
                                               << ", effective_seq_len=" << effective_seq_len);
 
@@ -343,7 +343,7 @@ namespace llaminar2
             current_hidden_ = tensor_factory_->createActivation(
                 {static_cast<size_t>(effective_seq_len), static_cast<size_t>(d_model_)},
                 config_.activation_precision, device_idx_);
-            LOG_DEBUG("Allocated hidden states: "
+            LOG_TRACE("Allocated hidden states: "
                       << effective_seq_len << " x " << d_model_ << " on device " << device_idx_);
         }
 
@@ -434,7 +434,7 @@ namespace llaminar2
 
     bool Qwen2Pipeline::transformer_layer(int layer_idx, int effective_seq_len)
     {
-        LOG_DEBUG("Processing layer " << layer_idx);
+        LOG_TRACE("Processing layer " << layer_idx);
 
         // Get layer weights (loaded lazily on first access)
         auto &layer = getLayerWeights(layer_idx);
@@ -613,7 +613,7 @@ namespace llaminar2
         std::string layer_prefix = "layer" + std::to_string(layer_idx);
 
         // Save residual for later
-        LOG_DEBUG("[attention_block] layer=" << layer_idx
+        LOG_TRACE("[attention_block] layer=" << layer_idx
                                              << " residual=" << reinterpret_cast<void *>(buffers.residual.get())
                                              << " normalized=" << reinterpret_cast<void *>(buffers.normalized.get()));
         TRY_OP(save_residual(input_hidden, buffers.residual.get(), effective_seq_len, d_model_));
@@ -691,7 +691,7 @@ namespace llaminar2
             if (normalized_q8_1)
             {
                 // Pure Q8_1 path: Q8_1 input → Q8_1 output (no double quantization)
-                LOG_DEBUG("Layer " << layer_idx << " QKV: Using Q8_1→Q8_1 path (avoiding double quantization)");
+                LOG_TRACE("Layer " << layer_idx << " QKV: Using Q8_1→Q8_1 path (avoiding double quantization)");
                 VALIDATE_OP(layer.qkv_fused->execute_q8_1_to_q8_1(
                                 normalized_q8_1->q8_1_blocks(),
                                 Q_q8_1->mutable_q8_1_blocks(),
@@ -1210,7 +1210,7 @@ namespace llaminar2
                     type_name = "UNKNOWN";
                     break;
                 }
-                LOG_DEBUG("[DEBUG] Layer " << layer_idx << " wq: type=" << type_name
+                LOG_TRACE("[DEBUG] Layer " << layer_idx << " wq: type=" << type_name
                                            << ", shape=[" << shape[0] << ", " << shape[1] << "]");
             }
 
@@ -1230,7 +1230,7 @@ namespace llaminar2
 
             if (layer.q_bias)
             {
-                LOG_DEBUG("[DEBUG] Layer " << layer_idx << " has Q/K/V biases");
+                LOG_TRACE("[DEBUG] Layer " << layer_idx << " has Q/K/V biases");
             }
         }
 
@@ -1317,7 +1317,7 @@ namespace llaminar2
             logits_buffer_ = tensor_factory_->createActivation(
                 {static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
                 ActivationPrecision::FP32, device_idx_); // Always FP32 for sampling accuracy
-            LOG_DEBUG("Allocated logits buffer (FP32): "
+            LOG_TRACE("Allocated logits buffer (FP32): "
                       << effective_seq_len << " x " << vocab_size_ << " on device " << device_idx_);
         }
 
@@ -1344,7 +1344,7 @@ namespace llaminar2
                 min_val = std::min(min_val, logits[i]);
                 max_val = std::max(max_val, logits[i]);
             }
-            LOG_DEBUG("[LM_HEAD] After projection: logits[0:100] min=" << min_val
+            LOG_TRACE("[LM_HEAD] After projection: logits[0:100] min=" << min_val
                                                                        << " max=" << max_val << " first=" << logits[0]);
 
             // Also check the hidden state input
@@ -1355,7 +1355,7 @@ namespace llaminar2
                 h_min = std::min(h_min, hidden_data[i]);
                 h_max = std::max(h_max, hidden_data[i]);
             }
-            LOG_DEBUG("[LM_HEAD] Hidden input: hidden[0:100] min=" << h_min
+            LOG_TRACE("[LM_HEAD] Hidden input: hidden[0:100] min=" << h_min
                                                                    << " max=" << h_max << " first=" << hidden_data[0]);
         }
 
@@ -1407,7 +1407,7 @@ namespace llaminar2
         // Compute the actual buffer size from the logits buffer shape
         int logits_rows = static_cast<int>(logits_buffer_->shape()[0]);
 
-        LOG_DEBUG("[getLastTokenLogits] seq_idx=" << seq_idx
+        LOG_TRACE("[getLastTokenLogits] seq_idx=" << seq_idx
                                                   << ", padded_seq_len=" << padded_seq_len_
                                                   << ", seq_length=" << seq_length
                                                   << ", last_pos=" << last_pos

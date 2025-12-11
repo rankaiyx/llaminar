@@ -1419,13 +1419,13 @@ namespace llaminar2
                 _mm_storeu_si128(reinterpret_cast<__m128i *>(block_out.qs), bytes0);
                 _mm_storeu_si128(reinterpret_cast<__m128i *>(block_out.qs + 16), bytes1);
 
-                // Compute sum_qs
+                // Compute sum_qs (raw integer sum, NOT FP16!)
                 int32_t sum_qs = 0;
                 for (int i = 0; i < 32; ++i)
                 {
                     sum_qs += block_out.qs[i];
                 }
-                block_out.sum_qs = fp32_to_fp16(static_cast<float>(sum_qs));
+                block_out.sum_qs = static_cast<int16_t>(sum_qs);
 
 #elif defined(__AVX2__)
                 // Dequant A and B, add, and store to temp buffer
@@ -1481,7 +1481,7 @@ namespace llaminar2
                     block_out.qs[i] = static_cast<int8_t>(q);
                     sum_qs += q;
                 }
-                block_out.sum_qs = fp32_to_fp16(static_cast<float>(sum_qs));
+                block_out.sum_qs = static_cast<int16_t>(sum_qs);
 
 #else
                 // Scalar fallback
@@ -1522,7 +1522,7 @@ namespace llaminar2
                     block_out.qs[i] = static_cast<int8_t>(q);
                     sum_qs += q;
                 }
-                block_out.sum_qs = fp32_to_fp16(static_cast<float>(sum_qs));
+                block_out.sum_qs = static_cast<int16_t>(sum_qs);
 #endif
             }
         }
@@ -1942,19 +1942,23 @@ namespace llaminar2
             __m512i i0 = _mm512_cvtps_epi32(scaled0);
             __m512i i1 = _mm512_cvtps_epi32(scaled1);
 
-            // Compute sum: Vertical add first, then single horizontal reduction
-            // This saves one expensive horizontal reduction compared to reducing separately
-            __m512i sum_vec = _mm512_add_epi32(i0, i1);
-            int32_t sum_i32 = _mm512_reduce_add_epi32(sum_vec);
-
             // Pack 32-bit integers to 8-bit using AVX-512 vpmovdb (direct int32 → int8)
             // This uses _mm512_cvtsepi32_epi8 which outputs a __m128i (16 bytes from 16 int32s)
+            // Note: This saturates values > 127 to 127 and < -128 to -128
             __m128i i8_0 = _mm512_cvtsepi32_epi8(i0); // 16 int32 → 16 int8
             __m128i i8_1 = _mm512_cvtsepi32_epi8(i1); // 16 int32 → 16 int8
 
             // Combine into a single 256-bit register and store
             __m256i i8_all = _mm256_set_m128i(i8_1, i8_0);
             _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst.qs), i8_all);
+
+            // Compute sum from saturated values to ensure consistency with stored data
+            // This fixes a bug where rounding to 128 would be summed as 128 but stored as 127
+            __m512i i32_sat_0 = _mm512_cvtepi8_epi32(i8_0);
+            __m512i i32_sat_1 = _mm512_cvtepi8_epi32(i8_1);
+            __m512i sum_vec = _mm512_add_epi32(i32_sat_0, i32_sat_1);
+            int32_t sum_i32 = _mm512_reduce_add_epi32(sum_vec);
+
             dst.sum_qs = static_cast<int16_t>(sum_i32);
         }
 #endif

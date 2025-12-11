@@ -1546,7 +1546,7 @@ namespace llaminar
                             tensor->cache_ = new_cache;
                             packed_cache = new_cache;
 
-                            LOG_DEBUG("[KernelFactory] Packed weights for tensor "
+                            LOG_TRACE("[KernelFactory] Packed weights for tensor "
                                       << tensor << " (" << packed_cache->packed.N << "x" << packed_cache->packed.K << ")");
                         }
 

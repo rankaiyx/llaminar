@@ -451,7 +451,7 @@ namespace llaminar2
             if (!jit_kernel)
             {
                 LOG_WARN("[CPUAttentionKernelTyped] head_dim=" << head_dim
-                                                               << " not supported by fused JIT, using reference implementation");
+                                                               << " not supported by JIT, falling back to reference implementation");
 
                 // Use reference implementation
 #pragma omp parallel for

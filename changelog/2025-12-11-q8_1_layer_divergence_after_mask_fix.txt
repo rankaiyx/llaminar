@@ -1,0 +1,588 @@
+[20:37:26.349] [INFO ] [PipelineFactory.cpp:36] [PipelineFactory] Registered pipeline for architecture 'qwen2'
+Note: Google Test filter = Test__Q8_1_LayerByLayer.SnapshotComparison
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Test__Q8_1_LayerByLayer
+[ RUN      ] Test__Q8_1_LayerByLayer.SnapshotComparison
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1933] [ModelLoader] Available metadata keys:
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   general.architecture (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   general.file_type (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   general.finetune (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   general.name (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   general.quantization_version (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   general.size_label (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   general.type (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   general.version (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   qwen2.attention.head_count (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   qwen2.attention.head_count_kv (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   qwen2.attention.layer_norm_rms_epsilon (type=6)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   qwen2.block_count (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   qwen2.context_length (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   qwen2.embedding_length (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   qwen2.feed_forward_length (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   qwen2.rope.freq_base (type=6)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.chat_template (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.add_bos_token (type=7)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.bos_token_id (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.eos_token_id (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.merges (type=9)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.model (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.padding_token_id (type=4)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.pre (type=8)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.token_type (type=9)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:1936]   tokenizer.ggml.tokens (type=9)
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2013] [ModelLoader] Extracted vocab_size from tokenizer.ggml.tokens array: 151936
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2018] [ModelLoader] Extracted metadata:
+
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2019]   architecture: qwen2
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2020]   context_length: 32768
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2021]   embedding_length: 896
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2022]   block_count: 24
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2023]   head_count: 14
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2024]   head_count_kv: 2
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2025]   vocab_size: 151936
+[20:37:26.755] [INFO ] [ModelLoader.cpp:2026]   rope_theta: 1e+06
+[20:37:26.755] [INFO ] [ModelLoader.cpp:310] [ModelLoader] Loaded models/qwen2.5-0.5b-instruct-q4_0.gguf
+[20:37:26.755] [INFO ] [ModelLoader.cpp:311]   Architecture: qwen2
+[20:37:26.755] [INFO ] [ModelLoader.cpp:312]   Layers: 24
+[20:37:26.755] [INFO ] [ModelLoader.cpp:313]   Hidden size: 896
+[20:37:26.755] [INFO ] [ModelLoader.cpp:314]   Vocab size: 151936
+[20:37:26.755] [INFO ] [ModelLoader.cpp:315]   Heads: 14 (KV: 2)
+[20:37:26.755] [INFO ] [ModelLoader.cpp:316]   Tensors: 291
+[20:37:26.755] [INFO ] [WeightManager.cpp:44] [WeightManager] Initialized with strategy: REPLICATED (full copy per rank)
+[20:37:26.755] [INFO ] [WeightManager.cpp:66] [WeightManager] Weight precision: NATIVE (weights in original GGUF format, dequantize on-the-fly)
+[20:37:26.755] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:297] ╔════════════════════════════════════════════════════════════════════════════╗
+[20:37:26.755] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:298] ║          Q8_1 vs FP32 LAYER-BY-LAYER SNAPSHOT COMPARISON                   ║
+[20:37:26.755] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:299] ║  Tokens: 9, Model: qwen2.5-0.5b-instruct-q4_0                              ║
+[20:37:26.755] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:300] ╚════════════════════════════════════════════════════════════════════════════╝
+[20:37:26.755] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:301] 
+[20:37:26.756] [INFO ] [PipelineBase.cpp:67] [PipelineBase] Initializing with model: models/qwen2.5-0.5b-instruct-q4_0.gguf
+[20:37:26.756] [INFO ] [PipelineBase.cpp:68] [PipelineBase] Runtime config: max_seq_len=512, n_threads=-1, batch_size=1
+[20:37:26.756] [INFO ] [PipelineBase.cpp:73] [PipelineBase] MPI context provided, rank 0/1
+[20:37:26.756] [INFO ] [PipelineBase.cpp:84] [PipelineBase] Device index: -1 (CPU)
+
+[20:37:26.756] [INFO ] [PipelineBase.cpp:90] [PipelineBase] No placement map provided, creating default (all on device -1)
+[20:37:26.756] [INFO ] [Qwen2Pipeline.cpp:94] Initializing Qwen 2.x pipeline (batch_size=1)
+[20:37:26.756] [INFO ] [PipelineBase.cpp:625] Active devices for this rank: [-1]
+[20:37:26.756] [INFO ] [PipelineBase.cpp:630] Single-device mode (device -1)
+[20:37:26.778] [INFO ] [PipelineBase.cpp:655] Allocating attention workspace buffers (max_seq_len=512, batch_size=1, total_len=512, max_threads=28)
+[20:37:26.795] [INFO ] [PipelineBase.cpp:683] Attention workspace buffers allocated (batch_size=1): scores=14MB, qkv=10MB, context=3MB, mask=1MB
+[20:37:26.795] [INFO ] [PipelineBase.cpp:728] [PipelineBase] Single-rank MPI execution (world_size=1)
+[20:37:26.802] [INFO ] [KVCache.cpp:253] [KVCache<FP32>] Heterogeneous allocation for 24 layers:
+[20:37:26.803] [INFO ] [KVCache.cpp:258]   CPU: 12 MB
+[20:37:26.803] [INFO ] [PipelineBase.cpp:762] Initialized KV cache: 24 layers, 512 max_seq_len, 2 KV heads, 64 head_dim, precision: 0
+[20:37:26.809] [INFO ] [PipelineBase.cpp:779] [PipelineBase] Snapshot capture ENABLED (memory only)
+[20:37:27.184] [INFO ] [PipelineBase.cpp:265] [PipelineBase] Lazy allocating buffers for device -1
+[20:37:27.917] [INFO ] [PipelineBase.cpp:67] [PipelineBase] Initializing with model: models/qwen2.5-0.5b-instruct-q4_0.gguf
+[20:37:27.917] [INFO ] [PipelineBase.cpp:68] [PipelineBase] Runtime config: max_seq_len=512, n_threads=-1, batch_size=1
+[20:37:27.917] [INFO ] [PipelineBase.cpp:73] [PipelineBase] MPI context provided, rank 0/1
+[20:37:27.917] [INFO ] [PipelineBase.cpp:84] [PipelineBase] Device index: -1 (CPU)
+
+[20:37:27.917] [INFO ] [PipelineBase.cpp:90] [PipelineBase] No placement map provided, creating default (all on device -1)
+[20:37:27.917] [INFO ] [Qwen2Pipeline.cpp:94] Initializing Qwen 2.x pipeline (batch_size=1)
+[20:37:27.917] [INFO ] [PipelineBase.cpp:625] Active devices for this rank: [-1]
+[20:37:27.917] [INFO ] [PipelineBase.cpp:630] Single-device mode (device -1)
+[20:37:27.921] [INFO ] [PipelineBase.cpp:655] Allocating attention workspace buffers (max_seq_len=512, batch_size=1, total_len=512, max_threads=28)
+[20:37:27.935] [INFO ] [PipelineBase.cpp:683] Attention workspace buffers allocated (batch_size=1): scores=14MB, qkv=10MB, context=3MB, mask=1MB
+[20:37:27.935] [INFO ] [PipelineBase.cpp:728] [PipelineBase] Single-rank MPI execution (world_size=1)
+[20:37:27.936] [INFO ] [KVCache.cpp:253] [KVCache<Q8_1>] Heterogeneous allocation for 24 layers:
+[20:37:27.936] [INFO ] [KVCache.cpp:258]   CPU: 3.375 MB
+[20:37:27.936] [INFO ] [PipelineBase.cpp:762] Initialized KV cache: 24 layers, 512 max_seq_len, 2 KV heads, 64 head_dim, precision: 3
+[20:37:27.942] [INFO ] [PipelineBase.cpp:779] [PipelineBase] Snapshot capture ENABLED (memory only)
+[20:37:27.942] [INFO ] [PipelineBase.cpp:265] [PipelineBase] Lazy allocating buffers for device -1
+[20:37:27.968] [INFO ] [CPUAttentionKernelTyped.h:445] [CPUAttentionKernelTyped] Using JIT kernel for head_dim=64
+[20:37:27.968] [INFO ] [CPUAttentionKernelTyped.h:483] [compute_q8_1_native] seq_len=9 kv_len=9 n_heads=14 n_kv_heads=2 head_dim=64 heads_per_kv=7 q_blocks_per_row=28 k_blocks_per_row=4 mask=yes mask_stride=9
+DEBUG layer21_ATTENTION_NORM:
+  FP32 range: [-16.7678, 89.2464]
+  Q8_1 range: [-17.2238, 89.1729]
+DEBUG layer21_Q_PROJECTION:
+  FP32 range: [-11.2666, 13.0927]
+  Q8_1 range: [-11.3326, 13.069]
+DEBUG layer21_Q_ROPE:
+  FP32 range: [-11.2666, 13.0927]
+  Q8_1 range: [-11.3326, 13.069]
+DEBUG layer21_K_PROJECTION:
+  FP32 range: [-7.2551, 8.84188]
+  Q8_1 range: [-6.80966, 7.83286]
+DEBUG layer21_K_ROPE:
+  FP32 range: [-7.25517, 8.84198]
+  Q8_1 range: [-6.80966, 7.83286]
+DEBUG layer21_V_PROJECTION:
+  FP32 range: [-9.13486, 7.83014]
+  Q8_1 range: [-9.46454, 8.1933]
+DEBUG layer21_ATTENTION_CONTEXT:
+  FP32 range: [-7.43926, 4.32511]
+  Q8_1 range: [-7.85999, 4.21292]
+DEBUG layer21_ATTENTION_OUTPUT:
+  FP32 range: [-2.26692, 5.03116]
+  Q8_1 range: [-1.80706, 5.68958]
+DEBUG layer21_ATTENTION_RESIDUAL:
+  FP32 range: [-90.6719, 1523.79]
+  Q8_1 range: [-61.8567, 1046.76]
+DEBUG layer21_FFN_NORM:
+  FP32 range: [-9.19679, 143.496]
+  Q8_1 range: [-9.89087, 143.371]
+DEBUG layer21_FFN_GATE:
+  FP32 range: [-35.0201, 37.6482]
+  Q8_1 range: [-32.8972, 43.8423]
+DEBUG layer21_FFN_UP:
+  FP32 range: [-57.5524, 20.9932]
+  Q8_1 range: [-57.6709, 20.9755]
+DEBUG layer21_FFN_SWIGLU:
+  FP32 range: [-358.797, 16.0658]
+  Q8_1 range: [-539.75, 15.937]
+DEBUG layer21_FFN_DOWN:
+  FP32 range: [-1410.59, 85.4966]
+  Q8_1 range: [-1850.43, 112.613]
+DEBUG layer21_FFN_RESIDUAL:
+  FP32 range: [-7.63356, 113.207]
+  Q8_1 range: [-803.672, 50.7566]
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:499] 
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:500] ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:501] ║                    Q8_1 vs FP32 STAGE-BY-STAGE DIVERGENCE REPORT                         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:502] ║                    Model: qwen2.5-0.5b-instruct-q4_0 (9 tokens)                          ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:503] ╠══════════════════════════════════════════════════════════════════════════════════════════╣
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:504] ║  #  │ Stage                                    │ Cosine   │ Rel L2   │ Status           ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:505] ╠═════╪══════════════════════════════════════════╪══════════╪══════════╪══════════════════╣
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   1 │ EMBEDDING                                │ 0.999987 │ 0.005314 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   2 │ layer0_ATTENTION_NORM                    │ 0.999964 │ 0.025192 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   3 │ layer0_Q_PROJECTION                      │ 0.999963 │ 0.008629 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   4 │ layer0_Q_ROPE                            │ 0.999951 │ 0.009887 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   5 │ layer0_K_PROJECTION                      │ 0.999972 │ 0.007508 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   6 │ layer0_K_ROPE                            │ 0.999964 │ 0.008449 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   7 │ layer0_V_PROJECTION                      │ 0.999845 │ 0.027604 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   8 │ layer0_ATTENTION_CONTEXT                 │ 0.891274 │ 0.474711 │ ⚠ DIVERGING    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║   9 │ layer0_ATTENTION_OUTPUT                  │ 0.929058 │ 0.376121 │ ⚠ DRIFT        ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  10 │ layer0_ATTENTION_RESIDUAL                │ 0.969573 │ 0.248094 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  11 │ layer0_FFN_NORM                          │ 0.958965 │ 0.285700 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  12 │ layer0_FFN_GATE                          │ 0.945785 │ 0.327195 │ ⚠ DRIFT        ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  13 │ layer0_FFN_UP                            │ 0.976002 │ 0.218290 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  14 │ layer0_FFN_SWIGLU                        │ 0.940913 │ 0.341554 │ ⚠ DRIFT        ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  15 │ layer0_FFN_DOWN                          │ 0.975647 │ 0.219354 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  16 │ layer0_FFN_RESIDUAL                      │ 0.975606 │ 0.219532 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  17 │ layer1_ATTENTION_NORM                    │ 0.950201 │ 0.316225 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  18 │ layer1_Q_PROJECTION                      │ 0.987764 │ 0.157340 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  19 │ layer1_Q_ROPE                            │ 0.987745 │ 0.157451 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  20 │ layer1_K_PROJECTION                      │ 0.999854 │ 0.017063 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  21 │ layer1_K_ROPE                            │ 0.999841 │ 0.017836 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  22 │ layer1_V_PROJECTION                      │ 0.983515 │ 0.180888 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  23 │ layer1_ATTENTION_CONTEXT                 │ 0.981610 │ 0.192842 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  24 │ layer1_ATTENTION_OUTPUT                  │ 0.979200 │ 0.204880 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  25 │ layer1_ATTENTION_RESIDUAL                │ 0.977452 │ 0.211160 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  26 │ layer1_FFN_NORM                          │ 0.956861 │ 0.294306 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  27 │ layer1_FFN_GATE                          │ 0.977052 │ 0.214710 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  28 │ layer1_FFN_UP                            │ 0.955734 │ 0.298672 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  29 │ layer1_FFN_SWIGLU                        │ 0.936863 │ 0.359359 │ ⚠ DRIFT        ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  30 │ layer1_FFN_DOWN                          │ 0.942072 │ 0.345271 │ ⚠ DRIFT        ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  31 │ layer1_FFN_RESIDUAL                      │ 0.980054 │ 0.198941 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  32 │ layer2_ATTENTION_NORM                    │ 0.961479 │ 0.278365 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  33 │ layer2_Q_PROJECTION                      │ 0.990506 │ 0.137675 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  34 │ layer2_Q_ROPE                            │ 0.990495 │ 0.137764 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  35 │ layer2_K_PROJECTION                      │ 0.999808 │ 0.019614 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  36 │ layer2_K_ROPE                            │ 0.999802 │ 0.019922 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  37 │ layer2_V_PROJECTION                      │ 0.983936 │ 0.179247 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  38 │ layer2_ATTENTION_CONTEXT                 │ 0.969964 │ 0.244337 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  39 │ layer2_ATTENTION_OUTPUT                  │ 0.970954 │ 0.239380 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  40 │ layer2_ATTENTION_RESIDUAL                │ 0.978777 │ 0.205437 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  41 │ layer2_FFN_NORM                          │ 0.964949 │ 0.264688 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  42 │ layer2_FFN_GATE                          │ 0.981227 │ 0.195649 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  43 │ layer2_FFN_UP                            │ 0.966132 │ 0.259691 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  44 │ layer2_FFN_SWIGLU                        │ 0.988480 │ 0.151769 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  45 │ layer2_FFN_DOWN                          │ 0.999892 │ 0.016853 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  46 │ layer2_FFN_RESIDUAL                      │ 0.999865 │ 0.018224 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  47 │ layer3_ATTENTION_NORM                    │ 0.976357 │ 0.216667 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  48 │ layer3_Q_PROJECTION                      │ 0.995927 │ 0.090181 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  49 │ layer3_Q_ROPE                            │ 0.995918 │ 0.090280 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  50 │ layer3_K_PROJECTION                      │ 0.997607 │ 0.069222 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  51 │ layer3_K_ROPE                            │ 0.997585 │ 0.069549 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  52 │ layer3_V_PROJECTION                      │ 0.971689 │ 0.237394 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  53 │ layer3_ATTENTION_CONTEXT                 │ 0.973145 │ 0.230489 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  54 │ layer3_ATTENTION_OUTPUT                  │ 0.966505 │ 0.258627 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  55 │ layer3_ATTENTION_RESIDUAL                │ 0.999864 │ 0.018281 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  56 │ layer3_FFN_NORM                          │ 0.967537 │ 0.367695 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  57 │ layer3_FFN_GATE                          │ 0.965801 │ 0.365061 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  58 │ layer3_FFN_UP                            │ 0.948193 │ 0.335385 │ ⚠ DRIFT        ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  59 │ layer3_FFN_SWIGLU                        │ 0.903344 │ 0.516990 │ ⚠ DRIFT        ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  60 │ layer3_FFN_DOWN                          │ 0.999596 │ 0.552656 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  61 │ layer3_FFN_RESIDUAL                      │ 0.999306 │ 0.320995 │ ✓ EXCELLENT    ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  62 │ layer4_ATTENTION_NORM                    │ 0.960444 │ 0.279372 │ ~ OK             ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  63 │ layer4_Q_PROJECTION                      │ 0.996756 │ 0.080501 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  64 │ layer4_Q_ROPE                            │ 0.996735 │ 0.080772 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  65 │ layer4_K_PROJECTION                      │ 0.997144 │ 0.075518 │ ✓ GOOD         ║
+[20:37:28.659] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  66 │ layer4_K_ROPE                            │ 0.997122 │ 0.075809 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  67 │ layer4_V_PROJECTION                      │ 0.953521 │ 0.302680 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  68 │ layer4_ATTENTION_CONTEXT                 │ 0.959799 │ 0.282327 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  69 │ layer4_ATTENTION_OUTPUT                  │ 0.958035 │ 0.286652 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  70 │ layer4_ATTENTION_RESIDUAL                │ 0.999303 │ 0.321020 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  71 │ layer4_FFN_NORM                          │ 0.961073 │ 0.277212 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  72 │ layer4_FFN_GATE                          │ 0.986079 │ 0.166321 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  73 │ layer4_FFN_UP                            │ 0.959476 │ 0.282589 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  74 │ layer4_FFN_SWIGLU                        │ 0.930223 │ 0.369467 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  75 │ layer4_FFN_DOWN                          │ 0.938419 │ 0.346328 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  76 │ layer4_FFN_RESIDUAL                      │ 0.999298 │ 0.320687 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  77 │ layer5_ATTENTION_NORM                    │ 0.958675 │ 0.285602 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  78 │ layer5_Q_PROJECTION                      │ 0.995732 │ 0.092430 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  79 │ layer5_Q_ROPE                            │ 0.995692 │ 0.092853 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  80 │ layer5_K_PROJECTION                      │ 0.990840 │ 0.135044 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  81 │ layer5_K_ROPE                            │ 0.990836 │ 0.135077 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  82 │ layer5_V_PROJECTION                      │ 0.953164 │ 0.306071 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  83 │ layer5_ATTENTION_CONTEXT                 │ 0.951271 │ 0.311366 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  84 │ layer5_ATTENTION_OUTPUT                  │ 0.961145 │ 0.280463 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  85 │ layer5_ATTENTION_RESIDUAL                │ 0.999294 │ 0.320854 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  86 │ layer5_FFN_NORM                          │ 0.959239 │ 0.284449 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  87 │ layer5_FFN_GATE                          │ 0.990321 │ 0.139593 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  88 │ layer5_FFN_UP                            │ 0.957177 │ 0.291631 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  89 │ layer5_FFN_SWIGLU                        │ 0.939064 │ 0.349578 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  90 │ layer5_FFN_DOWN                          │ 0.977447 │ 0.212538 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  91 │ layer5_FFN_RESIDUAL                      │ 0.999349 │ 0.315067 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  92 │ layer6_ATTENTION_NORM                    │ 0.953616 │ 0.303261 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  93 │ layer6_Q_PROJECTION                      │ 0.995800 │ 0.091578 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  94 │ layer6_Q_ROPE                            │ 0.995772 │ 0.091883 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  95 │ layer6_K_PROJECTION                      │ 0.989416 │ 0.145259 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  96 │ layer6_K_ROPE                            │ 0.989401 │ 0.145354 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  97 │ layer6_V_PROJECTION                      │ 0.960576 │ 0.287957 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  98 │ layer6_ATTENTION_CONTEXT                 │ 0.966147 │ 0.267168 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║  99 │ layer6_ATTENTION_OUTPUT                  │ 0.955834 │ 0.303678 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 100 │ layer6_ATTENTION_RESIDUAL                │ 0.999348 │ 0.314949 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 101 │ layer6_FFN_NORM                          │ 0.951874 │ 0.308914 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 102 │ layer6_FFN_GATE                          │ 0.977443 │ 0.214115 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 103 │ layer6_FFN_UP                            │ 0.950759 │ 0.312269 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 104 │ layer6_FFN_SWIGLU                        │ 0.917293 │ 0.402896 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 105 │ layer6_FFN_DOWN                          │ 0.924151 │ 0.387214 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 106 │ layer6_FFN_RESIDUAL                      │ 0.999349 │ 0.314651 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 107 │ layer7_ATTENTION_NORM                    │ 0.951984 │ 0.308558 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 108 │ layer7_Q_PROJECTION                      │ 0.997465 │ 0.071154 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 109 │ layer7_Q_ROPE                            │ 0.997437 │ 0.071555 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 110 │ layer7_K_PROJECTION                      │ 0.992192 │ 0.124737 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 111 │ layer7_K_ROPE                            │ 0.992159 │ 0.125002 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 112 │ layer7_V_PROJECTION                      │ 0.960232 │ 0.281902 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 113 │ layer7_ATTENTION_CONTEXT                 │ 0.953174 │ 0.334637 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 114 │ layer7_ATTENTION_OUTPUT                  │ 0.945346 │ 0.359871 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 115 │ layer7_ATTENTION_RESIDUAL                │ 0.999347 │ 0.314488 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 116 │ layer7_FFN_NORM                          │ 0.946284 │ 0.326139 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 117 │ layer7_FFN_GATE                          │ 0.977827 │ 0.210553 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 118 │ layer7_FFN_UP                            │ 0.943386 │ 0.334373 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 119 │ layer7_FFN_SWIGLU                        │ 0.911370 │ 0.414902 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 120 │ layer7_FFN_DOWN                          │ 0.913460 │ 0.409167 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 121 │ layer7_FFN_RESIDUAL                      │ 0.999344 │ 0.314180 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 122 │ layer8_ATTENTION_NORM                    │ 0.948657 │ 0.318820 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 123 │ layer8_Q_PROJECTION                      │ 0.995446 │ 0.095417 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 124 │ layer8_Q_ROPE                            │ 0.995439 │ 0.095488 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 125 │ layer8_K_PROJECTION                      │ 0.999888 │ 0.014974 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 126 │ layer8_K_ROPE                            │ 0.999873 │ 0.015906 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 127 │ layer8_V_PROJECTION                      │ 0.956640 │ 0.294360 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 128 │ layer8_ATTENTION_CONTEXT                 │ 0.942058 │ 0.351377 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 129 │ layer8_ATTENTION_OUTPUT                  │ 0.932001 │ 0.380608 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 130 │ layer8_ATTENTION_RESIDUAL                │ 0.999330 │ 0.314159 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 131 │ layer8_FFN_NORM                          │ 0.940479 │ 0.344607 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 132 │ layer8_FFN_GATE                          │ 0.975768 │ 0.221296 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 133 │ layer8_FFN_UP                            │ 0.941897 │ 0.340430 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 134 │ layer8_FFN_SWIGLU                        │ 0.894649 │ 0.456382 │ ⚠ DIVERGING    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 135 │ layer8_FFN_DOWN                          │ 0.895860 │ 0.455508 │ ⚠ DIVERGING    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 136 │ layer8_FFN_RESIDUAL                      │ 0.999333 │ 0.313914 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 137 │ layer9_ATTENTION_NORM                    │ 0.942270 │ 0.339150 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 138 │ layer9_Q_PROJECTION                      │ 0.995837 │ 0.091293 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 139 │ layer9_Q_ROPE                            │ 0.995818 │ 0.091502 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 140 │ layer9_K_PROJECTION                      │ 0.989169 │ 0.148110 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 141 │ layer9_K_ROPE                            │ 0.989192 │ 0.147952 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 142 │ layer9_V_PROJECTION                      │ 0.947670 │ 0.331666 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 143 │ layer9_ATTENTION_CONTEXT                 │ 0.947076 │ 0.349947 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 144 │ layer9_ATTENTION_OUTPUT                  │ 0.937713 │ 0.372347 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 145 │ layer9_ATTENTION_RESIDUAL                │ 0.999327 │ 0.313811 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 146 │ layer9_FFN_NORM                          │ 0.938091 │ 0.350578 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 147 │ layer9_FFN_GATE                          │ 0.968160 │ 0.255366 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 148 │ layer9_FFN_UP                            │ 0.936209 │ 0.355438 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 149 │ layer9_FFN_SWIGLU                        │ 0.885543 │ 0.474978 │ ⚠ DIVERGING    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 150 │ layer9_FFN_DOWN                          │ 0.897899 │ 0.445561 │ ⚠ DIVERGING    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 151 │ layer9_FFN_RESIDUAL                      │ 0.999329 │ 0.313476 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 152 │ layer10_ATTENTION_NORM                   │ 0.933916 │ 0.362372 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 153 │ layer10_Q_PROJECTION                     │ 0.994971 │ 0.100271 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 154 │ layer10_Q_ROPE                           │ 0.994958 │ 0.100403 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 155 │ layer10_K_PROJECTION                     │ 0.990046 │ 0.141452 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 156 │ layer10_K_ROPE                           │ 0.989995 │ 0.141815 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 157 │ layer10_V_PROJECTION                     │ 0.903394 │ 0.442129 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 158 │ layer10_ATTENTION_CONTEXT                │ 0.942865 │ 0.348610 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 159 │ layer10_ATTENTION_OUTPUT                 │ 0.942692 │ 0.340280 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 160 │ layer10_ATTENTION_RESIDUAL               │ 0.999324 │ 0.313419 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 161 │ layer10_FFN_NORM                         │ 0.931966 │ 0.367821 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 162 │ layer10_FFN_GATE                         │ 0.962440 │ 0.276846 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 163 │ layer10_FFN_UP                           │ 0.937928 │ 0.350898 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 164 │ layer10_FFN_SWIGLU                       │ 0.880925 │ 0.483656 │ ⚠ DIVERGING    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 165 │ layer10_FFN_DOWN                         │ 0.891310 │ 0.463462 │ ⚠ DIVERGING    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 166 │ layer10_FFN_RESIDUAL                     │ 0.999320 │ 0.313392 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 167 │ layer11_ATTENTION_NORM                   │ 0.941078 │ 0.342523 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 168 │ layer11_Q_PROJECTION                     │ 0.993839 │ 0.111410 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 169 │ layer11_Q_ROPE                           │ 0.993811 │ 0.111653 │ ✓ GOOD         ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 170 │ layer11_K_PROJECTION                     │ 0.985052 │ 0.173352 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 171 │ layer11_K_ROPE                           │ 0.985061 │ 0.173313 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 172 │ layer11_V_PROJECTION                     │ 0.957149 │ 0.292196 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 173 │ layer11_ATTENTION_CONTEXT                │ 0.943858 │ 0.362958 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 174 │ layer11_ATTENTION_OUTPUT                 │ 0.940735 │ 0.355887 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 175 │ layer11_ATTENTION_RESIDUAL               │ 0.999309 │ 0.313401 │ ✓ EXCELLENT    ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 176 │ layer11_FFN_NORM                         │ 0.924665 │ 0.386473 │ ⚠ DRIFT        ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 177 │ layer11_FFN_GATE                         │ 0.957876 │ 0.290388 │ ~ OK             ║
+[20:37:28.660] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 178 │ layer11_FFN_UP                           │ 0.929344 │ 0.375665 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 179 │ layer11_FFN_SWIGLU                       │ 0.864530 │ 0.519812 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 180 │ layer11_FFN_DOWN                         │ 0.885973 │ 0.481818 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 181 │ layer11_FFN_RESIDUAL                     │ 0.999289 │ 0.313244 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 182 │ layer12_ATTENTION_NORM                   │ 0.916865 │ 0.406852 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 183 │ layer12_Q_PROJECTION                     │ 0.992486 │ 0.122486 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 184 │ layer12_Q_ROPE                           │ 0.992461 │ 0.122693 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 185 │ layer12_K_PROJECTION                     │ 0.986002 │ 0.168334 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 186 │ layer12_K_ROPE                           │ 0.986012 │ 0.168293 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 187 │ layer12_V_PROJECTION                     │ 0.886626 │ 0.482438 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 188 │ layer12_ATTENTION_CONTEXT                │ 0.902712 │ 0.449346 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 189 │ layer12_ATTENTION_OUTPUT                 │ 0.883609 │ 0.486634 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 190 │ layer12_ATTENTION_RESIDUAL               │ 0.999290 │ 0.313249 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 191 │ layer12_FFN_NORM                         │ 0.924864 │ 0.384931 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 192 │ layer12_FFN_GATE                         │ 0.965506 │ 0.262548 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 193 │ layer12_FFN_UP                           │ 0.928520 │ 0.374943 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 194 │ layer12_FFN_SWIGLU                       │ 0.873113 │ 0.499836 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 195 │ layer12_FFN_DOWN                         │ 0.879848 │ 0.489214 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 196 │ layer12_FFN_RESIDUAL                     │ 0.999303 │ 0.313002 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 197 │ layer13_ATTENTION_NORM                   │ 0.925602 │ 0.384241 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 198 │ layer13_Q_PROJECTION                     │ 0.990053 │ 0.140853 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 199 │ layer13_Q_ROPE                           │ 0.990018 │ 0.141111 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 200 │ layer13_K_PROJECTION                     │ 0.984587 │ 0.176134 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 201 │ layer13_K_ROPE                           │ 0.984565 │ 0.176244 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 202 │ layer13_V_PROJECTION                     │ 0.920733 │ 0.401955 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 203 │ layer13_ATTENTION_CONTEXT                │ 0.935343 │ 0.369488 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 204 │ layer13_ATTENTION_OUTPUT                 │ 0.931764 │ 0.375856 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 205 │ layer13_ATTENTION_RESIDUAL               │ 0.999299 │ 0.312993 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 206 │ layer13_FFN_NORM                         │ 0.925923 │ 0.383280 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 207 │ layer13_FFN_GATE                         │ 0.965680 │ 0.262839 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 208 │ layer13_FFN_UP                           │ 0.926300 │ 0.382968 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 209 │ layer13_FFN_SWIGLU                       │ 0.875880 │ 0.497556 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 210 │ layer13_FFN_DOWN                         │ 0.887653 │ 0.473479 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 211 │ layer13_FFN_RESIDUAL                     │ 0.999292 │ 0.312600 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 212 │ layer14_ATTENTION_NORM                   │ 0.932342 │ 0.367014 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 213 │ layer14_Q_PROJECTION                     │ 0.991525 │ 0.129917 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 214 │ layer14_Q_ROPE                           │ 0.991503 │ 0.130084 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 215 │ layer14_K_PROJECTION                     │ 0.985760 │ 0.168565 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 216 │ layer14_K_ROPE                           │ 0.985782 │ 0.168430 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 217 │ layer14_V_PROJECTION                     │ 0.893479 │ 0.457703 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 218 │ layer14_ATTENTION_CONTEXT                │ 0.916731 │ 0.409945 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 219 │ layer14_ATTENTION_OUTPUT                 │ 0.884980 │ 0.482189 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 220 │ layer14_ATTENTION_RESIDUAL               │ 0.999291 │ 0.312633 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 221 │ layer14_FFN_NORM                         │ 0.934504 │ 0.359508 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 222 │ layer14_FFN_GATE                         │ 0.970406 │ 0.243698 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 223 │ layer14_FFN_UP                           │ 0.940098 │ 0.344193 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 224 │ layer14_FFN_SWIGLU                       │ 0.896407 │ 0.452112 │ ⚠ DIVERGING    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 225 │ layer14_FFN_DOWN                         │ 0.913514 │ 0.411431 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 226 │ layer14_FFN_RESIDUAL                     │ 0.999279 │ 0.312454 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 227 │ layer15_ATTENTION_NORM                   │ 0.944821 │ 0.331719 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 228 │ layer15_Q_PROJECTION                     │ 0.994145 │ 0.108175 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 229 │ layer15_Q_ROPE                           │ 0.994125 │ 0.108364 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 230 │ layer15_K_PROJECTION                     │ 0.985100 │ 0.172008 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 231 │ layer15_K_ROPE                           │ 0.985118 │ 0.171904 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 232 │ layer15_V_PROJECTION                     │ 0.950938 │ 0.309908 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 233 │ layer15_ATTENTION_CONTEXT                │ 0.958031 │ 0.287136 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 234 │ layer15_ATTENTION_OUTPUT                 │ 0.957146 │ 0.290399 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 235 │ layer15_ATTENTION_RESIDUAL               │ 0.999275 │ 0.312609 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 236 │ layer15_FFN_NORM                         │ 0.941385 │ 0.341082 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 237 │ layer15_FFN_GATE                         │ 0.975215 │ 0.224396 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 238 │ layer15_FFN_UP                           │ 0.943237 │ 0.336958 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 239 │ layer15_FFN_SWIGLU                       │ 0.908756 │ 0.427208 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 240 │ layer15_FFN_DOWN                         │ 0.910189 │ 0.425880 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 241 │ layer15_FFN_RESIDUAL                     │ 0.999266 │ 0.312026 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 242 │ layer16_ATTENTION_NORM                   │ 0.957756 │ 0.290899 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 243 │ layer16_Q_PROJECTION                     │ 0.990686 │ 0.136515 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 244 │ layer16_Q_ROPE                           │ 0.990684 │ 0.136533 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 245 │ layer16_K_PROJECTION                     │ 0.988688 │ 0.150194 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 246 │ layer16_K_ROPE                           │ 0.988700 │ 0.150130 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 247 │ layer16_V_PROJECTION                     │ 0.977838 │ 0.209874 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 248 │ layer16_ATTENTION_CONTEXT                │ 0.957674 │ 0.297375 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 249 │ layer16_ATTENTION_OUTPUT                 │ 0.959903 │ 0.290257 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 250 │ layer16_ATTENTION_RESIDUAL               │ 0.999250 │ 0.312069 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 251 │ layer16_FFN_NORM                         │ 0.949360 │ 0.318020 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 252 │ layer16_FFN_GATE                         │ 0.979004 │ 0.206657 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 253 │ layer16_FFN_UP                           │ 0.956241 │ 0.295674 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 254 │ layer16_FFN_SWIGLU                       │ 0.932295 │ 0.369180 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 255 │ layer16_FFN_DOWN                         │ 0.934281 │ 0.364400 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 256 │ layer16_FFN_RESIDUAL                     │ 0.999168 │ 0.312106 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 257 │ layer17_ATTENTION_NORM                   │ 0.953746 │ 0.304156 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 258 │ layer17_Q_PROJECTION                     │ 0.993264 │ 0.116385 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 259 │ layer17_Q_ROPE                           │ 0.993251 │ 0.116500 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 260 │ layer17_K_PROJECTION                     │ 0.989671 │ 0.143455 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 261 │ layer17_K_ROPE                           │ 0.989655 │ 0.143567 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 262 │ layer17_V_PROJECTION                     │ 0.970485 │ 0.242562 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 263 │ layer17_ATTENTION_CONTEXT                │ 0.975974 │ 0.218294 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 264 │ layer17_ATTENTION_OUTPUT                 │ 0.968724 │ 0.250195 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 265 │ layer17_ATTENTION_RESIDUAL               │ 0.999145 │ 0.311855 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 266 │ layer17_FFN_NORM                         │ 0.956869 │ 0.292999 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 267 │ layer17_FFN_GATE                         │ 0.982524 │ 0.188248 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 268 │ layer17_FFN_UP                           │ 0.961313 │ 0.277889 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 269 │ layer17_FFN_SWIGLU                       │ 0.942500 │ 0.338681 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 270 │ layer17_FFN_DOWN                         │ 0.944805 │ 0.331753 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 271 │ layer17_FFN_RESIDUAL                     │ 0.999064 │ 0.312226 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 272 │ layer18_ATTENTION_NORM                   │ 0.959227 │ 0.285464 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 273 │ layer18_Q_PROJECTION                     │ 0.993724 │ 0.111885 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 274 │ layer18_Q_ROPE                           │ 0.993712 │ 0.111994 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 275 │ layer18_K_PROJECTION                     │ 0.987353 │ 0.159919 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 276 │ layer18_K_ROPE                           │ 0.987324 │ 0.160098 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 277 │ layer18_V_PROJECTION                     │ 0.965509 │ 0.261110 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 278 │ layer18_ATTENTION_CONTEXT                │ 0.937992 │ 0.346742 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 279 │ layer18_ATTENTION_OUTPUT                 │ 0.930031 │ 0.367480 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 280 │ layer18_ATTENTION_RESIDUAL               │ 0.999039 │ 0.312215 │ ✓ EXCELLENT    ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 281 │ layer18_FFN_NORM                         │ 0.956123 │ 0.294944 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 282 │ layer18_FFN_GATE                         │ 0.975236 │ 0.222409 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 283 │ layer18_FFN_UP                           │ 0.958457 │ 0.286903 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 284 │ layer18_FFN_SWIGLU                       │ 0.924669 │ 0.387382 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 285 │ layer18_FFN_DOWN                         │ 0.932009 │ 0.368439 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 286 │ layer18_FFN_RESIDUAL                     │ 0.998923 │ 0.312579 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 287 │ layer19_ATTENTION_NORM                   │ 0.961323 │ 0.279226 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 288 │ layer19_Q_PROJECTION                     │ 0.994511 │ 0.104954 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 289 │ layer19_Q_ROPE                           │ 0.994492 │ 0.105140 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 290 │ layer19_K_PROJECTION                     │ 0.989368 │ 0.146754 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 291 │ layer19_K_ROPE                           │ 0.989362 │ 0.146796 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 292 │ layer19_V_PROJECTION                     │ 0.947513 │ 0.325462 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 293 │ layer19_ATTENTION_CONTEXT                │ 0.941402 │ 0.342889 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 294 │ layer19_ATTENTION_OUTPUT                 │ 0.937803 │ 0.354535 │ ⚠ DRIFT        ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 295 │ layer19_ATTENTION_RESIDUAL               │ 0.998899 │ 0.312650 │ ✓ GOOD         ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 296 │ layer19_FFN_NORM                         │ 0.955222 │ 0.298474 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 297 │ layer19_FFN_GATE                         │ 0.980023 │ 0.199912 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 298 │ layer19_FFN_UP                           │ 0.957767 │ 0.290043 │ ~ OK             ║
+[20:37:28.661] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 299 │ layer19_FFN_SWIGLU                       │ 0.918496 │ 0.406791 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 300 │ layer19_FFN_DOWN                         │ 0.927087 │ 0.384080 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 301 │ layer19_FFN_RESIDUAL                     │ 0.998653 │ 0.313373 │ ✓ GOOD         ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 302 │ layer20_ATTENTION_NORM                   │ 0.965104 │ 0.265982 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 303 │ layer20_Q_PROJECTION                     │ 0.989766 │ 0.144623 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 304 │ layer20_Q_ROPE                           │ 0.989742 │ 0.144772 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 305 │ layer20_K_PROJECTION                     │ 0.988202 │ 0.155582 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 306 │ layer20_K_ROPE                           │ 0.988172 │ 0.155757 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 307 │ layer20_V_PROJECTION                     │ 0.975101 │ 0.222080 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 308 │ layer20_ATTENTION_CONTEXT                │ 0.988184 │ 0.153796 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 309 │ layer20_ATTENTION_OUTPUT                 │ 0.976350 │ 0.217894 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 310 │ layer20_ATTENTION_RESIDUAL               │ 0.998583 │ 0.312946 │ ✓ GOOD         ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 311 │ layer20_FFN_NORM                         │ 0.955170 │ 0.299415 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 312 │ layer20_FFN_GATE                         │ 0.980613 │ 0.198266 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 313 │ layer20_FFN_UP                           │ 0.959997 │ 0.283040 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 314 │ layer20_FFN_SWIGLU                       │ 0.920070 │ 0.402294 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 315 │ layer20_FFN_DOWN                         │ 0.945770 │ 0.329132 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 316 │ layer20_FFN_RESIDUAL                     │ 0.998261 │ 0.313506 │ ✓ GOOD         ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 317 │ layer21_ATTENTION_NORM                   │ 0.971358 │ 0.241531 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 318 │ layer21_Q_PROJECTION                     │ 0.991997 │ 0.128919 │ ✓ GOOD         ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 319 │ layer21_Q_ROPE                           │ 0.991984 │ 0.129043 │ ✓ GOOD         ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 320 │ layer21_K_PROJECTION                     │ 0.989424 │ 0.147738 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 321 │ layer21_K_ROPE                           │ 0.989425 │ 0.147722 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 322 │ layer21_V_PROJECTION                     │ 0.961104 │ 0.278337 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 323 │ layer21_ATTENTION_CONTEXT                │ 0.979761 │ 0.202164 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 324 │ layer21_ATTENTION_OUTPUT                 │ 0.968992 │ 0.251223 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 325 │ layer21_ATTENTION_RESIDUAL               │ 0.998203 │ 0.313528 │ ✓ GOOD         ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 326 │ layer21_FFN_NORM                         │ 0.969399 │ 0.247767 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 327 │ layer21_FFN_GATE                         │ 0.988897 │ 0.149115 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 328 │ layer21_FFN_UP                           │ 0.969636 │ 0.247065 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 329 │ layer21_FFN_SWIGLU                       │ 0.975764 │ 0.416443 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 330 │ layer21_FFN_DOWN                         │ 0.999644 │ 0.313163 │ ✓ EXCELLENT    ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 331 │ layer21_FFN_RESIDUAL                     │ -0.382370 │ 4.453407 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 332 │ layer22_ATTENTION_NORM                   │ 0.649125 │ 0.850274 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 333 │ layer22_Q_PROJECTION                     │ 0.890280 │ 0.486930 │ ⚠ DIVERGING    ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 334 │ layer22_Q_ROPE                           │ 0.890286 │ 0.486954 │ ⚠ DIVERGING    ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 335 │ layer22_K_PROJECTION                     │ 0.938903 │ 0.350786 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 336 │ layer22_K_ROPE                           │ 0.938892 │ 0.350810 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 337 │ layer22_V_PROJECTION                     │ 0.964958 │ 0.263009 │ ~ OK             ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 338 │ layer22_ATTENTION_CONTEXT                │ 0.301212 │ 1.787258 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 339 │ layer22_ATTENTION_OUTPUT                 │ -0.004654 │ 1.888948 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 340 │ layer22_ATTENTION_RESIDUAL               │ -0.384200 │ 4.542802 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 341 │ layer22_FFN_NORM                         │ 0.609978 │ 0.874855 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 342 │ layer22_FFN_GATE                         │ 0.779025 │ 0.650312 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 343 │ layer22_FFN_UP                           │ 0.589719 │ 0.891014 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 344 │ layer22_FFN_SWIGLU                       │ 0.703618 │ 0.745575 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 345 │ layer22_FFN_DOWN                         │ 0.796740 │ 0.606025 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 346 │ layer22_FFN_RESIDUAL                     │ -0.133347 │ 4.311798 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 347 │ layer23_ATTENTION_NORM                   │ 0.642279 │ 0.843925 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 348 │ layer23_Q_PROJECTION                     │ 0.929719 │ 0.371647 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 349 │ layer23_Q_ROPE                           │ 0.929704 │ 0.371674 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 350 │ layer23_K_PROJECTION                     │ 0.943223 │ 0.336727 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 351 │ layer23_K_ROPE                           │ 0.943207 │ 0.336784 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 352 │ layer23_V_PROJECTION                     │ 0.929161 │ 0.369886 │ ⚠ DRIFT        ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 353 │ layer23_ATTENTION_CONTEXT                │ 0.568593 │ 0.936663 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 354 │ layer23_ATTENTION_OUTPUT                 │ 0.688994 │ 0.774495 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 355 │ layer23_ATTENTION_RESIDUAL               │ -0.110927 │ 4.171168 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 356 │ layer23_FFN_NORM                         │ 0.557812 │ 0.950152 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 357 │ layer23_FFN_GATE                         │ 0.861905 │ 0.524233 │ ⚠ DIVERGING    ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 358 │ layer23_FFN_UP                           │ 0.651348 │ 0.834670 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 359 │ layer23_FFN_SWIGLU                       │ 0.625823 │ 0.811941 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 360 │ layer23_FFN_DOWN                         │ 0.891103 │ 0.454777 │ ⚠ DIVERGING    ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 361 │ layer23_FFN_RESIDUAL                     │ -0.053910 │ 4.804146 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 362 │ FINAL_NORM                               │ 0.792539 │ 0.611045 │ ✗ DIVERGED     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:516] ║ 363 │ LM_HEAD                                  │ 0.843344 │ 0.538712 │ ⚠ DIVERGING    ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:519] ╠══════════════════════════════════════════════════════════════════════════════════════════╣
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:535] ║  SUMMARY:                                                                                ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:536] ║    Total stages:  363    Good (≥0.99):  102    Diverged (<0.90):   43                    ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:539] ║    Average cosine: 0.932591                                                          ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:540] ║    Best:  EMBEDDING                           (cos=1.0000)                  ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:542] ║    Worst: layer22_ATTENTION_RESIDUAL          (cos=-0.3842)                  ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:544] ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:547] 
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:548] ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:549] ║                              FINAL LOGITS COMPARISON                                     ║
+[20:37:28.662] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:550] ╠══════════════════════════════════════════════════════════════════════════════════════════╣
+[20:37:28.664] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:596] ║  Logits Cosine Similarity: 0.885454    Rel L2: 0.470240                       ║
+[20:37:28.664] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:598] ║  FP32 Top-5: [    11,     13,    624,    382,    345]                            ║
+[20:37:28.664] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:601] ║  Q8_1 Top-5: [    13,    624,     11,    382,    198]                            ║
+[20:37:28.664] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:604] ║  Top-5 Overlap: 4/5 (80%)                                                           ║
+[20:37:28.664] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:605] ╠══════════════════════════════════════════════════════════════════════════════════════════╣
+[20:37:28.664] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:614] ║  ✗ TOP-1 MISMATCH: FP32=    11, Q8_1=    13                                        ║
+[20:37:28.664] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:617] ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+[20:37:28.664] [INFO ] [Test__Q8_1_LayerByLayer_Divergence.cpp:618] 
+/workspaces/llaminar/tests/v2/e2e/qwen2/Test__Q8_1_LayerByLayer_Divergence.cpp:622: Failure
+Expected: (logit_cos) >= (0.90), actual: 0.88545408908935208 vs 0.9
+Logits cosine too low (< 0.90)
+
+/workspaces/llaminar/tests/v2/e2e/qwen2/Test__Q8_1_LayerByLayer_Divergence.cpp:623: Failure
+Expected equality of these values:
+  top5_fp32[0]
+    Which is: 11
+  top5_q8_1[0]
+    Which is: 13
+Top-1 token mismatch: FP32=11, Q8_1=13
+
+[  FAILED  ] Test__Q8_1_LayerByLayer.SnapshotComparison (2078 ms)
+[----------] 1 test from Test__Q8_1_LayerByLayer (2078 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (2078 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] Test__Q8_1_LayerByLayer.SnapshotComparison
+
+ 1 FAILED TEST
+--------------------------------------------------------------------------
+Primary job  terminated normally, but 1 process returned
+a non-zero exit code. Per user-direction, the job has been aborted.
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+mpirun detected that one or more processes exited with non-zero status, thus causing
+the job to be terminated. The first process to do so was:
+
+  Process name: [[20238,1],0]
+  Exit code:    1
+--------------------------------------------------------------------------

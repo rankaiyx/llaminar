@@ -208,11 +208,11 @@ namespace llaminar2
                 if (debug_generate_)
                     std::cerr << "[JIT_DEBUG]     emit_exp2_poly: vrndscaleps" << std::endl;
                 // Split into integer and fractional parts
-                // n = round(x), f = x - n
+                // n = floor(x), f = x - n
                 // 2^x = 2^n * 2^f
-                // Use round-to-nearest-even (imm=8) to keep f in [-0.5, 0.5] for better precision
-                vrndscaleps(zmm30, src, 8); // round(x) -> zmm30
-                vsubps(zmm31, src, zmm30);  // f = x - round(x) -> zmm31
+                // Use floor (imm=1) to match our other exp implementations and keep f in [0, 1)
+                vrndscaleps(zmm30, src, 1); // floor(x) -> zmm30
+                vsubps(zmm31, src, zmm30);  // f = x - floor(x) -> zmm31
 
                 // 2^f using polynomial (for f in [-0.5, 0.5])
                 // p(f) = 1 + f*(ln2 + f*(ln2^2/2 + f*(ln2^3/6 + ...)))
@@ -624,6 +624,10 @@ namespace llaminar2
                     // We use reg_tmp (rdi) for the calculation to avoid clobbering reg_n (rax).
                     // reg_n (rax) holds the current n loop counter.
 
+                    // CRITICAL: reg_n (rax) is clobbered during score computation (eax loads) and exp.
+                    // We must reload the saved loop index before indexing the mask.
+                    mov(reg_n, ptr[rsp + reg_n_offset_]);
+
                     mov(reg_tmp.cvt32(), reg_m.cvt32());            // edi = m (zero extends rdi)
                     imul(reg_tmp.cvt32(), reg_mask_stride.cvt32()); // edi = m * stride
                     add(reg_tmp.cvt32(), reg_n.cvt32());            // edi = m * stride + n
@@ -888,8 +892,8 @@ namespace llaminar2
                     vcvtps2dq(zmm21, zmm21);
 
                     // Pack to int8 with saturation
-                    vpmovdb(xmm20, zmm20); // 16 int32 -> 16 int8
-                    vpmovdb(xmm21, zmm21); // 16 int32 -> 16 int8
+                    vpmovsdb(xmm20, zmm20); // 16 int32 -> 16 int8
+                    vpmovsdb(xmm21, zmm21); // 16 int32 -> 16 int8
                     // Use EVEX version for extended registers
                     vinserti32x4(ymm20, ymm20, xmm21, 1); // EVEX: vinserti32x4 instead of vinserti128
 

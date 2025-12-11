@@ -64,30 +64,30 @@ namespace llaminar2
             tensor_factory_ = std::make_unique<TensorFactory>(*default_mpi_ctx_);
         }
 
-        LOG_INFO("[PipelineBase] Initializing with model: " << model_path_);
-        LOG_INFO("[PipelineBase] Runtime config: max_seq_len=" << config_.max_seq_len
-                                                               << ", n_threads=" << config_.n_threads << ", batch_size=" << config_.batch_size);
+        LOG_DEBUG("[PipelineBase] Initializing with model: " << model_path_);
+        LOG_DEBUG("[PipelineBase] Runtime config: max_seq_len=" << config_.max_seq_len
+                                                                << ", n_threads=" << config_.n_threads << ", batch_size=" << config_.batch_size);
 
         if (mpi_ctx_)
         {
-            LOG_INFO("[PipelineBase] MPI context provided, rank "
-                     << mpi_ctx_->rank() << "/" << mpi_ctx_->world_size());
+            LOG_DEBUG("[PipelineBase] MPI context provided, rank "
+                      << mpi_ctx_->rank() << "/" << mpi_ctx_->world_size());
         }
 
         if (device_idx_ >= 0)
         {
-            LOG_INFO("[PipelineBase] Device index: " << device_idx_ << " (GPU)\n");
+            LOG_DEBUG("[PipelineBase] Device index: " << device_idx_ << " (GPU)\n");
             // TODO Phase 4: GPU tensor support
         }
         else
         {
-            LOG_INFO("[PipelineBase] Device index: " << device_idx_ << " (CPU)\n");
+            LOG_DEBUG("[PipelineBase] Device index: " << device_idx_ << " (CPU)\n");
         }
 
         // Create default placement map if not provided (all weights on device_idx_)
         if (!placement_map_)
         {
-            LOG_INFO("[PipelineBase] No placement map provided, creating default (all on device " << device_idx_ << ")");
+            LOG_DEBUG("[PipelineBase] No placement map provided, creating default (all on device " << device_idx_ << ")");
             placement_map_ = std::make_shared<WeightPlacementMap>(device_idx_);
         }
 
@@ -111,7 +111,7 @@ namespace llaminar2
         // Phase 3: KV cache initialization (uses attention device placement)
         initializeKVCache(max_seq_len);
 
-        LOG_INFO("Pipeline infrastructure initialized (max_seq_len=" << max_seq_len << ")");
+        LOG_DEBUG("Pipeline infrastructure initialized (max_seq_len=" << max_seq_len << ")");
     }
     const float *PipelineBase::logits() const
     {
@@ -262,7 +262,7 @@ namespace llaminar2
         }
 
         // Lazy allocation: create buffers for this device
-        LOG_INFO("[PipelineBase] Lazy allocating buffers for device " << device_idx);
+        LOG_DEBUG("[PipelineBase] Lazy allocating buffers for device " << device_idx);
 
         // Determine max_seq_len from existing buffers (or use default)
         int max_seq_len = 2048; // Default
@@ -622,20 +622,20 @@ namespace llaminar2
             devices_str << active_devices_[i];
         }
         devices_str << "]";
-        LOG_INFO(devices_str.str());
+        LOG_DEBUG(devices_str.str());
 
         if (active_devices_.size() == 1 && active_devices_[0] == device_idx_)
         {
             // Single-device mode: use legacy path for backward compat
-            LOG_INFO("Single-device mode (device " << device_idx_ << ")");
+            LOG_DEBUG("Single-device mode (device " << device_idx_ << ")");
             // Derived class must allocate buffers via createBuffersForDevice
             activation_buffers_ = createBuffersForDevice(device_idx_, max_seq_len);
         }
         else
         {
             // Multi-device mode: allocate buffer pool per device
-            LOG_INFO("Multi-device mode: allocating buffers for "
-                     << active_devices_.size() << " devices");
+            LOG_DEBUG("Multi-device mode: allocating buffers for "
+                      << active_devices_.size() << " devices");
             for (int dev_idx : active_devices_)
             {
                 // Lazy allocation happens in getBuffersForDevice(), just ensure they exist
@@ -652,10 +652,11 @@ namespace llaminar2
         // These buffers are reused across all attention calls, eliminating per-call allocations
         const int max_threads = omp_get_max_threads();
         const int total_len = batch_size * max_seq_len; // Total sequence length across batch
-        LOG_INFO("Allocating attention workspace buffers (max_seq_len=" << max_seq_len
-                                                                        << ", batch_size=" << batch_size
-                                                                        << ", total_len=" << total_len
-                                                                        << ", max_threads=" << max_threads << ")");
+        LOG_DEBUG("Allocating attention workspace buffers (max_seq_len=" << max_seq_len
+                                                                         << ", batch_size=" << batch_size
+                                                                         << ", total_len=" << total_len
+                                                                         << ", max_threads=" << max_threads << ")");
+        ;
 
         // Scores buffer: [n_heads * total_len, total_len] where total_len = batch_size * max_seq_len
         // For batched attention, scores computed between all tokens across all sequences
@@ -680,11 +681,11 @@ namespace llaminar2
         attention_workspace_mask_ = std::make_shared<FP32Tensor>(
             std::vector<size_t>{static_cast<size_t>(total_len * total_len)});
 
-        LOG_INFO("Attention workspace buffers allocated (batch_size=" << batch_size << "): "
-                                                                      << "scores=" << (n_heads_ * max_seq_len * max_seq_len * sizeof(float) / 1024 / 1024) << "MB, "
-                                                                      << "qkv=" << (max_threads * max_seq_len * head_dim_ * 3 * sizeof(float) / 1024 / 1024) << "MB, "
-                                                                      << "context=" << (max_threads * max_seq_len * head_dim_ * sizeof(float) / 1024 / 1024) << "MB, "
-                                                                      << "mask=" << (total_len * total_len * sizeof(float) / 1024 / 1024) << "MB");
+        LOG_DEBUG("Attention workspace buffers allocated (batch_size=" << batch_size << "): "
+                                                                       << "scores=" << (n_heads_ * max_seq_len * max_seq_len * sizeof(float) / 1024 / 1024) << "MB, "
+                                                                       << "qkv=" << (max_threads * max_seq_len * head_dim_ * 3 * sizeof(float) / 1024 / 1024) << "MB, "
+                                                                       << "context=" << (max_threads * max_seq_len * head_dim_ * sizeof(float) / 1024 / 1024) << "MB, "
+                                                                       << "mask=" << (total_len * total_len * sizeof(float) / 1024 / 1024) << "MB");
     }
 
     void PipelineBase::configureMPIStrategy()
@@ -713,8 +714,9 @@ namespace llaminar2
 
             if (mpi_ctx_->rank() == 0)
             {
-                LOG_INFO("[PipelineBase] MPI Strategy: " << strategyName(mpi_strategy_)
-                                                         << " (rank " << mpi_ctx_->rank() << "/" << mpi_ctx_->world_size() << ")");
+                LOG_DEBUG("[PipelineBase] MPI Strategy: " << strategyName(mpi_strategy_)
+                                                          << " (rank " << mpi_ctx_->rank() << "/" << mpi_ctx_->world_size() << ")");
+                ;
 
                 // Log strategy-specific info (virtual, can be overridden)
                 logMPIStrategyInfo();
@@ -725,7 +727,7 @@ namespace llaminar2
             mpi_strategy_ = MPIStrategy::None;
             if (mpi_ctx_)
             {
-                LOG_INFO("[PipelineBase] Single-rank MPI execution (world_size=1)");
+                LOG_DEBUG("[PipelineBase] Single-rank MPI execution (world_size=1)");
             }
         }
     }
@@ -736,8 +738,8 @@ namespace llaminar2
         if (mpi_strategy_ == MPIStrategy::TensorParallel && n_heads_ > 0)
         {
             auto [start_head, local_n_heads] = getHeadDistribution(n_heads_);
-            LOG_INFO("[PipelineBase] Tensor-parallel: " << local_n_heads
-                                                        << " heads per rank (total: " << n_heads_ << ")");
+            LOG_DEBUG("[PipelineBase] Tensor-parallel: " << local_n_heads
+                                                         << " heads per rank (total: " << n_heads_ << ")");
         }
     }
 
@@ -759,10 +761,10 @@ namespace llaminar2
                                   attention_devices);
         current_positions_.clear(); // Will be resized to batch_size in forward_batch()
 
-        LOG_INFO("Initialized KV cache: " << n_layers_ << " layers, "
-                                          << max_seq_len << " max_seq_len, "
-                                          << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim"
-                                          << ", precision: " << static_cast<int>(config_.activation_precision));
+        LOG_DEBUG("Initialized KV cache: " << n_layers_ << " layers, "
+                                           << max_seq_len << " max_seq_len, "
+                                           << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim"
+                                           << ", precision: " << static_cast<int>(config_.activation_precision));
     }
 
     // ===== Snapshot Capture Implementation =====
@@ -776,14 +778,14 @@ namespace llaminar2
         snapshot_capture_enabled_ = true;
         snapshot_output_dir_ = output_dir;
         snapshots_.clear();
-        LOG_INFO("[PipelineBase] Snapshot capture ENABLED" << (output_dir.empty() ? " (memory only)" : " (output: " + output_dir + ")"));
+        LOG_DEBUG("[PipelineBase] Snapshot capture ENABLED" << (output_dir.empty() ? " (memory only)" : " (output: " + output_dir + ")"));
     }
 
     void PipelineBase::disableSnapshotCapture()
     {
         snapshot_capture_enabled_ = false;
         snapshots_.clear();
-        LOG_INFO("[PipelineBase] Snapshot capture DISABLED");
+        LOG_DEBUG("[PipelineBase] Snapshot capture DISABLED");
     }
 
     void PipelineBase::clearSnapshots()
@@ -1260,7 +1262,7 @@ namespace llaminar2
         }
 
         // Allreduce-sum to combine partial results from all ranks
-        // NOTE: Only applies to FP32 output - Q8_1 output skips allreduce
+        // NOTE: Required for BOTH FP32 and Q8_1 output when using column-parallel sharding.
         if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
         {
             auto *output_fp32 = dynamic_cast<FP32Tensor *>(output);
@@ -1273,9 +1275,38 @@ namespace llaminar2
                 LOG_TRACE("[TP GEMM] Column-parallel allreduce completed for " << snapshot_key
                                                                                << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
             }
+            else if (auto *output_q8 = dynamic_cast<Q8_1Tensor *>(output))
+            {
+                // Q8_1 output: allreduce in FP32 domain, then requantize.
+                // This is necessary because each rank computes only a partial sum.
+                const size_t output_size = static_cast<size_t>(m) * n;
+
+                const float *local_fp32 = output_q8->data();
+                if (!local_fp32)
+                {
+                    LOG_ERROR("[TP GEMM] Column-parallel failed to dequantize Q8_1 output for allreduce");
+                    return false;
+                }
+
+                std::vector<float> reduced(output_size);
+                std::memcpy(reduced.data(), local_fp32, output_size * sizeof(float));
+                mpi_ctx_->allreduce_sum_inplace(reduced.data(), output_size);
+
+                Q8_1Block *dst_blocks = output_q8->mutable_q8_1_blocks();
+                if (!dst_blocks)
+                {
+                    LOG_ERROR("[TP GEMM] Column-parallel failed to get mutable Q8_1 blocks for requantization");
+                    return false;
+                }
+
+                simd::quantize_fp32_to_q8_1_blocks(reduced.data(), dst_blocks, output_size);
+
+                LOG_TRACE("[TP GEMM] Column-parallel allreduce+requant completed for " << snapshot_key
+                                                                                       << " (m=" << m << ", n=" << n << ", k_local=" << k_local << ")");
+            }
             else
             {
-                LOG_WARN("[TP GEMM] Column-parallel requires FP32 output for allreduce");
+                LOG_WARN("[TP GEMM] Column-parallel allreduce unsupported for output tensor type");
             }
         }
 
@@ -1377,8 +1408,27 @@ namespace llaminar2
                     LOG_ERROR("copy_tensor: null Q8_1 block pointer");
                     return false;
                 }
-                size_t n_blocks = (num_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                std::memcpy(dst_blocks, src_blocks, n_blocks * sizeof(Q8_1Block));
+
+                // If we're copying a full 2D tensor, copy full padded rows (rows * blocks_per_row),
+                // not ceil(total_elements/32). This avoids leaving tail blocks uninitialized when
+                // cols is not a multiple of 32.
+                size_t blocks_to_copy = 0;
+                if (src_q8_1->shape().size() == 2 && dst_q8_1->shape().size() == 2)
+                {
+                    const size_t src_elems = src_q8_1->shape()[0] * src_q8_1->shape()[1];
+                    const size_t dst_elems = dst_q8_1->shape()[0] * dst_q8_1->shape()[1];
+                    if (num_elements == src_elems && num_elements <= dst_elems && src_q8_1->shape()[1] == dst_q8_1->shape()[1])
+                    {
+                        blocks_to_copy = src_q8_1->total_blocks();
+                    }
+                }
+
+                if (blocks_to_copy == 0)
+                {
+                    blocks_to_copy = (num_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                }
+
+                std::memcpy(dst_blocks, src_blocks, blocks_to_copy * sizeof(Q8_1Block));
             }
             else
             {
@@ -1390,8 +1440,34 @@ namespace llaminar2
                     LOG_ERROR("copy_tensor: null pointer for FP32->Q8_1 copy");
                     return false;
                 }
-                size_t n_blocks = (num_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                simd::quantize_fp32_to_q8_1_blocks(src_data, dst_blocks, num_elements);
+
+                // Quantizer requires count to be a multiple of 32. For partial/tail elements,
+                // pad with zeros to ensure deterministic output.
+                size_t padded_count = 0;
+                if (dst_q8_1->shape().size() == 2)
+                {
+                    const size_t dst_elems = dst_q8_1->shape()[0] * dst_q8_1->shape()[1];
+                    if (num_elements == dst_elems)
+                    {
+                        padded_count = dst_q8_1->total_blocks() * Q8_1Block::BLOCK_SIZE;
+                    }
+                }
+                if (padded_count == 0)
+                {
+                    const size_t n_blocks = (num_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                    padded_count = n_blocks * Q8_1Block::BLOCK_SIZE;
+                }
+
+                if (padded_count == num_elements)
+                {
+                    simd::quantize_fp32_to_q8_1_blocks(src_data, dst_blocks, padded_count);
+                }
+                else
+                {
+                    std::vector<float> tmp(padded_count, 0.0f);
+                    std::memcpy(tmp.data(), src_data, num_elements * sizeof(float));
+                    simd::quantize_fp32_to_q8_1_blocks(tmp.data(), dst_blocks, padded_count);
+                }
             }
             return true;
         }
@@ -1426,7 +1502,7 @@ namespace llaminar2
         int batch_size, const std::vector<int> &sequence_lengths, int padded_seq_len,
         bool causal, const std::string &snapshot_key)
     {
-        LOG_DEBUG("[PipelineBase::compute_attention] seq_len=" << seq_len << ", precision=" << static_cast<int>(config_.activation_precision));
+        LOG_TRACE("[PipelineBase::compute_attention] seq_len=" << seq_len << ", precision=" << static_cast<int>(config_.activation_precision));
         KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
         // Create views with actual effective_seq_len

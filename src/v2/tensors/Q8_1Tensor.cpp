@@ -35,7 +35,7 @@ namespace llaminar2
           view_byte_offset_(0), parent_(nullptr), device_idx_(-1), device_blocks_(nullptr),
           is_mutable_(false), cache_dirty_(false)
     {
-        LOG_DEBUG("[Q8_1Tensor] Creating IMMUTABLE tensor from raw_data, shape=[" << shape[0] << "," << shape[1]
+        LOG_TRACE("[Q8_1Tensor] Creating IMMUTABLE tensor from raw_data, shape=[" << shape[0] << "," << shape[1]
                                                                                   << "], raw_data.size()=" << raw_data.size());
 
         if (shape.empty())
@@ -43,16 +43,19 @@ namespace llaminar2
             throw std::invalid_argument("Q8_1Tensor: shape cannot be empty");
         }
 
-        // Calculate total elements
-        size_t n_elems = 1;
-        for (auto dim : shape)
+        // Q8_1 tensors are treated as row-major blocks with per-row padding:
+        // blocks_per_row = ceil(cols/32), total_blocks = rows * blocks_per_row.
+        // This must match q8_1_blocks() / decode_block_at() indexing.
+        if (shape.size() != 2)
         {
-            n_elems *= dim;
+            throw std::invalid_argument("Q8_1Tensor: expected 2D shape for Q8_1 storage");
         }
 
-        // Each Q8_1Block contains 32 elements
-        size_t n_blocks = (n_elems + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-        size_t expected_bytes = n_blocks * sizeof(Q8_1Block);
+        const size_t rows = shape[0];
+        const size_t cols = shape[1];
+        const size_t blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        const size_t n_blocks = rows * blocks_per_row;
+        const size_t expected_bytes = n_blocks * sizeof(Q8_1Block);
 
         if (raw_data_.size() < expected_bytes)
         {
@@ -82,10 +85,12 @@ namespace llaminar2
             throw std::invalid_argument("Q8_1Tensor: mutable activation buffer requires 2D shape");
         }
 
-        // Calculate total elements and allocate Q8_1 block storage
-        size_t n_elems = shape[0] * shape[1];
-        size_t n_blocks = (n_elems + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-        size_t required_bytes = n_blocks * sizeof(Q8_1Block);
+        // Allocate row-major blocks with per-row padding (see q8_1_blocks()/decode_block_at()).
+        const size_t rows = shape[0];
+        const size_t cols = shape[1];
+        const size_t blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        const size_t n_blocks = rows * blocks_per_row;
+        const size_t required_bytes = n_blocks * sizeof(Q8_1Block);
 
         // Allocate and zero-initialize the raw block storage
         // NOTE: We do NOT allocate an FP32 dequant cache here.
@@ -94,7 +99,7 @@ namespace llaminar2
         // read-only dequantization (debugging, snapshot capture, etc.).
         raw_data_.resize(required_bytes, 0);
 
-        LOG_DEBUG("[Q8_1Tensor] Created MUTABLE tensor shape=[" << shape[0] << "," << shape[1]
+        LOG_TRACE("[Q8_1Tensor] Created MUTABLE tensor shape=[" << shape[0] << "," << shape[1]
                                                                 << "], blocks=" << n_blocks << ", bytes=" << required_bytes);
     }
 
@@ -126,7 +131,7 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[Q8_1Tensor] Creating VIEW tensor shape=[" << shape[0] << "," << shape[1]
+        LOG_TRACE("[Q8_1Tensor] Creating VIEW tensor shape=[" << shape[0] << "," << shape[1]
                                                               << "], is_mutable=" << is_mutable_ << " (inherited from parent)");
     }
 
@@ -261,52 +266,57 @@ namespace llaminar2
             }
         }
 
-        // For mutable non-view tensors with data in cache, return it directly
-        if (is_mutable_ && !dequant_cache_.empty())
+        // IMPORTANT:
+        // - For immutable tensors, caching is safe because blocks never change.
+        // - For mutable tensors, blocks are frequently updated by kernels writing directly into
+        //   `mutable_q8_1_blocks()`. Any previously-populated FP32 cache would become stale.
+        //   To ensure correctness (snapshots/debugging + any callers that legitimately require FP32),
+        //   we always dequantize from the current Q8_1 blocks for mutable tensors.
+
+        const size_t rows = shape_.size() > 0 ? shape_[0] : 0;
+        const size_t cols = shape_.size() > 1 ? shape_[1] : 0;
+        const size_t total_elements = rows * cols;
+
+        if (total_elements == 0)
         {
-            // Check if data is actually non-zero
-            float min_val = dequant_cache_[0], max_val = dequant_cache_[0];
-            for (size_t i = 0; i < std::min(dequant_cache_.size(), size_t(1000)); ++i)
-            {
-                if (dequant_cache_[i] < min_val)
-                    min_val = dequant_cache_[i];
-                if (dequant_cache_[i] > max_val)
-                    max_val = dequant_cache_[i];
-            }
-            LOG_DEBUG("[Q8_1Tensor::fp32_data] Mutable tensor shape=[" << shape_[0] << "," << shape_[1]
-                                                                       << "] this=" << reinterpret_cast<const void *>(this)
-                                                                       << " returning dequant_cache (first=" << dequant_cache_[0]
-                                                                       << " size=" << dequant_cache_.size()
-                                                                       << " min=" << min_val << " max=" << max_val << ")");
+            return nullptr;
+        }
+
+        if (!is_mutable_ && !dequant_cache_.empty())
+        {
             return dequant_cache_.data();
         }
 
-        // Dequantize to temp cache if needed (for immutable tensors loaded from GGUF)
-        if (dequant_cache_.empty() && !cache_dirty_)
+        if (dequant_cache_.size() != total_elements)
         {
-            size_t total_elements = shape_[0] * shape_[1];
-            dequant_cache_.resize(total_elements);
+            dequant_cache_.assign(total_elements, 0.0f);
+        }
 
-            LOG_DEBUG("[Q8_1Tensor::fp32_data] POPULATING cache: shape=[" << shape_[0] << "," << shape_[1]
-                                                                          << "] this=" << reinterpret_cast<const void *>(this)
-                                                                          << " is_mutable=" << is_mutable_
-                                                                          << " total_elements=" << total_elements);
-
-            // Decode all blocks (parallelized for large tensors)
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
-            const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
-            size_t blocks_per_row = (shape_[1] + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
+        const size_t blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
 
 #pragma omp parallel for collapse(2) if (total_elements > 10000)
-            for (size_t r = 0; r < shape_[0]; ++r)
+        for (size_t r = 0; r < rows; ++r)
+        {
+            for (size_t b = 0; b < blocks_per_row; ++b)
             {
-                for (size_t b = 0; b < blocks_per_row; ++b)
-                {
-                    const Q8_1Block &block = blocks[r * blocks_per_row + b];
-                    decodeBlock(block, &dequant_cache_[r * shape_[1] + b * Q8_1Block::BLOCK_SIZE]);
-                }
+                const size_t col0 = b * Q8_1Block::BLOCK_SIZE;
+                if (col0 >= cols)
+                    continue;
+
+                const Q8_1Block &block = blocks[r * blocks_per_row + b];
+
+                alignas(64) float tmp[Q8_1Block::BLOCK_SIZE];
+                decodeBlock(block, tmp);
+
+                const size_t copy = std::min(static_cast<size_t>(Q8_1Block::BLOCK_SIZE), cols - col0);
+                std::memcpy(&dequant_cache_[r * cols + col0], tmp, copy * sizeof(float));
             }
         }
+
+        // Cache is now consistent with current blocks.
+        cache_dirty_ = false;
         return dequant_cache_.data();
     }
 

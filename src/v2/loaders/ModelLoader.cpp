@@ -307,16 +307,16 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[ModelLoader] Loaded " << file_path);
-        LOG_INFO("  Architecture: " << model_.architecture);
-        LOG_INFO("  Layers: " << model_.block_count);
-        LOG_INFO("  Hidden size: " << model_.embedding_length);
-        LOG_INFO("  Vocab size: " << model_.vocab_size);
-        LOG_INFO("  Heads: " << model_.head_count << " (KV: " << model_.head_count_kv << ")");
-        LOG_INFO("  Tensors: " << model_.tensor_count);
+        LOG_DEBUG("[ModelLoader] Loaded " << file_path);
+        LOG_DEBUG("  Architecture: " << model_.architecture);
+        LOG_DEBUG("  Layers: " << model_.block_count);
+        LOG_DEBUG("  Hidden size: " << model_.embedding_length);
+        LOG_DEBUG("  Vocab size: " << model_.vocab_size);
+        LOG_DEBUG("  Heads: " << model_.head_count << " (KV: " << model_.head_count_kv << ")");
+        LOG_DEBUG("  Tensors: " << model_.tensor_count);
         if (model_.split_count > 1)
         {
-            LOG_INFO("  Split files: " << model_.split_count);
+            LOG_DEBUG("  Split files: " << model_.split_count);
         }
 
         loaded_ = true;
@@ -1930,10 +1930,10 @@ namespace llaminar2
     void ModelLoader::extractModelMetadata()
     {
         // Debug: Print all metadata keys
-        LOG_INFO("[ModelLoader] Available metadata keys:\n");
+        LOG_TRACE("[ModelLoader] Available metadata keys:\n");
         for (const auto &kv : model_.metadata)
         {
-            LOG_INFO("  " << kv.first << " (type=" << static_cast<int>(kv.second.type) << ")\n");
+            LOG_TRACE("  " << kv.first << " (type=" << static_cast<int>(kv.second.type) << ")\n");
         }
 
         // Extract common hyperparameters from metadata
@@ -2010,20 +2010,20 @@ namespace llaminar2
             if (it != model_.metadata.end() && it->second.type == GGUFValueType::ARRAY)
             {
                 model_.vocab_size = it->second.asArrayLength();
-                LOG_INFO("[ModelLoader] Extracted vocab_size from tokenizer.ggml.tokens array: " << model_.vocab_size);
+                LOG_DEBUG("[ModelLoader] Extracted vocab_size from tokenizer.ggml.tokens array: " << model_.vocab_size);
             }
         }
 
         // Debug output
-        LOG_INFO("[ModelLoader] Extracted metadata:\n");
-        LOG_INFO("  architecture: " << model_.architecture);
-        LOG_INFO("  context_length: " << model_.context_length);
-        LOG_INFO("  embedding_length: " << model_.embedding_length);
-        LOG_INFO("  block_count: " << model_.block_count);
-        LOG_INFO("  head_count: " << model_.head_count);
-        LOG_INFO("  head_count_kv: " << model_.head_count_kv);
-        LOG_INFO("  vocab_size: " << model_.vocab_size);
-        LOG_INFO("  rope_theta: " << model_.rope_theta);
+        LOG_DEBUG("[ModelLoader] Extracted metadata:\n");
+        LOG_DEBUG("  architecture: " << model_.architecture);
+        LOG_DEBUG("  context_length: " << model_.context_length);
+        LOG_DEBUG("  embedding_length: " << model_.embedding_length);
+        LOG_DEBUG("  block_count: " << model_.block_count);
+        LOG_DEBUG("  head_count: " << model_.head_count);
+        LOG_DEBUG("  head_count_kv: " << model_.head_count_kv);
+        LOG_DEBUG("  vocab_size: " << model_.vocab_size);
+        LOG_DEBUG("  rope_theta: " << model_.rope_theta);
     }
 
     // =============================================================================
