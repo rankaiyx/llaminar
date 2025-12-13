@@ -47,16 +47,51 @@ namespace llaminar::v2::kernels::jit
 {
 
     /**
+     * @brief Attention computation mode
+     *
+     * DECODE: Optimized for single-token generation (seq_len_q = 1)
+     *   - Loop order: Q → H → KV (current implementation)
+     *   - K/V cache loaded once per head per query
+     *   - Minimal memory overhead
+     *
+     * PREFILL: Optimized for multi-token processing (seq_len_q > 1)
+     *   - Loop order: Q_tile → H → KV → Q_inner (K/V cache reuse within tile)
+     *   - K/V cache loaded once per head per KV position, reused across queries in tile
+     *   - Higher memory overhead for per-query softmax state and context
+     *   - Better throughput for prefill workloads
+     */
+    enum class AttentionMode
+    {
+        DECODE,  // seq_len_q == 1, optimize for latency
+        PREFILL, // seq_len_q > 1, optimize for K/V cache reuse
+        AUTO     // Automatically select based on batch_size
+    };
+
+    /**
      * @brief Configuration for JIT attention kernel
      */
     struct JitAttentionConfig
     {
-        int head_dim = 0;                    // Dimension per head (e.g., 64)
-        int num_heads = 0;                   // Number of Q heads
-        int num_kv_heads = 0;                // Number of KV heads (GQA support)
-        int batch_size = 0;                  // Batch size (1 for decode, >1 for prefill)
-        WoFormat wo_format = WoFormat::Q8_1; // Output projection weight format
-        bool causal = true;                  // Whether to apply causal masking
+        int head_dim = 0;                         // Dimension per head (e.g., 64)
+        int num_heads = 0;                        // Number of Q heads
+        int num_kv_heads = 0;                     // Number of KV heads (GQA support)
+        int batch_size = 0;                       // Batch size (1 for decode, >1 for prefill)
+        WoFormat wo_format = WoFormat::Q8_1;      // Output projection weight format
+        bool causal = true;                       // Whether to apply causal masking
+        AttentionMode mode = AttentionMode::AUTO; // Kernel mode selection
+
+        /**
+         * @brief Get the effective mode based on batch_size
+         * @return DECODE if batch_size == 1, PREFILL otherwise
+         */
+        AttentionMode effectiveMode() const
+        {
+            if (mode == AttentionMode::AUTO)
+            {
+                return (batch_size <= 1) ? AttentionMode::DECODE : AttentionMode::PREFILL;
+            }
+            return mode;
+        }
 
         bool operator==(const JitAttentionConfig &other) const
         {
@@ -65,7 +100,8 @@ namespace llaminar::v2::kernels::jit
                    num_kv_heads == other.num_kv_heads &&
                    batch_size == other.batch_size &&
                    wo_format == other.wo_format &&
-                   causal == other.causal;
+                   causal == other.causal &&
+                   effectiveMode() == other.effectiveMode();
         }
     };
 
@@ -86,6 +122,8 @@ namespace std
             h ^= std::hash<int>()(cfg.batch_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= std::hash<int>()(static_cast<int>(cfg.wo_format)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= std::hash<bool>()(cfg.causal) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            // Include effective mode in hash to cache decode and prefill kernels separately
+            h ^= std::hash<int>()(static_cast<int>(cfg.effectiveMode())) + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -153,8 +191,28 @@ namespace llaminar::v2::kernels::jit
 
         /**
          * @brief Generate the complete kernel
+         *
+         * Dispatches to decode or prefill code generation based on config.
          */
         void generate()
+        {
+            if (config_.effectiveMode() == AttentionMode::PREFILL)
+            {
+                generate_prefill_kernel();
+            }
+            else
+            {
+                generate_decode_kernel();
+            }
+        }
+
+        /**
+         * @brief Generate decode-optimized kernel (seq_len_q == 1)
+         *
+         * Loop order: Q → H → KV
+         * Optimized for single-token generation with minimal memory overhead.
+         */
+        void generate_decode_kernel()
         {
             using namespace Xbyak;
 
@@ -190,6 +248,10 @@ namespace llaminar::v2::kernels::jit
             // Load scale from xmm0 (1st float argument in System V AMD64)
             // xmm0 already contains scale, broadcast to zmm_scale()
             vbroadcastss(zmm_scale(), xmm0);
+
+            // Initialize constants for exp
+            load_constant_f32(zmm_log2e(), 1.44269504089f);
+            load_constant_f32(zmm_exp_min(), -87.0f);
 
             // Calculate working space needed on stack:
             // 1. Q blocks for one head: num_blocks * 64 bytes (padded)
@@ -265,6 +327,975 @@ namespace llaminar::v2::kernels::jit
         }
 
         /**
+         * @brief Generate prefill-optimized kernel (seq_len_q > 1)
+         *
+         * Loop order: Q_tile → H → KV → Q_inner
+         *
+         * This processes queries in tiles to bound stack usage. Within each tile,
+         * we iterate over heads, then for each head we iterate over KV positions
+         * and for each KV position we process all queries in the tile that pass
+         * the causal mask.
+         *
+         * This achieves K/V cache reuse: each K/V block is loaded once per head
+         * and reused across all queries in the tile.
+         *
+         * Register allocation strategy:
+         * - Callee-saved (r12-r15, rbx, rbp): Input pointers, seq_len_q
+         * - Stack spills: All loop indices and values that must survive emitter calls
+         * - Caller-saved: Freely used within each emitter, reloaded from spills as needed
+         *
+         * Stack layout (Q_TILE_SIZE = 8):
+         * [0]: Q blocks for tile (Q_TILE_SIZE * num_blocks * 64 bytes)
+         * [+q_blocks]: Softmax state (Q_TILE_SIZE * 8 bytes: max,sum pairs)
+         * [+softmax]: Context buffer (Q_TILE_SIZE * d_model * 4 bytes)
+         * [+context]: Spill slots for loop variables
+         */
+        void generate_prefill_kernel()
+        {
+            using namespace Xbyak;
+
+            constexpr int Q_TILE_SIZE = 8;
+
+            // Function prologue
+            push_callee_saved();
+
+            // Callee-saved register allocation (persist across all emitter calls)
+            Reg64 reg_Q = r12;
+            Reg64 reg_K = r13;
+            Reg64 reg_V = rbx;
+            Reg64 reg_Wo = rbp;
+            Reg64 reg_output = r14;
+            Reg64 reg_seq_len_q = r15;
+
+            mov(reg_Q, rdi);
+            mov(reg_K, rsi);
+            mov(reg_V, rdx);
+            mov(reg_Wo, rcx);
+            mov(reg_output, r8);
+            mov(reg_seq_len_q, r9);
+
+            // Broadcast scale
+            vbroadcastss(zmm_scale(), xmm0);
+
+            // Initialize constants for exp
+            load_constant_f32(zmm_log2e(), 1.44269504089f);
+            load_constant_f32(zmm_one(), 1.0f);
+
+            // Initialize constant for unsigned Q conversion
+            emit_broadcast_i32_const(zmm_128(), 0x80808080, rax);
+
+            // Calculate dimensions
+            int num_blocks = config_.head_dim / 32;
+            int d_model = config_.num_heads * config_.head_dim;
+            int head_dim = config_.head_dim;
+            int heads_per_kv = config_.num_heads / config_.num_kv_heads;
+
+            // Stack layout calculation
+            int q_blocks_size = Q_TILE_SIZE * num_blocks * 64;
+            int softmax_state_size = Q_TILE_SIZE * config_.num_heads * 8; // (max, sum) per query per head
+            int context_size = Q_TILE_SIZE * d_model * 4;                 // FP32 context per query
+
+            int q_blocks_offset = 0;
+            int softmax_offset = q_blocks_size;
+            int context_offset = softmax_offset + softmax_state_size;
+            int spill_vars_offset = context_offset + context_size;
+
+            // Spill slots
+            int tile_start_spill = spill_vars_offset;
+            int tile_size_spill = tile_start_spill + 8;
+            int seq_len_kv_spill = tile_size_spill + 8;
+            int position_offset_spill = seq_len_kv_spill + 8;
+            int kv_idx_spill = position_offset_spill + 8;
+            int q_local_spill = kv_idx_spill + 8;
+            int k_ptr_spill = q_local_spill + 8;
+            int v_ptr_spill = k_ptr_spill + 8;
+
+            int stack_size = v_ptr_spill + 8 + 64;
+            stack_size = (stack_size + 63) & ~63;
+
+            sub(rsp, stack_size);
+
+            // Load and spill seq_len_kv (7th arg)
+            mov(rax, ptr[rsp + stack_size + stack_frame_size() + 8]);
+            mov(ptr[rsp + seq_len_kv_spill], rax);
+
+            // Load and spill position_offset (8th arg)
+            mov(rax, ptr[rsp + stack_size + stack_frame_size() + 16]);
+            mov(ptr[rsp + position_offset_spill], rax);
+
+            // Initialize zmm_128 constant for Q8_1 unsigned conversion
+            emit_broadcast_i32_const(zmm_128(), 0x80808080, rax);
+
+            // ===============================================================
+            // TILE LOOP: Process queries in tiles of Q_TILE_SIZE
+            // ===============================================================
+            mov(qword[rsp + tile_start_spill], 0);
+
+            L("prefill_tile_loop");
+            mov(rax, ptr[rsp + tile_start_spill]);
+            cmp(rax, reg_seq_len_q);
+            jge("prefill_tile_end", T_NEAR);
+
+            // Calculate tile_size = min(Q_TILE_SIZE, seq_len_q - tile_start)
+            mov(rcx, reg_seq_len_q);
+            sub(rcx, rax);
+            cmp(rcx, Q_TILE_SIZE);
+            jle("prefill_tile_size_ok", T_NEAR);
+            mov(rcx, Q_TILE_SIZE);
+            L("prefill_tile_size_ok");
+            mov(ptr[rsp + tile_size_spill], rcx);
+
+            // Initialize softmax state: max=-inf, sum=0
+            // Initialize for ALL heads in the tile
+            emit_prefill_init_softmax(Q_TILE_SIZE * config_.num_heads, softmax_offset);
+
+            // Initialize context buffer to zeros
+            emit_prefill_init_context(Q_TILE_SIZE, d_model, context_offset);
+
+            // ===============================================================
+            // HEAD LOOP: Process each attention head (compile-time unrolled)
+            // ===============================================================
+            for (int h = 0; h < config_.num_heads; ++h)
+            {
+                int kv_head = h / heads_per_kv;
+                std::string h_prefix = "prefill_h" + std::to_string(h);
+
+                // Copy Q blocks for all queries in tile for this head
+                emit_prefill_copy_q_tile(reg_Q, h, num_blocks, q_blocks_offset,
+                                         tile_start_spill, tile_size_spill);
+
+                // ===============================================================
+                // KV LOOP: Iterate over K/V cache positions (runtime)
+                // ===============================================================
+                mov(qword[rsp + kv_idx_spill], 0);
+
+                L((h_prefix + "_kv_loop").c_str());
+                mov(r8, ptr[rsp + kv_idx_spill]);
+                mov(r9, ptr[rsp + seq_len_kv_spill]);
+                cmp(r8, r9);
+                jge((h_prefix + "_kv_end").c_str(), T_NEAR);
+
+                // Calculate and spill K/V pointers
+                int kv_stride = config_.num_kv_heads * num_blocks * 36;
+
+                mov(rdi, r8);
+                imul(rdi, rdi, kv_stride);
+                add(rdi, kv_head * num_blocks * 36);
+                add(rdi, reg_K);
+                mov(ptr[rsp + k_ptr_spill], rdi);
+
+                mov(rsi, r8);
+                imul(rsi, rsi, kv_stride);
+                add(rsi, kv_head * num_blocks * 36);
+                add(rsi, reg_V);
+                mov(ptr[rsp + v_ptr_spill], rsi);
+
+                // ===============================================================
+                // Q INNER LOOP: Process queries within tile that pass causal mask
+                // ===============================================================
+                // For causal: q_start = max(0, kv_idx - position_offset)
+                mov(r10, ptr[rsp + kv_idx_spill]);
+                if (config_.causal)
+                {
+                    sub(r10, ptr[rsp + position_offset_spill]);
+                    xor_(r11, r11);
+                    cmp(r10, 0);
+                    cmovl(r10, r11);
+                }
+                else
+                {
+                    xor_(r10, r10);
+                }
+
+                // q_local_start = max(0, q_start - tile_start)
+                mov(rax, ptr[rsp + tile_start_spill]);
+                sub(r10, rax);
+                xor_(r11, r11);
+                cmp(r10, 0);
+                cmovl(r10, r11);
+                mov(ptr[rsp + q_local_spill], r10);
+
+                L((h_prefix + "_q_loop").c_str());
+                mov(r10, ptr[rsp + q_local_spill]);
+                mov(rcx, ptr[rsp + tile_size_spill]);
+                cmp(r10, rcx);
+                jge((h_prefix + "_q_end").c_str(), T_NEAR);
+
+                // Process attention for this query
+                // Reload K/V pointers from spill (emitters may clobber registers)
+                mov(rdi, ptr[rsp + k_ptr_spill]);
+                mov(rsi, ptr[rsp + v_ptr_spill]);
+
+                emit_prefill_query_attention(
+                    rdi, rsi, r10, // K_ptr, V_ptr, q_local
+                    h, num_blocks,
+                    q_blocks_offset,
+                    softmax_offset + h * Q_TILE_SIZE * 8, // Per-head softmax state
+                    context_offset, d_model);
+
+                // Increment q_local (reload from spill since emitter may have clobbered r10)
+                mov(r10, ptr[rsp + q_local_spill]);
+                inc(r10);
+                mov(ptr[rsp + q_local_spill], r10);
+                jmp((h_prefix + "_q_loop").c_str(), T_NEAR);
+
+                L((h_prefix + "_q_end").c_str());
+
+                // Increment kv_idx
+                mov(r8, ptr[rsp + kv_idx_spill]);
+                inc(r8);
+                mov(ptr[rsp + kv_idx_spill], r8);
+                jmp((h_prefix + "_kv_loop").c_str(), T_NEAR);
+
+                L((h_prefix + "_kv_end").c_str());
+
+            } // End head loop
+
+            // ===============================================================
+            // NORMALIZE AND PROJECT: 1/sum normalization + Wo projection
+            // ===============================================================
+            emit_prefill_normalize_project(
+                reg_Wo, reg_output,
+                num_blocks, Q_TILE_SIZE,
+                softmax_offset, context_offset,
+                tile_start_spill, tile_size_spill, d_model, q_local_spill);
+
+            // Advance tile_start
+            mov(rax, ptr[rsp + tile_start_spill]);
+            add(rax, Q_TILE_SIZE);
+            mov(ptr[rsp + tile_start_spill], rax);
+            jmp("prefill_tile_loop", T_NEAR);
+
+            L("prefill_tile_end");
+
+            // Epilogue
+            add(rsp, stack_size);
+            pop_callee_saved();
+            ret();
+
+            ready();
+        }
+
+        // =================================================================
+        // Prefill helper methods
+        // =================================================================
+
+        /**
+         * @brief Initialize softmax state for prefill tile
+         */
+        void emit_prefill_init_softmax(int tile_size, int softmax_offset)
+        {
+            using namespace Xbyak;
+
+            // max = -FLT_MAX, sum = 0 for each query
+            Zmm zmm_neg_inf = zmm_scratch(0);
+            load_constant_f32(zmm_neg_inf, -3.4028235e+38f);
+
+            Zmm zmm_zero = zmm_scratch(1);
+            vxorps(zmm_zero, zmm_zero, zmm_zero);
+
+            for (int q = 0; q < tile_size; ++q)
+            {
+                int offset = softmax_offset + q * 8;
+                vmovss(ptr[rsp + offset], Xmm(zmm_neg_inf.getIdx()));
+                vmovss(ptr[rsp + offset + 4], Xmm(zmm_zero.getIdx()));
+            }
+        }
+
+        /**
+         * @brief Initialize context buffer for prefill tile
+         */
+        void emit_prefill_init_context(int tile_size, int d_model, int context_offset)
+        {
+            using namespace Xbyak;
+
+            Zmm zmm_zero = zmm_scratch(0);
+            vxorps(zmm_zero, zmm_zero, zmm_zero);
+
+            int total_floats = tile_size * d_model;
+            for (int i = 0; i < total_floats; i += 16)
+            {
+                vmovups(ptr[rsp + context_offset + i * 4], zmm_zero);
+            }
+        }
+
+        /**
+         * @brief Copy Q blocks for tile for one head
+         */
+        void emit_prefill_copy_q_tile(
+            const Xbyak::Reg64 &reg_Q,
+            int head_idx,
+            int num_blocks,
+            int q_blocks_offset,
+            int tile_start_spill,
+            int tile_size_spill)
+        {
+            using namespace Xbyak;
+
+            int q_stride = config_.num_heads * num_blocks * 36;
+            int head_offset = head_idx * num_blocks * 36;
+
+            inLocalLabel();
+
+            xor_(r8, r8); // q_local = 0
+
+            L(".copy_loop");
+            cmp(r8, ptr[rsp + tile_size_spill]);
+            jge(".copy_end", T_NEAR);
+
+            // Q source: reg_Q + (tile_start + q_local) * q_stride + head_offset
+            mov(r9, ptr[rsp + tile_start_spill]);
+            add(r9, r8);
+            imul(r9, r9, q_stride);
+            add(r9, head_offset);
+            add(r9, reg_Q);
+
+            // Q dest on stack: q_blocks_offset + q_local * num_blocks * 64
+            mov(r10, r8);
+            imul(r10, r10, num_blocks * 64);
+            add(r10, q_blocks_offset);
+
+            // Copy blocks
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                int src_b = b * 36;
+                int dst_b = b * 64;
+
+                // Copy scale+sum_qs (4 bytes)
+                mov(eax, ptr[r9 + src_b]);
+                mov(ptr[rsp + r10 + dst_b], eax);
+
+                // Copy data (32 bytes)
+                Ymm ymm_tmp = Ymm(zmm_scratch(0).getIdx());
+                vmovdqu8(ymm_tmp, ptr[r9 + src_b + 4]);
+                vmovdqu8(ptr[rsp + r10 + dst_b + 4], ymm_tmp);
+            }
+
+            inc(r8);
+            jmp(".copy_loop", T_NEAR);
+
+            L(".copy_end");
+
+            outLocalLabel();
+        }
+
+        /**
+         * @brief Process attention for one query in prefill tile
+         *
+         * K/V pointers are passed in registers, q_local indicates which query.
+         */
+        void emit_prefill_query_attention(
+            const Xbyak::Reg64 &reg_K_ptr,
+            const Xbyak::Reg64 &reg_V_ptr,
+            const Xbyak::Reg64 &reg_q_local,
+            int head_idx,
+            int num_blocks,
+            int q_blocks_offset,
+            int softmax_offset,
+            int context_offset,
+            int d_model)
+        {
+            using namespace Xbyak;
+
+            int head_dim = num_blocks * 32;
+            int head_ctx_offset = head_idx * head_dim * 4;
+
+            // Calculate Q base on stack: rsp + q_blocks_offset + q_local * num_blocks * 64
+            Reg64 reg_q_base = r11;
+            mov(reg_q_base, reg_q_local);
+            imul(reg_q_base, reg_q_base, num_blocks * 64);
+            add(reg_q_base, q_blocks_offset);
+            add(reg_q_base, rsp);
+
+            // Q·K dot product
+            Xmm xmm_score = Xmm(zmm_scratch(0).getIdx());
+            Xmm xmm_scale_tmp = Xmm(zmm_scratch(1).getIdx());
+            vmovss(xmm_scale_tmp, Xmm(zmm_scale().getIdx()));
+
+            emit_prefill_dot_product(xmm_score, reg_K_ptr, reg_q_base, num_blocks, xmm_scale_tmp);
+
+            // Load softmax state
+            Reg64 reg_sm = rcx;
+            mov(reg_sm, reg_q_local);
+            shl(reg_sm, 3);
+            add(reg_sm, softmax_offset);
+            add(reg_sm, rsp);
+
+            // Use StateRegs for max/sum to avoid clobbering constants
+            Xmm xmm_max = Xmm(zmm_max().getIdx()); // zmm16
+            Xmm xmm_sum = Xmm(zmm_sum().getIdx()); // zmm17
+            vmovss(xmm_max, ptr[reg_sm]);
+            vmovss(xmm_sum, ptr[reg_sm + 4]);
+
+            // Online softmax update
+            Xmm xmm_new_max = Xmm(zmm_scratch(2).getIdx()); // zmm22
+            Xmm xmm_corr = Xmm(zmm_corr().getIdx());        // zmm19
+            Xmm xmm_weight = Xmm(zmm_weight().getIdx());    // zmm18
+
+            vmaxss(xmm_new_max, xmm_score, xmm_max);
+
+            // corr = exp(old_max - new_max)
+            vsubss(xmm_corr, xmm_max, xmm_new_max);
+            emit_prefill_exp_scalar(xmm_corr, xmm_corr);
+
+            // weight = exp(score - new_max)
+            vsubss(xmm_weight, xmm_score, xmm_new_max);
+            emit_prefill_exp_scalar(xmm_weight, xmm_weight);
+
+            // new_sum = old_sum * corr + weight
+            vmulss(xmm_sum, xmm_sum, xmm_corr);
+            vaddss(xmm_sum, xmm_sum, xmm_weight);
+
+            // Store updated state
+            vmovss(ptr[reg_sm], xmm_new_max);
+            vmovss(ptr[reg_sm + 4], xmm_sum);
+
+            // Broadcast for V accumulation
+            vbroadcastss(zmm_weight(), xmm_weight);
+            vbroadcastss(zmm_corr(), xmm_corr);
+
+            // Calculate context pointer
+            Reg64 reg_ctx = r11;
+            mov(reg_ctx, reg_q_local);
+            imul(reg_ctx, reg_ctx, d_model * 4);
+            add(reg_ctx, context_offset + head_ctx_offset);
+            add(reg_ctx, rsp);
+
+            // Accumulate weighted V
+            emit_prefill_v_accum(reg_V_ptr, reg_ctx, num_blocks);
+        }
+
+        /**
+         * @brief Q8_1 dot product for prefill (inline version)
+         */
+        void emit_prefill_dot_product(
+            const Xbyak::Xmm &dst,
+            const Xbyak::Reg64 &reg_K,
+            const Xbyak::Reg64 &reg_Q,
+            int num_blocks,
+            const Xbyak::Xmm &scale)
+        {
+            using namespace Xbyak;
+
+            vxorps(dst, dst, dst);
+
+            Ymm ymm_q(4);
+            Ymm ymm_k(5);
+            Ymm ymm_dot(6);
+            Xmm xmm_d_q(8);
+            Xmm xmm_d_k(9);
+            Xmm xmm_sum_qs_k(15);
+            Xmm xmm_correction(14);
+            Xmm xmm_block_result(6);
+            Xmm xmm_tmp(7);
+
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                int q_off = b * 64;
+                int k_off = b * 36;
+
+                // Load Q scale
+                vpbroadcastw(xmm_d_q, ptr[reg_Q + q_off]);
+                vcvtph2ps(xmm_d_q, xmm_d_q);
+
+                // Load Q data
+                vmovdqu8(ymm_q, ptr[reg_Q + q_off + 4]);
+                vpxord(ymm_q, ymm_q, Ymm(zmm_128().getIdx()));
+
+                // Load K scale
+                vpbroadcastw(xmm_d_k, ptr[reg_K + k_off]);
+                vcvtph2ps(xmm_d_k, xmm_d_k);
+
+                // Load K sum_qs
+                vpbroadcastw(xmm_sum_qs_k, ptr[reg_K + k_off + 2]);
+                vpmovsxwd(xmm_sum_qs_k, xmm_sum_qs_k);
+                vcvtdq2ps(xmm_sum_qs_k, xmm_sum_qs_k);
+
+                // Load K data
+                vmovdqu8(ymm_k, ptr[reg_K + k_off + 4]);
+
+                // vpdpbusd
+                vxorps(ymm_dot, ymm_dot, ymm_dot);
+                vpdpbusd(ymm_dot, ymm_q, ymm_k);
+
+                // Horizontal sum
+                vextracti128(xmm_tmp, ymm_dot, 1);
+                vpaddd(xmm_block_result, Xmm(ymm_dot.getIdx()), xmm_tmp);
+                vpshufd(xmm_tmp, xmm_block_result, 0x4E);
+                vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
+                vpshufd(xmm_tmp, xmm_block_result, 0xB1);
+                vpaddd(xmm_block_result, xmm_block_result, xmm_tmp);
+
+                vcvtdq2ps(xmm_block_result, xmm_block_result);
+
+                // Scale: d_q * d_k
+                vmulps(xmm_d_q, xmm_d_q, xmm_d_k);
+                vmulps(xmm_block_result, xmm_block_result, xmm_d_q);
+
+                // Correction: 128 * sum_qs * (d_q * d_k)
+                mov(eax, 0x43000000);
+                vmovd(xmm_correction, eax);
+                vbroadcastss(xmm_correction, xmm_correction);
+                vmulps(xmm_correction, xmm_correction, xmm_sum_qs_k);
+                vmulps(xmm_correction, xmm_correction, xmm_d_q);
+
+                // Subtract correction
+                vsubps(xmm_block_result, xmm_block_result, xmm_correction);
+
+                vaddps(dst, dst, xmm_block_result);
+            }
+
+            vmulss(dst, dst, scale);
+        }
+
+        /**
+         * @brief Fast scalar exp for prefill (using range reduction)
+         */
+        void emit_prefill_exp_scalar(const Xbyak::Xmm &dst, const Xbyak::Xmm &src)
+        {
+            using namespace Xbyak;
+
+            // Scratch registers
+            // Avoid zmm20 (xmm_score) and zmm22 (xmm_new_max) which are live
+            Xmm xmm_n = Xmm(zmm_scratch(3).getIdx()); // zmm23
+            Xmm xmm_f = Xmm(zmm_scratch(4).getIdx()); // zmm24
+            Xmm xmm_p = Xmm(zmm_scratch(5).getIdx()); // zmm25
+
+            // Load log2e
+            Xmm xmm_log2e = Xmm(zmm_log2e().getIdx());
+
+            // x * log2e
+            vmulss(xmm_f, src, xmm_log2e);
+
+            // n = floor(x * log2e)
+            vrndscaless(xmm_n, xmm_n, xmm_f, 0x01); // Round down (floor)
+
+            // f = x * log2e - n
+            vsubss(xmm_f, xmm_f, xmm_n);
+
+            // Polynomial for 2^f (f in [0, 1))
+            // p = c0 + f * (c1 + f * (c2 + f * (c3 + f * (c4 + f * c5))))
+            // Coefficients from JitFastExp.h (Taylor for 2^x)
+
+            mov(eax, 0x3aaec3b4); // c5 = 0.0013334f
+            vmovd(xmm_p, eax);
+
+            mov(eax, 0x3c1d9250);           // c4 = 0.0096181f
+            vmovd(dst, eax);                // reuse dst as temp
+            vfmadd213ss(xmm_p, xmm_f, dst); // p = p*f + c4
+
+            mov(eax, 0x3d63570a); // c3 = 0.0555041f
+            vmovd(dst, eax);
+            vfmadd213ss(xmm_p, xmm_f, dst); // p = p*f + c3
+
+            mov(eax, 0x3e75fdf0); // c2 = 0.2402265f
+            vmovd(dst, eax);
+            vfmadd213ss(xmm_p, xmm_f, dst); // p = p*f + c2
+
+            mov(eax, 0x3f317218); // c1 = 0.6931472f
+            vmovd(dst, eax);
+            vfmadd213ss(xmm_p, xmm_f, dst); // p = p*f + c1
+
+            // p = p*f + 1.0
+            Xmm xmm_one = Xmm(zmm_one().getIdx());
+            vfmadd213ss(xmm_p, xmm_f, xmm_one);
+
+            // Scale by 2^n
+            // dst = p * 2^n
+            vscalefss(dst, xmm_p, xmm_n);
+        }
+
+        /**
+         * @brief Accumulate weighted V for prefill
+         */
+        void emit_prefill_v_accum(
+            const Xbyak::Reg64 &reg_V,
+            const Xbyak::Reg64 &reg_ctx,
+            int num_blocks)
+        {
+            using namespace Xbyak;
+
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                int v_off = b * 36;
+                int ctx_off = b * 32 * 4;
+
+                // Load V scale
+                Zmm zmm_v_scale = zmm_scratch(0);
+                vpbroadcastw(Xmm(zmm_v_scale.getIdx()), ptr[reg_V + v_off]);
+                vcvtph2ps(Xmm(zmm_v_scale.getIdx()), Xmm(zmm_v_scale.getIdx()));
+                vbroadcastss(zmm_v_scale, Xmm(zmm_v_scale.getIdx()));
+
+                // combined = v_scale * weight
+                Zmm zmm_comb = zmm_scratch(1);
+                vmulps(zmm_comb, zmm_v_scale, zmm_weight());
+
+                // Load V data
+                Zmm zmm_v_lo = zmm_scratch(2);
+                Zmm zmm_v_hi = zmm_scratch(3);
+                vpmovsxbd(zmm_v_lo, ptr[reg_V + v_off + 4]);
+                vpmovsxbd(zmm_v_hi, ptr[reg_V + v_off + 4 + 16]);
+                vcvtdq2ps(zmm_v_lo, zmm_v_lo);
+                vcvtdq2ps(zmm_v_hi, zmm_v_hi);
+
+                vmulps(zmm_v_lo, zmm_v_lo, zmm_comb);
+                vmulps(zmm_v_hi, zmm_v_hi, zmm_comb);
+
+                // Load context
+                Zmm zmm_ctx_lo = zmm_scratch(4);
+                Zmm zmm_ctx_hi = zmm_scratch(5);
+                vmovups(zmm_ctx_lo, ptr[reg_ctx + ctx_off]);
+                vmovups(zmm_ctx_hi, ptr[reg_ctx + ctx_off + 64]);
+
+                // context = context * corr + weighted_v
+                vmulps(zmm_ctx_lo, zmm_ctx_lo, zmm_corr());
+                vmulps(zmm_ctx_hi, zmm_ctx_hi, zmm_corr());
+                vaddps(zmm_ctx_lo, zmm_ctx_lo, zmm_v_lo);
+                vaddps(zmm_ctx_hi, zmm_ctx_hi, zmm_v_hi);
+
+                // Store
+                vmovups(ptr[reg_ctx + ctx_off], zmm_ctx_lo);
+                vmovups(ptr[reg_ctx + ctx_off + 64], zmm_ctx_hi);
+            }
+        }
+
+        /**
+         * @brief Normalize and project for prefill tile
+         */
+        void emit_prefill_normalize_project(
+            const Xbyak::Reg64 &reg_Wo,
+            const Xbyak::Reg64 &reg_output,
+            int num_blocks,
+            int tile_size,
+            int softmax_offset,
+            int context_offset,
+            int tile_start_spill,
+            int tile_size_spill,
+            int d_model,
+            int q_local_spill)
+        {
+            using namespace Xbyak;
+
+            int head_dim = num_blocks * 32;
+
+            inLocalLabel();
+
+            xor_(r8, r8); // q_local
+
+            L(".proj_loop");
+            cmp(r8, ptr[rsp + tile_size_spill]);
+            jge(".proj_end", T_NEAR);
+
+            mov(ptr[rsp + q_local_spill], r8); // Save q_local (clobbered by emit_prefill_wo_projection)
+
+            // Normalize all heads for this query
+            mov(r10, r8);
+            imul(r10, r10, d_model * 4);
+            add(r10, context_offset);
+
+            Zmm zmm_inv_sum = zmm_scratch(0);
+            Zmm zmm_one = zmm_scratch(1);
+            load_constant_f32(zmm_one, 1.0f);
+            Zmm zmm_epsilon = zmm_scratch(2);
+            load_constant_f32(zmm_epsilon, 1e-20f);
+
+            for (int h = 0; h < config_.num_heads; ++h)
+            {
+                // Load 1/sum for this head
+                // Offset: softmax_offset + h * tile_size * 8 + q_local * 8
+                int sm_off = softmax_offset + h * tile_size * 8;
+
+                mov(r9, r8); // q_local
+                shl(r9, 3);  // * 8
+                add(r9, sm_off);
+
+                vbroadcastss(zmm_inv_sum, ptr[rsp + r9 + 4]);
+                vmaxps(zmm_inv_sum, zmm_inv_sum, zmm_epsilon);
+                vdivps(zmm_inv_sum, zmm_one, zmm_inv_sum);
+
+                int h_off = h * head_dim * 4;
+                for (int b = 0; b < num_blocks; ++b)
+                {
+                    int b_off = b * 32 * 4;
+                    Zmm zmm_lo = zmm_scratch(2); // Reuse zmm_epsilon as scratch (reloaded next iter if needed? No, zmm_epsilon is constant)
+                    // Wait, zmm_epsilon is zmm_scratch(2). zmm_lo is zmm_scratch(2).
+                    // This clobbers zmm_epsilon!
+                    // I need to use different scratch registers.
+
+                    // zmm_scratch(0) = zmm_inv_sum (live)
+                    // zmm_scratch(1) = zmm_one (live)
+                    // zmm_scratch(2) = zmm_epsilon (live)
+                    // zmm_scratch(3) = zmm_hi
+                    // zmm_scratch(4) = zmm_lo
+
+                    Zmm zmm_lo_safe = zmm_scratch(4);
+                    Zmm zmm_hi_safe = zmm_scratch(3);
+
+                    vmovups(zmm_lo_safe, ptr[rsp + r10 + h_off + b_off]);
+                    vmovups(zmm_hi_safe, ptr[rsp + r10 + h_off + b_off + 64]);
+                    vmulps(zmm_lo_safe, zmm_lo_safe, zmm_inv_sum);
+                    vmulps(zmm_hi_safe, zmm_hi_safe, zmm_inv_sum);
+                    vmovups(ptr[rsp + r10 + h_off + b_off], zmm_lo_safe);
+                    vmovups(ptr[rsp + r10 + h_off + b_off + 64], zmm_hi_safe);
+                }
+            }
+
+            // Wo projection: output[q_global] = context[q_local] @ Wo
+            mov(r11, ptr[rsp + tile_start_spill]);
+            add(r11, r8); // q_global = tile_start + q_local
+
+            emit_prefill_wo_projection(reg_Wo, reg_output, r11, r10, d_model);
+
+            mov(r8, ptr[rsp + q_local_spill]); // Restore q_local
+            inc(r8);
+            jmp(".proj_loop", T_NEAR);
+
+            L(".proj_end");
+
+            outLocalLabel();
+        }
+
+        /**
+         * @brief Wo projection for one query in prefill
+         */
+        void emit_prefill_wo_projection(
+            const Xbyak::Reg64 &reg_Wo,
+            const Xbyak::Reg64 &reg_output,
+            const Xbyak::Reg64 &reg_q_global,
+            const Xbyak::Reg64 &reg_ctx_offset,
+            int d_model)
+        {
+            using namespace Xbyak;
+
+            // Output pointer
+            Reg64 reg_out_ptr = r11; // Use r11 since rdi is used as scratch inside emit_wo_projection_* methods
+            mov(reg_out_ptr, reg_q_global);
+            imul(reg_out_ptr, reg_out_ptr, d_model * 4);
+            add(reg_out_ptr, reg_output);
+
+            // Dispatch by format
+            switch (config_.wo_format)
+            {
+            case WoFormat::FP32:
+                emit_prefill_wo_fp32(reg_Wo, reg_out_ptr, reg_ctx_offset, d_model);
+                break;
+            case WoFormat::FP16:
+                emit_prefill_wo_fp16(reg_Wo, reg_out_ptr, reg_ctx_offset, d_model);
+                break;
+            case WoFormat::BF16:
+                emit_prefill_wo_bf16(reg_Wo, reg_out_ptr, reg_ctx_offset, d_model);
+                break;
+            case WoFormat::Q8_1:
+                emit_prefill_wo_q8_1(reg_Wo, reg_out_ptr, reg_ctx_offset, d_model);
+                break;
+            }
+        }
+
+        void emit_prefill_wo_fp32(const Xbyak::Reg64 &reg_Wo, const Xbyak::Reg64 &reg_out,
+                                  const Xbyak::Reg64 &reg_ctx_off, int d_model)
+        {
+            using namespace Xbyak;
+            inLocalLabel();
+
+            xor_(r8, r8);
+            L(".row");
+            cmp(r8, d_model);
+            jge(".end", T_NEAR);
+
+            Zmm acc = zmm_scratch(0);
+            vxorps(acc, acc, acc);
+
+            mov(r9, r8);
+            imul(r9, r9, d_model * 4);
+            add(r9, reg_Wo);
+
+            xor_(rcx, rcx);
+            L(".col");
+            cmp(rcx, d_model);
+            jge(".col_end", T_NEAR);
+
+            Zmm ctx = zmm_scratch(1);
+            Zmm wo = zmm_scratch(2);
+            lea(rax, ptr[rsp + reg_ctx_off]);
+            vmovups(ctx, ptr[rax + rcx * 4]);
+            vmovups(wo, ptr[r9 + rcx * 4]);
+            vfmadd231ps(acc, ctx, wo);
+
+            add(rcx, 16);
+            jmp(".col", T_NEAR);
+            L(".col_end");
+
+            emit_horizontal_sum_to_scalar(acc);
+            vmovss(ptr[reg_out + r8 * 4], Xmm(acc.getIdx()));
+
+            inc(r8);
+            jmp(".row", T_NEAR);
+            L(".end");
+            outLocalLabel();
+        }
+
+        void emit_prefill_wo_fp16(const Xbyak::Reg64 &reg_Wo, const Xbyak::Reg64 &reg_out,
+                                  const Xbyak::Reg64 &reg_ctx_off, int d_model)
+        {
+            using namespace Xbyak;
+            inLocalLabel();
+
+            xor_(r8, r8);
+            L(".row");
+            cmp(r8, d_model);
+            jge(".end", T_NEAR);
+
+            Zmm acc = zmm_scratch(0);
+            vxorps(acc, acc, acc);
+
+            mov(r9, r8);
+            imul(r9, r9, d_model * 2);
+            add(r9, reg_Wo);
+
+            xor_(rcx, rcx);
+            L(".col");
+            cmp(rcx, d_model);
+            jge(".col_end", T_NEAR);
+
+            Zmm ctx = zmm_scratch(1);
+            Zmm wo = zmm_scratch(2);
+            lea(rax, ptr[rsp + reg_ctx_off]);
+            vmovups(ctx, ptr[rax + rcx * 4]);
+            vmovups(Ymm(wo.getIdx()), ptr[r9 + rcx * 2]);
+            vcvtph2ps(wo, Ymm(wo.getIdx()));
+            vfmadd231ps(acc, ctx, wo);
+
+            add(rcx, 16);
+            jmp(".col", T_NEAR);
+            L(".col_end");
+
+            emit_horizontal_sum_to_scalar(acc);
+            vmovss(ptr[reg_out + r8 * 4], Xmm(acc.getIdx()));
+
+            inc(r8);
+            jmp(".row", T_NEAR);
+            L(".end");
+            outLocalLabel();
+        }
+
+        void emit_prefill_wo_bf16(const Xbyak::Reg64 &reg_Wo, const Xbyak::Reg64 &reg_out,
+                                  const Xbyak::Reg64 &reg_ctx_off, int d_model)
+        {
+            using namespace Xbyak;
+            inLocalLabel();
+
+            xor_(r8, r8);
+            L(".row");
+            cmp(r8, d_model);
+            jge(".end", T_NEAR);
+
+            Zmm acc = zmm_scratch(0);
+            vxorps(acc, acc, acc);
+
+            mov(r9, r8);
+            imul(r9, r9, d_model * 2);
+            add(r9, reg_Wo);
+
+            xor_(rcx, rcx);
+            L(".col");
+            cmp(rcx, d_model);
+            jge(".col_end", T_NEAR);
+
+            Zmm ctx = zmm_scratch(1);
+            Zmm wo = zmm_scratch(2);
+            lea(rax, ptr[rsp + reg_ctx_off]);
+            vmovups(ctx, ptr[rax + rcx * 4]);
+            vpmovzxwd(wo, ptr[r9 + rcx * 2]);
+            vpslld(wo, wo, 16);
+            vfmadd231ps(acc, ctx, wo);
+
+            add(rcx, 16);
+            jmp(".col", T_NEAR);
+            L(".col_end");
+
+            emit_horizontal_sum_to_scalar(acc);
+            vmovss(ptr[reg_out + r8 * 4], Xmm(acc.getIdx()));
+
+            inc(r8);
+            jmp(".row", T_NEAR);
+            L(".end");
+            outLocalLabel();
+        }
+
+        void emit_prefill_wo_q8_1(const Xbyak::Reg64 &reg_Wo, const Xbyak::Reg64 &reg_out,
+                                  const Xbyak::Reg64 &reg_ctx_off, int d_model)
+        {
+            using namespace Xbyak;
+            inLocalLabel();
+
+            int num_blocks = d_model / 32;
+
+            xor_(r8, r8);
+            L(".row");
+            cmp(r8, d_model);
+            jge(".end", T_NEAR);
+
+            Zmm acc = zmm_scratch(0);
+            vxorps(acc, acc, acc);
+
+            mov(r9, r8);
+            imul(r9, r9, num_blocks * 36);
+            add(r9, reg_Wo);
+
+            xor_(rcx, rcx);
+            L(".blk");
+            cmp(rcx, num_blocks);
+            jge(".blk_end", T_NEAR);
+
+            // Context block
+            mov(rdx, rcx);
+            shl(rdx, 7);
+            lea(rax, ptr[rsp + reg_ctx_off]);
+            add(rdx, rax);
+
+            Zmm ctx_lo = zmm_scratch(1);
+            Zmm ctx_hi = zmm_scratch(2);
+            vmovups(ctx_lo, ptr[rdx]);
+            vmovups(ctx_hi, ptr[rdx + 64]);
+
+            // Wo block
+            mov(rax, rcx);
+            imul(rax, rax, 36);
+            add(rax, r9);
+
+            // Load scale
+            Zmm d = zmm_scratch(3);
+            vpbroadcastw(Xmm(d.getIdx()), ptr[rax]);
+            vcvtph2ps(Xmm(d.getIdx()), Xmm(d.getIdx()));
+            vbroadcastss(d, Xmm(d.getIdx()));
+
+            // Load data
+            Zmm wo_lo = zmm_scratch(4);
+            Zmm wo_hi = zmm_scratch(5);
+            vpmovsxbd(wo_lo, ptr[rax + 4]);
+            vpmovsxbd(wo_hi, ptr[rax + 4 + 16]);
+            vcvtdq2ps(wo_lo, wo_lo);
+            vcvtdq2ps(wo_hi, wo_hi);
+            vmulps(wo_lo, wo_lo, d);
+            vmulps(wo_hi, wo_hi, d);
+
+            vfmadd231ps(acc, ctx_lo, wo_lo);
+            vfmadd231ps(acc, ctx_hi, wo_hi);
+
+            inc(rcx);
+            jmp(".blk", T_NEAR);
+            L(".blk_end");
+
+            emit_horizontal_sum_to_scalar(acc);
+            vmovss(ptr[reg_out + r8 * 4], Xmm(acc.getIdx()));
+
+            inc(r8);
+            jmp(".row", T_NEAR);
+            L(".end");
+            outLocalLabel();
+        }
+
+        /**
          * @brief Emit attention computation for a single query position
          *
          * For each head:
@@ -326,14 +1357,8 @@ namespace llaminar::v2::kernels::jit
             // For GQA, compute KV head index
             int heads_per_kv = config_.num_heads / config_.num_kv_heads;
 
-            // Calculate Q base pointer for this query position
             // Q layout: [seq_len_q, num_heads, head_dim] in Q8_1 blocks
-            Reg64 reg_Q_base = rdi;                             // Use rdi now that we've finished with max_kv_pos in r11
             int q_stride = config_.num_heads * num_blocks * 36; // bytes per query position
-
-            mov(reg_Q_base, reg_q_idx);
-            imul(reg_Q_base, reg_Q_base, q_stride);
-            add(reg_Q_base, reg_Q);
 
             // Phase 1: Compute attention context for all heads
             // Store to context buffer on stack (not output yet)
@@ -351,8 +1376,17 @@ namespace llaminar::v2::kernels::jit
                 vxorps(zmm_sum(), zmm_sum(), zmm_sum());
 
                 // Initialize constant for unsigned Q conversion
-                // NOTE: Use rsi as scratch (rdi is now reg_Q_base)
+                // NOTE: Use rsi as scratch (rdi is used for Q_base below)
                 emit_broadcast_i32_const(zmm_128(), 0x80808080, rsi);
+
+                // Calculate Q base pointer for this query position
+                // NOTE: Must be computed inside head loop because rdi gets clobbered
+                //       by emit_single_head_attention (used for K/V pointers)
+                // NOTE: Load q_idx from spill slot since rax is clobbered by emitters
+                Reg64 reg_Q_base = rdi;
+                mov(reg_Q_base, ptr[rsp + q_idx_spill_offset]); // Load saved q_idx
+                imul(reg_Q_base, reg_Q_base, q_stride);
+                add(reg_Q_base, reg_Q); // reg_Q = r12, preserved callee-saved
 
                 // Copy Q[q,h] blocks to stack for this head
                 emit_copy_q_head_to_stack(reg_Q_base, h, num_blocks, q_stack_offset);
@@ -959,6 +1993,7 @@ namespace llaminar::v2::kernels::jit
             vmovaps(xmm_tmp, Xmm(zmm.getIdx()));
             vhaddps(xmm_tmp, xmm_tmp, xmm_tmp);
             vhaddps(xmm_tmp, xmm_tmp, xmm_tmp);
+            vmovss(Xmm(zmm.getIdx()), xmm_tmp);
             vmovaps(Xmm(zmm.getIdx()), xmm_tmp);
         }
 

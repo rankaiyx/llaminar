@@ -2844,6 +2844,21 @@ add_v2_test(V2_Unit_JitFusedAttentionWo_Correctness
     MPI_PROCS 1
 )
 
+# Test: JIT Fused Attention + Wo - Prefill Mode Tests
+# Tests the prefill kernel (H→KV→Q loop order) for K/V cache reuse optimization
+# Validates prefill vs decode parity, tile boundary handling, causal masking
+add_executable(v2_test_jit_fused_attention_wo_prefill unit/attention/Test__JitFusedAttentionWo_Prefill.cpp)
+target_link_libraries(v2_test_jit_fused_attention_wo_prefill 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitFusedAttentionWo_Prefill 
+    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_prefill>
+    LABELS "V2;Unit;JIT;FusedAttention;Prefill;AVX512;Q8_1;KVCacheReuse"
+    MPI_PROCS 1
+)
+
 # Test: JIT Wo Projection - Tests the Wo projection implementation in JIT kernel
 # Validates FP32, FP16, BF16, Q8_1 Wo formats against REFERENCE backend
 add_executable(v2_test_jit_wo_projection unit/attention/Test__JitWoProjection.cpp)
@@ -2891,6 +2906,35 @@ target_link_libraries(v2_perf_fused_attention_wo
 add_v2_test(V2_Perf_FusedAttentionWo 
     COMMAND $<TARGET_FILE:v2_perf_fused_attention_wo>
     LABELS "V2;Performance;FusedAttention;JIT;Reference;Tiled;Prefill;Decode;Throughput"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# Phase 8.2b: Performance Benchmarking - JIT Microkernels
+# =============================================================================
+# Benchmarks individual JIT microkernels in isolation
+
+add_executable(v2_perf_jit_microkernels performance/kernels/cpu/attention/Perf__JitMicrokernels.cpp)
+target_link_libraries(v2_perf_jit_microkernels 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_JitMicrokernels 
+    COMMAND $<TARGET_FILE:v2_perf_jit_microkernels>
+    LABELS "V2;Performance;JIT;Microkernels;Q8_1"
+    MPI_PROCS 1
+)
+
+add_executable(v2_perf_fused_attention_wo_tuning performance/kernels/cpu/attention/Perf__FusedAttentionWo_Tuning.cpp)
+target_link_libraries(v2_perf_fused_attention_wo_tuning 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_FusedAttentionWo_Tuning 
+    COMMAND $<TARGET_FILE:v2_perf_fused_attention_wo_tuning>
+    LABELS "V2;Performance;FusedAttention;Tuning;Qwen"
     MPI_PROCS 1
 )
 

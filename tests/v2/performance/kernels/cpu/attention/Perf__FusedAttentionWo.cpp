@@ -179,7 +179,8 @@ protected:
             jit_config.head_dim = config.head_dim;
             jit_config.num_heads = config.num_heads;
             jit_config.num_kv_heads = config.num_kv_heads;
-            jit_config.batch_size = 1;
+            // Use seq_len_q as batch_size to trigger prefill mode for multi-token
+            jit_config.batch_size = config.seq_len_q;
             jit_config.wo_format = WoFormat::FP32;
             jit_config.causal = true;
 
@@ -428,7 +429,8 @@ TEST_F(Perf__FusedAttentionWo, Summary)
         jit_config.head_dim = config.head_dim;
         jit_config.num_heads = config.num_heads;
         jit_config.num_kv_heads = config.num_kv_heads;
-        jit_config.batch_size = 1;
+        // Use seq_len_q as batch_size to trigger prefill mode for multi-token
+        jit_config.batch_size = config.seq_len_q;
         jit_config.wo_format = WoFormat::FP32;
         jit_config.causal = true;
 
