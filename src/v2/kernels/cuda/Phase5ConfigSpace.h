@@ -32,27 +32,27 @@ namespace llaminar2
         struct Phase5GemmConfig
         {
             // Tile dimensions
-            int tile_m;
-            int tile_n;
-            int tile_k;
+            int tile_m = 0;
+            int tile_n = 0;
+            int tile_k = 0;
 
             // Streaming sub-tile size (16, 32, or tile_k for no streaming)
-            int sub_k;
+            int sub_k = 0;
 
             // CuTe atom layout multipliers
-            int mma_m; // 1, 2, 4
-            int mma_n; // 1, 2, 4
+            int mma_m = 1; // 1, 2, 4
+            int mma_n = 1; // 1, 2, 4
 
             // Buffering strategy: 1 (single), 2 (double), 3 (triple)
-            int buffer_stages;
+            int buffer_stages = 1;
 
             // Thread block size (derived from MMA layout)
-            int threads_per_block; // 32, 64, 128, 256
+            int threads_per_block = 32; // 32, 64, 128, 256
 
             // Swizzle parameters (for shared memory bank conflict avoidance)
-            int swizzle_b; // BBits parameter (0-6 for TILE_K=64)
-            int swizzle_m; // MBase parameter (0-6)
-            int swizzle_s; // SShift parameter (0-6)
+            int swizzle_b = 0; // BBits parameter (0-6 for TILE_K=64)
+            int swizzle_m = 0; // MBase parameter (0-6)
+            int swizzle_s = 0; // SShift parameter (0-6)
 
             /**
              * @brief Compute shared memory usage in bytes

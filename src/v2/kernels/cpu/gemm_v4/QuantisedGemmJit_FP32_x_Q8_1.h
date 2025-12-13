@@ -36,17 +36,17 @@ namespace llaminar2
          */
         struct FP32xQ8_1Params
         {
-            const float *A;     // FP32 scores [M, K] with stride A_stride
-            const void *B;      // Q8_1 blocks for V [K, N] with stride B_stride_bytes
-            float *C;           // FP32 output [M, N] with stride C_stride
-            int M;              // Number of output rows (seq_len for attention)
-            int N;              // Number of output cols (head_dim for attention)
-            int K;              // Reduction dimension (kv_len for attention)
-            int A_stride;       // Stride of A in floats (typically K or kv_len)
-            int B_stride_bytes; // Stride of B in bytes between rows
-            int C_stride;       // Stride of C in floats (typically N or head_dim * n_heads)
-            float alpha;        // Scale factor (typically 1.0)
-            float beta;         // Accumulation factor (typically 0.0)
+            const float *A = nullptr; // FP32 scores [M, K] with stride A_stride
+            const void *B = nullptr;  // Q8_1 blocks for V [K, N] with stride B_stride_bytes
+            float *C = nullptr;       // FP32 output [M, N] with stride C_stride
+            int M = 0;                // Number of output rows (seq_len for attention)
+            int N = 0;                // Number of output cols (head_dim for attention)
+            int K = 0;                // Reduction dimension (kv_len for attention)
+            int A_stride = 0;         // Stride of A in floats (typically K or kv_len)
+            int B_stride_bytes = 0;   // Stride of B in bytes between rows
+            int C_stride = 0;         // Stride of C in floats (typically N or head_dim * n_heads)
+            float alpha = 1.0f;       // Scale factor (typically 1.0)
+            float beta = 0.0f;        // Accumulation factor (typically 0.0)
         };
 
         /**

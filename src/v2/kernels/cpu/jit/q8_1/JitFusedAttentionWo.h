@@ -51,12 +51,12 @@ namespace llaminar::v2::kernels::jit
      */
     struct JitAttentionConfig
     {
-        int head_dim;       // Dimension per head (e.g., 64)
-        int num_heads;      // Number of Q heads
-        int num_kv_heads;   // Number of KV heads (GQA support)
-        int batch_size;     // Batch size (1 for decode, >1 for prefill)
-        WoFormat wo_format; // Output projection weight format
-        bool causal;        // Whether to apply causal masking
+        int head_dim = 0;                    // Dimension per head (e.g., 64)
+        int num_heads = 0;                   // Number of Q heads
+        int num_kv_heads = 0;                // Number of KV heads (GQA support)
+        int batch_size = 0;                  // Batch size (1 for decode, >1 for prefill)
+        WoFormat wo_format = WoFormat::Q8_1; // Output projection weight format
+        bool causal = true;                  // Whether to apply causal masking
 
         bool operator==(const JitAttentionConfig &other) const
         {

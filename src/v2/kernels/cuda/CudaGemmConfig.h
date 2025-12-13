@@ -42,28 +42,28 @@ namespace llaminar2
         struct CudaGemmConfig
         {
             // Thread block dimensions
-            int tile_m; // Output tile rows (e.g., 16, 32, 64)
-            int tile_n; // Output tile columns (e.g., 16, 32, 64)
-            int tile_k; // K-dimension tile (e.g., 32, 64)
+            int tile_m = 0; // Output tile rows (e.g., 16, 32, 64)
+            int tile_n = 0; // Output tile columns (e.g., 16, 32, 64)
+            int tile_k = 0; // K-dimension tile (e.g., 32, 64)
 
             // Thread block configuration
-            int threads_m; // Threads in M dimension (e.g., 8, 16)
-            int threads_n; // Threads in N dimension (e.g., 8, 16)
+            int threads_m = 0; // Threads in M dimension (e.g., 8, 16)
+            int threads_n = 0; // Threads in N dimension (e.g., 8, 16)
 
             // Work per thread (register tiling)
-            int work_per_thread_m; // Elements per thread in M (e.g., 2, 4, 8)
-            int work_per_thread_n; // Elements per thread in N (e.g., 2, 4, 8)
+            int work_per_thread_m = 0; // Elements per thread in M (e.g., 2, 4, 8)
+            int work_per_thread_n = 0; // Elements per thread in N (e.g., 2, 4, 8)
 
             // Memory optimizations
-            int prefetch_stages; // 0 = no prefetch, 1 = double-buffer, 2 = triple-buffer
-            bool transpose_smem; // Transpose shared memory to reduce bank conflicts
-            int vectorize_load;  // Vectorized load width: 1=scalar, 2=float2, 4=float4
+            int prefetch_stages = 0;     // 0 = no prefetch, 1 = double-buffer, 2 = triple-buffer
+            bool transpose_smem = false; // Transpose shared memory to reduce bank conflicts
+            int vectorize_load = 1;      // Vectorized load width: 1=scalar, 2=float2, 4=float4
 
             // Tensor Core atom configuration (NEW - enables true configuration diversity)
-            int atom_type;     // 0 = SM80_16x8x16 (K=16), 1 = SM80_16x8x8 (K=8)
-            int atom_layout_m; // Atoms in M dimension (1, 2, 4)
-            int atom_layout_n; // Atoms in N dimension (1, 2, 4)
-            int atom_layout_k; // Atoms in K dimension (always 1 for SM80)
+            int atom_type = 0;     // 0 = SM80_16x8x16 (K=16), 1 = SM80_16x8x8 (K=8)
+            int atom_layout_m = 1; // Atoms in M dimension (1, 2, 4)
+            int atom_layout_n = 1; // Atoms in N dimension (1, 2, 4)
+            int atom_layout_k = 1; // Atoms in K dimension (always 1 for SM80)
 
             /**
              * @brief Validate configuration consistency

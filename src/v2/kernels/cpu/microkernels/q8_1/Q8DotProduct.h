@@ -25,10 +25,10 @@ namespace llaminar::v2::kernels::microkernels
      */
     struct Q8DotProductParams
     {
-        const Q8_1Block *q_blocks; ///< Q vector blocks [num_blocks]
-        const Q8_1Block *k_blocks; ///< K vector blocks [num_blocks]
-        int num_blocks;            ///< Number of blocks (head_dim / 32)
-        float global_scale;        ///< Pre-multiplied scale (e.g., 1/sqrt(d))
+        const Q8_1Block *q_blocks = nullptr; ///< Q vector blocks [num_blocks]
+        const Q8_1Block *k_blocks = nullptr; ///< K vector blocks [num_blocks]
+        int num_blocks = 0;                  ///< Number of blocks (head_dim / 32)
+        float global_scale = 0.0f;           ///< Pre-multiplied scale (e.g., 1/sqrt(d))
     };
 
     /**
@@ -36,7 +36,7 @@ namespace llaminar::v2::kernels::microkernels
      */
     struct Q8DotProductResult
     {
-        float score; ///< Final scaled dot product
+        float score = 0.0f; ///< Final scaled dot product
     };
 
     /**

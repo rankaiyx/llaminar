@@ -35,11 +35,11 @@ namespace llaminar::v2::kernels
      */
     struct TileConfig
     {
-        int kv_tile;      ///< K/V positions per tile (fits in L2)
-        int q_tile;       ///< Query positions per tile (for K/V reuse)
-        int wo_tile;      ///< Wo output dimensions per tile (optional L3 blocking)
-        uint32_t l2_size; ///< Detected L2 cache size in bytes
-        uint32_t l3_size; ///< Detected L3 cache size in bytes
+        int kv_tile = 0;      ///< K/V positions per tile (fits in L2)
+        int q_tile = 0;       ///< Query positions per tile (for K/V reuse)
+        int wo_tile = 0;      ///< Wo output dimensions per tile (optional L3 blocking)
+        uint32_t l2_size = 0; ///< Detected L2 cache size in bytes
+        uint32_t l3_size = 0; ///< Detected L3 cache size in bytes
 
         /**
          * @brief Check if tiling is beneficial for given dimensions.

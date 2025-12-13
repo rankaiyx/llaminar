@@ -728,22 +728,30 @@ namespace llaminar2
                 const int k_stride_bytes = k_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
                 const int out_stride_bytes = out_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
 
-                // Build params for fused kernel
+                // Build params for fused kernel using volatile to prevent optimization issues
+                // This mirrors the fix applied to QuantisedGemmKernel for -O3 compatibility
+                volatile gemm_v4::FusedQ8_1AttentionParams params_v;
+                params_v.Q = Q_h;
+                params_v.K = K_h;
+                params_v.V = V_h;
+                params_v.output = out_h;
+                params_v.M = seq_len;
+                params_v.N = kv_len;
+                params_v.head_dim = head_dim;
+                params_v.Q_stride_bytes = q_stride_bytes;
+                params_v.K_stride_bytes = k_stride_bytes;
+                params_v.V_stride_bytes = k_stride_bytes; // V has same stride as K
+                params_v.output_stride_bytes = out_stride_bytes;
+                params_v.scale = scale;
+                params_v.mask = mask;
+                params_v.mask_stride = kv_len;
+
+                // Copy to non-volatile for kernel call (workaround for -O3 optimization issue)
                 gemm_v4::FusedQ8_1AttentionParams params;
-                params.Q = Q_h;
-                params.K = K_h;
-                params.V = V_h;
-                params.output = out_h;
-                params.M = seq_len;
-                params.N = kv_len;
-                params.head_dim = head_dim;
-                params.Q_stride_bytes = q_stride_bytes;
-                params.K_stride_bytes = k_stride_bytes;
-                params.V_stride_bytes = k_stride_bytes; // V has same stride as K
-                params.output_stride_bytes = out_stride_bytes;
-                params.scale = scale;
-                params.mask = mask;
-                params.mask_stride = kv_len;
+                std::memcpy(&params, const_cast<gemm_v4::FusedQ8_1AttentionParams *>(&params_v), sizeof(params));
+
+                // Memory barrier to prevent reordering
+                asm volatile("" ::: "memory");
 
                 // Dump inputs for debugging (compile-time optional)
                 gemm_v4::dump_attention_inputs(params, h, -1);

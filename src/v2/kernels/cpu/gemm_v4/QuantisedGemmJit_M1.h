@@ -225,37 +225,37 @@ namespace llaminar2
         struct QuantisedGemmParams
         {
             /** @brief Pointer to Q8_1 quantized activation matrix A[M×K]. */
-            const void *A;
+            const void *A = nullptr;
 
             /** @brief Pointer to packed INT8 weight matrix B[K×N]. */
-            const void *B_packed;
+            const void *B_packed = nullptr;
 
             /** @brief Pointer to compensation values (pre-computed for asymmetric correction). */
-            const void *comp;
+            const void *comp = nullptr;
 
             /** @brief Pointer to weight scale factors [K/32][N]. */
-            const void *scales;
+            const void *scales = nullptr;
 
             /** @brief Pointer to asymmetric mins [N] or nullptr for symmetric quantization. */
-            const void *mins;
+            const void *mins = nullptr;
 
             /** @brief Pointer to output matrix C[M×N] (FP32). */
-            float *C;
+            float *C = nullptr;
 
             /** @brief Number of K blocks (K/32, where 32 is Q8_1 block size). */
-            int K_blocks;
+            int K_blocks = 0;
 
             /** @brief Output dimension N (number of columns). */
-            int N;
+            int N = 0;
 
             /** @brief Leading dimension of C (stride between rows in elements). */
-            int ldc;
+            int ldc = 0;
 
             /** @brief Pointer to bias vector [N] or nullptr if no bias. */
-            const float *bias;
+            const float *bias = nullptr;
 
             /** @brief Pointer to attention mask [M×N] or nullptr if no mask. */
-            const float *mask;
+            const float *mask = nullptr;
 
             /**
              * @brief Pointer to store local max values for online softmax.
@@ -264,7 +264,7 @@ namespace llaminar2
              * online softmax algorithm to compute global max across all blocks.
              * Size: ceil(N/64) floats.
              */
-            float *local_max;
+            float *local_max = nullptr;
 
             /**
              * @brief Pointer to store local sum values for online softmax.
@@ -273,10 +273,10 @@ namespace llaminar2
              * Used by online softmax algorithm to compute normalized probabilities.
              * Size: ceil(N/64) floats.
              */
-            float *local_sum;
+            float *local_sum = nullptr;
 
             /** @brief Flag to enable softmax computation after GEMM. */
-            bool do_softmax;
+            bool do_softmax = false;
 
             /**
              * @brief Stride between rows of A in bytes.
@@ -284,7 +284,7 @@ namespace llaminar2
              * For M=1 kernel this is unused. For M=2 kernel, this specifies the
              * byte offset from row 0 to row 1 of the activation matrix.
              */
-            int A_stride;
+            int A_stride = 0;
 
             /**
              * @brief Pointer to gate tensor for SwiGLU activation.
@@ -293,10 +293,10 @@ namespace llaminar2
              * The kernel computes: output = up * gate * sigmoid(gate).
              * Size: [M×N] floats.
              */
-            const float *gate_input;
+            const float *gate_input = nullptr;
 
             /** @brief Flag to enable SwiGLU activation after GEMM. */
-            bool do_swiglu;
+            bool do_swiglu = false;
 
             // ================================================================
             // Output Format Control (for fused requantization)

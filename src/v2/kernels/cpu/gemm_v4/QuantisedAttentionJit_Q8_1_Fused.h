@@ -53,20 +53,20 @@ namespace llaminar2
          */
         struct FusedQ8_1AttentionParams
         {
-            const void *Q;           ///< Q8_1 blocks [seq_len, head_dim] (row-major, head_dim/32 blocks per row)
-            const void *K;           ///< Q8_1 blocks [kv_len, head_dim]
-            const void *V;           ///< Q8_1 blocks [kv_len, head_dim]
-            void *output;            ///< Q8_1 blocks [seq_len, head_dim] output
-            int M;                   ///< Number of Q rows (seq_len for this head)
-            int N;                   ///< Number of K/V rows (kv_len)
-            int head_dim;            ///< Head dimension (must be multiple of 32)
-            int Q_stride_bytes;      ///< Stride between Q rows in bytes
-            int K_stride_bytes;      ///< Stride between K rows in bytes
-            int V_stride_bytes;      ///< Stride between V rows in bytes
-            int output_stride_bytes; ///< Stride between output rows in bytes
-            float scale;             ///< Attention scale (1/sqrt(head_dim))
-            const float *mask;       ///< Optional attention mask [M, N] (nullptr if none)
-            int mask_stride;         ///< Stride between mask rows (in floats)
+            const void *Q = nullptr;     ///< Q8_1 blocks [seq_len, head_dim] (row-major, head_dim/32 blocks per row)
+            const void *K = nullptr;     ///< Q8_1 blocks [kv_len, head_dim]
+            const void *V = nullptr;     ///< Q8_1 blocks [kv_len, head_dim]
+            void *output = nullptr;      ///< Q8_1 blocks [seq_len, head_dim] output
+            int M = 0;                   ///< Number of Q rows (seq_len for this head)
+            int N = 0;                   ///< Number of K/V rows (kv_len)
+            int head_dim = 0;            ///< Head dimension (must be multiple of 32)
+            int Q_stride_bytes = 0;      ///< Stride between Q rows in bytes
+            int K_stride_bytes = 0;      ///< Stride between K rows in bytes
+            int V_stride_bytes = 0;      ///< Stride between V rows in bytes
+            int output_stride_bytes = 0; ///< Stride between output rows in bytes
+            float scale = 0.0f;          ///< Attention scale (1/sqrt(head_dim))
+            const float *mask = nullptr; ///< Optional attention mask [M, N] (nullptr if none)
+            int mask_stride = 0;         ///< Stride between mask rows (in floats)
         };
 
         /**

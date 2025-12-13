@@ -18,18 +18,18 @@ namespace llaminar2
 
         struct OnlineSoftmaxParams
         {
-            const void *Q;         // Pointer to Q start (Q8_1 blocks)
-            const void *K;         // Pointer to K start (Q8_1 blocks)
-            float *C;              // Pointer to C start (scores)
-            int M;                 // Number of Q rows
-            int N;                 // Number of K rows (kv_len)
-            int K_blocks;          // Number of blocks in head_dim
-            int Q_stride_bytes;    // Stride between Q rows
-            int K_stride_bytes;    // Stride between K rows
-            int C_stride_bytes;    // Stride between C rows (usually N * sizeof(float))
-            float scale;           // Attention scale
-            const float *mask;     // Mask pointer
-            int mask_stride_bytes; // Stride between mask rows
+            const void *Q = nullptr;     // Pointer to Q start (Q8_1 blocks)
+            const void *K = nullptr;     // Pointer to K start (Q8_1 blocks)
+            float *C = nullptr;          // Pointer to C start (scores)
+            int M = 0;                   // Number of Q rows
+            int N = 0;                   // Number of K rows (kv_len)
+            int K_blocks = 0;            // Number of blocks in head_dim
+            int Q_stride_bytes = 0;      // Stride between Q rows
+            int K_stride_bytes = 0;      // Stride between K rows
+            int C_stride_bytes = 0;      // Stride between C rows (usually N * sizeof(float))
+            float scale = 0.0f;          // Attention scale
+            const float *mask = nullptr; // Mask pointer
+            int mask_stride_bytes = 0;   // Stride between mask rows
         };
 
         /**
