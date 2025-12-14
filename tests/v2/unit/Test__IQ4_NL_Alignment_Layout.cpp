@@ -50,8 +50,8 @@ TEST_F(IQ4_NL_Alignment_Layout, CheckAlignedVectorUsage)
     auto iq4_nl = std::dynamic_pointer_cast<IQ4_NLTensor>(weight);
     ASSERT_NE(iq4_nl, nullptr) << "Weight is not IQ4_NL format";
 
-    // Check raw data pointer alignment
-    const uint8_t *raw_ptr = iq4_nl->raw_data();
+    // Check raw data pointer alignment (use raw_blocks() for typed access)
+    const uint8_t *raw_ptr = iq4_nl->raw_blocks();
     uintptr_t addr = reinterpret_cast<uintptr_t>(raw_ptr);
 
     std::cout << "\n=== IQ4_NL Tensor Alignment ===" << std::endl;

@@ -37,6 +37,7 @@
 #include "JitOnlineSoftmax.h"
 #include "JitVWeightedAccum.h"
 #include "JitWoProjection.h"
+#include "JitFastExp.h"
 
 #include <memory>
 #include <unordered_map>
@@ -213,6 +214,7 @@ namespace llaminar::v2::kernels::jit
         JitOnlineSoftmaxEmitter softmax_emitter_;
         JitVWeightedAccumEmitter v_accum_emitter_;
         JitWoProjectionEmitter wo_emitter_;
+        JitFastExpEmitter exp_emitter_; // Vectorized exp for prefill softmax
 
         /**
          * @brief Generate the complete kernel
@@ -897,67 +899,17 @@ namespace llaminar::v2::kernels::jit
                 vmulss(Xmm(Zmm(q).getIdx()), Xmm(Zmm(q).getIdx()), xmm8);
             }
 
-            // 2. Update Softmax (Scalar Loop - Optimized for sparsity)
+            // 2. Update Softmax (Vectorized)
+            // Uses ZMM-based parallel exp for all queries in tile
+            emit_prefill_tile_softmax_vectorized(reg_q_local_start, op_tile_size, reg_softmax_head_offset);
+
+            // After vectorized softmax:
+            // zmm0..zmm(q_tile_size-1) = corr (broadcasted)
+            // zmm(q_tile_size)..zmm(2*q_tile_size-1) = weight (broadcasted)
+            // State updated in memory
+
+            // Need r8 for V accumulation loop
             mov(r8, op_tile_size);
-
-            for (int q = 0; q < q_tile_size_; ++q)
-            {
-                std::string skip_label = ".skip_softmax_" + std::to_string(q);
-
-                cmp(reg_q_local_start, q);
-                jg(skip_label, T_NEAR); // q_local_start > q
-
-                cmp(r8, q);
-                jle(skip_label, T_NEAR); // tile_size <= q
-
-                // Valid query
-                mov(r9, q);
-                shl(r9, 3);
-                add(r9, reg_softmax_head_offset);
-                add(r9, rsp);
-
-                Xmm xmm_score = Xmm(Zmm(q).getIdx());
-                Xmm xmm_max = xmm16;
-                Xmm xmm_sum = xmm17;
-
-                vmovss(xmm_max, ptr[r9]);
-                vmovss(xmm_sum, ptr[r9 + 4]);
-
-                Xmm xmm_new_max = xmm18;
-                vmaxss(xmm_new_max, xmm_score, xmm_max);
-
-                // corr = exp(old_max - new_max)
-                Xmm xmm_corr = xmm19;
-                vsubss(xmm_corr, xmm_max, xmm_new_max);
-                emit_prefill_exp_scalar(xmm_corr, xmm_corr);
-
-                // weight = exp(score - new_max)
-                Xmm xmm_weight = xmm20;
-                vsubss(xmm_weight, xmm_score, xmm_new_max);
-                emit_prefill_exp_scalar(xmm_weight, xmm_weight);
-
-                // new_sum = old_sum * corr + weight
-                vmulss(xmm_sum, xmm_sum, xmm_corr);
-                vaddss(xmm_sum, xmm_sum, xmm_weight);
-
-                // Store updated state
-                vmovss(ptr[r9], xmm_new_max);
-                vmovss(ptr[r9 + 4], xmm_sum);
-
-                // Save corr/weight for V accumulation
-                vbroadcastss(Zmm(q), xmm_corr);                  // zmm0..7 = corr
-                vbroadcastss(Zmm(q + q_tile_size_), xmm_weight); // zmm8..15 = weight
-
-                jmp(".done_softmax_" + std::to_string(q), T_NEAR);
-
-                L(skip_label);
-                // Zero out corr/weight for invalid queries (safety)
-                // corr = 1.0 (preserve existing context), weight = 0.0 (no new contribution)
-                vmovups(Zmm(q), zmm_one());
-                vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
-
-                L(".done_softmax_" + std::to_string(q));
-            }
 
             // 3. Accumulate V
             for (int b = 0; b < num_blocks; ++b)
@@ -1267,6 +1219,196 @@ namespace llaminar::v2::kernels::jit
 
             // Final scale
             vmulss(dst, dst, scale);
+        }
+
+        /**
+         * @brief Emit vectorized softmax update for prefill tile
+         *
+         * Processes all queries in the tile in parallel using AVX-512 operations.
+         * Uses ZMM-based vectorized exp for 16-way parallel computation.
+         *
+         * Algorithm:
+         * 1. Pack scores from zmm0..zmm(q_tile_size-1) element[0] into zmm18 low elements
+         * 2. Load max/sum state for all queries into zmm16/zmm17 low elements
+         * 3. Compute new_max, corr_input, weight_input in parallel (all ZMM operations)
+         * 4. Two vectorized exp() calls using emit_fast_exp (operates on full ZMM)
+         * 5. Scatter results back and broadcast for V accumulation
+         *
+         * Causal masking: invalid queries get corr=1.0, weight=0.0 via masking.
+         *
+         * @param reg_q_local_start First valid query index in tile
+         * @param op_tile_size Actual number of queries in this tile
+         * @param reg_softmax_head_offset Stack offset to softmax state
+         */
+        void emit_prefill_tile_softmax_vectorized(
+            const Xbyak::Reg64 &reg_q_local_start,
+            const Xbyak::Operand &op_tile_size,
+            const Xbyak::Reg64 &reg_softmax_head_offset)
+        {
+            using namespace Xbyak;
+
+            debug_emit("emit_prefill_tile_softmax_vectorized");
+
+            // ZMM register allocation for vectorized softmax:
+            // Input scores: zmm0..zmm(q_tile_size-1) element[0]
+            // zmm16: packed old_max values (low q_tile_size elements)
+            // zmm17: packed old_sum values (low q_tile_size elements)
+            // zmm18: packed scores (low q_tile_size elements)
+            // zmm19: packed new_max
+            // zmm20: corr_input (old_max - new_max) -> after exp: corr
+            // zmm21: weight_input (score - new_max) -> after exp: weight
+            // zmm22-25: scratch for exp_emitter_
+
+            // Step 1: Pack scores from zmm0..zmm(q_tile_size-1) into zmm18
+            // Each score is in element[0] of its respective ZMM
+            Zmm zmm_scores = Zmm(18);
+            vxorps(zmm_scores, zmm_scores, zmm_scores); // Clear all elements first
+
+            // Use vinsertps to gather scores into low XMM portion
+            Xmm xmm_scores = Xmm(18);
+            if (q_tile_size_ >= 1)
+                vmovss(xmm_scores, Xmm(0));
+            if (q_tile_size_ >= 2)
+                vinsertps(xmm_scores, xmm_scores, Xmm(1), 0x10); // Insert zmm1[0] at position 1
+            if (q_tile_size_ >= 3)
+                vinsertps(xmm_scores, xmm_scores, Xmm(2), 0x20); // Insert zmm2[0] at position 2
+            if (q_tile_size_ >= 4)
+                vinsertps(xmm_scores, xmm_scores, Xmm(3), 0x30); // Insert zmm3[0] at position 3
+            // Note: For q_tile_size > 4, would need to handle YMM upper portion
+
+            // Step 2: Load max/sum state for all queries
+            // State layout: [max0, sum0, max1, sum1, ...] at reg_softmax_head_offset
+            Zmm zmm_max = Zmm(16);
+            Zmm zmm_sum = Zmm(17);
+            vxorps(zmm_max, zmm_max, zmm_max);
+            vxorps(zmm_sum, zmm_sum, zmm_sum);
+
+            lea(r9, ptr[rsp + reg_softmax_head_offset]);
+
+            // Load state pairs and deinterleave
+            if (q_tile_size_ <= 2)
+            {
+                // Load 2 pairs (16 bytes): [max0, sum0, max1, sum1]
+                Xmm xmm_state = Xmm(16);
+                vmovups(xmm_state, ptr[r9]);
+                // Deinterleave: max = [max0, max1], sum = [sum0, sum1]
+                Xmm xmm_max_lo = Xmm(16);
+                Xmm xmm_sum_lo = Xmm(17);
+                vshufps(xmm_sum_lo, xmm_state, xmm_state, 0xDD); // [sum0, sum1, sum0, sum1]
+                vshufps(xmm_max_lo, xmm_state, xmm_state, 0x88); // [max0, max1, max0, max1]
+            }
+            else if (q_tile_size_ <= 4)
+            {
+                // Load 4 pairs (32 bytes): [max0, sum0, max1, sum1, max2, sum2, max3, sum3]
+                Ymm ymm_state = Ymm(16);
+                vmovups(ymm_state, ptr[r9]);
+                // Deinterleave
+                Ymm ymm_sum_tmp = Ymm(17);
+                vshufps(ymm_sum_tmp, ymm_state, ymm_state, 0xDD);
+                vshufps(ymm_state, ymm_state, ymm_state, 0x88);
+            }
+
+            // Step 3: Compute new_max = max(scores, old_max) for all queries
+            Zmm zmm_new_max = Zmm(19);
+            vmaxps(zmm_new_max, zmm_scores, zmm_max);
+
+            // Step 4: Compute corr_input = old_max - new_max
+            Zmm zmm_corr = Zmm(20);
+            vsubps(zmm_corr, zmm_max, zmm_new_max);
+
+            // Step 5: Compute weight_input = score - new_max
+            Zmm zmm_weight = Zmm(21);
+            vsubps(zmm_weight, zmm_scores, zmm_new_max);
+
+            // Step 6: Vectorized exp for corr and weight
+            // Uses 16-way parallel exp, but only low q_tile_size elements are meaningful
+            exp_emitter_.emit_fast_exp(*this, zmm_corr, zmm_corr);     // corr = exp(old_max - new_max)
+            exp_emitter_.emit_fast_exp(*this, zmm_weight, zmm_weight); // weight = exp(score - new_max)
+
+            // Step 7: Compute new_sum = old_sum * corr + weight
+            Zmm zmm_new_sum = Zmm(17);                      // Reuse zmm_sum
+            vfmadd213ps(zmm_new_sum, zmm_corr, zmm_weight); // new_sum = old_sum * corr + weight
+
+            // Step 8: Store updated state back
+            // Need to interleave [max, sum] pairs
+            if (q_tile_size_ <= 2)
+            {
+                // Interleave: [max0, sum0, max1, sum1]
+                Xmm xmm_new_max = Xmm(19);
+                Xmm xmm_new_sum = Xmm(17);
+                Xmm xmm_interleaved = Xmm(22);
+                vunpcklps(xmm_interleaved, xmm_new_max, xmm_new_sum); // [max0, sum0, max1, sum1]
+                vmovups(ptr[r9], xmm_interleaved);
+            }
+            else if (q_tile_size_ <= 4)
+            {
+                // Interleave: [max0, sum0, max1, sum1, max2, sum2, max3, sum3]
+                Ymm ymm_new_max = Ymm(19);
+                Ymm ymm_new_sum = Ymm(17);
+                Ymm ymm_interleaved = Ymm(22);
+                vunpcklps(ymm_interleaved, ymm_new_max, ymm_new_sum);
+                vmovups(ptr[r9], ymm_interleaved);
+            }
+
+            // Step 9: Scatter corr/weight to ZMMs for V accumulation
+            // zmm0..zmm(q_tile_size-1) = broadcasted corr[q]
+            // zmm(q_tile_size)..zmm(2*q_tile_size-1) = broadcasted weight[q]
+            for (int q = 0; q < q_tile_size_; ++q)
+            {
+                // Extract corr[q] and broadcast to zmm(q)
+                if (q == 0)
+                {
+                    vbroadcastss(Zmm(q), Xmm(zmm_corr.getIdx()));
+                }
+                else
+                {
+                    vextractps(eax, Xmm(zmm_corr.getIdx()), q);
+                    vmovd(Xmm(q), eax);
+                    vbroadcastss(Zmm(q), Xmm(q));
+                }
+
+                // Extract weight[q] and broadcast to zmm(q + q_tile_size)
+                if (q == 0)
+                {
+                    vbroadcastss(Zmm(q + q_tile_size_), Xmm(zmm_weight.getIdx()));
+                }
+                else
+                {
+                    vextractps(eax, Xmm(zmm_weight.getIdx()), q);
+                    vmovd(Xmm(q + q_tile_size_), eax);
+                    vbroadcastss(Zmm(q + q_tile_size_), Xmm(q + q_tile_size_));
+                }
+            }
+
+            // Step 10: Apply causal masking for invalid queries
+            // Invalid query: q < q_local_start OR q >= tile_size
+            // Set corr=1.0 (preserve context), weight=0.0 (no new contribution)
+            mov(r8, op_tile_size);
+            for (int q = 0; q < q_tile_size_; ++q)
+            {
+                std::string valid_label = ".valid_" + std::to_string(q);
+                std::string done_label = ".done_mask_" + std::to_string(q);
+
+                // Check q_local_start > q (invalid)
+                cmp(reg_q_local_start, q);
+                jle(valid_label, T_NEAR);
+
+                // Invalid: mask out
+                vmovups(Zmm(q), zmm_one());
+                vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
+                jmp(done_label, T_NEAR);
+
+                L(valid_label);
+                // Check tile_size <= q (invalid)
+                cmp(r8, q);
+                jg(done_label, T_NEAR);
+
+                // Invalid: mask out
+                vmovups(Zmm(q), zmm_one());
+                vxorps(Zmm(q + q_tile_size_), Zmm(q + q_tile_size_), Zmm(q + q_tile_size_));
+
+                L(done_label);
+            }
         }
 
         /**

@@ -1878,8 +1878,8 @@ namespace llaminar2
         size_t padded_k() const;
         size_t element_count() const { return shape_[0] * shape_[1]; }
 
-        // Raw data access
-        const uint8_t *raw_data() const { return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data(); }
+        // Raw data access (raw_data returns void* to match TensorBase interface)
+        const void *raw_data() const override { return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data(); }
         const uint8_t *raw_blocks() const { return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data(); }
         size_t raw_size() const
         {

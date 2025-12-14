@@ -425,7 +425,7 @@ namespace llaminar2
             if (rank == 0)
             {
                 LOG_DEBUG("[MPI Strategy] Selected TensorParallel (n_heads=" << n_heads_
-                                                                            << " divisible by world_size=" << world_size << ")");
+                                                                             << " divisible by world_size=" << world_size << ")");
             }
             return MPIStrategy::TensorParallel;
         }
@@ -436,7 +436,7 @@ namespace llaminar2
             if (rank == 0)
             {
                 LOG_DEBUG("[MPI Strategy] Selected PipelineParallel (n_layers=" << n_layers_
-                                                                               << " divisible by world_size=" << world_size << ")");
+                                                                                << " divisible by world_size=" << world_size << ")");
             }
             return MPIStrategy::PipelineParallel;
         }
@@ -664,25 +664,37 @@ namespace llaminar2
         // Scores buffer: [n_heads * total_len, total_len] where total_len = batch_size * max_seq_len
         // For batched attention, scores computed between all tokens across all sequences
         // Sized for worst case (all heads, full batch)
-        attention_workspace_scores_ = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(n_heads_ * total_len),
-                                static_cast<size_t>(total_len)});
+        // Use TensorFactory for NUMA-aware allocation
+        attention_workspace_scores_ = std::shared_ptr<FP32Tensor>(
+            tensor_factory_->createFP32(
+                               {static_cast<size_t>(n_heads_ * total_len), static_cast<size_t>(total_len)},
+                               device_idx_)
+                .release());
 
         // QKV extraction buffer: [max_threads * total_len * head_dim * 3]
         // 3x: Q, K, V extraction buffers per thread, sized for full batch
-        attention_workspace_qkv_buffer_ = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_threads * total_len * head_dim_ * 3)});
+        attention_workspace_qkv_buffer_ = std::shared_ptr<FP32Tensor>(
+            tensor_factory_->createFP32(
+                               {static_cast<size_t>(max_threads * total_len * head_dim_ * 3)},
+                               device_idx_)
+                .release());
 
         // Context buffer: [max_threads * total_len * head_dim]
         // Thread-local context accumulation, sized for full batch
-        attention_workspace_context_ = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(max_threads * total_len * head_dim_)});
+        attention_workspace_context_ = std::shared_ptr<FP32Tensor>(
+            tensor_factory_->createFP32(
+                               {static_cast<size_t>(max_threads * total_len * head_dim_)},
+                               device_idx_)
+                .release());
 
         // Mask buffer: [total_len * total_len]
         // Causal/padding mask (reused across heads)
         // Must be square to support batched attention (attention between all tokens across all batches)
-        attention_workspace_mask_ = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(total_len * total_len)});
+        attention_workspace_mask_ = std::shared_ptr<FP32Tensor>(
+            tensor_factory_->createFP32(
+                               {static_cast<size_t>(total_len * total_len)},
+                               device_idx_)
+                .release());
 
         LOG_DEBUG("Attention workspace buffers allocated (batch_size=" << batch_size << "): "
                                                                        << "scores=" << (n_heads_ * max_seq_len * max_seq_len * sizeof(float) / 1024 / 1024) << "MB, "
@@ -995,7 +1007,7 @@ namespace llaminar2
                     fp32_file.write(reinterpret_cast<const char *>(fp32_data),
                                     effective_elements * sizeof(float));
                     LOG_DEBUG("[TensorDump] Wrote " << key << " FP32 data (" << rows << "x" << cols
-                                                   << " = " << effective_elements << " elements) to " << base_path << "_fp32.bin");
+                                                    << " = " << effective_elements << " elements) to " << base_path << "_fp32.bin");
                 }
             }
         }
@@ -1014,7 +1026,7 @@ namespace llaminar2
                 blocks_file.write(reinterpret_cast<const char *>(blocks),
                                   total_blocks * sizeof(Q8_1Block));
                 LOG_DEBUG("[TensorDump] Wrote " << key << " Q8_1 blocks (" << total_blocks << " blocks) to "
-                                               << base_path << "_q8_1_blocks.bin");
+                                                << base_path << "_q8_1_blocks.bin");
             }
         }
 
@@ -2461,8 +2473,12 @@ namespace llaminar2
         {
             // Non-Q8_1 input (FP32/BF16/FP16) with Q8_1 output
             // Need FP32 temp buffer, then quantize
-            fp32_output_temp = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(q_seq_len), static_cast<size_t>(n_heads * head_dim)});
+            // Use TensorFactory for NUMA-aware allocation
+            fp32_output_temp = std::shared_ptr<FP32Tensor>(
+                tensor_factory_->createFP32(
+                                   {static_cast<size_t>(q_seq_len), static_cast<size_t>(n_heads * head_dim)},
+                                   device_idx_)
+                    .release());
             effective_output = fp32_output_temp.get();
             needs_quantize = true;
         }
@@ -2487,8 +2503,12 @@ namespace llaminar2
         // doesn't expose compute_decode. We'll use the raw compute with proper workspace setup.
 
         // Allocate workspace for attention scores [n_heads, q_seq_len, kv_seq_len]
-        auto scores_workspace = std::make_shared<FP32Tensor>(
-            std::vector<size_t>{static_cast<size_t>(n_heads * q_seq_len * kv_seq_len)});
+        // Use TensorFactory for NUMA-aware allocation
+        auto scores_workspace = std::shared_ptr<FP32Tensor>(
+            tensor_factory_->createFP32(
+                               {static_cast<size_t>(n_heads * q_seq_len * kv_seq_len)},
+                               device_idx_)
+                .release());
 
         // Build causal mask for decode: [q_seq_len, kv_seq_len]
         // For decode, we mask future positions. Since Q is at the end of the sequence,
@@ -2496,8 +2516,12 @@ namespace llaminar2
         std::shared_ptr<FP32Tensor> mask_tensor = nullptr;
         if (causal)
         {
-            mask_tensor = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(q_seq_len * kv_seq_len)});
+            // Use TensorFactory for NUMA-aware allocation
+            mask_tensor = std::shared_ptr<FP32Tensor>(
+                tensor_factory_->createFP32(
+                                   {static_cast<size_t>(q_seq_len * kv_seq_len)},
+                                   device_idx_)
+                    .release());
             float *mask_data = mask_tensor->mutable_data();
 
             // For decode with KV cache:

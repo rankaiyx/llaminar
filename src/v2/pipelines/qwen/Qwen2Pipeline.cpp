@@ -23,6 +23,7 @@
 #include "../../utils/BatchPaddingUtils.h"
 #include "../../kernels/cpu/ops/CPURMSNormKernelT.h"
 #include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
+#include "../../kernels/KernelFactory.h"
 #include "../../tensors/SIMDHelpers.h"
 #include "../ops/EmbeddingOp.h"
 #include <iostream>
@@ -1056,9 +1057,12 @@ namespace llaminar2
                                                                                << "] to [" << shape[1] << ", " << shape[0] << "]");
 
                 // Create FP32 tensor with transposed shape [vocab_size, d_model]
-                embedding_table_ = std::make_shared<FP32Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(vocab_size_), static_cast<size_t>(d_model_)},
-                    device_idx_);
+                // Use TensorFactory for NUMA-aware allocation
+                embedding_table_ = std::shared_ptr<TensorBase>(
+                    tensor_factory_->createFP32(
+                                       {static_cast<size_t>(vocab_size_), static_cast<size_t>(d_model_)},
+                                       device_idx_)
+                        .release());
 
                 // Transpose: dst[v, d] = src[d, v]
                 const float *src = raw_embed->data();
@@ -1235,6 +1239,52 @@ namespace llaminar2
 
     bool Qwen2Pipeline::lm_head_batch(TensorBase *hidden, int effective_seq_len)
     {
+        // Allocate logits buffer if needed
+        // Use TensorFactory for NUMA-aware allocation
+        if (!logits_buffer_ || static_cast<int>(logits_buffer_->shape()[0]) != effective_seq_len)
+        {
+            logits_buffer_ = std::shared_ptr<FP32Tensor>(
+                tensor_factory_->createFP32(
+                                   {static_cast<size_t>(effective_seq_len), static_cast<size_t>(vocab_size_)},
+                                   device_idx_)
+                    .release());
+            LOG_INFO("Allocated logits buffer: "
+                     << effective_seq_len << " x " << vocab_size_ << " on device " << device_idx_);
+        }
+
+        VALIDATE_TENSOR(logits_buffer_, spec_logits(effective_seq_len), "logits_allocation");
+
+        auto lm_head = getLMHead();
+        VALIDATE_POINTER(lm_head, "LM head");
+
+        LOG_DEBUG("lm_head_batch: hidden=" << hidden << ", hidden type=" << static_cast<int>(hidden->native_type())
+                                           << ", effective_seq_len=" << effective_seq_len
+                                           << ", vocab_size=" << vocab_size_ << ", d_model=" << d_model_);
+        LOG_DEBUG("lm_head_batch: lm_head type=" << static_cast<int>(lm_head->native_type())
+                                                 << ", shape=[" << lm_head->shape()[0] << "," << lm_head->shape()[1] << "]");
+
+        // Use cached GEMM kernel (weights were packed during model loading and raw data released)
+        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head.get());
+        if (!lm_gemm)
+        {
+            LOG_ERROR("lm_head_batch: Failed to get/create LM head GEMM kernel");
+            return false;
+        }
+
+        LOG_DEBUG("lm_head_batch: Created GEMM kernel, about to call multiply_tensor");
+
+        // LM head: logits = hidden @ lm_head^T
+        // hidden: [effective_seq_len, d_model], lm_head: [vocab_size, d_model]
+        // output: [effective_seq_len, vocab_size]
+        // Use multiply_tensor to handle typed activations (FP32 or Q8_1)
+        VALIDATE_OP(lm_gemm->multiply_tensor(
+                        hidden, logits_buffer_.get(),
+                        effective_seq_len, vocab_size_, d_model_,
+                        true, 1.0f, 0.0f, mpi_ctx_.get(), device_idx_),
+                    "LM head projection");
+
+        LOG_DEBUG("lm_head_batch: GEMM completed successfully");
+        VALIDATE_TENSOR(logits_buffer_, spec_logits(effective_seq_len), "after_lm_head");
         return true;
     }
 
