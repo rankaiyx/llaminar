@@ -170,22 +170,41 @@ namespace llaminar::v2::kernels::jit
               ,
               config_(config)
         {
-            // Calculate optimal Q_TILE_SIZE for register blocking
-            // We reserve zmm20-zmm31 for constants and scratch (zmm20-25 scratch, zmm26-31 consts).
-            // We have 4 ZMM registers (zmm16-zmm19) available for Q data.
-            // Each query requires num_blocks registers.
-            // num_blocks = head_dim / 32.
-            // Constraint: q_tile_size * num_blocks <= 4.
+            // Calculate optimal Q_TILE_SIZE based on kernel mode
+            //
+            // DECODE mode: Q data kept in registers across KV loop for speed.
+            //   - We have zmm10-13 (4 regs) for Q data
+            //   - Each query needs num_blocks registers
+            //   - Constraint: q_tile_size * num_blocks <= 4
+            //   - For head_dim=128 (4 blocks): tile_size = 1
+            //
+            // PREFILL mode: Q data loaded from stack each iteration.
+            //   - No register constraint on Q (loaded per-block from stack)
+            //   - Tile size determines K/V reuse across queries
+            //   - Larger tile = better K/V cache reuse
+            //   - Use fixed tile size of 4 to enable meaningful parallelism
+            //   - (Limited to 4 due to softmax vectorization using XMM = 4 floats)
+            //
             int num_blocks = config_.head_dim / 32;
-            int available_q_regs = 4;
 
-            if (num_blocks > 0)
+            if (config_.effectiveMode() == AttentionMode::PREFILL)
             {
-                q_tile_size_ = available_q_regs / num_blocks;
+                // Prefill: Use fixed tile size for K/V reuse
+                // Use 4 (max XMM elements) for vectorized softmax
+                q_tile_size_ = 4;
             }
             else
             {
-                q_tile_size_ = 8;
+                // Decode: Constrained by Q register allocation
+                int available_q_regs = 4;
+                if (num_blocks > 0)
+                {
+                    q_tile_size_ = available_q_regs / num_blocks;
+                }
+                else
+                {
+                    q_tile_size_ = 4;
+                }
             }
 
             // Clamp to reasonable limits
@@ -1104,7 +1123,9 @@ namespace llaminar::v2::kernels::jit
 
             // Zero-fill context buffer using 64-byte ZMM stores
             int total_floats = tile_size * d_model;
-            for (int i = 0; i < total_floats - 16; i += 16)
+            // BUG FIX: Original loop was `i < total_floats - 16` which missed last 16 floats
+            // Now correctly zeros ALL floats: [0, 16), [16, 32), ... up to total_floats
+            for (int i = 0; i < total_floats; i += 16)
             {
                 vmovups(ptr[rsp + context_offset + i * 4], zmm_zero);
             }
@@ -2087,10 +2108,68 @@ namespace llaminar::v2::kernels::jit
             // Note: For q_tile_size > 4, would need YMM upper portion handling
 
             // ───────────────────────────────────────────────────────────────────
+            // STEP 1.5: APPLY CAUSAL MASKING TO SCORES BEFORE SOFTMAX
+            // ───────────────────────────────────────────────────────────────────
+            // Set scores[q] = -infinity for q < q_local_start (causally masked)
+            // and for q >= tile_size (partial tile). This ensures:
+            //   - new_max = old_max (since -inf < old_max)
+            //   - corr = 1.0 (exp(0) = 1)
+            //   - weight = 0.0 (exp(-inf) = 0)
+            // And crucially: softmax state is NOT updated for masked queries.
+
+            // Load -FLT_MAX for masking
+            Xmm xmm_neg_inf = Xmm(zmm_scratch(0).getIdx()); // xmm20
+            load_constant_f32(Zmm(zmm_scratch(0).getIdx()), -3.4028235e+38f);
+
+            mov(r8, op_tile_size);
+            for (int q = 0; q < q_tile_size_; ++q)
+            {
+                std::string valid_label = ".mask_valid_" + std::to_string(q);
+                std::string done_label = ".mask_done_" + std::to_string(q);
+
+                // Check: q_local_start > q means this query is masked
+                cmp(reg_q_local_start, q);
+                jle(valid_label, T_NEAR);
+
+                // Masked: set score[q] = -inf
+                // Use insertps to set a single element
+                if (q == 0)
+                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x00);
+                else if (q == 1)
+                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x10);
+                else if (q == 2)
+                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x20);
+                else if (q == 3)
+                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x30);
+                jmp(done_label, T_NEAR);
+
+                L(valid_label);
+                // Also check tile_size <= q (partial tile)
+                cmp(r8, q);
+                jg(done_label, T_NEAR);
+
+                // Outside tile: set score[q] = -inf
+                if (q == 0)
+                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x00);
+                else if (q == 1)
+                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x10);
+                else if (q == 2)
+                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x20);
+                else if (q == 3)
+                    vinsertps(xmm_scores, xmm_scores, xmm_neg_inf, 0x30);
+
+                L(done_label);
+            }
+
+            // ───────────────────────────────────────────────────────────────────
             // STEP 2: Load max/sum state for all queries from memory
             // ───────────────────────────────────────────────────────────────────
             // State layout in memory: [max0, sum0, max1, sum1, ...]
             // Each (max, sum) pair is 8 bytes
+            //
+            // We load into zmm16 (maxs) and zmm17 (sums) using scalar loads
+            // and insertps to build up the packed vectors. This avoids the
+            // complexity of cross-lane shuffle operations for deinterleaving.
             Zmm zmm_max = Zmm(16);
             Zmm zmm_sum = Zmm(17);
             vxorps(zmm_max, zmm_max, zmm_max);
@@ -2098,27 +2177,42 @@ namespace llaminar::v2::kernels::jit
 
             lea(r9, ptr[rsp + reg_softmax_head_offset]);
 
-            // Load state pairs and deinterleave into separate max/sum vectors
-            if (q_tile_size_ <= 2)
+            // Load interleaved [max, sum] pairs and deinterleave using insertps
+            // Memory: [max0, sum0, max1, sum1, max2, sum2, max3, sum3]
+            // Result: zmm16[0..3] = [max0, max1, max2, max3]
+            //         zmm17[0..3] = [sum0, sum1, sum2, sum3]
+            Xmm xmm_max = Xmm(16);
+            Xmm xmm_sum = Xmm(17);
+            Xmm xmm_tmp = Xmm(22);
+
+            // Load and deinterleave each (max, sum) pair
+            // Query 0: max at offset 0, sum at offset 4
+            vmovss(xmm_max, ptr[r9 + 0]); // max0
+            vmovss(xmm_sum, ptr[r9 + 4]); // sum0
+
+            if (q_tile_size_ >= 2)
             {
-                // 2 queries: Load 16 bytes [max0, sum0, max1, sum1]
-                Xmm xmm_state = Xmm(16);
-                vmovups(xmm_state, ptr[r9]);
-                // Deinterleave using shuffle
-                Xmm xmm_max_lo = Xmm(16);
-                Xmm xmm_sum_lo = Xmm(17);
-                vshufps(xmm_sum_lo, xmm_state, xmm_state, 0xDD); // Extract sums: [sum0, sum1, ...]
-                vshufps(xmm_max_lo, xmm_state, xmm_state, 0x88); // Extract maxs: [max0, max1, ...]
+                // Query 1: max at offset 8, sum at offset 12
+                vmovss(xmm_tmp, ptr[r9 + 8]);
+                vinsertps(xmm_max, xmm_max, xmm_tmp, 0x10); // max1 -> slot 1
+                vmovss(xmm_tmp, ptr[r9 + 12]);
+                vinsertps(xmm_sum, xmm_sum, xmm_tmp, 0x10); // sum1 -> slot 1
             }
-            else if (q_tile_size_ <= 4)
+            if (q_tile_size_ >= 3)
             {
-                // 4 queries: Load 32 bytes [max0, sum0, max1, sum1, max2, sum2, max3, sum3]
-                Ymm ymm_state = Ymm(16);
-                vmovups(ymm_state, ptr[r9]);
-                // Deinterleave
-                Ymm ymm_sum_tmp = Ymm(17);
-                vshufps(ymm_sum_tmp, ymm_state, ymm_state, 0xDD); // Sums
-                vshufps(ymm_state, ymm_state, ymm_state, 0x88);   // Maxs (in-place)
+                // Query 2: max at offset 16, sum at offset 20
+                vmovss(xmm_tmp, ptr[r9 + 16]);
+                vinsertps(xmm_max, xmm_max, xmm_tmp, 0x20); // max2 -> slot 2
+                vmovss(xmm_tmp, ptr[r9 + 20]);
+                vinsertps(xmm_sum, xmm_sum, xmm_tmp, 0x20); // sum2 -> slot 2
+            }
+            if (q_tile_size_ >= 4)
+            {
+                // Query 3: max at offset 24, sum at offset 28
+                vmovss(xmm_tmp, ptr[r9 + 24]);
+                vinsertps(xmm_max, xmm_max, xmm_tmp, 0x30); // max3 -> slot 3
+                vmovss(xmm_tmp, ptr[r9 + 28]);
+                vinsertps(xmm_sum, xmm_sum, xmm_tmp, 0x30); // sum3 -> slot 3
             }
 
             // ───────────────────────────────────────────────────────────────────
@@ -2131,17 +2225,23 @@ namespace llaminar::v2::kernels::jit
             // STEP 4: Compute exp inputs
             // ───────────────────────────────────────────────────────────────────
             // corr_input = old_max - new_max (will become exp() for correction)
-            Zmm zmm_corr = Zmm(20);
+            // weight_input = score - new_max (will become exp() for weight)
+            //
+            // CRITICAL: Use INPUT zone registers (zmm8, zmm9) instead of SCRATCH
+            // zone (zmm20, zmm21). emit_fast_exp clobbers zmm_scratch(0-2) = zmm20-22
+            // during polynomial evaluation. If we use zmm20/21 for corr/weight,
+            // the exp computation would overwrite them before finishing!
+            Zmm zmm_corr = Zmm(8); // INPUT zone - safe from exp clobber
             vsubps(zmm_corr, zmm_max, zmm_new_max);
 
-            // weight_input = score - new_max (will become exp() for weight)
-            Zmm zmm_weight = Zmm(21);
+            Zmm zmm_weight = Zmm(9); // INPUT zone - safe from exp clobber
             vsubps(zmm_weight, zmm_scores, zmm_new_max);
 
             // ───────────────────────────────────────────────────────────────────
             // STEP 5: Vectorized exp for corr and weight
             // ───────────────────────────────────────────────────────────────────
             // Uses 16-way parallel exp, only low q_tile_size elements are valid
+            // NOTE: emit_fast_exp clobbers zmm20-22 (SCRATCH zone) but not INPUT zone
             exp_emitter_.emit_fast_exp(*this, zmm_corr, zmm_corr);     // corr = exp(old_max - new_max)
             exp_emitter_.emit_fast_exp(*this, zmm_weight, zmm_weight); // weight = exp(score - new_max)
 
@@ -2154,22 +2254,34 @@ namespace llaminar::v2::kernels::jit
             // ───────────────────────────────────────────────────────────────────
             // STEP 7: Store updated softmax state back to memory
             // ───────────────────────────────────────────────────────────────────
-            // Re-interleave [max, sum] pairs for storage
-            if (q_tile_size_ <= 2)
+            // Store [max, sum] pairs using scalar stores for correctness.
+            // Memory layout: [max0, sum0, max1, sum1, max2, sum2, max3, sum3]
+            // zmm_new_max (zmm19) has [max0, max1, max2, max3, ...] in low elements
+            // zmm_new_sum (zmm17) has [sum0, sum1, sum2, sum3, ...] in low elements
+            Xmm xmm_new_max = Xmm(19);
+            Xmm xmm_new_sum = Xmm(17);
+
+            // Query 0: store max at offset 0, sum at offset 4
+            vmovss(ptr[r9 + 0], xmm_new_max);
+            vmovss(ptr[r9 + 4], xmm_new_sum);
+
+            if (q_tile_size_ >= 2)
             {
-                Xmm xmm_new_max = Xmm(19);
-                Xmm xmm_new_sum = Xmm(17);
-                Xmm xmm_interleaved = Xmm(22);
-                vunpcklps(xmm_interleaved, xmm_new_max, xmm_new_sum); // [max0, sum0, max1, sum1]
-                vmovups(ptr[r9], xmm_interleaved);
+                // Query 1: store max at offset 8, sum at offset 12
+                vextractps(ptr[r9 + 8], xmm_new_max, 1);
+                vextractps(ptr[r9 + 12], xmm_new_sum, 1);
             }
-            else if (q_tile_size_ <= 4)
+            if (q_tile_size_ >= 3)
             {
-                Ymm ymm_new_max = Ymm(19);
-                Ymm ymm_new_sum = Ymm(17);
-                Ymm ymm_interleaved = Ymm(22);
-                vunpcklps(ymm_interleaved, ymm_new_max, ymm_new_sum);
-                vmovups(ptr[r9], ymm_interleaved);
+                // Query 2: store max at offset 16, sum at offset 20
+                vextractps(ptr[r9 + 16], xmm_new_max, 2);
+                vextractps(ptr[r9 + 20], xmm_new_sum, 2);
+            }
+            if (q_tile_size_ >= 4)
+            {
+                // Query 3: store max at offset 24, sum at offset 28
+                vextractps(ptr[r9 + 24], xmm_new_max, 3);
+                vextractps(ptr[r9 + 28], xmm_new_sum, 3);
             }
 
             // ───────────────────────────────────────────────────────────────────
