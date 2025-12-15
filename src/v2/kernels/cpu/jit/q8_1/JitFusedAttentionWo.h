@@ -672,6 +672,8 @@ namespace llaminar::v2::kernels::jit
          *   │ [rsp + softmax_head_offset]  Softmax offset for head (8)       │
          *   │ [rsp + context_head_offset]  Context offset for head (8)       │
          *   │ [rsp + q_loop_spill]         Query loop counter (8)            │
+         *   │ [rsp + kv_loop_end_spill]    KV loop end bound (8)             │
+         *   │ [rsp + kv_head_offset_spill] Pre-computed kv_head offset (8)   │
          *   └─────────────────────────────────────────────────────────────────┘
          *
          * ═══════════════════════════════════════════════════════════════════════
@@ -792,9 +794,10 @@ namespace llaminar::v2::kernels::jit
             int context_head_offset_spill = softmax_head_offset_spill + 8; // Context offset for head
             int q_loop_spill = context_head_offset_spill + 8;              // Query loop counter
             int kv_loop_end_spill = q_loop_spill + 8;                      // KV loop end bound
+            int kv_head_offset_spill = kv_loop_end_spill + 8;              // Pre-computed kv_head * kv_head_stride
 
             // Total stack size (64-byte aligned for AVX-512)
-            int stack_size = kv_loop_end_spill + 8 + 64;
+            int stack_size = kv_head_offset_spill + 8 + 64;
             stack_size = (stack_size + 63) & ~63;
 
             // ═══════════════════════════════════════════════════════════════════
@@ -878,6 +881,25 @@ namespace llaminar::v2::kernels::jit
                                      tile_start_spill, tile_size_spill);
 
             // ═══════════════════════════════════════════════════════════════════
+            // CALCULATE KV HEAD INDEX (GQA support) - HOISTED OUT OF KV LOOP
+            // ═══════════════════════════════════════════════════════════════════
+            // kv_head = head_idx / heads_per_kv
+            // This is constant for the entire KV loop, so compute once here.
+            // Division is expensive (~30-80 cycles), hoisting saves significant time.
+
+            xor_(rdx, rdx);
+            mov(rax, ptr[rsp + head_idx_spill]);
+            mov(rcx, heads_per_kv);
+            div(rcx); // rax = kv_head, rdx = remainder
+
+            // Pre-compute kv_head_offset = kv_head * kv_head_stride
+            // This is also constant for the KV loop
+            int kv_stride = config_.num_kv_heads * num_blocks * 36; // Per KV position
+            int kv_head_stride = num_blocks * 36;                   // Per KV head
+            imul(rax, rax, kv_head_stride);
+            mov(ptr[rsp + kv_head_offset_spill], rax); // Store kv_head_offset
+
+            // ═══════════════════════════════════════════════════════════════════
             // KV LOOP: Iterate over K/V cache positions
             // ═══════════════════════════════════════════════════════════════════
 
@@ -906,29 +928,15 @@ namespace llaminar::v2::kernels::jit
             jge(".kv_end", T_NEAR);
 
             // ═══════════════════════════════════════════════════════════════════
-            // CALCULATE KV HEAD INDEX (GQA support)
-            // ═══════════════════════════════════════════════════════════════════
-            // kv_head = head_idx / heads_per_kv
-
-            xor_(rdx, rdx);
-            mov(rax, ptr[rsp + head_idx_spill]);
-            mov(rcx, heads_per_kv);
-            div(rcx); // rax = kv_head, rdx = remainder
-
-            // ═══════════════════════════════════════════════════════════════════
             // CALCULATE K/V POINTERS FOR CURRENT KV POSITION
             // ═══════════════════════════════════════════════════════════════════
+            // K_ptr = reg_K + kv_idx * kv_stride + kv_head_offset
+            // V_ptr = reg_V + kv_idx * kv_stride + kv_head_offset
+            // (kv_head_offset was pre-computed above)
 
-            int kv_stride = config_.num_kv_heads * num_blocks * 36; // Per KV position
-            int kv_head_stride = num_blocks * 36;                   // Per KV head
-
-            // K_ptr = reg_K + kv_idx * kv_stride + kv_head * kv_head_stride
             mov(rdi, ptr[rsp + kv_idx_spill]);
             imul(rdi, rdi, kv_stride);
-
-            mov(rsi, rax); // kv_head
-            imul(rsi, rsi, kv_head_stride);
-            add(rdi, rsi);
+            add(rdi, ptr[rsp + kv_head_offset_spill]); // Add pre-computed kv_head_offset
 
             mov(rsi, rdi); // Copy offset for V
 
@@ -975,6 +983,20 @@ namespace llaminar::v2::kernels::jit
             // Reload K/V pointers from spill
             mov(rdi, ptr[rsp + k_ptr_spill]);
             mov(rsi, ptr[rsp + v_ptr_spill]);
+
+            // ═══════════════════════════════════════════════════════════════════
+            // SOFTWARE PREFETCH: Bring next KV position into L1/L2 cache
+            // ═══════════════════════════════════════════════════════════════════
+            // Prefetch next K/V blocks while processing current ones.
+            // This hides memory latency for streaming KV access.
+            // prefetcht0 = L1, prefetcht1 = L2, prefetcht2 = L3
+            prefetcht0(ptr[rdi + kv_stride]);      // Next K position, block 0
+            prefetcht0(ptr[rsi + kv_stride]);      // Next V position, block 0
+            if (num_blocks > 1)
+            {
+                prefetcht0(ptr[rdi + kv_stride + 64]); // Next K, block 1
+                prefetcht0(ptr[rsi + kv_stride + 64]); // Next V, block 1
+            }
 
             // Load dynamic offsets for softmax and context
             mov(rdx, ptr[rsp + softmax_head_offset_spill]);
@@ -1545,6 +1567,9 @@ namespace llaminar::v2::kernels::jit
             // All context blocks use the memory buffer on stack. This is correct
             // because each head's context offset is different, and register
             // persistence across heads would cause incorrect accumulation.
+            //
+            // OPTIMIZATION: Pre-multiply V * scale once per block, then apply
+            // per-query weight using FMA instructions.
 
             for (int b = 0; b < num_blocks; ++b)
             {
@@ -1564,6 +1589,10 @@ namespace llaminar::v2::kernels::jit
                 vcvtdq2ps(zmm17, zmm17);
                 vcvtdq2ps(zmm18, zmm18);
 
+                // Pre-multiply V * scale (shared across all queries)
+                vmulps(zmm17, zmm17, zmm16); // V_lo_scaled = V_lo * scale
+                vmulps(zmm18, zmm18, zmm16); // V_hi_scaled = V_hi * scale
+
                 // Process each query in tile
                 for (int q = 0; q < q_tile_size_; ++q)
                 {
@@ -1577,40 +1606,37 @@ namespace llaminar::v2::kernels::jit
                     cmp(r8, q);
                     jle(skip_v, T_NEAR);
 
-                    // Compute weighted V: V_dequant * scale * weight[q]
-                    // weight[q] is in Zmm(q + q_tile_size_)
-                    Zmm zmm_wv_lo = zmm21;
-                    Zmm zmm_wv_hi = zmm22;
-
-                    vmulps(zmm_wv_lo, zmm17, zmm16);                     // V_lo * scale
-                    vmulps(zmm_wv_lo, zmm_wv_lo, Zmm(q + q_tile_size_)); // * weight[q]
-
-                    vmulps(zmm_wv_hi, zmm18, zmm16);                     // V_hi * scale
-                    vmulps(zmm_wv_hi, zmm_wv_hi, Zmm(q + q_tile_size_)); // * weight[q]
-
-                    // All blocks use memory - compute context address
-                    // context_ptr = rsp + context_offset + q * d_model * 4 + ctx_off_base
-                    mov(r9, q);
-                    imul(r9, r9, d_model * 4);
-                    add(r9, reg_context_head_offset);
+                    // Compute context address (compile-time offset optimization)
+                    // context_ptr = rsp + context_head_offset + q * d_model * 4 + ctx_off_base
+                    int q_ctx_offset = q * d_model * 4 + ctx_off_base;
+                    mov(r9, reg_context_head_offset);
                     add(r9, rsp);
 
                     // Load existing context accumulator
                     Zmm zmm_ctx_lo = zmm19;
                     Zmm zmm_ctx_hi = zmm20;
-                    vmovups(zmm_ctx_lo, ptr[r9 + ctx_off_base]);
-                    vmovups(zmm_ctx_hi, ptr[r9 + ctx_off_base + 64]);
+                    vmovups(zmm_ctx_lo, ptr[r9 + q_ctx_offset]);
+                    vmovups(zmm_ctx_hi, ptr[r9 + q_ctx_offset + 64]);
+
+                    // Compute weighted V: V_scaled * weight[q]
+                    // weight[q] is in Zmm(q + q_tile_size_)
+                    Zmm zmm_wv_lo = zmm21;
+                    Zmm zmm_wv_hi = zmm22;
+                    Zmm zmm_weight_q = Zmm(q + q_tile_size_);
+
+                    vmulps(zmm_wv_lo, zmm17, zmm_weight_q); // V_lo_scaled * weight[q]
+                    vmulps(zmm_wv_hi, zmm18, zmm_weight_q); // V_hi_scaled * weight[q]
 
                     // Update context: ctx = ctx * corr[q] + weighted_V
-                    vmulps(zmm_ctx_lo, zmm_ctx_lo, Zmm(q)); // ctx_lo *= corr[q]
-                    vaddps(zmm_ctx_lo, zmm_ctx_lo, zmm_wv_lo);
+                    // Use FMA: vfmadd231ps(a, b, c) = a + b*c
+                    // We want: ctx = ctx * corr + wv
+                    // Rewrite as: ctx = wv + ctx * corr → vfmadd231ps(wv, ctx, corr)
+                    vfmadd231ps(zmm_wv_lo, zmm_ctx_lo, Zmm(q)); // wv_lo += ctx_lo * corr[q]
+                    vfmadd231ps(zmm_wv_hi, zmm_ctx_hi, Zmm(q)); // wv_hi += ctx_hi * corr[q]
 
-                    vmulps(zmm_ctx_hi, zmm_ctx_hi, Zmm(q)); // ctx_hi *= corr[q]
-                    vaddps(zmm_ctx_hi, zmm_ctx_hi, zmm_wv_hi);
-
-                    // Store updated context
-                    vmovups(ptr[r9 + ctx_off_base], zmm_ctx_lo);
-                    vmovups(ptr[r9 + ctx_off_base + 64], zmm_ctx_hi);
+                    // Store updated context (result is now in zmm_wv)
+                    vmovups(ptr[r9 + q_ctx_offset], zmm_wv_lo);
+                    vmovups(ptr[r9 + q_ctx_offset + 64], zmm_wv_hi);
 
                     L(skip_v);
                 }
