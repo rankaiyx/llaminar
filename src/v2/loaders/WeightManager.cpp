@@ -118,16 +118,21 @@ namespace llaminar2
             return nullptr;
         }
 
-        // For GEMM weight matrices, immediately pack to INT8 and release raw data
-        // This prevents peak memory from growing as we load all weights
+        // For GEMM weight matrices, pack to INT8 for CPU VNNI kernel
+        // Only release raw data if NOT using multi-GPU placement (GPU needs the data for transfer)
         if (tensor && isGemmWeight(name))
         {
             // Pack weights into INT8 VNNI format (creates cached kernel via KernelFactory)
             auto *gemm_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(tensor.get());
             if (gemm_kernel)
             {
-                // Release original quantized data - kernel has packed copy
-                tensor->release_raw_data();
+                // Only release raw data if single-device (CPU only)
+                // Multi-GPU needs the raw data for device transfer
+                bool needs_gpu_transfer = placement_map_ && placement_map_->getDeviceForWeight(name, -1) > 0;
+                if (!needs_gpu_transfer)
+                {
+                    tensor->release_raw_data();
+                }
             }
         }
 

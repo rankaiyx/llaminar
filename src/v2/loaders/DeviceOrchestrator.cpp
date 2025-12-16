@@ -59,6 +59,9 @@ namespace llaminar2
         case PlacementStrategy::CUSTOM:
             return createCustomMap(model_ctx);
 
+        case PlacementStrategy::MULTI_GPU:
+            return createMultiGPUMap(model_ctx);
+
         default:
             LOG_ERROR("[DeviceOrchestrator] Unknown strategy, falling back to AUTO");
             return createAutoMap(model_ctx);
@@ -570,6 +573,190 @@ namespace llaminar2
             // Skip invalid rules
             break;
         }
+    }
+
+    // ========================================================================
+    // Phase 6: Multi-GPU Support
+    // ========================================================================
+
+    std::vector<int> DeviceOrchestrator::getAvailableGPUs() const
+    {
+        std::vector<int> gpu_indices;
+        const auto &devices = device_mgr_->devices();
+
+        for (size_t i = 0; i < devices.size(); ++i)
+        {
+            const auto &dev = devices[i];
+            if (dev.type == ComputeBackendType::GPU_CUDA ||
+                dev.type == ComputeBackendType::GPU_ROCM)
+            {
+                gpu_indices.push_back(static_cast<int>(i));
+            }
+        }
+
+        return gpu_indices;
+    }
+
+    std::shared_ptr<WeightPlacementMap> DeviceOrchestrator::createMultiGPUMap(
+        const std::shared_ptr<ModelContext> &model_ctx)
+    {
+        // Get available GPUs
+        std::vector<int> gpus;
+
+        if (!config_.gpu_devices.empty())
+        {
+            // Use user-specified GPUs
+            gpus = config_.gpu_devices;
+            logPlacementDecision("MULTI_GPU: Using user-specified GPUs: " +
+                                 std::to_string(gpus.size()) + " devices");
+        }
+        else
+        {
+            // Use all available GPUs
+            gpus = getAvailableGPUs();
+            logPlacementDecision("MULTI_GPU: Auto-detected " +
+                                 std::to_string(gpus.size()) + " GPUs");
+        }
+
+        if (gpus.empty())
+        {
+            logPlacementDecision("MULTI_GPU: No GPUs available, falling back to CPU");
+            return createAllCPUMap(model_ctx);
+        }
+
+        if (gpus.size() == 1)
+        {
+            logPlacementDecision("MULTI_GPU: Only one GPU, using ALL_GPU mode");
+            config_.gpu_device_idx = gpus[0];
+            return createAllGPUMap(model_ctx);
+        }
+
+        // Get layer count
+        int layer_count = getLayerCount(model_ctx);
+        if (layer_count <= 0)
+        {
+            logPlacementDecision("MULTI_GPU: Unknown layer count, defaulting to 24");
+            layer_count = 24;
+        }
+
+        // Log GPU details
+        const auto &devices = device_mgr_->devices();
+        for (int gpu_idx : gpus)
+        {
+            if (gpu_idx >= 0 && static_cast<size_t>(gpu_idx) < devices.size())
+            {
+                const auto &dev = devices[gpu_idx];
+                logPlacementDecision("MULTI_GPU: Device " + std::to_string(gpu_idx) +
+                                     " = " + dev.name +
+                                     " (" + std::to_string(dev.total_memory_bytes / (1024 * 1024)) + " MB)");
+            }
+        }
+
+        // Default device is first GPU (for embeddings, etc.)
+        auto map = std::make_shared<WeightPlacementMap>(gpus[0]);
+
+        // Parse split strategy
+        std::vector<float> weights;
+
+        if (config_.gpu_split == "even")
+        {
+            // Even distribution
+            float weight = 1.0f / static_cast<float>(gpus.size());
+            weights.resize(gpus.size(), weight);
+            logPlacementDecision("MULTI_GPU: Even split across " + std::to_string(gpus.size()) + " GPUs");
+        }
+        else if (config_.gpu_split.find(',') != std::string::npos)
+        {
+            // Weighted distribution: "0.6,0.4" or "0.5,0.3,0.2"
+            std::stringstream ss(config_.gpu_split);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                try
+                {
+                    weights.push_back(std::stof(token));
+                }
+                catch (...)
+                {
+                    logPlacementDecision("MULTI_GPU: Invalid weight '" + token + "', using 0.0");
+                    weights.push_back(0.0f);
+                }
+            }
+
+            // Pad with zeros or truncate to match GPU count
+            while (weights.size() < gpus.size())
+            {
+                weights.push_back(0.0f);
+            }
+            weights.resize(gpus.size());
+
+            // Normalize
+            float sum = 0.0f;
+            for (float w : weights)
+                sum += w;
+            if (sum > 0.0f)
+            {
+                for (float &w : weights)
+                    w /= sum;
+            }
+            else
+            {
+                // All zeros - fall back to even
+                float even = 1.0f / static_cast<float>(gpus.size());
+                for (float &w : weights)
+                    w = even;
+            }
+
+            logPlacementDecision("MULTI_GPU: Weighted split: " + config_.gpu_split);
+        }
+        else
+        {
+            // Unknown - default to even
+            float weight = 1.0f / static_cast<float>(gpus.size());
+            weights.resize(gpus.size(), weight);
+            logPlacementDecision("MULTI_GPU: Unknown split '" + config_.gpu_split + "', using even");
+        }
+
+        // Assign layers to GPUs based on weights
+        int current_layer = 0;
+        for (size_t i = 0; i < gpus.size() && current_layer < layer_count; ++i)
+        {
+            int layers_for_gpu = static_cast<int>(std::round(weights[i] * layer_count));
+
+            // Last GPU gets remaining layers
+            if (i == gpus.size() - 1)
+            {
+                layers_for_gpu = layer_count - current_layer;
+            }
+
+            if (layers_for_gpu > 0)
+            {
+                int start_layer = current_layer;
+                int end_layer = std::min(current_layer + layers_for_gpu - 1, layer_count - 1);
+
+                map->setLayerRange(start_layer, end_layer, gpus[i]);
+
+                logPlacementDecision("MULTI_GPU: Layers " + std::to_string(start_layer) +
+                                     "-" + std::to_string(end_layer) +
+                                     " -> GPU " + std::to_string(gpus[i]) +
+                                     " (" + devices[gpus[i]].name + ")");
+
+                current_layer = end_layer + 1;
+            }
+        }
+
+        // Embeddings on first GPU (high bandwidth access)
+        map->setPatternDevice("*embd*", gpus[0]);
+        map->setPatternDevice("token_embd.weight", gpus[0]);
+        logPlacementDecision("MULTI_GPU: Embeddings -> GPU " + std::to_string(gpus[0]));
+
+        // Output head on last GPU (close to final layers)
+        int last_gpu = gpus.back();
+        map->setPatternDevice("output.weight", last_gpu);
+        map->setPatternDevice("*lm_head*", last_gpu);
+        logPlacementDecision("MULTI_GPU: Output head -> GPU " + std::to_string(last_gpu));
+
+        return map;
     }
 
 } // namespace llaminar2

@@ -1997,6 +1997,28 @@ add_v2_test(V2_Unit_DeviceContext
     MPI_PROCS 1  # Tests CPU context locally, no MPI needed
 )
 
+# Test: MultiGPU (Phase 6 - heterogeneous GPU support with CUDA + ROCm)
+# Tests DeviceManager enumeration, backend-specific device ID mapping, 
+# tensor GPU transfers, cross-device transfers, and kernel fallbacks
+add_executable(v2_test_multi_gpu unit/backends/Test__MultiGPU.cpp)
+target_link_libraries(v2_test_multi_gpu llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MultiGPU
+    COMMAND $<TARGET_FILE:v2_test_multi_gpu>
+    LABELS "V2;Unit;DeviceManagement;MultiGPU;CUDA;ROCm;HeterogeneousBackends;TensorTransfer;KernelFallback"
+    MPI_PROCS 1  # Tests device management locally, no MPI needed
+)
+
+# Test: MultiGPU Real Model (Integration tests with actual GGUF model data)
+# Tests GPU transfers of real weight tensors, data integrity verification,
+# cross-backend transfers (CUDA ↔ ROCm), and multi-tensor GPU staging
+add_executable(v2_test_multi_gpu_real_model integration/Test__MultiGPU_RealModel.cpp)
+target_link_libraries(v2_test_multi_gpu_real_model llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_MultiGPU_RealModel
+    COMMAND $<TARGET_FILE:v2_test_multi_gpu_real_model>
+    LABELS "V2;Integration;DeviceManagement;MultiGPU;CUDA;ROCm;ModelLoading;TensorTransfer;WeightManagement"
+    MPI_PROCS 1  # Tests tensor transfers locally, no MPI needed
+)
+
 # Test: ComputeStage (device-agnostic kernel dispatch abstraction)
 # Tests all compute stage types: RMSNorm, RoPE, Attention, SwiGLU, ResidualAdd, MoE stages
 add_executable(v2_test_compute_stage unit/Test__ComputeStage.cpp)

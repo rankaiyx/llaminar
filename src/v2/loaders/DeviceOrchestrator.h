@@ -61,7 +61,8 @@ namespace llaminar2
         AUTO,          ///< Automatic based on available memory
         MEMORY_AWARE,  ///< Auto-fit layers within memory budget (Phase 2)
         MOE_OPTIMIZED, ///< MoE-aware placement (shared experts GPU, sparse CPU) (Phase 2)
-        CUSTOM         ///< User-provided custom device map string (Phase 2)
+        CUSTOM,        ///< User-provided custom device map string (Phase 2)
+        MULTI_GPU      ///< Distribute layers across multiple GPUs (Phase 6)
     };
 
     /**
@@ -85,9 +86,10 @@ namespace llaminar2
         bool moe_shared_experts_gpu = true; ///< Put MoE shared experts on GPU
         bool moe_sparse_experts_cpu = true; ///< Put MoE sparse experts on CPU
 
-        // Phase 2: Multi-GPU
+        // Phase 6: Multi-GPU
         bool multi_gpu = false;         ///< Enable multi-GPU distribution
         std::string gpu_split = "even"; ///< GPU split strategy: "even", "weighted", or "0.6,0.4"
+        std::vector<int> gpu_devices;   ///< Specific GPU device indices to use (empty = all GPUs)
 
         bool verbose = false; ///< Log placement decisions
     };
@@ -205,6 +207,22 @@ namespace llaminar2
          */
         std::shared_ptr<WeightPlacementMap> createCustomMap(
             const std::shared_ptr<ModelContext> &model_ctx);
+
+        /**
+         * @brief Create MULTI_GPU placement map (Phase 6)
+         *
+         * Distributes layers across multiple GPUs using round-robin or
+         * weighted distribution based on gpu_split config.
+         */
+        std::shared_ptr<WeightPlacementMap> createMultiGPUMap(
+            const std::shared_ptr<ModelContext> &model_ctx);
+
+        /**
+         * @brief Get list of available GPU device indices
+         *
+         * @return Vector of device indices for GPUs (CUDA or ROCm)
+         */
+        std::vector<int> getAvailableGPUs() const;
 
         /**
          * @brief Parse individual device map rule (Phase 2)

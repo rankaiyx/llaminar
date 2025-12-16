@@ -218,6 +218,10 @@ int main(int argc, char *argv[])
     {
         strategy = PlacementStrategy::CUSTOM;
     }
+    else if (args.strategy == "multi-gpu")
+    {
+        strategy = PlacementStrategy::MULTI_GPU;
+    }
     else if (args.strategy != "auto")
     {
         if (mpi_ctx->rank() == 0)
@@ -226,20 +230,26 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Auto-enable multi-gpu strategy if --multi-gpu or --gpus specified
+    if (args.multi_gpu && strategy == PlacementStrategy::AUTO)
+    {
+        strategy = PlacementStrategy::MULTI_GPU;
+    }
+
     // Create orchestration config from ArgContext
     OrchestrationConfig orch_config;
     orch_config.strategy = strategy;
     orch_config.gpu_device_idx = device_idx;
     orch_config.offload_layers = args.offload_layers;
     orch_config.verbose = args.verbose;
-    // TODO: Add new fields to OrchestrationConfig for Phase 2:
-    // orch_config.device_map = args.device_map;
-    // orch_config.max_gpu_memory_mb = args.max_gpu_memory_mb;
-    // orch_config.max_cpu_memory_mb = args.max_cpu_memory_mb;
-    // orch_config.moe_shared_experts_gpu = args.moe_shared_experts_gpu;
-    // orch_config.moe_sparse_experts_cpu = args.moe_sparse_experts_cpu;
-    // orch_config.multi_gpu = args.multi_gpu;
-    // orch_config.gpu_split = args.gpu_split;
+    orch_config.device_map = args.device_map;
+    orch_config.max_gpu_memory_mb = args.max_gpu_memory_mb;
+    orch_config.max_cpu_memory_mb = args.max_cpu_memory_mb;
+    orch_config.moe_shared_experts_gpu = args.moe_shared_experts_gpu;
+    orch_config.moe_sparse_experts_cpu = args.moe_sparse_experts_cpu;
+    orch_config.multi_gpu = args.multi_gpu;
+    orch_config.gpu_split = args.gpu_split;
+    orch_config.gpu_devices = args.gpu_devices;
 
     // Create device orchestrator
     auto device_mgr_shared = std::shared_ptr<DeviceManager>(&dm, [](DeviceManager *) {});

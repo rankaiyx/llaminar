@@ -48,9 +48,10 @@ namespace llaminar2
         bool moe_shared_experts_gpu = true; // Shared experts on GPU (for moe-optimized)
         bool moe_sparse_experts_cpu = true; // Sparse experts on CPU (for moe-optimized)
 
-        // Multi-GPU
-        bool multi_gpu = false; // Enable multi-GPU mode
-        std::string gpu_split;  // GPU split strategy: "even", "weighted", or custom ratios
+        // Multi-GPU (Phase 6)
+        bool multi_gpu = false;       // Enable multi-GPU mode
+        std::string gpu_split;        // GPU split strategy: "even", "weighted", or custom ratios
+        std::vector<int> gpu_devices; // Specific GPU device indices to use (empty = all)
 
         // Debugging/logging
         bool verbose = false;  // Deprecated: use verbose_level instead

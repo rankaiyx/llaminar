@@ -52,9 +52,9 @@ namespace llaminar2
         int device_idx,
         const PipelineConfig &config)
     {
-        // Factory doesn't have placement_map yet
-        // Use batch_size from config (defaults to 1 in PipelineConfig)
-        return std::make_unique<Qwen2Pipeline>(model_ctx, mpi_ctx, device_idx, nullptr, config, config.batch_size);
+        // Get placement map from model context (Phase 6: Multi-GPU support)
+        auto placement_map = model_ctx->placementMap();
+        return std::make_unique<Qwen2Pipeline>(model_ctx, mpi_ctx, device_idx, placement_map, config, config.batch_size);
     }
 
     /**

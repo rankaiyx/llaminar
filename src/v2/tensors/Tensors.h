@@ -620,7 +620,28 @@ namespace llaminar2
         // Device affinity
         virtual int device_index() const = 0;        // -1 = host, ≥0 = device index from DeviceManager
         virtual bool set_device(int device_idx) = 0; // Upload to device
-        virtual bool is_on_device(int device_idx) const = 0;
+
+        /**
+         * @brief Check if tensor currently has valid data on the specified device
+         *
+         * @param device_idx Device index to check:
+         *        - device_idx <= 0: Check if tensor has valid host/CPU data
+         *        - device_idx >= 1: Check if tensor is currently on that specific GPU
+         * @return true if tensor has valid data on the specified device
+         *
+         * @note This checks CURRENT location, not creation device.
+         *       A tensor can be on multiple devices simultaneously (dual-residency).
+         */
+        virtual bool is_on_device(int device_idx) const
+        {
+            if (device_idx <= 0)
+            {
+                // Asking about CPU/host - return true if host data is valid
+                return !host_invalid_;
+            }
+            // Asking about a specific GPU
+            return gpu_device_idx_ == device_idx;
+        }
 
         // ===== Lazy Transfer API (Phase 1 GPU Device-Aware Slicing) =====
         // These are NON-VIRTUAL - single implementation in TensorBase.cpp
@@ -954,7 +975,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -1141,7 +1161,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
@@ -1335,7 +1354,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
@@ -1526,7 +1544,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
@@ -1663,7 +1680,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override; // Dequantizes to cache
         float *mutable_data() override;     // Not supported
@@ -1783,7 +1799,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override; // Dequantizes to temp buffer
         float *mutable_data() override;     // Not supported for quantized tensors
@@ -2005,7 +2020,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -2235,7 +2249,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         /**
          * @brief DEPRECATED: Do not use data() on Q8_1Tensor - throws std::runtime_error
@@ -2622,7 +2635,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -2754,7 +2766,13 @@ namespace llaminar2
         {
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
-        size_t byte_size() const override { return raw_data_.size(); }
+        size_t byte_size() const override
+        {
+            // Calculate from shape, not raw_data_.size() (which may be cleared after GEMM pack)
+            // Q4_0: 32 elements per block, 18 bytes per block
+            size_t blocks_per_row = (shape_[1] + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
+            return shape_[0] * blocks_per_row * sizeof(Q4_0Block);
+        }
 
     private:
         std::vector<size_t> shape_;
@@ -2804,7 +2822,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -2991,7 +3008,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -3169,7 +3185,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -3343,7 +3358,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -3480,7 +3494,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -3625,7 +3638,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -3759,7 +3771,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -3896,7 +3907,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4037,7 +4047,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4171,7 +4180,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4339,7 +4347,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4495,7 +4502,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4651,7 +4657,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4811,7 +4816,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -4967,7 +4971,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -5127,7 +5130,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;
@@ -5283,7 +5285,6 @@ namespace llaminar2
 
         int device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
-        bool is_on_device(int device_idx) const override { return device_idx_ == device_idx; }
 
         const float *data() const override;
         float *mutable_data() override;

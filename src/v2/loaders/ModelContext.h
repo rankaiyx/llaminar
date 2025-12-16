@@ -145,6 +145,17 @@ namespace llaminar2
          */
         std::shared_ptr<WeightManager> weightManager() { return weight_manager_; }
 
+        /**
+         * @brief Get weight placement map (Phase 6: Multi-GPU support)
+         *
+         * Returns the placement map from the weight manager.
+         * @return Shared pointer to placement map (may be nullptr if single device)
+         */
+        std::shared_ptr<WeightPlacementMap> placementMap() const
+        {
+            return weight_manager_ ? weight_manager_->placementMap() : nullptr;
+        }
+
     private:
         // Private constructor - use create() factory method
     private:

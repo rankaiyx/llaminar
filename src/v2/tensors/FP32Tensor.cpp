@@ -36,6 +36,39 @@
 namespace llaminar2
 {
 
+    // Helper to get the backend for a device index
+    static IBackend *getBackendForDeviceIdx(int device_idx)
+    {
+        if (device_idx <= 0)
+            return nullptr; // CPU doesn't use IBackend
+
+        // Get device type from DeviceManager
+        const auto &devices = DeviceManager::instance().devices();
+        if (device_idx < 0 || static_cast<size_t>(device_idx) >= devices.size())
+        {
+            LOG_ERROR("[FP32Tensor] Invalid device index: " << device_idx);
+            return nullptr;
+        }
+
+        const auto &device = devices[device_idx];
+        return getBackendForDeviceType(device.type);
+    }
+
+    // Helper to get backend-specific device ID
+    static int getBackendDeviceId(int device_idx)
+    {
+        if (device_idx <= 0)
+            return 0;
+
+        const auto &devices = DeviceManager::instance().devices();
+        if (static_cast<size_t>(device_idx) >= devices.size())
+        {
+            return 0;
+        }
+
+        return devices[device_idx].device_id;
+    }
+
     FP32Tensor::FP32Tensor(const std::vector<size_t> &shape, int device_idx)
         : shape_(shape), device_idx_(device_idx), device_data_(nullptr),
           host_dirty_(false), device_dirty_(false),
@@ -48,10 +81,33 @@ namespace llaminar2
         }
         host_data_.resize(count, 0.0f);
 
-        // TODO Phase 4: Allocate device_data_ if device_idx >= 0
-        if (device_idx_ >= 0)
+        // Phase 6: Allocate GPU memory if device_idx > 0 (GPU)
+        if (device_idx_ > 0)
         {
-            LOG_DEBUG("[FP32Tensor] GPU allocation not yet implemented (device " << device_idx_ << ")");
+            IBackend *backend = getBackendForDeviceIdx(device_idx_);
+            if (backend)
+            {
+                int backend_device_id = getBackendDeviceId(device_idx_);
+                size_t bytes = count * sizeof(float);
+                device_data_ = backend->allocate(bytes, backend_device_id);
+                if (device_data_)
+                {
+                    LOG_DEBUG("[FP32Tensor] Allocated " << bytes << " bytes on device " << device_idx_
+                                                        << " (backend device " << backend_device_id << ")");
+                    // Initialize device memory from host
+                    backend->hostToDevice(device_data_, host_data_.data(), bytes, backend_device_id);
+                    device_dirty_ = false;
+                    host_dirty_ = false;
+                }
+                else
+                {
+                    LOG_ERROR("[FP32Tensor] GPU allocation failed for " << bytes << " bytes on device " << device_idx_);
+                }
+            }
+            else
+            {
+                LOG_DEBUG("[FP32Tensor] No backend available for device " << device_idx_ << ", using CPU fallback");
+            }
         }
     }
 
@@ -71,10 +127,21 @@ namespace llaminar2
 
     FP32Tensor::~FP32Tensor()
     {
-        // TODO: Free device_data_ if allocated
+        // Phase 6: Free device memory using appropriate backend
         if (device_data_)
         {
-            LOG_ERROR("[FP32Tensor] TODO: Free device data in destructor");
+            IBackend *backend = getBackendForDeviceIdx(device_idx_);
+            if (backend)
+            {
+                int backend_device_id = getBackendDeviceId(device_idx_);
+                backend->free(device_data_, backend_device_id);
+                LOG_DEBUG("[FP32Tensor] Freed device memory on device " << device_idx_);
+            }
+            else
+            {
+                LOG_ERROR("[FP32Tensor] Cannot free device data - backend unavailable for device " << device_idx_);
+            }
+            device_data_ = nullptr;
         }
     }
 
@@ -85,9 +152,60 @@ namespace llaminar2
             return true; // Already on target device
         }
 
-        // TODO: Implement actual device transfer
-        LOG_ERROR("[FP32Tensor] set_device not yet fully implemented");
+        // Phase 6: Cross-device transfer
+        size_t bytes = numel() * sizeof(float);
+
+        // Step 1: Sync current data to host if on GPU and dirty
+        if (device_data_ && device_dirty_)
+        {
+            IBackend *old_backend = getBackendForDeviceIdx(device_idx_);
+            if (old_backend)
+            {
+                int old_backend_id = getBackendDeviceId(device_idx_);
+                old_backend->deviceToHost(host_data_.data(), device_data_, bytes, old_backend_id);
+                device_dirty_ = false;
+            }
+        }
+
+        // Step 2: Free old device memory
+        if (device_data_)
+        {
+            IBackend *old_backend = getBackendForDeviceIdx(device_idx_);
+            if (old_backend)
+            {
+                int old_backend_id = getBackendDeviceId(device_idx_);
+                old_backend->free(device_data_, old_backend_id);
+            }
+            device_data_ = nullptr;
+        }
+
+        // Step 3: Update device index
         device_idx_ = device_idx;
+
+        // Step 4: Allocate on new device if GPU
+        if (device_idx_ > 0)
+        {
+            IBackend *new_backend = getBackendForDeviceIdx(device_idx_);
+            if (new_backend)
+            {
+                int new_backend_id = getBackendDeviceId(device_idx_);
+                device_data_ = new_backend->allocate(bytes, new_backend_id);
+                if (device_data_)
+                {
+                    // Copy host data to new device
+                    new_backend->hostToDevice(device_data_, host_data_.data(), bytes, new_backend_id);
+                    device_dirty_ = false;
+                    host_dirty_ = false;
+                    LOG_DEBUG("[FP32Tensor] Transferred " << bytes << " bytes to device " << device_idx_);
+                }
+                else
+                {
+                    LOG_ERROR("[FP32Tensor] set_device: allocation failed on device " << device_idx_);
+                    return false;
+                }
+            }
+        }
+
         return true;
     }
 

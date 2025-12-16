@@ -11,6 +11,7 @@
 #include "../utils/CPUFeatures.h"
 #include "../utils/Logger.h"
 #include "../backends/BackendManager.h"
+#include "../backends/ComputeBackend.h"
 #include "../kernels/KernelFactory.h"
 #include <stdexcept>
 #include <cmath>
@@ -21,6 +22,58 @@
 
 namespace llaminar2
 {
+
+    // ===== Helper functions for multi-GPU device mapping =====
+
+    /**
+     * @brief Get the appropriate backend for a global device index
+     *
+     * Maps global device index (e.g., 1, 2, 3) to the correct backend (CUDA or ROCm)
+     * based on the device type from DeviceManager.
+     *
+     * @param device_idx Global device index (0 = CPU, 1+ = GPUs)
+     * @return IBackend* for the device, or nullptr for CPU/invalid
+     */
+    static IBackend *getBackendForGlobalDeviceIdx(int device_idx)
+    {
+        if (device_idx <= 0)
+            return nullptr; // CPU doesn't use IBackend
+
+        // Get device type from DeviceManager
+        const auto &devices = DeviceManager::instance().devices();
+        if (static_cast<size_t>(device_idx) >= devices.size())
+        {
+            LOG_ERROR("[TensorBase] Invalid device index: " << device_idx
+                                                            << " (max: " << devices.size() - 1 << ")");
+            return nullptr;
+        }
+
+        const auto &device = devices[device_idx];
+        return getBackendForDeviceType(device.type);
+    }
+
+    /**
+     * @brief Convert global device index to backend-specific device ID
+     *
+     * E.g., global index 2 (second AMD GPU) -> ROCm device 0
+     *
+     * @param device_idx Global device index
+     * @return Backend-specific device ID
+     */
+    static int getBackendSpecificDeviceId(int device_idx)
+    {
+        if (device_idx <= 0)
+            return 0;
+
+        const auto &devices = DeviceManager::instance().devices();
+        if (static_cast<size_t>(device_idx) >= devices.size())
+        {
+            LOG_ERROR("[TensorBase] Invalid device index for device ID lookup: " << device_idx);
+            return 0;
+        }
+
+        return devices[device_idx].device_id;
+    }
 
     // ===== TensorBase destructor =====
     // Clears the kernel cache entry for this tensor to prevent use-after-free
@@ -486,18 +539,27 @@ namespace llaminar2
             return true;
         }
 
-        // Get backend
-        IBackend *backend = getGPUBackend();
-        if (!backend)
+        // Get backend for target device (uses DeviceManager to determine CUDA vs ROCm)
+        IBackend *target_backend = getBackendForGlobalDeviceIdx(target_device);
+        if (!target_backend)
         {
-            LOG_ERROR("[TensorBase::ensureOnDevice] No GPU backend available");
+            LOG_ERROR("[TensorBase::ensureOnDevice] No backend available for device " << target_device);
             return false;
         }
+
+        // Get backend-specific device ID (e.g., global idx 2 -> ROCm device 0)
+        int backend_device_id = getBackendSpecificDeviceId(target_device);
 
         // Free existing device memory if on different device
         if (device_data_ptr_ && gpu_device_idx_ != target_device)
         {
-            backend->free(device_data_ptr_, gpu_device_idx_);
+            // Use the OLD device's backend and device ID for freeing
+            IBackend *old_backend = getBackendForGlobalDeviceIdx(gpu_device_idx_);
+            int old_backend_device_id = getBackendSpecificDeviceId(gpu_device_idx_);
+            if (old_backend)
+            {
+                old_backend->free(device_data_ptr_, old_backend_device_id);
+            }
             device_data_ptr_ = nullptr;
             gpu_device_idx_ = -1;
         }
@@ -506,14 +568,15 @@ namespace llaminar2
         size_t bytes = byte_size();
         if (!device_data_ptr_)
         {
-            device_data_ptr_ = backend->allocate(bytes, target_device);
+            device_data_ptr_ = target_backend->allocate(bytes, backend_device_id);
             if (!device_data_ptr_)
             {
                 LOG_ERROR("[TensorBase::ensureOnDevice] Failed to allocate " << bytes
-                                                                             << " bytes on device " << target_device);
+                                                                             << " bytes on device " << target_device
+                                                                             << " (backend device ID: " << backend_device_id << ")");
                 return false;
             }
-            gpu_device_idx_ = target_device;
+            gpu_device_idx_ = target_device; // Store GLOBAL device index
         }
 
         // Upload data from host
@@ -521,16 +584,16 @@ namespace llaminar2
         if (!src)
         {
             LOG_ERROR("[TensorBase::ensureOnDevice] Host data pointer is null");
-            backend->free(device_data_ptr_, target_device);
+            target_backend->free(device_data_ptr_, backend_device_id);
             device_data_ptr_ = nullptr;
             gpu_device_idx_ = -1;
             return false;
         }
 
-        if (!backend->hostToDevice(device_data_ptr_, src, bytes, target_device))
+        if (!target_backend->hostToDevice(device_data_ptr_, src, bytes, backend_device_id))
         {
             LOG_ERROR("[TensorBase::ensureOnDevice] hostToDevice failed");
-            backend->free(device_data_ptr_, target_device);
+            target_backend->free(device_data_ptr_, backend_device_id);
             device_data_ptr_ = nullptr;
             gpu_device_idx_ = -1;
             return false;
@@ -539,7 +602,8 @@ namespace llaminar2
         host_invalid_ = false; // Host still has valid data (dual residency)
 
         LOG_DEBUG("[TensorBase::ensureOnDevice] Uploaded " << bytes
-                                                           << " bytes to device " << target_device);
+                                                           << " bytes to device " << target_device
+                                                           << " (backend device ID: " << backend_device_id << ")");
         return true;
     }
 
@@ -554,12 +618,14 @@ namespace llaminar2
         // If GPU has data, download it
         if (device_data_ptr_ && gpu_device_idx_ >= 0)
         {
-            IBackend *backend = getGPUBackend();
+            IBackend *backend = getBackendForGlobalDeviceIdx(gpu_device_idx_);
             if (!backend)
             {
-                LOG_ERROR("[TensorBase::ensureOnHost] No GPU backend available");
+                LOG_ERROR("[TensorBase::ensureOnHost] No backend available for device " << gpu_device_idx_);
                 return false;
             }
+
+            int backend_device_id = getBackendSpecificDeviceId(gpu_device_idx_);
 
             size_t bytes = byte_size();
             void *dst = raw_host_data_ptr();
@@ -569,7 +635,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (!backend->deviceToHost(dst, device_data_ptr_, bytes, gpu_device_idx_))
+            if (!backend->deviceToHost(dst, device_data_ptr_, bytes, backend_device_id))
             {
                 LOG_ERROR("[TensorBase::ensureOnHost] deviceToHost failed");
                 return false;
@@ -577,7 +643,8 @@ namespace llaminar2
 
             host_invalid_ = false;
             LOG_DEBUG("[TensorBase::ensureOnHost] Downloaded " << bytes
-                                                               << " bytes from device " << gpu_device_idx_);
+                                                               << " bytes from device " << gpu_device_idx_
+                                                               << " (backend device ID: " << backend_device_id << ")");
         }
 
         return true;
@@ -594,10 +661,11 @@ namespace llaminar2
         // Free device memory
         if (device_data_ptr_)
         {
-            IBackend *backend = getGPUBackend();
+            IBackend *backend = getBackendForGlobalDeviceIdx(gpu_device_idx_);
             if (backend)
             {
-                backend->free(device_data_ptr_, gpu_device_idx_);
+                int backend_device_id = getBackendSpecificDeviceId(gpu_device_idx_);
+                backend->free(device_data_ptr_, backend_device_id);
             }
             device_data_ptr_ = nullptr;
             LOG_DEBUG("[TensorBase::releaseDeviceMemory] Released device memory on device "

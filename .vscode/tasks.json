@@ -14,6 +14,8 @@
                 "Unix Makefiles",
                 "-DCMAKE_BUILD_TYPE=Debug",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DHAVE_CUDA=ON",
+                "-DHAVE_ROCM=ON",
                 "-DCMAKE_CXX_FLAGS_DEBUG=-g -O0 --coverage -fprofile-abs-path",
                 "-DCMAKE_C_FLAGS_DEBUG=-g -O0 --coverage -fprofile-abs-path",
                 "-DCMAKE_EXE_LINKER_FLAGS_DEBUG=--coverage"
@@ -28,7 +30,7 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "detail": "Configure V2 project with Debug settings"
+            "detail": "Configure V2 project with Debug settings (CUDA + ROCm enabled)"
         },
         {
             "label": "V2: configure (release)",
@@ -42,7 +44,9 @@
                 "-G",
                 "Unix Makefiles",
                 "-DCMAKE_BUILD_TYPE=Release",
-                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DHAVE_CUDA=ON",
+                "-DHAVE_ROCM=ON"
             ],
             "group": "build",
             "presentation": {
@@ -54,7 +58,7 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "detail": "Configure V2 project with optimized Release settings"
+            "detail": "Configure V2 project with optimized Release settings (CUDA + ROCm enabled)"
         },
         {
             "label": "V2: configure (e2e release)",
@@ -68,7 +72,9 @@
                 "-G",
                 "Unix Makefiles",
                 "-DCMAKE_BUILD_TYPE=E2ERelease",
-                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DHAVE_CUDA=ON",
+                "-DHAVE_ROCM=ON"
             ],
             "group": "build",
             "presentation": {
@@ -80,7 +86,7 @@
                 "clear": false
             },
             "problemMatcher": [],
-            "detail": "Configure V2 project with E2ERelease (Release optimizations + snapshots for E2E testing)"
+            "detail": "Configure V2 project with E2ERelease (Release optimizations + snapshots + CUDA + ROCm)"
         },
         {
             "label": "Debug Build",

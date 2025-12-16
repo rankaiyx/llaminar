@@ -27,8 +27,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 # Backend options (Phase 6: Heterogeneous Multi-GPU)
 # CUDA and ROCm CAN coexist - compiled in separate translation units
 # Enable both for mixed NVIDIA + AMD GPU systems
-option(HAVE_CUDA "Enable CUDA backend" OFF)
-option(HAVE_ROCM "Enable ROCm backend" OFF)
+# DEFAULT: ON - most development machines have at least one GPU type
+option(HAVE_CUDA "Enable CUDA backend" ON)
+option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 
 # ML Heuristic auto-retraining option

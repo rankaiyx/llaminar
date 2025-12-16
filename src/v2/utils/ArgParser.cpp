@@ -10,6 +10,7 @@
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
+#include <sstream>
 
 namespace llaminar2
 {
@@ -162,7 +163,7 @@ namespace llaminar2
                 ctx.moe_sparse_experts_cpu = true;
             }
 
-            // Multi-GPU
+            // Multi-GPU (Phase 6)
             else if (arg == "--multi-gpu")
             {
                 ctx.multi_gpu = true;
@@ -172,6 +173,29 @@ namespace llaminar2
             {
                 ctx.gpu_split = getNextArg(argv, argc, i, "gpu-split");
                 ctx.multi_gpu = true; // Automatically enable
+            }
+
+            else if (arg == "--gpus")
+            {
+                // Parse comma-separated GPU indices: --gpus 1,2,3
+                std::string gpus_str = getNextArg(argv, argc, i, "gpus");
+                std::stringstream ss(gpus_str);
+                std::string token;
+                while (std::getline(ss, token, ','))
+                {
+                    try
+                    {
+                        ctx.gpu_devices.push_back(std::stoi(token));
+                    }
+                    catch (const std::exception &e)
+                    {
+                        std::cerr << "Warning: Invalid GPU index '" << token << "', ignoring\n";
+                    }
+                }
+                if (!ctx.gpu_devices.empty())
+                {
+                    ctx.multi_gpu = true; // Automatically enable
+                }
             }
 
             // Batch size
@@ -332,9 +356,13 @@ namespace llaminar2
         std::cout << "  --moe-sparse-gpu          Sparse experts on GPU\n";
         std::cout << "  --moe-sparse-cpu          Sparse experts on CPU (default)\n\n";
 
-        std::cout << "Multi-GPU:\n";
-        std::cout << "  --multi-gpu               Enable multi-GPU mode\n";
-        std::cout << "  --gpu-split STRATEGY      GPU split: even, weighted, or custom ratios\n\n";
+        std::cout << "Multi-GPU (Phase 6):\n";
+        std::cout << "  --multi-gpu               Enable multi-GPU mode (distribute layers)\n";
+        std::cout << "  --gpus 1,2,3              Use specific GPU device indices\n";
+        std::cout << "  --gpu-split STRATEGY      Layer distribution strategy:\n";
+        std::cout << "                              even  - Equal layers per GPU (default)\n";
+        std::cout << "                              0.6,0.4 - Custom ratio (60%% GPU1, 40%% GPU2)\n";
+        std::cout << "  --strategy multi-gpu      Explicit strategy (same as --multi-gpu)\n\n";
 
         std::cout << "Performance:\n";
         std::cout << "  --threads N               Thread count (-1 = auto)\n";

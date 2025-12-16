@@ -182,6 +182,13 @@ namespace llaminar2
             const std::shared_ptr<TensorBase> &full_tensor,
             int rank, int world_size);
 
+        /**
+         * @brief Get the placement map (Phase 6: Multi-GPU support)
+         *
+         * @return Shared pointer to placement map (may be nullptr)
+         */
+        std::shared_ptr<WeightPlacementMap> placementMap() const { return placement_map_; }
+
     private:
         /**
          * @brief Load weight with replicated strategy
