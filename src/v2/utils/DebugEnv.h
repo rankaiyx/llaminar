@@ -409,6 +409,126 @@ namespace llaminar2
     };
 
     /**
+     * @brief Execution framework configuration group
+     *
+     * Controls the LayerExecutor-based pipeline execution, enabling gradual
+     * migration from imperative pipeline code to declarative compute graphs.
+     *
+     * Environment Variables:
+     *   LLAMINAR_USE_LAYER_EXECUTOR        - Enable LayerExecutor for layer execution (default: 0)
+     *   LLAMINAR_EXECUTION_MODE            - Execution mode: "sequential", "parallel", "pipelined" (default: "sequential")
+     *   LLAMINAR_EXECUTOR_PROFILING        - Enable per-stage profiling in LayerExecutor (default: 0)
+     *   LLAMINAR_EXECUTOR_VALIDATION       - Enable output validation after each stage (default: 0)
+     *   LLAMINAR_AUTO_WEIGHT_TRANSFER      - Auto-transfer weights to target device (default: 1)
+     *
+     * Feature Flags:
+     *   These flags enable incremental migration of pipeline operations:
+     *   LLAMINAR_EXEC_RMSNORM              - Use ComputeStage for RMSNorm (default: 0)
+     *   LLAMINAR_EXEC_ROPE                 - Use ComputeStage for RoPE (default: 0)
+     *   LLAMINAR_EXEC_ATTENTION            - Use ComputeStage for Attention (default: 0)
+     *   LLAMINAR_EXEC_GEMM                 - Use ComputeStage for GEMM (default: 0)
+     *   LLAMINAR_EXEC_SWIGLU               - Use ComputeStage for SwiGLU (default: 0)
+     *   LLAMINAR_EXEC_RESIDUAL             - Use ComputeStage for residual add (default: 0)
+     *
+     * Example Usage:
+     *   # Enable executor with RMSNorm only (safe first migration step)
+     *   LLAMINAR_USE_LAYER_EXECUTOR=1 LLAMINAR_EXEC_RMSNORM=1 ./run_llaminar.sh ...
+     *
+     *   # Enable all stages with profiling
+     *   LLAMINAR_USE_LAYER_EXECUTOR=1 LLAMINAR_EXECUTOR_PROFILING=1 ./run_llaminar.sh ...
+     */
+    struct ExecutionConfig
+    {
+        bool use_layer_executor = false;           ///< Master switch for LayerExecutor
+        std::string execution_mode = "sequential"; ///< Execution mode
+        bool executor_profiling = false;           ///< Enable stage profiling
+        bool executor_validation = false;          ///< Validate outputs after each stage
+        bool auto_weight_transfer = true;          ///< Auto-transfer weights to device
+
+        // Per-operation feature flags (enable incremental migration)
+        bool exec_rmsnorm = false;   ///< Use ComputeStage for RMSNorm
+        bool exec_rope = false;      ///< Use ComputeStage for RoPE
+        bool exec_attention = false; ///< Use ComputeStage for Attention
+        bool exec_gemm = false;      ///< Use ComputeStage for GEMM
+        bool exec_swiglu = false;    ///< Use ComputeStage for SwiGLU
+        bool exec_residual = false;  ///< Use ComputeStage for residual add
+
+        ExecutionConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *use_exec_env = std::getenv("LLAMINAR_USE_LAYER_EXECUTOR");
+            if (use_exec_env)
+            {
+                use_layer_executor = (std::atoi(use_exec_env) != 0);
+            }
+
+            const char *mode_env = std::getenv("LLAMINAR_EXECUTION_MODE");
+            if (mode_env)
+            {
+                execution_mode = mode_env;
+            }
+
+            const char *prof_env = std::getenv("LLAMINAR_EXECUTOR_PROFILING");
+            if (prof_env)
+            {
+                executor_profiling = (std::atoi(prof_env) != 0);
+            }
+
+            const char *valid_env = std::getenv("LLAMINAR_EXECUTOR_VALIDATION");
+            if (valid_env)
+            {
+                executor_validation = (std::atoi(valid_env) != 0);
+            }
+
+            const char *auto_xfer_env = std::getenv("LLAMINAR_AUTO_WEIGHT_TRANSFER");
+            if (auto_xfer_env)
+            {
+                auto_weight_transfer = (std::atoi(auto_xfer_env) != 0);
+            }
+
+            // Per-operation flags
+            const char *rmsnorm_env = std::getenv("LLAMINAR_EXEC_RMSNORM");
+            if (rmsnorm_env)
+                exec_rmsnorm = (std::atoi(rmsnorm_env) != 0);
+
+            const char *rope_env = std::getenv("LLAMINAR_EXEC_ROPE");
+            if (rope_env)
+                exec_rope = (std::atoi(rope_env) != 0);
+
+            const char *attn_env = std::getenv("LLAMINAR_EXEC_ATTENTION");
+            if (attn_env)
+                exec_attention = (std::atoi(attn_env) != 0);
+
+            const char *gemm_env = std::getenv("LLAMINAR_EXEC_GEMM");
+            if (gemm_env)
+                exec_gemm = (std::atoi(gemm_env) != 0);
+
+            const char *swiglu_env = std::getenv("LLAMINAR_EXEC_SWIGLU");
+            if (swiglu_env)
+                exec_swiglu = (std::atoi(swiglu_env) != 0);
+
+            const char *residual_env = std::getenv("LLAMINAR_EXEC_RESIDUAL");
+            if (residual_env)
+                exec_residual = (std::atoi(residual_env) != 0);
+
+            // GEMM execution requires all other stages to maintain correct data flow
+            // When exec_gemm=true, implicitly enable the full pipeline
+            if (exec_gemm)
+            {
+                exec_rmsnorm = true;
+                exec_rope = true;
+                exec_attention = true;
+                exec_swiglu = true;
+                exec_residual = true;
+            }
+        }
+    };
+
+    /**
      * @brief Snapshot and tensor dump configuration group
      *
      * Controls the snapshot framework for E2E parity testing and debugging.
@@ -621,6 +741,271 @@ namespace llaminar2
     };
 
     /**
+     * @brief Configuration for compute stage input/output dumping
+     *
+     * Enables first-class debugging of individual compute stages by dumping
+     * all inputs, outputs, and parameters to disk for later analysis or replay.
+     *
+     * Unlike SnapshotConfig (which captures tensor values at pipeline stages),
+     * StageDumpConfig captures the exact kernel-level inputs for any ComputeStage:
+     * - GEMM: A matrix, B tensor (with dequant info), C output, dimensions
+     * - RMSNorm: input, gamma weights, output, eps
+     * - Attention: Q/K/V projections (Q8_1 blocks), mask, scale, output
+     * - SwiGLU: gate input, up input, output
+     * - etc.
+     *
+     * Environment Variables:
+     * - LLAMINAR_STAGE_DUMP_ENABLED=1          Master enable for stage dumping
+     * - LLAMINAR_STAGE_DUMP_DIR=/path          Output directory (default: /tmp/llaminar_stage_dumps)
+     * - LLAMINAR_STAGE_DUMP_TYPES=GEMM,ATTENTION  Stage types to dump (default: all)
+     * - LLAMINAR_STAGE_DUMP_LAYERS=0,1,5       Layer indices to dump (default: all)
+     * - LLAMINAR_STAGE_DUMP_RANK=0             MPI rank to dump (-1=all, default: 0)
+     * - LLAMINAR_STAGE_DUMP_MAX=100            Maximum dumps per type (prevent disk explosion)
+     * - LLAMINAR_STAGE_DUMP_INPUTS=1           Dump input tensors (default: 1)
+     * - LLAMINAR_STAGE_DUMP_OUTPUTS=1          Dump output tensors (default: 1)
+     * - LLAMINAR_STAGE_DUMP_WEIGHTS=1          Dump weight tensors (default: 1)
+     * - LLAMINAR_STAGE_DUMP_ITERATION=0,1,2    Specific decode iterations to dump (default: all)
+     *
+     * Stage Types (from ComputeStageType enum):
+     *   GEMM, GEMM_BIAS, GEMM_FUSED_QKV, RMS_NORM, LAYER_NORM, SWIGLU, GELU, SILU,
+     *   ROPE, ATTENTION, ATTENTION_QK, ATTENTION_SOFTMAX, ATTENTION_V,
+     *   ADD_RESIDUAL, SCALE, MOE_ROUTER, MOE_EXPERT_FFN, MOE_COMBINE,
+     *   ALLREDUCE, ALLGATHER, COPY, QUANTIZE, DEQUANTIZE
+     *
+     * Output Format:
+     *   <dump_dir>/stage_<counter>_<type>_layer<N>/
+     *     metadata.txt        - Human-readable parameters
+     *     params.bin          - Binary struct for replay
+     *     input_A.bin         - Input matrix A (FP32 or Q8_1 blocks)
+     *     input_B_dequant.bin - Weight tensor dequantized to FP32
+     *     input_B_raw.bin     - Raw quantized weight data
+     *     output_C.bin        - Output tensor
+     *     <stage-specific files>
+     *
+     * Example Usage:
+     *   # Dump all GEMM stages in layer 0
+     *   LLAMINAR_STAGE_DUMP_ENABLED=1 \
+     *   LLAMINAR_STAGE_DUMP_TYPES=GEMM \
+     *   LLAMINAR_STAGE_DUMP_LAYERS=0 \
+     *   ./run_llaminar.sh -m model.gguf -p "test"
+     *
+     *   # Dump attention stages for first decode iteration only
+     *   LLAMINAR_STAGE_DUMP_ENABLED=1 \
+     *   LLAMINAR_STAGE_DUMP_TYPES=ATTENTION \
+     *   LLAMINAR_STAGE_DUMP_ITERATION=0 \
+     *   ./run_llaminar.sh -m model.gguf -p "test"
+     */
+    struct StageDumpConfig
+    {
+        bool enabled = false;                               ///< Master enable for stage dumping
+        std::string dump_dir = "/tmp/llaminar_stage_dumps"; ///< Output directory
+        std::set<std::string> dump_types;                   ///< Stage types to dump (empty=all)
+        std::set<int> dump_layers;                          ///< Layer indices to dump (empty=all)
+        std::set<int> dump_iterations;                      ///< Decode iterations to dump (empty=all)
+        int dump_rank = 0;                                  ///< MPI rank to dump (-1=all)
+        int max_dumps_per_type = 100;                       ///< Max dumps per stage type (prevent disk explosion)
+        bool dump_inputs = true;                            ///< Dump input tensors
+        bool dump_outputs = true;                           ///< Dump output tensors
+        bool dump_weights = true;                           ///< Dump weight tensors
+        bool dump_all_types = true;                         ///< Whether to dump all stage types
+        bool dump_all_layers = true;                        ///< Whether to dump all layers
+        bool dump_all_iterations = true;                    ///< Whether to dump all iterations
+
+        StageDumpConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            const char *enabled_env = std::getenv("LLAMINAR_STAGE_DUMP_ENABLED");
+            if (enabled_env)
+            {
+                enabled = (std::atoi(enabled_env) != 0);
+            }
+
+            const char *dir_env = std::getenv("LLAMINAR_STAGE_DUMP_DIR");
+            if (dir_env)
+            {
+                dump_dir = dir_env;
+            }
+
+            const char *types_env = std::getenv("LLAMINAR_STAGE_DUMP_TYPES");
+            if (types_env)
+            {
+                std::string types_str(types_env);
+                if (types_str == "all")
+                {
+                    dump_all_types = true;
+                    dump_types.clear();
+                }
+                else
+                {
+                    dump_all_types = false;
+                    dump_types.clear();
+                    std::istringstream iss(types_str);
+                    std::string token;
+                    while (std::getline(iss, token, ','))
+                    {
+                        token.erase(0, token.find_first_not_of(" \t"));
+                        token.erase(token.find_last_not_of(" \t") + 1);
+                        if (!token.empty())
+                        {
+                            dump_types.insert(token);
+                        }
+                    }
+                }
+            }
+
+            const char *layers_env = std::getenv("LLAMINAR_STAGE_DUMP_LAYERS");
+            if (layers_env)
+            {
+                std::string layers_str(layers_env);
+                if (layers_str == "all")
+                {
+                    dump_all_layers = true;
+                    dump_layers.clear();
+                }
+                else
+                {
+                    dump_all_layers = false;
+                    dump_layers.clear();
+                    std::istringstream iss(layers_str);
+                    std::string token;
+                    while (std::getline(iss, token, ','))
+                    {
+                        token.erase(0, token.find_first_not_of(" \t"));
+                        token.erase(token.find_last_not_of(" \t") + 1);
+                        if (!token.empty())
+                        {
+                            dump_layers.insert(std::atoi(token.c_str()));
+                        }
+                    }
+                }
+            }
+
+            const char *iterations_env = std::getenv("LLAMINAR_STAGE_DUMP_ITERATION");
+            if (iterations_env)
+            {
+                std::string iter_str(iterations_env);
+                if (iter_str == "all")
+                {
+                    dump_all_iterations = true;
+                    dump_iterations.clear();
+                }
+                else
+                {
+                    dump_all_iterations = false;
+                    dump_iterations.clear();
+                    std::istringstream iss(iter_str);
+                    std::string token;
+                    while (std::getline(iss, token, ','))
+                    {
+                        token.erase(0, token.find_first_not_of(" \t"));
+                        token.erase(token.find_last_not_of(" \t") + 1);
+                        if (!token.empty())
+                        {
+                            dump_iterations.insert(std::atoi(token.c_str()));
+                        }
+                    }
+                }
+            }
+
+            const char *rank_env = std::getenv("LLAMINAR_STAGE_DUMP_RANK");
+            if (rank_env)
+            {
+                dump_rank = std::atoi(rank_env);
+            }
+
+            const char *max_env = std::getenv("LLAMINAR_STAGE_DUMP_MAX");
+            if (max_env)
+            {
+                max_dumps_per_type = std::atoi(max_env);
+            }
+
+            const char *inputs_env = std::getenv("LLAMINAR_STAGE_DUMP_INPUTS");
+            if (inputs_env)
+            {
+                dump_inputs = (std::atoi(inputs_env) != 0);
+            }
+
+            const char *outputs_env = std::getenv("LLAMINAR_STAGE_DUMP_OUTPUTS");
+            if (outputs_env)
+            {
+                dump_outputs = (std::atoi(outputs_env) != 0);
+            }
+
+            const char *weights_env = std::getenv("LLAMINAR_STAGE_DUMP_WEIGHTS");
+            if (weights_env)
+            {
+                dump_weights = (std::atoi(weights_env) != 0);
+            }
+        }
+
+        /**
+         * @brief Check if a stage type should be dumped
+         * @param type_name Stage type name (e.g., "GEMM", "ATTENTION")
+         * @return true if this stage type should be dumped
+         */
+        bool shouldDumpType(const std::string &type_name) const
+        {
+            return dump_all_types || dump_types.count(type_name) > 0;
+        }
+
+        /**
+         * @brief Check if a specific layer should be dumped
+         * @param layer_idx Layer index (-1 for non-layer stages)
+         * @return true if this layer should be dumped
+         */
+        bool shouldDumpLayer(int layer_idx) const
+        {
+            if (layer_idx < 0)
+                return true; // Non-layer stages always pass layer filter
+            return dump_all_layers || dump_layers.count(layer_idx) > 0;
+        }
+
+        /**
+         * @brief Check if a specific iteration should be dumped
+         * @param iteration Decode iteration index (-1 for prefill)
+         * @return true if this iteration should be dumped
+         */
+        bool shouldDumpIteration(int iteration) const
+        {
+            if (iteration < 0)
+                return true; // Prefill always passes iteration filter
+            return dump_all_iterations || dump_iterations.count(iteration) > 0;
+        }
+
+        /**
+         * @brief Check if this MPI rank should perform dumps
+         * @param rank Current MPI rank
+         * @return true if this rank should dump
+         */
+        bool shouldDumpRank(int rank) const
+        {
+            return dump_rank == -1 || dump_rank == rank;
+        }
+
+        /**
+         * @brief Full filter: check if a stage execution should be dumped
+         * @param type_name Stage type name
+         * @param layer_idx Layer index (-1 for non-layer stages)
+         * @param iteration Decode iteration (-1 for prefill)
+         * @param rank MPI rank
+         * @return true if this stage execution should be dumped
+         */
+        bool shouldDump(const std::string &type_name, int layer_idx, int iteration, int rank) const
+        {
+            if (!enabled)
+                return false;
+            return shouldDumpType(type_name) &&
+                   shouldDumpLayer(layer_idx) &&
+                   shouldDumpIteration(iteration) &&
+                   shouldDumpRank(rank);
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
@@ -629,8 +1014,10 @@ namespace llaminar2
         GemmConfig gemm;
         ProfileConfig profile;
         RMSNormConfig rmsnorm;
-        AttentionConfig attention; ///< Q8_1 attention precision configuration
-        SnapshotConfig snapshot;   ///< Snapshot and tensor dump configuration
+        AttentionConfig attention;  ///< Q8_1 attention precision configuration
+        ExecutionConfig execution;  ///< LayerExecutor framework configuration
+        SnapshotConfig snapshot;    ///< Snapshot and tensor dump configuration
+        StageDumpConfig stage_dump; ///< Compute stage input/output dumping
 
         // Add more config groups as needed:
         // NumaConfig numa;
@@ -644,7 +1031,9 @@ namespace llaminar2
             profile.reload();
             rmsnorm.reload();
             attention.reload();
+            execution.reload();
             snapshot.reload();
+            stage_dump.reload();
         }
     };
 

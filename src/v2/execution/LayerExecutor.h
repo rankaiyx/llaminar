@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include "ILayerExecutor.h"
 #include "ComputeStage.h"
 #include "DeviceContext.h"
 #include "WorkDistributor.h"
@@ -41,15 +42,8 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
 
-    /**
-     * @brief Execution mode for LayerExecutor
-     */
-    enum class ExecutionMode
-    {
-        SEQUENTIAL, ///< Execute stages one at a time (debugging)
-        PARALLEL,   ///< Execute independent stages in parallel
-        PIPELINED   ///< Overlap stages where possible (future)
-    };
+    // ExecutionMode, StageSnapshotCallback, LayerExecutorConfig, and LayerExecutorStats
+    // are now defined in ILayerExecutor.h
 
     /**
      * @brief Represents a node in the compute graph
@@ -165,36 +159,6 @@ namespace llaminar2
     };
 
     /**
-     * @brief Configuration for LayerExecutor
-     */
-    struct LayerExecutorConfig
-    {
-        ExecutionMode mode = ExecutionMode::SEQUENTIAL;
-        bool enable_profiling = false;  ///< Track per-stage timing
-        bool enable_validation = false; ///< Validate outputs after each stage
-        int default_device = 0;         ///< Default device for stages
-    };
-
-    /**
-     * @brief Layer execution statistics
-     */
-    struct LayerExecutorStats
-    {
-        size_t total_stages_executed = 0;
-        size_t total_flops = 0;
-        double total_time_ms = 0.0;
-        std::unordered_map<std::string, double> stage_times_ms;
-
-        void reset()
-        {
-            total_stages_executed = 0;
-            total_flops = 0;
-            total_time_ms = 0.0;
-            stage_times_ms.clear();
-        }
-    };
-
-    /**
      * @brief Orchestrates execution of compute stages within a layer
      *
      * LayerExecutor manages the execution of transformer blocks (attention, FFN)
@@ -213,7 +177,7 @@ namespace llaminar2
      * executor.execute(ffn_graph, ctx);
      * @endcode
      */
-    class LayerExecutor
+    class LayerExecutor : public ILayerExecutor
     {
     public:
         /**
@@ -221,7 +185,7 @@ namespace llaminar2
          * @param config Executor configuration
          */
         explicit LayerExecutor(const LayerExecutorConfig &config = LayerExecutorConfig());
-        ~LayerExecutor();
+        ~LayerExecutor() override;
 
         // Non-copyable, movable
         LayerExecutor(const LayerExecutor &) = delete;
@@ -230,33 +194,58 @@ namespace llaminar2
         LayerExecutor &operator=(LayerExecutor &&) = default;
 
         // =========================================================================
-        // Configuration
+        // Configuration (ILayerExecutor interface)
         // =========================================================================
 
         /**
          * @brief Get current configuration
          */
-        const LayerExecutorConfig &config() const { return config_; }
+        const LayerExecutorConfig &config() const override { return config_; }
 
         /**
          * @brief Set execution mode
          */
-        void setExecutionMode(ExecutionMode mode) { config_.mode = mode; }
+        void setExecutionMode(ExecutionMode mode) override { config_.mode = mode; }
 
         /**
          * @brief Get current execution mode
          */
-        ExecutionMode executionMode() const { return config_.mode; }
+        ExecutionMode executionMode() const override { return config_.mode; }
 
         /**
          * @brief Enable/disable profiling
          */
-        void setProfilingEnabled(bool enabled) { config_.enable_profiling = enabled; }
+        void setProfilingEnabled(bool enabled) override { config_.enable_profiling = enabled; }
 
         /**
          * @brief Enable/disable output validation
          */
-        void setValidationEnabled(bool enabled) { config_.enable_validation = enabled; }
+        void setValidationEnabled(bool enabled) override { config_.enable_validation = enabled; }
+
+        /**
+         * @brief Set snapshot callback for debugging
+         *
+         * When set, this callback is invoked after each compute stage executes,
+         * allowing capture of intermediate tensors for comparison.
+         *
+         * @param callback Function called with (node_name, snapshot_info) after each stage
+         */
+        void setSnapshotCallback(StageSnapshotCallback callback) override { config_.snapshot_callback = std::move(callback); }
+
+        /**
+         * @brief Set the current layer context for stage dumping
+         */
+        void setCurrentLayerIdx(int layer_idx) override { config_.current_layer_idx = layer_idx; }
+
+        /**
+         * @brief Set the current iteration context for stage dumping
+         */
+        void setCurrentIteration(int iteration) override { config_.current_iteration = iteration; }
+
+        /**
+         * @brief Set the MPI rank for stage dumping
+         */
+        void setMPIRank(int rank) override { config_.mpi_rank = rank; }
 
         // =========================================================================
         // Graph Building - Attention Block
@@ -384,13 +373,17 @@ namespace llaminar2
         // Execution
         // =========================================================================
 
+        // =========================================================================
+        // Execution (ILayerExecutor interface)
+        // =========================================================================
+
         /**
          * @brief Execute a compute graph
          * @param graph The compute graph to execute
          * @param ctx Device context for execution
          * @return true on success
          */
-        bool execute(ComputeGraph &graph, IDeviceContext *ctx);
+        bool execute(ComputeGraph &graph, IDeviceContext *ctx) override;
 
         /**
          * @brief Execute a compute graph with multi-device support
@@ -400,21 +393,21 @@ namespace llaminar2
          */
         bool executeMultiDevice(
             ComputeGraph &graph,
-            const std::unordered_map<int, IDeviceContext *> &contexts);
+            const std::unordered_map<int, IDeviceContext *> &contexts) override;
 
         // =========================================================================
-        // Statistics
+        // Statistics (ILayerExecutor interface)
         // =========================================================================
 
         /**
          * @brief Get execution statistics
          */
-        const LayerExecutorStats &stats() const { return stats_; }
+        const LayerExecutorStats &stats() const override { return stats_; }
 
         /**
          * @brief Reset statistics
          */
-        void resetStats() { stats_.reset(); }
+        void resetStats() override { stats_.reset(); }
 
     private:
         LayerExecutorConfig config_;

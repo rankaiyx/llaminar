@@ -506,7 +506,7 @@ The `WorkDistributor` supports MoE via:
    - `apply_rope()` → ROPE flag
 5. ✅ All 149 unit tests passing
 
-### Phase 6: Multi-GPU (Week 5+)
+### Phase 6: Multi-GPU Infrastructure ✅ COMPLETE
 
 1. ✅ Enable CUDA + ROCm in same binary (heterogeneous multi-GPU)
    - Created separate GPU enumeration compilation units (CUDAEnumeration.cu, ROCmEnumeration.cpp)
@@ -515,6 +515,216 @@ The `WorkDistributor` supports MoE via:
 2. ☐ Enable multiple GPUs per rank in DeviceManager
 3. ☐ Implement layer-wise GPU assignment
 4. ☐ Add GPU-aware MPI (NCCL for NVIDIA, RCCL for AMD)
+
+### Phase 7: Kernel Execution (CPU) - IN PROGRESS
+
+**Problem**: The executor framework infrastructure is complete but compute stages are placeholders:
+- ✅ RMSNormStage, SwiGLUStage, ResidualAddStage, RoPEStage, AttentionStage - **IMPLEMENTED**
+- ❌ GEMMStage - **PLACEHOLDER** (just logs and returns true)
+
+**Goal**: Wire GEMMStage to existing production kernels so the executor path produces correct output.
+
+#### 7.1 Current Kernel Architecture (Legacy Path)
+
+The legacy pipeline uses these kernel patterns:
+
+```
+Qwen2Pipeline::attention_block():
+  ├─ FusedGEMM(wq, wk, wv) → Fused 3-way QKV projection
+  │     └─ Uses KernelFactory::getOrCreateGemm() for each weight
+  │     └─ Quantizes activations ONCE, runs 3 GEMMs
+  │
+  ├─ apply_rope() → RoPEKernel (CPU primitives)
+  │
+  ├─ MpiAttentionOrchestrator::compute()
+  │     └─ Updates KV cache
+  │     └─ GQAAttention::compute() for Q*K^T, softmax, *V
+  │
+  └─ project_row_parallel(wo) → Single GEMM + allreduce
+
+Qwen2Pipeline::ffn_block():
+  ├─ FusedGEMM(gate, up) → Fused 2-way GateUp projection
+  │
+  ├─ swiglu() → SwiGLUPrimitives (CPU SIMD)
+  │
+  └─ project_row_parallel(down) → Single GEMM + allreduce
+```
+
+#### 7.2 Kernel Mapping for Executor Stages
+
+| Stage | Current Implementation | Production Kernel to Wire |
+|-------|------------------------|---------------------------|
+| `GEMMStage` | Placeholder | `KernelFactory::getOrCreateGemm(B)->multiply()` |
+| `RMSNormStage` | ✅ Implemented inline | Already works |
+| `RoPEStage` | ✅ Implemented inline | Already works |
+| `AttentionStage` | ✅ Implemented inline | Already works (naive, see note) |
+| `SwiGLUStage` | ✅ Implemented inline | Already works |
+| `ResidualAddStage` | ✅ Implemented inline | Already works |
+| `FusedGEMMStage` | **NEW NEEDED** | `FusedGEMM::execute()` |
+
+**Note on AttentionStage**: Current inline implementation is correct but naive (O(n²) memory for scores).
+The legacy path uses `GQAAttention` which has better memory characteristics. For production, we may
+want to wire AttentionStage to GQAAttention, but the inline version is functionally correct.
+
+#### 7.3 GEMMStage Implementation Plan
+
+**File**: `src/v2/execution/ComputeStage.cpp` (GEMMStage::execute)
+
+```cpp
+bool GEMMStage::execute(IDeviceContext *ctx)
+{
+    if (!ctx || !params_.A || !params_.B || !params_.C) {
+        LOG_ERROR("[GEMMStage] Invalid parameters");
+        return false;
+    }
+
+    // Get cached kernel from KernelFactory (handles weight packing once)
+    auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.B);
+    if (!gemm) {
+        LOG_ERROR("[GEMMStage] Failed to get GEMM kernel for weight tensor");
+        return false;
+    }
+
+    // Cast to QuantisedGemmKernel if available (for full API access)
+    auto *qgemm = dynamic_cast<gemm_v4::QuantisedGemmKernel*>(gemm);
+    if (qgemm) {
+        // Quantized GEMM path: FP32 activations, quantized weights
+        return qgemm->multiply(
+            static_cast<const float*>(params_.A),
+            static_cast<float*>(params_.C),
+            params_.m, params_.n, params_.k,
+            params_.transpose_B,
+            params_.alpha, params_.beta,
+            nullptr, // no bias in GEMMStage (added separately)
+            -1       // device_idx (not used for CPU)
+        );
+    }
+
+    // FP32 GEMM fallback (for non-quantized weights)
+    return gemm->multiply(
+        static_cast<const float*>(params_.A),
+        static_cast<float*>(params_.C),
+        params_.m, params_.n, params_.k,
+        params_.alpha, params_.beta
+    );
+}
+```
+
+**Key insight**: The existing `KernelFactory::getOrCreateGemm()` caches packed weights.
+We MUST use the cached kernel, not create new ones (would re-pack weights every call!).
+
+#### 7.4 FusedGEMMStage (New Stage)
+
+**Problem**: QKV and GateUp projections share a common input (normalized activations).
+Quantizing the input once for multiple GEMMs saves significant overhead.
+
+**File**: `src/v2/execution/ComputeStage.h` (new class)
+
+```cpp
+/**
+ * @brief Fused multi-GEMM stage for QKV/GateUp patterns
+ *
+ * Quantizes activations once, executes N GEMMs with shared quantized data.
+ * Replaces N separate GEMMStage nodes for better performance.
+ */
+class FusedGEMMStage : public IComputeStage
+{
+public:
+    struct Projection {
+        const TensorBase* weight;  ///< Weight tensor (k × n)
+        void* output;              ///< Output buffer (m × n)
+        const float* bias;         ///< Optional bias (n)
+        int n;                     ///< Output dimension
+    };
+
+    struct Params {
+        const void* A;                      ///< Shared input activations (m × k)
+        std::vector<Projection> projections; ///< List of projections
+        int m, k;                           ///< Input dimensions
+    };
+
+    explicit FusedGEMMStage(Params params);
+
+    bool execute(IDeviceContext *ctx) override;
+    ComputeStageType type() const override { return ComputeStageType::GEMM; }
+    // ... etc
+};
+```
+
+**Implementation**: Creates `FusedGEMM` instance and calls `execute()`.
+
+#### 7.5 Updated Qwen2LayerExecutor Graph Building
+
+**Current** (builds separate Q, K, V GEMMStages):
+```cpp
+// 3 separate GEMM stages - inefficient (quantizes input 3 times)
+graph.addNode("q_proj", createGEMM(...wq...), device);
+graph.addNode("k_proj", createGEMM(...wk...), device);
+graph.addNode("v_proj", createGEMM(...wv...), device);
+```
+
+**Target** (single FusedGEMMStage):
+```cpp
+// 1 fused stage - quantizes input once
+FusedGEMMStage::Params qkv_params{
+    buffers.normalized->data(),
+    {{layer.wq, buffers.Q->mutable_data(), q_bias, n_q},
+     {layer.wk, buffers.K->mutable_data(), k_bias, n_kv},
+     {layer.wv, buffers.V->mutable_data(), v_bias, n_kv}},
+    seq_len, d_model
+};
+graph.addNode("qkv_fused", ComputeStageFactory::createFusedGEMM(qkv_params), device);
+```
+
+#### 7.6 Implementation Order
+
+1. **GEMMStage::execute()** - Wire to KernelFactory (single GEMM)
+   - Unblocks Wo and Down projections
+   - ~20 lines of code
+
+2. **Test separate GEMMs** - Verify Q, K, V, Wo, Gate, Up, Down work individually
+   - May be inefficient but correct
+
+3. **FusedGEMMStage** - Add new stage type
+   - ~100 lines new code
+   - Wire to existing FusedGEMM class
+
+4. **Update Qwen2LayerExecutor** - Replace 3 GEMMStages with FusedGEMMStage
+   - Modify buildAttentionGraph() and buildFFNGraph()
+
+5. **End-to-end test** - Run with `LLAMINAR_USE_LAYER_EXECUTOR=1`
+   - Should produce correct output matching legacy path
+
+#### 7.7 Required File Changes
+
+| File | Change |
+|------|--------|
+| `ComputeStage.cpp` | Implement GEMMStage::execute() with KernelFactory |
+| `ComputeStage.h` | Add FusedGEMMStage class declaration |
+| `ComputeStage.cpp` | Add FusedGEMMStage::execute() implementation |
+| `ComputeStageFactory` | Add createFusedGEMM() factory method |
+| `Qwen2LayerExecutor.cpp` | Replace separate GEMM nodes with fused nodes |
+
+#### 7.8 Verification Strategy
+
+```bash
+# Test with separate GEMMs first (less efficient but correct)
+LLAMINAR_USE_LAYER_EXECUTOR=1 \
+LLAMINAR_EXEC_GEMM=1 \
+./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf \
+    -p "The capital of France is" -n 10 -t 0
+
+# Should output: "Paris. It is the largest city..."
+```
+
+After FusedGEMMStage:
+```bash
+# Test with fused QKV/GateUp
+LLAMINAR_USE_LAYER_EXECUTOR=1 \
+LLAMINAR_EXEC_GEMM=1 \
+LLAMINAR_EXEC_FUSED_GEMM=1 \  # New flag
+./run_llaminar.sh ...
+```
 
 ## File Structure
 
@@ -576,8 +786,235 @@ The new architecture will be introduced alongside existing code:
 4. **NCCL integration**: Use NCCL for GPU allreduce or stage through CPU?
 5. **Layer-level parallelism**: Can we truly run attention+FFN in parallel regions?
 
+### Phase 8: Precision-Aware Execution Graph - PLANNED
+
+**Problem Statement:**
+
+All `ComputeStage` implementations are currently hardcoded to FP32:
+
+```cpp
+// Current ResidualAddStage::execute() - WRONG for Q8_1!
+const float *input = static_cast<const float *>(params_.input);
+const float *residual = static_cast<const float *>(params_.residual);
+float *output = static_cast<float *>(params_.output);
+```
+
+When `activation_precision = Q8_1`, buffers contain `Q8_1Block` data (36 bytes per 32 elements),
+not floats. Casting to `float*` produces garbage output.
+
+Meanwhile, the legacy pipeline's typed ops (`ResidualOpTyped<P>`, `RMSNormOpTyped<P>`, etc.)
+properly handle all precisions including Q8_1.
+
+**Goal:** Make the execution graph precision-aware without duplicating code.
+
+#### 8.1 Current Architecture Gap
+
+| Component | Legacy Pipeline | Execution Graph | Status |
+|-----------|-----------------|-----------------|--------|
+| Residual Add | `ResidualOpTyped<P>` | `ResidualAddStage` (FP32 only) | ❌ Gap |
+| RMSNorm | `RMSNormOpTyped<P>` | `RMSNormStage` (FP32 only) | ❌ Gap |
+| SwiGLU | `SwiGLUOpTyped<P>` | `SwiGLUStage` (FP32 only) | ❌ Gap |
+| RoPE | `RoPEOpTyped<P>` | `RoPEStage` (FP32 only) | ❌ Gap |
+| Attention | `CPUAttentionKernelTyped<P>` | `AttentionStage` (FP32 only) | ❌ Gap |
+| GEMM | `QuantisedGemmKernel` | `GEMMStage` | ✅ Works |
+
+**Key Insight:** The typed ops in `src/v2/pipelines/ops/` already implement correct
+precision handling. We should delegate to them, not reimplement.
+
+#### 8.2 Design Approach: Delegation Pattern
+
+Instead of templating all stages or adding if/else chains, we'll use **delegation**:
+
+```cpp
+// New: ResidualAddStage delegates to IResidualOp
+class ResidualAddStage : public IComputeStage {
+public:
+    struct Params {
+        TensorBase* input;      // Changed from void* - tensor knows its precision!
+        TensorBase* residual;
+        TensorBase* output;
+        int rows, cols;         // For dimension tracking
+        ActivationPrecision precision; // Runtime precision selector
+    };
+
+    bool execute(IDeviceContext *ctx) override {
+        // Create appropriate typed op based on precision
+        auto op = createResidualOp(params_.precision);
+        return op->apply(
+            params_.residual,
+            params_.input,
+            params_.output,
+            params_.rows,
+            params_.cols
+        );
+    }
+};
+```
+
+The `createResidualOp()` factory (already exists in `PipelineBase.h`) returns:
+- `ResidualOpTyped<FP32>` for FP32 activations
+- `ResidualOpTyped<Q8_1>` for Q8_1 activations (uses `simd::q8_1_add_q8_1`)
+- etc.
+
+#### 8.3 Q8_1 Residual Add Implementation (Reference)
+
+The Q8_1 residual add in `ResidualOpTyped<Q8_1>` uses `simd::q8_1_add_q8_1()`:
+
+```cpp
+// From SIMDHelpers.h - Native Q8_1 addition
+inline void q8_1_add_q8_1(const Q8_1Block *a, const Q8_1Block *b,
+                          Q8_1Block *output, size_t count) {
+    const size_t n_blocks = count / 32;
+    for (size_t blk = 0; blk < n_blocks; ++blk) {
+        // 1. Dequant both blocks to FP32 (in registers, using SIMD)
+        // 2. Add FP32 values
+        // 3. Find max_abs for requantization
+        // 4. Requantize to Q8_1
+    }
+}
+```
+
+This is **NOT** a dequant→add→requant in separate passes. It's fused:
+- Dequant happens in registers (no memory write)
+- Add happens in registers
+- Requant happens immediately with fresh scale
+
+This preserves precision better than explicit dequant steps.
+
+#### 8.4 Implementation Plan
+
+**Phase 8.1: Add Mockable Interfaces for Testing**
+
+Create `IComputeStageMock` interface for testing graph execution without real kernels:
+
+```cpp
+// tests/v2/mocks/MockComputeStage.h
+class MockComputeStage : public IComputeStage {
+public:
+    bool execute(IDeviceContext *ctx) override {
+        execute_count_++;
+        return should_succeed_;
+    }
+    
+    int execute_count_ = 0;
+    bool should_succeed_ = true;
+};
+```
+
+**Phase 8.2: Update Stage Params to Use TensorBase***
+
+Change all stage `Params` structs from `void*` to `TensorBase*`:
+
+| Stage | Old Params | New Params |
+|-------|------------|------------|
+| `ResidualAddStage` | `void* input, void* residual, void* output` | `TensorBase* input, TensorBase* residual, TensorBase* output` |
+| `RMSNormStage` | `void* input, void* output, float* gamma` | `TensorBase* input, TensorBase* output, TensorBase* gamma` |
+| `SwiGLUStage` | `void* gate, void* up, void* output` | `TensorBase* gate, TensorBase* up, TensorBase* output` |
+| `RoPEStage` | `void* Q, void* K` | `TensorBase* Q, TensorBase* K` |
+
+With `TensorBase*`, stages can query `tensor->precision()` at runtime.
+
+**Phase 8.3: Implement Precision Dispatch**
+
+```cpp
+bool ResidualAddStage::execute(IDeviceContext *ctx) {
+    // Query precision from tensor (or use explicit param)
+    auto precision = params_.input->precision();
+    
+    switch (precision) {
+        case ActivationPrecision::FP32: {
+            ResidualOpTyped<ActivationPrecision::FP32> op;
+            return op.apply(params_.residual, params_.input, params_.output,
+                           params_.rows, params_.cols);
+        }
+        case ActivationPrecision::Q8_1: {
+            ResidualOpTyped<ActivationPrecision::Q8_1> op;
+            return op.apply(params_.residual, params_.input, params_.output,
+                           params_.rows, params_.cols);
+        }
+        // ... BF16, FP16
+    }
+}
+```
+
+**Phase 8.4: Add Unit Tests for Precision Modes**
+
+```cpp
+TEST(ResidualAddStageTyped, Q8_1_NativeAddition) {
+    // Create Q8_1 tensors
+    auto residual = TensorFactory::createQ8_1({32, 896});
+    auto input = TensorFactory::createQ8_1({32, 896});
+    auto output = TensorFactory::createQ8_1({32, 896});
+    
+    // Fill with test data
+    fill_with_random_q8_1(residual.get());
+    fill_with_random_q8_1(input.get());
+    
+    // Execute via stage
+    ResidualAddStage::Params params{
+        input.get(), residual.get(), output.get(),
+        32, 896, ActivationPrecision::Q8_1
+    };
+    ResidualAddStage stage(params);
+    ASSERT_TRUE(stage.execute(ctx.get()));
+    
+    // Verify against direct simd::q8_1_add_q8_1
+    auto expected = TensorFactory::createQ8_1({32, 896});
+    simd::q8_1_add_q8_1(
+        residual->q8_1_blocks(),
+        input->q8_1_blocks(),
+        expected->mutable_q8_1_blocks(),
+        32 * 896
+    );
+    
+    // Compare blocks
+    EXPECT_EQ(memcmp(output->q8_1_blocks(), expected->q8_1_blocks(),
+                     output->num_blocks() * sizeof(Q8_1Block)), 0);
+}
+```
+
+**Phase 8.5: Update Qwen2LayerExecutor to Pass Precision**
+
+```cpp
+// In buildAttentionGraph()
+ResidualAddStage::Params attn_residual_params{
+    buffers.attn_proj,           // TensorBase* (not void*)
+    buffers.current_hidden,
+    buffers.current_hidden,
+    seq_len, config_.d_model,
+    config_.activation_precision  // NEW: precision from config
+};
+```
+
+#### 8.5 File Changes Required
+
+| File | Change |
+|------|--------|
+| `execution/ComputeStage.h` | Change Params to use TensorBase*, add precision field |
+| `execution/ComputeStage.cpp` | Implement precision dispatch in execute() |
+| `pipelines/qwen/Qwen2LayerExecutor.cpp` | Pass TensorBase* instead of void* |
+| `tests/v2/unit/Test__ComputeStage.cpp` | Add precision-aware tests |
+| `tests/v2/mocks/MockComputeStage.h` | NEW: Mock implementations for testing |
+
+#### 8.6 Testing Strategy
+
+1. **Unit tests**: Each stage with each precision (FP32, BF16, FP16, Q8_1)
+2. **Graph tests**: Full attention/FFN graphs with Q8_1 tensors
+3. **Parity tests**: Compare executor output vs legacy pipeline for same input
+4. **Mock tests**: Verify graph execution order without real kernels
+
+#### 8.7 Success Criteria
+
+- [ ] `ResidualAddStage` produces correct output for Q8_1 tensors
+- [ ] `RMSNormStage` produces correct output for Q8_1 tensors
+- [ ] `SwiGLUStage` produces correct output for Q8_1 tensors
+- [ ] Full layer execution with Q8_1 matches legacy pipeline output
+- [ ] Unit tests pass for all precision modes
+- [ ] No unnecessary dequant→requant cycles in Q8_1 path
+
 ## Related Documents
 
 - `.github/copilot-instructions.md` - Development guidelines
 - `.github/instructions/llaminar-v2-architecture.instructions.md` - V2 architecture overview
 - `docs/v2/LAYER_FUSION_PLAN.md` - OpenMP optimization plan
+- `src/v2/pipelines/ops/ResidualOp.h` - Reference implementation for typed residuals

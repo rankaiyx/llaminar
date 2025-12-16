@@ -63,10 +63,14 @@ protected:
      * @param path Output file path
      * @param include_tensors Whether to include tensor data section
      * @param arch Architecture name (default: "qwen2")
+     * @param include_rms_norm_eps Whether to include rms_norm_eps metadata (default: true)
+     * @param rms_norm_eps_value Value for rms_norm_eps (default: 1e-5f to verify parsing vs default 1e-6f)
      */
     void createMinimalGGUF(const std::string &path,
                            bool include_tensors = true,
-                           const std::string &arch = "qwen2")
+                           const std::string &arch = "qwen2",
+                           bool include_rms_norm_eps = true,
+                           float rms_norm_eps_value = 1e-5f)
     {
         std::ofstream file(path, std::ios::binary);
         ASSERT_TRUE(file.is_open());
@@ -82,8 +86,8 @@ protected:
         uint64_t tensor_count = include_tensors ? 2 : 0;
         file.write(reinterpret_cast<const char *>(&tensor_count), 8);
 
-        // Metadata count (architecture + 7 hyperparams)
-        uint64_t metadata_count = 8;
+        // Metadata count (architecture + 7 hyperparams + optionally rms_norm_eps)
+        uint64_t metadata_count = include_rms_norm_eps ? 9 : 8;
         file.write(reinterpret_cast<const char *>(&metadata_count), 8);
 
         // Helper to write string metadata
@@ -145,6 +149,12 @@ protected:
         write_uint32_kv(arch + ".attention.head_count_kv", 2);
         write_float32_kv(arch + ".rope.freq_base", 10000.0f);
         write_uint32_kv("tokenizer.ggml.token_count", 151936);
+
+        // Optional rms_norm_eps
+        if (include_rms_norm_eps)
+        {
+            write_float32_kv(arch + ".attention.layer_norm_rms_epsilon", rms_norm_eps_value);
+        }
 
         if (include_tensors)
         {
@@ -439,6 +449,23 @@ TEST_F(Test__ModelLoader, ExtractMetadata)
     EXPECT_EQ(model.head_count_kv, 2);
     EXPECT_FLOAT_EQ(model.rope_theta, 10000.0f);
     EXPECT_EQ(model.vocab_size, 151936);
+    EXPECT_FLOAT_EQ(model.rms_norm_eps, 1e-5f); // Parsed from GGUF
+}
+
+/**
+ * @brief Test rms_norm_eps defaults to 1e-6 when not in GGUF
+ */
+TEST_F(Test__ModelLoader, RmsNormEpsDefault)
+{
+    std::string path = test_dir_ + "meta_no_eps.gguf";
+    // Create GGUF without rms_norm_eps metadata
+    createMinimalGGUF(path, false, "qwen2", false, 0.0f);
+
+    ModelLoader loader;
+    ASSERT_TRUE(loader.loadModel(path));
+
+    const auto &model = loader.getModel();
+    EXPECT_FLOAT_EQ(model.rms_norm_eps, 1e-6f); // Default value
 }
 
 /**

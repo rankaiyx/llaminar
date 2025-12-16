@@ -65,10 +65,12 @@ TEST_F(ComputeStageTest, RMSNormBasic)
     // Input: two rows of [1, 2, 3, 4]
     std::vector<float> input = {1.0f, 2.0f, 3.0f, 4.0f,
                                 1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> output(input.size());
     std::vector<float> gamma(hidden_dim, 1.0f); // Scale = 1
 
     RMSNormStage::Params params;
     params.input = input.data();
+    params.output = output.data(); // Separate output buffer
     params.gamma = gamma.data();
     params.seq_len = seq_len;
     params.hidden_dim = hidden_dim;
@@ -85,10 +87,10 @@ TEST_F(ComputeStageTest, RMSNormBasic)
     // Verify: RMS of [1,2,3,4] = sqrt((1+4+9+16)/4) = sqrt(7.5) ≈ 2.739
     // Each element should be divided by RMS
     float expected_rms = std::sqrt((1.0f + 4.0f + 9.0f + 16.0f) / 4.0f + eps);
-    EXPECT_NEAR(input[0], 1.0f / expected_rms, 1e-5f);
-    EXPECT_NEAR(input[1], 2.0f / expected_rms, 1e-5f);
-    EXPECT_NEAR(input[2], 3.0f / expected_rms, 1e-5f);
-    EXPECT_NEAR(input[3], 4.0f / expected_rms, 1e-5f);
+    EXPECT_NEAR(output[0], 1.0f / expected_rms, 1e-5f);
+    EXPECT_NEAR(output[1], 2.0f / expected_rms, 1e-5f);
+    EXPECT_NEAR(output[2], 3.0f / expected_rms, 1e-5f);
+    EXPECT_NEAR(output[3], 4.0f / expected_rms, 1e-5f);
 }
 
 TEST_F(ComputeStageTest, RMSNormWithGamma)
@@ -99,10 +101,12 @@ TEST_F(ComputeStageTest, RMSNormWithGamma)
     const float eps = 1e-6f;
 
     std::vector<float> input = {1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> output(input.size());
     std::vector<float> gamma = {2.0f, 0.5f, 1.0f, 0.0f}; // Different scales
 
     RMSNormStage::Params params;
     params.input = input.data();
+    params.output = output.data(); // Separate output buffer
     params.gamma = gamma.data();
     params.seq_len = seq_len;
     params.hidden_dim = hidden_dim;
@@ -112,14 +116,16 @@ TEST_F(ComputeStageTest, RMSNormWithGamma)
     EXPECT_TRUE(stage.execute(ctx_.get()));
 
     float rms = std::sqrt((1.0f + 4.0f + 9.0f + 16.0f) / 4.0f + eps);
-    EXPECT_NEAR(input[0], (1.0f / rms) * 2.0f, 1e-5f); // gamma = 2
-    EXPECT_NEAR(input[1], (2.0f / rms) * 0.5f, 1e-5f); // gamma = 0.5
-    EXPECT_NEAR(input[3], 0.0f, 1e-5f);                // gamma = 0
+    EXPECT_NEAR(output[0], (1.0f / rms) * 2.0f, 1e-5f); // gamma = 2
+    EXPECT_NEAR(output[1], (2.0f / rms) * 0.5f, 1e-5f); // gamma = 0.5
+    EXPECT_NEAR(output[3], 0.0f, 1e-5f);                // gamma = 0
 }
 
 TEST_F(ComputeStageTest, RMSNormFlopEstimate)
 {
     RMSNormStage::Params params;
+    params.input = nullptr;
+    params.output = nullptr;
     params.seq_len = 512;
     params.hidden_dim = 896;
 
@@ -305,6 +311,8 @@ TEST_F(ComputeStageTest, BackendSupport)
 {
     // All CPU stages should support OpenBLAS and MKL
     RMSNormStage::Params rms_params;
+    rms_params.input = nullptr;
+    rms_params.output = nullptr;
     rms_params.seq_len = 1;
     rms_params.hidden_dim = 4;
 
@@ -395,6 +403,7 @@ TEST_F(ComputeStageTest, FactoryCreateRMSNorm)
 {
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 896;
@@ -442,6 +451,8 @@ TEST_F(ComputeStageTest, NullContextHandling)
 {
     // All stages should gracefully handle null context
     RMSNormStage::Params rms_params;
+    rms_params.input = nullptr;
+    rms_params.output = nullptr;
     rms_params.seq_len = 1;
     rms_params.hidden_dim = 4;
 

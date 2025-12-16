@@ -165,6 +165,7 @@ namespace llaminar2
         uint64_t head_count_kv = 0;    // num_key_value_heads (GQA)
         uint64_t vocab_size = 0;       // vocabulary size
         float rope_theta = 10000.0f;   // RoPE base frequency
+        float rms_norm_eps = 1e-6f;    // RMSNorm epsilon (default 1e-6 for Qwen2/LLaMA)
 
         std::map<std::string, GGUFValue> metadata;
         std::vector<GGUFTensorInfo> tensors;

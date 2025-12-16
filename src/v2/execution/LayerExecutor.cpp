@@ -6,7 +6,9 @@
  */
 
 #include "LayerExecutor.h"
+#include "StageDumper.h"
 #include "../utils/Logger.h"
+#include "../utils/DebugEnv.h"
 #include <algorithm>
 #include <chrono>
 #include <queue>
@@ -262,6 +264,7 @@ namespace llaminar2
         {
             RMSNormStage::Params norm_params;
             norm_params.input = params.input;
+            norm_params.output = params.input; // In-place for now
             norm_params.gamma = params.attn_norm;
             norm_params.seq_len = params.seq_len;
             norm_params.hidden_dim = params.d_model;
@@ -340,6 +343,7 @@ namespace llaminar2
         {
             RMSNormStage::Params norm_params;
             norm_params.input = params.input;
+            norm_params.output = params.input; // In-place for now
             norm_params.gamma = params.ffn_norm;
             norm_params.seq_len = seq_len;
             norm_params.hidden_dim = d_model;
@@ -432,6 +436,7 @@ namespace llaminar2
         {
             RMSNormStage::Params norm_params;
             norm_params.input = params.input;
+            norm_params.output = params.input; // In-place for now
             norm_params.gamma = params.ffn_norm;
             norm_params.seq_len = seq_len;
             norm_params.hidden_dim = d_model;
@@ -705,17 +710,50 @@ namespace llaminar2
             return false;
         }
 
+        // Check if stage dumping is enabled for this stage
+        StageDumpContext dump_ctx;
+        const bool should_dump = StageDumper::shouldDump(
+            node.stage.get(),
+            config_.current_layer_idx,
+            config_.current_iteration,
+            config_.mpi_rank);
+
+        if (should_dump)
+        {
+            dump_ctx = StageDumper::beginDump(
+                node.stage.get(),
+                config_.current_layer_idx,
+                config_.current_iteration,
+                config_.mpi_rank);
+            StageDumper::dumpInputs(dump_ctx, node.stage.get());
+        }
+
         auto start = std::chrono::high_resolution_clock::now();
 
         bool success = node.stage->execute(ctx);
 
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
         if (config_.enable_profiling)
         {
-            auto end = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration<double, std::milli>(end - start).count();
             stats_.stage_times_ms[node.name] = ms;
 
             LOG_DEBUG("[LayerExecutor] Stage '" << node.name << "' took " << ms << " ms");
+        }
+
+        // Dump outputs after execution (if dumping enabled)
+        if (should_dump && success)
+        {
+            StageDumper::dumpOutputs(dump_ctx, node.stage.get());
+            StageDumper::finalizeDump(dump_ctx, ms);
+        }
+
+        // Invoke snapshot callback if configured (uses same dump info for efficiency)
+        if (success && config_.snapshot_callback)
+        {
+            auto dump_info = node.stage->getDumpInfo();
+            config_.snapshot_callback(node.name, dump_info);
         }
 
         return success;

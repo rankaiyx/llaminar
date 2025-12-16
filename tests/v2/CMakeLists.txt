@@ -2029,6 +2029,28 @@ add_v2_test(V2_Unit_ComputeStage
     MPI_PROCS 1  # Tests CPU stages locally, no MPI needed
 )
 
+# Test: ResidualAddStage Precision Awareness
+# Tests precision-aware residual addition: FP32, BF16, FP16, Q8_1
+# Verifies Q8_1 uses native simd::q8_1_add_q8_1 (no explicit dequant)
+add_executable(v2_test_residual_add_precision unit/Test__ResidualAddStage_Precision.cpp)
+target_link_libraries(v2_test_residual_add_precision llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ResidualAddPrecision
+    COMMAND $<TARGET_FILE:v2_test_residual_add_precision>
+    LABELS "V2;Unit;Execution;ComputeStage;ResidualAdd;Precision;Q8_1;SIMD"
+    MPI_PROCS 1
+)
+
+# Test: ComputeGraph Execution Flow
+# Comprehensive tests for graph construction, dependency resolution, execution order,
+# error handling, snapshot callbacks, statistics tracking, and multi-device execution
+add_executable(v2_test_compute_graph_execution unit/Test__ComputeGraphExecution.cpp)
+target_link_libraries(v2_test_compute_graph_execution llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ComputeGraphExecution
+    COMMAND $<TARGET_FILE:v2_test_compute_graph_execution>
+    LABELS "V2;Unit;Execution;ComputeGraph;TopologicalSort;DependencyResolution;SnapshotCallback;Statistics"
+    MPI_PROCS 1
+)
+
 # Test: LayerExecutor (layer-level execution orchestration)
 # Tests compute graph construction, topological ordering, dependency tracking,
 # attention/FFN/MoE graph building, and multi-device execution
@@ -2038,6 +2060,28 @@ add_v2_test(V2_Unit_LayerExecutor
     COMMAND $<TARGET_FILE:v2_test_layer_executor>
     LABELS "V2;Unit;Execution;LayerExecutor;ComputeGraph;Orchestration;Attention;FFN;MoE;MultiDevice"
     MPI_PROCS 1  # Tests execution orchestration locally
+)
+
+# Test: LayerExecutorInterface (ILayerExecutor interface and MockLayerExecutor)
+# Tests polymorphic execution, MockLayerExecutor behavior, interface-based testing patterns,
+# configuration, statistics, and multi-device execution through interface abstraction
+add_executable(v2_test_layer_executor_interface unit/Test__LayerExecutorInterface.cpp)
+target_link_libraries(v2_test_layer_executor_interface llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LayerExecutorInterface
+    COMMAND $<TARGET_FILE:v2_test_layer_executor_interface>
+    LABELS "V2;Unit;Execution;ILayerExecutor;MockLayerExecutor;Interface;Polymorphism;Testing"
+    MPI_PROCS 1
+)
+
+# Test: ComputeStages (individual compute stage unit tests)
+# Tests GEMMStage, RMSNormStage, RoPEStage, SwiGLUStage, ResidualAddStage, QuantizeStage, etc.
+# Verifies correctness, precision preservation, FLOP estimation, and backend compatibility
+add_executable(v2_test_compute_stages unit/Test__ComputeStages.cpp)
+target_link_libraries(v2_test_compute_stages llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ComputeStages
+    COMMAND $<TARGET_FILE:v2_test_compute_stages>
+    LABELS "V2;Unit;ComputeStage;GEMM;RMSNorm;RoPE;SwiGLU;ResidualAdd;Quantize;Precision"
+    MPI_PROCS 1
 )
 
 # Test: PipelineExecutor (LayerExecutor-to-pipeline adapter)
@@ -2050,6 +2094,7 @@ add_v2_test(V2_Unit_PipelineExecutor
     LABELS "V2;Unit;PipelineExecution;Execution;LayerExecutor;ComputeStage;DeviceContext"
     MPI_PROCS 1
 )
+
 
 # Test: PipelineBase Precision Mode
 # Tests WeightPrecision and ActivationPrecision configuration flow through PipelineBase

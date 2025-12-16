@@ -517,6 +517,7 @@ add_library(llaminar2_core STATIC
     pipelines/PipelineFactory.cpp
     pipelines/PipelineExecutor.cpp
     pipelines/qwen/Qwen2Pipeline.cpp
+    pipelines/qwen/Qwen2LayerExecutor.cpp
     pipelines/attention/GQAAttention.cpp
     pipelines/attention/MpiAttentionOrchestrator.cpp
     tensors/TensorBase.cpp
@@ -634,6 +635,7 @@ target_compile_features(llaminar2_core PUBLIC cxx_std_17)
 # Dependencies
 find_package(MPI REQUIRED)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
+message(STATUS "V2: MPI enabled (required dependency)")
 message(STATUS "V2: OpenBLAS configured for FP32 GEMM baseline")
 
 # Generate microkernel instantiations (auto-run Python script at configure time)

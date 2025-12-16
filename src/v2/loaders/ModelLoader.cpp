@@ -1995,6 +1995,13 @@ namespace llaminar2
             model_.rope_theta = theta;
         }
 
+        // RMSNorm epsilon (default 1e-6 for Qwen2/LLaMA)
+        float eps = get_float(arch_prefix + "attention.layer_norm_rms_epsilon");
+        if (eps > 0.0f)
+        {
+            model_.rms_norm_eps = eps;
+        }
+
         // Vocab size from tokenizer metadata
         // Try multiple common locations
         model_.vocab_size = get_uint("tokenizer.ggml.token_count");
@@ -2024,6 +2031,7 @@ namespace llaminar2
         LOG_DEBUG("  head_count_kv: " << model_.head_count_kv);
         LOG_DEBUG("  vocab_size: " << model_.vocab_size);
         LOG_DEBUG("  rope_theta: " << model_.rope_theta);
+        LOG_DEBUG("  rms_norm_eps: " << model_.rms_norm_eps);
     }
 
     // =============================================================================

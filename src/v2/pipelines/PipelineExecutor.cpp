@@ -115,6 +115,7 @@ namespace llaminar2
         // Create RMSNorm stage params
         RMSNormStage::Params params;
         params.input = input->mutable_data();
+        params.output = input->mutable_data(); // In-place operation
         params.gamma = static_cast<const float *>(gamma->data());
         params.seq_len = seq_len;
         params.hidden_dim = hidden_dim;

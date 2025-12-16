@@ -24,6 +24,7 @@
 #include "../ops/Ops.h"
 #include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
 #include "../../kernels/cpu/attention/FusedAttentionWoKernel.h"
+#include "Qwen2LayerExecutor.h"
 
 namespace llaminar2
 {
@@ -210,6 +211,15 @@ namespace llaminar2
 
         // Fused attention + Wo projection kernel (optional, enabled via config.use_fused_attention)
         std::unique_ptr<FusedAttentionWoKernel> fused_attn_wo_kernel_;
+
+        // Execution framework (optional, enabled via LLAMINAR_USE_LAYER_EXECUTOR=1)
+        std::unique_ptr<Qwen2LayerExecutor> layer_executor_;
+
+        // Q8_1 quantization buffers for executor path (quantize once, reuse for multiple GEMMs)
+        // Sized for max_seq_len × d_model, stored as Q8_1Block arrays
+        std::vector<uint8_t> q8_1_attn_buffer_; // For attention Q/K/V projections
+        std::vector<uint8_t> q8_1_ffn_buffer_;  // For FFN gate/up projections
+        size_t q8_1_buffer_size_ = 0;           // Allocated size (same for both)
 
         // NOTE: Ops are now in PipelineBase (rmsnorm_op_, gemm_op_, etc.)
         // Child pipelines use the declarative methods: rms_norm(), project(), add_residual(), etc.

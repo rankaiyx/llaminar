@@ -76,6 +76,7 @@ TEST_F(LayerExecutorTest, SingleNodeGraph)
     // Create a simple RMSNorm stage
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 64;
@@ -99,6 +100,7 @@ TEST_F(LayerExecutorTest, LinearDependencyChain)
     // Create: A -> B -> C (linear chain)
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 64;
@@ -132,6 +134,7 @@ TEST_F(LayerExecutorTest, DiamondDependency)
     // Create diamond: A -> [B, C] -> D
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 64;
@@ -168,6 +171,7 @@ TEST_F(LayerExecutorTest, GetReadyNodes)
 
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 64;
@@ -203,6 +207,7 @@ TEST_F(LayerExecutorTest, GraphReset)
 
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 64;
@@ -231,6 +236,7 @@ TEST_F(LayerExecutorTest, TotalEstimatedFlops)
     // RMSNorm flops: 4 * seq_len * hidden_dim (squares + adds + sqrt + div + muls)
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 10;
     params.hidden_dim = 64;
@@ -262,6 +268,7 @@ TEST_F(LayerExecutorTest, ExecuteNullContext)
 
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 64;
@@ -287,6 +294,7 @@ TEST_F(LayerExecutorTest, ExecuteSequential)
 
     RMSNormStage::Params params;
     params.input = input.data();
+    params.output = input.data(); // In-place operation
     params.gamma = gamma.data();
     params.seq_len = seq_len;
     params.hidden_dim = hidden_dim;
@@ -318,6 +326,7 @@ TEST_F(LayerExecutorTest, ExecuteParallel)
 
     RMSNormStage::Params params;
     params.input = input.data();
+    params.output = input.data(); // In-place operation
     params.gamma = gamma.data();
     params.seq_len = seq_len;
     params.hidden_dim = hidden_dim;
@@ -343,6 +352,7 @@ TEST_F(LayerExecutorTest, ExecuteWithDependencies)
     // Two sequential norms: A -> B
     RMSNormStage::Params params;
     params.input = input.data();
+    params.output = input.data(); // In-place operation
     params.gamma = gamma.data();
     params.seq_len = seq_len;
     params.hidden_dim = hidden_dim;
@@ -375,6 +385,7 @@ TEST_F(LayerExecutorTest, StatsTracking)
 
     RMSNormStage::Params params;
     params.input = input.data();
+    params.output = input.data(); // In-place operation
     params.gamma = gamma.data();
     params.seq_len = seq_len;
     params.hidden_dim = hidden_dim;
@@ -403,6 +414,7 @@ TEST_F(LayerExecutorTest, StatsReset)
 
     RMSNormStage::Params params;
     params.input = input.data();
+    params.output = input.data(); // In-place operation
     params.gamma = gamma.data();
     params.seq_len = seq_len;
     params.hidden_dim = hidden_dim;
@@ -614,6 +626,7 @@ TEST_F(LayerExecutorTest, ExecuteMultiDeviceEmptyContexts)
 
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 64;
@@ -638,6 +651,7 @@ TEST_F(LayerExecutorTest, ExecuteMultiDeviceSingleContext)
 
     RMSNormStage::Params params;
     params.input = input.data();
+    params.output = input.data(); // In-place operation
     params.gamma = gamma.data();
     params.seq_len = seq_len;
     params.hidden_dim = hidden_dim;
@@ -689,6 +703,7 @@ TEST_F(LayerExecutorTest, DuplicateNodeName)
 
     RMSNormStage::Params params;
     params.input = nullptr;
+    params.output = nullptr;
     params.gamma = nullptr;
     params.seq_len = 1;
     params.hidden_dim = 64;

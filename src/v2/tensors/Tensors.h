@@ -135,6 +135,72 @@ namespace llaminar2
         IQ1_M    // 1-bit medium IQ
     };
 
+    /**
+     * @brief Get human-readable name for TensorType
+     * @param type The tensor type enum value
+     * @return Static string like "FP32", "Q8_0", "IQ4_NL", etc.
+     */
+    inline const char *tensorTypeName(TensorType type)
+    {
+        switch (type)
+        {
+        case TensorType::FP32:
+            return "FP32";
+        case TensorType::BF16:
+            return "BF16";
+        case TensorType::FP16:
+            return "FP16";
+        case TensorType::INT8:
+            return "INT8";
+        case TensorType::INT32:
+            return "INT32";
+        case TensorType::IQ4_NL:
+            return "IQ4_NL";
+        case TensorType::IQ4_XS:
+            return "IQ4_XS";
+        case TensorType::Q8_0:
+            return "Q8_0";
+        case TensorType::Q8_1:
+            return "Q8_1";
+        case TensorType::Q4_0:
+            return "Q4_0";
+        case TensorType::Q4_1:
+            return "Q4_1";
+        case TensorType::Q5_0:
+            return "Q5_0";
+        case TensorType::Q5_1:
+            return "Q5_1";
+        case TensorType::Q6_K:
+            return "Q6_K";
+        case TensorType::Q2_K:
+            return "Q2_K";
+        case TensorType::Q5_K:
+            return "Q5_K";
+        case TensorType::Q3_K:
+            return "Q3_K";
+        case TensorType::Q4_K:
+            return "Q4_K";
+        case TensorType::Q8_K:
+            return "Q8_K";
+        case TensorType::IQ2_XXS:
+            return "IQ2_XXS";
+        case TensorType::IQ2_XS:
+            return "IQ2_XS";
+        case TensorType::IQ3_XXS:
+            return "IQ3_XXS";
+        case TensorType::IQ2_S:
+            return "IQ2_S";
+        case TensorType::IQ3_S:
+            return "IQ3_S";
+        case TensorType::IQ1_S:
+            return "IQ1_S";
+        case TensorType::IQ1_M:
+            return "IQ1_M";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
     struct ActivationPack
     {
         std::vector<int8_t> data;
@@ -578,6 +644,37 @@ namespace llaminar2
         // Shape and type
         virtual const std::vector<size_t> &shape() const = 0;
         virtual TensorType native_type() const = 0;
+
+        /**
+         * @brief Get number of rows (first dimension)
+         * @return shape()[0], or 1 if shape is empty
+         * @note Convenience method for 2D matrix access pattern
+         */
+        size_t rows() const
+        {
+            const auto &s = shape();
+            return s.empty() ? 1 : s[0];
+        }
+
+        /**
+         * @brief Get number of columns (second dimension)
+         * @return shape()[1], or 1 if shape has fewer than 2 dimensions
+         * @note Convenience method for 2D matrix access pattern
+         */
+        size_t cols() const
+        {
+            const auto &s = shape();
+            return s.size() < 2 ? 1 : s[1];
+        }
+
+        /**
+         * @brief Get human-readable dtype name
+         * @return String like "FP32", "Q8_0", "IQ4_NL", etc.
+         */
+        const char *dtype_name() const
+        {
+            return tensorTypeName(native_type());
+        }
 
         // ===== ITensor Interface Implementation =====
 
