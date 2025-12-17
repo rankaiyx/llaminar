@@ -521,78 +521,22 @@ The `WorkDistributor` supports MoE via:
 3. ☐ Implement layer-wise GPU assignment
 4. ☐ Add GPU-aware MPI (NCCL for NVIDIA, RCCL for AMD)
 
-### Phase 7: Kernel Execution (CPU) - IN PROGRESS
+### Phase 7: Kernel Execution (CPU) - ✅ COMPLETE
 
-**Problem**: The executor framework infrastructure is complete but compute stages have critical flaws:
-- ❌ RMSNormStage, SwiGLUStage, RoPEStage - **BROKEN** (scalar reimplementations, no precision support)
-- ✅ ResidualAddStage - **CORRECT** (handles ActivationPrecision properly)
-- ✅ GEMMStage - **CORRECT** (delegates to KernelFactory)
-- ✅ FusedQKVGEMMStage - **CORRECT** (delegates to QuantisedGemmKernel::multiply_fused_multi)
+All compute stages now delegate to typed kernels via `KernelFactory`:
 
-**Root Cause**: Stages reimplemented operations as scalar loops instead of using existing typed kernels.
-This violates the architecture and breaks ActivationPrecision support.
+- ✅ **RMSNormStage** - Uses `KernelFactory::createRMSNorm()` + `apply_tensor()`
+- ✅ **SwiGLUStage** - Uses `KernelFactory::createSwiGLU()` + `apply_tensor()`
+- ✅ **RoPEStage** - Uses `KernelFactory::createRoPE()` + `apply_tensor()`
+- ✅ **ResidualAddStage** - Handles `ActivationPrecision` properly
+- ✅ **GEMMStage** - Uses `KernelFactory::getOrCreateGemm()` (cached)
+- ✅ **FusedQKVGEMMStage** - Uses `QuantisedGemmKernel::multiply_fused_multi()`
+- ✅ **AttentionStage** - Uses `KernelFactory::createAttention()` + `compute_tensor()`
 
-**Goal**: Refactor stages to delegate to typed kernels (`CPURMSNormKernelT<P>`, `CPUSwiGLUKernelT<P>`, etc.)
-matching how the legacy Ops work, but without the Op wrapper layer.
+**Pattern**: All stages use `TensorBase*` typed parameters and delegate to KernelFactory at execute-time.
+This ensures proper precision dispatch (FP32/BF16/Q8_1) and device dispatch (CPU/CUDA/ROCm).
 
-#### 7.1 Type-Safe Tensor Design (CRITICAL)
-
-**Problem**: Original ComputeStage design used `void*` pointers with manual precision tracking:
-
-```cpp
-// BROKEN DESIGN - void* loses type safety and device info
-struct Params {
-    const void *input;           // What type? What device?
-    void *output;                // Manual casting everywhere
-    int seq_len, hidden_dim;     // Duplicates tensor metadata
-    ActivationPrecision precision; // Redundant - tensor knows this
-};
-```
-
-**Issues with void***:
-1. **No type safety**: Requires manual casting, easy to mismatch types
-2. **No device info**: Can't dispatch to GPU vs CPU automatically
-3. **Redundant metadata**: `seq_len`, `hidden_dim`, `precision` duplicate tensor info
-4. **Not GPU-ready**: GPU dispatch requires knowing tensor's device placement
-5. **Manual kernel selection**: Must switch on precision instead of using polymorphism
-
-**Correct Design**: Use typed tensor pointers:
-
-```cpp
-// CORRECT DESIGN - TensorBase*/IActivationTensor* are self-describing
-struct Params {
-    TensorBase* input;        // Knows: type, device, rows, cols, precision
-    TensorBase* output;       // Knows: type, device, rows, cols, precision
-    const TensorBase* gamma;  // Weight tensor (immutable)
-    float eps;                // Only operation-specific params remain
-};
-
-bool RMSNormStage::execute(IDeviceContext *ctx) {
-    // Tensor tells us everything we need
-    auto* activation = dynamic_cast<IActivationTensor*>(params_.input);
-    if (!activation) return false;
-    
-    // IActivationTensor::applyRMSNorm dispatches to correct kernel automatically:
-    // - Checks tensor's native_type() for precision (FP32/BF16/FP16/Q8_1)
-    // - Checks tensor's device_idx() for CPU vs GPU
-    // - Creates appropriate kernel via KernelFactory
-    return activation->applyRMSNorm(
-        params_.gamma->data(),
-        params_.input->rows(),
-        params_.input->cols(),
-        params_.eps
-    );
-}
-```
-
-**Benefits**:
-1. **Type-safe**: No void* casting, compiler catches type errors
-2. **Self-describing**: Tensor knows its precision, dimensions, device
-3. **Device-aware**: `IActivationTensor::applyRMSNorm()` dispatches to GPU if tensor is on GPU
-4. **DRY**: No duplicate `seq_len`/`hidden_dim`/`precision` fields
-5. **Polymorphic dispatch**: Uses existing kernel factory infrastructure
-
-#### 7.2 Tensor Type Hierarchy
+#### 7.1 Tensor Type Hierarchy (Reference)
 
 ```
 TensorBase (base class)
@@ -615,54 +559,27 @@ Concrete Types:
 └─ IQ4_NLTensor  : TensorBase (weight only, not IActivationTensor)
 ```
 
-#### 7.3 Stage Parameter Patterns
+#### 7.2 Stage Implementation Example
 
-**Activation-only stages** (RMSNorm, RoPE, SwiGLU, ResidualAdd):
 ```cpp
-struct Params {
-    TensorBase* input;         // IActivationTensor* at runtime
-    TensorBase* output;        // May be same as input (in-place)
-    const TensorBase* weights; // If needed (gamma for RMSNorm)
-    // Operation-specific scalars only
-};
+bool RMSNormStage::execute(IDeviceContext *ctx) {
+    // Get dimensions from tensor (self-describing)
+    const int seq_len = params_.seq_len > 0 ? params_.seq_len : static_cast<int>(params_.input->rows());
+    const int hidden_dim = static_cast<int>(params_.input->cols());
+
+    // Create kernel via KernelFactory with automatic type dispatch
+    auto dev_type = KernelFactory::getDeviceType(params_.device_idx);
+    auto kernel = KernelFactory::createRMSNorm(params_.input, dev_type);
+    if (!kernel) return false;
+
+    // Kernel handles precision dispatch internally (FP32/BF16/Q8_1)
+    return kernel->apply_tensor(params_.input, params_.gamma, params_.output,
+                                seq_len, hidden_dim, params_.eps,
+                                params_.mpi_ctx, params_.device_idx);
+}
 ```
 
-**GEMM stages** (weights × activations):
-```cpp
-struct Params {
-    TensorBase* A;             // Activation (IActivationTensor*)
-    const TensorBase* B;       // Weight tensor (quantized)
-    TensorBase* C;             // Output (IActivationTensor*)
-    // Optional: bias, fusion flags
-};
-```
-
-**Attention stages**:
-```cpp
-struct Params {
-    TensorBase* Q;             // Query activations
-    TensorBase* K;             // Key activations  
-    TensorBase* V;             // Value activations
-    TensorBase* output;        // Attention output
-    IUnifiedKVCache* kv_cache; // Cache (already typed)
-    // Attention config (n_heads, etc.)
-};
-```
-
-#### 7.4 Migration Plan
-
-| Stage | Current | Target |
-|-------|---------|--------|
-| `RMSNormStage` | `void* input, void* output, ActivationPrecision` | `TensorBase* input, TensorBase* output` |
-| `RoPEStage` | `void* tensor, int seq_len, n_heads, head_dim` | `TensorBase* Q, TensorBase* K` |
-| `SwiGLUStage` | `void* gate, void* up, void* output` | `TensorBase* gate, TensorBase* up, TensorBase* output` |
-| `ResidualAddStage` | Already uses `ActivationPrecision` | Convert to `TensorBase*` |
-| `GEMMStage` | `void* A, TensorBase* B` | `TensorBase* A, TensorBase* B` |
-| `AttentionStage` | `void* Q/K/V` | `TensorBase* Q/K/V` |
-
-#### 7.5 Kernel Dispatch via IActivationTensor
-
-The legacy pipeline uses these kernel patterns:
+#### 7.3 Pipeline Kernel Patterns (Reference)
 
 ```
 Qwen2Pipeline::attention_block():
@@ -685,242 +602,6 @@ Qwen2Pipeline::ffn_block():
   │
   └─ project_row_parallel(down) → Single GEMM + allreduce
 ```
-
-#### 7.2 Kernel Mapping for Executor Stages
-
-| Stage | Current Implementation | Production Kernel to Wire |
-|-------|------------------------|---------------------------|
-| `GEMMStage` | Placeholder | `KernelFactory::getOrCreateGemm(B)->multiply()` |
-| `RMSNormStage` | ✅ Implemented inline | Already works |
-| `RoPEStage` | ✅ Implemented inline | Already works |
-| `AttentionStage` | ✅ Implemented inline | Already works (naive, see note) |
-| `SwiGLUStage` | ✅ Implemented inline | Already works |
-| `ResidualAddStage` | ✅ Implemented inline | Already works |
-| `FusedGEMMStage` | **NEW NEEDED** | `FusedGEMM::execute()` |
-
-**Note on AttentionStage**: Current inline implementation is correct but naive (O(n²) memory for scores).
-The legacy path uses `GQAAttention` which has better memory characteristics. For production, we may
-want to wire AttentionStage to GQAAttention, but the inline version is functionally correct.
-
-#### 7.3 GEMMStage Implementation Plan
-
-**File**: `src/v2/execution/ComputeStage.cpp` (GEMMStage::execute)
-
-```cpp
-bool GEMMStage::execute(IDeviceContext *ctx)
-{
-    if (!ctx || !params_.A || !params_.B || !params_.C) {
-        LOG_ERROR("[GEMMStage] Invalid parameters");
-        return false;
-    }
-
-    // Get cached kernel from KernelFactory (handles weight packing once)
-    auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.B);
-    if (!gemm) {
-        LOG_ERROR("[GEMMStage] Failed to get GEMM kernel for weight tensor");
-        return false;
-    }
-
-    // Cast to QuantisedGemmKernel if available (for full API access)
-    auto *qgemm = dynamic_cast<gemm_v4::QuantisedGemmKernel*>(gemm);
-    if (qgemm) {
-        // Quantized GEMM path: FP32 activations, quantized weights
-        return qgemm->multiply(
-            static_cast<const float*>(params_.A),
-            static_cast<float*>(params_.C),
-            params_.m, params_.n, params_.k,
-            params_.transpose_B,
-            params_.alpha, params_.beta,
-            nullptr, // no bias in GEMMStage (added separately)
-            -1       // device_idx (not used for CPU)
-        );
-    }
-
-    // FP32 GEMM fallback (for non-quantized weights)
-    return gemm->multiply(
-        static_cast<const float*>(params_.A),
-        static_cast<float*>(params_.C),
-        params_.m, params_.n, params_.k,
-        params_.alpha, params_.beta
-    );
-}
-```
-
-**Key insight**: The existing `KernelFactory::getOrCreateGemm()` caches packed weights.
-We MUST use the cached kernel, not create new ones (would re-pack weights every call!).
-
-#### 7.4 FusedGEMMStage (New Stage)
-
-**Problem**: QKV and GateUp projections share a common input (normalized activations).
-Quantizing the input once for multiple GEMMs saves significant overhead.
-
-**File**: `src/v2/execution/ComputeStage.h` (new class)
-
-```cpp
-/**
- * @brief Fused multi-GEMM stage for QKV/GateUp patterns
- *
- * Quantizes activations once, executes N GEMMs with shared quantized data.
- * Replaces N separate GEMMStage nodes for better performance.
- */
-class FusedGEMMStage : public IComputeStage
-{
-public:
-    struct Projection {
-        const TensorBase* weight;  ///< Weight tensor (k × n)
-        void* output;              ///< Output buffer (m × n)
-        const float* bias;         ///< Optional bias (n)
-        int n;                     ///< Output dimension
-    };
-
-    struct Params {
-        const void* A;                      ///< Shared input activations (m × k)
-        std::vector<Projection> projections; ///< List of projections
-        int m, k;                           ///< Input dimensions
-    };
-
-    explicit FusedGEMMStage(Params params);
-
-    bool execute(IDeviceContext *ctx) override;
-    ComputeStageType type() const override { return ComputeStageType::GEMM; }
-    // ... etc
-};
-```
-
-**Implementation**: Creates `FusedGEMM` instance and calls `execute()`.
-
-#### 7.5 Updated Qwen2LayerExecutor Graph Building
-
-**Current** (builds separate Q, K, V GEMMStages):
-```cpp
-// 3 separate GEMM stages - inefficient (quantizes input 3 times)
-graph.addNode("q_proj", createGEMM(...wq...), device);
-graph.addNode("k_proj", createGEMM(...wk...), device);
-graph.addNode("v_proj", createGEMM(...wv...), device);
-```
-
-**Target** (single FusedGEMMStage):
-```cpp
-// 1 fused stage - quantizes input once
-FusedGEMMStage::Params qkv_params{
-    buffers.normalized->data(),
-    {{layer.wq, buffers.Q->mutable_data(), q_bias, n_q},
-     {layer.wk, buffers.K->mutable_data(), k_bias, n_kv},
-     {layer.wv, buffers.V->mutable_data(), v_bias, n_kv}},
-    seq_len, d_model
-};
-graph.addNode("qkv_fused", ComputeStageFactory::createFusedGEMM(qkv_params), device);
-```
-
-#### 7.6 Implementation Order
-
-1. **GEMMStage::execute()** - Wire to KernelFactory (single GEMM)
-   - Unblocks Wo and Down projections
-   - ~20 lines of code
-
-2. **Test separate GEMMs** - Verify Q, K, V, Wo, Gate, Up, Down work individually
-   - May be inefficient but correct
-
-3. **FusedGEMMStage** - Add new stage type
-   - ~100 lines new code
-   - Wire to existing FusedGEMM class
-
-4. **Update Qwen2LayerExecutor** - Replace 3 GEMMStages with FusedGEMMStage
-   - Modify buildAttentionGraph() and buildFFNGraph()
-
-5. **End-to-end test** - Run with `LLAMINAR_USE_LAYER_EXECUTOR=1`
-   - Should produce correct output matching legacy path
-
-#### 7.7 Required File Changes
-
-| File | Change |
-|------|--------|
-| `ComputeStage.cpp` | Implement GEMMStage::execute() with KernelFactory |
-| `ComputeStage.h` | Add FusedGEMMStage class declaration |
-| `ComputeStage.cpp` | Add FusedGEMMStage::execute() implementation |
-| `ComputeStageFactory` | Add createFusedGEMM() factory method |
-| `Qwen2LayerExecutor.cpp` | Replace separate GEMM nodes with fused nodes |
-
-#### 7.8 Verification Strategy
-
-```bash
-# Test with separate GEMMs first (less efficient but correct)
-LLAMINAR_USE_LAYER_EXECUTOR=1 \
-LLAMINAR_EXEC_GEMM=1 \
-./run_llaminar.sh -m models/qwen2.5-0.5b-instruct-q4_0.gguf \
-    -p "The capital of France is" -n 10 -t 0
-
-# Should output: "Paris. It is the largest city..."
-```
-
-After FusedGEMMStage:
-```bash
-# Test with fused QKV/GateUp
-LLAMINAR_USE_LAYER_EXECUTOR=1 \
-LLAMINAR_EXEC_GEMM=1 \
-LLAMINAR_EXEC_FUSED_GEMM=1 \  # New flag
-./run_llaminar.sh ...
-```
-
-## File Structure
-
-```
-src/v2/execution/
-├── WorkDistributor.h       # Hierarchical work distribution (340 lines)
-├── WorkDistributor.cpp     # Rank/Device/MoE slicing
-├── DeviceContext.h         # IDeviceContext, IGPUDeviceContext, CPUDeviceContext, CUDADeviceContext, ROCmDeviceContext (~400 lines)
-├── DeviceContext.cpp       # CPU/GPU context implementations, memory management (~550 lines)
-├── ComputeStage.h          # IComputeStage + unified stage classes (~420 lines, reduced after GPU stage removal)
-├── ComputeStage.cpp        # Unified implementations - stages delegate to KernelFactory (~600 lines)
-├── LayerExecutor.h         # ComputeGraph + LayerExecutor (425 lines)
-└── LayerExecutor.cpp       # Graph execution, Attention/FFN/MoE builders (658 lines)
-
-src/v2/backends/
-├── IBackend.h              # Abstract GPU backend interface (272 lines)
-├── ComputeBackend.{h,cpp}  # DeviceManager, device enumeration (~1000 lines)
-├── GPUEnumeration.h        # Extern declarations for GPU enumeration
-├── CUDAEnumeration.cu      # CUDA device enumeration (isolated TU to avoid header conflicts)
-├── ROCmEnumeration.cpp     # ROCm device enumeration (compiled with HIP)
-├── cuda/
-│   ├── CUDABackend.h       # CUDA implementation of IBackend
-│   └── CUDABackend.cu      # CUDA kernels and runtime calls
-└── rocm/
-    ├── ROCmBackend.h       # ROCm implementation of IBackend
-    └── ROCmBackend.cpp     # HIP kernels and runtime calls
-
-src/v2/pipelines/
-├── PipelineConfig.h        # Added executor_* feature flags (~460 lines)
-├── PipelineBase.h          # Added PipelineExecutor member, initializePipelineExecutor() (~1360 lines)
-├── PipelineBase.cpp        # Modified rms_norm/swiglu/add_residual/apply_rope for executor dispatch (~2930 lines)
-├── PipelineExecutor.h      # LayerExecutor-to-pipeline adapter (~260 lines)
-└── PipelineExecutor.cpp    # Operation execution via ComputeStage (~265 lines)
-
-tests/v2/unit/
-├── Test__WorkDistributor.cpp    # 22 tests
-├── Test__DeviceContext.cpp      # 19 tests (including GPU context tests)
-├── Test__ComputeStage.cpp       # 16 tests
-├── Test__LayerExecutor.cpp      # 29 tests (681 lines)
-└── Test__PipelineExecutor.cpp   # 22 tests (300 lines)
-```
-
-**Total: 159 unit tests passing (execution framework: 108 tests)**
-
-## Migration Path
-
-The new architecture will be introduced alongside existing code:
-
-1. `LayerExecutor` wraps existing `attention_block()`/`ffn_block()` logic
-2. Existing kernels wrapped in `ComputeStage` interface
-3. Pipeline can use either old or new path (feature flag)
-4. Once validated, old path deprecated
-
-## Open Questions
-
-1. **GPU memory management**: Use CUDA memory pools? Pre-allocate all buffers?
-2. **Async execution**: How to overlap CPU and GPU work within a layer?
-3. **Mixed precision**: Should GPU use FP16/BF16 while CPU uses Q8_1?
-4. **NCCL integration**: Use NCCL for GPU allreduce or stage through CPU?
-5. **Layer-level parallelism**: Can we truly run attention+FFN in parallel regions?
 
 ### Phase 8: Precision-Aware Execution Graph - PLANNED
 
