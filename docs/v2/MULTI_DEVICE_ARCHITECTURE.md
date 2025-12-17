@@ -236,22 +236,28 @@ public:
 
 /**
  * @brief Factory for creating device-appropriate kernels
+ * 
+ * Note: Stages are backend-agnostic. Device dispatch happens at execute-time
+ * via IDeviceContext::deviceType() and KernelFactory.
  */
 class ComputeStageFactory {
 public:
+    // Backend-agnostic factory methods (no target_backend parameter)
     static std::unique_ptr<ComputeStage> createGEMM(
-        const GEMMParams& params,
-        ComputeBackendType target_backend);
+        const GEMMParams& params);
     
     static std::unique_ptr<ComputeStage> createAttention(
-        const AttentionParams& params,
-        ComputeBackendType target_backend);
+        const AttentionParams& params);
     
     // ... other factory methods
 };
 
 } // namespace llaminar2
 ```
+
+**Unified Stage Pattern** (December 2025): Stages no longer take a `target_backend` parameter.
+Instead, they query `ctx->deviceType()` at execute-time and use `KernelFactory` to create
+the appropriate kernel for CPU/CUDA/ROCm. See `docs/v2/UNIFIED_STAGE_ARCHITECTURE.md`.
 
 ### 4. LayerExecutor
 
@@ -455,16 +461,15 @@ The `WorkDistributor` supports MoE via:
    - `CUDADeviceContext`: CUDA stream management, device memory, backend delegation
    - `ROCmDeviceContext`: HIP stream management, device memory, backend delegation  
    - `IGPUDeviceContext` base class for common patterns (workspace, synchronization)
+   - `IDeviceContext::deviceType()` returns `DeviceType` enum for kernel dispatch
    - Added to `src/v2/execution/DeviceContext.{h,cpp}`
 
-2. ✅ Create GPU ComputeStage implementations
-   - `GPUGEMMStage`: Matrix multiplication via IBackend::gemmIQ4NL()
-   - `GPURMSNormStage`: RMS normalization with device workspace
-   - `GPUSwiGLUStage`: SwiGLU activation
-   - `GPUResidualAddStage`: Element-wise residual addition
-   - `GPURoPEStage`: Rotary position encoding
-   - `GPUAttentionStage`: Scaled dot-product attention
-   - All stages conditionally compiled with `#ifdef HAVE_CUDA` / `#ifdef HAVE_ROCM`
+2. ✅ Unified Stage Architecture (December 2025)
+   - **Single stage class per operation** - no separate GPU*Stage classes
+   - Stages delegate to `KernelFactory` at execute-time for device dispatch
+   - `IDeviceContext::deviceType()` determines kernel backend (CPU, CUDA, ROCm)
+   - Removed ~430 lines of redundant GPU stage code
+   - See `docs/v2/UNIFIED_STAGE_ARCHITECTURE.md` for full design
 
 3. ✅ Add GPU memory management
    - Device memory allocation via IBackend interface
@@ -472,17 +477,17 @@ The `WorkDistributor` supports MoE via:
    - Device-to-device transfers for multi-GPU
    - Workspace allocation per context
 
-4. ✅ Wire up ComputeStageFactory for GPU dispatch
-   - Factory detects backend type from DeviceContext
-   - Returns GPU-optimized stages for CUDA/ROCm backends
-   - Falls back to CPU stages when GPU unavailable
+4. ✅ ComputeStageFactory simplified (no backend parameter)
+   - Factory creates backend-agnostic stages
+   - Stages query `ctx->deviceType()` at execute-time
+   - KernelFactory creates appropriate kernel for each device type
 
 5. ✅ Enable ROCm device enumeration
    - Fixed `enumerate_rocm_devices()` for modern HIP API (gcnArchName parsing)
    - Proper NUMA-aware GPU filtering
 
 6. ✅ All unit tests passing
-   - 149 unit tests pass on both CPU-only and ROCm builds
+   - 159 unit tests pass on both CPU-only and ROCm builds
    - GPU context tests skip gracefully when no GPU available
    - Namespace fix for backend includes (prevented nested namespace issue)
 
@@ -504,7 +509,7 @@ The `WorkDistributor` supports MoE via:
    - `swiglu()` → FFN_SWIGLU flag
    - `add_residual()` → FFN_RESIDUAL / ATTENTION_RESIDUAL detection
    - `apply_rope()` → ROPE flag
-5. ✅ All 149 unit tests passing
+5. ✅ All 159 unit tests passing
 
 ### Phase 6: Multi-GPU Infrastructure ✅ COMPLETE
 
@@ -865,8 +870,8 @@ src/v2/execution/
 ├── WorkDistributor.cpp     # Rank/Device/MoE slicing
 ├── DeviceContext.h         # IDeviceContext, IGPUDeviceContext, CPUDeviceContext, CUDADeviceContext, ROCmDeviceContext (~400 lines)
 ├── DeviceContext.cpp       # CPU/GPU context implementations, memory management (~550 lines)
-├── ComputeStage.h          # IComputeStage + CPU/GPU stage classes (~550 lines)
-├── ComputeStage.cpp        # CPU + GPU implementations of all stages (~900 lines)
+├── ComputeStage.h          # IComputeStage + unified stage classes (~420 lines, reduced after GPU stage removal)
+├── ComputeStage.cpp        # Unified implementations - stages delegate to KernelFactory (~600 lines)
 ├── LayerExecutor.h         # ComputeGraph + LayerExecutor (425 lines)
 └── LayerExecutor.cpp       # Graph execution, Attention/FFN/MoE builders (658 lines)
 
@@ -898,7 +903,7 @@ tests/v2/unit/
 └── Test__PipelineExecutor.cpp   # 22 tests (300 lines)
 ```
 
-**Total: 149 unit tests passing (execution framework: 108 tests)**
+**Total: 159 unit tests passing (execution framework: 108 tests)**
 
 ## Migration Path
 
