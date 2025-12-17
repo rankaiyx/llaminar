@@ -11,6 +11,7 @@
 #include "../../utils/DebugEnv.h"
 #include "../../backends/ComputeBackend.h"
 #include "../../tensors/TensorSlice.h"
+#include "../../tensors/Tensors.h" // For FP32Tensor
 #include "../../utils/MPIContext.h"
 #include "../MPIStrategy.h"
 
@@ -144,14 +145,27 @@ namespace llaminar2
         // Debug: dump input to attention (for layer 0 only to reduce noise)
         if (layer_idx == 0)
         {
-            const float *input = buffers.current_hidden->data();
+            const float *input = buffers.current_hidden->fp32_data();
             LOG_INFO("[EXEC_ATTN_INPUT] layer=" << layer_idx << " seq_len=" << seq_len
                                                 << " input[0:4]=" << input[0] << "," << input[1] << "," << input[2] << "," << input[3]);
+            LOG_INFO("[EXEC_ATTN_INPUT] wq=" << static_cast<const void *>(layer.wq)
+                                             << " wq_shape=[" << layer.wq->shape()[0] << "," << layer.wq->shape()[1] << "]");
         }
 
         // Build compute graph for this attention block
         ComputeGraph graph = buildAttentionGraph(layer, buffers, layer_idx, seq_len,
                                                  kv_cache, position_ids, device_idx);
+
+        // Debug: log graph structure
+        if (layer_idx == 0)
+        {
+            auto order = graph.getExecutionOrder();
+            LOG_INFO("[EXEC_ATTN] Graph has " << graph.size() << " nodes, execution order:");
+            for (const auto &name : order)
+            {
+                LOG_INFO("[EXEC_ATTN]   - " << name);
+            }
+        }
 
         // Get or create device context
         IDeviceContext *ctx = getDeviceContext(device_idx);
@@ -166,11 +180,11 @@ namespace llaminar2
         // Debug: dump intermediate buffers (for layer 0 only)
         if (layer_idx == 0)
         {
-            const float *normalized = buffers.normalized->data();
-            const float *Q = buffers.Q->data();
-            const float *attn_output = buffers.attn_output->data();
-            const float *attn_proj = buffers.attn_proj->data();
-            const float *output = buffers.current_hidden->data();
+            const float *normalized = buffers.normalized->fp32_data();
+            const float *Q = buffers.Q->fp32_data();
+            const float *attn_output = buffers.attn_output->fp32_data();
+            const float *attn_proj = buffers.attn_proj->fp32_data();
+            const float *output = buffers.current_hidden->fp32_data();
             LOG_INFO("[EXEC_ATTN] normalized ptr=" << static_cast<const void *>(normalized)
                                                    << " Q ptr=" << static_cast<const void *>(Q));
             LOG_INFO("[EXEC_ATTN] normalized[0:4]=" << std::setprecision(10) << normalized[0] << "," << normalized[1] << "," << normalized[2] << "," << normalized[3]);
@@ -203,12 +217,13 @@ namespace llaminar2
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
 
         LOG_DEBUG("[buildAttentionGraph] layer_idx=" << layer_idx << " seq_len=" << seq_len
+                                                     << " layer.wq=" << static_cast<const void *>(layer.wq)
                                                      << " layer.wo=" << layer.wo << " world_size="
                                                      << (mpi_ctx_ ? mpi_ctx_->world_size() : 1));
 
         // Determine backend type for stage creation
         auto &dm = DeviceManager::instance();
-        ComputeBackendType backend = ComputeBackendType::CPU_OPENBLAS;
+        ComputeBackendType backend = ComputeBackendType::CPU;
         if (static_cast<size_t>(device_idx) < dm.devices().size())
         {
             backend = dm.devices()[device_idx].type;
@@ -218,273 +233,265 @@ namespace llaminar2
         if (env.execution.exec_rmsnorm)
         {
             RMSNormStage::Params attn_norm_params;
-            attn_norm_params.input = buffers.current_hidden->data();      // Read from current_hidden (no copy needed)
-            attn_norm_params.output = buffers.normalized->mutable_data(); // Write to normalized
-            attn_norm_params.gamma = nullptr;
-            if (layer.attn_norm != nullptr)
-            {
-                attn_norm_params.gamma = layer.attn_norm->data();
-            }
-            attn_norm_params.seq_len = seq_len;
-            attn_norm_params.hidden_dim = config_.d_model;
+            // Use TensorBase* API (preferred) - tensor carries type/device/dimension info
+            attn_norm_params.input = buffers.current_hidden; // TensorBase* - read from current_hidden
+            attn_norm_params.output = buffers.normalized;    // TensorBase* - write to normalized
+            attn_norm_params.gamma = layer.attn_norm;        // TensorBase* - gamma weights (can be nullptr)
             attn_norm_params.eps = config_.rms_norm_eps;
+            attn_norm_params.seq_len = seq_len; // CRITICAL: Explicit seq_len for pre-allocated buffers
 
             graph.addNode(prefix + "attn_norm",
-                          ComputeStageFactory::createRMSNorm(attn_norm_params, backend),
+                          ComputeStageFactory::createRMSNorm(attn_norm_params),
                           device_idx);
         }
 
-        // Stage 2: Q/K/V projections using pre-quantized activations (like FusedGEMM)
-        if (env.execution.exec_gemm)
+        // Stage 2: Q/K/V projections using FusedQKVGEMMStage
+        // The fused stage handles quantization internally via ITensorGemm::multiply_fused()
+        // - For quantized weights: Optimized shared Q8_1 quantization
+        // - For FP32/FP16/BF16 weights: Falls back to sequential GEMMs
+        if (env.execution.exec_gemm && layer.wq && layer.wk && layer.wv)
         {
-            // Calculate Q8_1 buffer size needed
+            LOG_DEBUG("[Qwen2LayerExecutor] Using FusedQKVGEMMStage");
+
             int k = config_.d_model;
-            size_t q8_1_size = QuantizeStage::get_quantized_buffer_size(seq_len, k);
+            int q_n = static_cast<int>(layer.wq->shape()[0]);
+            int k_n = static_cast<int>(layer.wk->shape()[0]);
+            int v_n = static_cast<int>(layer.wv->shape()[0]);
 
-            LOG_INFO("[Qwen2LayerExecutor] Checking Q8_1 buffer: ptr=" << buffers.q8_1_attn_buffer
-                                                                       << " size=" << buffers.q8_1_attn_size << " required=" << q8_1_size);
+            // Extract bias pointers (nullptr if model doesn't have biases)
+            const float *q_bias_ptr = nullptr;
+            const float *k_bias_ptr = nullptr;
+            const float *v_bias_ptr = nullptr;
 
-            // Ensure buffer is allocated (pipeline should pre-allocate, but handle dynamic case)
-            if (!buffers.q8_1_attn_buffer || buffers.q8_1_attn_size < q8_1_size)
+            if (layer.q_bias)
             {
-                LOG_INFO("[Qwen2LayerExecutor] Q8_1 buffer not pre-allocated or too small, using FP32 GEMM path");
-                // Fall back to FP32 path if buffer not available
-                // (In production, buffer should be pre-allocated by pipeline)
-
-                // Q projection
-                if (layer.wq)
-                {
-                    int q_n = static_cast<int>(layer.wq->shape()[0]);
-                    int q_k = static_cast<int>(layer.wq->shape()[1]);
-                    graph.addNode(prefix + "q_proj",
-                                  ComputeStageFactory::createGEMM(
-                                      GEMMStage::Params{
-                                          buffers.normalized->data(), layer.wq,
-                                          buffers.Q->mutable_data(),
-                                          seq_len, q_n, q_k,
-                                          1.0f, 0.0f, false},
-                                      backend),
-                                  device_idx);
-                }
-
-                // K projection
-                if (layer.wk)
-                {
-                    int k_n = static_cast<int>(layer.wk->shape()[0]);
-                    int k_k = static_cast<int>(layer.wk->shape()[1]);
-                    graph.addNode(prefix + "k_proj",
-                                  ComputeStageFactory::createGEMM(
-                                      GEMMStage::Params{
-                                          buffers.normalized->data(), layer.wk,
-                                          buffers.K->mutable_data(),
-                                          seq_len, k_n, k_k,
-                                          1.0f, 0.0f, false},
-                                      backend),
-                                  device_idx);
-                }
-
-                // V projection
-                if (layer.wv)
-                {
-                    int v_n = static_cast<int>(layer.wv->shape()[0]);
-                    int v_k = static_cast<int>(layer.wv->shape()[1]);
-                    graph.addNode(prefix + "v_proj",
-                                  ComputeStageFactory::createGEMM(
-                                      GEMMStage::Params{
-                                          buffers.normalized->data(), layer.wv,
-                                          buffers.V->mutable_data(),
-                                          seq_len, v_n, v_k,
-                                          1.0f, 0.0f, false},
-                                      backend),
-                                  device_idx);
-                }
+                auto *q_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.q_bias);
+                if (q_bias_fp32)
+                    q_bias_ptr = q_bias_fp32->data();
             }
-            else
+            if (layer.k_bias)
             {
-                // Use Q8_1 path: quantize once, reuse for Q/K/V (matches FusedGEMM)
-                LOG_DEBUG("[Qwen2LayerExecutor] Using Q8_1 pre-quantized GEMM path");
-
-                // Stage 2a: Quantize normalized activations to Q8_1
-                graph.addNode(prefix + "attn_quantize",
-                              ComputeStageFactory::createQuantize(
-                                  QuantizeStage::Params{
-                                      buffers.normalized->data(),
-                                      buffers.q8_1_attn_buffer,
-                                      seq_len, k},
-                                  backend),
-                              device_idx);
-
-                // Stage 2b: Q projection using pre-quantized input
-                if (layer.wq)
-                {
-                    int q_n = static_cast<int>(layer.wq->shape()[0]);
-                    int q_k = static_cast<int>(layer.wq->shape()[1]);
-
-                    GEMMStage::Params q_params;
-                    q_params.A_q8_1 = buffers.q8_1_attn_buffer; // Pre-quantized
-                    q_params.B = layer.wq;
-                    q_params.C = buffers.Q->mutable_data();
-                    q_params.m = seq_len;
-                    q_params.n = q_n;
-                    q_params.k = q_k;
-
-                    graph.addNode(prefix + "q_proj",
-                                  ComputeStageFactory::createGEMM(q_params, backend),
-                                  device_idx);
-                }
-
-                // Stage 2c: K projection using pre-quantized input
-                if (layer.wk)
-                {
-                    int k_n = static_cast<int>(layer.wk->shape()[0]);
-                    int k_k = static_cast<int>(layer.wk->shape()[1]);
-
-                    GEMMStage::Params k_params;
-                    k_params.A_q8_1 = buffers.q8_1_attn_buffer; // Pre-quantized
-                    k_params.B = layer.wk;
-                    k_params.C = buffers.K->mutable_data();
-                    k_params.m = seq_len;
-                    k_params.n = k_n;
-                    k_params.k = k_k;
-
-                    graph.addNode(prefix + "k_proj",
-                                  ComputeStageFactory::createGEMM(k_params, backend),
-                                  device_idx);
-                }
-
-                // Stage 2d: V projection using pre-quantized input
-                if (layer.wv)
-                {
-                    int v_n = static_cast<int>(layer.wv->shape()[0]);
-                    int v_k = static_cast<int>(layer.wv->shape()[1]);
-
-                    GEMMStage::Params v_params;
-                    v_params.A_q8_1 = buffers.q8_1_attn_buffer; // Pre-quantized
-                    v_params.B = layer.wv;
-                    v_params.C = buffers.V->mutable_data();
-                    v_params.m = seq_len;
-                    v_params.n = v_n;
-                    v_params.k = v_k;
-
-                    graph.addNode(prefix + "v_proj",
-                                  ComputeStageFactory::createGEMM(v_params, backend),
-                                  device_idx);
-                }
-
-                // Dependencies: projections depend on quantization
-                if (layer.wq)
-                    graph.addDependency(prefix + "q_proj", prefix + "attn_quantize");
-                if (layer.wk)
-                    graph.addDependency(prefix + "k_proj", prefix + "attn_quantize");
-                if (layer.wv)
-                    graph.addDependency(prefix + "v_proj", prefix + "attn_quantize");
+                auto *k_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.k_bias);
+                if (k_bias_fp32)
+                    k_bias_ptr = k_bias_fp32->data();
+            }
+            if (layer.v_bias)
+            {
+                auto *v_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.v_bias);
+                if (v_bias_fp32)
+                    v_bias_ptr = v_bias_fp32->data();
             }
 
-            // Dependencies: projections/quantize depend on norm
+            FusedQKVGEMMStage::Params qkv_params;
+            qkv_params.input = buffers.normalized; // TensorBase* - stage extracts FP32 internally
+            qkv_params.m = seq_len;
+            qkv_params.k = k;
+            qkv_params.wq = layer.wq;
+            qkv_params.output_q = buffers.Q; // TensorBase* - stage extracts mutable FP32 internally
+            qkv_params.n_q = q_n;
+            qkv_params.bias_q = q_bias_ptr;
+            qkv_params.wk = layer.wk;
+            qkv_params.output_k = buffers.K; // TensorBase* - stage extracts mutable FP32 internally
+            qkv_params.n_k = k_n;
+            qkv_params.bias_k = k_bias_ptr;
+            qkv_params.wv = layer.wv;
+            qkv_params.output_v = buffers.V; // TensorBase* - stage extracts mutable FP32 internally
+            qkv_params.n_v = v_n;
+            qkv_params.bias_v = v_bias_ptr;
+
+            graph.addNode(prefix + "qkv_proj",
+                          ComputeStageFactory::createFusedQKVGEMM(qkv_params),
+                          device_idx);
+
+            // Dependency: fused projection depends on norm
             if (env.execution.exec_rmsnorm)
             {
-                if (buffers.q8_1_attn_buffer && buffers.q8_1_attn_size >= q8_1_size)
-                {
-                    graph.addDependency(prefix + "attn_quantize", prefix + "attn_norm");
-                }
-                else
-                {
-                    if (layer.wq)
-                        graph.addDependency(prefix + "q_proj", prefix + "attn_norm");
-                    if (layer.wk)
-                        graph.addDependency(prefix + "k_proj", prefix + "attn_norm");
-                    if (layer.wv)
-                        graph.addDependency(prefix + "v_proj", prefix + "attn_norm");
-                }
+                graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");
             }
         }
 
         // Stage 3: RoPE on Q and K
         if (env.execution.exec_rope)
         {
-            int pos_offset = 0; // TODO: Get from position_ids
+            // For decode mode, position_ids[0] contains the position of the new token
+            // (e.g., 9 for the 10th token after a 9-token prefill)
+            int pos_offset = position_ids ? position_ids[0] : 0;
 
-            graph.addNode(prefix + "q_rope",
-                          ComputeStageFactory::createRoPE(
-                              RoPEStage::Params{
-                                  buffers.Q->mutable_data(),
-                                  seq_len,
-                                  config_.n_heads,
-                                  config_.head_dim,
-                                  pos_offset,
-                                  config_.rope_theta},
-                              backend),
+            // Use TensorBase* API - pass both Q and K to RoPE stage
+            RoPEStage::Params rope_params;
+            rope_params.Q = buffers.Q;
+            rope_params.K = buffers.K;
+            rope_params.n_heads = config_.n_heads;
+            rope_params.n_kv_heads = config_.n_kv_heads;
+            rope_params.head_dim = config_.head_dim;
+            rope_params.pos_offset = pos_offset;
+            rope_params.theta_base = config_.rope_theta;
+
+            graph.addNode(prefix + "rope",
+                          ComputeStageFactory::createRoPE(rope_params),
                           device_idx);
 
-            graph.addNode(prefix + "k_rope",
-                          ComputeStageFactory::createRoPE(
-                              RoPEStage::Params{
-                                  buffers.K->mutable_data(),
-                                  seq_len,
-                                  config_.n_kv_heads,
-                                  config_.head_dim,
-                                  pos_offset,
-                                  config_.rope_theta},
-                              backend),
-                          device_idx);
-
-            // Dependencies: RoPE depends on projections
+            // Dependency: RoPE depends on fused QKV projection
             if (env.execution.exec_gemm)
             {
-                graph.addDependency(prefix + "q_rope", prefix + "q_proj");
-                graph.addDependency(prefix + "k_rope", prefix + "k_proj");
+                graph.addDependency(prefix + "rope", prefix + "qkv_proj");
             }
         }
 
         // Stage 4: Attention computation with KV cache integration
         if (env.execution.exec_attention)
         {
-            // Use the production attention stage with KV cache support
-            AttentionWithKVCacheStage::Params attn_params;
-            attn_params.Q = buffers.Q;
-            attn_params.K = buffers.K;
-            attn_params.V = buffers.V;
-            attn_params.output = buffers.attn_output;
-            attn_params.kv_cache = kv_cache; // Integrate with KV cache
-            attn_params.layer_idx = layer_idx;
-            attn_params.mode = AttentionWithKVCacheStage::Mode::AUTO; // Auto-detect prefill vs decode
-            attn_params.batch_size = 1;
-            attn_params.seq_len = seq_len;
-            attn_params.n_heads = config_.n_heads;
-            attn_params.n_kv_heads = config_.n_kv_heads;
-            attn_params.head_dim = config_.head_dim;
-            attn_params.causal = true;
-            attn_params.window_size = -1;   // Full attention
-            attn_params.mpi_ctx = mpi_ctx_; // MPI support
-            // Determine MPI strategy: TensorParallel if multi-rank, else None
-            MPIStrategy mpi_strategy = MPIStrategy::None;
-            if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+            if (config_.use_decomposed_attention)
             {
-                mpi_strategy = MPIStrategy::TensorParallel;
-            }
-            attn_params.mpi_strategy = static_cast<int>(mpi_strategy);
-            // Workspace buffers from PipelineBase (required for MPI TP with causal masking)
-            attn_params.workspace_scores = buffers.workspace_scores;
-            attn_params.workspace_context = buffers.workspace_context;
-            attn_params.workspace_mask = buffers.workspace_mask;
-            attn_params.sequence_lengths = nullptr; // Single sequence
-            attn_params.position_offset = position_ids ? position_ids[0] : 0;
+                // =================================================================
+                // Phase 9 Decomposed Path: KVCacheAppendStage + AttentionComputeStage
+                // =================================================================
+                // This path uses KernelFactory for device-aware kernel dispatch
 
-            graph.addNode(prefix + "attention",
-                          ComputeStageFactory::createAttentionWithKVCache(attn_params, backend),
-                          device_idx);
+                // Stage 4a: Append K/V to cache (if cache provided)
+                if (kv_cache)
+                {
+                    KVCacheAppendStage::Params kv_append_params;
+                    kv_append_params.K = buffers.K;
+                    kv_append_params.V = buffers.V;
+                    kv_append_params.kv_cache = kv_cache;
+                    kv_append_params.layer_idx = layer_idx;
+                    kv_append_params.seq_idx = 0;
+                    kv_append_params.num_tokens = seq_len;
 
-            // Dependencies: attention depends on RoPE (or projections if no RoPE)
-            if (env.execution.exec_rope)
-            {
-                graph.addDependency(prefix + "attention", prefix + "q_rope");
-                graph.addDependency(prefix + "attention", prefix + "k_rope");
+                    graph.addNode(prefix + "kv_append",
+                                  ComputeStageFactory::createKVCacheAppend(kv_append_params),
+                                  device_idx);
+
+                    // KV append depends on RoPE (or projections)
+                    if (env.execution.exec_rope)
+                    {
+                        graph.addDependency(prefix + "kv_append", prefix + "rope");
+                    }
+                    else if (env.execution.exec_gemm)
+                    {
+                        graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
+                    }
+                }
+
+                // Stage 4b: Pure attention compute
+                // Get K/V from cache if available, otherwise use buffers directly
+                TensorBase *K_for_attn = buffers.K;
+                TensorBase *V_for_attn = buffers.V;
+                int kv_len = seq_len;
+
+                if (kv_cache)
+                {
+                    // Note: We'll use cached K/V which includes just-appended tokens
+                    // This must be set up at graph execution time via a lambda or
+                    // deferred parameter resolution. For now, we still use buffer pointers
+                    // and let the kernel handle cache lookup internally.
+                    K_for_attn = kv_cache->get_k_base(layer_idx, 0);
+                    V_for_attn = kv_cache->get_v_base(layer_idx, 0);
+                    kv_len = kv_cache->get_cached_tokens(layer_idx, 0);
+                    // During first forward, cache may be empty - use seq_len
+                    if (kv_len == 0)
+                        kv_len = seq_len;
+                }
+
+                // Detect attention mode for optimized kernel dispatch
+                AttentionMode mode = detect_attention_mode(1, seq_len, kv_len);
+                LOG_TRACE("[Qwen2LayerExecutor] Layer " << layer_idx
+                                                        << " attention mode: " << attention_mode_name(mode)
+                                                        << " (seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
+
+                AttentionComputeStage::Params attn_params;
+                attn_params.Q = buffers.Q;
+                attn_params.K = K_for_attn;
+                attn_params.V = V_for_attn;
+                attn_params.output = buffers.attn_output;
+                attn_params.batch_size = 1;
+                attn_params.seq_len = seq_len;
+                attn_params.kv_len = kv_len;
+                attn_params.n_heads = config_.n_heads;
+                attn_params.n_kv_heads = config_.n_kv_heads;
+                attn_params.head_dim = config_.head_dim;
+                attn_params.causal = true;
+                attn_params.window_size = -1;
+                attn_params.attention_mode = mode;
+                attn_params.auto_detect_mode = false; // Already detected above
+                attn_params.workspace_scores = buffers.workspace_scores;
+                attn_params.workspace_context = buffers.workspace_context;
+                attn_params.workspace_mask = buffers.workspace_mask;
+                attn_params.mpi_ctx = mpi_ctx_.get();
+                attn_params.device_idx = device_idx;
+
+                graph.addNode(prefix + "attention",
+                              ComputeStageFactory::createAttentionCompute(attn_params),
+                              device_idx);
+
+                // Dependencies: attention depends on KV append (or RoPE if no cache)
+                if (kv_cache)
+                {
+                    graph.addDependency(prefix + "attention", prefix + "kv_append");
+                }
+                else if (env.execution.exec_rope)
+                {
+                    graph.addDependency(prefix + "attention", prefix + "rope");
+                }
+                else if (env.execution.exec_gemm)
+                {
+                    graph.addDependency(prefix + "attention", prefix + "qkv_proj");
+                }
+
+                LOG_DEBUG("[Qwen2LayerExecutor] Using decomposed attention path (Phase 9)");
             }
-            else if (env.execution.exec_gemm)
+            else
             {
-                graph.addDependency(prefix + "attention", prefix + "q_proj");
-                graph.addDependency(prefix + "attention", prefix + "k_proj");
-                graph.addDependency(prefix + "attention", prefix + "v_proj");
+                // =================================================================
+                // Legacy Path: AttentionWithKVCacheStage (uses MpiAttentionOrchestrator)
+                // =================================================================
+                // Use the production attention stage with KV cache support
+                AttentionWithKVCacheStage::Params attn_params;
+                attn_params.Q = buffers.Q;
+                attn_params.K = buffers.K;
+                attn_params.V = buffers.V;
+                attn_params.output = buffers.attn_output;
+                attn_params.kv_cache = kv_cache; // Integrate with KV cache
+                attn_params.layer_idx = layer_idx;
+                attn_params.mode = AttentionWithKVCacheStage::Mode::AUTO; // Auto-detect prefill vs decode
+                attn_params.batch_size = 1;
+                attn_params.seq_len = seq_len;
+                attn_params.n_heads = config_.n_heads;
+                attn_params.n_kv_heads = config_.n_kv_heads;
+                attn_params.head_dim = config_.head_dim;
+                attn_params.causal = true;
+                attn_params.window_size = -1;   // Full attention
+                attn_params.mpi_ctx = mpi_ctx_; // MPI support
+                // Determine MPI strategy: TensorParallel if multi-rank, else None
+                MPIStrategy mpi_strategy = MPIStrategy::None;
+                if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+                {
+                    mpi_strategy = MPIStrategy::TensorParallel;
+                }
+                attn_params.mpi_strategy = static_cast<int>(mpi_strategy);
+                // Workspace buffers from PipelineBase (required for MPI TP with causal masking)
+                attn_params.workspace_scores = buffers.workspace_scores;
+                attn_params.workspace_context = buffers.workspace_context;
+                attn_params.workspace_mask = buffers.workspace_mask;
+                attn_params.sequence_lengths = nullptr; // Single sequence
+                attn_params.position_offset = position_ids ? position_ids[0] : 0;
+
+                graph.addNode(prefix + "attention",
+                              ComputeStageFactory::createAttentionWithKVCache(attn_params),
+                              device_idx);
+
+                // Dependencies: attention depends on RoPE (or projections if no RoPE)
+                if (env.execution.exec_rope)
+                {
+                    graph.addDependency(prefix + "attention", prefix + "rope");
+                }
+                else if (env.execution.exec_gemm)
+                {
+                    graph.addDependency(prefix + "attention", prefix + "q_proj");
+                    graph.addDependency(prefix + "attention", prefix + "k_proj");
+                    graph.addDependency(prefix + "attention", prefix + "v_proj");
+                }
             }
         }
 
@@ -499,12 +506,15 @@ namespace llaminar2
             graph.addNode(prefix + "wo_proj",
                           ComputeStageFactory::createGEMM(
                               GEMMStage::Params{
-                                  buffers.attn_output->data(),
-                                  layer.wo,
-                                  buffers.attn_proj->mutable_data(),
-                                  seq_len, wo_n, wo_k,
-                                  1.0f, 0.0f, false},
-                              backend),
+                                  .A = buffers.attn_output, // TensorBase* - stage extracts FP32 internally
+                                  .B = layer.wo,
+                                  .C = buffers.attn_proj, // TensorBase* - stage extracts mutable FP32 internally
+                                  .m = seq_len,
+                                  .n = wo_n,
+                                  .k = wo_k,
+                                  .alpha = 1.0f,
+                                  .beta = 0.0f,
+                                  .transpose_B = false}),
                           device_idx);
 
             // Add Allreduce stage when weights are sharded row-parallel
@@ -519,8 +529,7 @@ namespace llaminar2
                                   AllreduceStage::Params{
                                       buffers.attn_proj->mutable_data(),
                                       static_cast<size_t>(seq_len) * config_.d_model,
-                                      getMPIComm(mpi_ctx_.get())},
-                                  backend),
+                                      getMPIComm(mpi_ctx_.get())}),
                               device_idx);
 
                 // Allreduce depends on Wo projection
@@ -541,16 +550,15 @@ namespace llaminar2
         if (env.execution.exec_residual)
         {
             ResidualAddStage::Params res_params;
-            res_params.input = buffers.attn_proj->data();
-            res_params.residual = buffers.current_hidden->data();       // Residual = current_hidden (before modification)
-            res_params.output = buffers.current_hidden->mutable_data(); // Output = current_hidden (in-place add)
-            res_params.num_elements = static_cast<size_t>(seq_len) * config_.d_model;
-            res_params.rows = seq_len;
-            res_params.cols = config_.d_model;
-            res_params.precision = config_.activation_precision; // Pass precision from config
+            res_params.input = buffers.attn_proj;         // TensorBase* directly
+            res_params.residual = buffers.current_hidden; // TensorBase* directly
+            res_params.output = buffers.current_hidden;   // In-place add
+            // CRITICAL: Set num_elements explicitly for decode mode where buffers are
+            // pre-allocated to max_seq_len but we only process seq_len tokens
+            res_params.num_elements = static_cast<size_t>(seq_len) * static_cast<size_t>(config_.d_model);
 
             graph.addNode(prefix + "attn_residual",
-                          ComputeStageFactory::createResidualAdd(res_params, backend),
+                          ComputeStageFactory::createResidualAdd(res_params),
                           device_idx);
 
             // Dependencies: residual depends on Wo (or Wo allreduce if sharded)
@@ -620,7 +628,7 @@ namespace llaminar2
 
         // Determine backend type
         auto &dm = DeviceManager::instance();
-        ComputeBackendType backend = ComputeBackendType::CPU_OPENBLAS;
+        ComputeBackendType backend = ComputeBackendType::CPU;
         if (static_cast<size_t>(device_idx) < dm.devices().size())
         {
             backend = dm.devices()[device_idx].type;
@@ -630,160 +638,74 @@ namespace llaminar2
         if (env.execution.exec_rmsnorm)
         {
             RMSNormStage::Params ffn_norm_params;
-            ffn_norm_params.input = buffers.current_hidden->data();      // Read from post-attention hidden
-            ffn_norm_params.output = buffers.normalized->mutable_data(); // Write to normalized
-            ffn_norm_params.gamma = nullptr;
-            if (layer.ffn_norm != nullptr)
-            {
-                ffn_norm_params.gamma = layer.ffn_norm->data();
-            }
-            ffn_norm_params.seq_len = seq_len;
-            ffn_norm_params.hidden_dim = config_.d_model;
+            // Use TensorBase* API (preferred) - tensor carries type/device/dimension info
+            ffn_norm_params.input = buffers.current_hidden; // TensorBase* - read from post-attention hidden
+            ffn_norm_params.output = buffers.normalized;    // TensorBase* - write to normalized
+            ffn_norm_params.gamma = layer.ffn_norm;         // TensorBase* - gamma weights (can be nullptr)
             ffn_norm_params.eps = config_.rms_norm_eps;
+            ffn_norm_params.seq_len = seq_len; // CRITICAL: Explicit seq_len for pre-allocated buffers
 
             graph.addNode(prefix + "ffn_norm",
-                          ComputeStageFactory::createRMSNorm(ffn_norm_params, backend),
+                          ComputeStageFactory::createRMSNorm(ffn_norm_params),
                           device_idx);
         }
 
-        // Stage 2: Gate and Up projections using pre-quantized activations (like FusedGEMM)
-        if (env.execution.exec_gemm)
+        // Stage 2: Gate and Up projections using FusedGateUpGEMMStage
+        // The fused stage handles quantization internally via ITensorGemm::multiply_fused()
+        // - For quantized weights: Optimized shared Q8_1 quantization
+        // - For FP32/FP16/BF16 weights: Falls back to sequential GEMMs
+        if (env.execution.exec_gemm && layer.gate_proj && layer.up_proj)
         {
-            // Calculate Q8_1 buffer size needed
+            LOG_DEBUG("[Qwen2LayerExecutor] FFN using FusedGateUpGEMMStage");
+
             int k = config_.d_model;
-            size_t q8_1_size = QuantizeStage::get_quantized_buffer_size(seq_len, k);
+            int gate_n = static_cast<int>(layer.gate_proj->shape()[0]);
+            int up_n = static_cast<int>(layer.up_proj->shape()[0]);
 
-            // Check if Q8_1 buffer is available
-            if (!buffers.q8_1_ffn_buffer || buffers.q8_1_ffn_size < q8_1_size)
+            FusedGateUpGEMMStage::Params gate_up_params;
+            gate_up_params.input = buffers.normalized; // TensorBase* - stage extracts FP32 internally
+            gate_up_params.m = seq_len;
+            gate_up_params.k = k;
+            gate_up_params.w_gate = layer.gate_proj;
+            gate_up_params.output_gate = buffers.gate; // TensorBase* - supports Q8_1 via multiply_tensor
+            gate_up_params.n_gate = gate_n;
+            gate_up_params.w_up = layer.up_proj;
+            gate_up_params.output_up = buffers.up; // TensorBase* - supports Q8_1 via multiply_tensor
+            gate_up_params.n_up = up_n;
+            gate_up_params.mpi_ctx = mpi_ctx_.get(); // For Q8_1 multiply_tensor path
+            gate_up_params.device_idx = device_idx;
+
+            graph.addNode(prefix + "gate_up_proj",
+                          ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
+                          device_idx);
+
+            // Dependency: fused projection depends on norm
+            if (env.execution.exec_rmsnorm)
             {
-                LOG_DEBUG("[Qwen2LayerExecutor] FFN Q8_1 buffer not pre-allocated, using FP32 GEMM path");
-                // Fall back to FP32 path
-
-                // Gate projection
-                if (layer.gate_proj)
-                {
-                    int gate_n = static_cast<int>(layer.gate_proj->shape()[0]);
-                    int gate_k = static_cast<int>(layer.gate_proj->shape()[1]);
-                    graph.addNode(prefix + "gate_proj",
-                                  ComputeStageFactory::createGEMM(
-                                      GEMMStage::Params{
-                                          buffers.normalized->data(), layer.gate_proj,
-                                          buffers.gate->mutable_data(),
-                                          seq_len, gate_n, gate_k,
-                                          1.0f, 0.0f, false},
-                                      backend),
-                                  device_idx);
-                }
-
-                // Up projection
-                if (layer.up_proj)
-                {
-                    int up_n = static_cast<int>(layer.up_proj->shape()[0]);
-                    int up_k = static_cast<int>(layer.up_proj->shape()[1]);
-                    graph.addNode(prefix + "up_proj",
-                                  ComputeStageFactory::createGEMM(
-                                      GEMMStage::Params{
-                                          buffers.normalized->data(), layer.up_proj,
-                                          buffers.up->mutable_data(),
-                                          seq_len, up_n, up_k,
-                                          1.0f, 0.0f, false},
-                                      backend),
-                                  device_idx);
-                }
-
-                // Dependencies: projections depend on norm
-                if (env.execution.exec_rmsnorm)
-                {
-                    if (layer.gate_proj)
-                        graph.addDependency(prefix + "gate_proj", prefix + "ffn_norm");
-                    if (layer.up_proj)
-                        graph.addDependency(prefix + "up_proj", prefix + "ffn_norm");
-                }
-            }
-            else
-            {
-                // Use Q8_1 path: quantize once, reuse for gate/up (matches FusedGEMM)
-                LOG_DEBUG("[Qwen2LayerExecutor] FFN using Q8_1 pre-quantized GEMM path");
-
-                // Stage 2a: Quantize normalized activations to Q8_1
-                graph.addNode(prefix + "ffn_quantize",
-                              ComputeStageFactory::createQuantize(
-                                  QuantizeStage::Params{
-                                      buffers.normalized->data(),
-                                      buffers.q8_1_ffn_buffer,
-                                      seq_len, k},
-                                  backend),
-                              device_idx);
-
-                // Stage 2b: Gate projection using pre-quantized input
-                if (layer.gate_proj)
-                {
-                    int gate_n = static_cast<int>(layer.gate_proj->shape()[0]);
-                    int gate_k = static_cast<int>(layer.gate_proj->shape()[1]);
-
-                    GEMMStage::Params gate_params;
-                    gate_params.A_q8_1 = buffers.q8_1_ffn_buffer; // Pre-quantized
-                    gate_params.B = layer.gate_proj;
-                    gate_params.C = buffers.gate->mutable_data();
-                    gate_params.m = seq_len;
-                    gate_params.n = gate_n;
-                    gate_params.k = gate_k;
-
-                    graph.addNode(prefix + "gate_proj",
-                                  ComputeStageFactory::createGEMM(gate_params, backend),
-                                  device_idx);
-                }
-
-                // Stage 2c: Up projection using pre-quantized input
-                if (layer.up_proj)
-                {
-                    int up_n = static_cast<int>(layer.up_proj->shape()[0]);
-                    int up_k = static_cast<int>(layer.up_proj->shape()[1]);
-
-                    GEMMStage::Params up_params;
-                    up_params.A_q8_1 = buffers.q8_1_ffn_buffer; // Pre-quantized
-                    up_params.B = layer.up_proj;
-                    up_params.C = buffers.up->mutable_data();
-                    up_params.m = seq_len;
-                    up_params.n = up_n;
-                    up_params.k = up_k;
-
-                    graph.addNode(prefix + "up_proj",
-                                  ComputeStageFactory::createGEMM(up_params, backend),
-                                  device_idx);
-                }
-
-                // Dependencies: projections depend on quantization, quantize depends on norm
-                if (layer.gate_proj)
-                    graph.addDependency(prefix + "gate_proj", prefix + "ffn_quantize");
-                if (layer.up_proj)
-                    graph.addDependency(prefix + "up_proj", prefix + "ffn_quantize");
-                if (env.execution.exec_rmsnorm)
-                {
-                    graph.addDependency(prefix + "ffn_quantize", prefix + "ffn_norm");
-                }
+                graph.addDependency(prefix + "gate_up_proj", prefix + "ffn_norm");
             }
         }
 
         // Stage 3: SwiGLU activation
+        // NOTE: SwiGLU writes output in-place to buffers.up (same as legacy pipeline)
+        // buffers.up has shape (seq_len, d_ff), which is correct for SwiGLU output.
+        // buffers.ffn_output has shape (seq_len, d_model) for the down projection result.
         if (env.execution.exec_swiglu)
         {
+            // Use TensorBase* API - tensor carries type/device/dimension info
+            SwiGLUStage::Params swiglu_params;
+            swiglu_params.gate = buffers.gate;
+            swiglu_params.up = buffers.up;
+            swiglu_params.output = buffers.up; // In-place: SwiGLU output to 'up' buffer
+
             graph.addNode(prefix + "swiglu",
-                          ComputeStageFactory::createSwiGLU(
-                              SwiGLUStage::Params{
-                                  buffers.gate->data(),
-                                  buffers.up->data(),
-                                  buffers.ffn_output->mutable_data(),
-                                  seq_len,
-                                  config_.d_ff},
-                              backend),
+                          ComputeStageFactory::createSwiGLU(swiglu_params),
                           device_idx);
 
-            // Dependencies: SwiGLU depends on gate and up projections
+            // Dependency: SwiGLU depends on fused gate/up projection
             if (env.execution.exec_gemm)
             {
-                graph.addDependency(prefix + "swiglu", prefix + "gate_proj");
-                graph.addDependency(prefix + "swiglu", prefix + "up_proj");
+                graph.addDependency(prefix + "swiglu", prefix + "gate_up_proj");
             }
         }
 
@@ -797,12 +719,15 @@ namespace llaminar2
             graph.addNode(prefix + "down_proj",
                           ComputeStageFactory::createGEMM(
                               GEMMStage::Params{
-                                  buffers.ffn_output->data(),
-                                  layer.down_proj,
-                                  buffers.attn_proj->mutable_data(), // Reuse attn_proj as temp buffer
-                                  seq_len, down_n, down_k,
-                                  1.0f, 0.0f, false},
-                              backend),
+                                  .A = buffers.up, // TensorBase* - SwiGLU output is in buffers.up (in-place)
+                                  .B = layer.down_proj,
+                                  .C = buffers.attn_proj, // TensorBase* - Reuse attn_proj as temp buffer
+                                  .m = seq_len,
+                                  .n = down_n,
+                                  .k = down_k,
+                                  .alpha = 1.0f,
+                                  .beta = 0.0f,
+                                  .transpose_B = false}),
                           device_idx);
 
             // Dependencies: down depends on SwiGLU
@@ -834,8 +759,7 @@ namespace llaminar2
                                   AllreduceStage::Params{
                                       buffers.attn_proj->mutable_data(),
                                       allreduce_count,
-                                      comm},
-                                  backend),
+                                      comm}),
                               device_idx);
 
                 graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");
@@ -846,16 +770,15 @@ namespace llaminar2
         if (env.execution.exec_residual)
         {
             ResidualAddStage::Params res_params;
-            res_params.input = buffers.attn_proj->data();               // Down proj output
-            res_params.residual = buffers.current_hidden->data();       // Previous residual
-            res_params.output = buffers.current_hidden->mutable_data(); // In-place update
-            res_params.num_elements = static_cast<size_t>(seq_len) * config_.d_model;
-            res_params.rows = seq_len;
-            res_params.cols = config_.d_model;
-            res_params.precision = config_.activation_precision; // Pass precision from config
+            res_params.input = buffers.attn_proj;         // Down proj output (TensorBase*)
+            res_params.residual = buffers.current_hidden; // Previous residual (TensorBase*)
+            res_params.output = buffers.current_hidden;   // In-place update
+            // CRITICAL: Set num_elements explicitly for decode mode where buffers are
+            // pre-allocated to max_seq_len but we only process seq_len tokens
+            res_params.num_elements = static_cast<size_t>(seq_len) * static_cast<size_t>(config_.d_model);
 
             graph.addNode(prefix + "ffn_residual",
-                          ComputeStageFactory::createResidualAdd(res_params, backend),
+                          ComputeStageFactory::createResidualAdd(res_params),
                           device_idx);
 
             // Dependencies: residual depends on down projection (or allreduce if sharded)

@@ -112,17 +112,15 @@ namespace llaminar2
             return false;
         }
 
-        // Create RMSNorm stage params
+        // Create RMSNorm stage params - pass TensorBase* directly
         RMSNormStage::Params params;
-        params.input = input->mutable_data();
-        params.output = input->mutable_data(); // In-place operation
-        params.gamma = static_cast<const float *>(gamma->data());
-        params.seq_len = seq_len;
-        params.hidden_dim = hidden_dim;
+        params.input = input;  // TensorBase* - modifies in-place
+        params.output = input; // TensorBase* - same as input for in-place
+        params.gamma = gamma;  // TensorBase*
         params.eps = eps;
 
         // Create and execute stage
-        auto stage = ComputeStageFactory::createRMSNorm(params, ctx->backendType());
+        auto stage = ComputeStageFactory::createRMSNorm(params);
         bool success = stage->execute(ctx);
 
         if (!success)
@@ -153,16 +151,14 @@ namespace llaminar2
             return false;
         }
 
-        // Create SwiGLU stage params
+        // Create SwiGLU stage params - pass TensorBase* directly
         SwiGLUStage::Params params;
-        params.gate = gate->data(); // SwiGLU reads from gate
-        params.up = up->data();
-        params.output = output->mutable_data();
-        params.seq_len = seq_len;
-        params.intermediate_dim = intermediate_dim;
+        params.gate = gate;     // TensorBase*
+        params.up = up;         // TensorBase*
+        params.output = output; // TensorBase*
 
         // Create and execute stage
-        auto stage = ComputeStageFactory::createSwiGLU(params, ctx->backendType());
+        auto stage = ComputeStageFactory::createSwiGLU(params);
         bool success = stage->execute(ctx);
 
         if (!success)
@@ -192,15 +188,14 @@ namespace llaminar2
             return false;
         }
 
-        // Create residual add stage params
+        // Create residual add stage params - pass TensorBase* directly
         ResidualAddStage::Params params;
-        params.input = input->data();
-        params.residual = residual->data();
-        params.output = output->mutable_data();
-        params.num_elements = num_elements;
+        params.input = input;       // const TensorBase*
+        params.residual = residual; // const TensorBase*
+        params.output = output;     // TensorBase*
 
         // Create and execute stage
-        auto stage = ComputeStageFactory::createResidualAdd(params, ctx->backendType());
+        auto stage = ComputeStageFactory::createResidualAdd(params);
         bool success = stage->execute(ctx);
 
         if (!success)
@@ -234,36 +229,21 @@ namespace llaminar2
             return false;
         }
 
-        // RoPE is applied to Q and K separately
-        // First apply to Q
+        // RoPE is applied to Q and K separately (or together if using TensorBase* mode)
+        // Use TensorBase* mode - pass Q and optionally K
         RoPEStage::Params q_params;
-        q_params.tensor = Q->mutable_data();
-        q_params.seq_len = seq_len;
+        q_params.Q = Q; // TensorBase*
+        q_params.K = K; // TensorBase* (optional, can process both at once)
         q_params.n_heads = n_heads;
+        q_params.n_kv_heads = n_kv_heads;
         q_params.head_dim = head_dim;
         q_params.pos_offset = 0; // TODO: pass position_ids properly
         q_params.theta_base = theta;
 
-        auto q_stage = ComputeStageFactory::createRoPE(q_params, ctx->backendType());
-        if (!q_stage->execute(ctx))
+        auto rope_stage = ComputeStageFactory::createRoPE(q_params);
+        if (!rope_stage->execute(ctx))
         {
-            LOG_ERROR("RoPE execution for Q failed on device " << device_idx);
-            return false;
-        }
-
-        // Then apply to K
-        RoPEStage::Params k_params;
-        k_params.tensor = K->mutable_data();
-        k_params.seq_len = seq_len;
-        k_params.n_heads = n_kv_heads;
-        k_params.head_dim = head_dim;
-        k_params.pos_offset = 0;
-        k_params.theta_base = theta;
-
-        auto k_stage = ComputeStageFactory::createRoPE(k_params, ctx->backendType());
-        if (!k_stage->execute(ctx))
-        {
-            LOG_ERROR("RoPE execution for K failed on device " << device_idx);
+            LOG_ERROR("RoPE execution failed on device " << device_idx);
             return false;
         }
 

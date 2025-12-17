@@ -80,8 +80,8 @@ TEST_F(Test__MultiGPU_DeviceManager, HasCPUDevice)
 
     // First device should be CPU
     const auto &cpu = devices[0];
-    EXPECT_TRUE(cpu.type == ComputeBackendType::CPU_OPENBLAS ||
-                cpu.type == ComputeBackendType::CPU_MKL)
+    EXPECT_TRUE(cpu.type == ComputeBackendType::CPU ||
+                cpu.type == ComputeBackendType::CPU)
         << "Device 0 should be CPU";
     EXPECT_EQ(cpu.device_id, 0) << "CPU should have device_id = 0";
 }
@@ -100,11 +100,8 @@ TEST_F(Test__MultiGPU_DeviceManager, EnumeratesAllDevices)
         std::string type_name;
         switch (dev.type)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-            type_name = "CPU_OPENBLAS";
-            break;
-        case ComputeBackendType::CPU_MKL:
-            type_name = "CPU_MKL";
+        case ComputeBackendType::CPU:
+            type_name = "CPU";
             break;
         case ComputeBackendType::GPU_CUDA:
             type_name = "GPU_CUDA";
@@ -161,7 +158,7 @@ protected:
 TEST_F(Test__MultiGPU_BackendMapping, GetBackendForDeviceType)
 {
     // CPU should not have a backend (returns nullptr)
-    auto cpu_backend = getBackendForDeviceType(ComputeBackendType::CPU_OPENBLAS);
+    auto cpu_backend = getBackendForDeviceType(ComputeBackendType::CPU);
     EXPECT_EQ(cpu_backend, nullptr) << "CPU should not have an IBackend";
 
 #ifdef HAVE_CUDA
@@ -655,8 +652,8 @@ TEST_F(Test__MultiGPU_HeterogeneousBackends, BackendSpecificDeviceIDs)
     {
         const auto &dev = devices_[i];
         std::string type_str;
-        if (dev.type == ComputeBackendType::CPU_OPENBLAS ||
-            dev.type == ComputeBackendType::CPU_MKL)
+        if (dev.type == ComputeBackendType::CPU ||
+            dev.type == ComputeBackendType::CPU)
         {
             type_str = "CPU";
         }

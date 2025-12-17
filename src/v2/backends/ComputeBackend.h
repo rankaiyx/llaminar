@@ -32,12 +32,11 @@ namespace llaminar2
      */
     enum class ComputeBackendType
     {
-        CPU_OPENBLAS, // CPU with OpenBLAS
-        CPU_MKL,      // CPU with Intel MKL
-        GPU_CUDA,     // NVIDIA GPU with CUDA
-        GPU_ROCM,     // AMD GPU with ROCm
-        GPU_VULKAN,   // Cross-platform GPU with Vulkan
-        GPU_METAL     // Apple GPU with Metal
+        CPU,        // CPU with custom kernels (AVX-512, VNNI, etc.)
+        GPU_CUDA,   // NVIDIA GPU with CUDA
+        GPU_ROCM,   // AMD GPU with ROCm
+        GPU_VULKAN, // Cross-platform GPU with Vulkan
+        GPU_METAL   // Apple GPU with Metal
     };
 
     /**
@@ -109,11 +108,7 @@ namespace llaminar2
 
         ComputeBackendType backend_type() const override
         {
-#ifdef HAVE_MKL
-            return ComputeBackendType::CPU_MKL;
-#else
-            return ComputeBackendType::CPU_OPENBLAS;
-#endif
+            return ComputeBackendType::CPU;
         }
         bool supports_bf16() const override { return true; } // Software emulation (or MKL native)
         bool supports_fp16() const override { return true; }

@@ -19,7 +19,8 @@
 #include "../../execution/LayerExecutor.h"
 #include "../../execution/ComputeStage.h"
 #include "../../execution/DeviceContext.h"
-#include "../../pipelines/PipelineConfig.h" // For ActivationPrecision
+#include "../../execution/ExecutionPolicy.h" // For ExecutionPolicy
+#include "../../pipelines/PipelineConfig.h"  // For ActivationPrecision
 #include "../../tensors/Tensors.h"
 #include "../../tensors/UnifiedKVCache.h"
 #include <memory>
@@ -48,6 +49,11 @@ namespace llaminar2
         TensorBase *wo = nullptr;        ///< Output projection
         TensorBase *attn_norm = nullptr; ///< Pre-attention norm gamma
 
+        // Attention biases (Qwen2 uses Q/K/V biases)
+        TensorBase *q_bias = nullptr; ///< Query bias [d_model]
+        TensorBase *k_bias = nullptr; ///< Key bias [n_kv_heads * head_dim]
+        TensorBase *v_bias = nullptr; ///< Value bias [n_kv_heads * head_dim]
+
         // FFN weights
         TensorBase *gate_proj = nullptr; ///< FFN gate projection
         TensorBase *up_proj = nullptr;   ///< FFN up projection
@@ -75,41 +81,96 @@ namespace llaminar2
 
         /// Activation precision for compute stages (affects residual add, norms, etc.)
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
+
+        /// Use decomposed attention path (Phase 9): KVCacheAppendStage + AttentionComputeStage
+        /// When false (default), uses legacy AttentionWithKVCacheStage + MpiAttentionOrchestrator
+        /// When true, uses decomposed stages that route through KernelFactory
+        bool use_decomposed_attention = false;
+
+        /**
+         * @brief Execution policy controlling which operations run
+         *
+         * Default: All operations enabled (ExecutionPolicy::allEnabled())
+         *
+         * Use ExecutionPolicy::fromEnvironment() to read from LLAMINAR_EXEC_* vars
+         * for backward compatibility with environment-based configuration.
+         *
+         * Example usage for testing:
+         * @code
+         * Qwen2ExecutorConfig config;
+         * config.execution_policy = ExecutionPolicy::ffnOnly();  // Test FFN in isolation
+         * @endcode
+         */
+        ExecutionPolicy execution_policy = ExecutionPolicy::allEnabled();
     };
 
     /**
      * @brief Activation buffers passed to layer executor
      *
-     * These point to pre-allocated tensors in Qwen2Pipeline.
-     * The executor does NOT own these - it just uses them for graph construction.
-     * Member names match ActivationBuffers in PipelineBase.h
+     * ## Buffer Lifecycle Semantics
+     *
+     * Buffers are categorized by their data flow role to clarify ownership
+     * and modification semantics:
+     *
+     * ### Buffer Categories:
+     *
+     * **INOUT (Input modified in-place)**:
+     *   The buffer provides input and is modified during execution.
+     *   The original input value is consumed/overwritten.
+     *   - `residual`: Accumulates attention/FFN outputs via +=
+     *   - `normalized`: Receives norm output, may be reused
+     *
+     * **SCRATCH (Temporary workspace)**:
+     *   Used for intermediate results. Content undefined after execution.
+     *   May be reused across layers without preservation.
+     *   - `Q`, `K`, `V`: Projection outputs, consumed by attention
+     *   - `attn_output`: Pre-Wo output, consumed by projection
+     *   - `gate`, `up`: FFN projections, consumed by SwiGLU
+     *   - `ffn_output`: SwiGLU output, consumed by down projection
+     *   - `workspace_scores`, `workspace_context`, `workspace_mask`: Attention scratch
+     *
+     * **OUTPUT (Write-only)**:
+     *   Written by execution, should be consumed before next execution.
+     *   - `current_hidden`: Final hidden state output
+     *   - `attn_proj`: After Wo projection, before residual add
+     *
+     * ## In-Place Modification Pattern
+     *
+     * Some operations modify inputs in-place for efficiency:
+     * - `residual += attn_proj` (residual is INOUT)
+     * - RoPE modifies Q/K in-place (Q/K are INOUT during attention)
+     *
+     * For these cases, the buffer serves as both input AND output.
+     * The semantic category should be understood as "INPUT that becomes OUTPUT".
+     *
+     * ## Thread Safety
+     *
+     * The executor does NOT own these buffers. Caller must ensure:
+     * - Buffers outlive the executor call
+     * - No concurrent writes from other threads
+     * - SCRATCH buffers may be aliased if execution is sequential
      */
     struct Qwen2ActivationBuffers
     {
-        TensorBase *residual = nullptr;       ///< Current hidden state
-        TensorBase *normalized = nullptr;     ///< Post-norm buffer
-        TensorBase *Q = nullptr;              ///< Query projection output
-        TensorBase *K = nullptr;              ///< Key projection output
-        TensorBase *V = nullptr;              ///< Value projection output
-        TensorBase *attn_output = nullptr;    ///< Attention output (pre-Wo)
-        TensorBase *attn_proj = nullptr;      ///< Post-Wo projection
-        TensorBase *gate = nullptr;           ///< FFN gate projection output
-        TensorBase *up = nullptr;             ///< FFN up projection output
-        TensorBase *ffn_output = nullptr;     ///< FFN intermediate (SwiGLU output)
-        TensorBase *current_hidden = nullptr; ///< Output hidden state
+        // === INOUT Buffers (modified in-place) ===
+        TensorBase *residual = nullptr;   ///< [INOUT] Hidden state, accumulates via +=
+        TensorBase *normalized = nullptr; ///< [INOUT] Post-norm, receives norm output
 
-        // Q8_1 quantized activation buffers for fused GEMM patterns
-        // These are pre-quantized once and reused across Q/K/V and gate/up projections
-        void *q8_1_attn_buffer = nullptr; ///< Q8_1 buffer for attention projections
-        size_t q8_1_attn_size = 0;        ///< Size in bytes
-        void *q8_1_ffn_buffer = nullptr;  ///< Q8_1 buffer for FFN projections
-        size_t q8_1_ffn_size = 0;         ///< Size in bytes
+        // === SCRATCH Buffers (intermediate, content undefined after use) ===
+        TensorBase *Q = nullptr;                 ///< [SCRATCH] Query projection output
+        TensorBase *K = nullptr;                 ///< [SCRATCH] Key projection output
+        TensorBase *V = nullptr;                 ///< [SCRATCH] Value projection output
+        TensorBase *attn_output = nullptr;       ///< [SCRATCH] Attention output (pre-Wo)
+        TensorBase *gate = nullptr;              ///< [SCRATCH] FFN gate projection
+        TensorBase *up = nullptr;                ///< [SCRATCH] FFN up projection
+        TensorBase *ffn_output = nullptr;        ///< [SCRATCH] SwiGLU output
+        TensorBase *workspace_scores = nullptr;  ///< [SCRATCH] Attention scores workspace
+        TensorBase *workspace_context = nullptr; ///< [SCRATCH] Attention context workspace
+        TensorBase *workspace_mask = nullptr;    ///< [SCRATCH] Causal/padding mask workspace
 
-        // Attention workspace buffers (pre-allocated by pipeline, reused across layers)
-        // Required for MPI tensor-parallel attention with causal masking
-        TensorBase *workspace_scores = nullptr;  ///< [n_heads * max_seq, max_seq]
-        TensorBase *workspace_context = nullptr; ///< [max_threads * max_seq * head_dim]
-        TensorBase *workspace_mask = nullptr;    ///< [max_seq * max_seq] causal/padding mask
+        // === OUTPUT Buffers (write-only, consumed before next call) ===
+        TensorBase *attn_proj = nullptr;      ///< [OUTPUT] Post-Wo projection
+        TensorBase *current_hidden = nullptr; ///< [OUTPUT] Final hidden state
     };
 
     /**

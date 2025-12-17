@@ -13,6 +13,7 @@
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/SIMDHelpers.h"
+#include "../../kernels/KernelFactory.h"
 #include "../../kernels/cpu/primitives/SoftmaxPrimitives.h"
 #include "../../kernels/cpu/attention/CPUAttentionKernelTyped.h"
 #include <cstring>
@@ -30,20 +31,30 @@ namespace llaminar2
          *
          * This decouples kernel selection from output tensor type, allowing
          * Q8_1 inputs with FP32 output to still use the Q8_1 kernel.
+         *
+         * Uses KernelFactory for centralized kernel dispatch and future GPU support.
          */
         std::unique_ptr<ITensorAttention> createAttentionKernelForPrecision(ActivationPrecision precision)
         {
+            // Use CPU device type - GPU support will come via KernelFactory automatically
+            using DeviceType = llaminar::v2::kernels::DeviceType;
+            auto dev_type = DeviceType::CPU;
+
             switch (precision)
             {
             case ActivationPrecision::Q8_1:
-                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::Q8_1>>();
+                return llaminar::v2::kernels::KernelFactory::createAttention(
+                    static_cast<const Q8_1Tensor *>(nullptr), dev_type);
             case ActivationPrecision::BF16:
-                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::BF16>>();
+                return llaminar::v2::kernels::KernelFactory::createAttention(
+                    static_cast<const BF16Tensor *>(nullptr), dev_type);
             case ActivationPrecision::FP16:
-                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP16>>();
+                return llaminar::v2::kernels::KernelFactory::createAttention(
+                    static_cast<const FP16Tensor *>(nullptr), dev_type);
             case ActivationPrecision::FP32:
             default:
-                return std::make_unique<CPUAttentionKernelTyped<ActivationPrecision::FP32>>();
+                return llaminar::v2::kernels::KernelFactory::createAttention(
+                    static_cast<const FP32Tensor *>(nullptr), dev_type);
             }
         }
     } // namespace

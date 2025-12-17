@@ -164,11 +164,27 @@ namespace llaminar2
         {
         public:
             explicit MockDeviceContext(int device_idx = 0,
-                                       ComputeBackendType backend = ComputeBackendType::CPU_OPENBLAS)
+                                       ComputeBackendType backend = ComputeBackendType::CPU)
                 : device_idx_(device_idx), backend_(backend) {}
 
             int deviceIndex() const override { return device_idx_; }
             ComputeBackendType backendType() const override { return backend_; }
+            DeviceType deviceType() const override
+            {
+                switch (backend_)
+                {
+                case ComputeBackendType::GPU_CUDA:
+                    return DeviceType::CUDA;
+                case ComputeBackendType::GPU_ROCM:
+                    return DeviceType::ROCm;
+                case ComputeBackendType::GPU_VULKAN:
+                    return DeviceType::Vulkan;
+                case ComputeBackendType::GPU_METAL:
+                    return DeviceType::Metal;
+                default:
+                    return DeviceType::CPU;
+                }
+            }
             bool isGPU() const override
             {
                 return backend_ == ComputeBackendType::GPU_CUDA ||

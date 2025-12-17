@@ -549,6 +549,222 @@ namespace llaminar2
                 }
             }
 
+            // =========================================================================
+            // Fused Multi-GEMM API - Quantize once, execute multiple projections
+            // =========================================================================
+
+        public:
+            /**
+             * @brief Descriptor for a single projection in multiply_fused_multi
+             *
+             * Each projection specifies a kernel (with packed weights), output buffer,
+             * and optional fused operations. All projections share the same quantized
+             * input buffer.
+             */
+            struct FusedProjection
+            {
+                QuantisedGemmKernel *kernel;       ///< Kernel with packed weights [n, k]
+                float *output;                     ///< Output buffer [m, n]
+                int n;                             ///< Output dimension (columns)
+                const float *bias = nullptr;       ///< Optional bias [n]
+                const float *gate_input = nullptr; ///< Optional gate for SwiGLU [m, n]
+                bool do_swiglu = false;            ///< Whether to apply SwiGLU fusion
+                const char *name = nullptr;        ///< Name for debug logging
+            };
+
+            /**
+             * @brief Execute multiple GEMMs sharing a single quantized input buffer
+             *
+             * This is the optimal API for patterns like Q/K/V projections or gate/up
+             * FFN projections, where the same input is projected through multiple
+             * weight matrices. The input is quantized once (FP32 → Q8_1), then all
+             * projections execute against the shared buffer.
+             *
+             * @param input FP32 input activations [m, k]
+             * @param projections Vector of projection descriptors
+             * @param m Number of rows (batch_size * seq_len)
+             * @param k Input dimension (must match all kernels' K dimension)
+             * @return true on success, false on error
+             *
+             * @details
+             * ## Computation Flow
+             *
+             * ```
+             * [FP32 Input] ──► Quantize ──► [Q8_1 Buffer]
+             *                                    │
+             *                    ┌───────────────┼───────────────┐
+             *                    ↓               ↓               ↓
+             *              GEMM(kernel_0)  GEMM(kernel_1)  GEMM(kernel_2)
+             *                    ↓               ↓               ↓
+             *              [Output 0]      [Output 1]      [Output 2]
+             * ```
+             *
+             * ## Performance Benefits
+             * - Saves (N-1) quantization passes vs calling multiply() N times
+             * - Input stays in cache across all projections
+             * - No intermediate buffer management by caller
+             *
+             * ## Example Usage
+             *
+             * ```cpp
+             * auto* kernel_q = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemm(wq));
+             * auto* kernel_k = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemm(wk));
+             * auto* kernel_v = static_cast<QuantisedGemmKernel*>(KernelFactory::getOrCreateGemm(wv));
+             *
+             * QuantisedGemmKernel::multiply_fused_multi(
+             *     normalized->data(),
+             *     {
+             *         {kernel_q, Q->mutable_data(), n_heads * head_dim, nullptr, nullptr, false, "Q"},
+             *         {kernel_k, K->mutable_data(), n_kv_heads * head_dim, nullptr, nullptr, false, "K"},
+             *         {kernel_v, V->mutable_data(), n_kv_heads * head_dim, nullptr, nullptr, false, "V"}
+             *     },
+             *     seq_len, d_model
+             * );
+             * ```
+             *
+             * @note All kernels must have the same K dimension
+             * @note Thread-safe: can be called concurrently with different inputs
+             */
+            static bool multiply_fused_multi(
+                const float *input,
+                const std::vector<FusedProjection> &projections,
+                int m, int k)
+            {
+                if (!input || projections.empty())
+                {
+                    LOG_ERROR("[multiply_fused_multi] Null input or empty projections");
+                    return false;
+                }
+
+                if (m <= 0 || k <= 0)
+                {
+                    LOG_ERROR("[multiply_fused_multi] Invalid dimensions: m=" << m << " k=" << k);
+                    return false;
+                }
+
+                // Validate all projections
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    if (!proj.kernel)
+                    {
+                        LOG_ERROR("[multiply_fused_multi] Projection " << i << " has null kernel");
+                        return false;
+                    }
+                    if (!proj.output)
+                    {
+                        LOG_ERROR("[multiply_fused_multi] Projection " << i << " has null output");
+                        return false;
+                    }
+                    if (proj.n <= 0)
+                    {
+                        LOG_ERROR("[multiply_fused_multi] Projection " << i << " has invalid n=" << proj.n);
+                        return false;
+                    }
+                    // Verify K dimension matches
+                    if (proj.kernel->get_k() != k)
+                    {
+                        LOG_ERROR("[multiply_fused_multi] Projection " << i
+                                                                       << " kernel K=" << proj.kernel->get_k() << " doesn't match input k=" << k);
+                        return false;
+                    }
+                    // Verify N dimension matches
+                    if (proj.kernel->get_n() != proj.n)
+                    {
+                        LOG_ERROR("[multiply_fused_multi] Projection " << i
+                                                                       << " n=" << proj.n << " doesn't match kernel N=" << proj.kernel->get_n());
+                        return false;
+                    }
+                }
+
+                // Step 1: Allocate shared Q8_1 buffer for quantized activations
+                int k_blocks = (k + 31) / 32;
+                size_t buffer_size = static_cast<size_t>(m) * k_blocks * sizeof(Q8_1Block);
+                std::vector<uint8_t> q8_1_buffer(buffer_size);
+
+                // Debug: Dump first 32 floats to see what's being quantized
+                if (m >= 1 && k >= 32)
+                {
+                    LOG_INFO("[multiply_fused_multi] input[0:8]="
+                             << std::setprecision(6) << input[0] << "," << input[1] << "," << input[2] << "," << input[3]
+                             << "," << input[4] << "," << input[5] << "," << input[6] << "," << input[7]);
+                }
+
+                // Step 2: Quantize activations once
+                bool success;
+                {
+                    KERNEL_PROFILE_SCOPE(KernelType::QUANTIZE_Q8);
+                    success = projections[0].kernel->quantize_activations(input, q8_1_buffer.data(), m, k);
+                }
+                if (!success)
+                {
+                    LOG_ERROR("[multiply_fused_multi] Failed to quantize activations");
+                    return false;
+                }
+
+                // Debug: dump first Q8_1 block for comparison
+                const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(q8_1_buffer.data());
+                LOG_DEBUG("[multiply_fused_multi] First Q8_1 block: d=" << blocks[0].d
+                                                                        << " sum_qs=" << blocks[0].sum_qs
+                                                                        << " qs[0:4]=" << (int)blocks[0].qs[0] << ","
+                                                                        << (int)blocks[0].qs[1] << ","
+                                                                        << (int)blocks[0].qs[2] << ","
+                                                                        << (int)blocks[0].qs[3]);
+
+                // Step 3: Execute all projections with shared quantized activations
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    const char *name = proj.name ? proj.name : "projection";
+
+                    // Debug: Log kernel and packed weight pointer for Q projection tracing
+                    if (i == 0 && proj.n == 896 && k == 896)
+                    {
+                        const auto &pw = proj.kernel->packed_weights();
+                        LOG_INFO("[multiply_fused_multi] " << name << " kernel=" << static_cast<const void *>(proj.kernel)
+                                                           << " pw.packed_data.data()=" << static_cast<const void *>(pw.packed_data.data())
+                                                           << " pw.N=" << pw.N << " pw.K=" << pw.K);
+                    }
+
+                    // DEBUG: Log output buffer BEFORE GEMM to check for stale data
+                    if (i == 0 && proj.n == 896 && k == 896)
+                    {
+                        LOG_INFO("[multiply_fused_multi] " << proj.name << " BEFORE: output=" << static_cast<const void *>(proj.output)
+                                                           << " output[0:4]=" << std::setprecision(10)
+                                                           << proj.output[0] << "," << proj.output[1] << ","
+                                                           << proj.output[2] << "," << proj.output[3]);
+                    }
+
+                    // Build fused ops configuration
+                    GemmFusedOps fused_ops = proj.do_swiglu
+                                                 ? GemmFusedOps::swiglu(proj.gate_input)
+                                                 : GemmFusedOps::none();
+
+                    success = proj.kernel->multiply_with_precomputed_q8_1(
+                        q8_1_buffer.data(),
+                        proj.output,
+                        m, proj.n, k,
+                        proj.bias,
+                        false,       // No accumulation
+                        1.0f, 0.0f,  // alpha=1, beta=0
+                        nullptr, -1, // No MPI context, CPU device
+                        fused_ops);
+
+                    if (!success)
+                    {
+                        LOG_ERROR("[multiply_fused_multi] " << name << " GEMM failed");
+                        return false;
+                    }
+
+                    // Debug: dump first 4 output values
+                    LOG_DEBUG("[multiply_fused_multi] " << name << " output[0:4]="
+                                                        << std::setprecision(10) << proj.output[0] << ","
+                                                        << proj.output[1] << "," << proj.output[2] << "," << proj.output[3]);
+                }
+
+                return true;
+            }
+
         public:
             /**
              * @brief Check if this kernel supports the specified device
@@ -561,6 +777,66 @@ namespace llaminar2
             bool supports_device(int device_idx) const override
             {
                 return device_idx == -1;
+            }
+
+            /**
+             * @brief Check if this kernel supports optimized fused multi-projection
+             *
+             * QuantisedGemmKernel supports optimized fusion: input is quantized once
+             * and all projections share the Q8_1 buffer.
+             *
+             * @return true - this kernel has optimized fusion via multiply_fused_multi
+             */
+            bool supports_fused_projection() const override
+            {
+                return true;
+            }
+
+            /**
+             * @brief Fused multi-projection GEMM using shared Q8_1 activation buffer
+             *
+             * This override provides optimized fusion for quantized GEMM:
+             * - Input is quantized to Q8_1 once
+             * - All projections execute against the shared quantized buffer
+             * - Saves (N-1) quantization passes vs calling multiply() N times
+             *
+             * @param input FP32 input activations [m, k]
+             * @param projections Vector of projection descriptors
+             * @param m Number of rows
+             * @param k Input dimension
+             * @param mpi_ctx MPI context (unused)
+             * @param device_idx Device index (-1 = CPU)
+             *
+             * @return true on success, false on error
+             */
+            bool multiply_fused(
+                const float *input,
+                const std::vector<FusedProjectionDesc> &projections,
+                int m, int k,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)mpi_ctx;
+                (void)device_idx;
+
+                // Convert ITensorGemm::FusedProjectionDesc to internal FusedProjection format
+                std::vector<FusedProjection> internal_projections;
+                internal_projections.reserve(projections.size());
+
+                for (const auto &proj : projections)
+                {
+                    // The kernel in FusedProjectionDesc must be a QuantisedGemmKernel
+                    auto *qkernel = dynamic_cast<QuantisedGemmKernel *>(proj.kernel);
+                    if (!qkernel)
+                    {
+                        LOG_ERROR("[QuantisedGemmKernel::multiply_fused] Projection kernel is not QuantisedGemmKernel");
+                        return false;
+                    }
+                    internal_projections.push_back({qkernel, proj.output, proj.n, proj.bias, proj.gate_input, proj.do_swiglu, proj.name});
+                }
+
+                // Delegate to the optimized static method
+                return multiply_fused_multi(input, internal_projections, m, k);
             }
 
             /**
@@ -1386,8 +1662,72 @@ namespace llaminar2
                 if (!q8_1_activations || !C)
                     return false;
 
+                // DEBUG: Log thread state at entry point
+                if (n == 896 && k == 896)
+                {
+                    LOG_INFO("[ENTRY] tid=" << omp_get_thread_num()
+                                            << " num_threads=" << omp_get_num_threads()
+                                            << " in_parallel=" << omp_in_parallel()
+                                            << " C=" << static_cast<const void *>(C));
+                }
+
                 // Get reference to packed weights (either external or owned)
                 const auto &pw = packed_weights();
+
+                // Debug: log packed weights pointer for comparison
+                if (n == 896 && k == 896)
+                {
+                    // Log q8_1_activations pointer and first block for comparison
+                    const Q8_1Block *blocks = static_cast<const Q8_1Block *>(q8_1_activations);
+
+                    // Compute a checksum of all Q8_1 blocks to detect any differences
+                    int blocks_per_row = k / 32;
+                    int num_blocks = m * blocks_per_row;
+                    float d_sum = 0.0f;
+                    int32_t sum_qs_sum = 0;
+                    uint64_t qs_checksum = 0;
+                    for (int i = 0; i < num_blocks; ++i)
+                    {
+                        d_sum += blocks[i].d;
+                        sum_qs_sum += blocks[i].sum_qs;
+                        for (int j = 0; j < 32; ++j)
+                        {
+                            qs_checksum += static_cast<uint64_t>(static_cast<uint8_t>(blocks[i].qs[j])) * (i * 32 + j + 1);
+                        }
+                    }
+
+                    // Compute a FULL checksum of the packed weights data
+                    uint64_t pw_checksum = 0;
+                    size_t pw_size = pw.packed_data.size();
+                    const uint8_t *pw_data = reinterpret_cast<const uint8_t *>(pw.packed_data.data());
+                    for (size_t i = 0; i < pw_size; i += 997)
+                    { // Sample every 997th byte for speed
+                        pw_checksum += static_cast<uint64_t>(pw_data[i]) * (i + 1);
+                    }
+
+                    LOG_INFO("[multiply_with_precomputed_q8_1] m=" << m << " n=" << n << " k=" << k
+                                                                   << " this=" << static_cast<const void *>(this)
+                                                                   << " C=" << static_cast<const void *>(C)
+                                                                   << " q8_1_act=" << static_cast<const void *>(q8_1_activations)
+                                                                   << " num_blocks=" << num_blocks
+                                                                   << " d_sum=" << d_sum
+                                                                   << " sum_qs_sum=" << sum_qs_sum
+                                                                   << " qs_checksum=" << qs_checksum
+                                                                   << " block0.d=" << blocks[0].d
+                                                                   << " block0.sum_qs=" << blocks[0].sum_qs
+                                                                   << " block0.qs[0:4]=" << (int)blocks[0].qs[0] << "," << (int)blocks[0].qs[1] << "," << (int)blocks[0].qs[2] << "," << (int)blocks[0].qs[3]
+                                                                   << " block1.d=" << (num_blocks > 1 ? blocks[1].d : 0)
+                                                                   << " block" << (blocks_per_row - 1) << ".d=" << blocks[blocks_per_row - 1].d     // Last block of row 0
+                                                                   << " block" << blocks_per_row << ".d=" << (m > 1 ? blocks[blocks_per_row].d : 0) // First block of row 1 (if exists)
+                                                                   << " pw.packed_data.data()=" << static_cast<const void *>(pw.packed_data.data())
+                                                                   << " pw_size=" << pw_size
+                                                                   << " pw_FULL_checksum=" << pw_checksum
+                                                                   << " pw.N=" << pw.N << " pw.K=" << pw.K
+                                                                   << " fused_swiglu=" << fused_ops.is_swiglu()
+                                                                   << " fused_softmax=" << fused_ops.is_softmax()
+                                                                   << " accumulate=" << accumulate
+                                                                   << " beta=" << beta);
+                }
 
                 // Check dimensions against packed weights
                 if (n != pw.N || k != pw.K)
@@ -1445,6 +1785,15 @@ namespace llaminar2
 
                     // Barrier to ensure zeroing complete before GEMM writes
 #pragma omp barrier
+
+                    // DEBUG: Check C[0:4] after zeroing (only thread 0 to avoid race)
+                    if (n == 896 && k == 896 && omp_get_thread_num() == 0)
+                    {
+                        LOG_INFO("[AFTER_ZERO] C[0:4]=" << C[0] << "," << C[1] << "," << C[2] << "," << C[3]
+                                                        << " needs_zero=" << needs_zero
+                                                        << " omp_in_parallel=" << omp_in_parallel()
+                                                        << " num_threads=" << omp_get_num_threads());
+                    }
 
                     // Cache-aware blocking (same logic as other paths)
                     int num_threads = omp_get_num_threads();
@@ -1538,6 +1887,78 @@ namespace llaminar2
                                 params_v.gate_input = gate_input ? (gate_input + i * n + n_blk) : nullptr;
                                 params_v.do_swiglu = do_swiglu;
 
+                                // DEBUG: Log first JIT call params for n_blk=0, i=0
+                                if (n == 896 && k == 896 && n_blk == 0 && i == 0)
+                                {
+                                    uint64_t a_cksum = 0, b_cksum = 0;
+                                    const uint8_t *a_bytes = static_cast<const uint8_t *>(params_v.A);
+                                    const uint8_t *b_bytes = static_cast<const uint8_t *>(params_v.B_packed);
+                                    for (int x = 0; x < 64; ++x)
+                                    {
+                                        a_cksum += static_cast<uint64_t>(a_bytes[x]) * (x + 1);
+                                        b_cksum += static_cast<uint64_t>(b_bytes[x]) * (x + 1);
+                                    }
+
+                                    // Checksum comp array data (K_blocks floats)
+                                    uint64_t comp_cksum = 0;
+                                    if (params_v.comp)
+                                    {
+                                        const uint8_t *comp_bytes = reinterpret_cast<const uint8_t *>(params_v.comp);
+                                        for (int x = 0; x < static_cast<int>(params_v.K_blocks) * sizeof(float); ++x)
+                                        {
+                                            comp_cksum += static_cast<uint64_t>(comp_bytes[x]) * (x + 1);
+                                        }
+                                    }
+
+                                    // Checksum scales array data (K_blocks floats)
+                                    uint64_t scales_cksum = 0;
+                                    if (params_v.scales)
+                                    {
+                                        const uint8_t *scales_bytes = reinterpret_cast<const uint8_t *>(params_v.scales);
+                                        for (int x = 0; x < static_cast<int>(params_v.K_blocks) * sizeof(float); ++x)
+                                        {
+                                            scales_cksum += static_cast<uint64_t>(scales_bytes[x]) * (x + 1);
+                                        }
+                                    }
+
+                                    // Also dump first 36 bytes of A in hex (first Q8_1 block = 36 bytes)
+                                    std::ostringstream hex_dump;
+                                    for (int x = 0; x < 36; ++x)
+                                    {
+                                        hex_dump << std::hex << std::setfill('0') << std::setw(2) << (int)a_bytes[x];
+                                        if (x % 4 == 3)
+                                            hex_dump << " ";
+                                    }
+
+                                    LOG_INFO("[JIT_PARAMS] n_blk=" << n_blk << " i=" << i
+                                                                   << " A_ptr=" << static_cast<const void *>(params_v.A)
+                                                                   << " B_ptr=" << static_cast<const void *>(params_v.B_packed)
+                                                                   << " C_ptr=" << static_cast<const void *>(params_v.C)
+                                                                   << " A_64byte_cksum=" << a_cksum
+                                                                   << " B_64byte_cksum=" << b_cksum
+                                                                   << " C_before=" << params_v.C[0] << "," << params_v.C[1]
+                                                                   << " A_hex=" << hex_dump.str()
+                                                                   << " output_format=" << static_cast<int>(params_v.output_format)
+                                                                   << " do_softmax=" << params_v.do_softmax
+                                                                   << " do_swiglu=" << params_v.do_swiglu
+                                                                   << " K_blocks=" << params_v.K_blocks
+                                                                   << " N=" << params_v.N
+                                                                   << " ldc=" << params_v.ldc
+                                                                   << " A_stride=" << params_v.A_stride
+                                                                   << " comp=" << static_cast<const void *>(params_v.comp)
+                                                                   << " comp_data_cksum=" << comp_cksum
+                                                                   << " scales=" << static_cast<const void *>(params_v.scales)
+                                                                   << " scales_data_cksum=" << scales_cksum
+                                                                   << " mins=" << static_cast<const void *>(params_v.mins)
+                                                                   << " bias=" << static_cast<const void *>(params_v.bias)
+                                                                   << " mask=" << static_cast<const void *>(params_v.mask)
+                                                                   << " local_max=" << static_cast<const void *>(params_v.local_max)
+                                                                   << " local_sum=" << static_cast<const void *>(params_v.local_sum)
+                                                                   << " gate_input=" << static_cast<const void *>(params_v.gate_input)
+                                                                   << " C_q8_1=" << static_cast<const void *>(params_v.C_q8_1)
+                                                                   << " C_q8_1_stride=" << params_v.C_q8_1_stride);
+                                }
+
                                 // Copy to non-volatile for kernel call
                                 QuantisedGemmParams params;
                                 std::memcpy(&params, const_cast<QuantisedGemmParams *>(&params_v), sizeof(params));
@@ -1545,16 +1966,46 @@ namespace llaminar2
                                 // Memory barrier to prevent reordering
                                 asm volatile("" ::: "memory");
 
+                                // DEBUG: Log params struct address for n_blk=0 i=0
+                                if (n == 896 && k == 896 && n_blk == 0 && i == 0)
+                                {
+                                    LOG_INFO("[PARAMS_ADDR] &params=" << static_cast<const void *>(&params)
+                                                                      << " alignment=" << (reinterpret_cast<uintptr_t>(&params) % 64)
+                                                                      << " sizeof(params)=" << sizeof(params)
+                                                                      << " kernel_ptr=" << reinterpret_cast<const void *>(kernel));
+                                }
+
                                 if (rows_to_process == 2)
                                     kernel_m2(&params);
                                 else
                                     kernel(&params);
+
+                                // DEBUG: Immediately log output after kernel returns for n_blk=0 i=0
+                                if (n == 896 && k == 896 && n_blk == 0 && i == 0)
+                                {
+                                    LOG_INFO("[KERNEL_DONE_IMMEDIATE] C[0:4]="
+                                             << std::setprecision(10) << params.C[0] << "," << params.C[1] << "," << params.C[2] << "," << params.C[3]
+                                             << " tid=" << omp_get_thread_num());
+                                }
                             }
                         }
                     }
                 }; // end do_gemm_work lambda
 
                 OMP_WORKSHARE_REGION(do_gemm_work);
+
+                // CRITICAL: Ensure all memory writes are visible before logging/returning
+                // The omp for inside do_gemm_work has implicit barrier, but if we're inside
+                // an existing parallel region (omp_in_parallel()==true), there's no barrier
+                // after work_fn() returns from OMP_WORKSHARE_REGION.
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+
+                // Debug: log output after GEMM completes
+                if (n == 896 && k == 896)
+                {
+                    LOG_INFO("[multiply_with_precomputed_q8_1 DONE] C[0:4]="
+                             << std::setprecision(10) << C[0] << "," << C[1] << "," << C[2] << "," << C[3]);
+                }
 
                 return true;
             }

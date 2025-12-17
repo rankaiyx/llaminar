@@ -65,6 +65,71 @@ namespace llaminar2
         }
     }
 
+    // Construct from Q8_1Block array (for testing and direct block construction)
+    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const Q8_1Block *blocks, size_t num_blocks, int device_idx)
+        : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_idx_(device_idx), device_blocks_(nullptr),
+          is_mutable_(true), cache_dirty_(false)
+    {
+        if (shape.empty())
+        {
+            throw std::invalid_argument("Q8_1Tensor: shape cannot be empty");
+        }
+        if (shape.size() != 2)
+        {
+            throw std::invalid_argument("Q8_1Tensor: expected 2D shape for Q8_1 storage");
+        }
+
+        const size_t rows = shape[0];
+        const size_t cols = shape[1];
+        const size_t blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+        const size_t expected_blocks = rows * blocks_per_row;
+
+        if (num_blocks < expected_blocks)
+        {
+            throw std::invalid_argument("Q8_1Tensor: insufficient blocks (" +
+                                        std::to_string(num_blocks) + ", expected " +
+                                        std::to_string(expected_blocks) + ")");
+        }
+
+        // Copy blocks to internal storage
+        const size_t required_bytes = expected_blocks * sizeof(Q8_1Block);
+        raw_data_.resize(required_bytes);
+        std::memcpy(raw_data_.data(), blocks, required_bytes);
+
+        LOG_TRACE("[Q8_1Tensor] Created from Q8_1Block* shape=[" << shape[0] << "," << shape[1]
+                                                                 << "], blocks=" << expected_blocks);
+    }
+
+    // Copy constructor - deep copy of all data
+    Q8_1Tensor::Q8_1Tensor(const Q8_1Tensor &other)
+        : shape_(other.shape_), is_view_(false), raw_data_(other.raw_data_), raw_data_ptr_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_idx_(other.device_idx_), device_blocks_(nullptr),
+          is_mutable_(other.is_mutable_), cache_dirty_(false)
+    {
+        // If the source is a view, we need to copy the actual viewed data
+        if (other.is_view_)
+        {
+            const size_t rows = shape_[0];
+            const size_t cols = shape_[1];
+            const size_t blocks_per_row = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+            const size_t n_blocks = rows * blocks_per_row;
+            const size_t required_bytes = n_blocks * sizeof(Q8_1Block);
+
+            raw_data_.resize(required_bytes);
+            std::memcpy(raw_data_.data(), other.raw_data_ptr_ + other.view_byte_offset_, required_bytes);
+        }
+
+        // Copy dequant cache if present
+        if (!other.dequant_cache_.empty())
+        {
+            dequant_cache_ = other.dequant_cache_;
+        }
+
+        LOG_TRACE("[Q8_1Tensor] Copy constructed shape=[" << shape_[0] << "," << shape_[1]
+                                                          << "], is_mutable=" << is_mutable_);
+    }
+
     // Mutable activation buffer constructor - allocates uninitialized Q8_1 storage
     //
     // IMPORTANT: Q8_1 is an activation-only format designed for memory bandwidth savings.

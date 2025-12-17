@@ -377,7 +377,8 @@ TEST_F(Test__ModelLoader, LoadValidModel)
     const auto &model = loader.getModel();
     EXPECT_EQ(model.version, 3);
     EXPECT_EQ(model.tensor_count, 2);
-    EXPECT_EQ(model.metadata_kv_count, 8);
+    // 8 base metadata + 1 rms_norm_eps (include_rms_norm_eps=true by default)
+    EXPECT_EQ(model.metadata_kv_count, 9);
     EXPECT_EQ(model.architecture, "qwen2");
 }
 

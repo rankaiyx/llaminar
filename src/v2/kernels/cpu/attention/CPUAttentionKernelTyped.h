@@ -1316,6 +1316,120 @@ namespace llaminar2
 
             return true;
         }
+
+        /**
+         * @brief Compute attention using tensor objects with automatic type dispatch
+         *
+         * Inspects Q tensor native_type() and dispatches to compute() or compute_batch()
+         * based on batch_size. Handles FP32, BF16, FP16, and Q8_1 tensors.
+         */
+        bool compute_tensor(
+            const TensorBase *Q,
+            const TensorBase *K,
+            const TensorBase *V,
+            TensorBase *output,
+            int batch_size,
+            int seq_len,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            if (!Q || !K || !V || !output)
+            {
+                LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] Null tensor provided");
+                return false;
+            }
+
+            // Map ActivationPrecision to TensorType
+            constexpr TensorType expected_type = []()
+            {
+                if constexpr (Precision == ActivationPrecision::FP32)
+                    return TensorType::FP32;
+                else if constexpr (Precision == ActivationPrecision::BF16)
+                    return TensorType::BF16;
+                else if constexpr (Precision == ActivationPrecision::FP16)
+                    return TensorType::FP16;
+                else if constexpr (Precision == ActivationPrecision::Q8_1)
+                    return TensorType::Q8_1;
+                else
+                    return TensorType::FP32; // Default
+            }();
+
+            if (Q->native_type() != expected_type)
+            {
+                LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] Q tensor type mismatch: expected "
+                          << static_cast<int>(expected_type) << ", got " << static_cast<int>(Q->native_type()));
+                return false;
+            }
+
+            // Get raw data pointers based on precision
+            const float *Q_ptr = nullptr;
+            const float *K_ptr = nullptr;
+            const float *V_ptr = nullptr;
+            float *output_ptr = nullptr;
+
+            if constexpr (Precision == ActivationPrecision::Q8_1)
+            {
+                // Q8_1 path: use block pointers cast to float* (kernel interprets internally)
+                auto Q_q8_1 = static_cast<const Q8_1Tensor *>(Q);
+                auto K_q8_1 = static_cast<const Q8_1Tensor *>(K);
+                auto V_q8_1 = static_cast<const Q8_1Tensor *>(V);
+                auto out_q8_1 = static_cast<Q8_1Tensor *>(output);
+
+                Q_ptr = reinterpret_cast<const float *>(Q_q8_1->q8_1_blocks());
+                K_ptr = reinterpret_cast<const float *>(K_q8_1->q8_1_blocks());
+                V_ptr = reinterpret_cast<const float *>(V_q8_1->q8_1_blocks());
+                output_ptr = reinterpret_cast<float *>(out_q8_1->mutable_q8_1_blocks());
+            }
+            else
+            {
+                // FP32/BF16/FP16 path: use data() pointers
+                Q_ptr = Q->data();
+                K_ptr = K->data();
+                V_ptr = V->data();
+                output_ptr = output->mutable_data();
+            }
+
+            // Dispatch to batch or single-sequence compute
+            if (batch_size > 1)
+            {
+                return compute_batch(
+                    Q_ptr, K_ptr, V_ptr, output_ptr,
+                    batch_size, seq_len, n_heads, n_kv_heads, head_dim,
+                    causal, window_size,
+                    workspace_scores, nullptr, nullptr, workspace_mask,
+                    false, mpi_ctx, device_idx);
+            }
+            else
+            {
+                // Single sequence: use compute() with kv_len support via compute_decode if different
+                if (kv_len != seq_len)
+                {
+                    return compute_decode(
+                        Q_ptr, K_ptr, V_ptr, output_ptr,
+                        seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                        causal, window_size,
+                        workspace_scores, nullptr, nullptr, workspace_mask,
+                        false, mpi_ctx, device_idx);
+                }
+                else
+                {
+                    return compute(
+                        Q_ptr, K_ptr, V_ptr, output_ptr,
+                        seq_len, n_heads, n_kv_heads, head_dim,
+                        causal, window_size,
+                        workspace_scores, nullptr, nullptr, workspace_mask,
+                        false, mpi_ctx, device_idx);
+                }
+            }
+        }
     };
 
     // Explicit instantiations

@@ -939,6 +939,148 @@ namespace llaminar2
          */
         void to_q8_0(Q8_0Block *dst) const;
 
+        // =====================================================================
+        // Tensor Comparison Utilities (for testing and debugging)
+        // =====================================================================
+
+        /**
+         * @brief Compute cosine similarity between this tensor and another
+         *
+         * Cosine similarity measures the angle between two vectors, ignoring magnitude.
+         * Result range: [-1, 1] where 1.0 = identical direction, 0.0 = orthogonal, -1.0 = opposite
+         *
+         * Formula: cos(θ) = (A · B) / (||A|| × ||B||)
+         *
+         * @param other Tensor to compare with (must have same element count)
+         * @return Cosine similarity in range [-1.0, 1.0], or NaN if either tensor is zero
+         * @throws std::invalid_argument if element counts don't match
+         *
+         * @note Uses fp32_data() for comparison, so Q8_1 tensors are dequantized
+         * @note Thread-safe: reads only
+         *
+         * Example usage in tests:
+         * @code
+         * float similarity = tensor_a->cosineSimilarityTo(tensor_b);
+         * EXPECT_GT(similarity, 0.999);  // Very similar
+         * @endcode
+         */
+        double cosineSimilarityTo(const TensorBase *other) const;
+
+        /**
+         * @brief Compute maximum absolute difference between this tensor and another
+         *
+         * Useful for detecting worst-case numerical divergence.
+         *
+         * @param other Tensor to compare with (must have same element count)
+         * @return max(|this[i] - other[i]|) for all i
+         * @throws std::invalid_argument if element counts don't match
+         *
+         * @note Uses fp32_data() for comparison
+         *
+         * Example usage in tests:
+         * @code
+         * float max_diff = tensor_a->maxAbsDiffTo(tensor_b);
+         * EXPECT_LT(max_diff, 1e-3f);  // Max error < 0.001
+         * @endcode
+         */
+        float maxAbsDiffTo(const TensorBase *other) const;
+
+        /**
+         * @brief Compute mean absolute difference between this tensor and another
+         *
+         * Useful for measuring average numerical divergence.
+         *
+         * @param other Tensor to compare with (must have same element count)
+         * @return mean(|this[i] - other[i]|) for all i
+         * @throws std::invalid_argument if element counts don't match
+         *
+         * @note Uses fp32_data() for comparison
+         *
+         * Example usage in tests:
+         * @code
+         * float mean_diff = tensor_a->meanAbsDiffTo(tensor_b);
+         * EXPECT_LT(mean_diff, 1e-5f);  // Mean error < 0.00001
+         * @endcode
+         */
+        float meanAbsDiffTo(const TensorBase *other) const;
+
+        /**
+         * @brief Compute relative L2 norm (Frobenius distance normalized by reference)
+         *
+         * Measures relative error as the ratio of difference norm to reference norm.
+         * Formula: ||A - B||_2 / ||B||_2
+         *
+         * @param other Reference tensor to compare against (must have same element count)
+         * @return Relative L2 norm (0.0 = identical, larger = more different)
+         * @throws std::invalid_argument if element counts don't match
+         *
+         * @note Uses fp32_data() for comparison
+         * @note Returns INFINITY if other tensor is zero
+         *
+         * Example usage in tests:
+         * @code
+         * double rel_l2 = tensor_a->relativeL2To(tensor_b);
+         * EXPECT_LT(rel_l2, 0.01);  // Relative error < 1%
+         * @endcode
+         */
+        double relativeL2To(const TensorBase *other) const;
+
+        /**
+         * @brief Compute KL divergence treating tensors as probability distributions
+         *
+         * KL divergence measures how one probability distribution differs from another.
+         * This method applies softmax to both tensors before computing divergence,
+         * making it suitable for comparing logits.
+         *
+         * Formula: KL(P || Q) = Σ P(i) × log(P(i) / Q(i))
+         *
+         * @param other Reference distribution (Q) to compare against
+         * @return KL divergence (≥0, lower = more similar), or INFINITY if distributions incompatible
+         * @throws std::invalid_argument if element counts don't match
+         *
+         * @note Applies softmax to convert logits to probabilities
+         * @note Uses fp32_data() for comparison
+         * @note KL divergence is asymmetric: KL(A||B) ≠ KL(B||A)
+         *
+         * Example usage for comparing logits:
+         * @code
+         * double kl_div = logits_a->klDivergenceTo(logits_b);
+         * EXPECT_LT(kl_div, 0.1);  // Distributions are similar
+         * @endcode
+         */
+        double klDivergenceTo(const TensorBase *other) const;
+
+        /**
+         * @brief Get a summary of comparison metrics between this tensor and another
+         *
+         * Computes all comparison metrics in one call for efficiency.
+         * Returns a struct with: cosine_similarity, max_abs_diff, mean_abs_diff, relative_l2
+         *
+         * @param other Tensor to compare with (must have same element count)
+         * @return ComparisonSummary struct with all metrics
+         * @throws std::invalid_argument if element counts don't match
+         *
+         * @note Does NOT compute KL divergence (expensive softmax)
+         */
+        struct ComparisonSummary
+        {
+            double cosine_similarity; ///< Cosine similarity [-1, 1]
+            float max_abs_diff;       ///< Maximum absolute difference
+            float mean_abs_diff;      ///< Mean absolute difference
+            double relative_l2;       ///< Relative L2 norm
+
+            std::string toString() const
+            {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                              "ComparisonSummary{cos=%.6f, max=%.6e, mean=%.6e, rel_l2=%.6e}",
+                              cosine_similarity, max_abs_diff, mean_abs_diff, relative_l2);
+                return buf;
+            }
+        };
+
+        ComparisonSummary compareTo(const TensorBase *other) const;
+
     protected:
         // Default constructor for derived classes
         TensorBase() = default;
@@ -2331,6 +2473,16 @@ namespace llaminar2
         /// Construct from existing raw Q8_1 block data (for rare cases like loaded data)
         /// Most Q8_1 tensors should be created as mutable activation buffers.
         Q8_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+
+        /// Construct from Q8_1Block array (for testing and direct block construction)
+        /// @param shape Tensor dimensions [rows, cols]
+        /// @param blocks Pointer to Q8_1Block array (copied)
+        /// @param num_blocks Number of blocks in the array
+        /// @param device_idx Device index (-1 for CPU)
+        Q8_1Tensor(const std::vector<size_t> &shape, const Q8_1Block *blocks, size_t num_blocks, int device_idx = -1);
+
+        /// Copy constructor (deep copy of all data)
+        Q8_1Tensor(const Q8_1Tensor &other);
 
         /// Construct mutable Q8_1 activation buffer - the primary use case
         /// Use mutable_q8_1_blocks() to write Q8_1 data, NOT mutable_data().

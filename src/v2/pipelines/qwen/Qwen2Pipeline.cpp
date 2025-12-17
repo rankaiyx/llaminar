@@ -498,13 +498,10 @@ namespace llaminar2
         // Optional: LayerExecutor path (Phase 7)
         // When LLAMINAR_USE_LAYER_EXECUTOR=1, use declarative compute graphs.
         // Individual operations are controlled by LLAMINAR_EXEC_* flags.
-        // LIMITATION: LayerExecutor doesn't support KV cache yet, so we fall back
-        // to baseline for decode mode (when seq_len is small and KV cache populated).
+        // Supports both prefill and decode modes via AttentionWithKVCacheStage.
         // =============================================================================
-        bool kv_cache_populated = kv_cache_ && kv_cache_->get_cached_tokens(0) > 0;
-        bool is_decode_mode = effective_seq_len <= 4 && kv_cache_populated;
 
-        if (layer_executor_ && !is_decode_mode)
+        if (layer_executor_)
         {
             // Determine target device based on placement map
             int target_device = placement_map_ ? getWeightDevice("attn_q", -1) : device_idx_;
@@ -542,28 +539,6 @@ namespace llaminar2
             exec_buffers.workspace_context = attention_workspace_context_.get();
             exec_buffers.workspace_mask = attention_workspace_mask_.get();
 
-            // Q8_1 quantization buffers for executor path
-            // These allow quantizing activations ONCE and reusing for multiple GEMMs
-            // (matching FusedGEMM's pattern of quantize_activations + multiply_with_precomputed_q8_1)
-            size_t required_q8_1_size = QuantizeStage::get_quantized_buffer_size(effective_seq_len, d_model_);
-            LOG_INFO("[Q8_1 Buffers] required_q8_1_size=" << required_q8_1_size
-                                                          << " current=" << q8_1_buffer_size_ << " seq_len=" << effective_seq_len << " d_model=" << d_model_);
-            if (q8_1_buffer_size_ < required_q8_1_size)
-            {
-                // Allocate/reallocate Q8_1 buffers
-                q8_1_attn_buffer_.resize(required_q8_1_size);
-                q8_1_ffn_buffer_.resize(required_q8_1_size);
-                q8_1_buffer_size_ = required_q8_1_size;
-                LOG_INFO("[Q8_1 Buffers] Allocated " << required_q8_1_size
-                                                     << " bytes for seq_len=" << effective_seq_len << " d_model=" << d_model_);
-            }
-            exec_buffers.q8_1_attn_buffer = q8_1_attn_buffer_.data();
-            exec_buffers.q8_1_attn_size = q8_1_buffer_size_;
-            exec_buffers.q8_1_ffn_buffer = q8_1_ffn_buffer_.data();
-            exec_buffers.q8_1_ffn_size = q8_1_buffer_size_;
-            LOG_INFO("[Q8_1 Buffers] Set attn_buffer=" << static_cast<void *>(exec_buffers.q8_1_attn_buffer)
-                                                       << " size=" << exec_buffers.q8_1_attn_size);
-
             // NOTE: No copy needed - LayerExecutor reads from current_hidden directly
             // and uses in-place residual adds (output[i] = input[i] + output[i])
 
@@ -574,6 +549,9 @@ namespace llaminar2
             exec_weights.wv = layer.wv.get();
             exec_weights.wo = layer.wo.get();
             exec_weights.attn_norm = layer.attn_norm.get();
+            exec_weights.q_bias = layer.q_bias.get();
+            exec_weights.k_bias = layer.k_bias.get();
+            exec_weights.v_bias = layer.v_bias.get();
             exec_weights.gate_proj = layer.gate_proj.get();
             exec_weights.up_proj = layer.up_proj.get();
             exec_weights.down_proj = layer.down_proj.get();
@@ -646,8 +624,8 @@ namespace llaminar2
         if (static_cast<size_t>(target_device) < dm.devices().size())
         {
             const auto &dev = dm.devices()[target_device];
-            if (dev.type == ComputeBackendType::CPU_OPENBLAS ||
-                dev.type == ComputeBackendType::CPU_MKL)
+            if (dev.type == ComputeBackendType::CPU ||
+                dev.type == ComputeBackendType::CPU)
             {
                 // CPU device - no GPU transfer needed
                 return true;
@@ -719,8 +697,8 @@ namespace llaminar2
         if (static_cast<size_t>(target_device) < dm.devices().size())
         {
             const auto &dev = dm.devices()[target_device];
-            if (dev.type == ComputeBackendType::CPU_OPENBLAS ||
-                dev.type == ComputeBackendType::CPU_MKL)
+            if (dev.type == ComputeBackendType::CPU ||
+                dev.type == ComputeBackendType::CPU)
             {
                 // CPU device - no GPU transfer needed
                 return true;
@@ -782,7 +760,7 @@ namespace llaminar2
         // Debug: dump input to attention (for layer 0 only to reduce noise)
         if (layer_idx == 0)
         {
-            const float *input = input_hidden->data();
+            const float *input = input_hidden->fp32_data();
             LOG_INFO("[LEGACY_ATTN_INPUT] layer=" << layer_idx << " seq_len=" << effective_seq_len
                                                   << " input[0:4]=" << input[0] << "," << input[1] << "," << input[2] << "," << input[3]);
         }
@@ -803,6 +781,14 @@ namespace llaminar2
             effective_seq_len, d_model_, 1e-6f,
             layer_prefix + "_ATTENTION_NORM", attn_device));
 
+        // Debug: Log normalized output for comparison with executor
+        if (layer_idx == 0)
+        {
+            const float *norm_out = buffers.normalized->fp32_data();
+            LOG_INFO("[LEGACY_RMSNORM_OUT] normalized[0:4]=" << std::setprecision(10)
+                                                             << norm_out[0] << "," << norm_out[1] << "," << norm_out[2] << "," << norm_out[3]);
+        }
+
         // 2. Fused Q/K/V projections
         if (!layer.qkv_fused)
         {
@@ -813,9 +799,10 @@ namespace llaminar2
         // Debug: Log input/output pointers for comparison with executor
         if (layer_idx == 0)
         {
-            LOG_INFO("[LEGACY_Q_PROJ] input ptr=" << static_cast<const void *>(buffers.normalized->data())
+            LOG_INFO("[LEGACY_Q_PROJ] input ptr=" << static_cast<const void *>(buffers.normalized->fp32_data())
                                                   << " wq ptr=" << static_cast<const void *>(layer.wq.get())
-                                                  << " output ptr=" << static_cast<void *>(buffers.Q->mutable_data()));
+                                                  << " wq shape=[" << layer.wq->shape()[0] << "," << layer.wq->shape()[1] << "]"
+                                                  << " output tensor=" << static_cast<void *>(buffers.Q.get()));
         }
 
         // Extract bias pointers (nullptr if model doesn't have biases)
@@ -912,7 +899,7 @@ namespace llaminar2
         // Debug: dump Q right after projection (BEFORE RoPE)
         if (layer_idx == 0)
         {
-            const float *Q_after_proj = buffers.Q->data();
+            const float *Q_after_proj = buffers.Q->fp32_data();
             LOG_INFO("[LEGACY_Q_POST_PROJ] Q[0:4]=" << std::setprecision(10)
                                                     << Q_after_proj[0] << "," << Q_after_proj[1] << "," << Q_after_proj[2] << "," << Q_after_proj[3]);
         }
@@ -1086,11 +1073,11 @@ namespace llaminar2
         // Debug: dump intermediate buffers (for layer 0 only)
         if (layer_idx == 0)
         {
-            const float *normalized = buffers.normalized.get()->data();
-            const float *Q = buffers.Q.get()->data();
-            const float *attn_output = buffers.attn_output.get()->data();
-            const float *attn_proj = buffers.attn_proj.get()->data();
-            const float *output = current_hidden_.get()->data();
+            const float *normalized = buffers.normalized.get()->fp32_data();
+            const float *Q = buffers.Q.get()->fp32_data();
+            const float *attn_output = buffers.attn_output.get()->fp32_data();
+            const float *attn_proj = buffers.attn_proj.get()->fp32_data();
+            const float *output = current_hidden_.get()->fp32_data();
             LOG_INFO("[LEGACY_ATTN] normalized ptr=" << static_cast<const void *>(normalized)
                                                      << " Q ptr=" << static_cast<const void *>(Q));
             LOG_INFO("[LEGACY_ATTN] normalized[0:4]=" << std::setprecision(10) << normalized[0] << "," << normalized[1] << "," << normalized[2] << "," << normalized[3]);

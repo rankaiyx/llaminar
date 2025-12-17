@@ -61,8 +61,7 @@ namespace llaminar
 
                 switch (device.type)
                 {
-                case llaminar2::ComputeBackendType::CPU_OPENBLAS:
-                case llaminar2::ComputeBackendType::CPU_MKL:
+                case llaminar2::ComputeBackendType::CPU:
                     return DeviceType::CPU;
                 case llaminar2::ComputeBackendType::GPU_CUDA:
                     return DeviceType::CUDA;
@@ -288,10 +287,10 @@ namespace llaminar
                         return kernel_.apply_typed(gate, up, output, rows * cols, device_idx);
                     }
 
-                    // Tensor-based interface (used by SwiGLUOpTyped)
+                    // Tensor-based interface (used by SwiGLUStage)
                     bool apply_tensor(
-                        llaminar2::TensorBase *gate,
-                        llaminar2::TensorBase *up,
+                        const llaminar2::TensorBase *gate,
+                        const llaminar2::TensorBase *up,
                         llaminar2::TensorBase *output,
                         int rows, int cols,
                         bool add_residual,
@@ -363,8 +362,8 @@ namespace llaminar
 
                     // Tensor-based interface (used by SwiGLUOpTyped)
                     bool apply_tensor(
-                        llaminar2::TensorBase *gate,
-                        llaminar2::TensorBase *up,
+                        const llaminar2::TensorBase *gate,
+                        const llaminar2::TensorBase *up,
                         llaminar2::TensorBase *output,
                         int rows, int cols,
                         bool add_residual,
@@ -395,8 +394,8 @@ namespace llaminar
                         }
 
                         // Cast to Q8_1Tensor to access Q8_1 blocks
-                        auto *gate_q8 = dynamic_cast<llaminar2::Q8_1Tensor *>(gate);
-                        auto *up_q8 = dynamic_cast<llaminar2::Q8_1Tensor *>(up);
+                        const auto *gate_q8 = dynamic_cast<const llaminar2::Q8_1Tensor *>(gate);
+                        const auto *up_q8 = dynamic_cast<const llaminar2::Q8_1Tensor *>(up);
                         auto *output_q8 = dynamic_cast<llaminar2::Q8_1Tensor *>(output);
 
                         if (!gate_q8 || !up_q8 || !output_q8)
@@ -460,7 +459,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -486,7 +488,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return new llaminar2::gemm_v4::QuantisedGemmKernel(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return new llaminar2::gemm_v4::QuantisedGemmKernel(packed);
+                }
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -511,7 +516,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                     // GPU backends not yet implemented for Q4_0
                 default:
@@ -533,7 +541,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -554,7 +565,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -575,7 +589,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -596,7 +613,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -617,7 +637,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -638,7 +661,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -659,7 +685,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -680,7 +709,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -701,7 +733,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -722,7 +757,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -743,7 +781,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -764,7 +805,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -785,7 +829,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -806,7 +853,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -827,7 +877,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -848,7 +901,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -869,7 +925,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -890,7 +949,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -911,7 +973,10 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(tensor);
+                {
+                    auto *packed = ensurePackedWeightsInTensorCache(tensor);
+                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                }
 
                 default:
                     if (dev_type != DeviceType::CPU)
@@ -1381,7 +1446,111 @@ namespace llaminar
             }
 
             // ==========================================================================
-            // Attention Kernel Creation - Device-aware dispatch
+            // Generic TensorBase* Factory Methods - Auto-dispatch by native_type()
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorRMSNorm> KernelFactory::createRMSNorm(
+                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::createRMSNorm: null tensor");
+                }
+
+                switch (tensor->native_type())
+                {
+                case llaminar2::TensorType::FP32:
+                    return createRMSNorm(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::BF16:
+                    return createRMSNorm(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::FP16:
+                    return createRMSNorm(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::Q8_1:
+                    return createRMSNorm(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                default:
+                    throw std::runtime_error(
+                        "KernelFactory::createRMSNorm: unsupported tensor type " +
+                        std::string(tensor->dtype_name()));
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
+                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::createRoPE: null tensor");
+                }
+
+                switch (tensor->native_type())
+                {
+                case llaminar2::TensorType::FP32:
+                    return createRoPE(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::BF16:
+                    return createRoPE(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::FP16:
+                    return createRoPE(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::Q8_1:
+                    return createRoPE(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                default:
+                    throw std::runtime_error(
+                        "KernelFactory::createRoPE: unsupported tensor type " +
+                        std::string(tensor->dtype_name()));
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorSwiGLU> KernelFactory::createSwiGLU(
+                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::createSwiGLU: null tensor");
+                }
+
+                switch (tensor->native_type())
+                {
+                case llaminar2::TensorType::FP32:
+                    return createSwiGLU(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::BF16:
+                    return createSwiGLU(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::FP16:
+                    return createSwiGLU(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::Q8_1:
+                    return createSwiGLU(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                default:
+                    throw std::runtime_error(
+                        "KernelFactory::createSwiGLU: unsupported tensor type " +
+                        std::string(tensor->dtype_name()));
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
+                const llaminar2::TensorBase *tensor, DeviceType dev_type)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::createAttention: null tensor");
+                }
+
+                switch (tensor->native_type())
+                {
+                case llaminar2::TensorType::FP32:
+                    return createAttention(static_cast<const llaminar2::FP32Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::BF16:
+                    return createAttention(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::FP16:
+                    return createAttention(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type);
+                case llaminar2::TensorType::Q8_1:
+                    return createAttention(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type);
+                default:
+                    throw std::runtime_error(
+                        "KernelFactory::createAttention: unsupported tensor type " +
+                        std::string(tensor->dtype_name()));
+                }
+            }
+
+            // ==========================================================================
+            // Attention Kernel Creation - Device-aware dispatch (typed overloads)
             // CPU fallback for GPU requests since GPU Attention kernels not yet implemented
             // ==========================================================================
 
@@ -1637,6 +1806,59 @@ namespace llaminar
                 llaminar2::gemm_v4::QuantisedPackedWeights packed;
             };
 
+            /**
+             * @brief Ensure tensor has packed weights in its cache and return pointer
+             *
+             * This is the canonical way to get packed weights for a tensor. The weights
+             * are stored in tensor->cache_ so they outlive any individual kernel.
+             *
+             * Thread-safe: acquires cache_mutex_ internally.
+             *
+             * @param tensor Quantized tensor that implements IINT8Unpackable
+             * @return Pointer to packed weights (stored in tensor's cache_)
+             * @throws std::runtime_error if packing fails
+             */
+            const llaminar2::gemm_v4::QuantisedPackedWeights *
+            KernelFactory::ensurePackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
+            {
+                // Check if tensor already has packed weights cached
+                TensorPackedWeightsCache *packed_cache = nullptr;
+                if (tensor->cache_.has_value())
+                {
+                    try
+                    {
+                        packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
+                        if (packed_cache)
+                        {
+                            return &packed_cache->packed;
+                        }
+                    }
+                    catch (const std::bad_any_cast &)
+                    {
+                        // cache_ contains something else - overwrite
+                    }
+                }
+
+                // Pack weights into tensor's cache_
+                auto *new_cache = new TensorPackedWeightsCache();
+                if (!llaminar2::gemm_v4::QuantisedGemmKernel::packWeightsInto(
+                        tensor, new_cache->packed, 0, -1))
+                {
+                    delete new_cache;
+                    LOG_ERROR("[KernelFactory] Failed to pack weights for tensor type "
+                              << static_cast<int>(tensor->native_type()));
+                    throw std::runtime_error("KernelFactory: failed to pack weights");
+                }
+
+                // Store in tensor's cache_ (tensor owns the packed data)
+                tensor->cache_ = new_cache;
+
+                LOG_TRACE("[KernelFactory] Packed weights for tensor "
+                          << tensor << " (" << new_cache->packed.N << "x" << new_cache->packed.K << ")");
+
+                return &new_cache->packed;
+            }
+
             llaminar2::ITensorGemm *KernelFactory::getOrCreateGemm(const llaminar2::TensorBase *tensor)
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -1651,6 +1873,14 @@ namespace llaminar
                 int tensor_n = static_cast<int>(shape[0]); // rows = output features
                 int tensor_k = static_cast<int>(shape[1]); // cols = input features
 
+                // Debug: Log cache lookup for Q weight tensors
+                if (tensor_n == 896 && tensor_k == 896)
+                {
+                    LOG_INFO("[KernelFactory::getOrCreateGemm] Looking up tensor=" << static_cast<const void *>(tensor)
+                                                                                   << " shape=[" << tensor_n << "," << tensor_k << "]"
+                                                                                   << " cache_size=" << kernel_cache_.size());
+                }
+
                 // Check kernel cache first
                 auto it = kernel_cache_.find(tensor);
                 if (it != kernel_cache_.end())
@@ -1661,6 +1891,10 @@ namespace llaminar
                     {
                         if (quantised->get_n() == tensor_n && quantised->get_k() == tensor_k)
                         {
+                            if (tensor_n == 896 && tensor_k == 896)
+                            {
+                                LOG_INFO("[KernelFactory::getOrCreateGemm] CACHE HIT: returning cached kernel=" << static_cast<const void *>(it->second.get()));
+                            }
                             return it->second.get();
                         }
                         // Dimensions mismatch - tensor memory was reused, evict stale entry
@@ -1780,6 +2014,15 @@ namespace llaminar
                             &packed_cache->packed);
 
                         auto *raw_ptr = kernel.get();
+
+                        // Debug: Log cache miss for Q weight tensors
+                        if (tensor_n == 896 && tensor_k == 896)
+                        {
+                            LOG_INFO("[KernelFactory::getOrCreateGemm] CACHE MISS: created new kernel=" << static_cast<const void *>(raw_ptr)
+                                                                                                        << " for tensor=" << static_cast<const void *>(tensor)
+                                                                                                        << " pw.data=" << static_cast<const void *>(packed_cache->packed.packed_data.data()));
+                        }
+
                         kernel_cache_[tensor] = std::move(kernel);
                         return raw_ptr;
                     }
@@ -1969,6 +2212,111 @@ namespace llaminar
                 // Note: Can't easily compute packed_bytes without RTTI to QuantisedGemmKernel
                 // For now, just return count
                 return {kernel_cache_.size(), total_bytes};
+            }
+
+            // ==========================================================================
+            // Activation/Weight Type Compatibility
+            // ==========================================================================
+
+            bool KernelFactory::isFloatingPointType(llaminar2::TensorType type)
+            {
+                switch (type)
+                {
+                case llaminar2::TensorType::FP32:
+                case llaminar2::TensorType::FP16:
+                case llaminar2::TensorType::BF16:
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
+            bool KernelFactory::isQuantizedType(llaminar2::TensorType type)
+            {
+                switch (type)
+                {
+                // 8-bit formats
+                case llaminar2::TensorType::Q8_0:
+                case llaminar2::TensorType::Q8_1:
+                case llaminar2::TensorType::Q8_K:
+                // 4-bit formats
+                case llaminar2::TensorType::Q4_0:
+                case llaminar2::TensorType::Q4_1:
+                case llaminar2::TensorType::Q4_K:
+                case llaminar2::TensorType::IQ4_NL:
+                case llaminar2::TensorType::IQ4_XS:
+                // 5-bit formats
+                case llaminar2::TensorType::Q5_0:
+                case llaminar2::TensorType::Q5_1:
+                case llaminar2::TensorType::Q5_K:
+                // 6-bit format
+                case llaminar2::TensorType::Q6_K:
+                // K-quant formats
+                case llaminar2::TensorType::Q2_K:
+                case llaminar2::TensorType::Q3_K:
+                // I-quant formats
+                case llaminar2::TensorType::IQ1_M:
+                case llaminar2::TensorType::IQ1_S:
+                case llaminar2::TensorType::IQ2_S:
+                case llaminar2::TensorType::IQ2_XS:
+                case llaminar2::TensorType::IQ2_XXS:
+                case llaminar2::TensorType::IQ3_S:
+                case llaminar2::TensorType::IQ3_XXS:
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
+            bool KernelFactory::isActivationWeightCompatible(
+                llaminar2::TensorType activation_type,
+                llaminar2::TensorType weight_type)
+            {
+                // FP32, FP16, BF16 activations work with ANY weight type
+                // (FloatingPointGemmKernel dequantizes weights on-the-fly)
+                if (isFloatingPointType(activation_type))
+                {
+                    return true;
+                }
+
+                // Q8_1 activations ONLY work with quantized weights
+                // (QuantisedGemmKernel uses INT8×INT8 dot products)
+                if (activation_type == llaminar2::TensorType::Q8_1)
+                {
+                    // Q8_1 activations can work with any quantized weight type
+                    // (the kernel repacks weights to INT8 VNNI format)
+                    return isQuantizedType(weight_type);
+                }
+
+                // Other activation types (INT8, INT32, etc.) are not supported
+                // in GEMM operations currently
+                return false;
+            }
+
+            std::string KernelFactory::getCompatibilityErrorMessage(
+                llaminar2::TensorType activation_type,
+                llaminar2::TensorType weight_type)
+            {
+                const char *act_name = llaminar2::tensorTypeName(activation_type);
+                const char *wgt_name = llaminar2::tensorTypeName(weight_type);
+
+                if (activation_type == llaminar2::TensorType::Q8_1 && isFloatingPointType(weight_type))
+                {
+                    return std::string("Q8_1 activation precision requires quantized weights, but got ") +
+                           wgt_name + " weights. The QuantisedGemmKernel uses INT8×INT8 VNNI " +
+                           "instructions which cannot process floating-point weights. Either:\n" +
+                           "  1. Use FP32 activation precision (slower but compatible with any weights)\n" +
+                           "  2. Use a quantized model (Q8_0, Q4_0, IQ4_NL, etc.)";
+                }
+
+                if (!isFloatingPointType(activation_type) && activation_type != llaminar2::TensorType::Q8_1)
+                {
+                    return std::string("Unsupported activation type: ") + act_name +
+                           ". Only FP32, FP16, BF16, and Q8_1 activation precisions are supported.";
+                }
+
+                return std::string("Activation type ") + act_name +
+                       " is not compatible with weight type " + wgt_name;
             }
 
         } // namespace kernels

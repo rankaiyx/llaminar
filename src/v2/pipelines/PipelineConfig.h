@@ -365,8 +365,7 @@ namespace llaminar2
     {
         switch (device.type)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
         {
             // Priority 1: AMX-BF16 (Intel Sapphire Rapids+, 4th gen Xeon)
             if (cpu_supports_amx_bf16())

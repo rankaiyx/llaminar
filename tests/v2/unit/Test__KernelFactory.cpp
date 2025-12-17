@@ -288,7 +288,10 @@ TEST_F(Test__KernelFactory, CreateGemm_Q5_K_CPU)
     ASSERT_NE(kernel, nullptr);
 }
 
-TEST_F(Test__KernelFactory, CreateGemm_Q8_K_CPU)
+// Q8_K does NOT implement IINT8Unpackable, so kernel creation should throw.
+// This is intentional - Q8_K uses the tile-based ITensorGemmTileDataProvider path
+// via TileBasedGemmKernel, not the packed GEMM path.
+TEST_F(Test__KernelFactory, CreateGemm_Q8_K_CPU_ThrowsNotImplemented)
 {
     const size_t rows = 256;
     const size_t cols = 256;
@@ -298,9 +301,11 @@ TEST_F(Test__KernelFactory, CreateGemm_Q8_K_CPU)
     std::vector<uint8_t> raw_data(num_blocks * bytes_per_block, 0);
 
     Q8_KTensor tensor({rows, cols}, raw_data);
-    auto kernel = KernelFactory::createGemm(&tensor, DeviceType::CPU);
 
-    ASSERT_NE(kernel, nullptr);
+    // Q8_K doesn't support packed GEMM - it uses tile-based decoding
+    EXPECT_THROW(
+        KernelFactory::createGemm(&tensor, DeviceType::CPU),
+        std::runtime_error);
 }
 
 // ============================================================================

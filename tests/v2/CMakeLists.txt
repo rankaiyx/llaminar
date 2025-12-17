@@ -317,6 +317,20 @@ add_v2_test(V2_Unit_ITensor
     MPI_PROCS 1  # Single-rank test, no MPI needed
 )
 
+# Test: AttentionMode enum and detection function
+# Tests the AttentionMode dispatch (PREFILL, DECODE, BATCHED_DECODE, CHUNKED_PREFILL)
+add_executable(v2_test_attention_mode unit/Test__AttentionMode.cpp)
+target_link_libraries(v2_test_attention_mode 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionMode 
+    COMMAND $<TARGET_FILE:v2_test_attention_mode>
+    LABELS "V2;Unit;Kernels;Attention;ModeDetection"
+    MPI_PROCS 1
+)
+
 # Test: Q8_1 Add Reproduction (Divergence Investigation)
 add_executable(v2_test_q8_1_add_repro unit/tensors/Test__Q8_1_Add_Repro.cpp)
 target_link_libraries(v2_test_q8_1_add_repro 
@@ -686,6 +700,32 @@ add_v2_test(V2_Unit_FusedGEMM
     MPI_PROCS 1  # CPU-only fused kernel, single rank
 )
 
+# Test: FusedQKVGEMMStage compute stage (regression test for QKV bias bug)
+add_executable(v2_test_fused_qkv_gemm_stage unit/Test__FusedQKVGEMMStage.cpp)
+target_link_libraries(v2_test_fused_qkv_gemm_stage
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedQKVGEMMStage
+    COMMAND $<TARGET_FILE:v2_test_fused_qkv_gemm_stage>
+    LABELS "V2;Unit;ComputeStage;FusedKernels;GEMM;Bias;Attention;QKV;RegressionTest;CPU"
+    MPI_PROCS 1  # CPU compute stage tests, single rank
+)
+
+# Test: FusedGateUpGEMMStage compute stage (FFN gate/up bias handling)
+add_executable(v2_test_fused_gate_up_gemm_stage unit/Test__FusedGateUpGEMMStage.cpp)
+target_link_libraries(v2_test_fused_gate_up_gemm_stage
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_FusedGateUpGEMMStage
+    COMMAND $<TARGET_FILE:v2_test_fused_gate_up_gemm_stage>
+    LABELS "V2;Unit;ComputeStage;FusedKernels;GEMM;Bias;FFN;RegressionTest;CPU"
+    MPI_PROCS 1  # CPU compute stage tests, single rank
+)
+
 # Test: Device index handling in CPU kernels (regression test for device_idx=0 bug)
 add_executable(v2_test_device_index_cpu_kernels unit/Test__DeviceIndexCPUKernels.cpp)
 target_link_libraries(v2_test_device_index_cpu_kernels
@@ -920,6 +960,19 @@ target_link_libraries(v2_test_cpu_attention_kernel_typed
 add_v2_test(V2_Unit_CPUAttentionKernelTyped
     COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_typed>
     LABELS "V2;Unit;Kernels;Attention;FP32;BF16;FP16;TypedKernel;CPU;FactoryWiring"
+    MPI_PROCS 1
+)
+
+# Test: AttentionComputeStage (Phase 9 - ComputeStage for attention via KernelFactory)
+add_executable(v2_test_attention_compute_stage unit/Test__AttentionComputeStage.cpp)
+target_link_libraries(v2_test_attention_compute_stage
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionComputeStage
+    COMMAND $<TARGET_FILE:v2_test_attention_compute_stage>
+    LABELS "V2;Unit;Kernels;Attention;ComputeStage;KernelFactory;CPU"
     MPI_PROCS 1
 )
 
@@ -2029,6 +2082,16 @@ add_v2_test(V2_Unit_ComputeStage
     MPI_PROCS 1  # Tests CPU stages locally, no MPI needed
 )
 
+# Test: ExecutionPolicy (declarative operation control)
+# Tests factory methods, environment variable parsing, utility methods, comparison operators
+add_executable(v2_test_execution_policy unit/Test__ExecutionPolicy.cpp)
+target_link_libraries(v2_test_execution_policy llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ExecutionPolicy
+    COMMAND $<TARGET_FILE:v2_test_execution_policy>
+    LABELS "V2;Unit;Execution;ExecutionPolicy;Configuration;EnvironmentVariables"
+    MPI_PROCS 1
+)
+
 # Test: ResidualAddStage Precision Awareness
 # Tests precision-aware residual addition: FP32, BF16, FP16, Q8_1
 # Verifies Q8_1 uses native simd::q8_1_add_q8_1 (no explicit dequant)
@@ -2074,13 +2137,13 @@ add_v2_test(V2_Unit_LayerExecutorInterface
 )
 
 # Test: ComputeStages (individual compute stage unit tests)
-# Tests GEMMStage, RMSNormStage, RoPEStage, SwiGLUStage, ResidualAddStage, QuantizeStage, etc.
+# Tests GEMMStage, RMSNormStage, RoPEStage, SwiGLUStage, ResidualAddStage, etc.
 # Verifies correctness, precision preservation, FLOP estimation, and backend compatibility
 add_executable(v2_test_compute_stages unit/Test__ComputeStages.cpp)
 target_link_libraries(v2_test_compute_stages llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ComputeStages
     COMMAND $<TARGET_FILE:v2_test_compute_stages>
-    LABELS "V2;Unit;ComputeStage;GEMM;RMSNorm;RoPE;SwiGLU;ResidualAdd;Quantize;Precision"
+    LABELS "V2;Unit;ComputeStage;GEMM;RMSNorm;RoPE;SwiGLU;ResidualAdd;Precision"
     MPI_PROCS 1
 )
 
@@ -2319,6 +2382,20 @@ add_v2_test(V2_Integration_Q8_1_KVCache
     LABELS "V2;Integration;KVCache;Q8_1;Attention;Pipeline;Correctness"
 )
 
+# Test: Decomposed Attention (Phase 9 KVCacheAppendStage + AttentionComputeStage)
+# Validates the new decomposed attention path that routes through KernelFactory
+add_executable(v2_integration_decomposed_attention integration/Test__DecomposedAttention.cpp)
+target_link_libraries(v2_integration_decomposed_attention
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_DecomposedAttention
+    COMMAND $<TARGET_FILE:v2_integration_decomposed_attention>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Attention;ComputeStage;KernelFactory;KVCache;Phase9"
+)
+
 # Test: Q8_1 vs FP32 Activation Precision Parity
 # Validates Q8_1 activation precision produces equivalent results to FP32
 # Tests Top-5 token overlap, KL divergence, and greedy sampling equivalence
@@ -2331,6 +2408,52 @@ target_link_libraries(v2_integration_q8_1_vs_fp32_parity
 add_v2_test(V2_Integration_Q8_1_vs_FP32_Parity
     COMMAND $<TARGET_FILE:v2_integration_q8_1_vs_fp32_parity>
     LABELS "V2;Integration;Pipeline;ActivationPrecision;Q8_1;FP32;Parity;TopK;KLDivergence"
+    MPI_PROCS 1
+)
+
+# Test: LayerExecutor Q8_1 vs FP32 Activation Precision Parity
+# Validates Qwen2LayerExecutor produces equivalent results with Q8_1 vs FP32 activations
+# Tests single layer execution using mock weights (faster than full pipeline test)
+# Uses decomposed attention path (Phase 9 ComputeStage architecture)
+add_executable(v2_integration_layer_executor_q8_1_vs_fp32_parity integration/Test__LayerExecutor_Q8_1_vs_FP32_Parity.cpp)
+target_link_libraries(v2_integration_layer_executor_q8_1_vs_fp32_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_LayerExecutor_Q8_1_vs_FP32_Parity
+    COMMAND $<TARGET_FILE:v2_integration_layer_executor_q8_1_vs_fp32_parity>
+    LABELS "V2;Integration;LayerExecutor;ActivationPrecision;Q8_1;FP32;Parity;ComputeStage;Phase9"
+    MPI_PROCS 1
+)
+
+# Test: Pipeline vs LayerExecutor FP32 Parity
+# Validates that the new LayerExecutor framework produces equivalent results
+# to the legacy imperative pipeline code when both use FP32 precision.
+# Tests prefill, single decode, and multi-step decode scenarios.
+add_executable(v2_integration_pipeline_vs_layer_executor_fp32 integration/Test__Pipeline_vs_LayerExecutor_FP32_Parity.cpp)
+target_link_libraries(v2_integration_pipeline_vs_layer_executor_fp32
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Pipeline_vs_LayerExecutor_FP32_Parity
+    COMMAND $<TARGET_FILE:v2_integration_pipeline_vs_layer_executor_fp32>
+    LABELS "V2;Integration;Pipeline;LayerExecutor;FP32;Parity;ExecutionFramework;Migration"
+    MPI_PROCS 1
+)
+
+# Test: Pipeline vs LayerExecutor Q8_1 Parity
+# Validates that the LayerExecutor framework produces equivalent results
+# to the legacy pipeline code when BOTH use Q8_1 activation precision.
+# Uses looser tolerances to account for quantization noise inherent to Q8_1.
+add_executable(v2_integration_pipeline_vs_layer_executor_q8_1 integration/Test__Pipeline_vs_LayerExecutor_Q8_1_Parity.cpp)
+target_link_libraries(v2_integration_pipeline_vs_layer_executor_q8_1
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Pipeline_vs_LayerExecutor_Q8_1_Parity
+    COMMAND $<TARGET_FILE:v2_integration_pipeline_vs_layer_executor_q8_1>
+    LABELS "V2;Integration;Pipeline;LayerExecutor;Q8_1;Parity;ExecutionFramework;Migration;Quantization"
     MPI_PROCS 1
 )
 

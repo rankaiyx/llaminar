@@ -57,8 +57,7 @@ namespace llaminar2
     {
         switch (type)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
             return "CPU";
         case ComputeBackendType::GPU_CUDA:
             return "NVIDIA CUDA";
@@ -79,17 +78,8 @@ namespace llaminar2
     {
         ComputeDevice dev;
 
-        // Backend is selected at compile time based on CPU vendor
-        // (see CMakeLists.txt BLAS_BACKEND selection)
-#ifdef HAVE_MKL
-        dev.type = ComputeBackendType::CPU_MKL;
+        dev.type = ComputeBackendType::CPU;
         dev.name = "CPU";
-#elif defined(HAVE_OPENBLAS)
-        dev.type = ComputeBackendType::CPU_OPENBLAS;
-        dev.name = "CPU";
-#else
-#error "No BLAS backend configured - set BLAS_BACKEND in CMake"
-#endif
 
         dev.device_id = 0;
         dev.compute_capability = 0;
@@ -412,8 +402,7 @@ namespace llaminar2
         {
             const auto &dev = devices_[i];
             std::string device_info = "  [" + std::to_string(i) + "] " + dev.name + " (" + std::to_string(dev.total_memory_bytes / (1024 * 1024 * 1024)) + " GB";
-            if (dev.type != ComputeBackendType::CPU_OPENBLAS &&
-                dev.type != ComputeBackendType::CPU_MKL)
+            if (dev.type != ComputeBackendType::CPU)
             {
                 device_info += ", SM " + std::to_string(dev.compute_capability / 10) + "." + std::to_string(dev.compute_capability % 10);
             }
@@ -452,8 +441,7 @@ namespace llaminar2
 
         switch (device.type)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
             ctx = std::make_shared<CPUComputeContext>();
             break;
 
@@ -613,10 +601,7 @@ namespace llaminar2
             case ComputeBackendType::GPU_VULKAN:
                 priority = 100;
                 break;
-            case ComputeBackendType::CPU_MKL:
-                priority = 50;
-                break;
-            case ComputeBackendType::CPU_OPENBLAS:
+            case ComputeBackendType::CPU:
                 priority = 10;
                 break;
             }

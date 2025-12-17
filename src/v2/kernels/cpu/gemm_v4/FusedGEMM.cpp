@@ -63,8 +63,9 @@ namespace llaminar2
         // Get GEMM kernels from KernelFactory (don't create new ones!)
         // This ensures we use the pre-packed weights and don't re-access raw data.
         gemm_kernels_.reserve(weights.size());
-        for (const auto *weight : weights)
+        for (size_t i = 0; i < weights.size(); ++i)
         {
+            const auto *weight = weights[i];
             // KernelFactory::getOrCreateGemm() returns cached ITensorGemm*
             auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(weight);
             auto *quantised_gemm = dynamic_cast<gemm_v4::QuantisedGemmKernel *>(gemm);
@@ -72,6 +73,8 @@ namespace llaminar2
             {
                 throw std::runtime_error("[FusedGEMM] Weight tensor returned non-QuantisedGemmKernel from KernelFactory::getOrCreateGemm()");
             }
+            LOG_DEBUG("[FusedGEMM] Got kernel " << i << " ptr=" << static_cast<const void *>(gemm)
+                                                << " weight ptr=" << static_cast<const void *>(weight));
             gemm_kernels_.push_back(quantised_gemm);
         }
     }
@@ -101,6 +104,12 @@ namespace llaminar2
             LOG_ERROR("[FusedGEMM] Input pointer is null");
             return false;
         }
+
+        // DEBUG: Log input pointer and first values for parity testing
+        LOG_INFO("[FusedGEMM] input ptr=" << static_cast<const void *>(input)
+                                          << " input[0:4]=" << std::setprecision(10)
+                                          << input[0] << "," << input[1] << ","
+                                          << input[2] << "," << input[3]);
 
         if (projections.size() != gemm_kernels_.size())
         {
@@ -149,6 +158,15 @@ namespace llaminar2
             return false;
         }
 
+        // Debug: dump first Q8_1 block for comparison
+        const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(q8_1_buffer.data());
+        LOG_DEBUG("[FusedGEMM] First Q8_1 block: d=" << blocks[0].d
+                                                     << " sum_qs=" << blocks[0].sum_qs
+                                                     << " qs[0:4]=" << (int)blocks[0].qs[0] << ","
+                                                     << (int)blocks[0].qs[1] << ","
+                                                     << (int)blocks[0].qs[2] << ","
+                                                     << (int)blocks[0].qs[3]);
+
         // Step 3: Execute all projections with shared quantized activations
         for (size_t i = 0; i < gemm_kernels_.size(); ++i)
         {
@@ -161,6 +179,14 @@ namespace llaminar2
             GemmFusedOps fused_ops = proj.do_swiglu
                                          ? GemmFusedOps::swiglu(proj.gate_input)
                                          : GemmFusedOps::none();
+
+            // Debug: Log kernel info before GEMM call for layer 0 Q projection
+            if (i == 0 && proj.n == 896 && k == 896)
+            {
+                LOG_INFO("[FusedGEMM] Calling multiply_with_precomputed_q8_1 for Q: "
+                         << "kernel=" << static_cast<const void *>(gemm_kernels_[i])
+                         << " m=" << m << " n=" << proj.n << " k=" << k);
+            }
 
             success = gemm_kernels_[i]->multiply_with_precomputed_q8_1(
                 q8_1_buffer.data(),
@@ -176,6 +202,13 @@ namespace llaminar2
             {
                 LOG_ERROR("[FusedGEMM] " << name << " GEMM failed");
                 return false;
+            }
+
+            // Debug: dump first 4 output values for Q projection (n=896, k=896)
+            if (i == 0 && proj.n == 896 && k == 896)
+            {
+                LOG_INFO("[FusedGEMM Q OUTPUT] n=" << proj.n << " output[0:4]="
+                                                   << std::setprecision(10) << proj.output[0] << "," << proj.output[1] << "," << proj.output[2] << "," << proj.output[3]);
             }
         }
 

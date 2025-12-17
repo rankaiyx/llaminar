@@ -53,11 +53,8 @@ void list_devices()
 
         switch (dev.type)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-            LOG_DEBUG("CPU (OpenBLAS)");
-            break;
-        case ComputeBackendType::CPU_MKL:
-            LOG_DEBUG("CPU (Intel MKL)");
+        case ComputeBackendType::CPU:
+            LOG_DEBUG("CPU");
             break;
         case ComputeBackendType::GPU_CUDA:
             LOG_DEBUG("GPU (CUDA) - " << dev.name);
@@ -95,7 +92,7 @@ int parse_device(const std::string &device_str, DeviceManager &dm)
 
     if (device_str == "cpu")
     {
-        return dm.find_device(ComputeBackendType::CPU_OPENBLAS, 0);
+        return dm.find_device(ComputeBackendType::CPU, 0);
     }
 
     if (device_str.substr(0, 5) == "cuda:")

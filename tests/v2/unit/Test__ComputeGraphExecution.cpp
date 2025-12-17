@@ -19,6 +19,7 @@
 #include "execution/LayerExecutor.h"
 #include "execution/ComputeStage.h"
 #include "execution/DeviceContext.h"
+#include "tensors/Tensors.h"
 #include <algorithm>
 #include <set>
 #include <thread>
@@ -35,7 +36,7 @@ class ComputeGraphExecutionTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        ctx_ = std::make_unique<MockDeviceContext>(0, ComputeBackendType::CPU_OPENBLAS);
+        ctx_ = std::make_unique<MockDeviceContext>(0, ComputeBackendType::CPU);
         executor_ = std::make_unique<LayerExecutor>();
     }
 
@@ -841,20 +842,30 @@ TEST_F(ComputeGraphExecutionTest, RealResidualAddStage_InGraph)
 {
     // Test with real ResidualAddStage (not mock) to verify integration
     const size_t n = 64;
-    std::vector<float> input(n, 1.0f);
-    std::vector<float> residual(n, 2.0f);
-    std::vector<float> output(n, 0.0f);
+    const std::vector<size_t> shape = {1, n};
+
+    // Create FP32 tensors for the residual add operation
+    auto input_tensor = std::make_unique<FP32Tensor>(shape);
+    auto residual_tensor = std::make_unique<FP32Tensor>(shape);
+    auto output_tensor = std::make_unique<FP32Tensor>(shape);
+
+    // Initialize input data
+    float *input_data = input_tensor->mutable_data();
+    float *residual_data = residual_tensor->mutable_data();
+    for (size_t i = 0; i < n; ++i)
+    {
+        input_data[i] = 1.0f;
+        residual_data[i] = 2.0f;
+    }
 
     ResidualAddStage::Params params;
-    params.input = input.data();
-    params.residual = residual.data();
-    params.output = output.data();
-    params.num_elements = n;
-    params.precision = ActivationPrecision::FP32;
+    params.input = input_tensor.get();
+    params.residual = residual_tensor.get();
+    params.output = output_tensor.get();
 
     ComputeGraph graph;
     graph.addNode("residual",
-                  ComputeStageFactory::createResidualAdd(params, ComputeBackendType::CPU_OPENBLAS),
+                  ComputeStageFactory::createResidualAdd(params),
                   0);
 
     // Use real CPU context
@@ -863,8 +874,9 @@ TEST_F(ComputeGraphExecutionTest, RealResidualAddStage_InGraph)
     EXPECT_TRUE(executor_->execute(graph, real_ctx.get()));
 
     // Verify actual computation
+    const float *output_data = output_tensor->data();
     for (size_t i = 0; i < n; ++i)
     {
-        EXPECT_FLOAT_EQ(output[i], 3.0f); // 1.0 + 2.0
+        EXPECT_FLOAT_EQ(output_data[i], 3.0f); // 1.0 + 2.0
     }
 }

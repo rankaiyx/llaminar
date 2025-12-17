@@ -38,6 +38,22 @@ namespace llaminar2
 {
 
     /**
+     * @brief Simplified device type for kernel dispatch
+     *
+     * This enum matches kernels::KernelFactory::DeviceType but is defined
+     * here to avoid circular includes. Stages can convert using
+     * KernelFactory::getDeviceType() when needed.
+     */
+    enum class DeviceType
+    {
+        CPU,    ///< Any CPU backend (OpenBLAS, MKL, etc.)
+        CUDA,   ///< NVIDIA CUDA
+        ROCm,   ///< AMD ROCm/HIP
+        Vulkan, ///< Vulkan compute shaders
+        Metal   ///< Apple Metal Performance Shaders
+    };
+
+    /**
      * @brief Abstract base class for device execution contexts
      *
      * Each IDeviceContext represents an execution context on a specific device.
@@ -64,6 +80,16 @@ namespace llaminar2
          * @return Backend type enum
          */
         virtual ComputeBackendType backendType() const = 0;
+
+        /**
+         * @brief Get simplified device type for kernel dispatch
+         *
+         * This maps the detailed ComputeBackendType to the simplified
+         * DeviceType used for kernel creation/caching.
+         *
+         * @return Device type for kernel dispatch
+         */
+        virtual DeviceType deviceType() const = 0;
 
         /**
          * @brief Check if this is a GPU device
@@ -258,7 +284,8 @@ namespace llaminar2
 
         // Device info
         int deviceIndex() const override { return device_idx_; }
-        ComputeBackendType backendType() const override { return ComputeBackendType::CPU_OPENBLAS; }
+        ComputeBackendType backendType() const override { return ComputeBackendType::CPU; }
+        DeviceType deviceType() const override { return DeviceType::CPU; }
         bool isGPU() const override { return false; }
         std::string deviceName() const override;
 
@@ -323,6 +350,7 @@ namespace llaminar2
         // Device info
         int deviceIndex() const override { return device_idx_; }
         ComputeBackendType backendType() const override { return backend_type_; }
+        DeviceType deviceType() const override;
         bool isGPU() const override { return true; }
         int gpuDeviceId() const { return gpu_device_id_; }
 

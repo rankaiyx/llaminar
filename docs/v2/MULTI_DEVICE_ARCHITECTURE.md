@@ -518,13 +518,144 @@ The `WorkDistributor` supports MoE via:
 
 ### Phase 7: Kernel Execution (CPU) - IN PROGRESS
 
-**Problem**: The executor framework infrastructure is complete but compute stages are placeholders:
-- ✅ RMSNormStage, SwiGLUStage, ResidualAddStage, RoPEStage, AttentionStage - **IMPLEMENTED**
-- ❌ GEMMStage - **PLACEHOLDER** (just logs and returns true)
+**Problem**: The executor framework infrastructure is complete but compute stages have critical flaws:
+- ❌ RMSNormStage, SwiGLUStage, RoPEStage - **BROKEN** (scalar reimplementations, no precision support)
+- ✅ ResidualAddStage - **CORRECT** (handles ActivationPrecision properly)
+- ✅ GEMMStage - **CORRECT** (delegates to KernelFactory)
+- ✅ FusedQKVGEMMStage - **CORRECT** (delegates to QuantisedGemmKernel::multiply_fused_multi)
 
-**Goal**: Wire GEMMStage to existing production kernels so the executor path produces correct output.
+**Root Cause**: Stages reimplemented operations as scalar loops instead of using existing typed kernels.
+This violates the architecture and breaks ActivationPrecision support.
 
-#### 7.1 Current Kernel Architecture (Legacy Path)
+**Goal**: Refactor stages to delegate to typed kernels (`CPURMSNormKernelT<P>`, `CPUSwiGLUKernelT<P>`, etc.)
+matching how the legacy Ops work, but without the Op wrapper layer.
+
+#### 7.1 Type-Safe Tensor Design (CRITICAL)
+
+**Problem**: Original ComputeStage design used `void*` pointers with manual precision tracking:
+
+```cpp
+// BROKEN DESIGN - void* loses type safety and device info
+struct Params {
+    const void *input;           // What type? What device?
+    void *output;                // Manual casting everywhere
+    int seq_len, hidden_dim;     // Duplicates tensor metadata
+    ActivationPrecision precision; // Redundant - tensor knows this
+};
+```
+
+**Issues with void***:
+1. **No type safety**: Requires manual casting, easy to mismatch types
+2. **No device info**: Can't dispatch to GPU vs CPU automatically
+3. **Redundant metadata**: `seq_len`, `hidden_dim`, `precision` duplicate tensor info
+4. **Not GPU-ready**: GPU dispatch requires knowing tensor's device placement
+5. **Manual kernel selection**: Must switch on precision instead of using polymorphism
+
+**Correct Design**: Use typed tensor pointers:
+
+```cpp
+// CORRECT DESIGN - TensorBase*/IActivationTensor* are self-describing
+struct Params {
+    TensorBase* input;        // Knows: type, device, rows, cols, precision
+    TensorBase* output;       // Knows: type, device, rows, cols, precision
+    const TensorBase* gamma;  // Weight tensor (immutable)
+    float eps;                // Only operation-specific params remain
+};
+
+bool RMSNormStage::execute(IDeviceContext *ctx) {
+    // Tensor tells us everything we need
+    auto* activation = dynamic_cast<IActivationTensor*>(params_.input);
+    if (!activation) return false;
+    
+    // IActivationTensor::applyRMSNorm dispatches to correct kernel automatically:
+    // - Checks tensor's native_type() for precision (FP32/BF16/FP16/Q8_1)
+    // - Checks tensor's device_idx() for CPU vs GPU
+    // - Creates appropriate kernel via KernelFactory
+    return activation->applyRMSNorm(
+        params_.gamma->data(),
+        params_.input->rows(),
+        params_.input->cols(),
+        params_.eps
+    );
+}
+```
+
+**Benefits**:
+1. **Type-safe**: No void* casting, compiler catches type errors
+2. **Self-describing**: Tensor knows its precision, dimensions, device
+3. **Device-aware**: `IActivationTensor::applyRMSNorm()` dispatches to GPU if tensor is on GPU
+4. **DRY**: No duplicate `seq_len`/`hidden_dim`/`precision` fields
+5. **Polymorphic dispatch**: Uses existing kernel factory infrastructure
+
+#### 7.2 Tensor Type Hierarchy
+
+```
+TensorBase (base class)
+├─ data(), mutable_data()     - Raw pointer access
+├─ rows(), cols(), numel()    - Dimensions
+├─ native_type()              - TensorType enum (FP32, BF16, Q8_1, etc.)
+├─ device_idx()               - Device placement (-1=CPU, 0+=GPU)
+└─ dtype_name()               - Human-readable type string
+
+IActivationTensor (interface for activation buffers)
+├─ createRoPE(), createSwiGLU(), createRMSNorm(), createAttention()
+├─ applyRoPE(), applyRMSNorm()  - In-place operations
+└─ to_int8_activation_pack()    - Quantization for INT8 GEMM
+
+Concrete Types:
+├─ FP32Tensor    : TensorBase, IActivationTensor
+├─ BF16Tensor    : TensorBase, IActivationTensor
+├─ FP16Tensor    : TensorBase, IActivationTensor
+├─ Q8_1Tensor    : TensorBase, IActivationTensor
+└─ IQ4_NLTensor  : TensorBase (weight only, not IActivationTensor)
+```
+
+#### 7.3 Stage Parameter Patterns
+
+**Activation-only stages** (RMSNorm, RoPE, SwiGLU, ResidualAdd):
+```cpp
+struct Params {
+    TensorBase* input;         // IActivationTensor* at runtime
+    TensorBase* output;        // May be same as input (in-place)
+    const TensorBase* weights; // If needed (gamma for RMSNorm)
+    // Operation-specific scalars only
+};
+```
+
+**GEMM stages** (weights × activations):
+```cpp
+struct Params {
+    TensorBase* A;             // Activation (IActivationTensor*)
+    const TensorBase* B;       // Weight tensor (quantized)
+    TensorBase* C;             // Output (IActivationTensor*)
+    // Optional: bias, fusion flags
+};
+```
+
+**Attention stages**:
+```cpp
+struct Params {
+    TensorBase* Q;             // Query activations
+    TensorBase* K;             // Key activations  
+    TensorBase* V;             // Value activations
+    TensorBase* output;        // Attention output
+    IUnifiedKVCache* kv_cache; // Cache (already typed)
+    // Attention config (n_heads, etc.)
+};
+```
+
+#### 7.4 Migration Plan
+
+| Stage | Current | Target |
+|-------|---------|--------|
+| `RMSNormStage` | `void* input, void* output, ActivationPrecision` | `TensorBase* input, TensorBase* output` |
+| `RoPEStage` | `void* tensor, int seq_len, n_heads, head_dim` | `TensorBase* Q, TensorBase* K` |
+| `SwiGLUStage` | `void* gate, void* up, void* output` | `TensorBase* gate, TensorBase* up, TensorBase* output` |
+| `ResidualAddStage` | Already uses `ActivationPrecision` | Convert to `TensorBase*` |
+| `GEMMStage` | `void* A, TensorBase* B` | `TensorBase* A, TensorBase* B` |
+| `AttentionStage` | `void* Q/K/V` | `TensorBase* Q/K/V` |
+
+#### 7.5 Kernel Dispatch via IActivationTensor
 
 The legacy pipeline uses these kernel patterns:
 
@@ -1018,3 +1149,259 @@ ResidualAddStage::Params attn_residual_params{
 - `.github/instructions/llaminar-v2-architecture.instructions.md` - V2 architecture overview
 - `docs/v2/LAYER_FUSION_PLAN.md` - OpenMP optimization plan
 - `src/v2/pipelines/ops/ResidualOp.h` - Reference implementation for typed residuals
+### Phase 9: Attention Architecture Refactoring - PLANNED
+
+**Problem Statement:**
+
+The current attention path has **5 abstraction layers** with redundant code:
+
+```
+AttentionWithKVCacheStage
+    └── MpiAttentionOrchestrator::compute_mpi()
+            ├── to_gqa_config() // Converts MpiAttentionConfig → GQAAttentionConfig
+            └── GQAAttention::compute()
+                    └── createAttentionKernelForPrecision() // Local anonymous factory
+                            └── CPUAttentionKernelTyped<P>
+```
+
+**Issues:**
+1. **Redundant config objects**: `MpiAttentionConfig` and `GQAAttentionConfig` are nearly identical
+2. **MPI strategy belongs in WorkDistributor**: Not in attention-specific orchestrator
+3. **KV cache mixed with compute**: `AttentionWithKVCacheStage` does two things
+4. **Local factory bypassed KernelFactory**: GQAAttention had its own kernel creation (fixed!)
+5. **5 layers vs 3**: Compare to RMSNorm: `RMSNormStage` → `KernelFactory` → `CPURMSNormKernelTyped`
+
+**Target Architecture:**
+
+```
+LayerExecutor (orchestrates DAG of ComputeStages)
+    │
+    ├── KVCacheAppendStage (NEW - dedicated cache update)
+    │       └── IUnifiedKVCache::append_kv()
+    │
+    ├── AttentionComputeStage (REFACTORED - pure attention compute)
+    │       └── KernelFactory::createAttention(tensor, device_type)
+    │               ├── CPUAttentionKernelTyped<P>  (ITensorAttention)
+    │               └── GPUAttentionKernelTyped<T>  (ITensorAttention, future CUDA/ROCm)
+    │
+    └── AllreduceStage (if tensor parallel)
+            └── MPI_Allreduce()
+
+WorkDistributor: Handles MPI head distribution (n_heads / world_size)
+DeviceContext: Handles execution device (CPU threads / GPU streams)
+```
+
+**Key Changes:**
+1. **Split KV Cache Management**: `KVCacheAppendStage` separate from attention
+2. **Remove MpiAttentionOrchestrator**: Responsibilities split:
+   - MPI strategy → `WorkDistributor` + `AllreduceStage`
+   - Compute dispatch → `KernelFactory::createAttention()`
+   - Config → Simplified `AttentionComputeStage::Params`
+3. **Remove GQAAttention**: Logic absorbed by `CPUAttentionKernelTyped`
+4. **Unified Config**: One config struct flows through
+
+#### 9.1 Current Responsibilities Analysis
+
+| Current Location | Target Location |
+|-----------------|-----------------|
+| MpiAttentionOrchestrator: MPI strategy selection | `WorkDistributor` + `AllreduceStage` |
+| MpiAttentionOrchestrator: Config conversion | Single unified params in `AttentionComputeStage` |
+| MpiAttentionOrchestrator: Input validation | `AttentionComputeStage` or kernel |
+| GQAAttention: GQA head broadcasting | Inside `CPUAttentionKernelTyped` (already handles GQA) |
+| GQAAttention: Kernel creation | `KernelFactory::createAttention()` ✅ (done!) |
+| AttentionWithKVCacheStage: KV cache append | `KVCacheAppendStage` (new) |
+| AttentionWithKVCacheStage: Attention compute | `AttentionComputeStage` (refactored) |
+
+#### 9.2 Implementation Plan
+
+**Phase 9.1: Create KVCacheAppendStage** (NEW)
+
+Dedicated stage for KV cache updates:
+
+```cpp
+class KVCacheAppendStage : public IComputeStage
+{
+public:
+    struct Params {
+        TensorBase* K;              ///< Key tensor to append [seq_len, n_kv_heads * head_dim]
+        TensorBase* V;              ///< Value tensor to append
+        IUnifiedKVCache* kv_cache;  ///< Target cache
+        int layer_idx;              ///< Layer index in cache
+        int seq_len;                ///< Number of tokens to append (1 for decode)
+    };
+
+    bool execute(IDeviceContext *ctx) override {
+        if (!params_.kv_cache) return true; // No cache = no-op
+        return params_.kv_cache->append_kv(
+            params_.layer_idx, 0, params_.K, params_.V, params_.seq_len
+        );
+    }
+};
+```
+
+**Phase 9.2: Create AttentionComputeStage** (Refactored)
+
+Pure attention compute, no KV cache management:
+
+```cpp
+class AttentionComputeStage : public IComputeStage
+{
+public:
+    struct Params {
+        TensorBase* Q;              ///< Query [seq_len, n_heads * head_dim]
+        TensorBase* K;              ///< Key [kv_len, n_kv_heads * head_dim]
+        TensorBase* V;              ///< Value [kv_len, n_kv_heads * head_dim]
+        TensorBase* output;         ///< Output [seq_len, n_heads * head_dim]
+        int batch_size;             ///< Batch size (1 for single sequence)
+        int seq_len;                ///< Query sequence length
+        int kv_len;                 ///< Key/Value length (may differ in decode)
+        int n_heads;                ///< Query heads
+        int n_kv_heads;             ///< KV heads (GQA: n_heads % n_kv_heads == 0)
+        int head_dim;               ///< Dimension per head
+        bool causal;                ///< Apply causal mask
+        int window_size;            ///< Sliding window (-1 = disabled)
+        // Workspaces (pre-allocated)
+        TensorBase* workspace_scores;
+        TensorBase* workspace_context;
+        TensorBase* workspace_mask;
+    };
+
+    bool execute(IDeviceContext *ctx) override {
+        // Get device type from context
+        auto dev_type = ctx->isGPU() 
+            ? DeviceType::CUDA  // or ROCm based on context
+            : DeviceType::CPU;
+        
+        // Create kernel via KernelFactory
+        auto kernel = KernelFactory::createAttention(params_.Q, dev_type);
+        if (!kernel) {
+            LOG_ERROR("[AttentionComputeStage] Failed to create attention kernel");
+            return false;
+        }
+        
+        // Dispatch to kernel's compute_tensor() method
+        return kernel->compute_tensor(
+            params_.Q, params_.K, params_.V, params_.output,
+            params_.batch_size, params_.seq_len, params_.kv_len,
+            params_.n_heads, params_.n_kv_heads, params_.head_dim,
+            params_.causal, params_.window_size,
+            params_.workspace_scores, params_.workspace_context, params_.workspace_mask,
+            nullptr, // mpi_ctx - handled at higher level
+            ctx->deviceIdx()
+        );
+    }
+};
+```
+
+**Phase 9.3: Update LayerExecutor DAG Building**
+
+Replace monolithic `AttentionWithKVCacheStage` with composable stages:
+
+```cpp
+// In Qwen2LayerExecutor::buildAttentionGraph()
+
+// Stage 1: Append K/V to cache (if caching enabled)
+if (params_.kv_cache) {
+    KVCacheAppendStage::Params cache_params{
+        buffers.K.get(), buffers.V.get(),
+        params_.kv_cache, layer_idx, seq_len
+    };
+    graph.addNode("kv_cache_append", 
+        ComputeStageFactory::createKVCacheAppend(cache_params), device);
+}
+
+// Stage 2: Get cached K/V for attention (or use direct K/V if no cache)
+TensorBase* K_attn = params_.kv_cache 
+    ? params_.kv_cache->get_k_base(layer_idx, 0)
+    : buffers.K.get();
+TensorBase* V_attn = params_.kv_cache
+    ? params_.kv_cache->get_v_base(layer_idx, 0) 
+    : buffers.V.get();
+int kv_len = params_.kv_cache
+    ? params_.kv_cache->get_cached_tokens(layer_idx, 0)
+    : seq_len;
+
+// Stage 3: Pure attention compute
+AttentionComputeStage::Params attn_params{
+    buffers.Q.get(), K_attn, V_attn, buffers.attn_output.get(),
+    1, seq_len, kv_len,
+    n_heads, n_kv_heads, head_dim,
+    true, -1,  // causal, no sliding window
+    workspaces.scores.get(), workspaces.context.get(), nullptr
+};
+graph.addNode("attention_compute",
+    ComputeStageFactory::createAttentionCompute(attn_params), device);
+
+// Dependencies
+if (params_.kv_cache) {
+    graph.addDependency("kv_cache_append", "attention_compute");
+}
+```
+
+**Phase 9.4: MPI Tensor Parallelism via WorkDistributor**
+
+Instead of `MpiAttentionOrchestrator::compute_tensor_parallel()`, use:
+
+```cpp
+// In LayerExecutor for tensor-parallel attention
+if (mpi_ctx && mpi_ctx->world_size() > 1) {
+    // WorkDistributor determines head distribution
+    WorkDistributor dist(mpi_config);
+    auto slice = dist.getRankSlice(n_heads);
+    
+    // Each rank computes its head slice
+    AttentionComputeStage::Params local_params = attn_params;
+    local_params.n_heads = slice.count;
+    // ... adjust Q/output pointers for local heads
+    
+    graph.addNode("attention_local", createAttentionCompute(local_params), device);
+    
+    // Allreduce to combine outputs
+    AllreduceStage::Params allreduce_params{
+        buffers.attn_output.get(),
+        seq_len * n_heads * head_dim,
+        MPI_SUM
+    };
+    graph.addNode("attention_allreduce", createAllreduce(allreduce_params), device);
+    graph.addDependency("attention_local", "attention_allreduce");
+}
+```
+
+#### 9.3 Deprecation Timeline
+
+| Component | Status | Target |
+|-----------|--------|--------|
+| `MpiAttentionOrchestrator` | Active | Deprecated in Phase 9.4 |
+| `GQAAttention` | Now uses KernelFactory | Deprecated in Phase 9.3 |
+| `AttentionWithKVCacheStage` | Active | Replaced by KVCacheAppendStage + AttentionComputeStage |
+| `AttentionStage` | [[deprecated]] | Remove after Phase 9.2 |
+| `MpiAttentionConfig` | Active | Replaced by AttentionComputeStage::Params |
+| `GQAAttentionConfig` | Active | Replaced by AttentionComputeStage::Params |
+
+#### 9.4 File Changes Required
+
+| File | Change |
+|------|--------|
+| `execution/ComputeStage.h` | Add `KVCacheAppendStage`, `AttentionComputeStage` |
+| `execution/ComputeStage.cpp` | Implement new stages |
+| `execution/ComputeStageFactory` | Add `createKVCacheAppend()`, `createAttentionCompute()` |
+| `pipelines/qwen/Qwen2LayerExecutor.cpp` | Use new composable stages |
+| `pipelines/attention/MpiAttentionOrchestrator.h` | Mark deprecated |
+| `pipelines/attention/GQAAttention.h` | Mark deprecated |
+
+#### 9.5 Testing Strategy
+
+1. **Unit tests**: `KVCacheAppendStage` append/get round-trip
+2. **Unit tests**: `AttentionComputeStage` with mock DeviceContext
+3. **Integration tests**: Full attention DAG vs legacy `AttentionWithKVCacheStage`
+4. **Parity tests**: Ensure output matches for all precisions (FP32, BF16, Q8_1)
+5. **MPI tests**: Tensor-parallel attention via WorkDistributor
+
+#### 9.6 Success Criteria
+
+- [ ] `KVCacheAppendStage` correctly manages cache state
+- [ ] `AttentionComputeStage` produces correct output for all precisions
+- [ ] DAG composition (append → compute) works correctly
+- [ ] Tensor-parallel attention works via `WorkDistributor` + `AllreduceStage`
+- [ ] No regression in attention correctness (E2E parity tests pass)
+- [ ] `MpiAttentionOrchestrator` and `GQAAttention` deprecated with clear migration path

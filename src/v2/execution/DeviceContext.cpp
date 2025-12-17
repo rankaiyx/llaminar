@@ -38,8 +38,7 @@ namespace llaminar2
 
         switch (device.type)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
             return std::make_unique<CPUDeviceContext>(device_idx, num_threads);
 
         case ComputeBackendType::GPU_CUDA:
@@ -271,6 +270,25 @@ namespace llaminar2
     IGPUDeviceContext::~IGPUDeviceContext()
     {
         // Workspace cleanup is handled by derived class destructors
+    }
+
+    DeviceType IGPUDeviceContext::deviceType() const
+    {
+        switch (backend_type_)
+        {
+        case ComputeBackendType::GPU_CUDA:
+            return DeviceType::CUDA;
+        case ComputeBackendType::GPU_ROCM:
+            return DeviceType::ROCm;
+        case ComputeBackendType::GPU_VULKAN:
+            return DeviceType::Vulkan;
+        case ComputeBackendType::GPU_METAL:
+            return DeviceType::Metal;
+        default:
+            LOG_ERROR("IGPUDeviceContext::deviceType() called with non-GPU backend: "
+                      << static_cast<int>(backend_type_));
+            return DeviceType::CPU;
+        }
     }
 
     void *IGPUDeviceContext::getWorkspace(size_t bytes)

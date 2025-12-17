@@ -11,6 +11,7 @@
 #include "../utils/OpenMPUtils.h"
 #include "../kernels/KernelFactory.h"
 #include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../kernels/cpu/gemm_v4/FusedGEMM.h"
 #include "../tensors/UnifiedKVCache.h"
 #include "../tensors/SIMDHelpers.h"
 #include "../tensors/Tensors.h" // For TensorBase::rows(), cols(), dtype_name()
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <cmath>
 #include <sstream>
+#include <limits>
 #include <omp.h>
 
 // Note: In production, GEMM would delegate to KernelFactory
@@ -45,6 +47,8 @@ namespace llaminar2
             return "GEMM_BIAS";
         case ComputeStageType::GEMM_FUSED_QKV:
             return "GEMM_FUSED_QKV";
+        case ComputeStageType::GEMM_FUSED_GATE_UP:
+            return "GEMM_FUSED_GATE_UP";
         case ComputeStageType::RMS_NORM:
             return "RMS_NORM";
         case ComputeStageType::LAYER_NORM:
@@ -81,13 +85,32 @@ namespace llaminar2
             return "ALLGATHER";
         case ComputeStageType::COPY:
             return "COPY";
-        case ComputeStageType::QUANTIZE:
-            return "QUANTIZE";
         case ComputeStageType::DEQUANTIZE:
             return "DEQUANTIZE";
         default:
             return "UNKNOWN";
         }
+    }
+
+    // =============================================================================
+    // Helper: Safe FP32 data access for getDumpInfo()
+    // For Q8_1 tensors, uses fp32_data() (explicit dequant for debugging only)
+    // For other tensors, uses data()
+    // =============================================================================
+
+    static const float *getSafeFp32Data(const TensorBase *tensor)
+    {
+        if (!tensor)
+            return nullptr;
+
+        if (tensor->native_type() == TensorType::Q8_1)
+        {
+            // Q8_1 tensors throw on data() - use explicit fp32_data() for debugging
+            auto *q8_1 = dynamic_cast<const Q8_1Tensor *>(tensor);
+            return q8_1 ? q8_1->fp32_data() : nullptr;
+        }
+
+        return tensor->data();
     }
 
     // =============================================================================
@@ -105,141 +128,22 @@ namespace llaminar2
         return *this;
     }
 
-    // =============================================================================
-    // QuantizeStage Implementation
-    // =============================================================================
-
-    QuantizeStage::QuantizeStage(Params params) : params_(std::move(params)) {}
-
-    bool QuantizeStage::execute(IDeviceContext *ctx)
+    StageDumpInfo &StageDumpInfo::addInput(const char *name, const TensorBase *tensor, size_t rows, size_t cols)
     {
-        (void)ctx; // CPU quantization doesn't need device context
-
-        if (!params_.input || !params_.output)
-        {
-            LOG_ERROR("[QuantizeStage] Null input or output buffer");
-            return false;
-        }
-
-        if (params_.m <= 0 || params_.k <= 0)
-        {
-            LOG_ERROR("[QuantizeStage] Invalid dimensions: m=" << params_.m << " k=" << params_.k);
-            return false;
-        }
-
-        LOG_DEBUG("[QuantizeStage] Quantizing FP32->Q8_1: " << params_.m << "x" << params_.k);
-
-        // Use the same quantization as FusedGEMM/QuantisedGemmKernel
-        int k_blocks = (params_.k + 31) / 32;
-        Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(params_.output);
-        const bool k_aligned = (params_.k % 32 == 0);
-
-        auto do_quantize = [&]()
-        {
-            int quant_thresh = debugEnv().gemm.gemm_quant_parallel_threshold;
-            if (quant_thresh == 0)
-                quant_thresh = omp_get_max_threads();
-
-            if (params_.m < quant_thresh)
-            {
-#pragma omp for collapse(2) schedule(static)
-                for (int i = 0; i < params_.m; ++i)
-                {
-                    for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
-                    {
-                        const float *a_row = params_.input + i * params_.k + k_blk * 32;
-                        Q8_1Block *row_blocks = all_blocks + i * k_blocks;
-                        int valid_elements = std::min(32, params_.k - k_blk * 32);
-                        simd::quantize_single_block(a_row, row_blocks[k_blk], valid_elements);
-                    }
-                }
-            }
-            else
-            {
-#pragma omp for schedule(static)
-                for (int i = 0; i < params_.m; ++i)
-                {
-                    const float *a_row = params_.input + i * params_.k;
-                    Q8_1Block *row_blocks = all_blocks + i * k_blocks;
-
-                    if (k_aligned)
-                    {
-                        for (int k_blk = 0; k_blk < k_blocks; ++k_blk)
-                        {
-                            simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
-                        }
-                    }
-                    else
-                    {
-                        for (int k_blk = 0; k_blk < k_blocks - 1; ++k_blk)
-                        {
-                            simd::quantize_single_block(a_row + k_blk * 32, row_blocks[k_blk], 32);
-                        }
-                        if (k_blocks > 0)
-                        {
-                            int last_k_blk = k_blocks - 1;
-                            int valid_elements = params_.k - last_k_blk * 32;
-                            simd::quantize_single_block(a_row + last_k_blk * 32, row_blocks[last_k_blk], valid_elements);
-                        }
-                    }
-                }
-            }
-        };
-
-        OMP_WORKSHARE_REGION(do_quantize);
-
-        return true;
+        // Extract FP32 data from tensor for dumping - works for all tensor types
+        const float *data = tensor ? tensor->fp32_data() : nullptr;
+        const char *dtype = tensor ? tensor->dtype_name() : "FP32";
+        inputs.push_back({name, data, rows, cols, dtype, sizeof(float)});
+        return *this;
     }
 
-    size_t QuantizeStage::estimatedFlops() const
+    StageDumpInfo &StageDumpInfo::addOutput(const char *name, const TensorBase *tensor, size_t rows, size_t cols)
     {
-        // Quantization: ~3 ops per element (find max, scale, round)
-        return static_cast<size_t>(3) * params_.m * params_.k;
-    }
-
-    size_t QuantizeStage::estimatedMemoryBytes() const
-    {
-        // Read: m * k floats, Write: m * ceil(k/32) Q8_1Blocks
-        size_t read_bytes = static_cast<size_t>(params_.m) * params_.k * sizeof(float);
-        size_t write_bytes = get_quantized_buffer_size(params_.m, params_.k);
-        return read_bytes + write_bytes;
-    }
-
-    bool QuantizeStage::supportsBackend(ComputeBackendType backend) const
-    {
-        // CPU only for now
-        return backend == ComputeBackendType::CPU_OPENBLAS ||
-               backend == ComputeBackendType::CPU_MKL;
-    }
-
-    size_t QuantizeStage::get_quantized_buffer_size(int m, int k)
-    {
-        int k_blocks = (k + 31) / 32;
-        return static_cast<size_t>(m) * k_blocks * sizeof(Q8_1Block);
-    }
-
-    StageDumpInfo QuantizeStage::getDumpInfo() const
-    {
-        StageDumpInfo info;
-        int k_blocks = (params_.k + 31) / 32;
-
-        // Input: FP32 activations
-        info.addInput("input", params_.input, params_.m, params_.k);
-
-        // Output: Q8_1 blocks (rows × blocks_per_row blocks)
-        info.outputs.push_back({"output_q8_1",
-                                params_.output,
-                                static_cast<size_t>(params_.m),
-                                static_cast<size_t>(k_blocks),
-                                "Q8_1",
-                                sizeof(Q8_1Block)});
-
-        // Scalar params
-        info.addScalarInt("m", params_.m);
-        info.addScalarInt("k", params_.k);
-        info.addScalarInt("k_blocks", k_blocks);
-
-        return info;
+        // Extract FP32 data from tensor for dumping - works for all tensor types
+        const float *data = tensor ? tensor->fp32_data() : nullptr;
+        const char *dtype = tensor ? tensor->dtype_name() : "FP32";
+        outputs.push_back({name, data, rows, cols, dtype, sizeof(float)});
+        return *this;
     }
 
     // =============================================================================
@@ -256,16 +160,11 @@ namespace llaminar2
             return false;
         }
 
-        // Validate: need either FP32 input (A) or pre-quantized input (A_q8_1)
-        if (!params_.A && !params_.A_q8_1)
+        // Validate inputs
+        if (!params_.A)
         {
-            LOG_ERROR("[GEMMStage] No input provided: both A and A_q8_1 are null");
+            LOG_ERROR("[GEMMStage] Null input A");
             return false;
-        }
-
-        if (params_.A && params_.A_q8_1)
-        {
-            LOG_WARN("[GEMMStage] Both A and A_q8_1 provided, using A_q8_1 (pre-quantized)");
         }
 
         if (!params_.B || !params_.C)
@@ -282,10 +181,11 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[GEMMStage] Execute GEMM: " << params_.m << "x" << params_.n << "x" << params_.k
-                                               << " mode=" << (params_.A_q8_1 ? "Q8_1" : "FP32")
                                                << " weight ptr=" << static_cast<const void *>(params_.B)
                                                << " weight shape=[" << (params_.B ? params_.B->shape()[0] : 0) << ","
-                                               << (params_.B ? params_.B->shape()[1] : 0) << "]");
+                                               << (params_.B ? params_.B->shape()[1] : 0) << "]"
+                                               << " input_type=" << params_.A->dtype_name()
+                                               << " output_type=" << params_.C->dtype_name());
 
         // Get cached kernel from KernelFactory (handles weight packing once)
         auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.B);
@@ -294,6 +194,9 @@ namespace llaminar2
             LOG_ERROR("[GEMMStage] Failed to get GEMM kernel for weight tensor");
             return false;
         }
+
+        LOG_DEBUG("[GEMMStage] Got kernel ptr=" << static_cast<const void *>(gemm)
+                                                << " for weight ptr=" << static_cast<const void *>(params_.B));
 
         // Cast to QuantisedGemmKernel for full API access
         auto *qgemm = dynamic_cast<gemm_v4::QuantisedGemmKernel *>(gemm);
@@ -311,70 +214,71 @@ namespace llaminar2
                                                                       << ", kernel K=" << kernel_k << " vs params k=" << params_.k);
                 return false;
             }
-        }
 
-        if (qgemm)
-        {
-            bool success;
+            // Check if we have a gate input for SwiGLU fusion
+            const float *gate_fp32 = params_.gate_input ? params_.gate_input->fp32_data() : nullptr;
 
-            if (params_.A_q8_1)
+            // If output is Q8_1 and no fusion needed, use multiply_tensor for type-aware dispatch
+            // This handles: FP32→Q8_1, Q8_1→Q8_1, Q8_1→FP32, FP32→FP32 internally
+            if (!gate_fp32 && params_.C->native_type() == TensorType::Q8_1)
             {
-                // =========================================================
-                // Q8_1 MODE: Use pre-quantized activations (like FusedGEMM)
-                // =========================================================
-                LOG_DEBUG("[GEMMStage] Using pre-quantized Q8_1 path");
-
-                // Build fused ops configuration
-                GemmFusedOps fused_ops = params_.do_swiglu
-                                             ? GemmFusedOps::swiglu(params_.gate_input)
-                                             : GemmFusedOps::none();
-
-                success = qgemm->multiply_with_precomputed_q8_1(
-                    params_.A_q8_1,
-                    static_cast<float *>(params_.C),
+                LOG_DEBUG("[GEMMStage] Using multiply_tensor for Q8_1 output type dispatch");
+                return qgemm->multiply_tensor(
+                    params_.A, params_.C,
                     params_.m, params_.n, params_.k,
-                    params_.bias, // Fused bias
-                    false,        // No accumulation
+                    params_.transpose_B,
                     params_.alpha, params_.beta,
-                    params_.mpi_ctx, params_.device_idx,
-                    fused_ops);
-            }
-            else
-            {
-                // =========================================================
-                // FP32 MODE: Quantize internally then GEMM
-                // =========================================================
-                LOG_DEBUG("[GEMMStage] Using FP32 path with internal quantization");
-
-                // Use multiply_fused to support bias and swiglu
-                success = qgemm->multiply_fused(
-                    static_cast<const float *>(params_.A),
-                    static_cast<float *>(params_.C),
-                    params_.m, params_.n, params_.k,
-                    params_.bias,           // Fused bias
-                    nullptr,                // No attention mask
-                    false,                  // No softmax
-                    nullptr, nullptr,       // No softmax buffers
-                    (params_.beta != 0.0f), // Accumulate if beta != 0
-                    params_.alpha, params_.beta,
-                    params_.mpi_ctx, params_.device_idx,
-                    params_.gate_input,
-                    params_.do_swiglu);
+                    params_.mpi_ctx, params_.device_idx);
             }
 
-            return success;
+            // For SwiGLU fusion or FP32 output, use multiply_fused
+            // (multiply_fused requires FP32 output for gate fusion)
+            float *output_fp32 = params_.C->mutable_data();
+            const float *input_fp32 = params_.A->fp32_data();
+
+            if (!input_fp32 || !output_fp32)
+            {
+                LOG_ERROR("[GEMMStage] Failed to get FP32 data from tensors");
+                return false;
+            }
+
+            return qgemm->multiply_fused(
+                input_fp32,
+                output_fp32,
+                params_.m, params_.n, params_.k,
+                params_.bias,           // Fused bias
+                nullptr,                // No attention mask
+                false,                  // No softmax
+                nullptr, nullptr,       // No softmax buffers
+                (params_.beta != 0.0f), // Accumulate if beta != 0
+                params_.alpha, params_.beta,
+                params_.mpi_ctx, params_.device_idx,
+                gate_fp32,
+                params_.do_swiglu);
         }
 
         // FP32 GEMM fallback (for non-quantized weights)
-        if (params_.A_q8_1)
+        // Use multiply_tensor if available for type-aware dispatch
+        if (gemm->multiply_tensor(params_.A, params_.C, params_.m, params_.n, params_.k,
+                                  params_.transpose_B, params_.alpha, params_.beta,
+                                  params_.mpi_ctx, params_.device_idx))
         {
-            LOG_ERROR("[GEMMStage] Q8_1 input requires QuantisedGemmKernel, but got non-quantized kernel");
+            return true;
+        }
+
+        // Final fallback: extract FP32 data manually
+        const float *input_fp32 = params_.A->fp32_data();
+        float *output_fp32 = params_.C->mutable_data();
+
+        if (!input_fp32 || !output_fp32)
+        {
+            LOG_ERROR("[GEMMStage] Failed to get FP32 data from tensors");
             return false;
         }
 
         return gemm->multiply(
-            static_cast<const float *>(params_.A),
-            static_cast<float *>(params_.C),
+            input_fp32,
+            output_fp32,
             params_.m, params_.n, params_.k,
             params_.alpha, params_.beta);
     }
@@ -400,17 +304,27 @@ namespace llaminar2
 
     bool GEMMStage::supportsBackend(ComputeBackendType backend) const
     {
-        // CPU always supported
-        // GPU support depends on whether we have CUDA/ROCm kernels
+        // Unified GEMMStage supports all backends via KernelFactory dispatch
+        // KernelFactory will select the appropriate kernel based on tensor device affinity
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
             return true;
         case ComputeBackendType::GPU_CUDA:
-        case ComputeBackendType::GPU_ROCM:
-            // TODO: Enable when GPU GEMM kernels are implemented
+#ifdef HAVE_CUDA
+            return true; // KernelFactory can create CUDA kernels
+#else
             return false;
+#endif
+        case ComputeBackendType::GPU_ROCM:
+#ifdef HAVE_ROCM
+            return true; // KernelFactory can create ROCm kernels
+#else
+            return false;
+#endif
+        case ComputeBackendType::GPU_VULKAN:
+        case ComputeBackendType::GPU_METAL:
+            return false; // Not yet implemented
         default:
             return false;
         }
@@ -420,22 +334,20 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
-        // Input A: either FP32 or Q8_1
-        if (params_.A_q8_1)
+        // Input A: activation tensor
+        if (params_.A)
         {
-            int k_blocks = (params_.k + 31) / 32;
-            info.addInputQ8_1("A_q8_1", params_.A_q8_1, params_.m, k_blocks);
-        }
-        else if (params_.A)
-        {
-            info.addInput("A", static_cast<const float *>(params_.A), params_.m, params_.k);
+            info.addInput("A", params_.A, params_.m, params_.k);
         }
 
         // Weight tensor B
         info.addWeight("B", params_.B);
 
         // Output C
-        info.addOutput("C", static_cast<const float *>(params_.C), params_.m, params_.n);
+        if (params_.C)
+        {
+            info.addOutput("C", params_.C, params_.m, params_.n);
+        }
 
         // Optional inputs
         if (params_.bias)
@@ -461,73 +373,517 @@ namespace llaminar2
     }
 
     // =============================================================================
-    // RMSNormStage Implementation
+    // FusedQKVGEMMStage Implementation
+    // =============================================================================
+
+    FusedQKVGEMMStage::FusedQKVGEMMStage(Params params) : params_(std::move(params)) {}
+
+    bool FusedQKVGEMMStage::execute(IDeviceContext *ctx)
+    {
+        LOG_DEBUG("[FusedQKVGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
+                                                    << " n_q=" << params_.n_q << " n_k=" << params_.n_k << " n_v=" << params_.n_v);
+
+        if (!ctx)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Null device context");
+            return false;
+        }
+
+        // Validate inputs
+        if (!params_.input)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Null input");
+            return false;
+        }
+        if (!params_.wq || !params_.wk || !params_.wv)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Null weight tensor(s)");
+            return false;
+        }
+        if (!params_.output_q || !params_.output_k || !params_.output_v)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Null output buffer(s)");
+            return false;
+        }
+        if (params_.m <= 0 || params_.k <= 0)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Invalid dimensions: m=" << params_.m << " k=" << params_.k);
+            return false;
+        }
+
+        // Check if outputs are Q8_1 tensors - if so, use Q8_1 execution path
+        auto *output_q_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_q);
+        auto *output_k_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_k);
+        auto *output_v_q8_1 = dynamic_cast<Q8_1Tensor *>(params_.output_v);
+
+        const bool q8_1_output = (output_q_q8_1 && output_k_q8_1 && output_v_q8_1);
+
+        if (q8_1_output)
+        {
+            LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 output detected, using Q8_1 execution path");
+
+            // Create FusedGEMM kernel for Q8_1 output support
+            FusedGEMM fused_gemm(params_.wq, params_.wk, params_.wv);
+
+            // Check if input is also Q8_1 - use Q8_1→Q8_1 path to avoid double quantization
+            auto *input_q8_1 = dynamic_cast<const Q8_1Tensor *>(params_.input);
+
+            if (input_q8_1)
+            {
+                LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 input detected, using Q8_1→Q8_1 path");
+
+                // Pure Q8_1 path: Q8_1 input → Q8_1 output
+                bool success = fused_gemm.execute_q8_1_to_q8_1(
+                    input_q8_1->q8_1_blocks(),
+                    output_q_q8_1->mutable_q8_1_blocks(),
+                    output_k_q8_1->mutable_q8_1_blocks(),
+                    output_v_q8_1->mutable_q8_1_blocks(),
+                    params_.bias_q, params_.bias_k, params_.bias_v,
+                    params_.m, params_.n_q, params_.n_k,
+                    params_.k,
+                    nullptr, -1); // ctx, device_idx
+
+                if (!success)
+                {
+                    LOG_ERROR("[FusedQKVGEMMStage] execute_q8_1_to_q8_1 failed");
+                    return false;
+                }
+            }
+            else
+            {
+                LOG_DEBUG("[FusedQKVGEMMStage] FP32 input detected, using FP32→Q8_1 path");
+
+                // FP32 input → Q8_1 output path
+                const float *input_fp32 = params_.input->fp32_data();
+                if (!input_fp32)
+                {
+                    LOG_ERROR("[FusedQKVGEMMStage] Failed to get FP32 data from input tensor");
+                    return false;
+                }
+
+                bool success = fused_gemm.execute_to_q8_1(
+                    input_fp32,
+                    output_q_q8_1->mutable_q8_1_blocks(),
+                    output_k_q8_1->mutable_q8_1_blocks(),
+                    output_v_q8_1->mutable_q8_1_blocks(),
+                    params_.bias_q, params_.bias_k, params_.bias_v,
+                    params_.m, params_.n_q, params_.n_k,
+                    params_.k,
+                    nullptr, -1); // ctx, device_idx
+
+                if (!success)
+                {
+                    LOG_ERROR("[FusedQKVGEMMStage] execute_to_q8_1 failed");
+                    return false;
+                }
+            }
+
+            LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 path complete");
+            return true;
+        }
+
+        // FP32 output path (original implementation)
+        // Extract FP32 data from tensors - works for all tensor types via fp32_data()
+        const float *input_fp32 = params_.input->fp32_data();
+        float *output_q_fp32 = params_.output_q->mutable_data();
+        float *output_k_fp32 = params_.output_k->mutable_data();
+        float *output_v_fp32 = params_.output_v->mutable_data();
+
+        if (!input_fp32 || !output_q_fp32 || !output_k_fp32 || !output_v_fp32)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Failed to get FP32 data from tensors");
+            return false;
+        }
+
+        // DEBUG: Log input pointer and first values for parity testing
+        LOG_INFO("[FusedQKVGEMMStage] input_fp32 ptr=" << static_cast<const void *>(input_fp32)
+                                                       << " input[0:4]=" << std::setprecision(10)
+                                                       << input_fp32[0] << "," << input_fp32[1] << ","
+                                                       << input_fp32[2] << "," << input_fp32[3]);
+
+        LOG_DEBUG("[FusedQKVGEMMStage] input_type=" << params_.input->dtype_name()
+                                                    << " output_type=" << params_.output_q->dtype_name());
+
+        // Get cached kernels from KernelFactory (handles weight packing once)
+        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.wq);
+        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.wk);
+        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.wv);
+
+        if (!gemm_q || !gemm_k || !gemm_v)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Failed to get GEMM kernel(s)");
+            return false;
+        }
+
+        // Build projection descriptors using device-agnostic interface
+        // Pass through bias pointers from params_
+        std::vector<ITensorGemm::FusedProjectionDesc> projections = {
+            {gemm_q, output_q_fp32, params_.n_q, params_.bias_q, nullptr, false, "Q"},
+            {gemm_k, output_k_fp32, params_.n_k, params_.bias_k, nullptr, false, "K"},
+            {gemm_v, output_v_fp32, params_.n_v, params_.bias_v, nullptr, false, "V"}};
+
+        // Use the interface method - kernel decides if it can do optimized fusion
+        // Note: We use gemm_q's multiply_fused since all kernels should be same type
+        bool success = gemm_q->multiply_fused(
+            input_fp32,
+            projections,
+            params_.m,
+            params_.k);
+
+        if (!success)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] multiply_fused failed");
+            return false;
+        }
+
+        LOG_DEBUG("[FusedQKVGEMMStage] Complete");
+        return true;
+    }
+
+    size_t FusedQKVGEMMStage::estimatedFlops() const
+    {
+        // Three GEMMs: 2 * M * N * K each
+        size_t flops_q = static_cast<size_t>(2) * params_.m * params_.n_q * params_.k;
+        size_t flops_k = static_cast<size_t>(2) * params_.m * params_.n_k * params_.k;
+        size_t flops_v = static_cast<size_t>(2) * params_.m * params_.n_v * params_.k;
+        return flops_q + flops_k + flops_v;
+    }
+
+    size_t FusedQKVGEMMStage::estimatedMemoryBytes() const
+    {
+        // Input: m * k reads (shared)
+        size_t input_bytes = static_cast<size_t>(params_.m) * params_.k * sizeof(float);
+
+        // Outputs: Q, K, V writes
+        size_t output_bytes = static_cast<size_t>(params_.m) * (params_.n_q + params_.n_k + params_.n_v) * sizeof(float);
+
+        // Weight reads (approximate - actual depends on quantization format)
+        // Quantized weights are ~4-8 bits/element, but we estimate conservatively
+        size_t weight_bytes = static_cast<size_t>(params_.k) * (params_.n_q + params_.n_k + params_.n_v) * sizeof(float) / 4;
+
+        return input_bytes + output_bytes + weight_bytes;
+    }
+
+    bool FusedQKVGEMMStage::supportsBackend(ComputeBackendType backend) const
+    {
+        // Uses ITensorGemm interface - device-agnostic
+        // Actual device support depends on the kernel implementation returned by KernelFactory
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+
+        case ComputeBackendType::GPU_CUDA:
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    StageDumpInfo FusedQKVGEMMStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // Input (shared)
+        info.addInput("input", params_.input, params_.m, params_.k);
+
+        // Weight tensors
+        info.addWeight("wq", params_.wq);
+        info.addWeight("wk", params_.wk);
+        info.addWeight("wv", params_.wv);
+
+        // Outputs
+        info.addOutput("output_q", params_.output_q, params_.m, params_.n_q);
+        info.addOutput("output_k", params_.output_k, params_.m, params_.n_k);
+        info.addOutput("output_v", params_.output_v, params_.m, params_.n_v);
+
+        // Scalar params
+        info.addScalarInt("m", params_.m);
+        info.addScalarInt("k", params_.k);
+        info.addScalarInt("n_q", params_.n_q);
+        info.addScalarInt("n_k", params_.n_k);
+        info.addScalarInt("n_v", params_.n_v);
+
+        return info;
+    }
+
+    // =============================================================================
+    // FusedGateUpGEMMStage Implementation
+    // =============================================================================
+
+    FusedGateUpGEMMStage::FusedGateUpGEMMStage(Params params) : params_(std::move(params)) {}
+
+    bool FusedGateUpGEMMStage::execute(IDeviceContext *ctx)
+    {
+        LOG_DEBUG("[FusedGateUpGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
+                                                       << " n_gate=" << params_.n_gate << " n_up=" << params_.n_up);
+
+        if (!ctx)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Null device context");
+            return false;
+        }
+
+        // Validate inputs
+        if (!params_.input)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Null input");
+            return false;
+        }
+        if (!params_.w_gate || !params_.w_up)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Null weight tensor(s)");
+            return false;
+        }
+        if (!params_.output_gate || !params_.output_up)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Null output buffer(s)");
+            return false;
+        }
+        if (params_.m <= 0 || params_.k <= 0)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Invalid dimensions: m=" << params_.m << " k=" << params_.k);
+            return false;
+        }
+
+        LOG_DEBUG("[FusedGateUpGEMMStage] input_type=" << params_.input->dtype_name()
+                                                       << " output_gate_type=" << params_.output_gate->dtype_name()
+                                                       << " output_up_type=" << params_.output_up->dtype_name());
+
+        // Get cached kernels from KernelFactory (handles weight packing once)
+        auto *gemm_gate = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.w_gate);
+        auto *gemm_up = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.w_up);
+
+        if (!gemm_gate || !gemm_up)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Failed to get GEMM kernel(s)");
+            return false;
+        }
+
+        // Check if outputs are Q8_1 - if so, use multiply_tensor for type-aware dispatch
+        // The fused FP32 path doesn't support Q8_1 output directly
+        bool gate_is_q8_1 = (params_.output_gate->native_type() == TensorType::Q8_1);
+        bool up_is_q8_1 = (params_.output_up->native_type() == TensorType::Q8_1);
+
+        if (gate_is_q8_1 || up_is_q8_1)
+        {
+            LOG_DEBUG("[FusedGateUpGEMMStage] Using multiply_tensor for Q8_1 output type dispatch");
+
+            // For Q8_1 outputs, we need to use multiply_tensor which handles the type-aware dispatch
+            // This means we lose the fusion optimization, but Q8_1 output is more important
+            // TODO: Implement fused multiply_tensor_multi for Q8_1 outputs
+            // TODO: multiply_tensor doesn't support bias - would need separate bias add pass
+            if (params_.bias_gate || params_.bias_up)
+            {
+                LOG_WARN("[FusedGateUpGEMMStage] Q8_1 output path does not support bias - bias will be ignored!");
+            }
+
+            // Gate projection
+            bool gate_ok = gemm_gate->multiply_tensor(
+                params_.input, params_.output_gate,
+                params_.m, params_.n_gate, params_.k,
+                false,      // transpose_B
+                1.0f, 0.0f, // alpha, beta
+                params_.mpi_ctx, params_.device_idx);
+
+            if (!gate_ok)
+            {
+                LOG_ERROR("[FusedGateUpGEMMStage] Gate GEMM multiply_tensor failed");
+                return false;
+            }
+
+            // Up projection
+            bool up_ok = gemm_up->multiply_tensor(
+                params_.input, params_.output_up,
+                params_.m, params_.n_up, params_.k,
+                false,      // transpose_B
+                1.0f, 0.0f, // alpha, beta
+                params_.mpi_ctx, params_.device_idx);
+
+            if (!up_ok)
+            {
+                LOG_ERROR("[FusedGateUpGEMMStage] Up GEMM multiply_tensor failed");
+                return false;
+            }
+
+            LOG_DEBUG("[FusedGateUpGEMMStage] Q8_1 path complete");
+            return true;
+        }
+
+        // FP32/BF16/FP16 output path - use optimized fused multiply
+        const float *input_fp32 = params_.input->fp32_data();
+        float *output_gate_fp32 = params_.output_gate->mutable_data();
+        float *output_up_fp32 = params_.output_up->mutable_data();
+
+        if (!input_fp32 || !output_gate_fp32 || !output_up_fp32)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Failed to get FP32 data from tensors");
+            return false;
+        }
+
+        // Build projection descriptors using device-agnostic interface
+        // Pass through bias pointers from params_
+        std::vector<ITensorGemm::FusedProjectionDesc> projections = {
+            {gemm_gate, output_gate_fp32, params_.n_gate, params_.bias_gate, nullptr, false, "gate"},
+            {gemm_up, output_up_fp32, params_.n_up, params_.bias_up, nullptr, false, "up"}};
+
+        // Use the interface method - kernel decides if it can do optimized fusion
+        bool success = gemm_gate->multiply_fused(
+            input_fp32,
+            projections,
+            params_.m,
+            params_.k);
+
+        if (!success)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] multiply_fused failed");
+            return false;
+        }
+
+        LOG_DEBUG("[FusedGateUpGEMMStage] Complete");
+        return true;
+    }
+
+    size_t FusedGateUpGEMMStage::estimatedFlops() const
+    {
+        // Two GEMMs: 2 * M * N * K each
+        size_t flops_gate = static_cast<size_t>(2) * params_.m * params_.n_gate * params_.k;
+        size_t flops_up = static_cast<size_t>(2) * params_.m * params_.n_up * params_.k;
+        return flops_gate + flops_up;
+    }
+
+    size_t FusedGateUpGEMMStage::estimatedMemoryBytes() const
+    {
+        // Input: m * k reads (shared)
+        size_t input_bytes = static_cast<size_t>(params_.m) * params_.k * sizeof(float);
+
+        // Outputs: gate, up writes
+        size_t output_bytes = static_cast<size_t>(params_.m) * (params_.n_gate + params_.n_up) * sizeof(float);
+
+        // Weight reads (approximate - actual depends on quantization format)
+        // Quantized weights are ~4-8 bits/element, but we estimate conservatively
+        size_t weight_bytes = static_cast<size_t>(params_.k) * (params_.n_gate + params_.n_up) * sizeof(float) / 4;
+
+        return input_bytes + output_bytes + weight_bytes;
+    }
+
+    bool FusedGateUpGEMMStage::supportsBackend(ComputeBackendType backend) const
+    {
+        // Uses ITensorGemm interface - device-agnostic
+        // Actual device support depends on the kernel implementation returned by KernelFactory
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+
+        case ComputeBackendType::GPU_CUDA:
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    StageDumpInfo FusedGateUpGEMMStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // Input (shared)
+        info.addInput("input", params_.input, params_.m, params_.k);
+
+        // Weight tensors
+        info.addWeight("w_gate", params_.w_gate);
+        info.addWeight("w_up", params_.w_up);
+
+        // Outputs
+        info.addOutput("output_gate", params_.output_gate, params_.m, params_.n_gate);
+        info.addOutput("output_up", params_.output_up, params_.m, params_.n_up);
+
+        // Scalar params
+        info.addScalarInt("m", params_.m);
+        info.addScalarInt("k", params_.k);
+        info.addScalarInt("n_gate", params_.n_gate);
+        info.addScalarInt("n_up", params_.n_up);
+
+        return info;
+    }
+
+    // =============================================================================
+    // RMSNormStage Implementation (Type-Safe via IActivationTensor)
     // =============================================================================
 
     RMSNormStage::RMSNormStage(Params params) : params_(std::move(params)) {}
 
     bool RMSNormStage::execute(IDeviceContext *ctx)
     {
-        LOG_DEBUG("[RMSNormStage] Execute: seq_len=" << params_.seq_len
-                                                     << " hidden_dim=" << params_.hidden_dim << " eps=" << params_.eps);
-
         if (!ctx)
         {
             LOG_ERROR("[RMSNormStage] Null device context");
             return false;
         }
 
-        const float *input = static_cast<const float *>(params_.input);
-        float *output = static_cast<float *>(params_.output);
-        const float *gamma = params_.gamma;
-        const int seq_len = params_.seq_len;
-        const int hidden_dim = params_.hidden_dim;
-        const float eps = params_.eps;
-
-        // Debug: log first few values
-        LOG_DEBUG("[RMSNormStage] input[0:4]="
-                  << input[0] << "," << input[1] << "," << input[2] << "," << input[3]);
-
-        // Execute RMSNorm using parallel iteration
-        // Supports both in-place (input == output) and out-of-place operation
-        ctx->runFor(0, static_cast<size_t>(seq_len), [=](size_t i_)
-                    {
-        int i = static_cast<int>(i_);
-        const float* in_row = input + i * hidden_dim;
-        float* out_row = output + i * hidden_dim;
-        
-        // Compute RMS from input
-        float sum_sq = 0.0f;
-        for (int j = 0; j < hidden_dim; ++j) {
-            sum_sq += in_row[j] * in_row[j];
+        if (!params_.input || !params_.output || !params_.gamma)
+        {
+            LOG_ERROR("[RMSNormStage] Null tensor(s): input=" << params_.input
+                                                              << " output=" << params_.output
+                                                              << " gamma=" << params_.gamma);
+            return false;
         }
-        float rms = std::sqrt(sum_sq / hidden_dim + eps);
-        float inv_rms = 1.0f / rms;
-        
-        // Normalize and scale, write to output
-        for (int j = 0; j < hidden_dim; ++j) {
-            out_row[j] = in_row[j] * inv_rms * gamma[j];
-        } });
 
-        // Debug: log output values
-        LOG_DEBUG("[RMSNormStage] output[0:4]="
-                  << output[0] << "," << output[1] << "," << output[2] << "," << output[3]);
+        // Use explicit seq_len if provided, otherwise derive from tensor dimensions
+        // CRITICAL: For pre-allocated buffers, params_.seq_len must be set to avoid
+        // processing garbage data beyond the actual sequence
+        const int seq_len = params_.seq_len > 0 ? params_.seq_len : static_cast<int>(params_.input->rows());
+        const int hidden_dim = static_cast<int>(params_.input->cols());
 
-        return true;
+        LOG_DEBUG("[RMSNormStage] Execute: seq_len=" << seq_len
+                                                     << " hidden_dim=" << hidden_dim
+                                                     << " eps=" << params_.eps
+                                                     << " tensor_type=" << params_.input->dtype_name());
+
+        // Create kernel via KernelFactory with automatic type dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createRMSNorm(params_.input, dev_type);
+        if (!kernel)
+        {
+            LOG_ERROR("[RMSNormStage] Failed to create RMSNorm kernel for type "
+                      << params_.input->dtype_name());
+            return false;
+        }
+
+        // apply_tensor handles input != output cases internally
+        return kernel->apply_tensor(
+            params_.input,
+            params_.gamma,
+            params_.output,
+            seq_len,
+            hidden_dim,
+            params_.eps,
+            params_.mpi_ctx,
+            params_.device_idx);
     }
 
     size_t RMSNormStage::estimatedFlops() const
     {
+        if (!params_.input)
+            return 0;
+
+        const int seq_len = params_.seq_len > 0 ? params_.seq_len : static_cast<int>(params_.input->rows());
+        const int hidden_dim = static_cast<int>(params_.input->cols());
         // Per row: hidden_dim squares + hidden_dim adds + sqrt + div + hidden_dim muls
         // Approximately 4 * hidden_dim FLOPs per row
-        return static_cast<size_t>(4) * params_.seq_len * params_.hidden_dim;
+        return static_cast<size_t>(4) * seq_len * hidden_dim;
     }
 
     size_t RMSNormStage::estimatedMemoryBytes() const
     {
+        if (!params_.input)
+            return 0;
+
+        const int seq_len = params_.seq_len > 0 ? params_.seq_len : static_cast<int>(params_.input->rows());
+        const int hidden_dim = static_cast<int>(params_.input->cols());
         // Read input + gamma, write output (in-place, so same buffer)
-        size_t input_bytes = static_cast<size_t>(params_.seq_len) * params_.hidden_dim * sizeof(float);
-        size_t gamma_bytes = static_cast<size_t>(params_.hidden_dim) * sizeof(float);
+        size_t input_bytes = static_cast<size_t>(seq_len) * hidden_dim * sizeof(float);
+        size_t gamma_bytes = static_cast<size_t>(hidden_dim) * sizeof(float);
         return 2 * input_bytes + gamma_bytes; // Read + write + gamma
     }
 
@@ -535,8 +891,8 @@ namespace llaminar2
     {
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -547,93 +903,134 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
-        // Input (may be same as output for in-place)
-        info.addInput("input", static_cast<const float *>(params_.input), params_.seq_len, params_.hidden_dim);
+        if (!params_.input)
+            return info;
+
+        const int seq_len = params_.seq_len > 0 ? params_.seq_len : static_cast<int>(params_.input->rows());
+        const int hidden_dim = static_cast<int>(params_.input->cols());
+
+        // Use TensorBase* overload for type-safe FP32 extraction (handles Q8_1)
+        info.addInput("input", params_.input, seq_len, hidden_dim);
 
         // Gamma weights
-        info.addInput("gamma", params_.gamma, 1, params_.hidden_dim);
+        if (params_.gamma)
+        {
+            info.addInput("gamma", params_.gamma, 1, hidden_dim);
+        }
 
-        // Output
-        info.addOutput("output", static_cast<const float *>(params_.output), params_.seq_len, params_.hidden_dim);
+        // Output - use TensorBase* overload
+        info.addOutput("output", params_.output, seq_len, hidden_dim);
 
         // Scalar params
-        info.addScalarInt("seq_len", params_.seq_len);
-        info.addScalarInt("hidden_dim", params_.hidden_dim);
+        info.addScalarInt("seq_len", seq_len);
+        info.addScalarInt("hidden_dim", hidden_dim);
         info.addScalar("eps", params_.eps);
 
         return info;
     }
 
     // =============================================================================
-    // RoPEStage Implementation
+    // RoPEStage Implementation (Type-Safe via KernelFactory)
     // =============================================================================
 
     RoPEStage::RoPEStage(Params params) : params_(std::move(params)) {}
 
     bool RoPEStage::execute(IDeviceContext *ctx)
     {
-        LOG_DEBUG("[RoPEStage] Execute: seq_len=" << params_.seq_len
-                                                  << " n_heads=" << params_.n_heads << " head_dim=" << params_.head_dim
-                                                  << " pos_offset=" << params_.pos_offset);
-
         if (!ctx)
         {
             LOG_ERROR("[RoPEStage] Null device context");
             return false;
         }
 
-        float *tensor = static_cast<float *>(params_.tensor);
-        const int seq_len = params_.seq_len;
-        const int n_heads = params_.n_heads;
-        const int head_dim = params_.head_dim;
-        const int pos_offset = params_.pos_offset;
-        const float theta_base = params_.theta_base;
+        if (!params_.Q)
+        {
+            LOG_ERROR("[RoPEStage] Null Q tensor");
+            return false;
+        }
 
-        // Execute RoPE using parallel iteration over positions
-        ctx->runFor(0, static_cast<size_t>(seq_len), [=](size_t pos_)
-                    {
-        int pos = static_cast<int>(pos_);
-        int actual_pos = pos + pos_offset;
-        
-        for (int h = 0; h < n_heads; ++h) {
-            float* head_ptr = tensor + pos * n_heads * head_dim + h * head_dim;
-            
-            // Apply rotary embedding to pairs of elements
-            for (int i = 0; i < head_dim / 2; ++i) {
-                float freq = 1.0f / std::pow(theta_base, 
-                    static_cast<float>(2 * i) / head_dim);
-                float angle = actual_pos * freq;
-                float cos_val = std::cos(angle);
-                float sin_val = std::sin(angle);
-                
-                float x0 = head_ptr[2 * i];
-                float x1 = head_ptr[2 * i + 1];
-                
-                head_ptr[2 * i]     = x0 * cos_val - x1 * sin_val;
-                head_ptr[2 * i + 1] = x0 * sin_val + x1 * cos_val;
-            }
-        } });
-        return true;
+        // Get seq_len from tensor dimensions
+        // Q tensor is [seq_len, n_heads * head_dim]
+        const int seq_len = static_cast<int>(params_.Q->rows());
+
+        LOG_DEBUG("[RoPEStage] Execute: seq_len=" << seq_len
+                                                  << " n_heads=" << params_.n_heads
+                                                  << " n_kv_heads=" << params_.n_kv_heads
+                                                  << " head_dim=" << params_.head_dim
+                                                  << " pos_offset=" << params_.pos_offset
+                                                  << " tensor_type=" << params_.Q->dtype_name());
+
+        // Create kernel via KernelFactory with automatic type dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createRoPE(params_.Q, dev_type);
+        if (!kernel)
+        {
+            LOG_ERROR("[RoPEStage] Failed to create RoPE kernel for type "
+                      << params_.Q->dtype_name());
+            return false;
+        }
+
+        // Generate position_ids array [pos_offset, pos_offset+1, ..., pos_offset+seq_len-1]
+        std::vector<int> position_ids(seq_len);
+        for (int i = 0; i < seq_len; ++i)
+        {
+            position_ids[i] = params_.pos_offset + i;
+        }
+
+        const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+
+        // Apply RoPE via kernel's apply_tensor method
+        return kernel->apply_tensor(
+            params_.Q,
+            params_.K, // May be nullptr
+            position_ids.data(),
+            seq_len,
+            params_.n_heads,
+            n_kv_heads,
+            params_.head_dim,
+            params_.theta_base,
+            params_.mpi_ctx,
+            params_.device_idx);
     }
 
     size_t RoPEStage::estimatedFlops() const
     {
+        if (!params_.Q)
+            return 0;
+
+        const int seq_len = static_cast<int>(params_.Q->rows());
         // Per position per head: head_dim/2 rotations, each ~10 FLOPs (sin, cos, 4 muls, 2 adds)
-        return static_cast<size_t>(10) * params_.seq_len * params_.n_heads * (params_.head_dim / 2);
+        size_t flops = static_cast<size_t>(10) * seq_len * params_.n_heads * (params_.head_dim / 2);
+        if (params_.K)
+        {
+            int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+            flops += static_cast<size_t>(10) * seq_len * n_kv_heads * (params_.head_dim / 2);
+        }
+        return flops;
     }
 
     size_t RoPEStage::estimatedMemoryBytes() const
     {
-        return static_cast<size_t>(2) * params_.seq_len * params_.n_heads *
-               params_.head_dim * sizeof(float); // Read + write
+        if (!params_.Q)
+            return 0;
+
+        const int seq_len = static_cast<int>(params_.Q->rows());
+        size_t bytes = static_cast<size_t>(2) * seq_len * params_.n_heads *
+                       params_.head_dim * sizeof(float); // Q read + write
+        if (params_.K)
+        {
+            int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+            bytes += static_cast<size_t>(2) * seq_len * n_kv_heads * params_.head_dim * sizeof(float);
+        }
+        return bytes;
     }
 
     bool RoPEStage::supportsBackend(ComputeBackendType backend) const
     {
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -643,16 +1040,39 @@ namespace llaminar2
     StageDumpInfo RoPEStage::getDumpInfo() const
     {
         StageDumpInfo info;
+        if (!params_.Q)
+            return info;
 
-        // Input/output tensor (in-place operation)
-        info.addInput("tensor", static_cast<const float *>(params_.tensor),
-                      params_.seq_len, params_.n_heads * params_.head_dim);
-        info.addOutput("tensor", static_cast<const float *>(params_.tensor),
-                       params_.seq_len, params_.n_heads * params_.head_dim);
+        const int seq_len = static_cast<int>(params_.Q->rows());
+
+        // Q tensor (in-place operation) - use safe accessor for Q8_1 compatibility
+        const float *q_data = getSafeFp32Data(params_.Q);
+        if (q_data)
+        {
+            info.addInput("Q", q_data,
+                          seq_len, params_.n_heads * params_.head_dim);
+            info.addOutput("Q", q_data,
+                           seq_len, params_.n_heads * params_.head_dim);
+        }
+
+        // K tensor (optional, in-place)
+        if (params_.K)
+        {
+            int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+            const float *k_data = getSafeFp32Data(params_.K);
+            if (k_data)
+            {
+                info.addInput("K", k_data,
+                              seq_len, n_kv_heads * params_.head_dim);
+                info.addOutput("K", k_data,
+                               seq_len, n_kv_heads * params_.head_dim);
+            }
+        }
 
         // Scalar params
-        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("seq_len", seq_len);
         info.addScalarInt("n_heads", params_.n_heads);
+        info.addScalarInt("n_kv_heads", params_.n_kv_heads);
         info.addScalarInt("head_dim", params_.head_dim);
         info.addScalarInt("pos_offset", params_.pos_offset);
         info.addScalar("theta_base", params_.theta_base);
@@ -802,8 +1222,8 @@ namespace llaminar2
     {
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -839,51 +1259,76 @@ namespace llaminar2
     }
 
     // =============================================================================
-    // SwiGLUStage Implementation
+    // SwiGLUStage Implementation (Type-Safe via TensorBase)
     // =============================================================================
 
     SwiGLUStage::SwiGLUStage(Params params) : params_(std::move(params)) {}
 
     bool SwiGLUStage::execute(IDeviceContext *ctx)
     {
-        LOG_DEBUG("[SwiGLUStage] Execute: seq_len=" << params_.seq_len
-                                                    << " intermediate_dim=" << params_.intermediate_dim);
-
         if (!ctx)
         {
             LOG_ERROR("[SwiGLUStage] Null device context");
             return false;
         }
 
-        const float *gate = static_cast<const float *>(params_.gate);
-        const float *up = static_cast<const float *>(params_.up);
-        float *output = static_cast<float *>(params_.output);
-        const int seq_len = params_.seq_len;
-        const int intermediate_dim = params_.intermediate_dim;
+        if (!params_.gate || !params_.up || !params_.output)
+        {
+            LOG_ERROR("[SwiGLUStage] Null tensor(s): gate=" << params_.gate
+                                                            << " up=" << params_.up
+                                                            << " output=" << params_.output);
+            return false;
+        }
 
-        // SwiGLU: silu(gate) * up
-        ctx->runFor(0, static_cast<size_t>(seq_len), [=](size_t i_)
-                    {
-        int i = static_cast<int>(i_);
-        for (int j = 0; j < intermediate_dim; ++j) {
-            int idx = i * intermediate_dim + j;
-            float g = gate[idx];
-            // SiLU: x * sigmoid(x)
-            float silu = g / (1.0f + std::exp(-g));
-            output[idx] = silu * up[idx];
-        } });
-        return true;
+        // Get dimensions from tensor
+        const int seq_len = static_cast<int>(params_.gate->rows());
+        const int intermediate_dim = static_cast<int>(params_.gate->cols());
+
+        LOG_DEBUG("[SwiGLUStage] Execute: seq_len=" << seq_len
+                                                    << " intermediate_dim=" << intermediate_dim
+                                                    << " tensor_type=" << params_.gate->dtype_name());
+
+        // Create kernel via KernelFactory with automatic type dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createSwiGLU(params_.gate, dev_type);
+        if (!kernel)
+        {
+            LOG_ERROR("[SwiGLUStage] Failed to create SwiGLU kernel for type "
+                      << params_.gate->dtype_name());
+            return false;
+        }
+
+        // Apply SwiGLU via kernel's apply_tensor method
+        return kernel->apply_tensor(
+            params_.gate,
+            params_.up,
+            params_.output,
+            seq_len,
+            intermediate_dim,
+            false, // add_residual
+            params_.mpi_ctx,
+            params_.device_idx);
     }
 
     size_t SwiGLUStage::estimatedFlops() const
     {
+        if (!params_.gate)
+            return 0;
+
+        const int seq_len = static_cast<int>(params_.gate->rows());
+        const int intermediate_dim = static_cast<int>(params_.gate->cols());
         // Per element: exp, div, mul, mul (~6 FLOPs)
-        return static_cast<size_t>(6) * params_.seq_len * params_.intermediate_dim;
+        return static_cast<size_t>(6) * seq_len * intermediate_dim;
     }
 
     size_t SwiGLUStage::estimatedMemoryBytes() const
     {
-        size_t bytes = static_cast<size_t>(params_.seq_len) * params_.intermediate_dim * sizeof(float);
+        if (!params_.gate)
+            return 0;
+
+        const int seq_len = static_cast<int>(params_.gate->rows());
+        const int intermediate_dim = static_cast<int>(params_.gate->cols());
+        size_t bytes = static_cast<size_t>(seq_len) * intermediate_dim * sizeof(float);
         return 3 * bytes; // gate + up + output
     }
 
@@ -891,8 +1336,8 @@ namespace llaminar2
     {
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -903,63 +1348,80 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
-        // Input tensors
-        info.addInput("gate", static_cast<const float *>(params_.gate),
-                      params_.seq_len, params_.intermediate_dim);
-        info.addInput("up", static_cast<const float *>(params_.up),
-                      params_.seq_len, params_.intermediate_dim);
+        if (!params_.gate || !params_.up || !params_.output)
+            return info;
 
-        // Output
-        info.addOutput("output", static_cast<const float *>(params_.output),
-                       params_.seq_len, params_.intermediate_dim);
+        const int seq_len = static_cast<int>(params_.gate->rows());
+        const int intermediate_dim = static_cast<int>(params_.gate->cols());
+
+        // Use TensorBase* overload for type-safe FP32 extraction (handles Q8_1)
+        info.addInput("gate", params_.gate, seq_len, intermediate_dim);
+        info.addInput("up", params_.up, seq_len, intermediate_dim);
+
+        // Output - use TensorBase* overload
+        info.addOutput("output", params_.output, seq_len, intermediate_dim);
 
         // Scalar params
-        info.addScalarInt("seq_len", params_.seq_len);
-        info.addScalarInt("intermediate_dim", params_.intermediate_dim);
+        info.addScalarInt("seq_len", seq_len);
+        info.addScalarInt("intermediate_dim", intermediate_dim);
 
         return info;
     }
 
     // =============================================================================
-    // ResidualAddStage Implementation (Precision-Aware)
+    // ResidualAddStage Implementation (Type-Safe via TensorBase)
     // =============================================================================
 
     ResidualAddStage::ResidualAddStage(Params params) : params_(std::move(params)) {}
 
     bool ResidualAddStage::execute(IDeviceContext *ctx)
     {
-        LOG_DEBUG("[ResidualAddStage] Execute: num_elements=" << params_.num_elements
-                                                              << " precision=" << static_cast<int>(params_.precision));
-
         if (!ctx)
         {
             LOG_ERROR("[ResidualAddStage] Null device context");
             return false;
         }
 
-        // Dispatch based on precision
-        switch (params_.precision)
+        if (!params_.input || !params_.residual || !params_.output)
         {
-        case ActivationPrecision::FP32:
-            return executeFP32(ctx);
-        case ActivationPrecision::BF16:
-            return executeBF16(ctx);
-        case ActivationPrecision::FP16:
-            return executeFP16(ctx);
-        case ActivationPrecision::Q8_1:
-            return executeQ8_1(ctx);
+            LOG_ERROR("[ResidualAddStage] Null tensor(s): input=" << params_.input
+                                                                  << " residual=" << params_.residual
+                                                                  << " output=" << params_.output);
+            return false;
+        }
+
+        // Use explicit num_elements if provided, otherwise fall back to input->numel()
+        // CRITICAL: For decode mode with pre-allocated buffers, params_.num_elements must be set
+        // to avoid reading/writing beyond the actual sequence data.
+        const size_t num_elements = params_.num_elements > 0 ? params_.num_elements : params_.input->numel();
+
+        LOG_DEBUG("[ResidualAddStage] Execute: num_elements=" << num_elements
+                                                              << " tensor_type=" << params_.input->dtype_name());
+
+        // Dispatch based on tensor type, passing num_elements through
+        TensorType ttype = params_.input->native_type();
+        switch (ttype)
+        {
+        case TensorType::FP32:
+            return executeFP32(ctx, num_elements);
+        case TensorType::BF16:
+            return executeBF16(ctx, num_elements);
+        case TensorType::FP16:
+            return executeFP16(ctx, num_elements);
+        case TensorType::Q8_1:
+            return executeQ8_1(ctx, num_elements);
         default:
-            LOG_ERROR("[ResidualAddStage] Unknown precision: " << static_cast<int>(params_.precision));
+            LOG_ERROR("[ResidualAddStage] Unsupported tensor type: " << params_.input->dtype_name());
             return false;
         }
     }
 
-    bool ResidualAddStage::executeFP32(IDeviceContext *ctx)
+    bool ResidualAddStage::executeFP32(IDeviceContext *ctx, size_t num_elements)
     {
-        const float *input = static_cast<const float *>(params_.input);
-        const float *residual = static_cast<const float *>(params_.residual);
-        float *output = static_cast<float *>(params_.output);
-        const size_t n = params_.num_elements;
+        const float *input = params_.input->data();
+        const float *residual = params_.residual->data();
+        float *output = params_.output->mutable_data();
+        const size_t n = num_elements;
 
         LOG_DEBUG("[ResidualAddStage::FP32] input[0:4]="
                   << input[0] << "," << input[1] << "," << input[2] << "," << input[3]
@@ -975,12 +1437,12 @@ namespace llaminar2
         return true;
     }
 
-    bool ResidualAddStage::executeBF16(IDeviceContext *ctx)
+    bool ResidualAddStage::executeBF16(IDeviceContext *ctx, size_t num_elements)
     {
-        const uint16_t *input = static_cast<const uint16_t *>(params_.input);
-        const uint16_t *residual = static_cast<const uint16_t *>(params_.residual);
-        uint16_t *output = static_cast<uint16_t *>(params_.output);
-        const size_t n = params_.num_elements;
+        const uint16_t *input = static_cast<const uint16_t *>(params_.input->raw_data());
+        const uint16_t *residual = static_cast<const uint16_t *>(params_.residual->raw_data());
+        uint16_t *output = static_cast<uint16_t *>(params_.output->raw_mutable_data());
+        const size_t n = num_elements;
 
         LOG_DEBUG("[ResidualAddStage::BF16] Converting and adding " << n << " elements");
 
@@ -993,12 +1455,12 @@ namespace llaminar2
         return true;
     }
 
-    bool ResidualAddStage::executeFP16(IDeviceContext *ctx)
+    bool ResidualAddStage::executeFP16(IDeviceContext *ctx, size_t num_elements)
     {
-        const uint16_t *input = static_cast<const uint16_t *>(params_.input);
-        const uint16_t *residual = static_cast<const uint16_t *>(params_.residual);
-        uint16_t *output = static_cast<uint16_t *>(params_.output);
-        const size_t n = params_.num_elements;
+        const uint16_t *input = static_cast<const uint16_t *>(params_.input->raw_data());
+        const uint16_t *residual = static_cast<const uint16_t *>(params_.residual->raw_data());
+        uint16_t *output = static_cast<uint16_t *>(params_.output->raw_mutable_data());
+        const size_t n = num_elements;
 
         LOG_DEBUG("[ResidualAddStage::FP16] Converting and adding " << n << " elements");
 
@@ -1011,69 +1473,97 @@ namespace llaminar2
         return true;
     }
 
-    bool ResidualAddStage::executeQ8_1(IDeviceContext *ctx)
+    bool ResidualAddStage::executeQ8_1(IDeviceContext *ctx, size_t num_elements)
     {
-        (void)ctx; // Q8_1 add is synchronous, doesn't use ctx parallelism
+        // Cast to Q8_1Tensor to access block storage
+        const auto *input_q8 = dynamic_cast<const Q8_1Tensor *>(params_.input);
+        const auto *residual_q8 = dynamic_cast<const Q8_1Tensor *>(params_.residual);
+        auto *output_q8 = dynamic_cast<Q8_1Tensor *>(params_.output);
 
-        const Q8_1Block *input = static_cast<const Q8_1Block *>(params_.input);
-        const Q8_1Block *residual = static_cast<const Q8_1Block *>(params_.residual);
-        Q8_1Block *output = static_cast<Q8_1Block *>(params_.output);
+        if (!input_q8 || !residual_q8 || !output_q8)
+        {
+            LOG_ERROR("[ResidualAddStage::Q8_1] Failed to cast tensors to Q8_1Tensor");
+            return false;
+        }
 
-        // Q8_1 blocks: 32 elements per block
-        // num_elements is the total FP32 element count
-        const size_t n = params_.num_elements;
+        const size_t numel = num_elements;
+        if (numel % 32 != 0)
+        {
+            LOG_ERROR("[ResidualAddStage::Q8_1] Element count " << numel << " is not a multiple of 32");
+            return false;
+        }
 
-        LOG_DEBUG("[ResidualAddStage::Q8_1] Native Q8_1 addition for " << n << " elements");
+        const Q8_1Block *input_blocks = input_q8->q8_1_blocks();
+        const Q8_1Block *residual_blocks = residual_q8->q8_1_blocks();
+        Q8_1Block *output_blocks = output_q8->mutable_q8_1_blocks();
 
-        // Use SIMD-optimized Q8_1 addition
-        // This performs: dequant(input) + dequant(residual) -> requant(output)
-        // All in registers with fused scale computation
-        simd::q8_1_add_q8_1(input, residual, output, n);
+        LOG_DEBUG("[ResidualAddStage::Q8_1] Adding " << numel << " elements ("
+                                                     << (numel / 32) << " blocks)");
 
-        LOG_DEBUG("[ResidualAddStage::Q8_1] Completed native Q8_1 addition");
+        // Use the SIMD-optimized Q8_1 addition (AVX512/AVX2/scalar)
+        simd::q8_1_add_q8_1(input_blocks, residual_blocks, output_blocks, numel);
 
         return true;
     }
 
     size_t ResidualAddStage::estimatedFlops() const
     {
-        // For Q8_1: dequant (1 mul/elem) + add + requant (1 mul/elem) = ~3 ops/elem
-        // For FP32/BF16/FP16: 1 add per element
-        if (params_.precision == ActivationPrecision::Q8_1)
+        if (!params_.input)
+            return 0;
+
+        // For BF16/FP16: convert (1) + add + convert (1) = ~3 ops/elem
+        // For FP32: 1 add per element
+        // For Q8_1: dequant (2) + add + requant (2) = ~5 ops/elem
+        TensorType ttype = params_.input->native_type();
+        if (ttype == TensorType::BF16 || ttype == TensorType::FP16)
         {
-            return params_.num_elements * 3;
+            return params_.input->numel() * 3;
         }
-        return params_.num_elements;
+        if (ttype == TensorType::Q8_1)
+        {
+            return params_.input->numel() * 5;
+        }
+        return params_.input->numel();
     }
 
     size_t ResidualAddStage::estimatedMemoryBytes() const
     {
-        // Memory depends on precision
-        size_t bytes_per_element;
-        switch (params_.precision)
+        if (!params_.input)
+            return 0;
+
+        // Memory depends on tensor type
+        TensorType ttype = params_.input->native_type();
+
+        // Q8_1: 1 byte per element + 4 bytes per 32-element block for scale+sum
+        // ~1.125 bytes/element on average
+        if (ttype == TensorType::Q8_1)
         {
-        case ActivationPrecision::Q8_1:
-            // Q8_1Block: 36 bytes per 32 elements = 1.125 bytes/element
-            bytes_per_element = 1; // Approximate
-            break;
-        case ActivationPrecision::BF16:
-        case ActivationPrecision::FP16:
+            // Q8_1Block: 32 bytes qs + 2 bytes d + 2 bytes sum_qs = 36 bytes per 32 elements
+            size_t num_blocks = (params_.input->numel() + 31) / 32;
+            return 3 * num_blocks * sizeof(Q8_1Block); // input + residual + output
+        }
+
+        size_t bytes_per_element;
+        switch (ttype)
+        {
+        case TensorType::BF16:
+        case TensorType::FP16:
             bytes_per_element = 2;
             break;
-        case ActivationPrecision::FP32:
+        case TensorType::FP32:
         default:
             bytes_per_element = 4;
             break;
         }
-        return 3 * params_.num_elements * bytes_per_element; // input + residual + output
+        return 3 * params_.input->numel() * bytes_per_element; // input + residual + output
     }
 
     bool ResidualAddStage::supportsBackend(ComputeBackendType backend) const
     {
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -1084,48 +1574,48 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
-        // Determine dtype string based on precision
-        const char *dtype = "FP32";
+        if (!params_.input || !params_.residual || !params_.output)
+            return info;
+
+        // Determine dtype string based on tensor type
+        const char *dtype = params_.input->dtype_name();
         size_t elem_size = sizeof(float);
-        switch (params_.precision)
+        TensorType ttype = params_.input->native_type();
+        switch (ttype)
         {
-        case ActivationPrecision::Q8_1:
-            dtype = "Q8_1";
-            elem_size = sizeof(Q8_1Block);
-            break;
-        case ActivationPrecision::BF16:
-            dtype = "BF16";
+        case TensorType::BF16:
+        case TensorType::FP16:
             elem_size = 2;
             break;
-        case ActivationPrecision::FP16:
-            dtype = "FP16";
-            elem_size = 2;
+        case TensorType::Q8_1:
+            // Q8_1Block: 36 bytes per 32 elements = 1.125 bytes/elem
+            // For dump purposes, use 1 (closest integer approximation)
+            elem_size = 1;
             break;
         default:
             break;
         }
 
-        int rows = params_.rows > 0 ? params_.rows : 1;
-        int cols = params_.cols > 0 ? params_.cols : static_cast<int>(params_.num_elements);
+        int rows = static_cast<int>(params_.input->rows());
+        int cols = static_cast<int>(params_.input->cols());
 
-        // Input tensors
-        info.inputs.push_back({"input", params_.input,
+        // Input tensors - use raw_data() for void* compatibility
+        info.inputs.push_back({"input", params_.input->raw_data(),
                                static_cast<size_t>(rows), static_cast<size_t>(cols),
                                dtype, elem_size});
-        info.inputs.push_back({"residual", params_.residual,
+        info.inputs.push_back({"residual", params_.residual->raw_data(),
                                static_cast<size_t>(rows), static_cast<size_t>(cols),
                                dtype, elem_size});
 
         // Output
-        info.outputs.push_back({"output", params_.output,
+        info.outputs.push_back({"output", params_.output->raw_data(),
                                 static_cast<size_t>(rows), static_cast<size_t>(cols),
                                 dtype, elem_size});
 
         // Scalar params
-        info.addScalarInt("num_elements", static_cast<int>(params_.num_elements));
+        info.addScalarInt("num_elements", static_cast<int>(params_.input->numel()));
         info.addScalarInt("rows", rows);
         info.addScalarInt("cols", cols);
-        info.addScalarInt("precision", static_cast<int>(params_.precision));
 
         return info;
     }
@@ -1220,8 +1710,8 @@ namespace llaminar2
     {
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -1285,8 +1775,8 @@ namespace llaminar2
     {
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -1321,8 +1811,8 @@ namespace llaminar2
     {
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -1374,7 +1864,17 @@ namespace llaminar2
         config.head_dim = params_.head_dim;
         config.causal = params_.causal;
         config.window_size = params_.window_size;
-        config.precision = ActivationPrecision::FP32; // TODO: Make configurable
+
+        // Auto-detect precision from Q tensor type (Q is authoritative since K/V come from cache)
+        if (params_.Q && params_.Q->native_type() == TensorType::Q8_1)
+        {
+            config.precision = ActivationPrecision::Q8_1;
+        }
+        else
+        {
+            config.precision = ActivationPrecision::FP32;
+        }
+
         config.mpi_ctx = params_.mpi_ctx;
         config.mpi_strategy = static_cast<MPIStrategy>(params_.mpi_strategy);
         config.verbose_logging = false;
@@ -1472,12 +1972,29 @@ namespace llaminar2
             LOG_DEBUG("[AttentionWithKVCacheStage] Using cached K/V with " << kv_len << " tokens");
         }
 
-        // Step 3: Build attention config and dispatch to MpiAttentionOrchestrator
+        // Step 3: Create tensor views with actual seq_len dimensions
+        // This is critical because activation buffers are allocated at max_seq_len
+        // but MpiAttentionOrchestrator validates tensor shapes match
+        int q_dim = params_.n_heads * params_.head_dim;
+        int kv_dim = params_.n_kv_heads * params_.head_dim;
+
+        auto Q_view = params_.Q->create_view({static_cast<size_t>(params_.seq_len), static_cast<size_t>(q_dim)});
+        auto K_view = K_full->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
+        auto V_view = V_full->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
+        auto out_view = params_.output->create_view({static_cast<size_t>(params_.seq_len), static_cast<size_t>(q_dim)});
+
+        if (!Q_view || !K_view || !V_view || !out_view)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage] Failed to create tensor views");
+            return false;
+        }
+
+        // Step 4: Build attention config and dispatch to MpiAttentionOrchestrator
         MpiAttentionConfig config = buildAttentionConfig();
 
-        // Dispatch to MPI-aware attention
+        // Dispatch to MPI-aware attention using views
         bool success = MpiAttentionOrchestrator::compute_mpi(
-            params_.Q, K_full, V_full, params_.output,
+            Q_view.get(), K_view.get(), V_view.get(), out_view.get(),
             config,
             params_.batch_size,
             params_.sequence_lengths);
@@ -1521,21 +2038,74 @@ namespace llaminar2
 
         LOG_DEBUG("[AttentionWithKVCacheStage::executeDecode] Attending to " << kv_len << " cached tokens");
 
-        // Step 3: Dispatch attention (Q is single token, K/V is full cache)
-        MpiAttentionConfig config = buildAttentionConfig();
+        // Step 3: Create tensor views with actual dimensions
+        // Q is single token (decode), K/V is full cache length
+        int q_dim = params_.n_heads * params_.head_dim;
+        int kv_dim = params_.n_kv_heads * params_.head_dim;
+        const int q_seq_len = 1; // Decode mode: single query token
 
-        // Note: For decode, Q has seq_len=1 but K/V has seq_len=kv_len
-        // MpiAttentionOrchestrator handles asymmetric Q/KV lengths
+        auto Q_view = params_.Q->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(q_dim)});
+        auto K_view = K_cached->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
+        auto V_view = V_cached->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
+        auto out_view = params_.output->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(q_dim)});
 
-        bool success = MpiAttentionOrchestrator::compute_mpi(
-            params_.Q, K_cached, V_cached, params_.output,
-            config,
+        if (!Q_view || !K_view || !V_view || !out_view)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Failed to create tensor views");
+            return false;
+        }
+
+        // Step 4: Create attention kernel via KernelFactory (device-aware dispatch)
+        // This uses the typed kernel path (CPUAttentionKernelTyped) which properly
+        // handles decode mode where Q.seq_len != K.seq_len
+        const int device_idx = params_.device_idx;
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx);
+        auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_view.get(), dev_type);
+
+        if (!attention_kernel)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Failed to create attention kernel");
+            return false;
+        }
+
+        // Step 5: Allocate workspace for attention scores [n_heads, q_seq_len, kv_len]
+        // Use simple allocation - in production, use pre-allocated workspace
+        FP32Tensor scores_workspace({static_cast<size_t>(params_.n_heads * q_seq_len * kv_len)});
+
+        // Step 6: Build causal mask for decode
+        // For decode: Q is at position kv_len-1 (end of sequence), attends to [0, kv_len-1]
+        FP32Tensor mask_tensor({static_cast<size_t>(q_seq_len * kv_len)});
+        float *mask_data = mask_tensor.mutable_data();
+
+        for (int q = 0; q < q_seq_len; ++q)
+        {
+            int q_pos = (kv_len - q_seq_len) + q; // Q position in full sequence
+            for (int k = 0; k < kv_len; ++k)
+            {
+                // Causal: Q at position q_pos can attend to K at positions [0, q_pos]
+                mask_data[q * kv_len + k] = (k <= q_pos) ? 0.0f : -std::numeric_limits<float>::infinity();
+            }
+        }
+
+        // Step 7: Dispatch via compute_tensor which handles decode mode (q_seq_len != kv_len)
+        bool success = attention_kernel->compute_tensor(
+            Q_view.get(), K_view.get(), V_view.get(), out_view.get(),
             params_.batch_size,
-            nullptr); // No padding mask for decode
+            q_seq_len, // Query sequence length (1 for decode)
+            kv_len,    // Key/value sequence length (full cache)
+            params_.n_heads,
+            params_.n_kv_heads,
+            params_.head_dim,
+            true, // causal
+            -1,   // window_size (disabled)
+            &scores_workspace,
+            &mask_tensor,
+            params_.mpi_ctx.get(),
+            device_idx);
 
         if (!success)
         {
-            LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] MpiAttentionOrchestrator failed");
+            LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] Attention kernel compute_tensor failed");
             return false;
         }
 
@@ -1627,8 +2197,8 @@ namespace llaminar2
         // MpiAttentionOrchestrator currently only supports CPU
         switch (backend)
         {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
+        case ComputeBackendType::CPU:
+
             return true;
         default:
             return false;
@@ -1639,20 +2209,28 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
-        // Q/K/V inputs
+        // Q/K/V inputs - use safe accessor for Q8_1 compatibility
         if (params_.Q)
         {
-            info.addInput("Q", params_.Q->data(),
-                          params_.batch_size * params_.seq_len,
-                          params_.n_heads * params_.head_dim);
+            const float *q_data = getSafeFp32Data(params_.Q);
+            if (q_data)
+            {
+                info.addInput("Q", q_data,
+                              params_.batch_size * params_.seq_len,
+                              params_.n_heads * params_.head_dim);
+            }
         }
 
-        // Output
+        // Output - use safe accessor for Q8_1 compatibility
         if (params_.output)
         {
-            info.addOutput("output", params_.output->data(),
-                           params_.batch_size * params_.seq_len,
-                           params_.n_heads * params_.head_dim);
+            const float *out_data = getSafeFp32Data(params_.output);
+            if (out_data)
+            {
+                info.addOutput("output", out_data,
+                               params_.batch_size * params_.seq_len,
+                               params_.n_heads * params_.head_dim);
+            }
         }
 
         // Scalar params
@@ -1713,521 +2291,286 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // AttentionComputeStage Implementation
+    // =============================================================================
+
+    AttentionComputeStage::AttentionComputeStage(Params params)
+        : params_(std::move(params)) {}
+
+    bool AttentionComputeStage::execute(IDeviceContext *ctx)
+    {
+        // Detect attention mode if auto-detection enabled
+        AttentionMode mode = params_.attention_mode;
+        if (params_.auto_detect_mode)
+        {
+            mode = detect_attention_mode(params_.batch_size, params_.seq_len, params_.kv_len);
+        }
+
+        LOG_DEBUG("[AttentionComputeStage] Execute: batch=" << params_.batch_size
+                                                            << " seq_len=" << params_.seq_len
+                                                            << " kv_len=" << params_.kv_len
+                                                            << " n_heads=" << params_.n_heads
+                                                            << " n_kv_heads=" << params_.n_kv_heads
+                                                            << " head_dim=" << params_.head_dim
+                                                            << " mode=" << attention_mode_name(mode));
+
+        // Validate inputs
+        if (!params_.Q || !params_.K || !params_.V || !params_.output)
+        {
+            LOG_ERROR("[AttentionComputeStage] Null tensor pointers");
+            return false;
+        }
+
+        if (params_.seq_len <= 0 || params_.kv_len <= 0 ||
+            params_.n_heads <= 0 || params_.n_kv_heads <= 0 || params_.head_dim <= 0)
+        {
+            LOG_ERROR("[AttentionComputeStage] Invalid dimensions");
+            return false;
+        }
+
+        if (params_.n_heads % params_.n_kv_heads != 0)
+        {
+            LOG_ERROR("[AttentionComputeStage] n_heads (" << params_.n_heads
+                                                          << ") must be divisible by n_kv_heads (" << params_.n_kv_heads << ")");
+            return false;
+        }
+
+        // Determine device type from context
+        using DeviceType = llaminar::v2::kernels::DeviceType;
+        DeviceType dev_type = DeviceType::CPU;
+
+        if (ctx)
+        {
+            auto *gpu_ctx = dynamic_cast<IGPUDeviceContext *>(ctx);
+            if (gpu_ctx)
+            {
+#if defined(HAVE_CUDA)
+                dev_type = DeviceType::CUDA;
+#elif defined(HAVE_ROCM)
+                dev_type = DeviceType::ROCm;
+#endif
+            }
+        }
+
+        // Create attention kernel via KernelFactory
+        auto kernel = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
+        if (!kernel)
+        {
+            LOG_ERROR("[AttentionComputeStage] Failed to create attention kernel for tensor type "
+                      << params_.Q->dtype_name());
+            return false;
+        }
+
+        // Get device index
+        int device_idx = params_.device_idx;
+        if (device_idx < 0 && ctx)
+        {
+            device_idx = ctx->deviceIndex();
+        }
+
+        // Dispatch to kernel's compute_tensor() method with detected mode
+        // The kernel uses mode internally for optimized dispatch (decode vs prefill path)
+        bool success = kernel->compute_tensor(
+            params_.Q, params_.K, params_.V, params_.output,
+            params_.batch_size,
+            params_.seq_len,
+            params_.kv_len,
+            params_.n_heads,
+            params_.n_kv_heads,
+            params_.head_dim,
+            params_.causal,
+            params_.window_size,
+            params_.workspace_scores,
+            params_.workspace_mask,
+            params_.mpi_ctx,
+            device_idx);
+
+        if (!success)
+        {
+            LOG_ERROR("[AttentionComputeStage] Kernel compute_tensor() failed");
+            return false;
+        }
+
+        LOG_DEBUG("[AttentionComputeStage] Execute complete (mode=" << attention_mode_name(mode) << ")");
+        return true;
+    }
+
+    size_t AttentionComputeStage::estimatedFlops() const
+    {
+        // Attention FLOPs:
+        // Q @ K^T: 2 * batch * n_heads * seq_len * kv_len * head_dim
+        // softmax: ~4 * batch * n_heads * seq_len * kv_len
+        // scores @ V: 2 * batch * n_heads * seq_len * kv_len * head_dim
+        const size_t qk_flops = 2ULL * params_.batch_size * params_.n_heads *
+                                params_.seq_len * params_.kv_len * params_.head_dim;
+        const size_t softmax_flops = 4ULL * params_.batch_size * params_.n_heads *
+                                     params_.seq_len * params_.kv_len;
+        const size_t sv_flops = qk_flops;
+        return qk_flops + softmax_flops + sv_flops;
+    }
+
+    size_t AttentionComputeStage::estimatedMemoryBytes() const
+    {
+        // Workspace for attention scores: n_heads * seq_len * kv_len
+        return static_cast<size_t>(params_.n_heads) * params_.seq_len * params_.kv_len * sizeof(float);
+    }
+
+    bool AttentionComputeStage::supportsBackend(ComputeBackendType backend) const
+    {
+        switch (backend)
+        {
+        case ComputeBackendType::CPU:
+
+            return true;
+#if defined(HAVE_CUDA)
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#if defined(HAVE_ROCM)
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
+    }
+
+    StageDumpInfo AttentionComputeStage::getDumpInfo() const
+    {
+        StageDumpInfo info;
+
+        // Note: TensorBase* doesn't expose data() directly - we rely on execute()
+        // to handle the actual type dispatch. For dump purposes, just report dimensions.
+        // TODO: Add addWeight() variant that accepts TensorBase* for type-safe dump
+
+        // Scalars capture all necessary info for debugging
+        info.addScalarInt("batch_size", params_.batch_size);
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("kv_len", params_.kv_len);
+        info.addScalarInt("n_heads", params_.n_heads);
+        info.addScalarInt("n_kv_heads", params_.n_kv_heads);
+        info.addScalarInt("head_dim", params_.head_dim);
+        info.addScalarBool("causal", params_.causal);
+        info.addScalarInt("window_size", params_.window_size);
+        info.addScalarInt("device_idx", params_.device_idx);
+
+        // Add attention mode info (as int - PREFILL=0, DECODE=1, BATCHED_DECODE=2, CHUNKED_PREFILL=3)
+        AttentionMode mode = params_.auto_detect_mode
+                                 ? detect_attention_mode(params_.batch_size, params_.seq_len, params_.kv_len)
+                                 : params_.attention_mode;
+        info.addScalarInt("attention_mode", static_cast<int>(mode));
+        info.addScalarBool("auto_detect_mode", params_.auto_detect_mode);
+
+        return info;
+    }
+
+    // =============================================================================
     // ComputeStageFactory Implementation
     // =============================================================================
 
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createQuantize(
-        const QuantizeStage::Params &params,
-        ComputeBackendType target_backend)
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createGEMM(
+        const GEMMStage::Params &params)
     {
-        // CPU only for now - GPU quantization would use different kernel
-        (void)target_backend;
-        return std::make_unique<QuantizeStage>(params);
+        // Unified: GEMMStage handles all backends via KernelFactory dispatch at execute-time
+        return std::make_unique<GEMMStage>(params);
     }
 
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createGEMM(
-        const GEMMStage::Params &params,
-        ComputeBackendType target_backend)
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createFusedQKVGEMM(
+        const FusedQKVGEMMStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<GEMMStage>(params);
-        case ComputeBackendType::GPU_CUDA:
-        case ComputeBackendType::GPU_ROCM:
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-            return std::make_unique<GPUGEMMStage>(params, target_backend);
-#else
-            LOG_WARN("[ComputeStageFactory] GPU GEMM not compiled in, falling back to CPU");
-            return std::make_unique<GEMMStage>(params);
-#endif
-        default:
-            LOG_ERROR("[ComputeStageFactory] Unknown backend for GEMM");
-            return nullptr;
-        }
+        // Unified: FusedQKVGEMMStage will use KernelFactory at execute-time
+        return std::make_unique<FusedQKVGEMMStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createFusedGateUpGEMM(
+        const FusedGateUpGEMMStage::Params &params)
+    {
+        // Unified: FusedGateUpGEMMStage will use KernelFactory at execute-time
+        return std::make_unique<FusedGateUpGEMMStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createRMSNorm(
-        const RMSNormStage::Params &params,
-        ComputeBackendType target_backend)
+        const RMSNormStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<RMSNormStage>(params);
-        case ComputeBackendType::GPU_CUDA:
-        case ComputeBackendType::GPU_ROCM:
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-            return std::make_unique<GPURMSNormStage>(params, target_backend);
-#else
-            LOG_WARN("[ComputeStageFactory] GPU RMSNorm not compiled in, using CPU");
-            return std::make_unique<RMSNormStage>(params);
-#endif
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for RMSNorm, using CPU");
-            return std::make_unique<RMSNormStage>(params);
-        }
+        // Unified: RMSNormStage uses KernelFactory at execute-time for device dispatch
+        return std::make_unique<RMSNormStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createRoPE(
-        const RoPEStage::Params &params,
-        ComputeBackendType target_backend)
+        const RoPEStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<RoPEStage>(params);
-        case ComputeBackendType::GPU_CUDA:
-        case ComputeBackendType::GPU_ROCM:
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-            return std::make_unique<GPURoPEStage>(params, target_backend);
-#else
-            LOG_WARN("[ComputeStageFactory] GPU RoPE not compiled in, using CPU");
-            return std::make_unique<RoPEStage>(params);
-#endif
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for RoPE, using CPU");
-            return std::make_unique<RoPEStage>(params);
-        }
+        // Unified: RoPEStage uses KernelFactory at execute-time for device dispatch
+        return std::make_unique<RoPEStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAttention(
-        const AttentionStage::Params &params,
-        ComputeBackendType target_backend)
+        const AttentionStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<AttentionStage>(params);
-        case ComputeBackendType::GPU_CUDA:
-        case ComputeBackendType::GPU_ROCM:
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-            return std::make_unique<GPUAttentionStage>(params, target_backend);
-#else
-            LOG_WARN("[ComputeStageFactory] GPU Attention not compiled in, using CPU");
-            return std::make_unique<AttentionStage>(params);
-#endif
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for Attention, using CPU");
-            return std::make_unique<AttentionStage>(params);
-        }
+        // Unified: AttentionStage uses KernelFactory at execute-time for device dispatch
+        return std::make_unique<AttentionStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createSwiGLU(
-        const SwiGLUStage::Params &params,
-        ComputeBackendType target_backend)
+        const SwiGLUStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<SwiGLUStage>(params);
-        case ComputeBackendType::GPU_CUDA:
-        case ComputeBackendType::GPU_ROCM:
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-            return std::make_unique<GPUSwiGLUStage>(params, target_backend);
-#else
-            LOG_WARN("[ComputeStageFactory] GPU SwiGLU not compiled in, using CPU");
-            return std::make_unique<SwiGLUStage>(params);
-#endif
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for SwiGLU, using CPU");
-            return std::make_unique<SwiGLUStage>(params);
-        }
+        // Unified: SwiGLUStage uses KernelFactory at execute-time for device dispatch
+        return std::make_unique<SwiGLUStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createResidualAdd(
-        const ResidualAddStage::Params &params,
-        ComputeBackendType target_backend)
+        const ResidualAddStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<ResidualAddStage>(params);
-        case ComputeBackendType::GPU_CUDA:
-        case ComputeBackendType::GPU_ROCM:
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-            return std::make_unique<GPUResidualAddStage>(params, target_backend);
-#else
-            LOG_WARN("[ComputeStageFactory] GPU ResidualAdd not compiled in, using CPU");
-            return std::make_unique<ResidualAddStage>(params);
-#endif
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for ResidualAdd, using CPU");
-            return std::make_unique<ResidualAddStage>(params);
-        }
+        // Unified: ResidualAddStage uses KernelFactory at execute-time for device dispatch
+        return std::make_unique<ResidualAddStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoERouter(
-        const MoERouterStage::Params &params,
-        ComputeBackendType target_backend)
+        const MoERouterStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<MoERouterStage>(params);
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for MoERouter, using CPU");
-            return std::make_unique<MoERouterStage>(params);
-        }
+        // Unified: MoERouterStage will use KernelFactory at execute-time
+        return std::make_unique<MoERouterStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpert(
-        const MoEExpertStage::Params &params,
-        ComputeBackendType target_backend)
+        const MoEExpertStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<MoEExpertStage>(params);
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for MoEExpert, using CPU");
-            return std::make_unique<MoEExpertStage>(params);
-        }
+        // Unified: MoEExpertStage will use KernelFactory at execute-time
+        return std::make_unique<MoEExpertStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoECombine(
-        const MoECombineStage::Params &params,
-        ComputeBackendType target_backend)
+        const MoECombineStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<MoECombineStage>(params);
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for MoECombine, using CPU");
-            return std::make_unique<MoECombineStage>(params);
-        }
+        // Unified: MoECombineStage will use KernelFactory at execute-time
+        return std::make_unique<MoECombineStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAllreduce(
-        const AllreduceStage::Params &params,
-        ComputeBackendType /* target_backend */)
+        const AllreduceStage::Params &params)
     {
         // Allreduce is backend-agnostic (uses MPI directly)
         return std::make_unique<AllreduceStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionWithKVCache(
-        const AttentionWithKVCacheStage::Params &params,
-        ComputeBackendType target_backend)
+        const AttentionWithKVCacheStage::Params &params)
     {
-        switch (target_backend)
-        {
-        case ComputeBackendType::CPU_OPENBLAS:
-        case ComputeBackendType::CPU_MKL:
-            return std::make_unique<AttentionWithKVCacheStage>(params);
-        case ComputeBackendType::GPU_CUDA:
-        case ComputeBackendType::GPU_ROCM:
-            // TODO: GPU attention implementation
-            LOG_WARN("[ComputeStageFactory] GPU AttentionWithKVCache not yet implemented, using CPU");
-            return std::make_unique<AttentionWithKVCacheStage>(params);
-        default:
-            LOG_WARN("[ComputeStageFactory] Backend not supported for AttentionWithKVCache, using CPU");
-            return std::make_unique<AttentionWithKVCacheStage>(params);
-        }
+        // Unified: AttentionWithKVCacheStage uses KernelFactory at execute-time
+        return std::make_unique<AttentionWithKVCacheStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createKVCacheAppend(
-        const KVCacheAppendStage::Params &params,
-        ComputeBackendType /* target_backend */)
+        const KVCacheAppendStage::Params &params)
     {
         // KV cache append is backend-agnostic (pure memory operations)
         return std::make_unique<KVCacheAppendStage>(params);
     }
 
-    // =============================================================================
-    // GPU Compute Stage Implementations
-    // =============================================================================
-
-#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
-
-#ifdef HAVE_CUDA
-#include "../backends/cuda/CUDABackend.h"
-#endif
-
-#ifdef HAVE_ROCM
-#include "../backends/rocm/ROCmBackend.h"
-#endif
-
-    // Helper to get GPU device ID from context
-    static int getGPUDeviceId(IDeviceContext *ctx)
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionCompute(
+        const AttentionComputeStage::Params &params)
     {
-        auto *gpu_ctx = dynamic_cast<IGPUDeviceContext *>(ctx);
-        return gpu_ctx ? gpu_ctx->gpuDeviceId() : 0;
+        // Unified: AttentionComputeStage uses KernelFactory at execute-time
+        return std::make_unique<AttentionComputeStage>(params);
     }
-
-    // -----------------------------------------------------------------------------
-    // GPUGEMMStage
-    // -----------------------------------------------------------------------------
-
-    GPUGEMMStage::GPUGEMMStage(GEMMStage::Params params, ComputeBackendType backend)
-        : params_(std::move(params)), backend_(backend) {}
-
-    bool GPUGEMMStage::execute(IDeviceContext *ctx)
-    {
-        if (!ctx || !ctx->isGPU())
-        {
-            LOG_ERROR("[GPUGEMMStage] Requires GPU device context");
-            return false;
-        }
-
-        int device_id = getGPUDeviceId(ctx);
-        LOG_DEBUG("[GPUGEMMStage] Execute GEMM on GPU " << device_id
-                                                        << ": " << params_.m << "x" << params_.n << "x" << params_.k);
-
-        // TODO: Delegate to backend-specific GEMM
-        // For quantized weights, use backend->gemmIQ4NL()
-        // For FP32/FP16, use cuBLAS/rocBLAS via backend
-
-        // Placeholder: mark as successful (actual kernels TBD)
-        return true;
-    }
-
-    size_t GPUGEMMStage::estimatedFlops() const
-    {
-        return static_cast<size_t>(2) * params_.m * params_.n * params_.k;
-    }
-
-    size_t GPUGEMMStage::estimatedMemoryBytes() const
-    {
-        size_t a_bytes = static_cast<size_t>(params_.m) * params_.k * sizeof(float);
-        size_t b_bytes = static_cast<size_t>(params_.k) * params_.n * sizeof(float);
-        size_t c_bytes = static_cast<size_t>(params_.m) * params_.n * sizeof(float);
-        return a_bytes + b_bytes + c_bytes;
-    }
-
-    bool GPUGEMMStage::supportsBackend(ComputeBackendType backend) const
-    {
-        return backend == ComputeBackendType::GPU_CUDA ||
-               backend == ComputeBackendType::GPU_ROCM;
-    }
-
-    // -----------------------------------------------------------------------------
-    // GPURMSNormStage
-    // -----------------------------------------------------------------------------
-
-    GPURMSNormStage::GPURMSNormStage(RMSNormStage::Params params, ComputeBackendType backend)
-        : params_(std::move(params)), backend_(backend) {}
-
-    bool GPURMSNormStage::execute(IDeviceContext *ctx)
-    {
-        if (!ctx || !ctx->isGPU())
-        {
-            LOG_ERROR("[GPURMSNormStage] Requires GPU device context");
-            return false;
-        }
-
-        int device_id = getGPUDeviceId(ctx);
-        LOG_DEBUG("[GPURMSNormStage] Execute RMSNorm on GPU " << device_id);
-
-        // TODO: Launch custom RMSNorm kernel with warp-level reduction
-        // Kernel signature: rmsnorm_kernel<<<blocks, threads>>>(input, gamma, seq_len, hidden_dim, eps)
-
-        return true;
-    }
-
-    size_t GPURMSNormStage::estimatedFlops() const
-    {
-        return static_cast<size_t>(4) * params_.seq_len * params_.hidden_dim;
-    }
-
-    size_t GPURMSNormStage::estimatedMemoryBytes() const
-    {
-        size_t input_bytes = static_cast<size_t>(params_.seq_len) * params_.hidden_dim * sizeof(float);
-        size_t gamma_bytes = static_cast<size_t>(params_.hidden_dim) * sizeof(float);
-        return 2 * input_bytes + gamma_bytes;
-    }
-
-    bool GPURMSNormStage::supportsBackend(ComputeBackendType backend) const
-    {
-        return backend == ComputeBackendType::GPU_CUDA ||
-               backend == ComputeBackendType::GPU_ROCM;
-    }
-
-    // -----------------------------------------------------------------------------
-    // GPUSwiGLUStage
-    // -----------------------------------------------------------------------------
-
-    GPUSwiGLUStage::GPUSwiGLUStage(SwiGLUStage::Params params, ComputeBackendType backend)
-        : params_(std::move(params)), backend_(backend) {}
-
-    bool GPUSwiGLUStage::execute(IDeviceContext *ctx)
-    {
-        if (!ctx || !ctx->isGPU())
-        {
-            LOG_ERROR("[GPUSwiGLUStage] Requires GPU device context");
-            return false;
-        }
-
-        int device_id = getGPUDeviceId(ctx);
-        LOG_DEBUG("[GPUSwiGLUStage] Execute SwiGLU on GPU " << device_id);
-
-        // TODO: Launch fused SwiGLU kernel
-        // output[i] = silu(gate[i]) * up[i]
-        // where silu(x) = x * sigmoid(x)
-
-        return true;
-    }
-
-    size_t GPUSwiGLUStage::estimatedFlops() const
-    {
-        // silu: ~5 ops, mul: 1 op = 6 per element
-        return static_cast<size_t>(6) * params_.seq_len * params_.intermediate_dim;
-    }
-
-    size_t GPUSwiGLUStage::estimatedMemoryBytes() const
-    {
-        size_t elem_bytes = static_cast<size_t>(params_.seq_len) * params_.intermediate_dim * sizeof(float);
-        return 3 * elem_bytes; // gate + up + output
-    }
-
-    bool GPUSwiGLUStage::supportsBackend(ComputeBackendType backend) const
-    {
-        return backend == ComputeBackendType::GPU_CUDA ||
-               backend == ComputeBackendType::GPU_ROCM;
-    }
-
-    // -----------------------------------------------------------------------------
-    // GPUResidualAddStage
-    // -----------------------------------------------------------------------------
-
-    GPUResidualAddStage::GPUResidualAddStage(ResidualAddStage::Params params, ComputeBackendType backend)
-        : params_(std::move(params)), backend_(backend) {}
-
-    bool GPUResidualAddStage::execute(IDeviceContext *ctx)
-    {
-        if (!ctx || !ctx->isGPU())
-        {
-            LOG_ERROR("[GPUResidualAddStage] Requires GPU device context");
-            return false;
-        }
-
-        int device_id = getGPUDeviceId(ctx);
-        LOG_DEBUG("[GPUResidualAddStage] Execute ResidualAdd on GPU " << device_id);
-
-        // TODO: Launch simple element-wise addition kernel
-        // output[i] = input[i] + residual[i]
-
-        return true;
-    }
-
-    size_t GPUResidualAddStage::estimatedFlops() const
-    {
-        return params_.num_elements; // One add per element
-    }
-
-    size_t GPUResidualAddStage::estimatedMemoryBytes() const
-    {
-        return 3 * params_.num_elements * sizeof(float); // input + residual + output
-    }
-
-    bool GPUResidualAddStage::supportsBackend(ComputeBackendType backend) const
-    {
-        return backend == ComputeBackendType::GPU_CUDA ||
-               backend == ComputeBackendType::GPU_ROCM;
-    }
-
-    // -----------------------------------------------------------------------------
-    // GPURoPEStage
-    // -----------------------------------------------------------------------------
-
-    GPURoPEStage::GPURoPEStage(RoPEStage::Params params, ComputeBackendType backend)
-        : params_(std::move(params)), backend_(backend) {}
-
-    bool GPURoPEStage::execute(IDeviceContext *ctx)
-    {
-        if (!ctx || !ctx->isGPU())
-        {
-            LOG_ERROR("[GPURoPEStage] Requires GPU device context");
-            return false;
-        }
-
-        int device_id = getGPUDeviceId(ctx);
-        LOG_DEBUG("[GPURoPEStage] Execute RoPE on GPU " << device_id);
-
-        // TODO: Launch RoPE kernel
-        // Apply rotary embeddings: cos/sin precomputed per position/dimension
-
-        return true;
-    }
-
-    size_t GPURoPEStage::estimatedFlops() const
-    {
-        return static_cast<size_t>(10) * params_.seq_len * params_.n_heads * (params_.head_dim / 2);
-    }
-
-    size_t GPURoPEStage::estimatedMemoryBytes() const
-    {
-        return static_cast<size_t>(2) * params_.seq_len * params_.n_heads *
-               params_.head_dim * sizeof(float);
-    }
-
-    bool GPURoPEStage::supportsBackend(ComputeBackendType backend) const
-    {
-        return backend == ComputeBackendType::GPU_CUDA ||
-               backend == ComputeBackendType::GPU_ROCM;
-    }
-
-    // -----------------------------------------------------------------------------
-    // GPUAttentionStage
-    // -----------------------------------------------------------------------------
-
-    GPUAttentionStage::GPUAttentionStage(AttentionStage::Params params, ComputeBackendType backend)
-        : params_(std::move(params)), backend_(backend) {}
-
-    bool GPUAttentionStage::execute(IDeviceContext *ctx)
-    {
-        if (!ctx || !ctx->isGPU())
-        {
-            LOG_ERROR("[GPUAttentionStage] Requires GPU device context");
-            return false;
-        }
-
-        int device_id = getGPUDeviceId(ctx);
-        LOG_DEBUG("[GPUAttentionStage] Execute Attention on GPU " << device_id
-                                                                  << " seq=" << params_.seq_len << " kv=" << params_.kv_len);
-
-        // TODO: Implement Flash Attention or standard attention
-        // 1. Q * K^T with scaling
-        // 2. Causal mask application
-        // 3. Online softmax
-        // 4. Attention @ V
-
-        return true;
-    }
-
-    size_t GPUAttentionStage::estimatedFlops() const
-    {
-        size_t qk_flops = 2ULL * params_.seq_len * params_.kv_len * params_.head_dim;
-        size_t softmax_flops = 5ULL * params_.seq_len * params_.kv_len;
-        size_t v_flops = 2ULL * params_.seq_len * params_.kv_len * params_.head_dim;
-        return (qk_flops + softmax_flops + v_flops) * params_.n_heads;
-    }
-
-    size_t GPUAttentionStage::estimatedMemoryBytes() const
-    {
-        size_t qkv_bytes = static_cast<size_t>(params_.seq_len + 2 * params_.kv_len) *
-                           params_.n_heads * params_.head_dim * sizeof(float);
-        size_t scores_bytes = static_cast<size_t>(params_.seq_len) * params_.kv_len *
-                              params_.n_heads * sizeof(float);
-        return qkv_bytes + scores_bytes;
-    }
-
-    bool GPUAttentionStage::supportsBackend(ComputeBackendType backend) const
-    {
-        return backend == ComputeBackendType::GPU_CUDA ||
-               backend == ComputeBackendType::GPU_ROCM;
-    }
-
-#endif // HAVE_CUDA || HAVE_ROCM
 
 } // namespace llaminar2

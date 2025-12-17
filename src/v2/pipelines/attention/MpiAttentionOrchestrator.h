@@ -77,8 +77,11 @@ namespace llaminar2
      * - Static methods (no state) for easy reuse
      * - Config object encapsulates parameters
      * - Automatic MPI dispatch based on config
+     *
+     * @deprecated Phase 9: Use KVCacheAppendStage + AttentionComputeStage instead.
+     *             This class will be removed in v3.0. See MULTI_DEVICE_ARCHITECTURE.md.
      */
-    class MpiAttentionOrchestrator
+    class [[deprecated("Use KVCacheAppendStage + AttentionComputeStage for new code")]] MpiAttentionOrchestrator
     {
     public:
         /**

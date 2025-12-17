@@ -168,7 +168,7 @@ namespace llaminar2
 
         for (size_t i = 0; i < devices.size(); ++i)
         {
-            if (devices[i].type == ComputeBackendType::CPU_OPENBLAS)
+            if (devices[i].type == ComputeBackendType::CPU)
             {
                 return static_cast<int>(i);
             }

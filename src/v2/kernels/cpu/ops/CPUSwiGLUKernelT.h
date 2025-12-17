@@ -181,8 +181,8 @@ namespace llaminar2
          * @brief Apply SwiGLU using tensor objects with automatic type dispatch
          */
         bool apply_tensor(
-            TensorBase *gate,
-            TensorBase *up,
+            const TensorBase *gate,
+            const TensorBase *up,
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
@@ -255,8 +255,8 @@ namespace llaminar2
          * @brief Apply SwiGLU using tensor objects with automatic type dispatch
          */
         bool apply_tensor(
-            TensorBase *gate,
-            TensorBase *up,
+            const TensorBase *gate,
+            const TensorBase *up,
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
@@ -329,8 +329,8 @@ namespace llaminar2
          * @brief Apply SwiGLU using tensor objects with automatic type dispatch
          */
         bool apply_tensor(
-            TensorBase *gate,
-            TensorBase *up,
+            const TensorBase *gate,
+            const TensorBase *up,
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
@@ -413,8 +413,8 @@ namespace llaminar2
          * @brief Apply SwiGLU using tensor objects with automatic type dispatch
          */
         bool apply_tensor(
-            TensorBase *gate,
-            TensorBase *up,
+            const TensorBase *gate,
+            const TensorBase *up,
             TensorBase *output,
             int rows, int cols,
             bool add_residual,

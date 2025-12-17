@@ -256,64 +256,14 @@ namespace llaminar2
             return graph;
         }
 
-        const int device = config_.default_device;
-        const auto backend = ComputeBackendType::CPU_OPENBLAS; // Default backend
+        // NOTE: This is a placeholder implementation using raw float* pointers.
+        // The real implementation is in Qwen2LayerExecutor which uses TensorBase*.
+        // Stage params now require TensorBase*, so we cannot create actual stages here.
+        // This method returns an empty graph - use Qwen2LayerExecutor for real execution.
 
-        // Pre-attention norm
-        if (params.attn_norm)
-        {
-            RMSNormStage::Params norm_params;
-            norm_params.input = params.input;
-            norm_params.output = params.input; // In-place for now
-            norm_params.gamma = params.attn_norm;
-            norm_params.seq_len = params.seq_len;
-            norm_params.hidden_dim = params.d_model;
-            norm_params.eps = params.rms_norm_eps;
-
-            graph.addNode("attn_norm",
-                          ComputeStageFactory::createRMSNorm(norm_params, backend),
-                          device);
-        }
-
-        // QKV projections could be parallel
-        // For now, we use placeholders - actual GEMM integration needs KernelFactory
-
-        // Note: GEMM stages are placeholders in current implementation
-        // The full implementation would use:
-        //   - ComputeStageFactory::createGEMM() with weight tensors
-        //   - Parallel execution of Q, K, V projections
-        //   - RoPE on Q and K
-        //   - Attention computation
-        //   - Output projection
-        //   - Residual add
-
-        // For demonstration, create a simplified graph structure:
-        // attn_norm -> [Q_proj, K_proj, V_proj] -> [Q_rope, K_rope] -> attention -> out_proj -> residual
-
-        // This shows the DAG structure without actual GEMM implementation
-        LOG_DEBUG("[LayerExecutor] Building attention graph with " << params.seq_len
-                                                                   << " tokens, " << params.n_heads << " heads");
-
-        // RoPE stage (operates on Q and K after projection)
-        // In practice, this would be split into Q_rope and K_rope running in parallel
-
-        // Residual add at the end
-        if (params.residual)
-        {
-            ResidualAddStage::Params res_params;
-            res_params.input = params.output; // Attention output
-            res_params.residual = params.residual;
-            res_params.output = params.output; // In-place
-            res_params.num_elements = static_cast<size_t>(params.seq_len) * params.d_model;
-
-            auto residual_stage = ComputeStageFactory::createResidualAdd(res_params, backend);
-            graph.addNode("attn_residual", std::move(residual_stage), device);
-
-            if (params.attn_norm)
-            {
-                graph.addDependency("attn_residual", "attn_norm");
-            }
-        }
+        LOG_DEBUG("[LayerExecutor] Building attention graph placeholder with " << params.seq_len
+                                                                               << " tokens, " << params.n_heads << " heads");
+        LOG_WARN("[LayerExecutor::buildAttentionGraph] Base class returns empty graph - use Qwen2LayerExecutor");
 
         return graph;
     }
@@ -332,80 +282,13 @@ namespace llaminar2
             return graph;
         }
 
-        const int device = config_.default_device;
-        const auto backend = ComputeBackendType::CPU_OPENBLAS;
-        const int seq_len = params.seq_len;
-        const int d_model = params.d_model;
-        const int d_ff = params.d_ff;
+        // NOTE: This is a placeholder implementation using raw float* pointers.
+        // The real implementation is in Qwen2LayerExecutor which uses TensorBase*.
+        // Stage params now require TensorBase*, so we cannot create actual stages here.
+        // This method returns an empty graph - use Qwen2LayerExecutor for real execution.
 
-        // Pre-FFN norm
-        if (params.ffn_norm)
-        {
-            RMSNormStage::Params norm_params;
-            norm_params.input = params.input;
-            norm_params.output = params.input; // In-place for now
-            norm_params.gamma = params.ffn_norm;
-            norm_params.seq_len = seq_len;
-            norm_params.hidden_dim = d_model;
-            norm_params.eps = params.rms_norm_eps;
-
-            graph.addNode("ffn_norm",
-                          ComputeStageFactory::createRMSNorm(norm_params, backend),
-                          device);
-        }
-
-        // Gate and Up projections are independent (can run in parallel)
-        // [seq_len, d_model] @ [d_model, d_ff].T = [seq_len, d_ff]
-        // These are GEMM placeholders
-
-        // For actual implementation, you would:
-        // graph.addNode("ffn_gate", createGEMM(...), device);
-        // graph.addNode("ffn_up", createGEMM(...), device);
-        // graph.addDependency("ffn_gate", "ffn_norm");
-        // graph.addDependency("ffn_up", "ffn_norm");
-
-        // SwiGLU: silu(gate) * up
-        // Get temporary buffer for intermediate results
-        float *gate_buffer = getTemporaryBuffer(static_cast<size_t>(seq_len) * d_ff);
-        float *up_buffer = gate_buffer + seq_len * d_ff; // Adjacent in buffer
-
-        if (gate_buffer && up_buffer)
-        {
-            SwiGLUStage::Params swiglu_params;
-            swiglu_params.gate = gate_buffer; // Would come from GEMM in real impl
-            swiglu_params.up = up_buffer;
-            swiglu_params.output = gate_buffer; // Reuse gate buffer
-            swiglu_params.seq_len = seq_len;
-            swiglu_params.intermediate_dim = d_ff;
-
-            graph.addNode("ffn_swiglu",
-                          ComputeStageFactory::createSwiGLU(swiglu_params, backend),
-                          device);
-
-            if (params.ffn_norm)
-            {
-                graph.addDependency("ffn_swiglu", "ffn_norm");
-            }
-        }
-
-        // Down projection: [seq_len, d_ff] @ [d_ff, d_model].T = [seq_len, d_model]
-        // Another GEMM placeholder
-
-        // Residual add
-        if (params.residual)
-        {
-            ResidualAddStage::Params res_params;
-            res_params.input = params.output;
-            res_params.residual = params.residual;
-            res_params.output = params.output;
-            res_params.num_elements = static_cast<size_t>(seq_len) * d_model;
-
-            auto residual_stage = ComputeStageFactory::createResidualAdd(res_params, backend);
-            graph.addNode("ffn_residual", std::move(residual_stage), device);
-            graph.addDependency("ffn_residual", "ffn_swiglu");
-        }
-
-        LOG_DEBUG("[LayerExecutor] Built FFN graph: " << graph.size() << " stages");
+        LOG_DEBUG("[LayerExecutor] Building FFN graph placeholder");
+        LOG_WARN("[LayerExecutor::buildFFNGraph] Base class returns empty graph - use Qwen2LayerExecutor");
 
         return graph;
     }
@@ -424,119 +307,13 @@ namespace llaminar2
             return graph;
         }
 
-        const int default_device = config_.default_device;
-        const auto backend = ComputeBackendType::CPU_OPENBLAS;
-        const int seq_len = params.seq_len;
-        const int d_model = params.d_model;
-        const int n_experts = params.n_experts;
-        const int top_k = params.top_k;
+        // NOTE: This is a placeholder implementation using raw float* pointers.
+        // The real implementation would need TensorBase* which is available in model-specific executors.
+        // Stage params now require TensorBase*, so we cannot create actual stages here.
+        // This method returns an empty graph - real MoE implementation would be in a model-specific executor.
 
-        // Pre-MoE norm
-        if (params.ffn_norm)
-        {
-            RMSNormStage::Params norm_params;
-            norm_params.input = params.input;
-            norm_params.output = params.input; // In-place for now
-            norm_params.gamma = params.ffn_norm;
-            norm_params.seq_len = seq_len;
-            norm_params.hidden_dim = d_model;
-            norm_params.eps = params.rms_norm_eps;
-
-            graph.addNode("moe_norm",
-                          ComputeStageFactory::createRMSNorm(norm_params, backend),
-                          default_device);
-        }
-
-        // Router: compute expert scores for each token
-        // Output: [seq_len, n_experts] scores
-        {
-            MoERouterStage::Params router_params;
-            router_params.hidden = params.input;
-            router_params.gate_weights = params.router_weight;
-            router_params.router_logits = nullptr; // Would be allocated in real impl
-            router_params.seq_len = seq_len;
-            router_params.d_model = d_model;
-            router_params.num_experts = n_experts;
-
-            graph.addNode("moe_router",
-                          ComputeStageFactory::createMoERouter(router_params, backend),
-                          default_device);
-
-            if (params.ffn_norm)
-            {
-                graph.addDependency("moe_router", "moe_norm");
-            }
-        }
-
-        // Expert FFNs: Each expert processes its assigned tokens
-        // With expert parallelism, different experts can run on different devices
-        for (int e = 0; e < n_experts; ++e)
-        {
-            int expert_device = default_device;
-            if (params.enable_expert_parallel && params.expert_device_map)
-            {
-                expert_device = params.expert_device_map[e];
-            }
-
-            MoEExpertStage::Params expert_params;
-            expert_params.expert_id = e;
-            expert_params.input = params.input;
-            expert_params.output = nullptr; // Placeholder - would be allocated
-            // Note: MoEExpertStage expects TensorBase*, but we have float* const*
-            // In a real implementation, we'd have proper tensor wrappers
-            expert_params.gate_w = nullptr;        // Placeholder
-            expert_params.up_w = nullptr;          // Placeholder
-            expert_params.down_w = nullptr;        // Placeholder
-            expert_params.token_indices = nullptr; // Would come from router
-            expert_params.d_model = d_model;
-            expert_params.intermediate_dim = params.d_ff;
-
-            std::string node_name = "expert_" + std::to_string(e);
-            graph.addNode(node_name,
-                          ComputeStageFactory::createMoEExpert(expert_params, backend),
-                          expert_device);
-            graph.addDependency(node_name, "moe_router");
-        }
-
-        // Combine: Weighted sum of expert outputs per token
-        {
-            MoECombineStage::Params combine_params;
-            combine_params.expert_outputs = nullptr;   // Placeholder
-            combine_params.expert_weights = nullptr;   // From router
-            combine_params.token_expert_map = nullptr; // From router
-            combine_params.output = params.output;
-            combine_params.seq_len = seq_len;
-            combine_params.d_model = d_model;
-            combine_params.top_k = top_k;
-
-            graph.addNode("moe_combine",
-                          ComputeStageFactory::createMoECombine(combine_params, backend),
-                          default_device);
-
-            // Combine depends on all experts completing
-            for (int e = 0; e < n_experts; ++e)
-            {
-                graph.addDependency("moe_combine", "expert_" + std::to_string(e));
-            }
-        }
-
-        // Residual add
-        if (params.residual)
-        {
-            ResidualAddStage::Params res_params;
-            res_params.input = params.output;
-            res_params.residual = params.residual;
-            res_params.output = params.output;
-            res_params.num_elements = static_cast<size_t>(seq_len) * d_model;
-
-            graph.addNode("moe_residual",
-                          ComputeStageFactory::createResidualAdd(res_params, backend),
-                          default_device);
-            graph.addDependency("moe_residual", "moe_combine");
-        }
-
-        LOG_DEBUG("[LayerExecutor] Built MoE graph: " << graph.size()
-                                                      << " stages, " << n_experts << " experts");
+        LOG_DEBUG("[LayerExecutor] Building MoE graph placeholder with " << params.n_experts << " experts");
+        LOG_WARN("[LayerExecutor::buildMoEGraph] Base class returns empty graph");
 
         return graph;
     }

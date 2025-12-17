@@ -26,6 +26,30 @@
  * return KernelFactory::createGemm(DeviceType::CUDA, createCudaGemm, createCPUGemm);
  * ```
  *
+ * ## Activation/Weight Type Compatibility
+ *
+ * **CRITICAL**: Not all activation types work with all weight types!
+ *
+ * The QuantisedGemmKernel uses INT8 VNNI instructions (vpdpbusd) which require:
+ * - Activations quantized to Q8_1 format (8-bit with scale+sum)
+ * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
+ *
+ * Use `isActivationWeightCompatible()` to validate before creating kernels.
+ *
+ * Compatibility Matrix:
+ * | Activation | FP32 Weight | BF16 Weight | FP16 Weight | Quantized Weight |
+ * |------------|-------------|-------------|-------------|------------------|
+ * | FP32       | ✓           | ✓           | ✓           | ✓               |
+ * | BF16       | ✓           | ✓           | ✓           | ✓               |
+ * | FP16       | ✓           | ✓           | ✓           | ✓               |
+ * | Q8_1       | ✗           | ✗           | ✗           | ✓               |
+ *
+ * Why Q8_1 only works with quantized weights:
+ * - Q8_1 activations use INT8×INT8 dot products (AVX512-VNNI vpdpbusd)
+ * - FP32/FP16/BF16 weights would require different GEMM kernel (FloatingPointGemmKernel)
+ * - FloatingPointGemmKernel expects FP32 activations (not Q8_1 blocks)
+ * - Mixing Q8_1 activations with FP weights produces garbage results
+ *
  * ## Supported Device Types
  *
  * - **CPU**: OpenBLAS/MKL backends (AVX-512 VNNI JIT kernels)
@@ -86,6 +110,13 @@ namespace llaminar2
     class FP32Tensor;
     class FP16Tensor;
     class BF16Tensor;
+
+    enum class TensorType; // Forward declare from Tensors.h
+
+    namespace gemm_v4
+    {
+        struct QuantisedPackedWeights;
+    } // namespace gemm_v4
 } // namespace llaminar2
 
 namespace llaminar
@@ -149,6 +180,66 @@ namespace llaminar
                  * @throws std::runtime_error if device_idx is invalid
                  */
                 static DeviceType getDeviceType(int device_idx);
+
+                // ==========================================================================
+                // Activation/Weight Type Compatibility
+                // ==========================================================================
+
+                /**
+                 * @brief Check if an activation type is compatible with a weight type for GEMM
+                 *
+                 * **Design Rationale**:
+                 * The QuantisedGemmKernel uses INT8 VNNI instructions which require:
+                 * - Activations in Q8_1 format (8-bit with scale+sum per block)
+                 * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
+                 *
+                 * FP32/FP16/BF16 activations use FloatingPointGemmKernel with OpenBLAS/MKL,
+                 * which dequantizes weights on-the-fly. This is more flexible but slower.
+                 *
+                 * @param activation_type Type of the activation tensor
+                 * @param weight_type Type of the weight tensor
+                 * @return true if compatible, false otherwise
+                 *
+                 * @note FP32/FP16/BF16 activations work with ANY weight type
+                 * @note Q8_1 activations ONLY work with quantized weights (not FP32/FP16/BF16)
+                 *
+                 * Example:
+                 * @code
+                 * if (!KernelFactory::isActivationWeightCompatible(TensorType::Q8_1, TensorType::FP32)) {
+                 *     throw std::runtime_error("Q8_1 activations require quantized weights!");
+                 * }
+                 * @endcode
+                 */
+                static bool isActivationWeightCompatible(
+                    llaminar2::TensorType activation_type,
+                    llaminar2::TensorType weight_type);
+
+                /**
+                 * @brief Check if a tensor type is a floating-point format
+                 *
+                 * @param type Tensor type to check
+                 * @return true if FP32, FP16, or BF16
+                 */
+                static bool isFloatingPointType(llaminar2::TensorType type);
+
+                /**
+                 * @brief Check if a tensor type is a quantized format
+                 *
+                 * @param type Tensor type to check
+                 * @return true if any quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
+                 */
+                static bool isQuantizedType(llaminar2::TensorType type);
+
+                /**
+                 * @brief Get a human-readable error message for incompatible types
+                 *
+                 * @param activation_type Activation tensor type
+                 * @param weight_type Weight tensor type
+                 * @return Error message explaining why types are incompatible
+                 */
+                static std::string getCompatibilityErrorMessage(
+                    llaminar2::TensorType activation_type,
+                    llaminar2::TensorType weight_type);
 
                 // ==========================================================================
                 // GEMM Kernel Creation - One overload per tensor type
@@ -482,6 +573,67 @@ namespace llaminar
                     const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
 
                 // ==========================================================================
+                // Generic TensorBase* Factory Methods - Auto-dispatch by native_type()
+                // ==========================================================================
+
+                /**
+                 * @brief Create RMSNorm kernel for any tensor type via dynamic dispatch
+                 *
+                 * Dispatches to the appropriate typed createRMSNorm overload based on
+                 * tensor->native_type(). Use this when you have a TensorBase* and want
+                 * to avoid manual type switching.
+                 *
+                 * @param tensor Input tensor (FP32, BF16, FP16, or Q8_1)
+                 * @param dev_type Target device type
+                 * @return ITensorRMSNorm implementation appropriate for the tensor type
+                 * @throws std::runtime_error if tensor type is unsupported
+                 */
+                static std::unique_ptr<llaminar2::ITensorRMSNorm> createRMSNorm(
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create RoPE kernel for any tensor type via dynamic dispatch
+                 *
+                 * Dispatches to the appropriate typed createRoPE overload based on
+                 * tensor->native_type().
+                 *
+                 * @param tensor Input tensor (FP32, BF16, FP16, or Q8_1)
+                 * @param dev_type Target device type
+                 * @return ITensorRoPE implementation appropriate for the tensor type
+                 * @throws std::runtime_error if tensor type is unsupported
+                 */
+                static std::unique_ptr<llaminar2::ITensorRoPE> createRoPE(
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create SwiGLU kernel for any tensor type via dynamic dispatch
+                 *
+                 * Dispatches to the appropriate typed createSwiGLU overload based on
+                 * tensor->native_type().
+                 *
+                 * @param tensor Input tensor (FP32, BF16, FP16, or Q8_1)
+                 * @param dev_type Target device type
+                 * @return ITensorSwiGLU implementation appropriate for the tensor type
+                 * @throws std::runtime_error if tensor type is unsupported
+                 */
+                static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Attention kernel for any tensor type via dynamic dispatch
+                 *
+                 * Dispatches to the appropriate typed createAttention overload based on
+                 * tensor->native_type().
+                 *
+                 * @param tensor Input tensor (FP32, BF16, FP16, or Q8_1)
+                 * @param dev_type Target device type
+                 * @return ITensorAttention implementation appropriate for the tensor type
+                 * @throws std::runtime_error if tensor type is unsupported
+                 */
+                static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+
+                // ==========================================================================
                 // Cached GEMM Kernel API - Pack Once, Use Many
                 // ==========================================================================
 
@@ -501,6 +653,21 @@ namespace llaminar
                  *       call clearCache() or the entry becomes stale
                  */
                 static llaminar2::ITensorGemm *getOrCreateGemm(const llaminar2::TensorBase *tensor);
+
+                /**
+                 * @brief Ensure tensor has packed weights in its cache and return pointer
+                 *
+                 * This is the canonical way to get packed weights for a tensor. The weights
+                 * are stored in tensor->cache_ so they outlive any individual kernel.
+                 *
+                 * Thread-safe: can be called from multiple threads.
+                 *
+                 * @param tensor Quantized tensor that implements IINT8Unpackable
+                 * @return Pointer to packed weights (stored in tensor's cache_)
+                 * @throws std::runtime_error if packing fails
+                 */
+                static const llaminar2::gemm_v4::QuantisedPackedWeights *
+                ensurePackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
 
                 /**
                  * @brief Clear cached kernel for a specific tensor

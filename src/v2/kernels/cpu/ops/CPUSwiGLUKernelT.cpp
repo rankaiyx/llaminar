@@ -178,8 +178,8 @@ namespace llaminar2
     }
 
     bool CPUSwiGLUKernelT<ActivationPrecision::FP32>::apply_tensor(
-        TensorBase *gate,
-        TensorBase *up,
+        const TensorBase *gate,
+        const TensorBase *up,
         TensorBase *output,
         int rows, int cols,
         bool add_residual,
@@ -246,8 +246,8 @@ namespace llaminar2
     }
 
     bool CPUSwiGLUKernelT<ActivationPrecision::BF16>::apply_tensor(
-        TensorBase *gate,
-        TensorBase *up,
+        const TensorBase *gate,
+        const TensorBase *up,
         TensorBase *output,
         int rows, int cols,
         bool add_residual,
@@ -270,8 +270,8 @@ namespace llaminar2
         }
 
         // Cast to BF16Tensor to access bf16_data() / mutable_bf16_data()
-        auto *gate_bf16 = dynamic_cast<BF16Tensor *>(gate);
-        auto *up_bf16 = dynamic_cast<BF16Tensor *>(up);
+        auto *gate_bf16 = dynamic_cast<const BF16Tensor *>(gate);
+        auto *up_bf16 = dynamic_cast<const BF16Tensor *>(up);
         auto *output_bf16 = dynamic_cast<BF16Tensor *>(output);
 
         if (!gate_bf16 || !up_bf16 || !output_bf16)
@@ -324,8 +324,8 @@ namespace llaminar2
     }
 
     bool CPUSwiGLUKernelT<ActivationPrecision::FP16>::apply_tensor(
-        TensorBase *gate,
-        TensorBase *up,
+        const TensorBase *gate,
+        const TensorBase *up,
         TensorBase *output,
         int rows, int cols,
         bool add_residual,
@@ -348,8 +348,8 @@ namespace llaminar2
         }
 
         // Cast to FP16Tensor to access fp16_data() / mutable_fp16_data()
-        auto *gate_fp16 = dynamic_cast<FP16Tensor *>(gate);
-        auto *up_fp16 = dynamic_cast<FP16Tensor *>(up);
+        auto *gate_fp16 = dynamic_cast<const FP16Tensor *>(gate);
+        auto *up_fp16 = dynamic_cast<const FP16Tensor *>(up);
         auto *output_fp16 = dynamic_cast<FP16Tensor *>(output);
 
         if (!gate_fp16 || !up_fp16 || !output_fp16)
@@ -406,8 +406,8 @@ namespace llaminar2
     }
 
     bool CPUSwiGLUKernelT<ActivationPrecision::Q8_1>::apply_tensor(
-        TensorBase *gate,
-        TensorBase *up,
+        const TensorBase *gate,
+        const TensorBase *up,
         TensorBase *output,
         int rows, int cols,
         bool add_residual,
@@ -430,8 +430,8 @@ namespace llaminar2
         }
 
         // Cast to Q8_1Tensor to access q8_1_blocks() / mutable_q8_1_blocks()
-        auto *gate_q8 = dynamic_cast<Q8_1Tensor *>(gate);
-        auto *up_q8 = dynamic_cast<Q8_1Tensor *>(up);
+        auto *gate_q8 = dynamic_cast<const Q8_1Tensor *>(gate);
+        auto *up_q8 = dynamic_cast<const Q8_1Tensor *>(up);
         auto *output_q8 = dynamic_cast<Q8_1Tensor *>(output);
 
         if (!gate_q8 || !up_q8 || !output_q8)

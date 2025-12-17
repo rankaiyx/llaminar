@@ -29,7 +29,7 @@ class LayerExecutorInterfaceTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        ctx_ = std::make_unique<MockDeviceContext>(0, ComputeBackendType::CPU_OPENBLAS);
+        ctx_ = std::make_unique<MockDeviceContext>(0, ComputeBackendType::CPU);
     }
 
     std::unique_ptr<MockDeviceContext> ctx_;

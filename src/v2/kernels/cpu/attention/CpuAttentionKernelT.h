@@ -214,7 +214,13 @@ namespace llaminar2
 
     private:
         /**
-         * @brief Typed implementation of attention
+         * @brief Typed implementation of attention with mode-based dispatch
+         *
+         * Uses AttentionMode to dispatch to specialized implementations:
+         * - DECODE: Optimized dot-product path for single-token generation
+         * - PREFILL: GEMM-based path for full prompt processing
+         * - CHUNKED_PREFILL: GEMM with separate kv_len (incremental)
+         * - BATCHED_DECODE: Parallel decode for multiple sequences
          *
          * @param Q Input Q [seq_len, n_heads, head_dim]
          * @param K Input K [kv_len, n_kv_heads, head_dim]
@@ -263,6 +269,11 @@ namespace llaminar2
                 return false;
             }
 
+            // Detect attention mode for dispatch
+            AttentionMode mode = detect_attention_mode(1 /* batch_size */, seq_len, kv_len);
+            LOG_TRACE("[CpuAttentionKernelT] Mode: " << attention_mode_name(mode)
+                                                     << " seq_len=" << seq_len << " kv_len=" << kv_len);
+
             // Create GEMM kernel once (reused across heads) using ActivationTraits!
             auto gemm = Traits::create_activation_gemm();
 
@@ -277,126 +288,27 @@ namespace llaminar2
                 else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
                     format = ActivationFormat::FP16;
 
-                // 1. Compute Q @ K^T -> Scores (FP32) + Mask + Softmax
-                // No GQA broadcast needed! We handle strides virtually.
-                const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-                const int heads_per_kv = n_heads / n_kv_heads;
-
-                // Parallelism strategy:
-                // 1. Decoding (seq_len < 128): Always parallelize over heads to hide latency/overhead.
-                //    BLAS threading is inefficient for small matrices (M=1).
-                // 2. Prefill (seq_len >= 128):
-                //    - If we have enough heads to saturate ~50% of cores, parallelize over heads.
-                //      (Single-threaded GEMM is efficient, avoids sync overhead).
-                //    - If few heads (e.g. 1-4) on many cores, run sequentially to let BLAS use all cores.
-                const int max_threads = omp_get_max_threads();
-                bool parallelize_heads = true;
-                if (seq_len >= 128 && n_heads * 2 < max_threads)
+                // Dispatch to mode-specific implementation
+                switch (mode)
                 {
-                    parallelize_heads = false;
+                case AttentionMode::DECODE:
+                    return compute_decode_native(
+                        Q, K, V, output, kv_len, n_heads, n_kv_heads, head_dim,
+                        causal, scores, mask, gemm.get(), format);
+
+                case AttentionMode::PREFILL:
+                case AttentionMode::CHUNKED_PREFILL:
+                    return compute_prefill_native(
+                        Q, K, V, output, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                        causal, scores, mask, gemm.get(), format);
+
+                case AttentionMode::BATCHED_DECODE:
+                    // Single-sequence compute_typed doesn't support batched decode
+                    // Fall through to prefill path (batch_size=1 means not really batched)
+                    return compute_prefill_native(
+                        Q, K, V, output, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                        causal, scores, mask, gemm.get(), format);
                 }
-
-                // 2. Scores @ V -> Output (FP32)
-                std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
-
-#pragma omp parallel for if (parallelize_heads)
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    // --- Step 1: Q @ K^T -> Scores ---
-                    float *scores_h = scores + h * seq_len * kv_len;
-                    const ElementType *Q_h = Q + h * head_dim;
-
-                    // Virtual GQA: Map head h to kv_head
-                    int kv_h = h / heads_per_kv;
-                    const ElementType *K_h = K + kv_h * head_dim;
-
-                    const int lda_k = n_heads * head_dim;
-                    const int ldb_k = n_kv_heads * head_dim; // Stride of K is based on n_kv_heads
-                    const int ldc_k = kv_len;
-
-                    // Optimized path for decoding (seq_len == 1) on FP32
-                    if (seq_len == 1 && std::is_same_v<TensorT, FP32Tensor>)
-                    {
-                        if constexpr (std::is_same_v<TensorT, FP32Tensor>)
-                        {
-                            // 1. Q @ K^T
-                            for (int t = 0; t < kv_len; ++t)
-                            {
-                                const float *k_ptr = K_h + t * ldb_k;
-                                float dot = 0.0f;
-#pragma omp simd reduction(+ : dot)
-                                for (int d = 0; d < head_dim; ++d)
-                                {
-                                    dot += Q_h[d] * k_ptr[d];
-                                }
-                                scores_h[t] = dot * scale;
-                                if (mask)
-                                    scores_h[t] += mask[t];
-                            }
-
-                            // 2. Softmax (Vectorized)
-                            // Note: scale is already applied in step 1, so we pass 1.0f here.
-                            // Causal masking is also handled in step 1 via the mask add.
-                            llaminar2::primitives::softmax_row_fp32(
-                                scores_h,
-                                kv_len,
-                                false, // causal
-                                1.0f,  // scale
-                                -1     // row_idx
-                            );
-
-                            // 3. Scores @ V
-                            const float *weights_h = scores_h;
-                            const ElementType *V_h = V + kv_h * head_dim;
-                            float *output_h = output + h * head_dim;
-
-                            const int ldb_v = n_kv_heads * head_dim;
-
-                            // Initialize output to 0
-                            std::memset(output_h, 0, head_dim * sizeof(float));
-
-                            for (int t = 0; t < kv_len; ++t)
-                            {
-                                float s = weights_h[t];
-                                const float *v_ptr = V_h + t * ldb_v;
-#pragma omp simd
-                                for (int d = 0; d < head_dim; ++d)
-                                {
-                                    output_h[d] += s * v_ptr[d];
-                                }
-                            }
-                            continue; // Skip generic path
-                        }
-                    }
-
-                    gemm->template multiply_with_softmax_strided_typed<ElementType, ElementType>(
-                        Q_h, K_h, scores_h,
-                        seq_len, kv_len, head_dim,
-                        lda_k, ldb_k, ldc_k,
-                        scale,
-                        true, // transpose_B
-                        1,    // softmax_axis
-                        mask,
-                        causal,
-                        nullptr, -1, format);
-
-                    // --- Step 2: Scores @ V -> Output ---
-                    const float *weights_h = scores_h; // Reuse scores_h
-                    const ElementType *V_h = V + kv_h * head_dim;
-                    float *output_h = output + h * head_dim;
-
-                    const int lda_v = kv_len;
-                    const int ldb_v = n_kv_heads * head_dim; // Stride of V is based on n_kv_heads
-                    const int ldc_v = n_heads * head_dim;
-
-                    gemm->template multiply_activations_strided_typed<float, ElementType>(
-                        weights_h, V_h, output_h,
-                        seq_len, head_dim, kv_len,
-                        lda_v, ldb_v, ldc_v,
-                        false, 1.0f, 0.0f, nullptr, -1, format);
-                }
-
-                return true;
             }
 
             // 1. Convert Q, K, V to FP32 (required for multiply_activations_strided)
@@ -641,6 +553,235 @@ namespace llaminar2
                         -1);     // device_idx (CPU)
                 }
             } // End fused parallel region
+
+            return true;
+        }
+
+        // ==========================================================================
+        // Mode-Specific Attention Implementations (Native Precision)
+        // ==========================================================================
+
+        /**
+         * @brief Decode mode: Single token attending to full KV cache
+         *
+         * Optimized for autoregressive decoding where seq_len=1.
+         * Uses dot product + softmax + weighted sum (not GEMM).
+         *
+         * Performance characteristics:
+         * - Memory bound (small compute, large cache reads)
+         * - Parallelizes over heads (each head independent)
+         * - SIMD vectorization for dot product and weighted sum
+         *
+         * @tparam TensorT Tensor type for K/V (Q always FP32 in decode)
+         */
+        bool compute_decode_native(
+            const ElementType *Q, const ElementType *K, const ElementType *V,
+            float *output,
+            int kv_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal, float *scores, const float *mask,
+            ITensorGemm *gemm, ActivationFormat format) const
+        {
+            (void)causal; // Unused in decode (last token attends to all)
+            (void)gemm;   // Not used in decode path
+            (void)format; // Native precision path
+
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            const int heads_per_kv = n_heads / n_kv_heads;
+
+            // Always parallelize over heads for decode (latency-sensitive)
+#pragma omp parallel for
+            for (int h = 0; h < n_heads; ++h)
+            {
+                float *scores_h = scores + h * kv_len;
+                const ElementType *Q_h = Q + h * head_dim;
+
+                // Virtual GQA: Map head h to kv_head
+                int kv_h = h / heads_per_kv;
+                const ElementType *K_h = K + kv_h * head_dim;
+
+                const int ldb_k = n_kv_heads * head_dim;
+
+                // Step 1: Q @ K^T via dot products
+                if constexpr (std::is_same_v<TensorT, FP32Tensor>)
+                {
+                    for (int t = 0; t < kv_len; ++t)
+                    {
+                        const float *k_ptr = K_h + t * ldb_k;
+                        float dot = 0.0f;
+#pragma omp simd reduction(+ : dot)
+                        for (int d = 0; d < head_dim; ++d)
+                        {
+                            dot += Q_h[d] * k_ptr[d];
+                        }
+                        scores_h[t] = dot * scale;
+                        if (mask)
+                            scores_h[t] += mask[t];
+                    }
+                }
+                else
+                {
+                    // BF16/FP16: convert on-the-fly
+                    for (int t = 0; t < kv_len; ++t)
+                    {
+                        const ElementType *k_ptr = K_h + t * ldb_k;
+                        float dot = 0.0f;
+                        for (int d = 0; d < head_dim; ++d)
+                        {
+                            float q_val, k_val;
+                            if constexpr (std::is_same_v<TensorT, BF16Tensor>)
+                            {
+                                q_val = simd::bf16_to_fp32(Q_h[d]);
+                                k_val = simd::bf16_to_fp32(k_ptr[d]);
+                            }
+                            else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
+                            {
+                                q_val = simd::fp16_to_fp32(Q_h[d]);
+                                k_val = simd::fp16_to_fp32(k_ptr[d]);
+                            }
+                            else
+                            {
+                                // Note: This path only reached for FP32/BF16/FP16 (constexpr if above)
+                                // Q8_1/INT32/Q8_0 use the dequantize-first fallback in compute_typed()
+                                q_val = 0.0f;
+                                k_val = 0.0f;
+                            }
+                            dot += q_val * k_val;
+                        }
+                        scores_h[t] = dot * scale;
+                        if (mask)
+                            scores_h[t] += mask[t];
+                    }
+                }
+
+                // Step 2: Softmax (vectorized, single row)
+                llaminar2::primitives::softmax_row_fp32(
+                    scores_h, kv_len, false, 1.0f, -1);
+
+                // Step 3: Scores @ V (weighted sum)
+                const float *weights_h = scores_h;
+                const ElementType *V_h = V + kv_h * head_dim;
+                float *output_h = output + h * head_dim;
+                const int ldb_v = n_kv_heads * head_dim;
+
+                std::memset(output_h, 0, head_dim * sizeof(float));
+
+                if constexpr (std::is_same_v<TensorT, FP32Tensor>)
+                {
+                    for (int t = 0; t < kv_len; ++t)
+                    {
+                        float s = weights_h[t];
+                        const float *v_ptr = V_h + t * ldb_v;
+#pragma omp simd
+                        for (int d = 0; d < head_dim; ++d)
+                        {
+                            output_h[d] += s * v_ptr[d];
+                        }
+                    }
+                }
+                else
+                {
+                    // BF16/FP16: convert V on-the-fly
+                    for (int t = 0; t < kv_len; ++t)
+                    {
+                        float s = weights_h[t];
+                        const ElementType *v_ptr = V_h + t * ldb_v;
+                        for (int d = 0; d < head_dim; ++d)
+                        {
+                            float v_val;
+                            if constexpr (std::is_same_v<TensorT, BF16Tensor>)
+                                v_val = simd::bf16_to_fp32(v_ptr[d]);
+                            else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
+                                v_val = simd::fp16_to_fp32(v_ptr[d]);
+                            else
+                            {
+                                // Note: This path only reached for FP32/BF16/FP16 (constexpr if above)
+                                v_val = 0.0f;
+                            }
+                            output_h[d] += s * v_val;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        /**
+         * @brief Prefill mode: Full prompt processing with GEMM
+         *
+         * Optimized for prompt ingestion where seq_len > 1.
+         * Uses batched GEMM for Q@K^T and Scores@V.
+         *
+         * Performance characteristics:
+         * - Compute bound (large matrix multiplications)
+         * - Parallelization depends on seq_len vs thread count
+         * - Uses fused softmax in Q@K^T when available
+         *
+         * Also handles CHUNKED_PREFILL where seq_len < kv_len.
+         */
+        bool compute_prefill_native(
+            const ElementType *Q, const ElementType *K, const ElementType *V,
+            float *output,
+            int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal, float *scores, const float *mask,
+            ITensorGemm *gemm, ActivationFormat format) const
+        {
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            const int heads_per_kv = n_heads / n_kv_heads;
+
+            // Parallelism strategy:
+            // - Small seq_len: Parallelize over heads (hide latency)
+            // - Large seq_len with few heads: Sequential (let BLAS use all cores)
+            const int max_threads = omp_get_max_threads();
+            bool parallelize_heads = true;
+            if (seq_len >= 128 && n_heads * 2 < max_threads)
+            {
+                parallelize_heads = false;
+            }
+
+            std::memset(output, 0, seq_len * n_heads * head_dim * sizeof(float));
+
+#pragma omp parallel for if (parallelize_heads)
+            for (int h = 0; h < n_heads; ++h)
+            {
+                float *scores_h = scores + h * seq_len * kv_len;
+                const ElementType *Q_h = Q + h * head_dim;
+
+                // Virtual GQA: Map head h to kv_head
+                int kv_h = h / heads_per_kv;
+                const ElementType *K_h = K + kv_h * head_dim;
+
+                const int lda_k = n_heads * head_dim;
+                const int ldb_k = n_kv_heads * head_dim;
+                const int ldc_k = kv_len;
+
+                // Q @ K^T with fused softmax
+                gemm->template multiply_with_softmax_strided_typed<ElementType, ElementType>(
+                    Q_h, K_h, scores_h,
+                    seq_len, kv_len, head_dim,
+                    lda_k, ldb_k, ldc_k,
+                    scale,
+                    true, // transpose_B
+                    1,    // softmax_axis
+                    mask,
+                    causal,
+                    nullptr, -1, format);
+
+                // Scores @ V -> Output
+                const float *weights_h = scores_h;
+                const ElementType *V_h = V + kv_h * head_dim;
+                float *output_h = output + h * head_dim;
+
+                const int lda_v = kv_len;
+                const int ldb_v = n_kv_heads * head_dim;
+                const int ldc_v = n_heads * head_dim;
+
+                gemm->template multiply_activations_strided_typed<float, ElementType>(
+                    weights_h, V_h, output_h,
+                    seq_len, head_dim, kv_len,
+                    lda_v, ldb_v, ldc_v,
+                    false, 1.0f, 0.0f, nullptr, -1, format);
+            }
 
             return true;
         }

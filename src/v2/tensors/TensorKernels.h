@@ -12,6 +12,7 @@
 
 #include "../utils/MPIContext.h"
 #include <memory>
+#include <vector>
 
 namespace llaminar2
 {
@@ -466,6 +467,103 @@ namespace llaminar2
             (void)mpi_ctx;
             (void)device_idx;
             return false;
+        }
+
+        /**
+         * @brief Descriptor for fused multi-projection GEMM
+         *
+         * Used by multiply_fused() to specify multiple output projections
+         * that share the same input. This is device-agnostic - the kernel
+         * implementation determines how to optimize (e.g., CPU quantizes once,
+         * GPU might batch into single kernel launch).
+         */
+        struct FusedProjectionDesc
+        {
+            ITensorGemm *kernel;               ///< GEMM kernel for this projection (with packed weights)
+            float *output;                     ///< Output buffer [m, n]
+            int n;                             ///< Output dimension (columns)
+            const float *bias = nullptr;       ///< Optional bias [n]
+            const float *gate_input = nullptr; ///< Optional gate for SwiGLU [m, n]
+            bool do_swiglu = false;            ///< Whether to apply SwiGLU fusion
+            const char *name = nullptr;        ///< Name for debug logging
+        };
+
+        /**
+         * @brief Fused multi-projection GEMM: run multiple GEMMs sharing the same input
+         *
+         * This is optimal for patterns like Q/K/V projections or gate/up FFN projections,
+         * where the same input is projected through multiple weight matrices.
+         *
+         * **Performance Benefits** (implementation-dependent):
+         * - CPU (quantized): Input quantized once, all projections use shared Q8_1 buffer
+         * - CPU (floating-point): May benefit from cache locality
+         * - GPU: May batch into single kernel launch
+         *
+         * **Default Behavior**: Falls back to calling multiply() for each projection sequentially.
+         * Subclasses can override for optimized implementations.
+         *
+         * @param input FP32 input activations [m, k]
+         * @param projections Vector of projection descriptors
+         * @param m Number of rows (batch_size * seq_len)
+         * @param k Input dimension (must match all kernels' K dimension)
+         * @param mpi_ctx MPI context for distributed execution
+         * @param device_idx Device index for execution
+         *
+         * @return true on success, false on error
+         */
+        virtual bool multiply_fused(
+            const float *input,
+            const std::vector<FusedProjectionDesc> &projections,
+            int m, int k,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            // Default implementation: run each projection separately
+            // Subclasses (e.g., QuantisedGemmKernel) can override for optimized fusion
+            for (const auto &proj : projections)
+            {
+                if (!proj.kernel)
+                {
+                    return false;
+                }
+                // Use the projection's kernel to run the GEMM
+                bool success = proj.kernel->multiply(
+                    input, proj.output,
+                    m, proj.n, k,
+                    true, // transpose_B (typical for weights)
+                    1.0f, // alpha
+                    0.0f, // beta
+                    mpi_ctx,
+                    device_idx);
+                if (!success)
+                {
+                    return false;
+                }
+                // Note: bias and SwiGLU fusion are not handled in default implementation
+                // Optimized implementations should handle these in fused manner
+                if (proj.bias)
+                {
+                    // Simple bias add (not fused)
+                    for (int i = 0; i < m; ++i)
+                    {
+                        for (int j = 0; j < proj.n; ++j)
+                        {
+                            proj.output[i * proj.n + j] += proj.bias[j];
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        /**
+         * @brief Check if this kernel supports optimized fused multi-projection
+         *
+         * @return true if multiply_fused() has optimized implementation beyond sequential GEMMs
+         */
+        virtual bool supports_fused_projection() const
+        {
+            return false; // Default: no optimized fusion, uses sequential fallback
         }
 
         /**
@@ -1207,6 +1305,78 @@ namespace llaminar2
 
     class TensorBase;
 
+    // ==========================================================================
+    // Attention Mode Detection
+    // ==========================================================================
+
+    /**
+     * @brief Attention computation mode for kernel dispatch
+     *
+     * Different attention scenarios require different kernel implementations
+     * for optimal performance:
+     *
+     * - **PREFILL**: Processing a full prompt (GEMM-based, high parallelism)
+     * - **DECODE**: Single new token attending to cache (dot product + softmax)
+     * - **BATCHED_DECODE**: Multiple sequences, each decoding one token
+     * - **CHUNKED_PREFILL**: Large prompt split into chunks (for memory limits)
+     *
+     * Kernels use this enum for internal dispatch to specialized implementations.
+     */
+    enum class AttentionMode
+    {
+        PREFILL,        ///< seq_len > 1, kv_len == seq_len (batch GEMM path)
+        DECODE,         ///< seq_len == 1, single sequence (dot product path)
+        BATCHED_DECODE, ///< batch_size > 1, seq_len == 1 (parallel decode)
+        CHUNKED_PREFILL ///< seq_len > 1, kv_len > seq_len (incremental prefill)
+    };
+
+    /**
+     * @brief Detect attention mode from dimensions
+     *
+     * Used by kernels to dispatch to optimized implementations.
+     *
+     * @param batch_size Number of sequences
+     * @param seq_len Query sequence length (new tokens)
+     * @param kv_len Key/Value length (total cached + new tokens)
+     * @return Detected AttentionMode
+     *
+     * Logic:
+     * - batch_size > 1 && seq_len == 1 → BATCHED_DECODE
+     * - seq_len == 1 → DECODE
+     * - seq_len < kv_len → CHUNKED_PREFILL
+     * - otherwise → PREFILL
+     */
+    inline AttentionMode detect_attention_mode(int batch_size, int seq_len, int kv_len)
+    {
+        if (batch_size > 1 && seq_len == 1)
+            return AttentionMode::BATCHED_DECODE;
+        if (seq_len == 1)
+            return AttentionMode::DECODE;
+        if (seq_len < kv_len)
+            return AttentionMode::CHUNKED_PREFILL;
+        return AttentionMode::PREFILL;
+    }
+
+    /**
+     * @brief Get string name for AttentionMode (for logging)
+     */
+    inline const char *attention_mode_name(AttentionMode mode)
+    {
+        switch (mode)
+        {
+        case AttentionMode::PREFILL:
+            return "PREFILL";
+        case AttentionMode::DECODE:
+            return "DECODE";
+        case AttentionMode::BATCHED_DECODE:
+            return "BATCHED_DECODE";
+        case AttentionMode::CHUNKED_PREFILL:
+            return "CHUNKED_PREFILL";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
     /**
      * @brief Attention computation kernel interface
      *
@@ -1380,6 +1550,69 @@ namespace llaminar2
             (void)device_idx;
             return false; // Default: Q8_1 not supported
         }
+
+        /**
+         * @brief Compute attention using tensor objects with automatic type dispatch
+         *
+         * Inspects Q/K/V/output tensor native_type() and dispatches to the appropriate
+         * typed method (compute, compute_batch, compute_q8_1, compute_batch_q8_1).
+         *
+         * @param Q Query tensor [batch_size * seq_len, n_heads * head_dim]
+         * @param K Key tensor [batch_size * kv_len, n_kv_heads * head_dim]
+         * @param V Value tensor [batch_size * kv_len, n_kv_heads * head_dim]
+         * @param output Output tensor [batch_size * seq_len, n_heads * head_dim]
+         * @param batch_size Batch size (1 for single sequence)
+         * @param seq_len Query sequence length
+         * @param kv_len Key/value sequence length (may differ from seq_len in decode)
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads (GQA: n_heads % n_kv_heads == 0)
+         * @param head_dim Dimension per head
+         * @param causal Apply causal (lower-triangular) masking
+         * @param window_size Sliding window size (-1 = disabled)
+         * @param workspace_scores Workspace for attention scores
+         * @param workspace_mask Pre-built attention mask or nullptr
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success, false on failure or unsupported type combination
+         *
+         * @note Default returns false. Subclasses should override with type-aware dispatch.
+         */
+        virtual bool compute_tensor(
+            const TensorBase *Q,
+            const TensorBase *K,
+            const TensorBase *V,
+            TensorBase *output,
+            int batch_size,
+            int seq_len,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal = false,
+            int window_size = -1,
+            TensorBase *workspace_scores = nullptr,
+            TensorBase *workspace_mask = nullptr,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)output;
+            (void)batch_size;
+            (void)seq_len;
+            (void)kv_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)workspace_scores;
+            (void)workspace_mask;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Subclasses override with type-aware dispatch
+        }
     };
 
     /**
@@ -1500,8 +1733,8 @@ namespace llaminar2
          * Inspects gate/up/output tensor native_type() and dispatches to the appropriate
          * typed method (apply, apply_bf16, apply_fp16, apply_q8_1).
          *
-         * @param gate Gate tensor [rows, cols]
-         * @param up Up tensor [rows, cols]
+         * @param gate Gate tensor [rows, cols] (read-only)
+         * @param up Up tensor [rows, cols] (read-only)
          * @param output Output tensor [rows, cols]
          * @param rows Number of rows
          * @param cols Number of columns
@@ -1513,8 +1746,8 @@ namespace llaminar2
          * @note Default returns false. Subclasses should override with type-aware dispatch.
          */
         virtual bool apply_tensor(
-            TensorBase *gate,
-            TensorBase *up,
+            const TensorBase *gate,
+            const TensorBase *up,
             TensorBase *output,
             int rows, int cols,
             bool add_residual,

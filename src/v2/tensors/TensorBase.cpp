@@ -676,4 +676,344 @@ namespace llaminar2
         return true;
     }
 
+    // =====================================================================
+    // Tensor Comparison Utilities Implementation
+    // =====================================================================
+
+    double TensorBase::cosineSimilarityTo(const TensorBase *other) const
+    {
+        if (!other)
+        {
+            throw std::invalid_argument("cosineSimilarityTo: other tensor is null");
+        }
+
+        const size_t n = element_count();
+        if (n != other->element_count())
+        {
+            throw std::invalid_argument(
+                "cosineSimilarityTo: element count mismatch (" +
+                std::to_string(n) + " vs " + std::to_string(other->element_count()) + ")");
+        }
+
+        if (n == 0)
+        {
+            return 0.0; // Empty tensors
+        }
+
+        const float *a = fp32_data();
+        const float *b = other->fp32_data();
+
+        // Compute dot product and norms in parallel
+        double dot = 0.0;
+        double norm_a = 0.0;
+        double norm_b = 0.0;
+
+#pragma omp parallel for reduction(+ : dot, norm_a, norm_b) schedule(static)
+        for (size_t i = 0; i < n; ++i)
+        {
+            double va = static_cast<double>(a[i]);
+            double vb = static_cast<double>(b[i]);
+            dot += va * vb;
+            norm_a += va * va;
+            norm_b += vb * vb;
+        }
+
+        double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
+        if (denom < 1e-12)
+        {
+            return std::numeric_limits<double>::quiet_NaN(); // At least one tensor is zero
+        }
+
+        return dot / denom;
+    }
+
+    float TensorBase::maxAbsDiffTo(const TensorBase *other) const
+    {
+        if (!other)
+        {
+            throw std::invalid_argument("maxAbsDiffTo: other tensor is null");
+        }
+
+        const size_t n = element_count();
+        if (n != other->element_count())
+        {
+            throw std::invalid_argument(
+                "maxAbsDiffTo: element count mismatch (" +
+                std::to_string(n) + " vs " + std::to_string(other->element_count()) + ")");
+        }
+
+        if (n == 0)
+        {
+            return 0.0f;
+        }
+
+        const float *a = fp32_data();
+        const float *b = other->fp32_data();
+
+        float max_diff = 0.0f;
+
+#pragma omp parallel for reduction(max : max_diff) schedule(static)
+        for (size_t i = 0; i < n; ++i)
+        {
+            float diff = std::fabs(a[i] - b[i]);
+            if (diff > max_diff)
+            {
+                max_diff = diff;
+            }
+        }
+
+        return max_diff;
+    }
+
+    float TensorBase::meanAbsDiffTo(const TensorBase *other) const
+    {
+        if (!other)
+        {
+            throw std::invalid_argument("meanAbsDiffTo: other tensor is null");
+        }
+
+        const size_t n = element_count();
+        if (n != other->element_count())
+        {
+            throw std::invalid_argument(
+                "meanAbsDiffTo: element count mismatch (" +
+                std::to_string(n) + " vs " + std::to_string(other->element_count()) + ")");
+        }
+
+        if (n == 0)
+        {
+            return 0.0f;
+        }
+
+        const float *a = fp32_data();
+        const float *b = other->fp32_data();
+
+        double sum_diff = 0.0;
+
+#pragma omp parallel for reduction(+ : sum_diff) schedule(static)
+        for (size_t i = 0; i < n; ++i)
+        {
+            sum_diff += std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+        }
+
+        return static_cast<float>(sum_diff / static_cast<double>(n));
+    }
+
+    double TensorBase::relativeL2To(const TensorBase *other) const
+    {
+        if (!other)
+        {
+            throw std::invalid_argument("relativeL2To: other tensor is null");
+        }
+
+        const size_t n = element_count();
+        if (n != other->element_count())
+        {
+            throw std::invalid_argument(
+                "relativeL2To: element count mismatch (" +
+                std::to_string(n) + " vs " + std::to_string(other->element_count()) + ")");
+        }
+
+        if (n == 0)
+        {
+            return 0.0;
+        }
+
+        const float *a = fp32_data();
+        const float *b = other->fp32_data();
+
+        double diff_sq = 0.0;
+        double ref_sq = 0.0;
+
+#pragma omp parallel for reduction(+ : diff_sq, ref_sq) schedule(static)
+        for (size_t i = 0; i < n; ++i)
+        {
+            double va = static_cast<double>(a[i]);
+            double vb = static_cast<double>(b[i]);
+            double d = va - vb;
+            diff_sq += d * d;
+            ref_sq += vb * vb;
+        }
+
+        if (ref_sq < 1e-24)
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+
+        return std::sqrt(diff_sq) / std::sqrt(ref_sq);
+    }
+
+    double TensorBase::klDivergenceTo(const TensorBase *other) const
+    {
+        if (!other)
+        {
+            throw std::invalid_argument("klDivergenceTo: other tensor is null");
+        }
+
+        const size_t n = element_count();
+        if (n != other->element_count())
+        {
+            throw std::invalid_argument(
+                "klDivergenceTo: element count mismatch (" +
+                std::to_string(n) + " vs " + std::to_string(other->element_count()) + ")");
+        }
+
+        if (n == 0)
+        {
+            return 0.0;
+        }
+
+        const float *a = fp32_data();
+        const float *b = other->fp32_data();
+
+        // Apply softmax to convert logits to probabilities
+        // First, find max for numerical stability
+        double max_a = a[0];
+        double max_b = b[0];
+        for (size_t i = 1; i < n; ++i)
+        {
+            if (a[i] > max_a)
+                max_a = a[i];
+            if (b[i] > max_b)
+                max_b = b[i];
+        }
+
+        // Compute softmax denominators
+        double sum_exp_a = 0.0;
+        double sum_exp_b = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            sum_exp_a += std::exp(static_cast<double>(a[i]) - max_a);
+            sum_exp_b += std::exp(static_cast<double>(b[i]) - max_b);
+        }
+
+        // Compute KL divergence: KL(P || Q) = Σ P(i) × log(P(i) / Q(i))
+        // = Σ P(i) × (log P(i) - log Q(i))
+        // where P = softmax(a), Q = softmax(b)
+        double kl = 0.0;
+        constexpr double epsilon = 1e-10; // Prevent log(0)
+
+        for (size_t i = 0; i < n; ++i)
+        {
+            double p = std::exp(static_cast<double>(a[i]) - max_a) / sum_exp_a;
+            double q = std::exp(static_cast<double>(b[i]) - max_b) / sum_exp_b;
+
+            if (p > epsilon)
+            {
+                // log(P/Q) = log(P) - log(Q)
+                // = (a[i] - max_a - log(sum_exp_a)) - (b[i] - max_b - log(sum_exp_b))
+                double log_p = static_cast<double>(a[i]) - max_a - std::log(sum_exp_a);
+                double log_q = static_cast<double>(b[i]) - max_b - std::log(sum_exp_b);
+                kl += p * (log_p - log_q);
+            }
+        }
+
+        return kl;
+    }
+
+    TensorBase::ComparisonSummary TensorBase::compareTo(const TensorBase *other) const
+    {
+        if (!other)
+        {
+            throw std::invalid_argument("compareTo: other tensor is null");
+        }
+
+        const size_t n = element_count();
+        if (n != other->element_count())
+        {
+            throw std::invalid_argument(
+                "compareTo: element count mismatch (" +
+                std::to_string(n) + " vs " + std::to_string(other->element_count()) + ")");
+        }
+
+        ComparisonSummary summary{};
+
+        if (n == 0)
+        {
+            summary.cosine_similarity = 0.0;
+            summary.max_abs_diff = 0.0f;
+            summary.mean_abs_diff = 0.0f;
+            summary.relative_l2 = 0.0;
+            return summary;
+        }
+
+        const float *a = fp32_data();
+        const float *b = other->fp32_data();
+
+        // Compute all metrics in a single pass for efficiency
+        double dot = 0.0;
+        double norm_a = 0.0;
+        double norm_b = 0.0;
+        double diff_sq = 0.0;
+        double sum_diff = 0.0;
+        float max_diff = 0.0f;
+
+#pragma omp parallel
+        {
+            double local_dot = 0.0;
+            double local_norm_a = 0.0;
+            double local_norm_b = 0.0;
+            double local_diff_sq = 0.0;
+            double local_sum_diff = 0.0;
+            float local_max_diff = 0.0f;
+
+#pragma omp for schedule(static)
+            for (size_t i = 0; i < n; ++i)
+            {
+                double va = static_cast<double>(a[i]);
+                double vb = static_cast<double>(b[i]);
+                double d = va - vb;
+                float abs_d = std::fabs(a[i] - b[i]);
+
+                local_dot += va * vb;
+                local_norm_a += va * va;
+                local_norm_b += vb * vb;
+                local_diff_sq += d * d;
+                local_sum_diff += abs_d;
+                if (abs_d > local_max_diff)
+                    local_max_diff = abs_d;
+            }
+
+#pragma omp critical
+            {
+                dot += local_dot;
+                norm_a += local_norm_a;
+                norm_b += local_norm_b;
+                diff_sq += local_diff_sq;
+                sum_diff += local_sum_diff;
+                if (local_max_diff > max_diff)
+                    max_diff = local_max_diff;
+            }
+        }
+
+        // Cosine similarity
+        double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
+        if (denom < 1e-12)
+        {
+            summary.cosine_similarity = std::numeric_limits<double>::quiet_NaN();
+        }
+        else
+        {
+            summary.cosine_similarity = dot / denom;
+        }
+
+        // Max abs diff
+        summary.max_abs_diff = max_diff;
+
+        // Mean abs diff
+        summary.mean_abs_diff = static_cast<float>(sum_diff / static_cast<double>(n));
+
+        // Relative L2
+        if (norm_b < 1e-24)
+        {
+            summary.relative_l2 = std::numeric_limits<double>::infinity();
+        }
+        else
+        {
+            summary.relative_l2 = std::sqrt(diff_sq) / std::sqrt(norm_b);
+        }
+
+        return summary;
+    }
+
 } // namespace llaminar2
