@@ -153,6 +153,31 @@ namespace llaminar2
          */
         void clear();
 
+        /**
+         * @brief Merge another graph into this one
+         *
+         * Moves all nodes from the source graph into this graph.
+         * If connect_from is specified, adds dependencies from nodes in the source
+         * graph that have no dependencies to the connect_from node in this graph.
+         *
+         * @param other The graph to merge (will be emptied)
+         * @param connect_from Optional node name to connect source graph roots to
+         * @return Reference to this graph for chaining
+         */
+        ComputeGraph &merge(ComputeGraph &&other, const std::string &connect_from = "");
+
+        /**
+         * @brief Get the names of all root nodes (nodes with no dependencies)
+         * @return Vector of root node names
+         */
+        std::vector<std::string> getRootNodes() const;
+
+        /**
+         * @brief Get the names of all leaf nodes (nodes with no dependents)
+         * @return Vector of leaf node names
+         */
+        std::vector<std::string> getLeafNodes() const;
+
     private:
         std::vector<std::unique_ptr<ComputeNode>> nodes_;
         std::unordered_map<std::string, size_t> node_index_;

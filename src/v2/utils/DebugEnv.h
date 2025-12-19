@@ -447,6 +447,7 @@ namespace llaminar2
         bool executor_validation = false;          ///< Validate outputs after each stage
         bool auto_weight_transfer = true;          ///< Auto-transfer weights to device
         bool use_graph_buffer_management = false;  ///< Use GraphBufferManager for buffer allocation
+        bool exec_full_forward = false;            ///< Use orchestrator->executeForward() for complete inference
 
         // Per-operation feature flags (enable incremental migration)
         // Model-level operations (embedding, final norm, lm head)
@@ -501,6 +502,12 @@ namespace llaminar2
             if (graph_buf_env)
             {
                 use_graph_buffer_management = (std::atoi(graph_buf_env) != 0);
+            }
+
+            const char *full_forward_env = std::getenv("LLAMINAR_EXEC_FULL_FORWARD");
+            if (full_forward_env)
+            {
+                exec_full_forward = (std::atoi(full_forward_env) != 0);
             }
 
             // Model-level operation flags (embedding, lm_head)

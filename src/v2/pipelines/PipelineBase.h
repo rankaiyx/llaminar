@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "../inference/IInferenceRunner.h"
 #include "../utils/MPIContext.h"
 #include "../backends/ComputeBackend.h"
 #include "../loaders/ModelContext.h"
@@ -267,8 +268,10 @@ namespace llaminar2
      *
      * Provides common infrastructure for model execution.
      * Derived classes implement architecture-specific logic.
+     *
+     * Implements IInferenceRunner interface for unified execution.
      */
-    class PipelineBase
+    class PipelineBase : public IInferenceRunner
     {
     public:
         /**
@@ -294,14 +297,14 @@ namespace llaminar2
          * @param seq_len Number of tokens
          * @return true on success, false on error
          */
-        virtual bool forward(const int *tokens, int seq_len) = 0;
+        bool forward(const int *tokens, int seq_len) override = 0;
 
         /**
          * @brief Get output logits (FP32)
          *
          * @return Logits tensor [seq_len, vocab_size], or nullptr if not available
          */
-        virtual const float *logits() const;
+        const float *logits() const override;
 
         // ===== Snapshot Capture API (for parity testing / debugging) =====
         // Only available when ENABLE_PIPELINE_SNAPSHOTS is defined (test builds)
@@ -406,7 +409,7 @@ namespace llaminar2
          *
          * @return Architecture string (e.g., "qwen2", "qwen3", "qwen3-moe")
          */
-        virtual const char *architecture() const = 0;
+        virtual const char *architecture() const override = 0;
 
         /**
          * @brief Get model context
@@ -438,7 +441,29 @@ namespace llaminar2
          * Default implementation is a no-op. Derived classes should override
          * if they maintain cached state (e.g., KV cache for attention).
          */
-        virtual void clear_cache() {}
+        void clear_cache() override {}
+
+        /**
+         * @brief Get vocabulary size
+         *
+         * @return Number of tokens in vocabulary
+         */
+        int vocab_size() const override { return vocab_size_; }
+
+        /**
+         * @brief Get current cache position
+         *
+         * For autoregressive generation, this returns the position offset
+         * for the next token (i.e., how many tokens have been processed).
+         *
+         * @return Current position in the sequence
+         */
+        int get_position() const override { return 0; }
+
+        /**
+         * @brief Get execution path (always PIPELINE for PipelineBase)
+         */
+        ExecutionPath executionPath() const override { return ExecutionPath::PIPELINE; }
 
     protected:
         // Context management

@@ -13,6 +13,7 @@
 #include <chrono>
 #include <queue>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace llaminar2
 {
@@ -230,6 +231,95 @@ namespace llaminar2
     {
         nodes_.clear();
         node_index_.clear();
+    }
+
+    ComputeGraph &ComputeGraph::merge(ComputeGraph &&other, const std::string &connect_from)
+    {
+        if (other.nodes_.empty())
+        {
+            return *this;
+        }
+
+        // Find root nodes in the source graph (nodes with no dependencies)
+        std::vector<std::string> source_roots;
+        for (const auto &node : other.nodes_)
+        {
+            if (node->dependencies.empty())
+            {
+                source_roots.push_back(node->name);
+            }
+        }
+
+        // Move all nodes from source to this graph
+        for (auto &node : other.nodes_)
+        {
+            // Check for name collision
+            if (node_index_.find(node->name) != node_index_.end())
+            {
+                LOG_WARN("[ComputeGraph::merge] Node name collision: " << node->name << ", skipping");
+                continue;
+            }
+
+            size_t idx = nodes_.size();
+            node_index_[node->name] = idx;
+            nodes_.push_back(std::move(node));
+        }
+
+        // If connect_from is specified, connect source roots to it
+        if (!connect_from.empty() && node_index_.find(connect_from) != node_index_.end())
+        {
+            for (const auto &root_name : source_roots)
+            {
+                auto it = node_index_.find(root_name);
+                if (it != node_index_.end())
+                {
+                    nodes_[it->second]->dependencies.push_back(connect_from);
+                }
+            }
+        }
+
+        // Clear the source graph
+        other.nodes_.clear();
+        other.node_index_.clear();
+
+        return *this;
+    }
+
+    std::vector<std::string> ComputeGraph::getRootNodes() const
+    {
+        std::vector<std::string> roots;
+        for (const auto &node : nodes_)
+        {
+            if (node->dependencies.empty())
+            {
+                roots.push_back(node->name);
+            }
+        }
+        return roots;
+    }
+
+    std::vector<std::string> ComputeGraph::getLeafNodes() const
+    {
+        // Build set of all nodes that are depended upon
+        std::unordered_set<std::string> has_dependents;
+        for (const auto &node : nodes_)
+        {
+            for (const auto &dep : node->dependencies)
+            {
+                has_dependents.insert(dep);
+            }
+        }
+
+        // Nodes not in has_dependents are leaves
+        std::vector<std::string> leaves;
+        for (const auto &node : nodes_)
+        {
+            if (has_dependents.find(node->name) == has_dependents.end())
+            {
+                leaves.push_back(node->name);
+            }
+        }
+        return leaves;
     }
 
     // =============================================================================

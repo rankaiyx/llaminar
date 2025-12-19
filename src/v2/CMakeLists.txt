@@ -512,6 +512,8 @@ add_library(llaminar2_core STATIC
     execution/LivenessAnalyzer.cpp
     execution/LayerExecutor.cpp
     execution/ModelExecutor.cpp
+    # Inference dispatch (InferenceRunner decouples pipeline vs graph paths)
+    inference/InferenceRunner.cpp
     loaders/ModelLoader.cpp
     loaders/ModelContext.cpp
     loaders/WeightManager.cpp
@@ -522,6 +524,7 @@ add_library(llaminar2_core STATIC
     pipelines/PipelineExecutor.cpp
     pipelines/qwen/Qwen2Pipeline.cpp
     pipelines/qwen/Qwen2Graph.cpp
+    pipelines/qwen/GraphOrchestrator.cpp
     pipelines/qwen/Qwen2LayerExecutor.cpp
     pipelines/qwen/Qwen2ModelExecutor.cpp
     pipelines/qwen/Qwen2BufferSpec.cpp

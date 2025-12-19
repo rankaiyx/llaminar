@@ -105,6 +105,7 @@ namespace llaminar2
         ComputeGraph buildLMHeadGraph(
             TensorBase *hidden_states,
             TensorBase *output_logits,
+            int total_tokens,
             int device_idx) override = 0;
 
         // =========================================================================
@@ -174,8 +175,12 @@ namespace llaminar2
 
         /**
          * @brief Execute LM head with timing
+         * @param hidden Hidden states tensor
+         * @param logits Output logits tensor
+         * @param total_tokens Number of tokens (batch_size * seq_len)
+         * @param device_idx Target device
          */
-        bool executeLMHead(TensorBase *hidden, TensorBase *logits, int device_idx);
+        bool executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, int device_idx);
 
         /**
          * @brief Record timing for a phase

@@ -24,7 +24,6 @@
 #include "../ops/Ops.h"
 #include "../../kernels/cpu/gemm_v4/FusedGEMM.h"
 #include "../../kernels/cpu/attention/FusedAttentionWoKernel.h"
-#include "Qwen2LayerExecutor.h"
 
 namespace llaminar2
 {
@@ -212,9 +211,6 @@ namespace llaminar2
         // Fused attention + Wo projection kernel (optional, enabled via config.use_fused_attention)
         std::unique_ptr<FusedAttentionWoKernel> fused_attn_wo_kernel_;
 
-        // Execution framework (optional, enabled via LLAMINAR_USE_LAYER_EXECUTOR=1)
-        std::unique_ptr<Qwen2LayerExecutor> layer_executor_;
-
         // NOTE: Ops are now in PipelineBase (rmsnorm_op_, gemm_op_, etc.)
         // Child pipelines use the declarative methods: rms_norm(), project(), add_residual(), etc.
 
@@ -314,7 +310,7 @@ namespace llaminar2
         /**
          * @brief Get current cache position (for first sequence)
          */
-        int get_position() const { return current_positions_.empty() ? 0 : current_positions_[0]; }
+        int get_position() const override { return current_positions_.empty() ? 0 : current_positions_[0]; }
     };
 
 } // namespace llaminar2

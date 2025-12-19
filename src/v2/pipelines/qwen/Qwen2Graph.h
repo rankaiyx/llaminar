@@ -35,6 +35,7 @@
 #include "../../execution/ComputeStage.h"
 #include "../../execution/DeviceContext.h"
 #include "../../execution/ExecutionPolicy.h"
+#include "../../execution/IGraphBuilder.h"
 #include "../../pipelines/PipelineConfig.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
@@ -221,11 +222,13 @@ namespace llaminar2
      */
     struct Qwen2ForwardInput
     {
-        const int *token_ids = nullptr; ///< Token IDs [batch_size * seq_len]
-        int batch_size = 1;             ///< Number of sequences
-        int seq_len = 0;                ///< Sequence length
-        int position_offset = 0;        ///< KV cache position offset
-        int device_idx = 0;             ///< Target device
+        const int *token_ids = nullptr;      ///< Token IDs [batch_size * seq_len]
+        const int *position_ids = nullptr;   ///< Position IDs [batch_size * seq_len] (required)
+        int batch_size = 1;                  ///< Number of sequences
+        int seq_len = 0;                     ///< Sequence length
+        int position_offset = 0;             ///< KV cache position offset (legacy, used if position_ids == nullptr)
+        int device_idx = 0;                  ///< Target device
+        IUnifiedKVCache *kv_cache = nullptr; ///< KV cache for attention (optional)
 
         /// For batched input (alternative to token_ids)
         struct Batch
@@ -256,8 +259,11 @@ namespace llaminar2
      *
      * Builds ComputeGraph instances for Qwen2 architecture,
      * delegating execution to GraphExecutor.
+     *
+     * Implements IGraphBuilder interface for polymorphic graph building
+     * and testability via MockGraphBuilder.
      */
-    class Qwen2Graph
+    class Qwen2Graph : public IGraphBuilder
     {
     public:
         /**
@@ -381,6 +387,44 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // IGraphBuilder Interface Implementation
+        // =====================================================================
+
+        /**
+         * @brief Build complete forward graph (IGraphBuilder interface)
+         *
+         * Adapts Qwen2ForwardInput/Output to generic ForwardInput/Output.
+         */
+        ComputeGraph buildForwardGraph(
+            const ForwardInput &input,
+            ForwardOutput &output) override;
+
+        /**
+         * @brief Build single transformer layer graph (IGraphBuilder interface)
+         *
+         * Uses layer context to build attention + FFN graph.
+         */
+        ComputeGraph buildLayerGraph(const LayerContext &ctx) override;
+
+        /**
+         * @brief Get number of transformer layers
+         */
+        int numLayers() const override { return config_.n_layers; }
+
+        /**
+         * @brief Get model hidden dimension
+         */
+        int hiddenDim() const override { return config_.d_model; }
+
+        /**
+         * @brief Check if the builder is properly initialized
+         */
+        bool isInitialized() const override
+        {
+            return weights_.get_layer_weights != nullptr;
+        }
+
+        // =====================================================================
         // Model-Level Graph Building
         // =====================================================================
 
@@ -419,10 +463,16 @@ namespace llaminar2
 
         /**
          * @brief Build LM head projection graph
+         * @param hidden_states Final hidden states from transformer layers
+         * @param output_logits Output tensor for logits
+         * @param total_tokens Number of tokens (batch_size * seq_len)
+         * @param device_idx Target device
+         * @return LM head compute graph
          */
         ComputeGraph buildLMHeadGraph(
             TensorBase *hidden_states,
             TensorBase *output_logits,
+            int total_tokens,
             int device_idx);
 
         // =====================================================================
@@ -452,26 +502,43 @@ namespace llaminar2
             int device_idx);
 
         // =====================================================================
-        // Execution Methods
+        // Execution Methods (DEPRECATED - Use GraphOrchestrator)
+        // =====================================================================
+        //
+        // These methods are deprecated. Qwen2Graph should only BUILD graphs.
+        // Use GraphOrchestrator for execution, which provides:
+        // - Graph caching with cache hit statistics
+        // - Device context management
+        // - Batched execution support
         // =====================================================================
 
         /**
          * @brief Execute full forward pass
          *
+         * @deprecated Use GraphOrchestrator::executeForward() instead.
+         *             Qwen2Graph should only build graphs, not execute them.
+         *
          * Builds and executes the complete forward graph.
          */
+        [[deprecated("Use GraphOrchestrator::executeForward() instead")]]
         bool executeForward(
             const Qwen2ForwardInput &input,
             Qwen2ForwardOutput &output);
 
         /**
          * @brief Execute a pre-built graph
+         *
+         * @deprecated Use GraphOrchestrator::execute() instead.
          */
+        [[deprecated("Use GraphOrchestrator::execute() instead")]]
         bool execute(ComputeGraph &graph, IDeviceContext *ctx);
 
         /**
          * @brief Execute attention block
+         *
+         * @deprecated Use GraphOrchestrator::executeAttention() instead.
          */
+        [[deprecated("Use GraphOrchestrator::executeAttention() instead")]]
         bool executeAttention(
             const Qwen2LayerWeights &layer,
             Qwen2ActivationBuffers &buffers,
@@ -483,7 +550,10 @@ namespace llaminar2
 
         /**
          * @brief Execute FFN block
+         *
+         * @deprecated Use GraphOrchestrator::executeFFN() instead.
          */
+        [[deprecated("Use GraphOrchestrator::executeFFN() instead")]]
         bool executeFFN(
             const Qwen2LayerWeights &layer,
             Qwen2ActivationBuffers &buffers,
@@ -493,7 +563,10 @@ namespace llaminar2
 
         /**
          * @brief Execute full transformer layer (attention + FFN)
+         *
+         * @deprecated Use GraphOrchestrator::executeLayer() instead.
          */
+        [[deprecated("Use GraphOrchestrator::executeLayer() instead")]]
         bool executeLayer(
             const Qwen2LayerWeights &layer,
             Qwen2ActivationBuffers &buffers,
@@ -557,9 +630,8 @@ namespace llaminar2
         // Snapshot callback
         StageSnapshotCallback snapshot_callback_;
 
-        // Current execution state
-        int current_batch_size_ = 0;
-        int current_seq_len_ = 0;
+        // Position IDs buffer - DEPRECATED: Position IDs should be provided externally via Qwen2ForwardInput
+        // Kept temporarily for backward compatibility with execute*() methods
         std::vector<int> position_ids_buffer_;
 
         // =====================================================================
@@ -652,7 +724,19 @@ namespace llaminar2
 
         IDeviceContext *getDeviceContext(int device_idx);
 
-        std::vector<int> buildPositionIds(int seq_len, int batch_size, int offset);
+    public:
+        /**
+         * @brief Build position IDs array for RoPE
+         * @param seq_len Sequence length
+         * @param batch_size Number of sequences
+         * @param offset Position offset (for KV cache continuation)
+         * @return Vector of position IDs [batch_size * seq_len]
+         *
+         * Static utility function that can be used by callers to build position IDs.
+         * For batch_size=1: [offset, offset+1, ..., offset+seq_len-1]
+         * For batch_size>1: Repeated pattern per batch
+         */
+        static std::vector<int> buildPositionIds(int seq_len, int batch_size, int offset);
 
         void addFinalNormToGraph(
             ComputeGraph &graph,

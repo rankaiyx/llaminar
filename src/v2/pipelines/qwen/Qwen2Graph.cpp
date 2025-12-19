@@ -185,6 +185,74 @@ namespace llaminar2
     }
 
     // =============================================================================
+    // IGraphBuilder Interface Implementation
+    // =============================================================================
+
+    ComputeGraph Qwen2Graph::buildForwardGraph(
+        const ForwardInput &input,
+        ForwardOutput &output)
+    {
+        // Adapt generic ForwardInput to Qwen2ForwardInput
+        Qwen2ForwardInput qwen_input;
+        qwen_input.token_ids = input.token_ids;
+        qwen_input.position_ids = input.position_ids;
+        qwen_input.batch_size = input.batch_size;
+        qwen_input.seq_len = input.seq_len;
+        qwen_input.position_offset = input.position_offset;
+        qwen_input.device_idx = input.device_idx;
+        qwen_input.kv_cache = input.kv_cache;
+
+        // Adapt generic ForwardOutput to Qwen2ForwardOutput
+        Qwen2ForwardOutput qwen_output;
+        qwen_output.logits = output.logits;
+        qwen_output.hidden = output.hidden;
+
+        // Build the graph
+        ComputeGraph graph = buildFullForwardGraph(qwen_input, qwen_output);
+
+        // Copy back output pointers (in case they were set by the builder)
+        output.logits = qwen_output.logits;
+        output.hidden = qwen_output.hidden;
+
+        return graph;
+    }
+
+    ComputeGraph Qwen2Graph::buildLayerGraph(const LayerContext &ctx)
+    {
+        // Validate layer index
+        if (ctx.layer_idx < 0 || ctx.layer_idx >= config_.n_layers)
+        {
+            LOG_ERROR("[Qwen2Graph::buildLayerGraph] Invalid layer index: " << ctx.layer_idx);
+            return ComputeGraph{};
+        }
+
+        // Get layer weights
+        if (!weights_.get_layer_weights)
+        {
+            LOG_ERROR("[Qwen2Graph::buildLayerGraph] Layer weight accessor not set");
+            return ComputeGraph{};
+        }
+
+        Qwen2LayerWeights layer_weights = weights_.get_layer_weights(ctx.layer_idx);
+
+        // Build attention graph
+        ComputeGraph attn_graph = buildAttentionGraph(
+            layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
+            ctx.kv_cache, ctx.position_ids, ctx.device_idx);
+
+        // Build FFN graph
+        ComputeGraph ffn_graph = buildFFNGraph(
+            layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
+            ctx.device_idx);
+
+        // Merge: attention -> FFN
+        std::string attn_last = "layer" + std::to_string(ctx.layer_idx) + "_attn_residual";
+        attn_graph.merge(std::move(ffn_graph), attn_last);
+
+        return attn_graph;
+    }
+
+    // =============================================================================
     // Model-Level Graph Building
     // =============================================================================
 
@@ -208,10 +276,6 @@ namespace llaminar2
             throw std::runtime_error("Qwen2Graph buffers not initialized");
         }
 
-        // Store current dimensions
-        current_batch_size_ = input.batch_size;
-        current_seq_len_ = input.seq_len;
-
         int device_idx = config_.default_device;
         int total_tokens = input.batch_size * input.seq_len;
 
@@ -234,23 +298,53 @@ namespace llaminar2
                       device_idx);
 
         // -------------------------------------------------------------------------
-        // Stage 2: Transformer Layers (as placeholder nodes)
+        // Stage 2: Transformer Layers (complete graphs, not placeholders)
         // -------------------------------------------------------------------------
         std::string prev_node = "embedding";
 
-        // Build position IDs
-        position_ids_buffer_ = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
+        // Position IDs must be provided externally (or use fallback for backward compat)
+        const int *position_ids = input.position_ids;
+        if (!position_ids)
+        {
+            // Fallback: build position IDs internally (deprecated path)
+            position_ids_buffer_ = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
+            position_ids = position_ids_buffer_.data();
+            LOG_DEBUG("[Qwen2Graph] Position IDs built internally (deprecated - prefer external input)");
+        }
 
-        // Each layer is a placeholder node - actual execution uses executeLayer()
+        // Check if we have layer weight accessor
+        if (!weights_.get_layer_weights)
+        {
+            LOG_ERROR("[Qwen2Graph] Layer weight accessor not set!");
+            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+        }
+
+        // Build complete graphs for each layer
         for (int layer = 0; layer < config_.n_layers; ++layer)
         {
-            std::string layer_name = "layer_" + std::to_string(layer);
+            // Get layer weights
+            Qwen2LayerWeights layer_weights = weights_.get_layer_weights(layer);
 
-            // Add node with nullptr stage - serves as a sequencing marker
-            graph.addNode(layer_name, nullptr, device_idx);
-            graph.addDependency(layer_name, prev_node);
+            // Build attention graph for this layer
+            ComputeGraph attn_graph = buildAttentionGraph(
+                layer_weights, buffers_.layer_buffers, layer, input.seq_len,
+                input.kv_cache, position_ids, device_idx);
 
-            prev_node = layer_name;
+            // Merge attention graph, connecting to previous node
+            graph.merge(std::move(attn_graph), prev_node);
+
+            // The last node in attention graph is the residual
+            std::string attn_last = "layer" + std::to_string(layer) + "_attn_residual";
+
+            // Build FFN graph for this layer
+            ComputeGraph ffn_graph = buildFFNGraph(
+                layer_weights, buffers_.layer_buffers, layer, input.seq_len, device_idx);
+
+            // Merge FFN graph, connecting to attention residual
+            graph.merge(std::move(ffn_graph), attn_last);
+
+            // The last node in FFN graph is the residual
+            prev_node = "layer" + std::to_string(layer) + "_ffn_residual";
         }
 
         // -------------------------------------------------------------------------
@@ -360,12 +454,12 @@ namespace llaminar2
     ComputeGraph Qwen2Graph::buildLMHeadGraph(
         TensorBase *hidden_states,
         TensorBase *output_logits,
+        int total_tokens,
         int device_idx)
     {
-        LOG_DEBUG("[Qwen2Graph] Building LM head graph");
+        LOG_DEBUG("[Qwen2Graph] Building LM head graph for " << total_tokens << " tokens");
 
         ComputeGraph graph;
-        int total_tokens = current_batch_size_ * current_seq_len_;
 
         // Final RMSNorm
         RMSNormStage::Params norm_params;
@@ -1225,8 +1319,6 @@ namespace llaminar2
 
     void Qwen2Graph::clearCache()
     {
-        current_batch_size_ = 0;
-        current_seq_len_ = 0;
         position_ids_buffer_.clear();
 
         // Clear cached graphs (Phase 10)

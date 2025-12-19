@@ -203,99 +203,6 @@ namespace llaminar2
             LOG_WARN("Fused attention requires Q8_1 activation precision, using unfused path");
         }
 
-        // =============================================================================
-        // LayerExecutor Framework (Phase 7: execution framework migration)
-        // =============================================================================
-        // When enabled via LLAMINAR_USE_LAYER_EXECUTOR=1, use declarative compute
-        // graphs instead of imperative pipeline code. This enables:
-        // 1. Automatic device-aware weight transfer
-        // 2. Parallel/pipelined execution modes
-        // 3. Cleaner separation of graph construction vs execution
-        // 4. Graph-managed buffer allocation with aliasing optimization
-        // =============================================================================
-        const auto &exec_env = debugEnv().execution;
-        if (exec_env.use_layer_executor)
-        {
-            Qwen2ExecutorConfig exec_config;
-            exec_config.d_model = d_model_;
-            exec_config.n_heads = n_heads_;
-            exec_config.n_kv_heads = n_kv_heads_;
-            exec_config.head_dim = head_dim_;
-            exec_config.d_ff = ffn_column_parallel_ ? d_ff_local_ : d_ff_;
-            exec_config.ffn_column_parallel = ffn_column_parallel_;
-            exec_config.rms_norm_eps = model_ctx_->model().rms_norm_eps; // From GGUF metadata
-            exec_config.rope_theta = model_ctx_->model().rope_theta;
-            exec_config.default_device = device_idx_;
-            exec_config.enable_profiling = exec_env.executor_profiling;
-            exec_config.enable_validation = exec_env.executor_validation;
-            exec_config.activation_precision = config_.activation_precision;
-            exec_config.vocab_size = vocab_size_;
-            exec_config.n_layers = n_layers_;
-
-            // Graph buffer management: when enabled, executor manages its own buffers
-            exec_config.use_graph_buffer_management = exec_env.use_graph_buffer_management;
-            exec_config.max_seq_len = config_.max_seq_len;
-
-            // Decomposed attention (KVCacheAppendStage + AttentionComputeStage) is REQUIRED
-            // when graph buffer management is enabled, because AttentionWithKVCacheStage
-            // uses create_view() which requires shared_ptr, but GraphBufferManager uses
-            // unique_ptr for buffer storage.
-            //
-            // When graph buffer management is DISABLED, we use the legacy
-            // AttentionWithKVCacheStage which is known to be numerically correct.
-            //
-            // TODO: Fix decomposed attention to match legacy attention numerically,
-            // then we can use decomposed attention everywhere.
-            exec_config.use_decomposed_attention = exec_env.use_graph_buffer_management;
-
-            layer_executor_ = std::make_unique<Qwen2LayerExecutor>(exec_config, mpi_ctx_);
-
-            // If graph buffer management is enabled, set up the executor's buffers
-            if (exec_env.use_graph_buffer_management)
-            {
-                layer_executor_->setTensorFactory(tensor_factory_.get());
-                if (!layer_executor_->initializeBuffers(config_.max_seq_len))
-                {
-                    LOG_ERROR("Failed to initialize graph-managed buffers");
-                    // Fall back to manual buffer management
-                }
-                else
-                {
-                    const auto *stats = layer_executor_->bufferStats();
-                    LOG_INFO("Graph-managed buffers initialized: "
-                             << (stats->total_bytes / (1024.0 * 1024.0)) << " MB total, "
-                             << stats->total_buffers << " buffers");
-                }
-            }
-
-            // Wire snapshot callback for debugging LayerExecutor vs legacy path
-            // Callback captures stage outputs using PipelineBase::captureSnapshot
-#ifdef ENABLE_PIPELINE_SNAPSHOTS
-            layer_executor_->setSnapshotCallback(
-                [this](const std::string &node_name, const StageDumpInfo &dump_info)
-                {
-                    // Use primary output (first in outputs vector) for snapshot
-                    if (!dump_info.outputs.empty())
-                    {
-                        const auto &output = dump_info.outputs[0];
-                        if (output.data && output.rows > 0 && output.cols > 0)
-                        {
-                            // Convert executor node name (e.g., "layer0_q_proj") to snapshot key
-                            // by uppercasing and adding _EXEC suffix to distinguish from legacy
-                            std::string key = node_name + "_EXEC";
-                            std::transform(key.begin(), key.end(), key.begin(), ::toupper);
-                            // Cast void* to float* - StageDumpInfo stores generic pointers
-                            captureSnapshot(key, static_cast<const float *>(output.data),
-                                            output.rows * output.cols);
-                        }
-                    }
-                });
-            LOG_INFO("LayerExecutor snapshot callback registered");
-#endif
-
-            LOG_INFO("LayerExecutor enabled (mode=" << exec_env.execution_mode << ")");
-        }
-
         LOG_DEBUG("Pipeline initialized (weights loaded on-demand)");
     }
     void Qwen2Pipeline::initializeInfrastructureBatched()
@@ -413,7 +320,7 @@ namespace llaminar2
 
     bool Qwen2Pipeline::forward(const int *tokens, int seq_len)
     {
-        LOG_INFO("[FORWARD] Called with seq_len=" << seq_len << " layer_executor_=" << layer_executor_.get());
+        LOG_INFO("[FORWARD] Called with seq_len=" << seq_len);
         // Legacy single-sequence interface: wrap as batch_size=1
         std::vector<int> token_vec(tokens, tokens + seq_len);
         return forward_batch(std::vector<std::vector<int>>{token_vec});
@@ -510,7 +417,7 @@ namespace llaminar2
         // Validate after embedding
         VALIDATE_TENSOR(current_hidden_, spec_hidden(effective_seq_len), "after_embedding");
 
-        LOG_INFO("[FORWARD_BATCH] About to process " << n_layers_ << " transformer layers, layer_executor_=" << layer_executor_.get());
+        LOG_INFO("[FORWARD_BATCH] About to process " << n_layers_ << " transformer layers");
 
         // Process all transformer layers
         for (int i = 0; i < n_layers_; ++i)
@@ -602,120 +509,12 @@ namespace llaminar2
     bool Qwen2Pipeline::transformer_layer(int layer_idx, int effective_seq_len)
     {
         LOG_TRACE("Processing layer " << layer_idx);
-        LOG_INFO("[LAYER_PROCESSING] layer_executor_=" << layer_executor_.get() << " layer_idx=" << layer_idx);
 
         // Get layer weights (loaded lazily on first access)
         auto &layer = getLayerWeights(layer_idx);
 
         // =============================================================================
-        // Optional: LayerExecutor path (Phase 7)
-        // When LLAMINAR_USE_LAYER_EXECUTOR=1, use declarative compute graphs.
-        // Individual operations are controlled by LLAMINAR_EXEC_* flags.
-        // Supports both prefill and decode modes via AttentionWithKVCacheStage.
-        // =============================================================================
-
-        if (layer_executor_)
-        {
-            // Determine target device based on placement map
-            int target_device = placement_map_ ? getWeightDevice("attn_q", -1) : device_idx_;
-            auto &buffers = placement_map_ ? getBuffersForDevice(target_device) : activation_buffers_;
-
-            // Build position IDs for RoPE
-            std::vector<int> position_ids(effective_seq_len);
-            for (int i = 0; i < effective_seq_len; ++i)
-            {
-                // For batched: use per-sequence positions
-                // For single sequence: use current position + offset
-                int seq_idx = 0; // TODO: support batched positions properly
-                position_ids[i] = current_positions_[seq_idx] + i;
-            }
-
-            // Get activation buffers - either from graph-managed or from pipeline
-            Qwen2ActivationBuffers *exec_buffers_ptr;
-            Qwen2ActivationBuffers manual_exec_buffers;
-
-            if (layer_executor_->hasGraphManagedBuffers())
-            {
-                // Graph-managed buffers: use executor's internal buffers
-                exec_buffers_ptr = &layer_executor_->getInternalBuffers();
-                // Set current_hidden to pipeline's (shared between pipeline and executor)
-                exec_buffers_ptr->current_hidden = current_hidden_.get();
-
-                LOG_DEBUG("[LAYER_PROCESSING] Using graph-managed buffers");
-            }
-            else
-            {
-                // Manual buffer mapping (legacy path)
-                // IMPORTANT: residual must be a SEPARATE buffer from current_hidden
-                // because residual needs to be preserved while current_hidden is modified
-                manual_exec_buffers.residual = buffers.residual.get();
-                manual_exec_buffers.normalized = buffers.normalized.get();
-                manual_exec_buffers.Q = buffers.Q.get();
-                manual_exec_buffers.K = buffers.K.get();
-                manual_exec_buffers.V = buffers.V.get();
-                manual_exec_buffers.attn_output = buffers.attn_output.get();
-                manual_exec_buffers.attn_proj = buffers.attn_proj.get();
-                manual_exec_buffers.gate = buffers.gate.get();
-                manual_exec_buffers.up = buffers.up.get();
-                manual_exec_buffers.ffn_output = buffers.ffn_output.get();
-                manual_exec_buffers.current_hidden = current_hidden_.get();
-
-                // Attention workspace buffers (pre-allocated by PipelineBase)
-                // Required for MPI tensor-parallel attention with causal masking
-                manual_exec_buffers.workspace_scores = attention_workspace_scores_.get();
-                manual_exec_buffers.workspace_context = attention_workspace_context_.get();
-                manual_exec_buffers.workspace_mask = attention_workspace_mask_.get();
-
-                exec_buffers_ptr = &manual_exec_buffers;
-            }
-
-            // NOTE: No copy needed - LayerExecutor reads from current_hidden directly
-            // and uses in-place residual adds (output[i] = input[i] + output[i])
-
-            // Map LayerWeights to Qwen2LayerWeights (executor doesn't own these)
-            Qwen2LayerWeights exec_weights;
-            exec_weights.wq = layer.wq.get();
-            exec_weights.wk = layer.wk.get();
-            exec_weights.wv = layer.wv.get();
-            exec_weights.wo = layer.wo.get();
-            exec_weights.attn_norm = layer.attn_norm.get();
-            exec_weights.q_bias = layer.q_bias.get();
-            exec_weights.k_bias = layer.k_bias.get();
-            exec_weights.v_bias = layer.v_bias.get();
-            exec_weights.gate_proj = layer.gate_proj.get();
-            exec_weights.up_proj = layer.up_proj.get();
-            exec_weights.down_proj = layer.down_proj.get();
-            exec_weights.ffn_norm = layer.ffn_norm.get();
-
-            // Debug: Log weight pointer assignment for layer 0
-            if (layer_idx == 0)
-            {
-                LOG_INFO("[EXEC_WEIGHT_ASSIGN] layer.wq.get()=" << static_cast<const void *>(layer.wq.get())
-                                                                << " exec_weights.wq=" << static_cast<const void *>(exec_weights.wq));
-            }
-
-            // Execute layer via compute graphs
-            bool success = layer_executor_->executeLayer(
-                exec_weights, *exec_buffers_ptr, layer_idx, effective_seq_len,
-                kv_cache_.get(), position_ids.data(), target_device);
-
-            if (!success)
-            {
-                LOG_ERROR("LayerExecutor failed at layer " << layer_idx);
-                return false;
-            }
-
-            // Capture layer output for comparison with legacy path
-            // Uses the same snapshot dump mechanism as legacy path
-            std::string layer_prefix = "layer" + std::to_string(layer_idx);
-            capture_snapshot(layer_prefix + "_FFN_RESIDUAL_EXEC", current_hidden_.get(),
-                             effective_seq_len, d_model_);
-
-            return true;
-        }
-
-        // =============================================================================
-        // Legacy imperative path (existing code)
+        // Imperative path (default)
         // =============================================================================
 
         // Attention block

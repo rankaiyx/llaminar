@@ -271,12 +271,14 @@ namespace llaminar2
          *
          * @param hidden_states Final hidden states
          * @param output_logits Output tensor for logits
+         * @param total_tokens Number of tokens (batch_size * seq_len)
          * @param device_idx Target device
          * @return LM head compute graph
          */
         virtual ComputeGraph buildLMHeadGraph(
             TensorBase *hidden_states,
             TensorBase *output_logits,
+            int total_tokens,
             int device_idx) = 0;
 
         // =========================================================================

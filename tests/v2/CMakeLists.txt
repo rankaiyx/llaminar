@@ -2160,6 +2160,27 @@ add_v2_test(V2_Unit_GraphBufferManager
     MPI_PROCS 1
 )
 
+# Test: ComputeGraphMerge (graph merging, root/leaf detection)
+# Tests merge(), getRootNodes(), getLeafNodes() for combining subgraphs
+# Part of Phase 3: Declarative Qwen2Graph refactoring
+add_executable(v2_test_compute_graph_merge unit/Test__ComputeGraphMerge.cpp)
+target_link_libraries(v2_test_compute_graph_merge llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ComputeGraphMerge
+    COMMAND $<TARGET_FILE:v2_test_compute_graph_merge>
+    LABELS "V2;Unit;Execution;ComputeGraph;GraphMerge;DAG"
+    MPI_PROCS 1
+)
+
+# Test: IGraphBuilder interface and MockGraphBuilder
+# Part of Phase 5: Declarative Qwen2Graph refactoring - Interface extraction
+add_executable(v2_test_igraph_builder unit/Test__IGraphBuilder.cpp)
+target_link_libraries(v2_test_igraph_builder llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_IGraphBuilder
+    COMMAND $<TARGET_FILE:v2_test_igraph_builder>
+    LABELS "V2;Unit;Execution;IGraphBuilder;MockGraphBuilder;Interface"
+    MPI_PROCS 1
+)
+
 # Test: StageBufferRequirements (IComputeStage::getBufferRequirements())
 # Tests buffer requirement declarations for all compute stages (SwiGLU, ResidualAdd,
 # RMSNorm, RoPE, GEMM, FusedQKVGEMM, FusedGateUpGEMM) for GraphBufferManager integration
@@ -2217,6 +2238,20 @@ target_link_libraries(v2_test_qwen2_graph_caching llaminar2_core GTest::gtest GT
 add_v2_test(V2_Unit_Qwen2GraphCaching
     COMMAND $<TARGET_FILE:v2_test_qwen2_graph_caching>
     LABELS "V2;Unit;Qwen2;Qwen2Graph;GraphCaching;Phase10;Optimization"
+    MPI_PROCS 1
+)
+
+# Test: GraphOrchestrator (clean separation of graph building and execution)
+# Tests the orchestrator's execution, caching, and device context management:
+# - Construction with graph builder or config
+# - Cache initialization and management
+# - Device context lazy creation and caching
+# - Cache statistics tracking
+add_executable(v2_test_graph_orchestrator unit/Test__GraphOrchestrator.cpp)
+target_link_libraries(v2_test_graph_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphOrchestrator
+    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator>
+    LABELS "V2;Unit;Qwen2;GraphOrchestrator;GraphExecution;DeclarativeDesign"
     MPI_PROCS 1
 )
 
@@ -2584,6 +2619,21 @@ target_link_libraries(v2_integration_graph_buffer_parity
 add_v2_test(V2_Integration_GraphBufferManagement_Parity
     COMMAND $<TARGET_FILE:v2_integration_graph_buffer_parity>
     LABELS "V2;Integration;GraphBufferManager;BufferManagement;Parity;ExecutionFramework;Phase5"
+    MPI_PROCS 1
+)
+
+# Test: Full Graph Forward vs Legacy Parity
+# Validates that the full graph forward path (orchestrator->executeForward())
+# produces equivalent results to the legacy imperative pipeline code.
+# Part of Phase 4: Integration Testing & Parity Verification for Full Graph Inference.
+add_executable(v2_integration_full_graph_forward_parity integration/Test__FullGraphForward_vs_Legacy_Parity.cpp)
+target_link_libraries(v2_integration_full_graph_forward_parity
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_FullGraphForward_vs_Legacy_Parity
+    COMMAND $<TARGET_FILE:v2_integration_full_graph_forward_parity>
+    LABELS "V2;Integration;FullGraphForward;Pipeline;Parity;GraphOrchestrator;ExecutionFramework"
     MPI_PROCS 1
 )
 
