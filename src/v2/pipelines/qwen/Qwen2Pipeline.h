@@ -96,7 +96,7 @@ namespace llaminar2
          * @param token_batches Vector of token sequences (batch_size sequences)
          * @return true if forward pass succeeded
          */
-        bool forward_batch(const std::vector<std::vector<int>> &token_batches);
+        bool forward_batch(const std::vector<std::vector<int>> &token_batches) override;
 
         /**
          * @brief Get output logits for E2E testing/validation (full sequence)
@@ -108,7 +108,7 @@ namespace llaminar2
          * @param seq_idx Sequence index in batch (default=0)
          * @return Logits tensor pointer, or nullptr if forward() not called
          */
-        const float *getLogits(int seq_idx = 0) const;
+        const float *getLogits(int seq_idx = 0) const override;
 
         /**
          * @brief Get logits for the last token of a sequence (for sampling)
@@ -124,17 +124,17 @@ namespace llaminar2
         /**
          * @brief Get batch size
          */
-        int batch_size() const { return batch_size_; }
+        int batch_size() const override { return batch_size_; }
 
         /**
          * @brief Get padded sequence length for current batch
          */
-        int padded_seq_len() const { return padded_seq_len_; }
+        int padded_seq_len() const override { return padded_seq_len_; }
 
         /**
          * @brief Get sequence lengths for current batch
          */
-        const std::vector<int> &sequence_lengths() const { return sequence_lengths_; }
+        const std::vector<int> &sequence_lengths() const override { return sequence_lengths_; }
 
         /**
          * @brief Get specific layer weight for device placement

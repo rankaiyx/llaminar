@@ -103,8 +103,8 @@ namespace llaminar2
             PipelineExecutorConfig config;
             PipelineExecutor exec(config, mpi_ctx);
 
-            // Should not crash
-            EXPECT_FALSE(exec.config().use_layer_executor);
+            // Should not crash; use_layer_executor defaults to true as of Dec 2025
+            EXPECT_TRUE(exec.config().use_layer_executor);
         }
 
         // =============================================================================

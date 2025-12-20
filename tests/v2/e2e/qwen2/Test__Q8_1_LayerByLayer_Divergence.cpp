@@ -28,11 +28,8 @@
  *
  * @author David Sanftenberg
  * @date 2025-12-09
+ * @updated 2025-12-19 - Migrated to IInferenceRunner interface
  */
-
-#ifndef ENABLE_PIPELINE_SNAPSHOTS
-#error "Test requires ENABLE_PIPELINE_SNAPSHOTS. Build with: cmake -B build_v2_e2e_release -S src/v2 -DCMAKE_BUILD_TYPE=Release -DENABLE_PIPELINE_SNAPSHOTS=ON"
-#endif
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -43,12 +40,14 @@
 #include <map>
 #include <algorithm>
 
-#include "pipelines/qwen/Qwen2Pipeline.h"
+#include "inference/InferenceRunner.h"
+#include "inference/IInferenceRunner.h"
 #include "pipelines/PipelineConfig.h"
 #include "loaders/ModelContext.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 #include "tensors/Tensors.h"
+#include "backends/ComputeBackend.h"
 
 using namespace llaminar2;
 
@@ -110,6 +109,9 @@ protected:
 
     void SetUp() override
     {
+        // Initialize device manager (required before creating inference runner)
+        DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
+
         MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
         MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
         mpi_ctx_ = std::make_shared<MPIContext>(rank_, world_size_, MPI_COMM_WORLD);
@@ -149,17 +151,17 @@ protected:
     }
 
     /**
-     * @brief Compare snapshots between FP32 and Q8_1 pipelines
+     * @brief Compare snapshots between FP32 and Q8_1 runners
      * @return Map of stage name -> (cosine_sim, rel_l2)
      */
     std::map<std::string, std::pair<double, double>> compareSnapshots(
-        Qwen2Pipeline *fp32_pipeline,
-        Qwen2Pipeline *q8_1_pipeline)
+        IInferenceRunner *fp32_runner,
+        IInferenceRunner *q8_1_runner)
     {
         std::map<std::string, std::pair<double, double>> results;
 
-        auto fp32_keys = fp32_pipeline->getSnapshotKeys();
-        auto q8_1_keys = q8_1_pipeline->getSnapshotKeys();
+        auto fp32_keys = fp32_runner->getSnapshotKeys();
+        auto q8_1_keys = q8_1_runner->getSnapshotKeys();
 
         // Sort keys for consistent output
         std::sort(fp32_keys.begin(), fp32_keys.end());
@@ -171,8 +173,8 @@ protected:
                 continue;
 
             size_t fp32_size = 0, q8_1_size = 0;
-            const float *fp32_data = fp32_pipeline->getSnapshot(key, fp32_size);
-            const float *q8_1_data = q8_1_pipeline->getSnapshot(key, q8_1_size);
+            const float *fp32_data = fp32_runner->getSnapshot(key, fp32_size);
+            const float *q8_1_data = q8_1_runner->getSnapshot(key, q8_1_size);
 
             if (!fp32_data || !q8_1_data)
             {
@@ -305,43 +307,43 @@ TEST_F(Test__Q8_1_LayerByLayer, SnapshotComparison)
     LOG_INFO("╚════════════════════════════════════════════════════════════════════════════╝");
     LOG_INFO("");
 
-    // ===== FP32 Pipeline with snapshots =====
-    PipelineConfig config_fp32;
+    // ===== FP32 Runner with snapshots =====
+    InferenceRunnerConfig config_fp32;
     config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.max_seq_len = 512;
+    config_fp32.force_pipeline = true; // Use Pipeline for this comparison test
 
-    auto pipeline_fp32 = std::make_unique<Qwen2Pipeline>(
-        model_ctx_, mpi_ctx_, -1, nullptr, config_fp32, 1);
-    pipeline_fp32->enableSnapshotCapture(); // Enable snapshot capture
+    auto runner_fp32 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_fp32);
+    ASSERT_NE(runner_fp32, nullptr) << "FP32 runner creation failed";
+    runner_fp32->enableSnapshotCapture(); // Enable snapshot capture
 
-    bool success_fp32 = pipeline_fp32->forward(tokens.data(), seq_len);
+    bool success_fp32 = runner_fp32->forward(tokens.data(), seq_len);
     ASSERT_TRUE(success_fp32) << "FP32 forward failed";
 
-    // ===== Q8_1 Pipeline with snapshots =====
-    PipelineConfig config_q8_1;
+    // ===== Q8_1 Runner with snapshots =====
+    InferenceRunnerConfig config_q8_1;
     config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.max_seq_len = 512;
+    config_q8_1.force_pipeline = true; // Use Pipeline for this comparison test
 
-    std::unique_ptr<Qwen2Pipeline> pipeline_q8_1;
+    std::unique_ptr<IInferenceRunner> runner_q8_1;
     try
     {
-        pipeline_q8_1 = std::make_unique<Qwen2Pipeline>(
-            model_ctx_, mpi_ctx_, -1, nullptr, config_q8_1, 1);
-        pipeline_q8_1->enableSnapshotCapture(); // Enable snapshot capture
+        runner_q8_1 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_q8_1);
+        ASSERT_NE(runner_q8_1, nullptr) << "Q8_1 runner creation failed";
+        runner_q8_1->enableSnapshotCapture(); // Enable snapshot capture
     }
     catch (const std::exception &e)
     {
-        GTEST_SKIP() << "Q8_1 pipeline creation failed: " << e.what();
+        GTEST_SKIP() << "Q8_1 runner creation failed: " << e.what();
     }
 
-    bool success_q8_1 = pipeline_q8_1->forward(tokens.data(), seq_len);
+    bool success_q8_1 = runner_q8_1->forward(tokens.data(), seq_len);
     ASSERT_TRUE(success_q8_1) << "Q8_1 forward failed";
 
     // ===== Compare all snapshots =====
-    auto results = compareSnapshots(pipeline_fp32.get(), pipeline_q8_1.get());
+    auto results = compareSnapshots(runner_fp32.get(), runner_q8_1.get());
 
     // Get snapshot keys in execution order (not alphabetical)
-    auto fp32_keys = pipeline_fp32->getSnapshotKeys();
+    auto fp32_keys = runner_fp32->getSnapshotKeys();
 
     // Custom sort function to order stages by actual pipeline execution order
     // Order: EMBEDDING -> layer0_* -> layer1_* -> ... -> layer23_* -> FINAL_NORM -> LM_HEAD
@@ -445,10 +447,10 @@ TEST_F(Test__Q8_1_LayerByLayer, SnapshotComparison)
         if (key.find("layer21") != std::string::npos)
         {
             size_t size_fp32 = 0;
-            const float *fp32_snap = pipeline_fp32->getSnapshot(key, size_fp32);
+            const float *fp32_snap = runner_fp32->getSnapshot(key, size_fp32);
 
             size_t size_q8 = 0;
-            const float *q8_1_snap = pipeline_q8_1->getSnapshot(key, size_q8);
+            const float *q8_1_snap = runner_q8_1->getSnapshot(key, size_q8);
 
             float min_fp32 = 1e9, max_fp32 = -1e9;
             float min_q8 = 1e9, max_q8 = -1e9;
@@ -556,8 +558,8 @@ TEST_F(Test__Q8_1_LayerByLayer, SnapshotComparison)
     LOG_INFO("║                              FINAL LOGITS COMPARISON                                     ║");
     LOG_INFO("╠══════════════════════════════════════════════════════════════════════════════════════════╣");
 
-    const float *logits_fp32 = pipeline_fp32->getLogits(0);
-    const float *logits_q8_1 = pipeline_q8_1->getLogits(0);
+    const float *logits_fp32 = runner_fp32->getLogits(0);
+    const float *logits_q8_1 = runner_q8_1->getLogits(0);
     ASSERT_NE(logits_fp32, nullptr);
     ASSERT_NE(logits_q8_1, nullptr);
 
@@ -648,43 +650,43 @@ TEST_F(Test__Q8_1_LayerByLayer, SingleLayerDetailed)
     LOG_INFO("Tokens: " << seq_len << ", Model: " << model_path_);
     LOG_INFO("========================================");
 
-    // ===== FP32 Pipeline =====
-    PipelineConfig config_fp32;
+    // ===== FP32 Runner =====
+    InferenceRunnerConfig config_fp32;
     config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.max_seq_len = 512;
+    config_fp32.force_pipeline = true; // Use Pipeline for this comparison test
 
-    auto pipeline_fp32 = std::make_unique<Qwen2Pipeline>(
-        model_ctx_, mpi_ctx_, -1, nullptr, config_fp32, 1);
+    auto runner_fp32 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_fp32);
+    ASSERT_NE(runner_fp32, nullptr) << "FP32 runner creation failed";
 
     // Run FP32 forward pass (just layer 0 would be ideal, but we run full for now)
-    bool success_fp32 = pipeline_fp32->forward(tokens.data(), seq_len);
+    bool success_fp32 = runner_fp32->forward(tokens.data(), seq_len);
     ASSERT_TRUE(success_fp32) << "FP32 forward failed";
 
-    // ===== Q8_1 Pipeline =====
-    PipelineConfig config_q8_1;
+    // ===== Q8_1 Runner =====
+    InferenceRunnerConfig config_q8_1;
     config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.max_seq_len = 512;
+    config_q8_1.force_pipeline = true; // Use Pipeline for this comparison test
 
-    std::unique_ptr<Qwen2Pipeline> pipeline_q8_1;
+    std::unique_ptr<IInferenceRunner> runner_q8_1;
     try
     {
-        pipeline_q8_1 = std::make_unique<Qwen2Pipeline>(
-            model_ctx_, mpi_ctx_, -1, nullptr, config_q8_1, 1);
+        runner_q8_1 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_q8_1);
+        ASSERT_NE(runner_q8_1, nullptr) << "Q8_1 runner creation failed";
     }
     catch (const std::exception &e)
     {
-        GTEST_SKIP() << "Q8_1 pipeline creation failed: " << e.what();
+        GTEST_SKIP() << "Q8_1 runner creation failed: " << e.what();
     }
 
-    bool success_q8_1 = pipeline_q8_1->forward(tokens.data(), seq_len);
+    bool success_q8_1 = runner_q8_1->forward(tokens.data(), seq_len);
     ASSERT_TRUE(success_q8_1) << "Q8_1 forward failed";
 
     // ===== Compare Final Logits =====
     LOG_INFO("");
     LOG_INFO("=== FINAL LOGITS COMPARISON ===");
 
-    const float *logits_fp32 = pipeline_fp32->getLogits(0);
-    const float *logits_q8_1 = pipeline_q8_1->getLogits(0);
+    const float *logits_fp32 = runner_fp32->getLogits(0);
+    const float *logits_q8_1 = runner_q8_1->getLogits(0);
     ASSERT_NE(logits_fp32, nullptr);
     ASSERT_NE(logits_q8_1, nullptr);
 
@@ -772,24 +774,24 @@ TEST_F(Test__Q8_1_LayerByLayer, EmbeddingComparison)
     LOG_INFO("EMBEDDING COMPARISON TEST");
     LOG_INFO("========================================");
 
-    // Create FP32 pipeline
-    PipelineConfig config_fp32;
+    // Create FP32 runner
+    InferenceRunnerConfig config_fp32;
     config_fp32.activation_precision = ActivationPrecision::FP32;
-    config_fp32.max_seq_len = 64;
+    config_fp32.force_pipeline = true; // Use Pipeline for this comparison test
 
-    auto pipeline_fp32 = std::make_unique<Qwen2Pipeline>(
-        model_ctx_, mpi_ctx_, -1, nullptr, config_fp32, 1);
+    auto runner_fp32 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_fp32);
+    ASSERT_NE(runner_fp32, nullptr) << "FP32 runner creation failed";
 
-    // Create Q8_1 pipeline
-    PipelineConfig config_q8_1;
+    // Create Q8_1 runner
+    InferenceRunnerConfig config_q8_1;
     config_q8_1.activation_precision = ActivationPrecision::Q8_1;
-    config_q8_1.max_seq_len = 64;
+    config_q8_1.force_pipeline = true; // Use Pipeline for this comparison test
 
-    std::unique_ptr<Qwen2Pipeline> pipeline_q8_1;
+    std::unique_ptr<IInferenceRunner> runner_q8_1;
     try
     {
-        pipeline_q8_1 = std::make_unique<Qwen2Pipeline>(
-            model_ctx_, mpi_ctx_, -1, nullptr, config_q8_1, 1);
+        runner_q8_1 = createInferenceRunner(model_ctx_, mpi_ctx_, DeviceManager::instance().cpuDeviceIndex(), config_q8_1);
+        ASSERT_NE(runner_q8_1, nullptr) << "Q8_1 runner creation failed";
     }
     catch (const std::exception &e)
     {
@@ -820,10 +822,10 @@ TEST_F(Test__Q8_1_LayerByLayer, EmbeddingComparison)
                                   << ", " << embed_fp32[2] << ", " << embed_fp32[3] << ", " << embed_fp32[4]);
 
     // Run forward passes
-    bool success_fp32 = pipeline_fp32->forward(tokens.data(), seq_len);
+    bool success_fp32 = runner_fp32->forward(tokens.data(), seq_len);
     ASSERT_TRUE(success_fp32);
 
-    bool success_q8_1 = pipeline_q8_1->forward(tokens.data(), seq_len);
+    bool success_q8_1 = runner_q8_1->forward(tokens.data(), seq_len);
     ASSERT_TRUE(success_q8_1);
 
     // The hidden states after embedding should be nearly identical

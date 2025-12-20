@@ -862,6 +862,14 @@ namespace llaminar2
                 size_t v_offset = b * seq_len * n_kv_heads * head_dim;
                 size_t out_offset = b * seq_len * n_heads * head_dim;
 
+                // DEBUG: Print Q_typed values for this batch
+                if constexpr (std::is_same_v<ElementType, float>)
+                {
+                    LOG_INFO("[KERNEL compute_batch] batch=" << b << " q_offset=" << q_offset
+                                                             << " Q_typed[0..3]=[" << Q_typed[q_offset] << "," << Q_typed[q_offset + 1]
+                                                             << "," << Q_typed[q_offset + 2] << "," << Q_typed[q_offset + 3] << "]");
+                }
+
                 // Scores: [batch_size, n_heads, seq_len, seq_len] (always float)
                 size_t scores_offset = b * n_heads * seq_len * seq_len;
 
@@ -906,6 +914,11 @@ namespace llaminar2
                     mask_slice,
                     device_idx,
                     seq_len); // kv_len = seq_len for batch compute
+
+                // DEBUG: Print output values after compute_typed
+                LOG_INFO("[KERNEL compute_batch] batch=" << b << " out_offset=" << out_offset
+                                                         << " output[0..3]=[" << output[out_offset] << "," << output[out_offset + 1]
+                                                         << "," << output[out_offset + 2] << "," << output[out_offset + 3] << "]");
 
                 if (!success)
                     return false;

@@ -191,14 +191,26 @@ namespace llaminar2
         const int total_tokens = static_cast<int>(q_shape[0]);
         const int effective_batch_size = (batch_size > 0) ? batch_size : 1;
 
-        if (total_tokens % effective_batch_size != 0)
+        // Determine sequence length: use explicit config value, or infer from Q shape
+        int seq_len;
+        if (config.seq_len > 0)
         {
-            LOG_ERROR("[GQAAttention] compute: total tokens (" << total_tokens
-                                                               << ") not divisible by batch size (" << effective_batch_size << ")");
-            return false;
+            // Use explicit seq_len from config (avoids incorrect inference when Q is pre-allocated for max_seq_len)
+            seq_len = config.seq_len;
+            LOG_TRACE("[GQAAttention] Using explicit seq_len=" << seq_len << " from config");
         }
-
-        const int seq_len = total_tokens / effective_batch_size;
+        else
+        {
+            // Legacy: infer from Q tensor shape (only correct when Q is exactly-sized)
+            if (total_tokens % effective_batch_size != 0)
+            {
+                LOG_ERROR("[GQAAttention] compute: total tokens (" << total_tokens
+                                                                   << ") not divisible by batch size (" << effective_batch_size << ")");
+                return false;
+            }
+            seq_len = total_tokens / effective_batch_size;
+            LOG_TRACE("[GQAAttention] Inferred seq_len=" << seq_len << " from Q shape (legacy)");
+        }
 
         // Create attention kernel based on config.precision, NOT output tensor type
         // This allows Q8_1 inputs to use the Q8_1 kernel even with FP32 output

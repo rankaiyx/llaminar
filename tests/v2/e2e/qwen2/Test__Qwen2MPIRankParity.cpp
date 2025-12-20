@@ -1,11 +1,14 @@
 /**
  * @file Test__Qwen2MPIRankParity.cpp
- * @brief End-to-end MPI rank parity tests for Qwen2Pipeline
+ * @brief End-to-end MPI rank parity tests using GraphOrchestrator
  * @author David Sanftenberg
+ * @updated 2025-12-27 - Migrated to IInferenceRunner/GraphOrchestrator
  *
  * Validates MPI execution parity by comparing:
  * - Single-rank execution vs multi-rank (tensor-parallel) MPI execution
  * - Ensures distributed execution produces identical results to single-node
+ *
+ * Uses the unified IInferenceRunner interface which now defaults to GraphOrchestrator.
  *
  * NOTE: These tests compare MPI ranks against each other, NOT against a
  * ground truth PyTorch reference. For PyTorch parity tests, see
@@ -30,9 +33,12 @@
 #include <cstring>
 
 #include "../../../../src/v2/loaders/ModelContext.h"
-#include "../../../../src/v2/pipelines/qwen/Qwen2Pipeline.h"
+#include "../../../../src/v2/inference/InferenceRunner.h"
+#include "../../../../src/v2/inference/IInferenceRunner.h"
+#include "../../../../src/v2/backends/ComputeBackend.h"
 #include "../../../../src/v2/utils/MPIContext.h"
 #include "../../../../src/v2/utils/Logger.h"
+#include "../../../../src/v2/kernels/KernelFactory.h"
 
 using namespace llaminar2;
 
@@ -41,6 +47,8 @@ using namespace llaminar2;
  *
  * Tests compare single-rank execution against multi-rank MPI execution
  * to ensure tensor-parallel distribution produces identical results.
+ *
+ * Uses IInferenceRunner (GraphOrchestrator) for all test execution.
  */
 class Qwen2MPIRankParity : public ::testing::Test
 {
@@ -55,18 +63,28 @@ protected:
 
         // Model path (from test fixtures)
         model_path_ = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+        // Initialize device manager (required before creating inference runners)
+        DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
     }
 
     void TearDown() override
     {
-        // Cleanup
+        // Cleanup runners first (before model contexts)
+        runner_single_.reset();
+        runner_multi_.reset();
         model_ctx_single_.reset();
         model_ctx_multi_.reset();
         mpi_ctx_.reset();
+
+        // Clear kernel cache to prevent stale pointers
+        llaminar::v2::kernels::KernelFactory::clearCache();
     }
 
     /**
-     * @brief Load model for single-rank execution
+     * @brief Load model and create single-rank inference runner
+     *
+     * Only rank 0 creates the runner (for baseline comparison).
      */
     bool loadModelSingleRank()
     {
@@ -78,24 +96,84 @@ protected:
                 LOG_ERROR("[E2E] Failed to load model (single-rank): " << model_path_);
                 return false;
             }
+
+            // Create runner without MPI context (single-rank execution)
+            InferenceRunnerConfig config;
+            config.max_seq_len = 4096;
+            config.batch_size = 1;
+            config.force_graph = true; // Use Graph path
+
+            auto &dm = DeviceManager::instance();
+            int cpu_device = dm.cpuDeviceIndex();
+
+            runner_single_ = createInferenceRunner(model_ctx_single_, nullptr, cpu_device, config);
+            if (!runner_single_)
+            {
+                LOG_ERROR("[E2E] Failed to create single-rank runner");
+                return false;
+            }
+
             LOG_INFO("[E2E] Model loaded successfully (single-rank): " << model_path_);
+            LOG_INFO("[E2E] Execution path: " << (runner_single_->executionPath() == ExecutionPath::GRAPH ? "GRAPH" : "PIPELINE"));
         }
         return true;
     }
 
     /**
-     * @brief Load model for multi-rank execution
+     * @brief Load model and create multi-rank inference runner
+     *
+     * All ranks create runners with MPI context (tensor-parallel execution).
      */
     bool loadModelMultiRank()
     {
-        model_ctx_multi_ = ModelContext::create(model_path_);
+        // Pass MPI context to ModelContext::create for consistent weight sharding
+        model_ctx_multi_ = ModelContext::create(model_path_, mpi_ctx_);
         if (!model_ctx_multi_)
         {
             LOG_ERROR("[E2E] Rank " << rank_ << " failed to load model (multi-rank): " << model_path_);
             return false;
         }
+
+        // Create runner with MPI context (multi-rank execution)
+        InferenceRunnerConfig config;
+        config.max_seq_len = 4096;
+        config.batch_size = 1;
+        config.force_graph = true; // Use Graph path
+
+        auto &dm = DeviceManager::instance();
+        int cpu_device = dm.cpuDeviceIndex();
+
+        runner_multi_ = createInferenceRunner(model_ctx_multi_, mpi_ctx_, cpu_device, config);
+        if (!runner_multi_)
+        {
+            LOG_ERROR("[E2E] Rank " << rank_ << " failed to create multi-rank runner");
+            return false;
+        }
+
         LOG_INFO("[E2E] Rank " << rank_ << " model loaded successfully (multi-rank)");
+        LOG_INFO("[E2E] Execution path: " << (runner_multi_->executionPath() == ExecutionPath::GRAPH ? "GRAPH" : "PIPELINE"));
         return true;
+    }
+
+    /**
+     * @brief Create a fresh inference runner with specific batch size
+     *
+     * Helper for tests that need runners with different batch sizes.
+     */
+    std::unique_ptr<IInferenceRunner> createRunner(
+        std::shared_ptr<ModelContext> model_ctx,
+        std::shared_ptr<MPIContext> mpi_ctx,
+        int batch_size)
+    {
+        InferenceRunnerConfig config;
+        config.max_seq_len = 4096;
+        config.batch_size = batch_size;
+        config.force_graph = true;
+
+        auto &dm = DeviceManager::instance();
+        int cpu_device = dm.cpuDeviceIndex();
+
+        return createInferenceRunner(model_ctx, mpi_ctx, cpu_device, config);
     }
 
     /**
@@ -161,6 +239,8 @@ protected:
     std::shared_ptr<MPIContext> mpi_ctx_;
     std::shared_ptr<ModelContext> model_ctx_single_;
     std::shared_ptr<ModelContext> model_ctx_multi_;
+    std::unique_ptr<IInferenceRunner> runner_single_;
+    std::unique_ptr<IInferenceRunner> runner_multi_;
     std::string model_path_;
     int rank_;
     int world_size_;
@@ -169,8 +249,10 @@ protected:
 /**
  * @brief Test: Single token inference correctness (decode phase)
  *
- * Validates that single-rank and multi-rank pipelines produce identical
+ * Validates that single-rank and multi-rank execution produce identical
  * logits for a single token (typical decode scenario).
+ *
+ * Uses IInferenceRunner (GraphOrchestrator) for execution.
  */
 TEST_F(Qwen2MPIRankParity, SingleTokenInference)
 {
@@ -201,20 +283,18 @@ TEST_F(Qwen2MPIRankParity, SingleTokenInference)
     bool single_rank_success = true;
     if (rank_ == 0)
     {
-        auto pipeline_single = std::make_unique<Qwen2Pipeline>(
-            model_ctx_single_, nullptr, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+        ASSERT_NE(runner_single_, nullptr) << "Single-rank runner not created";
 
-        single_rank_success = pipeline_single->forward(tokens.data(), tokens.size());
+        single_rank_success = runner_single_->forward(tokens.data(), static_cast<int>(tokens.size()));
 
         if (single_rank_success)
         {
             // Get logits (vocabulary size)
-            const auto &model = model_ctx_single_->model();
-            size_t vocab_size = model.vocab_size;
+            size_t vocab_size = static_cast<size_t>(runner_single_->vocab_size());
             logits_single.resize(vocab_size);
 
-            // Extract logits from pipeline (seq_idx=0 for single sequence)
-            const float *logits_ptr = pipeline_single->getLogits(0);
+            // Extract logits from runner (seq_idx=0 for single sequence)
+            const float *logits_ptr = runner_single_->getLogits(0);
             if (logits_ptr)
             {
                 std::memcpy(logits_single.data(), logits_ptr, vocab_size * sizeof(float));
@@ -235,22 +315,20 @@ TEST_F(Qwen2MPIRankParity, SingleTokenInference)
     ASSERT_EQ(global_success_int, 1) << "Single-rank forward pass failed on rank 0";
 
     // Multi-rank execution (all ranks)
-    auto pipeline_multi = std::make_unique<Qwen2Pipeline>(
-        model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+    ASSERT_NE(runner_multi_, nullptr) << "Multi-rank runner not created on rank " << rank_;
 
-    bool success = pipeline_multi->forward(tokens.data(), tokens.size());
+    bool success = runner_multi_->forward(tokens.data(), static_cast<int>(tokens.size()));
     local_ok = success;
     int global_success = local_ok ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     ASSERT_EQ(global_success, 1) << "Multi-rank forward pass failed on some rank";
 
     std::vector<float> logits_multi;
-    const auto &model = model_ctx_multi_->model();
-    size_t vocab_size = model.vocab_size;
+    size_t vocab_size = static_cast<size_t>(runner_multi_->vocab_size());
     logits_multi.resize(vocab_size);
 
-    // Extract logits from multi-rank pipeline (seq_idx=0)
-    const float *logits_ptr_multi = pipeline_multi->getLogits(0);
+    // Extract logits from multi-rank runner (seq_idx=0)
+    const float *logits_ptr_multi = runner_multi_->getLogits(0);
     ASSERT_NE(logits_ptr_multi, nullptr) << "getLogits() returned null on rank " << rank_;
     std::memcpy(logits_multi.data(), logits_ptr_multi, vocab_size * sizeof(float));
 
@@ -276,8 +354,10 @@ TEST_F(Qwen2MPIRankParity, SingleTokenInference)
 /**
  * @brief Test: Multi-token prefill correctness
  *
- * Validates that single-rank and multi-rank pipelines produce identical
+ * Validates that single-rank and multi-rank execution produce identical
  * results for multi-token prefill (e.g., 8-32 tokens).
+ *
+ * Uses IInferenceRunner (GraphOrchestrator) for execution.
  */
 TEST_F(Qwen2MPIRankParity, MultiTokenPrefill)
 {
@@ -312,24 +392,21 @@ TEST_F(Qwen2MPIRankParity, MultiTokenPrefill)
         0};
 
     // Single-rank execution (rank 0 only)
-    std::unique_ptr<Qwen2Pipeline> pipeline_single;
     std::vector<float> logits_single;
     int single_rank_success = 0;
 
     if (rank_ == 0)
     {
-        pipeline_single = std::make_unique<Qwen2Pipeline>(
-            model_ctx_single_, nullptr, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+        ASSERT_NE(runner_single_, nullptr) << "Single-rank runner not created";
 
-        bool success = pipeline_single->forward(tokens.data(), tokens.size());
+        bool success = runner_single_->forward(tokens.data(), static_cast<int>(tokens.size()));
         single_rank_success = success ? 1 : 0;
 
-        const auto &model = model_ctx_single_->model();
-        size_t vocab_size = model.vocab_size;
+        size_t vocab_size = static_cast<size_t>(runner_single_->vocab_size());
         size_t seq_len = tokens.size();
 
         logits_single.resize(seq_len * vocab_size);
-        const float *logits_ptr_single = pipeline_single->getLogits(0);
+        const float *logits_ptr_single = runner_single_->getLogits(0);
         if (logits_ptr_single)
         {
             std::memcpy(logits_single.data(), logits_ptr_single, seq_len * vocab_size * sizeof(float));
@@ -348,21 +425,19 @@ TEST_F(Qwen2MPIRankParity, MultiTokenPrefill)
     ASSERT_EQ(single_rank_success, 1) << "Single-rank forward pass failed";
 
     // Multi-rank execution (all ranks)
-    auto pipeline_multi = std::make_unique<Qwen2Pipeline>(
-        model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+    ASSERT_NE(runner_multi_, nullptr) << "Multi-rank runner not created on rank " << rank_;
 
-    bool success = pipeline_multi->forward(tokens.data(), tokens.size());
+    bool success = runner_multi_->forward(tokens.data(), static_cast<int>(tokens.size()));
     local_ok = success;
     int global_success = local_ok ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     ASSERT_EQ(global_success, 1) << "Multi-rank forward pass failed on some rank";
 
-    const auto &model = model_ctx_multi_->model();
-    size_t vocab_size = model.vocab_size;
+    size_t vocab_size = static_cast<size_t>(runner_multi_->vocab_size());
     size_t seq_len = tokens.size();
 
     std::vector<float> logits_multi(seq_len * vocab_size);
-    const float *logits_ptr_multi = pipeline_multi->getLogits(0);
+    const float *logits_ptr_multi = runner_multi_->getLogits(0);
 
     // Verify logits availability across all ranks to prevent hangs
     bool has_logits = (logits_ptr_multi != nullptr);
@@ -401,6 +476,8 @@ TEST_F(Qwen2MPIRankParity, MultiTokenPrefill)
  *
  * Validates batched execution with equal-length sequences (no padding).
  * This test should pass because padding masking is not required.
+ *
+ * Uses IInferenceRunner (GraphOrchestrator) for execution.
  */
 TEST_F(Qwen2MPIRankParity, MultiSequenceBatchEqualLength)
 {
@@ -425,28 +502,39 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatchEqualLength)
     };
 
     const size_t batch_size = batch.size();
+    const size_t vocab_size = static_cast<size_t>(runner_multi_->vocab_size());
 
     // ======== Sequential Execution (Baseline) ========
     std::vector<std::vector<float>> logits_sequential(batch_size);
 
     for (size_t i = 0; i < batch_size; ++i)
     {
-        auto pipeline_seq = std::make_unique<Qwen2Pipeline>(
-            model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+        // Create fresh runner for each sequence
+        LOG_INFO("[E2E] Rank " << rank_ << " creating runner for sequence " << i);
+        auto runner_seq = createRunner(model_ctx_multi_, mpi_ctx_, 1);
+        local_ok = (runner_seq != nullptr);
+        int global_runner_ok = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_runner_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_runner_ok, 1) << "Failed to create sequential runner on some rank";
 
-        bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
+        LOG_INFO("[E2E] Rank " << rank_ << " calling forward for sequence " << i << " with " << batch[i].size() << " tokens");
+        bool success = runner_seq->forward(batch[i].data(), static_cast<int>(batch[i].size()));
+        LOG_INFO("[E2E] Rank " << rank_ << " forward returned " << (success ? "SUCCESS" : "FAILED") << " for sequence " << i);
         local_ok = success;
         int global_success = local_ok ? 1 : 0;
         MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
         ASSERT_EQ(global_success, 1) << "Sequential forward pass failed for some rank (sequence " << i << ")";
 
-        const auto &model = model_ctx_multi_->model();
-        size_t vocab_size = model.vocab_size;
         size_t seq_len = batch[i].size();
-
         logits_sequential[i].resize(seq_len * vocab_size);
-        const float *logits_ptr = pipeline_seq->getLogits(0);
-        ASSERT_NE(logits_ptr, nullptr);
+        const float *logits_ptr = runner_seq->getLogits(0);
+
+        // Synchronize null check across ranks to prevent hangs
+        local_ok = (logits_ptr != nullptr);
+        int global_logits_ok = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_logits_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_logits_ok, 1) << "Sequential getLogits returned null on some rank (sequence " << i << ")";
+
         std::memcpy(logits_sequential[i].data(), logits_ptr, seq_len * vocab_size * sizeof(float));
 
         if (rank_ == 0)
@@ -458,34 +546,39 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatchEqualLength)
     mpi_ctx_->barrier();
 
     // ======== Batched Execution ========
-    auto pipeline_batch = std::make_unique<Qwen2Pipeline>(
-        model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/batch_size);
+    auto runner_batch = createRunner(model_ctx_multi_, mpi_ctx_, static_cast<int>(batch_size));
+    local_ok = (runner_batch != nullptr);
+    int global_batch_runner_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_batch_runner_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_batch_runner_ok, 1) << "Failed to create batched runner on some rank";
 
-    bool success = pipeline_batch->forward_batch(batch);
+    bool success = runner_batch->forward_batch(batch);
     local_ok = success;
     int global_success = local_ok ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     ASSERT_EQ(global_success, 1) << "Batched forward pass failed on some rank";
 
-    const auto &model = model_ctx_multi_->model();
-    size_t vocab_size = model.vocab_size;
-
     // Extract per-sequence logits from batch
     std::vector<std::vector<float>> logits_batched(batch_size);
 
-    const int padded_seq_len = pipeline_batch->padded_seq_len();
+    const int padded_seq_len = runner_batch->padded_seq_len();
 
     if (rank_ == 0)
     {
         LOG_INFO("[E2E] Batched execution complete (equal-length sequences):");
-        LOG_INFO("[E2E]   Batch size: " << pipeline_batch->batch_size());
+        LOG_INFO("[E2E]   Batch size: " << runner_batch->batch_size());
         LOG_INFO("[E2E]   Padded seq len: " << padded_seq_len);
     }
 
     for (size_t i = 0; i < batch_size; ++i)
     {
-        const float *logits_ptr = pipeline_batch->getLogits(i);
-        ASSERT_NE(logits_ptr, nullptr);
+        const float *logits_ptr = runner_batch->getLogits(static_cast<int>(i));
+
+        // Synchronize null check across ranks to prevent hangs
+        local_ok = (logits_ptr != nullptr);
+        int global_logits_ok = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_logits_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_logits_ok, 1) << "Batched getLogits returned null on some rank (sequence " << i << ")";
 
         size_t seq_len = batch[i].size();
         logits_batched[i].resize(seq_len * vocab_size);
@@ -526,7 +619,7 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatchEqualLength)
     }
 
     // Broadcast all results to all ranks
-    MPI_Bcast(test_results.data(), batch_size, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(test_results.data(), static_cast<int>(batch_size), MPI_INT, 0, MPI_COMM_WORLD);
 
     // All ranks check results together
     for (size_t i = 0; i < batch_size; ++i)
@@ -555,6 +648,8 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatchEqualLength)
  *
  * Uses combined causal+padding masking to prevent padding tokens from
  * participating in attention.
+ *
+ * Uses IInferenceRunner (GraphOrchestrator) for execution.
  */
 TEST_F(Qwen2MPIRankParity, MultiSequenceBatch)
 {
@@ -579,32 +674,39 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatch)
     };
 
     const size_t batch_size = batch.size();
+    const size_t vocab_size = static_cast<size_t>(runner_multi_->vocab_size());
 
     // ======== Sequential Execution (Baseline) ========
     std::vector<std::vector<float>> logits_sequential(batch_size);
-    std::vector<std::unique_ptr<Qwen2Pipeline>> pipelines_seq(batch_size);
+    std::vector<std::unique_ptr<IInferenceRunner>> runners_seq(batch_size);
 
     for (size_t i = 0; i < batch_size; ++i)
     {
-        pipelines_seq[i] = std::make_unique<Qwen2Pipeline>(
-            model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+        runners_seq[i] = createRunner(model_ctx_multi_, mpi_ctx_, 1);
+        local_ok = (runners_seq[i] != nullptr);
+        int global_runner_ok = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_runner_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_runner_ok, 1) << "Failed to create sequential runner on some rank";
 
         // Enable snapshot capture for sequential baseline
-        pipelines_seq[i]->enableSnapshotCapture("/tmp/llaminar_snapshots_seq_" + std::to_string(i));
+        runners_seq[i]->enableSnapshotCapture("/tmp/llaminar_snapshots_seq_" + std::to_string(i));
 
-        bool success = pipelines_seq[i]->forward(batch[i].data(), batch[i].size());
+        bool success = runners_seq[i]->forward(batch[i].data(), static_cast<int>(batch[i].size()));
         local_ok = success;
         int global_success = local_ok ? 1 : 0;
         MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
         ASSERT_EQ(global_success, 1) << "Sequential forward pass failed for some rank (sequence " << i << ")";
 
-        const auto &model = model_ctx_multi_->model();
-        size_t vocab_size = model.vocab_size;
         size_t seq_len = batch[i].size();
-
         logits_sequential[i].resize(seq_len * vocab_size);
-        const float *logits_ptr = pipelines_seq[i]->getLogits(0);
-        ASSERT_NE(logits_ptr, nullptr);
+        const float *logits_ptr = runners_seq[i]->getLogits(0);
+
+        // Synchronize null check across ranks to prevent hangs
+        local_ok = (logits_ptr != nullptr);
+        int global_logits_ok = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_logits_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_logits_ok, 1) << "Sequential getLogits returned null on some rank (sequence " << i << ")";
+
         std::memcpy(logits_sequential[i].data(), logits_ptr, seq_len * vocab_size * sizeof(float));
 
         if (rank_ == 0)
@@ -616,54 +718,56 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatch)
     mpi_ctx_->barrier();
 
     // ======== Batched Execution ========
-    auto pipeline_batch = std::make_unique<Qwen2Pipeline>(
-        model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/batch_size);
+    auto runner_batch = createRunner(model_ctx_multi_, mpi_ctx_, static_cast<int>(batch_size));
+    local_ok = (runner_batch != nullptr);
+    int global_batch_runner_ok = local_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &global_batch_runner_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    ASSERT_EQ(global_batch_runner_ok, 1) << "Failed to create batched runner on some rank";
 
     // Enable snapshot capture for batched execution
-    pipeline_batch->enableSnapshotCapture("/tmp/llaminar_snapshots_batch");
+    runner_batch->enableSnapshotCapture("/tmp/llaminar_snapshots_batch");
 
-    bool success = pipeline_batch->forward_batch(batch);
+    bool success = runner_batch->forward_batch(batch);
     local_ok = success;
     int global_success = local_ok ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     ASSERT_EQ(global_success, 1) << "Batched forward pass failed on some rank";
 
-    const auto &model = model_ctx_multi_->model();
-    size_t vocab_size = model.vocab_size;
-
     // Extract per-sequence logits from batch
     std::vector<std::vector<float>> logits_batched(batch_size);
 
-    const int padded_seq_len = pipeline_batch->padded_seq_len();
+    const int padded_seq_len = runner_batch->padded_seq_len();
 
     if (rank_ == 0)
     {
         LOG_INFO("[E2E] Batched execution complete. Extracting logits:");
-        LOG_INFO("[E2E]   Batch size: " << pipeline_batch->batch_size());
+        LOG_INFO("[E2E]   Batch size: " << runner_batch->batch_size());
         LOG_INFO("[E2E]   Padded seq len: " << padded_seq_len);
         for (size_t i = 0; i < batch_size; ++i)
         {
-            LOG_INFO("[E2E]   Sequence " << i << " actual length: " << pipeline_batch->sequence_lengths()[i]);
+            LOG_INFO("[E2E]   Sequence " << i << " actual length: " << runner_batch->sequence_lengths()[i]);
         }
     }
 
     for (size_t i = 0; i < batch_size; ++i)
     {
-        const float *logits_ptr = pipeline_batch->getLogits(i);
-        ASSERT_NE(logits_ptr, nullptr);
+        const float *logits_ptr = runner_batch->getLogits(static_cast<int>(i));
+
+        // Synchronize null check across ranks to prevent hangs
+        local_ok = (logits_ptr != nullptr);
+        int global_logits_ok = local_ok ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &global_logits_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        ASSERT_EQ(global_logits_ok, 1) << "Batched getLogits returned null on some rank (sequence " << i << ")";
 
         size_t seq_len = batch[i].size();
-        const auto &seq_lengths = pipeline_batch->sequence_lengths();
-        size_t actual_len = seq_lengths[i];
+        const auto &seq_lengths = runner_batch->sequence_lengths();
+        size_t actual_len = static_cast<size_t>(seq_lengths[i]);
         ASSERT_EQ(actual_len, seq_len) << "Sequence length mismatch for sequence " << i;
 
         // Allocate buffer for this sequence's logits
         logits_batched[i].resize(seq_len * vocab_size);
 
         // Extract only non-padded logits row by row
-        // logits_ptr points to start of sequence i in padded layout
-        // Layout: [padded_seq_len rows for this sequence, vocab_size cols]
-        // We want first seq_len rows (actual tokens, not padding)
         for (size_t token_idx = 0; token_idx < seq_len; ++token_idx)
         {
             const float *src = logits_ptr + (token_idx * vocab_size);
@@ -717,7 +821,7 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatch)
         LOG_INFO("[E2E] ===== Snapshot Comparison for Seq1 =====");
 
         // Get snapshot keys from sequential Seq1 execution
-        auto seq1_keys = pipelines_seq[1]->getSnapshotKeys();
+        auto seq1_keys = runners_seq[1]->getSnapshotKeys();
         LOG_INFO("[E2E] Sequential Seq1 has " << seq1_keys.size() << " snapshots");
 
         // For each layer, compare Q_ROPE, K_ROPE, ATTENTION_CONTEXT
@@ -731,8 +835,8 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatch)
             for (const auto &key : keys_to_check)
             {
                 size_t seq_size = 0, batch_size_snap = 0;
-                const float *seq_data = pipelines_seq[1]->getSnapshot(key, seq_size);
-                const float *batch_data = pipeline_batch->getSnapshot(key, batch_size_snap);
+                const float *seq_data = runners_seq[1]->getSnapshot(key, seq_size);
+                const float *batch_data = runner_batch->getSnapshot(key, batch_size_snap);
 
                 if (seq_data && batch_data)
                 {
@@ -740,7 +844,7 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatch)
                     // Snapshots for batched have layout [batch_size * seq_len, feature_dim]
                     // Seq1 starts at offset: padded_seq_len * feature_dim (after Seq0)
                     size_t feature_dim = seq_size / batch[1].size(); // feature_dim = total / seq_len
-                    size_t batch_seq1_offset = padded_seq_len * feature_dim;
+                    size_t batch_seq1_offset = static_cast<size_t>(padded_seq_len) * feature_dim;
                     const float *batch_seq1_data = batch_data + batch_seq1_offset;
 
                     auto result = compareTensors(seq_data, batch_seq1_data, seq_size, tolerance);
@@ -759,7 +863,7 @@ TEST_F(Qwen2MPIRankParity, MultiSequenceBatch)
     }
 
     // Broadcast all results to all ranks
-    MPI_Bcast(test_results.data(), batch_size, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(test_results.data(), static_cast<int>(batch_size), MPI_INT, 0, MPI_COMM_WORLD);
 
     // All ranks check results together
     for (size_t i = 0; i < batch_size; ++i)
@@ -829,15 +933,13 @@ TEST_F(Qwen2MPIRankParity, BatchScaling)
 
         // Sequential execution (baseline)
         std::vector<std::vector<float>> logits_sequential(batch_size);
-        const auto &model = model_ctx_multi_->model();
-        size_t vocab_size = model.vocab_size;
+        size_t vocab_size = runner_multi_->vocab_size();
 
         for (int i = 0; i < batch_size; ++i)
         {
-            auto pipeline_seq = std::make_unique<Qwen2Pipeline>(
-                model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+            auto runner_seq = createRunner(model_ctx_multi_, mpi_ctx_, 1);
 
-            bool success = pipeline_seq->forward(batch[i].data(), batch[i].size());
+            bool success = runner_seq->forward(batch[i].data(), batch[i].size());
             local_ok = success;
             int global_success = local_ok ? 1 : 0;
             MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -845,17 +947,16 @@ TEST_F(Qwen2MPIRankParity, BatchScaling)
 
             size_t seq_len = batch[i].size();
             logits_sequential[i].resize(seq_len * vocab_size);
-            const float *logits_ptr = pipeline_seq->getLogits(0);
+            const float *logits_ptr = runner_seq->getLogits(0);
             std::memcpy(logits_sequential[i].data(), logits_ptr, seq_len * vocab_size * sizeof(float));
         }
 
         mpi_ctx_->barrier();
 
         // Batched execution
-        auto pipeline_batch = std::make_unique<Qwen2Pipeline>(
-            model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, batch_size);
+        auto runner_batch = createRunner(model_ctx_multi_, mpi_ctx_, batch_size);
 
-        bool success = pipeline_batch->forward_batch(batch);
+        bool success = runner_batch->forward_batch(batch);
         local_ok = success;
         int global_success = local_ok ? 1 : 0;
         MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -868,7 +969,7 @@ TEST_F(Qwen2MPIRankParity, BatchScaling)
             size_t seq_len = batch[i].size();
             logits_batched[i].resize(seq_len * vocab_size);
 
-            const float *logits_ptr = pipeline_batch->getLogits(i);
+            const float *logits_ptr = runner_batch->getLogits(static_cast<int>(i));
             ASSERT_NE(logits_ptr, nullptr);
 
             // Extract non-padded logits
@@ -947,12 +1048,11 @@ TEST_F(Qwen2MPIRankParity, IncrementalDecode)
     std::vector<int> prompt = {151644, 9906}; // BOS + "Hello"
     const int n_decode_steps = 5;
 
-    // Create pipeline with batch_size=1
-    auto pipeline = std::make_unique<Qwen2Pipeline>(
-        model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+    // Create runner with batch_size=1
+    auto runner = createRunner(model_ctx_multi_, mpi_ctx_, 1);
 
     // Prefill phase
-    bool success = pipeline->forward(prompt.data(), prompt.size());
+    bool success = runner->forward(prompt.data(), prompt.size());
     local_ok = success;
     int global_success = local_ok ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -965,13 +1065,12 @@ TEST_F(Qwen2MPIRankParity, IncrementalDecode)
 
     // Decode phase (incremental)
     std::vector<int> generated_tokens;
-    const auto &model = model_ctx_multi_->model();
-    size_t vocab_size = model.vocab_size;
+    size_t vocab_size = runner->vocab_size();
 
     for (int step = 0; step < n_decode_steps; ++step)
     {
         // Get logits from last token
-        const float *logits = pipeline->getLogits(0);
+        const float *logits = runner->getLogits(0);
         ASSERT_NE(logits, nullptr);
 
         // Greedy sampling on rank 0
@@ -996,7 +1095,7 @@ TEST_F(Qwen2MPIRankParity, IncrementalDecode)
         generated_tokens.push_back(next_token);
 
         // Incremental decode (single token)
-        success = pipeline->forward(&next_token, 1);
+        success = runner->forward(&next_token, 1);
         local_ok = success;
         global_success = local_ok ? 1 : 0;
         MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -1048,22 +1147,20 @@ TEST_F(Qwen2MPIRankParity, ComprehensiveBatchParity)
     };
 
     const int batch_size = static_cast<int>(batch.size());
-    const auto &model = model_ctx_multi_->model();
-    const size_t vocab_size = model.vocab_size;
+    const size_t vocab_size = runner_multi_->vocab_size();
 
     // ======== Sequential Execution (Baseline) ========
     std::vector<std::vector<float>> logits_sequential(batch_size);
-    std::vector<std::unique_ptr<Qwen2Pipeline>> pipelines_seq(batch_size);
+    std::vector<std::unique_ptr<IInferenceRunner>> runners_seq(batch_size);
 
     for (int i = 0; i < batch_size; ++i)
     {
-        pipelines_seq[i] = std::make_unique<Qwen2Pipeline>(
-            model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, /*batch_size=*/1);
+        runners_seq[i] = createRunner(model_ctx_multi_, mpi_ctx_, 1);
 
         // Enable snapshot capture for detailed layer comparison
-        pipelines_seq[i]->enableSnapshotCapture("/tmp/llaminar_snapshots_seq_" + std::to_string(i));
+        runners_seq[i]->enableSnapshotCapture("/tmp/llaminar_snapshots_seq_" + std::to_string(i));
 
-        bool success = pipelines_seq[i]->forward(batch[i].data(), batch[i].size());
+        bool success = runners_seq[i]->forward(batch[i].data(), batch[i].size());
         local_ok = success;
         int global_success = local_ok ? 1 : 0;
         MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -1071,7 +1168,7 @@ TEST_F(Qwen2MPIRankParity, ComprehensiveBatchParity)
 
         const size_t seq_len = batch[i].size();
         logits_sequential[i].resize(seq_len * vocab_size);
-        const float *logits_ptr = pipelines_seq[i]->getLogits(0);
+        const float *logits_ptr = runners_seq[i]->getLogits(0);
         std::memcpy(logits_sequential[i].data(), logits_ptr, seq_len * vocab_size * sizeof(float));
 
         if (rank_ == 0)
@@ -1083,13 +1180,12 @@ TEST_F(Qwen2MPIRankParity, ComprehensiveBatchParity)
     mpi_ctx_->barrier();
 
     // ======== Batched Execution ========
-    auto pipeline_batch = std::make_unique<Qwen2Pipeline>(
-        model_ctx_multi_, mpi_ctx_, -1, nullptr, PipelineConfig{}, batch_size);
+    auto runner_batch = createRunner(model_ctx_multi_, mpi_ctx_, batch_size);
 
     // Enable snapshot capture for batched execution
-    pipeline_batch->enableSnapshotCapture("/tmp/llaminar_snapshots_batch");
+    runner_batch->enableSnapshotCapture("/tmp/llaminar_snapshots_batch");
 
-    bool success = pipeline_batch->forward_batch(batch);
+    bool success = runner_batch->forward_batch(batch);
     local_ok = success;
     int global_success = local_ok ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &global_success, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -1098,8 +1194,8 @@ TEST_F(Qwen2MPIRankParity, ComprehensiveBatchParity)
     if (rank_ == 0)
     {
         LOG_INFO("[Parity] Batched execution complete:");
-        LOG_INFO("[Parity]   Batch size: " << pipeline_batch->batch_size());
-        LOG_INFO("[Parity]   Padded seq len: " << pipeline_batch->padded_seq_len());
+        LOG_INFO("[Parity]   Batch size: " << runner_batch->batch_size());
+        LOG_INFO("[Parity]   Padded seq len: " << runner_batch->padded_seq_len());
     }
 
     // ======== Extract and Compare Logits ========
@@ -1110,7 +1206,7 @@ TEST_F(Qwen2MPIRankParity, ComprehensiveBatchParity)
         const size_t seq_len = batch[i].size();
         logits_batched[i].resize(seq_len * vocab_size);
 
-        const float *logits_ptr = pipeline_batch->getLogits(i);
+        const float *logits_ptr = runner_batch->getLogits(static_cast<int>(i));
         ASSERT_NE(logits_ptr, nullptr);
 
         // Extract non-padded logits row by row
@@ -1146,7 +1242,7 @@ TEST_F(Qwen2MPIRankParity, ComprehensiveBatchParity)
                 LOG_INFO("\n[E2E] ===== Layer-by-Layer Snapshot Comparison for Sequence " << i << " =====");
 
                 // Get all snapshot keys from sequential execution
-                auto seq_keys = pipelines_seq[i]->getSnapshotKeys();
+                auto seq_keys = runners_seq[i]->getSnapshotKeys();
                 LOG_INFO("[E2E] Sequential has " << seq_keys.size() << " snapshots");
 
                 // Track if we found the first divergence
@@ -1158,14 +1254,14 @@ TEST_F(Qwen2MPIRankParity, ComprehensiveBatchParity)
                     size_t seq_size = 0;
                     size_t batch_size_snap = 0;
 
-                    const float *seq_data = pipelines_seq[i]->getSnapshot(key, seq_size);
-                    const float *batch_data = pipeline_batch->getSnapshot(key, batch_size_snap);
+                    const float *seq_data = runners_seq[i]->getSnapshot(key, seq_size);
+                    const float *batch_data = runner_batch->getSnapshot(key, batch_size_snap);
 
                     if (seq_data && batch_data)
                     {
                         // For batched snapshots, extract the specific sequence
                         // Layout: [batch_size * padded_seq_len, feature_dim]
-                        const int padded_len = pipeline_batch->padded_seq_len();
+                        const int padded_len = runner_batch->padded_seq_len();
                         const size_t feature_dim = seq_size / seq_len;
                         const size_t batch_feature_dim = batch_size_snap / (batch_size * padded_len);
 

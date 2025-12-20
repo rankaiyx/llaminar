@@ -1210,7 +1210,8 @@ namespace llaminar2
         if (!params_.Q)
             return info;
 
-        const int seq_len = static_cast<int>(params_.Q->rows());
+        // Use explicit seq_len if provided, otherwise derive from tensor
+        const int seq_len = (params_.seq_len > 0) ? params_.seq_len : static_cast<int>(params_.Q->rows());
 
         // Q tensor (in-place operation) - use safe accessor for Q8_1 compatibility
         const float *q_data = getSafeFp32Data(params_.Q);
@@ -1368,7 +1369,8 @@ namespace llaminar2
         if (!params_.gate || !params_.up || !params_.output)
             return info;
 
-        const int seq_len = static_cast<int>(params_.gate->rows());
+        // Use explicit seq_len if provided, otherwise derive from tensor
+        const int seq_len = (params_.seq_len > 0) ? params_.seq_len : static_cast<int>(params_.gate->rows());
         const int intermediate_dim = static_cast<int>(params_.gate->cols());
 
         // Use TensorBase* overload for type-safe FP32 extraction (handles Q8_1)
@@ -1637,24 +1639,40 @@ namespace llaminar2
             break;
         }
 
-        int rows = static_cast<int>(params_.input->rows());
+        // Use explicit num_elements if provided (for pre-allocated buffers)
+        // Otherwise derive from tensor dimensions
+        size_t actual_elements = (params_.num_elements > 0) ? params_.num_elements : params_.input->numel();
         int cols = static_cast<int>(params_.input->cols());
+        int rows = (cols > 0) ? static_cast<int>(actual_elements / cols) : 1;
 
-        // Input tensors - use raw_data() for void* compatibility
-        info.inputs.push_back({"input", params_.input->raw_data(),
-                               static_cast<size_t>(rows), static_cast<size_t>(cols),
-                               dtype, elem_size});
-        info.inputs.push_back({"residual", params_.residual->raw_data(),
-                               static_cast<size_t>(rows), static_cast<size_t>(cols),
-                               dtype, elem_size});
+        // Input tensors - use safe FP32 accessor
+        const float *input_data = getSafeFp32Data(params_.input);
+        const float *residual_data = getSafeFp32Data(params_.residual);
+        const float *output_data = getSafeFp32Data(params_.output);
+
+        if (input_data)
+        {
+            info.inputs.push_back({"input", input_data,
+                                   static_cast<size_t>(rows), static_cast<size_t>(cols),
+                                   dtype, elem_size});
+        }
+        if (residual_data)
+        {
+            info.inputs.push_back({"residual", residual_data,
+                                   static_cast<size_t>(rows), static_cast<size_t>(cols),
+                                   dtype, elem_size});
+        }
 
         // Output
-        info.outputs.push_back({"output", params_.output->raw_data(),
-                                static_cast<size_t>(rows), static_cast<size_t>(cols),
-                                dtype, elem_size});
+        if (output_data)
+        {
+            info.outputs.push_back({"output", output_data,
+                                    static_cast<size_t>(rows), static_cast<size_t>(cols),
+                                    dtype, elem_size});
+        }
 
         // Scalar params
-        info.addScalarInt("num_elements", static_cast<int>(params_.input->numel()));
+        info.addScalarInt("num_elements", static_cast<int>(actual_elements));
         info.addScalarInt("rows", rows);
         info.addScalarInt("cols", cols);
 
@@ -2066,6 +2084,7 @@ namespace llaminar2
         config.head_dim = params_.head_dim;
         config.causal = params_.causal;
         config.window_size = params_.window_size;
+        config.seq_len = params_.seq_len; // Pass explicit seq_len to avoid incorrect inference from Q shape
 
         // Auto-detect precision from Q tensor type (Q is authoritative since K/V come from cache)
         if (params_.Q && params_.Q->native_type() == TensorType::Q8_1)
@@ -2320,7 +2339,9 @@ namespace llaminar2
         (void)ctx;
 
         LOG_DEBUG("[AttentionWithKVCacheStage::executeBatched] layer=" << params_.layer_idx
-                                                                       << " batch_size=" << params_.batch_size << " seq_len=" << params_.seq_len);
+                                                                       << " batch_size=" << params_.batch_size << " seq_len=" << params_.seq_len
+                                                                       << " sequence_lengths=" << (params_.sequence_lengths ? "valid" : "nullptr")
+                                                                       << (params_.sequence_lengths ? " [0]=" + std::to_string((*params_.sequence_lengths)[0]) : ""));
 
         // For batched mode with different sequence lengths, we need to:
         // 1. Append K/V per sequence to cache
@@ -2524,19 +2545,78 @@ namespace llaminar2
             return false;
         }
 
-        int num_tokens = params_.num_tokens;
-        if (num_tokens <= 0)
+        // Determine total tokens to append
+        int total_tokens = params_.num_tokens;
+        if (total_tokens <= 0)
         {
-            // Infer from tensor shape
-            num_tokens = static_cast<int>(params_.K->shape()[0]);
+            total_tokens = static_cast<int>(params_.K->shape()[0]);
         }
 
-        LOG_DEBUG("[KVCacheAppendStage] Appending " << num_tokens
-                                                    << " tokens to layer " << params_.layer_idx << " seq " << params_.seq_idx);
+        // Determine batch handling mode
+        const int batch_size = params_.batch_size;
+        const int seq_len = params_.seq_len;
+
+        // If batch_size > 1 and seq_len > 0, do per-sequence append
+        // K/V layout: [batch_size * seq_len, kv_dim] - contiguous per-sequence
+        if (batch_size > 1 && seq_len > 0)
+        {
+            const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
+
+            LOG_DEBUG("[KVCacheAppendStage] Batched append: batch_size=" << batch_size
+                                                                         << " seq_len=" << seq_len
+                                                                         << " kv_dim=" << kv_dim
+                                                                         << " layer=" << params_.layer_idx);
+
+            // Get raw data pointers for slicing
+            const float *k_data = params_.K->fp32_data();
+            const float *v_data = params_.V->fp32_data();
+
+            if (!k_data || !v_data)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for K/V tensors");
+                return false;
+            }
+
+            // Create temporary tensors for per-sequence slices
+            // Note: We create views/copies that the cache will copy from
+            for (int b = 0; b < batch_size; ++b)
+            {
+                const int seq_idx = params_.seq_idx + b;
+                const size_t offset = b * seq_len * kv_dim;
+
+                // Create temporary FP32 tensors wrapping the slice data
+                // These are views into the contiguous K/V buffer
+                auto k_slice = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
+                auto v_slice = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
+
+                // Copy slice data (could be optimized with non-owning views)
+                std::memcpy(k_slice->mutable_data(), k_data + offset, seq_len * kv_dim * sizeof(float));
+                std::memcpy(v_slice->mutable_data(), v_data + offset, seq_len * kv_dim * sizeof(float));
+
+                LOG_TRACE("[KVCacheAppendStage] Appending " << seq_len << " tokens to layer "
+                                                            << params_.layer_idx << " seq_idx=" << seq_idx);
+
+                bool success = params_.kv_cache->append_kv(
+                    params_.layer_idx, seq_idx,
+                    k_slice.get(), v_slice.get(), seq_len);
+
+                if (!success)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] append_kv failed for batch " << b);
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // Single-sequence path (original behavior)
+        LOG_DEBUG("[KVCacheAppendStage] Single-sequence append: " << total_tokens
+                                                                  << " tokens to layer " << params_.layer_idx << " seq " << params_.seq_idx);
 
         bool success = params_.kv_cache->append_kv(
             params_.layer_idx, params_.seq_idx,
-            params_.K, params_.V, num_tokens);
+            params_.K, params_.V, total_tokens);
 
         if (!success)
         {
@@ -2563,6 +2643,91 @@ namespace llaminar2
         {
             BufferTensorType buf_type = toBufferTensorType(params_.V->native_type());
             reqs.addInput("V", params_.V->shape(), buf_type);
+        }
+
+        // Note: KV cache itself is external state, not a buffer managed by this stage
+
+        return reqs;
+    }
+
+    // =============================================================================
+    // KVCacheGatherStage Implementation
+    // =============================================================================
+
+    KVCacheGatherStage::KVCacheGatherStage(Params params)
+        : params_(std::move(params)) {}
+
+    bool KVCacheGatherStage::execute(IDeviceContext *ctx)
+    {
+        (void)ctx;
+
+        if (!params_.kv_cache)
+        {
+            LOG_ERROR("[KVCacheGatherStage] No KV cache provided");
+            return false;
+        }
+
+        if (!params_.out_K || !params_.out_V)
+        {
+            LOG_ERROR("[KVCacheGatherStage] Invalid output K/V tensors");
+            return false;
+        }
+
+        if (params_.batch_size <= 0)
+        {
+            LOG_ERROR("[KVCacheGatherStage] Invalid batch_size=" << params_.batch_size);
+            return false;
+        }
+
+        // Call the unified gather method
+        int max_kv_len = params_.kv_cache->gather_kv_batched(
+            params_.layer_idx,
+            params_.batch_size,
+            params_.out_K,
+            params_.out_V,
+            last_per_seq_kv_lens_);
+
+        if (max_kv_len < 0)
+        {
+            LOG_ERROR("[KVCacheGatherStage] gather_kv_batched failed for layer " << params_.layer_idx);
+            return false;
+        }
+
+        last_max_kv_len_ = max_kv_len;
+
+        // Write outputs if requested
+        if (params_.out_max_kv_len)
+        {
+            *params_.out_max_kv_len = max_kv_len;
+        }
+        if (params_.out_per_seq_kv_lens)
+        {
+            *params_.out_per_seq_kv_lens = last_per_seq_kv_lens_;
+        }
+
+        LOG_DEBUG("[KVCacheGatherStage] Gathered " << params_.batch_size
+                                                   << " sequences from layer " << params_.layer_idx
+                                                   << ", max_kv_len=" << max_kv_len);
+
+        return true;
+    }
+
+    StageBufferRequirements KVCacheGatherStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        // Output: K (gathered from cache)
+        if (params_.out_K)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.out_K->native_type());
+            reqs.addOutput("gathered_K", params_.out_K->shape(), buf_type);
+        }
+
+        // Output: V (gathered from cache)
+        if (params_.out_V)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.out_V->native_type());
+            reqs.addOutput("gathered_V", params_.out_V->shape(), buf_type);
         }
 
         // Note: KV cache itself is external state, not a buffer managed by this stage
@@ -2783,9 +2948,19 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
-        // Note: TensorBase* doesn't expose data() directly - we rely on execute()
-        // to handle the actual type dispatch. For dump purposes, just report dimensions.
-        // TODO: Add addWeight() variant that accepts TensorBase* for type-safe dump
+        // Output: attention context
+        // Output shape: [batch_size * seq_len, n_heads * head_dim]
+        if (params_.output)
+        {
+            const float *out_data = getSafeFp32Data(params_.output);
+            if (out_data)
+            {
+                info.addOutput("output",
+                               out_data,
+                               params_.seq_len,
+                               params_.n_heads * params_.head_dim);
+            }
+        }
 
         // Scalars capture all necessary info for debugging
         info.addScalarInt("batch_size", params_.batch_size);
@@ -3341,6 +3516,13 @@ namespace llaminar2
     {
         // KV cache append is backend-agnostic (pure memory operations)
         return std::make_unique<KVCacheAppendStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createKVCacheGather(
+        const KVCacheGatherStage::Params &params)
+    {
+        // KV cache gather is backend-agnostic (pure memory operations)
+        return std::make_unique<KVCacheGatherStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionCompute(

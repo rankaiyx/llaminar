@@ -543,6 +543,164 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Gather K/V Batched Implementation
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    int UnifiedKVCache<Precision>::gather_kv_batched(
+        int layer, int num_sequences, TensorBase *out_k, TensorBase *out_v,
+        std::vector<int> &out_kv_lens)
+    {
+        if (layer < 0 || layer >= n_layers_)
+        {
+            LOG_ERROR("UnifiedKVCache::gather_kv_batched: invalid layer=" << layer);
+            return -1;
+        }
+
+        if (num_sequences > batch_size_)
+        {
+            LOG_ERROR("UnifiedKVCache::gather_kv_batched: num_sequences=" << num_sequences
+                                                                          << " > batch_size=" << batch_size_);
+            return -1;
+        }
+
+        // Type check output tensors
+        TensorT *typed_k = dynamic_cast<TensorT *>(out_k);
+        TensorT *typed_v = dynamic_cast<TensorT *>(out_v);
+        if (!typed_k || !typed_v)
+        {
+            LOG_ERROR("UnifiedKVCache::gather_kv_batched: output tensor type mismatch");
+            return -1;
+        }
+
+        // Resize output vector
+        out_kv_lens.resize(num_sequences);
+
+        // First pass: find max kv_len and populate out_kv_lens
+        int max_kv_len = 0;
+        for (int seq_idx = 0; seq_idx < num_sequences; ++seq_idx)
+        {
+            int kv_len = entries_[layer][seq_idx].cached_tokens;
+            out_kv_lens[seq_idx] = kv_len;
+            max_kv_len = std::max(max_kv_len, kv_len);
+        }
+
+        if (max_kv_len == 0)
+        {
+            LOG_DEBUG("UnifiedKVCache::gather_kv_batched: all sequences have 0 cached tokens");
+            return 0;
+        }
+
+        // Validate output tensor dimensions
+        size_t expected_rows = static_cast<size_t>(num_sequences) * max_kv_len;
+        size_t expected_cols = kv_dim_;
+        if (typed_k->shape()[0] < expected_rows || typed_k->shape()[1] != expected_cols)
+        {
+            LOG_ERROR("UnifiedKVCache::gather_kv_batched: out_k shape mismatch. Expected at least ["
+                      << expected_rows << ", " << expected_cols << "], got ["
+                      << typed_k->shape()[0] << ", " << typed_k->shape()[1] << "]");
+            return -1;
+        }
+        if (typed_v->shape()[0] < expected_rows || typed_v->shape()[1] != expected_cols)
+        {
+            LOG_ERROR("UnifiedKVCache::gather_kv_batched: out_v shape mismatch");
+            return -1;
+        }
+
+        // Second pass: copy data from each sequence to batched output
+        // Parallelize across sequences - each copy is independent
+#pragma omp parallel for schedule(static) if (num_sequences >= 4)
+        for (int seq_idx = 0; seq_idx < num_sequences; ++seq_idx)
+        {
+            int kv_len = out_kv_lens[seq_idx];
+            if (kv_len == 0)
+            {
+                continue;
+            }
+
+            const TensorT *src_k = entries_[layer][seq_idx].K.get();
+            const TensorT *src_v = entries_[layer][seq_idx].V.get();
+
+            // Copy K
+            if constexpr (Precision == ActivationPrecision::FP32)
+            {
+                const float *src_data = src_k->data();
+                float *dst_data = typed_k->mutable_data();
+                size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
+                size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(float);
+                std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
+            }
+            else if constexpr (Precision == ActivationPrecision::BF16)
+            {
+                const uint16_t *src_data = src_k->bf16_data();
+                uint16_t *dst_data = typed_k->mutable_bf16_data();
+                size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
+                size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(uint16_t);
+                std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
+            }
+            else if constexpr (Precision == ActivationPrecision::FP16)
+            {
+                const uint16_t *src_data = src_k->fp16_data();
+                uint16_t *dst_data = typed_k->mutable_fp16_data();
+                size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
+                size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(uint16_t);
+                std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
+            }
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+            {
+                const Q8_1Block *src_blocks = src_k->q8_1_blocks();
+                Q8_1Block *dst_blocks = typed_k->mutable_q8_1_blocks();
+                size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                size_t dst_offset_blocks = static_cast<size_t>(seq_idx) * max_kv_len * blocks_per_row;
+                size_t copy_blocks = static_cast<size_t>(kv_len) * blocks_per_row;
+                size_t copy_bytes = copy_blocks * sizeof(Q8_1Block);
+                std::memcpy(dst_blocks + dst_offset_blocks, src_blocks, copy_bytes);
+            }
+
+            // Copy V
+            if constexpr (Precision == ActivationPrecision::FP32)
+            {
+                const float *src_data = src_v->data();
+                float *dst_data = typed_v->mutable_data();
+                size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
+                size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(float);
+                std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
+            }
+            else if constexpr (Precision == ActivationPrecision::BF16)
+            {
+                const uint16_t *src_data = src_v->bf16_data();
+                uint16_t *dst_data = typed_v->mutable_bf16_data();
+                size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
+                size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(uint16_t);
+                std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
+            }
+            else if constexpr (Precision == ActivationPrecision::FP16)
+            {
+                const uint16_t *src_data = src_v->fp16_data();
+                uint16_t *dst_data = typed_v->mutable_fp16_data();
+                size_t dst_offset = static_cast<size_t>(seq_idx) * max_kv_len * kv_dim_;
+                size_t copy_bytes = static_cast<size_t>(kv_len) * kv_dim_ * sizeof(uint16_t);
+                std::memcpy(dst_data + dst_offset, src_data, copy_bytes);
+            }
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+            {
+                const Q8_1Block *src_blocks = src_v->q8_1_blocks();
+                Q8_1Block *dst_blocks = typed_v->mutable_q8_1_blocks();
+                size_t blocks_per_row = (kv_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                size_t dst_offset_blocks = static_cast<size_t>(seq_idx) * max_kv_len * blocks_per_row;
+                size_t copy_blocks = static_cast<size_t>(kv_len) * blocks_per_row;
+                size_t copy_bytes = copy_blocks * sizeof(Q8_1Block);
+                std::memcpy(dst_blocks + dst_offset_blocks, src_blocks, copy_bytes);
+            }
+        }
+
+        LOG_DEBUG("UnifiedKVCache::gather_kv_batched: layer " << layer
+                                                              << ", gathered " << num_sequences << " sequences, max_kv_len=" << max_kv_len);
+
+        return max_kv_len;
+    }
+
+    // =========================================================================
     // Explicit Template Instantiations
     // =========================================================================
 

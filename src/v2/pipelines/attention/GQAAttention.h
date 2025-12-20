@@ -39,6 +39,11 @@ namespace llaminar2
         bool causal;     // Apply causal masking for autoregressive generation
         int window_size; // Sliding window size (-1 = full attention)
 
+        // Explicit sequence length (required when Q tensor is pre-allocated for max_seq_len)
+        // If > 0, this is used instead of inferring from Q tensor shape.
+        // If <= 0, seq_len is inferred from Q->shape()[0] / batch_size (legacy behavior)
+        int seq_len; // Explicit sequence length (number of query tokens per batch)
+
         // Activation precision for attention operations
         ActivationPrecision precision; // FP32, BF16, FP16 (controls GEMM precision)
 
@@ -58,6 +63,7 @@ namespace llaminar2
         GQAAttentionConfig()
             : n_heads(0), n_kv_heads(0), head_dim(0),
               causal(true), window_size(-1),
+              seq_len(0), // 0 = infer from Q tensor shape
               precision(ActivationPrecision::FP32),
               mpi_ctx(nullptr), mpi_strategy(MPIStrategy::None),
               verbose_logging(false),

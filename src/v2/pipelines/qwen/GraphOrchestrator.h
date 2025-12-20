@@ -33,9 +33,12 @@
 #include "../../inference/IInferenceRunner.h"
 #include "../../execution/GraphExecutor.h"
 #include "../../execution/DeviceContext.h"
+#include "../../execution/ComputeStage.h" // For StageDumpInfo
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <cstring>
 
 namespace llaminar2
 {
@@ -517,6 +520,303 @@ namespace llaminar2
         const char *architecture() const override { return "qwen2"; }
 
         // =========================================================================
+        // Batch Interface (IInferenceRunner overrides)
+        // =========================================================================
+
+        /**
+         * @brief Batched forward pass with variable-length sequences
+         *
+         * @param token_batches Vector of token sequences
+         * @return true if forward pass succeeded
+         */
+        bool forward_batch(const std::vector<std::vector<int>> &token_batches) override;
+
+        /**
+         * @brief Get logits for a specific sequence in batch
+         *
+         * @param seq_idx Sequence index in batch (default=0)
+         * @return Pointer to logits [padded_seq_len, vocab_size], or nullptr
+         */
+        const float *getLogits(int seq_idx = 0) const override;
+
+        /**
+         * @brief Get current batch size
+         */
+        int batch_size() const override { return state_.batch_size; }
+
+        /**
+         * @brief Get padded sequence length for current batch
+         */
+        int padded_seq_len() const override { return padded_seq_len_; }
+
+        /**
+         * @brief Get sequence lengths for current batch
+         */
+        const std::vector<int> &sequence_lengths() const override { return state_.sequence_lengths; }
+
+        // =========================================================================
+        // Snapshot Capture API (Pipeline-compatible for E2E testing)
+        // =========================================================================
+
+        /**
+         * @brief Enable snapshot capture of intermediate activations
+         *
+         * When enabled, orchestrator stores copies of intermediate tensors from
+         * each stage execution. Used for parity testing against reference implementations.
+         *
+         * This mirrors the PipelineBase snapshot API for easy migration of E2E tests.
+         *
+         * @param output_dir Optional directory to save snapshots (currently unused)
+         */
+        void enableSnapshotCapture(const std::string &output_dir = "") override
+        {
+            (void)output_dir; // Reserved for future disk output
+            snapshots_.clear();
+            snapshot_enabled_ = true;
+
+            executor_.setSnapshotCallback(
+                [this](const std::string &name, const StageDumpInfo &dump)
+                {
+                    // Handle fused QKV stage specially - split into separate Q, K, V snapshots
+                    // The fused stage outputs are ordered: Q (output_q), K (output_k), V (output_v)
+                    if (name.find("_qkv_proj") != std::string::npos)
+                    {
+                        // Extract layer prefix (e.g., "layer0" from "layer0_qkv_proj")
+                        size_t qkv_pos = name.find("_qkv_proj");
+                        std::string prefix = name.substr(0, qkv_pos);
+
+                        // Store Q, K, V separately with pipeline-compatible keys
+                        if (dump.outputs.size() >= 3)
+                        {
+                            // Output 0 = Q
+                            if (dump.outputs[0].data)
+                            {
+                                const auto &out = dump.outputs[0];
+                                size_t count = out.rows * out.cols;
+                                std::vector<float> data(count);
+                                std::memcpy(data.data(), out.data, count * sizeof(float));
+                                snapshots_[prefix + "_Q_PROJECTION"] = std::move(data);
+                            }
+                            // Output 1 = K
+                            if (dump.outputs[1].data)
+                            {
+                                const auto &out = dump.outputs[1];
+                                size_t count = out.rows * out.cols;
+                                std::vector<float> data(count);
+                                std::memcpy(data.data(), out.data, count * sizeof(float));
+                                snapshots_[prefix + "_K_PROJECTION"] = std::move(data);
+                            }
+                            // Output 2 = V
+                            if (dump.outputs[2].data)
+                            {
+                                const auto &out = dump.outputs[2];
+                                size_t count = out.rows * out.cols;
+                                std::vector<float> data(count);
+                                std::memcpy(data.data(), out.data, count * sizeof(float));
+                                snapshots_[prefix + "_V_PROJECTION"] = std::move(data);
+                            }
+                        }
+                        return;
+                    }
+
+                    // Handle fused Gate/Up stage specially - split into separate GATE and UP snapshots
+                    if (name.find("_gate_up") != std::string::npos)
+                    {
+                        size_t pos = name.find("_gate_up");
+                        std::string prefix = name.substr(0, pos);
+
+                        if (dump.outputs.size() >= 2)
+                        {
+                            // Output 0 = gate
+                            if (dump.outputs[0].data)
+                            {
+                                const auto &out = dump.outputs[0];
+                                size_t count = out.rows * out.cols;
+                                std::vector<float> data(count);
+                                std::memcpy(data.data(), out.data, count * sizeof(float));
+                                snapshots_[prefix + "_FFN_GATE"] = std::move(data);
+                            }
+                            // Output 1 = up
+                            if (dump.outputs[1].data)
+                            {
+                                const auto &out = dump.outputs[1];
+                                size_t count = out.rows * out.cols;
+                                std::vector<float> data(count);
+                                std::memcpy(data.data(), out.data, count * sizeof(float));
+                                snapshots_[prefix + "_FFN_UP"] = std::move(data);
+                            }
+                        }
+                        return;
+                    }
+
+                    // Handle RoPE stage - captures Q_ROPE and K_ROPE
+                    if (name.find("_rope") != std::string::npos && name.find("_q_rope") == std::string::npos && name.find("_k_rope") == std::string::npos)
+                    {
+                        // Generic "_rope" stage (fused Q/K RoPE)
+                        size_t pos = name.find("_rope");
+                        std::string prefix = name.substr(0, pos);
+
+                        // RoPE stage outputs are Q and K after RoPE application
+                        if (dump.outputs.size() >= 2)
+                        {
+                            if (dump.outputs[0].data)
+                            {
+                                const auto &out = dump.outputs[0];
+                                size_t count = out.rows * out.cols;
+                                std::vector<float> data(count);
+                                std::memcpy(data.data(), out.data, count * sizeof(float));
+                                snapshots_[prefix + "_Q_ROPE"] = std::move(data);
+                            }
+                            if (dump.outputs[1].data)
+                            {
+                                const auto &out = dump.outputs[1];
+                                size_t count = out.rows * out.cols;
+                                std::vector<float> data(count);
+                                std::memcpy(data.data(), out.data, count * sizeof(float));
+                                snapshots_[prefix + "_K_ROPE"] = std::move(data);
+                            }
+                        }
+                        return;
+                    }
+
+                    // Standard single-output stages
+                    if (!dump.outputs.empty() && dump.outputs[0].data)
+                    {
+                        const auto &out = dump.outputs[0];
+                        size_t count = out.rows * out.cols;
+                        std::vector<float> data(count);
+                        std::memcpy(data.data(), out.data, count * sizeof(float));
+
+                        // Convert graph stage name to pipeline-style key
+                        std::string key = convertStageNameToSnapshotKey(name);
+                        snapshots_[key] = std::move(data);
+                    }
+                });
+        }
+
+        /**
+         * @brief Disable snapshot capture and clear stored snapshots
+         */
+        void disableSnapshotCapture() override
+        {
+            snapshot_enabled_ = false;
+            snapshots_.clear();
+            executor_.setSnapshotCallback(nullptr);
+        }
+
+        /**
+         * @brief Clear stored snapshots but keep capture enabled
+         */
+        void clearSnapshots() override
+        {
+            snapshots_.clear();
+        }
+
+        /**
+         * @brief Retrieve a captured snapshot by key
+         *
+         * @param key Snapshot identifier (e.g., "layer0_Q_PROJECTION", "EMBEDDING")
+         * @param out_size Output parameter for tensor size (number of float elements)
+         * @return Pointer to snapshot data, or nullptr if key doesn't exist
+         */
+        const float *getSnapshot(const std::string &key, size_t &out_size) const override
+        {
+            auto it = snapshots_.find(key);
+            if (it == snapshots_.end())
+            {
+                out_size = 0;
+                return nullptr;
+            }
+            out_size = it->second.size();
+            return it->second.data();
+        }
+
+        /**
+         * @brief Get list of all captured snapshot keys
+         *
+         * @return Vector of snapshot identifiers
+         */
+        std::vector<std::string> getSnapshotKeys() const override
+        {
+            std::vector<std::string> keys;
+            keys.reserve(snapshots_.size());
+            for (const auto &p : snapshots_)
+            {
+                keys.push_back(p.first);
+            }
+            return keys;
+        }
+
+        /**
+         * @brief Check if snapshot capture is enabled
+         */
+        bool isSnapshotCaptureEnabled() const { return snapshot_enabled_; }
+
+        /**
+         * @brief Convert graph stage name to pipeline-style snapshot key
+         *
+         * Graph stages use snake_case (e.g., "layer0_q_proj")
+         * Pipeline snapshots use SCREAMING_CASE (e.g., "layer0_Q_PROJECTION")
+         *
+         * This is public to allow unit testing of the conversion logic.
+         *
+         * @param stage_name Graph stage name
+         * @return Pipeline-compatible snapshot key
+         */
+        static std::string convertStageNameToSnapshotKey(const std::string &stage_name)
+        {
+            // Stage name mappings (graph → pipeline)
+            static const std::unordered_map<std::string, std::string> suffix_map = {
+                {"_attn_norm", "_ATTENTION_NORM"},
+                {"_q_proj", "_Q_PROJECTION"},
+                {"_k_proj", "_K_PROJECTION"},
+                {"_v_proj", "_V_PROJECTION"},
+                {"_q_rope", "_Q_ROPE"},
+                {"_k_rope", "_K_ROPE"},
+                {"_attention", "_ATTENTION_CONTEXT"}, // Graph uses "attention" not "attn_compute"
+                {"_wo_proj", "_ATTENTION_OUTPUT"},    // Graph uses "wo_proj" not "attn_proj"
+                {"_attn_residual", "_ATTENTION_RESIDUAL"},
+                {"_ffn_norm", "_FFN_NORM"},
+                {"_ffn_gate", "_FFN_GATE"},
+                {"_ffn_up", "_FFN_UP"},
+                {"_swiglu", "_FFN_SWIGLU"},
+                {"_down_proj", "_FFN_DOWN"}, // Graph uses "down_proj" not "ffn_down"
+                {"_ffn_residual", "_FFN_RESIDUAL"},
+            };
+
+            // Global stages
+            if (stage_name == "embedding")
+                return "EMBEDDING";
+            if (stage_name == "final_norm")
+                return "FINAL_NORM";
+            if (stage_name == "lm_head")
+                return "LM_HEAD";
+
+            // Layer-specific stages: extract layer prefix and convert suffix
+            for (const auto &[suffix, replacement] : suffix_map)
+            {
+                size_t pos = stage_name.find(suffix);
+                if (pos != std::string::npos)
+                {
+                    // Extract "layerN" prefix
+                    std::string prefix = stage_name.substr(0, pos);
+                    return prefix + replacement;
+                }
+            }
+
+            // Fallback: return original name (uppercase)
+            std::string result = stage_name;
+            for (char &c : result)
+            {
+                if (c >= 'a' && c <= 'z')
+                    c = c - 'a' + 'A';
+                if (c == '_')
+                    c = '_'; // Keep underscores
+            }
+            return result;
+        }
+
+        // =========================================================================
         // Model Metadata Accessors (Convenience)
         // =========================================================================
 
@@ -615,6 +915,19 @@ namespace llaminar2
 
         /// Inference state (Phase 5 - owned buffers)
         InferenceState state_;
+
+        /// Padded sequence length from last forward_batch() call
+        int padded_seq_len_ = 0;
+
+        // =========================================================================
+        // Snapshot Capture Members
+        // =========================================================================
+
+        /// Whether snapshot capture is enabled
+        bool snapshot_enabled_ = false;
+
+        /// Captured snapshots (key -> FP32 data)
+        std::unordered_map<std::string, std::vector<float>> snapshots_;
     };
 
     // =========================================================================

@@ -30,8 +30,11 @@ namespace llaminar2
 
         if (device_idx < 0 || static_cast<size_t>(device_idx) >= devices.size())
         {
-            LOG_ERROR("IDeviceContext::create: invalid device_idx " << device_idx);
-            return nullptr;
+            LOG_ERROR("IDeviceContext::create: invalid device_idx " << device_idx
+                                                                    << " (valid range: 0-" << (devices.size() - 1) << ")"
+                                                                    << ". Use DeviceManager::cpuDeviceIndex() for CPU, not -1.");
+            throw std::invalid_argument("Invalid device_idx " + std::to_string(device_idx) +
+                                        ". Use DeviceManager::cpuDeviceIndex() for CPU.");
         }
 
         const auto &device = devices[device_idx];

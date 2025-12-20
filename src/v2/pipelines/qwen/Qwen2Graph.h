@@ -95,9 +95,8 @@ namespace llaminar2
         /// Use graph-managed buffer allocation with aliasing optimization.
         /// When true, Qwen2Graph will use GraphBufferManager to allocate activation
         /// buffers with automatic aliasing of non-overlapping SCRATCH buffers.
-        /// When false (default), uses external setBuffers() pattern.
-        /// Part of Phase 5: Qwen2Graph Integration.
-        bool use_graph_buffer_management = false;
+        /// NOTE: As of December 2025, this defaults to true (Graph is primary path).
+        bool use_graph_buffer_management = true;
 
         /// Maximum sequence length for buffer allocation (when use_graph_buffer_management=true)
         int max_seq_len = 2048;
@@ -196,6 +195,10 @@ namespace llaminar2
         TensorBase *workspace_context = nullptr;
         TensorBase *workspace_mask = nullptr;
 
+        // === Batched Decode Buffers (for gather from multiple cache slots) ===
+        TensorBase *gathered_K = nullptr; ///< [batch_size * max_kv_len, kv_dim]
+        TensorBase *gathered_V = nullptr; ///< [batch_size * max_kv_len, kv_dim]
+
         // === OUTPUT Buffers ===
         TensorBase *attn_proj = nullptr;
         TensorBase *current_hidden = nullptr;
@@ -229,6 +232,11 @@ namespace llaminar2
         int position_offset = 0;             ///< KV cache position offset (legacy, used if position_ids == nullptr)
         int device_idx = 0;                  ///< Target device
         IUnifiedKVCache *kv_cache = nullptr; ///< KV cache for attention (optional)
+
+        /// Sequence lengths for variable-length batching (nullptr = all equal to seq_len)
+        /// When set, this enables proper batch-separating attention masks that
+        /// prevent cross-sequence attention in batched execution.
+        const std::vector<int> *sequence_lengths = nullptr;
 
         /// For batched input (alternative to token_ids)
         struct Batch
@@ -481,15 +489,19 @@ namespace llaminar2
 
         /**
          * @brief Build attention block graph
+         * @param batch_size Number of sequences in batch (1 for single-sequence)
+         * @param sequence_lengths Actual lengths per sequence (nullptr = all equal to seq_len)
          */
         ComputeGraph buildAttentionGraph(
             const Qwen2LayerWeights &layer,
             Qwen2ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
+            int batch_size,
             IUnifiedKVCache *kv_cache,
             const int *position_ids,
-            int device_idx);
+            int device_idx,
+            const std::vector<int> *sequence_lengths = nullptr);
 
         /**
          * @brief Build FFN block graph
@@ -499,6 +511,7 @@ namespace llaminar2
             Qwen2ActivationBuffers &buffers,
             int layer_idx,
             int seq_len,
+            int batch_size,
             int device_idx);
 
         // =====================================================================

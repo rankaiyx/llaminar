@@ -2127,6 +2127,17 @@ add_v2_test(V2_Unit_ComputeGraphExecution
     MPI_PROCS 1
 )
 
+# Test: GraphOrchestrator Snapshot API
+# Tests pipeline-compatible snapshot capture API (enableSnapshotCapture/getSnapshot/getSnapshotKeys)
+# and stage name conversion for E2E test compatibility
+add_executable(v2_test_graph_orchestrator_snapshots unit/Test__GraphOrchestratorSnapshots.cpp)
+target_link_libraries(v2_test_graph_orchestrator_snapshots llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphOrchestratorSnapshots
+    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_snapshots>
+    LABELS "V2;Unit;Execution;GraphOrchestrator;Snapshots;StageNameConversion"
+    MPI_PROCS 1
+)
+
 # Test: LayerExecutor (layer-level execution orchestration)
 # Tests compute graph construction, topological ordering, dependency tracking,
 # attention/FFN/MoE graph building, and multi-device execution
@@ -2531,6 +2542,23 @@ target_link_libraries(v2_integration_kv_cache
 add_v2_test(V2_Integration_KVCache
     COMMAND $<TARGET_FILE:v2_integration_kv_cache>
     LABELS "V2;Integration;KVCache;AutoregressiveDecode;Attention;Pipeline"
+)
+
+# Test: Graph Batched KVCache Integration Tests (Phase 3 of Graph Batching Implementation)
+# Validates batched KV cache handling in Graph framework:
+# - KVCacheAppendStage correctly appends to separate seq_idx per batch sequence
+# - Batched prefill populates KV cache slots independently
+# - Sequential execution matches batched execution for KV cache contents
+# - Per-sequence cache isolation
+add_executable(v2_integration_graph_batched_kvcache integration/Test__GraphBatchedKVCache.cpp)
+target_link_libraries(v2_integration_graph_batched_kvcache
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_GraphBatchedKVCache
+    COMMAND $<TARGET_FILE:v2_integration_graph_batched_kvcache>
+    LABELS "V2;Integration;KVCache;Graph;Batched;ComputeStage;Phase3"
+    MPI_PROCS 1
 )
 
 # Test: Q8_1 KV Cache Integration Tests

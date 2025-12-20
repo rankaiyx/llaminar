@@ -331,12 +331,13 @@ cd /workspaces/llaminar && GTEST_FILTER=The.Specific.GTest.Name ctest --test-dir
 
 ### Snapshot Framework and E2E Testing
 
-**Overview**: Llaminar V2 includes a comprehensive snapshot framework for capturing and comparing intermediate pipeline activations during inference. This is essential for E2E (end-to-end) correctness validation and debugging divergences.
+**Overview**: Llaminar V2 includes a comprehensive snapshot framework for capturing and comparing intermediate activations during inference. This is essential for E2E (end-to-end) correctness validation and debugging divergences. The snapshot API is unified across both execution paths (`PipelineBase` and `GraphOrchestrator`) via the `IInferenceRunner` interface.
 
 **Key Concepts**:
-- **Snapshots**: Captured intermediate tensors at specific pipeline stages (embeddings, Q/K/V projections, attention outputs, FFN outputs, layer norms, etc.)
+- **Snapshots**: Captured intermediate tensors at specific stages (embeddings, Q/K/V projections, attention outputs, FFN outputs, layer norms, etc.)
 - **Snapshot Keys**: Human-readable identifiers for each captured tensor (e.g., `"layer0_ATTENTION_CONTEXT"`, `"layer5_FFN_DOWN"`)
 - **Ground Truth Comparison**: Compare Llaminar outputs against PyTorch reference implementation to validate correctness
+- **Unified API**: Same `enableSnapshotCapture()`/`getSnapshot()` methods work on both Pipeline and Graph execution paths
 
 #### Snapshot-Enabled Builds
 
@@ -398,20 +399,35 @@ timeout 180 mpirun -np 2 --bind-to socket --map-by socket \
 
 #### Snapshot Capture API
 
-**Pipeline-Level Snapshot Control**:
+The snapshot API is identical for both execution paths. Use `IInferenceRunner*` for polymorphic access:
+
+**Unified IInferenceRunner API**:
 ```cpp
+// Works with both PipelineBase and GraphOrchestrator
+IInferenceRunner* runner = /* pipeline or orchestrator */;
+
 // Enable snapshot capture (must be done before forward pass)
-pipeline->enableSnapshotCapture("/tmp/llaminar_snapshots");
+runner->enableSnapshotCapture("/tmp/llaminar_snapshots");
 
 // Run inference (snapshots automatically captured at instrumented points)
-pipeline->forward(input_ids, seq_len);
+runner->forward(input_ids, seq_len);
 
 // Retrieve captured snapshots
-auto snapshot_keys = pipeline->getSnapshotKeys();  // List of all captured stages
-auto tensor_data = pipeline->getSnapshot("layer0_ATTENTION_CONTEXT");  // Get specific snapshot
+auto snapshot_keys = runner->getSnapshotKeys();  // List of all captured stages
+size_t size;
+const float* data = runner->getSnapshot("layer0_ATTENTION_CONTEXT", size);
 ```
 
-**Common Snapshot Keys** (Qwen2 Pipeline):
+**GraphOrchestrator-Specific**: The graph execution path uses `StageDumpInfo` callbacks internally and converts graph stage names (snake_case) to pipeline-style keys (SCREAMING_CASE) automatically:
+
+| Graph Stage Name | Snapshot Key |
+|------------------|--------------|
+| `embedding` | `EMBEDDING` |
+| `layer0_q_proj` | `layer0_Q_PROJECTION` |
+| `layer0_attn_compute` | `layer0_ATTENTION_CONTEXT` |
+| `layer0_swiglu` | `layer0_FFN_SWIGLU` |
+
+**Common Snapshot Keys** (Qwen2):
 - `EMBEDDING`: Token embeddings after embedding layer
 - `layer{N}_ATTENTION_NORM`: Pre-attention RMS normalization
 - `layer{N}_Q_PROJECTION`, `layer{N}_K_PROJECTION`, `layer{N}_V_PROJECTION`: QKV projections
@@ -431,17 +447,17 @@ auto tensor_data = pipeline->getSnapshot("layer0_ATTENTION_CONTEXT");  // Get sp
 
 **Layer-by-Layer Divergence Detection**:
 ```cpp
-// Example from ComprehensiveBatchParity test
-auto seq_keys = pipeline_sequential->getSnapshotKeys();
-for (const auto& key : seq_keys) {
-    auto seq_snapshot = pipeline_sequential->getSnapshot(key);
-    auto batch_snapshot = pipeline_batched->getSnapshot(key);
+// Works with any IInferenceRunner (Pipeline or GraphOrchestrator)
+auto keys = runner->getSnapshotKeys();
+for (const auto& key : keys) {
+    size_t size;
+    const float* snapshot = runner->getSnapshot(key, size);
     
-    // Extract corresponding sequence from batch
-    // Compare tensors with tolerance
+    // Compare against reference (e.g., PyTorch snapshot)
+    float max_diff = compute_max_diff(snapshot, reference, size);
     if (max_diff > tolerance) {
         LOG_ERROR("First divergence at stage: " << key);
-        LOG_ERROR("Max diff: " << max_diff << ", Mean diff: " << mean_diff);
+        LOG_ERROR("Max diff: " << max_diff);
         break;
     }
 }
@@ -450,7 +466,7 @@ for (const auto& key : seq_keys) {
 **Snapshot Output Directories**:
 - `/tmp/llaminar_snapshots/`: Default snapshot directory
 - Snapshots are **NOT automatically cleaned up** - useful for post-test analysis
-- Each snapshot is a binary file containing FP32 tensor data
+- Each snapshot is stored in memory as FP32 tensor data
 
 #### Debugging Layer Divergence with Tensor Dumps
 
@@ -1629,29 +1645,35 @@ For a full list of environment variables available, check `src/v2/utils/DebugEnv
 | `LLAMINAR_PROFILE_KERNELS` | Enable per-kernel timing breakdown in benchmark mode. | Disabled unless set to non-zero. | Performance profiling |
 | `LLAMINAR_DEQUANT_STATS` | Logs per-tensor dequant stats (min/max/mean/sample). | Disabled unless set to non-zero. | Quantized tensor loading |
 | `OMP_NUM_THREADS` / `OMP_PLACES` / `OMP_PROC_BIND` | Governs OpenMP thread placement & counts (run script sets). | Auto-set by `run_llaminar.sh` | Threading performance |
-| `LLAMINAR_USE_LAYER_EXECUTOR` | Enable LayerExecutor (Qwen2Graph) for declarative compute graphs. | Disabled (0) | Execution framework |
-| `LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT` | When LayerExecutor is enabled, use GraphBufferManager for automatic buffer allocation with aliasing optimization. | Disabled (0) | Buffer management |
+| `LLAMINAR_EXECUTOR_PROFILING` | Enable per-stage profiling in GraphExecutor. | Disabled (0) | Execution profiling |
+| `LLAMINAR_EXECUTOR_VALIDATION` | Enable output validation after each stage. | Disabled (0) | Debugging |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk for debugging. | Disabled (0) | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_DIR` | Output directory for tensor dumps. | `/tmp/llaminar_tensor_dumps` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_LAYERS` | Comma-separated layer indices to dump. | `all` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_STAGES` | Comma-separated stage names to dump. | `all` | Snapshot framework |
 | `LLAMINAR_SNAPSHOT_DUMP_RANK` | Only dump from this MPI rank (-1=all). | `0` | Snapshot framework |
 
-### Graph Buffer Management
+### Graph Execution System (Default as of December 2025)
 
-When both `LLAMINAR_USE_LAYER_EXECUTOR=1` and `LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT=1` are set, the GraphExecutor takes over buffer responsibilities from the pipeline. This enables automatic aliasing optimization for SCRATCH buffers that don't have overlapping lifetimes.
+The Graph execution system (GraphOrchestrator / LayerExecutor) is now the **primary execution path**. All graph-based features are enabled by default:
 
-```bash
-# Enable graph-managed buffers with LayerExecutor
-LLAMINAR_USE_LAYER_EXECUTOR=1 \
-LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT=1 \
-./run_llaminar.sh -m model.gguf -p "Hello world"
-```
+- **GraphBufferManager**: Automatic buffer allocation with aliasing optimization for SCRATCH buffers
+- **All ComputeStages**: GEMM, Attention, RMSNorm, RoPE, SwiGLU, ResidualAdd all use declarative graph stages
+- **Full forward execution**: Complete inference runs through `executeForward()` with the compute graph
 
-Benefits of graph-managed buffers:
+Benefits:
 - **Memory savings**: Non-overlapping SCRATCH buffers can share physical memory
 - **Automatic aliasing**: Q↔gate, K↔up, V↔ffn_output aliasing
 - **Centralized allocation**: All buffers managed by GraphBufferManager with NUMA awareness
+- **Snapshot capture**: Automatic intermediate tensor capture for E2E parity testing
+
+```bash
+# Run with default graph execution (no flags needed)
+./run_llaminar.sh -m model.gguf -p "Hello world"
+
+# Enable profiling for stage-level timing
+LLAMINAR_EXECUTOR_PROFILING=1 ./run_llaminar.sh -m model.gguf -p "Hello world"
+```
 
 ### Tensor Dump Feature
 
@@ -1960,7 +1982,7 @@ The top-1 token should match PyTorch's prediction (`decode_tokens` in metadata).
 
 ### Llaminar Snapshot Capture
 
-Llaminar can also capture snapshots during inference for comparison:
+Llaminar can capture snapshots during inference for comparison using the unified `IInferenceRunner` interface (works with both `PipelineBase` and `GraphOrchestrator`):
 
 #### Enable Snapshot Capture (E2E Build Required)
 
@@ -1976,16 +1998,20 @@ cmake --build build_v2_e2e --parallel
 #### Capture Snapshots in Code
 
 ```cpp
+// Works with any IInferenceRunner (Pipeline or GraphOrchestrator)
+IInferenceRunner* runner = /* pipeline or orchestrator */;
+
 // Enable snapshot capture before forward pass
-pipeline->enableSnapshotCapture("/tmp/llaminar_snapshots");
+runner->enableSnapshotCapture("/tmp/llaminar_snapshots");
 
 // Run inference
-pipeline->forward(token_ids.data(), seq_len);
+runner->forward(token_ids.data(), seq_len);
 
 // Retrieve snapshots
-auto keys = pipeline->getSnapshotKeys();
+auto keys = runner->getSnapshotKeys();
 for (const auto& key : keys) {
-    auto data = pipeline->getSnapshot(key);
+    size_t size;
+    const float* data = runner->getSnapshot(key, size);
     // Compare with PyTorch reference...
 }
 ```

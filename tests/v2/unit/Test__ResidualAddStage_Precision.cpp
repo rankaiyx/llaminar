@@ -550,7 +550,8 @@ TEST_F(ResidualAddStagePrecisionTest, SnapshotInfo_FP32)
 
 TEST_F(ResidualAddStagePrecisionTest, DumpInfo_BF16_ReturnsWithDtype)
 {
-    // BF16 dump info returns the raw pointer with dtype="BF16"
+    // BF16 dump info returns the FP32 shadow data pointer with dtype="BF16"
+    // (getDumpInfo uses tensor->data() which returns FP32 accessor for all tensor types)
     auto input = makeBF16Tensor(1, 128);
     auto residual = makeBF16Tensor(1, 128);
     auto output = makeBF16Tensor(1, 128);
@@ -565,7 +566,8 @@ TEST_F(ResidualAddStagePrecisionTest, DumpInfo_BF16_ReturnsWithDtype)
 
     // BF16 outputs are present with correct dtype annotation
     ASSERT_EQ(dump_info.outputs.size(), 1);
-    EXPECT_EQ(dump_info.outputs[0].data, output->bf16_data());
+    // getDumpInfo returns FP32 data() pointer, not raw bf16_data()
+    EXPECT_EQ(dump_info.outputs[0].data, output->data());
     EXPECT_STREQ(dump_info.outputs[0].dtype, "BF16");
     // element_size reflects the BF16 size (2 bytes)
     EXPECT_EQ(dump_info.outputs[0].element_size, sizeof(uint16_t));

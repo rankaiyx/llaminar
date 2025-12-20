@@ -288,6 +288,27 @@ public:
         int find_device(ComputeBackendType type, int device_id = 0) const;
 
         /**
+         * @brief Get the default CPU device index
+         *
+         * CPU is always enumerated first (index 0) after initialization.
+         * Use this instead of hardcoding 0 or using magic values like -1.
+         *
+         * @return Index of the CPU device (always 0 after initialization)
+         */
+        int cpuDeviceIndex() const { return 0; }
+
+        /**
+         * @brief Validate a device index
+         *
+         * @param device_idx Device index to validate
+         * @return true if valid (>= 0 and < devices().size())
+         */
+        bool isValidDeviceIndex(int device_idx) const
+        {
+            return device_idx >= 0 && static_cast<size_t>(device_idx) < devices_.size();
+        }
+
+        /**
          * @brief Auto-select best device
          *
          * Heuristics:

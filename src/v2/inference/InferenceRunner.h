@@ -30,6 +30,7 @@
 
 #include "IInferenceRunner.h"
 #include "../loaders/ModelContext.h"
+#include "../pipelines/PipelineConfig.h"
 #include "../utils/MPIContext.h"
 #include <memory>
 
@@ -50,6 +51,9 @@ namespace llaminar2
         // Explicit path selection (overrides environment)
         bool force_pipeline = false;
         bool force_graph = false;
+
+        // Pipeline-specific settings (passed through when creating Pipeline)
+        ActivationPrecision activation_precision = ActivationPrecision::FP32;
     };
 
     /**
@@ -58,8 +62,7 @@ namespace llaminar2
      * Selection logic:
      * 1. If force_pipeline: use Pipeline path
      * 2. If force_graph: use Graph path
-     * 3. If LLAMINAR_EXEC_FULL_FORWARD=1: use Graph path
-     * 4. Otherwise: use Pipeline path (default)
+     * 3. Otherwise: use Graph path (default as of December 2025)
      *
      * @param model_ctx Model context with weights
      * @param mpi_ctx MPI context (nullptr for single-rank)

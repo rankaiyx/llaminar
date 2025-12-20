@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include "../../../src/v2/pipelines/qwen/GraphOrchestrator.h"
 #include "../../../src/v2/pipelines/qwen/Qwen2Graph.h"
+#include "../../../src/v2/backends/ComputeBackend.h"
 #include "../../../src/v2/utils/Logger.h"
 #include "../../../src/v2/utils/DebugEnv.h"
 #include "../../../src/v2/tensors/Tensors.h"
@@ -27,6 +28,9 @@ class Test__GraphOrchestrator : public ::testing::Test
 protected:
     void SetUp() override
     {
+        // Initialize DeviceManager (required for DeviceContext creation)
+        DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
+
         // Create minimal config for testing
         config_.d_model = 896;
         config_.d_ff = 4864;

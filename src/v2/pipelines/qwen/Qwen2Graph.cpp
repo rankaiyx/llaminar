@@ -18,6 +18,7 @@
 #include "../../tensors/Tensors.h"
 #include "../../utils/MPIContext.h"
 #include "../MPIStrategy.h"
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 
@@ -125,7 +126,9 @@ namespace llaminar2
                                                                     << " d_ff=" << config_.d_ff
                                                                     << " ffn_column_parallel=" << config_.ffn_column_parallel
                                                                     << " n_heads=" << config_.n_heads
-                                                                    << " n_kv_heads=" << config_.n_kv_heads);
+                                                                    << " n_kv_heads=" << config_.n_kv_heads
+                                                                    << " mpi_ctx=" << (mpi_ctx_ ? "valid" : "nullptr")
+                                                                    << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1));
 
         // Configure underlying GraphExecutor
         GraphExecutorConfig exec_config = config.executor_config;
@@ -238,12 +241,13 @@ namespace llaminar2
         // Build attention graph
         ComputeGraph attn_graph = buildAttentionGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.kv_cache, ctx.position_ids, ctx.device_idx);
+            ctx.batch_size, ctx.kv_cache, ctx.position_ids, ctx.device_idx,
+            ctx.sequence_lengths);
 
         // Build FFN graph
         ComputeGraph ffn_graph = buildFFNGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.device_idx);
+            ctx.batch_size, ctx.device_idx);
 
         // Merge: attention -> FFN
         std::string attn_last = "layer" + std::to_string(ctx.layer_idx) + "_attn_residual";
@@ -326,25 +330,62 @@ namespace llaminar2
             Qwen2LayerWeights layer_weights = weights_.get_layer_weights(layer);
 
             // Build attention graph for this layer
+            // Pass sequence_lengths for proper batch-aware attention masking
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.kv_cache, position_ids, device_idx);
+                input.batch_size, input.kv_cache, position_ids, device_idx,
+                input.sequence_lengths);
+
+            // Get the leaf node(s) of attention graph before merging
+            auto attn_leaves = attn_graph.getLeafNodes();
+            std::string attn_last;
+            if (!attn_leaves.empty())
+            {
+                std::string prefix = "layer" + std::to_string(layer) + "_";
+                attn_last = prefix + "attn_residual";
+                if (std::find(attn_leaves.begin(), attn_leaves.end(), attn_last) == attn_leaves.end())
+                {
+                    attn_last = attn_leaves.front();
+                }
+            }
+            else
+            {
+                // Fallback: use previous node if attention graph is empty
+                attn_last = prev_node;
+            }
 
             // Merge attention graph, connecting to previous node
             graph.merge(std::move(attn_graph), prev_node);
 
-            // The last node in attention graph is the residual
-            std::string attn_last = "layer" + std::to_string(layer) + "_attn_residual";
-
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
-                layer_weights, buffers_.layer_buffers, layer, input.seq_len, device_idx);
+                layer_weights, buffers_.layer_buffers, layer, input.seq_len,
+                input.batch_size, device_idx);
+
+            // Get the leaf node(s) of FFN graph before merging (we need the last node)
+            auto ffn_leaves = ffn_graph.getLeafNodes();
+            std::string ffn_last;
+            if (!ffn_leaves.empty())
+            {
+                // Prefer ffn_residual if it exists, otherwise use first leaf
+                std::string prefix = "layer" + std::to_string(layer) + "_";
+                ffn_last = prefix + "ffn_residual";
+                if (std::find(ffn_leaves.begin(), ffn_leaves.end(), ffn_last) == ffn_leaves.end())
+                {
+                    ffn_last = ffn_leaves.front(); // Fall back to first leaf
+                }
+            }
+            else
+            {
+                // Fallback: use attention residual if FFN graph is empty
+                ffn_last = attn_last;
+            }
 
             // Merge FFN graph, connecting to attention residual
             graph.merge(std::move(ffn_graph), attn_last);
 
-            // The last node in FFN graph is the residual
-            prev_node = "layer" + std::to_string(layer) + "_ffn_residual";
+            // Use the determined FFN leaf as the prev node for next layer
+            prev_node = ffn_last;
         }
 
         // -------------------------------------------------------------------------
@@ -502,18 +543,27 @@ namespace llaminar2
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
+        int batch_size,
         IUnifiedKVCache *kv_cache,
         const int *position_ids,
-        int device_idx)
+        int device_idx,
+        const std::vector<int> *sequence_lengths)
     {
         ComputeGraph graph;
         const auto &env = debugEnv();
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
 
+        // Total tokens for GEMM m dimension = batch_size * seq_len
+        int total_tokens = batch_size * seq_len;
+
         LOG_DEBUG("[buildAttentionGraph] layer_idx=" << layer_idx << " seq_len=" << seq_len
+                                                     << " batch_size=" << batch_size
+                                                     << " total_tokens=" << total_tokens
                                                      << " layer.wq=" << static_cast<const void *>(layer.wq)
                                                      << " layer.wo=" << layer.wo << " world_size="
-                                                     << (mpi_ctx_ ? mpi_ctx_->world_size() : 1));
+                                                     << (mpi_ctx_ ? mpi_ctx_->world_size() : 1)
+                                                     << " sequence_lengths=" << (sequence_lengths ? "valid" : "nullptr")
+                                                     << (sequence_lengths ? " size=" + std::to_string(sequence_lengths->size()) : ""));
 
         // Determine backend type for stage creation
         auto &dm = DeviceManager::instance();
@@ -531,7 +581,7 @@ namespace llaminar2
             attn_norm_params.output = buffers.normalized;
             attn_norm_params.gamma = layer.attn_norm;
             attn_norm_params.eps = config_.rms_norm_eps;
-            attn_norm_params.seq_len = seq_len;
+            attn_norm_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
 
             graph.addNode(prefix + "attn_norm",
                           ComputeStageFactory::createRMSNorm(attn_norm_params),
@@ -574,7 +624,7 @@ namespace llaminar2
 
             FusedQKVGEMMStage::Params qkv_params;
             qkv_params.input = buffers.normalized;
-            qkv_params.m = seq_len;
+            qkv_params.m = total_tokens; // Use total_tokens = batch_size * seq_len
             qkv_params.k = k;
             qkv_params.wq = layer.wq;
             qkv_params.output_q = buffers.Q;
@@ -612,6 +662,7 @@ namespace llaminar2
             rope_params.head_dim = config_.head_dim;
             rope_params.pos_offset = pos_offset;
             rope_params.theta_base = config_.rope_theta;
+            rope_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
 
             graph.addNode(prefix + "rope",
                           ComputeStageFactory::createRoPE(rope_params),
@@ -631,13 +682,19 @@ namespace llaminar2
                 // Phase 9 Decomposed Path: KVCacheAppendStage + AttentionComputeStage
                 if (kv_cache)
                 {
+                    // For batched execution, K/V are [batch_size * seq_len, kv_dim]
+                    // Each sequence's K/V is appended to its own seq_idx in the cache
+                    int total_tokens = batch_size * seq_len;
+
                     KVCacheAppendStage::Params kv_append_params;
                     kv_append_params.K = buffers.K;
                     kv_append_params.V = buffers.V;
                     kv_append_params.kv_cache = kv_cache;
                     kv_append_params.layer_idx = layer_idx;
-                    kv_append_params.seq_idx = 0;
-                    kv_append_params.num_tokens = seq_len;
+                    kv_append_params.seq_idx = 0; // Starting seq_idx
+                    kv_append_params.num_tokens = total_tokens;
+                    kv_append_params.batch_size = batch_size; // Phase 3: Per-sequence append
+                    kv_append_params.seq_len = seq_len;       // Phase 3: Tokens per sequence
 
                     graph.addNode(prefix + "kv_append",
                                   ComputeStageFactory::createKVCacheAppend(kv_append_params),
@@ -655,29 +712,82 @@ namespace llaminar2
 
                 TensorBase *K_for_attn = buffers.K;
                 TensorBase *V_for_attn = buffers.V;
-                int kv_len = seq_len; // Static hint for mode detection (actual queried at runtime)
+                int total_query_tokens = batch_size * seq_len;
+                int kv_len = total_query_tokens; // Static hint for mode detection (actual queried at runtime)
+                bool use_gather_stage = false;
 
+                // For attention K/V source:
+                // - Prefill (cached_tokens == 0): Use projected K/V directly [batch_size * seq_len, kv_dim]
+                // - Decode (cached_tokens > 0 and batch_size == 1): Use cache (single-sequence only)
+                // - Batched decode (cached_tokens > 0 and batch_size > 1): Gather K/V from multiple cache slots
                 if (kv_cache)
                 {
-                    K_for_attn = kv_cache->get_k_base(layer_idx, 0);
-                    V_for_attn = kv_cache->get_v_base(layer_idx, 0);
                     int cached_tokens = kv_cache->get_cached_tokens(layer_idx, 0);
-                    // Use static cached_tokens for initial mode hint
-                    // Actual kv_len will be queried dynamically at execution time
-                    kv_len = (cached_tokens > 0) ? cached_tokens : seq_len;
+                    if (cached_tokens > 0 && batch_size == 1)
+                    {
+                        // Single-sequence decode: read K/V from cache
+                        K_for_attn = kv_cache->get_k_base(layer_idx, 0);
+                        V_for_attn = kv_cache->get_v_base(layer_idx, 0);
+                        kv_len = cached_tokens;
+                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using cached K/V (decode mode)");
+                    }
+                    else if (cached_tokens > 0 && batch_size > 1)
+                    {
+                        // Batched decode: gather K/V from multiple cache slots
+                        if (buffers.gathered_K && buffers.gathered_V)
+                        {
+                            use_gather_stage = true;
+                            K_for_attn = buffers.gathered_K;
+                            V_for_attn = buffers.gathered_V;
+                            // kv_len will be updated by gather stage; use cache max for now
+                            kv_len = cached_tokens; // Approximate - actual max determined at gather
+                            LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using gathered K/V (batched decode mode)");
+                        }
+                        else
+                        {
+                            // Fallback: use projected K/V if gather buffers not provided
+                            LOG_WARN("[Qwen2Graph] Layer " << layer_idx
+                                                           << " batched decode but no gather buffers - using projected K/V");
+                        }
+                    }
+                    else
+                    {
+                        // Prefill or batched prefill: use projected K/V directly
+                        // KV cache will be populated but attention uses fresh projections
+                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using projected K/V (prefill/batch mode)");
+                    }
                 }
 
-                AttentionMode mode = detect_attention_mode(1, seq_len, kv_len);
+                // Add KVCacheGatherStage if batched decode
+                if (use_gather_stage)
+                {
+                    KVCacheGatherStage::Params gather_params;
+                    gather_params.kv_cache = kv_cache;
+                    gather_params.layer_idx = layer_idx;
+                    gather_params.batch_size = batch_size;
+                    gather_params.out_K = buffers.gathered_K;
+                    gather_params.out_V = buffers.gathered_V;
+                    // Note: out_max_kv_len and out_per_seq_kv_lens can be retrieved from stage after execute
+
+                    graph.addNode(prefix + "kv_gather",
+                                  ComputeStageFactory::createKVCacheGather(gather_params),
+                                  device_idx);
+
+                    // Gather depends on append (must append new tokens before gathering full history)
+                    graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
+                }
+
+                AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
                 LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
                                                 << " attention mode: " << attention_mode_name(mode)
-                                                << " (seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
+                                                << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
 
                 AttentionComputeStage::Params attn_params;
                 attn_params.Q = buffers.Q;
                 attn_params.K = K_for_attn;
                 attn_params.V = V_for_attn;
                 attn_params.output = buffers.attn_output;
-                attn_params.batch_size = 1;
+                attn_params.batch_size = batch_size;
                 attn_params.seq_len = seq_len;
                 attn_params.kv_len = kv_len; // Static hint, actual queried from kv_cache at runtime
                 attn_params.n_heads = config_.n_heads;
@@ -700,7 +810,12 @@ namespace llaminar2
                               ComputeStageFactory::createAttentionCompute(attn_params),
                               device_idx);
 
-                if (kv_cache)
+                if (use_gather_stage)
+                {
+                    // Batched decode: attention depends on gather
+                    graph.addDependency(prefix + "attention", prefix + "kv_gather");
+                }
+                else if (kv_cache)
                 {
                     graph.addDependency(prefix + "attention", prefix + "kv_append");
                 }
@@ -726,7 +841,7 @@ namespace llaminar2
                 attn_params.kv_cache = kv_cache;
                 attn_params.layer_idx = layer_idx;
                 attn_params.mode = AttentionWithKVCacheStage::Mode::AUTO;
-                attn_params.batch_size = 1;
+                attn_params.batch_size = batch_size;
                 attn_params.seq_len = seq_len;
                 attn_params.n_heads = config_.n_heads;
                 attn_params.n_kv_heads = config_.n_kv_heads;
@@ -743,7 +858,8 @@ namespace llaminar2
                 attn_params.workspace_scores = buffers.workspace_scores;
                 attn_params.workspace_context = buffers.workspace_context;
                 attn_params.workspace_mask = buffers.workspace_mask;
-                attn_params.sequence_lengths = nullptr;
+                // Pass sequence_lengths for proper batch-aware attention masking
+                attn_params.sequence_lengths = sequence_lengths;
                 attn_params.position_offset = position_ids ? position_ids[0] : 0;
 
                 graph.addNode(prefix + "attention",
@@ -775,7 +891,7 @@ namespace llaminar2
                                   .A = buffers.attn_output,
                                   .B = layer.wo,
                                   .C = buffers.attn_proj,
-                                  .m = seq_len,
+                                  .m = total_tokens, // Use total_tokens = batch_size * seq_len
                                   .n = wo_n,
                                   .k = wo_k,
                                   .alpha = 1.0f,
@@ -814,7 +930,7 @@ namespace llaminar2
             res_params.input = buffers.attn_proj;
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
-            res_params.num_elements = static_cast<size_t>(seq_len) * static_cast<size_t>(config_.d_model);
+            res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
 
             graph.addNode(prefix + "attn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
@@ -844,11 +960,15 @@ namespace llaminar2
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
+        int batch_size,
         int device_idx)
     {
         ComputeGraph graph;
         const auto &env = debugEnv();
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
+
+        // Compute total tokens for GEMM m parameter
+        int total_tokens = batch_size * seq_len;
 
         // Determine backend type
         auto &dm = DeviceManager::instance();
@@ -866,7 +986,7 @@ namespace llaminar2
             ffn_norm_params.output = buffers.normalized;
             ffn_norm_params.gamma = layer.ffn_norm;
             ffn_norm_params.eps = config_.rms_norm_eps;
-            ffn_norm_params.seq_len = seq_len;
+            ffn_norm_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
 
             graph.addNode(prefix + "ffn_norm",
                           ComputeStageFactory::createRMSNorm(ffn_norm_params),
@@ -884,7 +1004,7 @@ namespace llaminar2
 
             FusedGateUpGEMMStage::Params gate_up_params;
             gate_up_params.input = buffers.normalized;
-            gate_up_params.m = seq_len;
+            gate_up_params.m = total_tokens; // Use total_tokens = batch_size * seq_len
             gate_up_params.k = k;
             gate_up_params.w_gate = layer.gate_proj;
             gate_up_params.output_gate = buffers.gate;
@@ -911,7 +1031,8 @@ namespace llaminar2
             SwiGLUStage::Params swiglu_params;
             swiglu_params.gate = buffers.gate;
             swiglu_params.up = buffers.up;
-            swiglu_params.output = buffers.up; // In-place
+            swiglu_params.output = buffers.up;    // In-place
+            swiglu_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
 
             graph.addNode(prefix + "swiglu",
                           ComputeStageFactory::createSwiGLU(swiglu_params),
@@ -935,7 +1056,7 @@ namespace llaminar2
                                   .A = buffers.up,
                                   .B = layer.down_proj,
                                   .C = buffers.attn_proj,
-                                  .m = seq_len,
+                                  .m = total_tokens, // Use total_tokens = batch_size * seq_len
                                   .n = down_n,
                                   .k = down_k,
                                   .alpha = 1.0f,
@@ -954,7 +1075,7 @@ namespace llaminar2
 
             if (needs_allreduce && has_multi_rank)
             {
-                size_t allreduce_count = static_cast<size_t>(seq_len) * down_n;
+                size_t allreduce_count = static_cast<size_t>(total_tokens) * down_n;
                 MPI_Comm comm = static_cast<MPI_Comm>(getMPIComm(mpi_ctx_.get()));
 
                 LOG_DEBUG("[buildFFNGraph] Adding down_allreduce: ffn_column_parallel="
@@ -979,7 +1100,7 @@ namespace llaminar2
             res_params.input = buffers.attn_proj;
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
-            res_params.num_elements = static_cast<size_t>(seq_len) * static_cast<size_t>(config_.d_model);
+            res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
 
             graph.addNode(prefix + "ffn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
@@ -1124,7 +1245,7 @@ namespace llaminar2
             // Build and cache the graph
             LOG_DEBUG("[Qwen2Graph] Building and caching attention graph for layer " << layer_idx << " (decode mode)");
             cache.attention_decode = std::make_unique<ComputeGraph>(
-                buildAttentionGraph(layer, buffers, layer_idx, seq_len, kv_cache, position_ids, device_idx));
+                buildAttentionGraph(layer, buffers, layer_idx, seq_len, 1, kv_cache, position_ids, device_idx, nullptr));
             cache.cached_seq_len = seq_len;
             cache.valid = true;
 
@@ -1142,7 +1263,7 @@ namespace llaminar2
         // Non-cached path (prefill or caching disabled)
         // =============================================================================
         ComputeGraph graph = buildAttentionGraph(layer, buffers, layer_idx, seq_len,
-                                                 kv_cache, position_ids, device_idx);
+                                                 1, kv_cache, position_ids, device_idx, nullptr);
 
         // Debug: log graph structure
         if (layer_idx == 0)
@@ -1220,7 +1341,7 @@ namespace llaminar2
             // Build and cache the graph
             LOG_DEBUG("[Qwen2Graph] Building and caching FFN graph for layer " << layer_idx << " (decode mode)");
             cache.ffn_decode = std::make_unique<ComputeGraph>(
-                buildFFNGraph(layer, buffers, layer_idx, seq_len, device_idx));
+                buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device_idx)); // batch_size=1 for decode
 
             // Execute the newly built graph
             bool success = executor_.execute(*cache.ffn_decode, ctx);
@@ -1235,7 +1356,7 @@ namespace llaminar2
         // =============================================================================
         // Non-cached path (prefill or caching disabled)
         // =============================================================================
-        ComputeGraph graph = buildFFNGraph(layer, buffers, layer_idx, seq_len, device_idx);
+        ComputeGraph graph = buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device_idx); // batch_size=1 for deprecated path
 
         bool success = executor_.execute(graph, ctx);
 

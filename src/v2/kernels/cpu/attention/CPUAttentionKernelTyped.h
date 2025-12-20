@@ -880,6 +880,15 @@ namespace llaminar2
                 // Capture variables for nested-safe parallel execution
                 auto typed_attention_work = [&]()
                 {
+                    // Debug: Log dimensions once at start of loop (thread 0 only)
+                    if (omp_get_thread_num() == 0)
+                    {
+                        LOG_DEBUG("[compute_typed] FP32 path: seq_len=" << seq_len << " kv_len=" << kv_len
+                                                                        << " n_heads=" << n_heads << " n_kv_heads=" << n_kv_heads
+                                                                        << " head_dim=" << head_dim << " Q_ptr=" << (void *)Q
+                                                                        << " K_ptr=" << (void *)K << " V_ptr=" << (void *)V
+                                                                        << " output_ptr=" << (void *)output);
+                    }
 #pragma omp for schedule(static)
                     for (int h = 0; h < n_heads; ++h)
                     {
@@ -1263,6 +1272,21 @@ namespace llaminar2
                 size_t v_offset = b * seq_len * n_kv_heads * head_dim;
                 size_t out_offset = b * seq_len * n_heads * head_dim;
 
+                // DEBUG: Print Q_typed values for this batch (only for FP32)
+                if constexpr (std::is_same_v<ElementType, float>)
+                {
+                    LOG_DEBUG("[CPUAttentionKernelTyped::compute_batch] batch=" << b << " q_offset=" << q_offset
+                                                                                << " k_offset=" << k_offset << " v_offset=" << v_offset
+                                                                                << " Q_typed[0..3]=[" << Q_typed[q_offset] << ","
+                                                                                << Q_typed[q_offset + 1] << ","
+                                                                                << Q_typed[q_offset + 2] << ","
+                                                                                << Q_typed[q_offset + 3] << "]"
+                                                                                << " K_typed[0..3]=[" << K_typed[k_offset] << ","
+                                                                                << K_typed[k_offset + 1] << ","
+                                                                                << K_typed[k_offset + 2] << ","
+                                                                                << K_typed[k_offset + 3] << "]");
+                }
+
                 // Scores: [batch_size, n_heads, seq_len, seq_len] (always float)
                 size_t scores_offset = b * n_heads * seq_len * seq_len;
 
@@ -1295,6 +1319,13 @@ namespace llaminar2
                 const ElementType *K_slice = K_typed + k_offset;
                 const ElementType *V_slice = V_typed + v_offset;
 
+                // DEBUG: Print pointer values before compute_typed
+                LOG_DEBUG("[CPUAttentionKernelTyped::compute_batch] batch=" << b
+                                                                            << " Q_slice=" << (void *)Q_slice
+                                                                            << " K_slice=" << (void *)K_slice
+                                                                            << " V_slice=" << (void *)V_slice
+                                                                            << " output_ptr=" << (void *)(output + out_offset));
+
                 bool success = compute_typed(
                     Q_slice,
                     K_slice,
@@ -1307,6 +1338,11 @@ namespace llaminar2
                     mask_slice,
                     device_idx,
                     seq_len); // kv_len = seq_len for batch compute
+
+                // DEBUG: Print output values after compute_typed
+                LOG_DEBUG("[CPUAttentionKernelTyped::compute_batch] batch=" << b << " out_offset=" << out_offset
+                                                                            << " output[0..3]=[" << output[out_offset] << "," << output[out_offset + 1]
+                                                                            << "," << output[out_offset + 2] << "," << output[out_offset + 3] << "]");
 
                 if (!success)
                     return false;

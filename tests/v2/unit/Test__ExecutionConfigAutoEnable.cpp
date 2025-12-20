@@ -139,21 +139,21 @@ namespace
     // Default State Tests
     // =============================================================================
 
-    TEST_F(Test__ExecutionConfigAutoEnable, DefaultState_AllFlagsDisabled)
+    TEST_F(Test__ExecutionConfigAutoEnable, DefaultState_AllFlagsEnabled)
     {
-        // Without any env vars set, all flags should be false
+        // As of Dec 2025, all flags default to TRUE (graph execution is the default path)
         llaminar2::ExecutionConfig config;
 
-        EXPECT_FALSE(config.use_layer_executor);
-        EXPECT_FALSE(config.use_graph_buffer_management);
-        EXPECT_FALSE(config.exec_rmsnorm);
-        EXPECT_FALSE(config.exec_rope);
-        EXPECT_FALSE(config.exec_attention);
-        EXPECT_FALSE(config.exec_gemm);
-        EXPECT_FALSE(config.exec_swiglu);
-        EXPECT_FALSE(config.exec_residual);
-        EXPECT_FALSE(config.exec_embedding);
-        EXPECT_FALSE(config.exec_lm_head);
+        EXPECT_TRUE(config.use_layer_executor);
+        EXPECT_TRUE(config.use_graph_buffer_management);
+        EXPECT_TRUE(config.exec_rmsnorm);
+        EXPECT_TRUE(config.exec_rope);
+        EXPECT_TRUE(config.exec_attention);
+        EXPECT_TRUE(config.exec_gemm);
+        EXPECT_TRUE(config.exec_swiglu);
+        EXPECT_TRUE(config.exec_residual);
+        EXPECT_TRUE(config.exec_embedding);
+        EXPECT_TRUE(config.exec_lm_head);
     }
 
     // =============================================================================
@@ -193,20 +193,21 @@ namespace
         EXPECT_TRUE(config.exec_residual) << "exec_residual should be auto-enabled for graph buffer management";
     }
 
-    TEST_F(Test__ExecutionConfigAutoEnable, GraphBufferManagement_WithValue0_NoAutoEnable)
+    TEST_F(Test__ExecutionConfigAutoEnable, GraphBufferManagement_WithValue0_DisablesOnlyThatFlag)
     {
-        // Explicitly setting to 0 should NOT enable flags
+        // Explicitly setting to 0 disables only that flag, others remain at default (true)
         EnvVarGuard guard("LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT", "0");
 
         llaminar2::ExecutionConfig config;
 
         EXPECT_FALSE(config.use_graph_buffer_management);
-        EXPECT_FALSE(config.exec_rmsnorm);
-        EXPECT_FALSE(config.exec_rope);
-        EXPECT_FALSE(config.exec_attention);
-        EXPECT_FALSE(config.exec_gemm);
-        EXPECT_FALSE(config.exec_swiglu);
-        EXPECT_FALSE(config.exec_residual);
+        // Other flags remain at their defaults (true)
+        EXPECT_TRUE(config.exec_rmsnorm);
+        EXPECT_TRUE(config.exec_rope);
+        EXPECT_TRUE(config.exec_attention);
+        EXPECT_TRUE(config.exec_gemm);
+        EXPECT_TRUE(config.exec_swiglu);
+        EXPECT_TRUE(config.exec_residual);
     }
 
     // =============================================================================
@@ -240,27 +241,27 @@ namespace
     // Individual Flag Override Tests
     // =============================================================================
 
-    TEST_F(Test__ExecutionConfigAutoEnable, IndividualFlags_CanBeSetIndependently)
+    TEST_F(Test__ExecutionConfigAutoEnable, IndividualFlags_CanBeDisabledIndependently)
     {
-        // Test setting individual flags without cascading
-        EnvVarGuard guard1("LLAMINAR_EXEC_RMSNORM", "1");
+        // Test disabling individual flags (all default to true)
+        EnvVarGuard guard1("LLAMINAR_EXEC_RMSNORM", "0");
 
         llaminar2::ExecutionConfig config;
 
-        // Only RMSNorm should be enabled
-        EXPECT_TRUE(config.exec_rmsnorm);
-        EXPECT_FALSE(config.exec_rope);
-        EXPECT_FALSE(config.exec_attention);
-        EXPECT_FALSE(config.exec_gemm);
-        EXPECT_FALSE(config.exec_swiglu);
-        EXPECT_FALSE(config.exec_residual);
+        // Only RMSNorm should be disabled, others remain true
+        EXPECT_FALSE(config.exec_rmsnorm);
+        EXPECT_TRUE(config.exec_rope);
+        EXPECT_TRUE(config.exec_attention);
+        EXPECT_TRUE(config.exec_gemm);
+        EXPECT_TRUE(config.exec_swiglu);
+        EXPECT_TRUE(config.exec_residual);
     }
 
-    TEST_F(Test__ExecutionConfigAutoEnable, MultipleIndividualFlags)
+    TEST_F(Test__ExecutionConfigAutoEnable, MultipleIndividualFlags_CanBeDisabled)
     {
-        EnvVarGuard guard1("LLAMINAR_EXEC_RMSNORM", "1");
-        EnvVarGuard guard2("LLAMINAR_EXEC_ROPE", "1");
-        EnvVarGuard guard3("LLAMINAR_EXEC_ATTENTION", "1");
+        EnvVarGuard guard1("LLAMINAR_EXEC_GEMM", "0");
+        EnvVarGuard guard2("LLAMINAR_EXEC_SWIGLU", "0");
+        EnvVarGuard guard3("LLAMINAR_EXEC_RESIDUAL", "0");
 
         llaminar2::ExecutionConfig config;
 
@@ -276,17 +277,14 @@ namespace
     // Model-Level Flags Tests (Embedding, LM Head)
     // =============================================================================
 
-    TEST_F(Test__ExecutionConfigAutoEnable, ModelLevelFlags_NotAutoEnabled)
+    TEST_F(Test__ExecutionConfigAutoEnable, ModelLevelFlags_EnabledByDefault)
     {
-        // Graph buffer management should NOT auto-enable model-level flags
-        // (embedding, lm_head) as those have different buffer semantics
-        EnvVarGuard guard("LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT", "1");
-
+        // As of Dec 2025, model-level flags are also true by default
         llaminar2::ExecutionConfig config;
 
-        // Model-level flags should remain independent
-        EXPECT_FALSE(config.exec_embedding) << "Embedding should NOT be auto-enabled";
-        EXPECT_FALSE(config.exec_lm_head) << "LM head should NOT be auto-enabled";
+        // Model-level flags are enabled by default
+        EXPECT_TRUE(config.exec_embedding) << "Embedding should be enabled by default";
+        EXPECT_TRUE(config.exec_lm_head) << "LM head should be enabled by default";
     }
 
     TEST_F(Test__ExecutionConfigAutoEnable, ModelLevelFlags_CanBeSetExplicitly)
@@ -308,18 +306,20 @@ namespace
     {
         llaminar2::ExecutionConfig config;
 
-        // Initially all false
-        EXPECT_FALSE(config.use_graph_buffer_management);
-        EXPECT_FALSE(config.exec_rmsnorm);
-
-        // Set env var
-        setenv("LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT", "1", 1);
-
-        // Reload should pick up new value
-        config.reload();
-
+        // Initially all true (defaults)
         EXPECT_TRUE(config.use_graph_buffer_management);
         EXPECT_TRUE(config.exec_rmsnorm);
+
+        // Set env vars to disable
+        setenv("LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT", "0", 1);
+        setenv("LLAMINAR_EXEC_RMSNORM", "0", 1);
+
+        // Reload should pick up new values
+        config.reload();
+
+        EXPECT_FALSE(config.use_graph_buffer_management);
+        EXPECT_FALSE(config.exec_rmsnorm);
+        // Other flags remain at their defaults (true) unless explicitly set
         EXPECT_TRUE(config.exec_rope);
         EXPECT_TRUE(config.exec_attention);
         EXPECT_TRUE(config.exec_gemm);
@@ -328,6 +328,7 @@ namespace
 
         // Clean up
         unsetenv("LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT");
+        unsetenv("LLAMINAR_EXEC_RMSNORM");
     }
 
     // =============================================================================

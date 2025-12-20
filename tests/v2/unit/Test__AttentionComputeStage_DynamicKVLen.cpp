@@ -157,6 +157,17 @@ namespace llaminar2
             int get_total_evicted() const override { return 0; }
             void reset_eviction_counter() override {}
 
+            int gather_kv_batched(int layer, int num_sequences, TensorBase *out_k,
+                                  TensorBase *out_v, std::vector<int> &out_kv_lens) override
+            {
+                (void)layer;
+                (void)num_sequences;
+                (void)out_k;
+                (void)out_v;
+                (void)out_kv_lens;
+                return 0; // Not needed for these tests
+            }
+
             // Test helper: set cached tokens directly
             void setCachedTokens(int layer, int count)
             {

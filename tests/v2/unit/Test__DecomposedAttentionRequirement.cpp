@@ -136,12 +136,12 @@ namespace
     {
         ExecutionConfig config;
 
-        // Default should be false
-        EXPECT_FALSE(config.use_graph_buffer_management);
-
-        // Should be able to set
-        config.use_graph_buffer_management = true;
+        // Default is now true (as of Dec 2025)
         EXPECT_TRUE(config.use_graph_buffer_management);
+
+        // Should be able to set to false
+        config.use_graph_buffer_management = false;
+        EXPECT_FALSE(config.use_graph_buffer_management);
     }
 
     // =============================================================================

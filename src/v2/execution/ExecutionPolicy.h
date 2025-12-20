@@ -120,9 +120,8 @@ namespace llaminar2
          *   - LLAMINAR_EXEC_SWIGLU
          *   - LLAMINAR_EXEC_RESIDUAL
          *
-         * Note: When LLAMINAR_EXEC_GEMM=1, all other operations are implicitly enabled
-         * since GEMM execution requires the full data flow to be correct.
-         * This logic is handled by ExecutionConfig::reload() in DebugEnv.h.
+         * Note: Each flag is independent. Defaults are true (all operations enabled).
+         * Set individual flags to 0 to disable specific operations for debugging.
          *
          * @return ExecutionPolicy with flags set from environment
          */

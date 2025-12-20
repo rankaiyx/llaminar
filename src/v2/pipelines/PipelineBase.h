@@ -308,7 +308,7 @@ namespace llaminar2
 
         // ===== Snapshot Capture API (for parity testing / debugging) =====
         // Only available when ENABLE_PIPELINE_SNAPSHOTS is defined (test builds)
-        // In release builds, all snapshot code compiles away to NOOPs
+        // In release builds, the default no-op implementations from IInferenceRunner are used
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         /**
@@ -319,18 +319,18 @@ namespace llaminar2
          * Used for granular debugging and parity testing against reference implementations.
          *
          * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
-         * In release builds, this is a NOOP.
+         * In release builds, uses IInferenceRunner's default no-op.
          *
          * @param output_dir Optional directory to save snapshots (empty = memory only)
          */
-        void enableSnapshotCapture(const std::string &output_dir = "");
+        void enableSnapshotCapture(const std::string &output_dir = "") override;
 
         /**
          * @brief Disable snapshot capture and clear stored snapshots
          *
          * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
          */
-        void disableSnapshotCapture();
+        void disableSnapshotCapture() override;
 
         /**
          * @brief Clear stored snapshots but keep capture enabled
@@ -340,7 +340,7 @@ namespace llaminar2
          *
          * NOTE: Only available in test builds (ENABLE_PIPELINE_SNAPSHOTS defined).
          */
-        void clearSnapshots();
+        void clearSnapshots() override;
 
         /**
          * @brief Retrieve a captured snapshot by key
@@ -351,7 +351,7 @@ namespace llaminar2
          * @param out_size Output parameter for tensor size (number of float elements)
          * @return Pointer to snapshot data, or nullptr if key doesn't exist
          */
-        const float *getSnapshot(const std::string &key, size_t &out_size) const;
+        const float *getSnapshot(const std::string &key, size_t &out_size) const override;
 
         /**
          * @brief Get list of all captured snapshot keys
@@ -360,7 +360,7 @@ namespace llaminar2
          *
          * @return Vector of snapshot identifiers
          */
-        std::vector<std::string> getSnapshotKeys() const;
+        std::vector<std::string> getSnapshotKeys() const override;
 
         /**
          * @brief Dump tensor data to disk for debugging

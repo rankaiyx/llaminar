@@ -92,6 +92,35 @@ namespace llaminar2
             return append_kv(layer, 0, new_k, new_v, num_tokens);
         }
 
+        /**
+         * @brief Gather K/V from multiple cache slots into batched output tensors
+         *
+         * This method copies K/V from cache slots [0..batch_size-1] into contiguous
+         * output tensors suitable for batched attention computation.
+         *
+         * For batched decode, each sequence may have different kv_len. This method
+         * handles variable lengths by:
+         * 1. Finding the maximum kv_len across all sequences
+         * 2. Copying each sequence's K/V to its slot (with implicit zero-padding)
+         * 3. Returning per-sequence kv_lens for masking
+         *
+         * Output tensor layout: [batch_size * max_kv_len, kv_dim]
+         * where each sequence's K/V occupies [seq_idx * max_kv_len, (seq_idx+1) * max_kv_len)
+         *
+         * @param layer Layer index
+         * @param num_sequences Number of sequences to gather (typically batch_size)
+         * @param out_k Output K tensor [num_sequences * max_kv_len, kv_dim]
+         * @param out_v Output V tensor [num_sequences * max_kv_len, kv_dim]
+         * @param out_kv_lens Per-sequence kv_lens (output, size = num_sequences)
+         * @return Maximum kv_len across all sequences, or -1 on error
+         */
+        virtual int gather_kv_batched(
+            int layer,
+            int num_sequences,
+            TensorBase *out_k,
+            TensorBase *out_v,
+            std::vector<int> &out_kv_lens) = 0;
+
         // Cache management
         virtual void clear() = 0;
         virtual void clear_sequence(int seq_idx) = 0;
@@ -232,6 +261,9 @@ namespace llaminar2
 
         // Bring in convenience methods from interface (would be hidden by overrides otherwise)
         using IUnifiedKVCache::append_kv;
+
+        int gather_kv_batched(int layer, int num_sequences, TensorBase *out_k, TensorBase *out_v,
+                              std::vector<int> &out_kv_lens) override;
 
         void clear() override;
         void clear_sequence(int seq_idx) override;

@@ -73,11 +73,48 @@ namespace llaminar2
         const Qwen2GraphConfig &graph_config,
         std::shared_ptr<MPIContext> mpi_ctx,
         const GraphCacheConfig &cache_config)
-        : GraphOrchestrator(
-              std::make_shared<Qwen2Graph>(graph_config, mpi_ctx),
-              std::move(mpi_ctx),
-              cache_config)
+        // Create Qwen2Graph with MPI context FIRST (before any move)
+        : graph_builder_(std::make_shared<Qwen2Graph>(graph_config, mpi_ctx)),
+          mpi_ctx_(std::move(mpi_ctx)),
+          cache_config_(cache_config)
     {
+        // Duplicate initialization logic from the other constructor
+        if (!graph_builder_)
+        {
+            throw std::invalid_argument("GraphOrchestrator requires a valid graph builder");
+        }
+
+        // Configure executor from graph builder's config
+        GraphExecutorConfig exec_config;
+        exec_config.default_device = graph_builder_->config().default_device;
+        exec_config.enable_profiling = graph_builder_->config().enable_profiling;
+        exec_config.enable_validation = graph_builder_->config().enable_validation;
+
+        // Parse execution mode from environment
+        const auto &env = debugEnv();
+        if (env.execution.execution_mode == "parallel")
+        {
+            exec_config.mode = ExecutionMode::PARALLEL;
+        }
+        else if (env.execution.execution_mode == "pipelined")
+        {
+            exec_config.mode = ExecutionMode::PIPELINED;
+        }
+        else
+        {
+            exec_config.mode = ExecutionMode::SEQUENTIAL;
+        }
+
+        executor_ = GraphExecutor(exec_config);
+
+        // Propagate MPI rank to executor for stage dumping
+        if (mpi_ctx_)
+        {
+            executor_.setMPIRank(mpi_ctx_->rank());
+        }
+
+        LOG_INFO("[GraphOrchestrator] Initialized with graph builder, caching="
+                 << (cache_config_.enabled ? "enabled" : "disabled"));
     }
 
     // =========================================================================
@@ -278,7 +315,7 @@ namespace llaminar2
 
             cache.attention_decode = std::make_unique<ComputeGraph>(
                 graph_builder_->buildAttentionGraph(layer, buffers, layer_idx, seq_len,
-                                                    kv_cache, position_ids, device_idx));
+                                                    1, kv_cache, position_ids, device_idx, nullptr));
             cache.cached_seq_len = seq_len;
             cache.valid = true;
             cache_stats_.attention_cache_misses++;
@@ -300,7 +337,7 @@ namespace llaminar2
         cache_stats_.attention_cache_misses++;
 
         ComputeGraph graph = graph_builder_->buildAttentionGraph(
-            layer, buffers, layer_idx, seq_len, kv_cache, position_ids, device_idx);
+            layer, buffers, layer_idx, seq_len, 1, kv_cache, position_ids, device_idx, nullptr);
 
         // Debug: log graph structure
         if (layer_idx == 0)
@@ -378,7 +415,7 @@ namespace llaminar2
                       << layer_idx << " (decode mode)");
 
             cache.ffn_decode = std::make_unique<ComputeGraph>(
-                graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, device_idx));
+                graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device_idx)); // batch_size=1 for decode
             cache_stats_.ffn_cache_misses++;
 
             // Execute the newly built graph
@@ -397,7 +434,7 @@ namespace llaminar2
         // =============================================================================
         cache_stats_.ffn_cache_misses++;
 
-        ComputeGraph graph = graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, device_idx);
+        ComputeGraph graph = graph_builder_->buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device_idx); // batch_size=1 for deprecated path
 
         bool success = executor_.execute(graph, ctx);
 
@@ -716,6 +753,11 @@ namespace llaminar2
         input.position_offset = state_.positions[0]; // Legacy compat
         input.device_idx = state_.device_idx;
         input.kv_cache = state_.kv_cache.get();
+        // Pass sequence_lengths for batch-aware attention masking
+        // This enables proper separation of sequences in batched execution
+        input.sequence_lengths = (batch_size > 1 && !state_.sequence_lengths.empty())
+                                     ? &state_.sequence_lengths
+                                     : nullptr;
 
         // Build forward output
         Qwen2ForwardOutput output;
@@ -749,6 +791,83 @@ namespace llaminar2
             return nullptr;
         }
         return state_.logits->fp32_data();
+    }
+
+    // =========================================================================
+    // Batch Interface Implementation
+    // =========================================================================
+
+    bool GraphOrchestrator::forward_batch(const std::vector<std::vector<int>> &token_batches)
+    {
+        if (token_batches.empty())
+        {
+            LOG_ERROR("[GraphOrchestrator] forward_batch() called with empty batch");
+            return false;
+        }
+
+        int batch_size = static_cast<int>(token_batches.size());
+        if (batch_size > state_.batch_size)
+        {
+            LOG_ERROR("[GraphOrchestrator] Batch size " << batch_size
+                                                        << " exceeds initialized batch size " << state_.batch_size);
+            return false;
+        }
+
+        // Find max sequence length (for padding)
+        int max_len = 0;
+        for (const auto &seq : token_batches)
+        {
+            max_len = std::max(max_len, static_cast<int>(seq.size()));
+        }
+        padded_seq_len_ = max_len;
+
+        // Update sequence lengths
+        state_.sequence_lengths.resize(batch_size);
+        for (int i = 0; i < batch_size; ++i)
+        {
+            state_.sequence_lengths[i] = static_cast<int>(token_batches[i].size());
+        }
+
+        // Create flattened, padded token array [batch_size * padded_seq_len]
+        std::vector<int> flat_tokens(batch_size * padded_seq_len_, 0); // pad with 0
+        for (int b = 0; b < batch_size; ++b)
+        {
+            const auto &seq = token_batches[b];
+            for (size_t s = 0; s < seq.size(); ++s)
+            {
+                flat_tokens[b * padded_seq_len_ + s] = seq[s];
+            }
+        }
+
+        // Call the 3-parameter forward() with padded tokens
+        const float *result = forward(flat_tokens.data(), padded_seq_len_, batch_size);
+        return result != nullptr;
+    }
+
+    const float *GraphOrchestrator::getLogits(int seq_idx) const
+    {
+        if (!state_.logits)
+        {
+            return nullptr;
+        }
+
+        if (seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            LOG_ERROR("[GraphOrchestrator] Invalid sequence index " << seq_idx
+                                                                    << " (batch_size=" << state_.batch_size << ")");
+            return nullptr;
+        }
+
+        // Return pointer to logits for requested sequence
+        // Layout: [batch_size * padded_seq_len, vocab_size]
+        // For sequence seq_idx, logits start at row (seq_idx * padded_seq_len_)
+        const float *base = state_.logits->fp32_data();
+        if (!base)
+        {
+            return nullptr;
+        }
+
+        return base + (seq_idx * padded_seq_len_ * state_.vocab_size);
     }
 
     int GraphOrchestrator::getPosition(int seq_idx) const

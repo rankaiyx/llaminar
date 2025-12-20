@@ -306,20 +306,21 @@ TEST_F(ExecutionPolicyTest, FromEnvironment_EnableMultiple)
     EXPECT_FALSE(policy.residual);
 }
 
-TEST_F(ExecutionPolicyTest, FromEnvironment_GemmEnablesAllOthers)
+TEST_F(ExecutionPolicyTest, FromEnvironment_GemmEnablesOnlyGemm)
 {
-    // Enable GEMM - this should re-enable all others for correct data flow
+    // Enable GEMM only - cascade logic was removed (Dec 2025)
+    // Each flag is independent; setting GEMM=1 only enables GEMM
     setOnlyEnvAndReload("LLAMINAR_EXEC_GEMM", "1");
 
     auto policy = ExecutionPolicy::fromEnvironment();
 
-    // GEMM requires full pipeline for correct data flow
-    EXPECT_TRUE(policy.rmsnorm);
-    EXPECT_TRUE(policy.rope);
-    EXPECT_TRUE(policy.attention);
+    // Only GEMM is enabled; others remain at baseline (false from resetExecutionConfig)
+    EXPECT_FALSE(policy.rmsnorm);
+    EXPECT_FALSE(policy.rope);
+    EXPECT_FALSE(policy.attention);
     EXPECT_TRUE(policy.gemm);
-    EXPECT_TRUE(policy.swiglu);
-    EXPECT_TRUE(policy.residual);
+    EXPECT_FALSE(policy.swiglu);
+    EXPECT_FALSE(policy.residual);
 }
 
 TEST_F(ExecutionPolicyTest, FromEnvironment_DisableGemm)

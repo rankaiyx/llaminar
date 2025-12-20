@@ -68,9 +68,12 @@ namespace llaminar2
     {
         int layer_idx = 0;                   ///< Layer index
         int seq_len = 0;                     ///< Sequence length
+        int batch_size = 1;                  ///< Batch size (number of sequences)
         int device_idx = 0;                  ///< Target device
         const int *position_ids = nullptr;   ///< Position IDs for RoPE
         IUnifiedKVCache *kv_cache = nullptr; ///< KV cache
+        /// Sequence lengths for variable-length batching (nullptr = all equal)
+        const std::vector<int> *sequence_lengths = nullptr;
     };
 
     // =========================================================================

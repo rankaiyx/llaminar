@@ -411,55 +411,59 @@ namespace llaminar2
     /**
      * @brief Execution framework configuration group
      *
-     * Controls the LayerExecutor-based pipeline execution, enabling gradual
-     * migration from imperative pipeline code to declarative compute graphs.
+     * Controls the Graph-based execution system (LayerExecutor / GraphOrchestrator).
+     * As of December 2025, the Graph execution system is the PRIMARY path.
      *
      * Environment Variables:
-     *   LLAMINAR_USE_LAYER_EXECUTOR        - Enable LayerExecutor for layer execution (default: 0)
+     *   LLAMINAR_USE_LAYER_EXECUTOR        - Enable LayerExecutor (default: 1 - ON)
      *   LLAMINAR_EXECUTION_MODE            - Execution mode: "sequential", "parallel", "pipelined" (default: "sequential")
      *   LLAMINAR_EXECUTOR_PROFILING        - Enable per-stage profiling in LayerExecutor (default: 0)
      *   LLAMINAR_EXECUTOR_VALIDATION       - Enable output validation after each stage (default: 0)
      *   LLAMINAR_AUTO_WEIGHT_TRANSFER      - Auto-transfer weights to target device (default: 1)
+     *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use GraphBufferManager for buffers (default: 1 - ON)
+     *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
      *
-     * Feature Flags:
-     *   These flags enable incremental migration of pipeline operations:
-     *   LLAMINAR_EXEC_EMBEDDING            - Use ComputeStage for Embedding lookup (default: 0)
-     *   LLAMINAR_EXEC_LM_HEAD              - Use ComputeStage for LM head projection (default: 0)
-     *   LLAMINAR_EXEC_RMSNORM              - Use ComputeStage for RMSNorm (default: 0)
-     *   LLAMINAR_EXEC_ROPE                 - Use ComputeStage for RoPE (default: 0)
-     *   LLAMINAR_EXEC_ATTENTION            - Use ComputeStage for Attention (default: 0)
-     *   LLAMINAR_EXEC_GEMM                 - Use ComputeStage for GEMM (default: 0)
-     *   LLAMINAR_EXEC_SWIGLU               - Use ComputeStage for SwiGLU (default: 0)
-     *   LLAMINAR_EXEC_RESIDUAL             - Use ComputeStage for residual add (default: 0)
+     * Per-Operation Flags (all default to 1 - ON):
+     *   These flags exist for debugging only - to selectively DISABLE operations.
+     *   Set to 0 to disable the corresponding ComputeStage:
+     *   LLAMINAR_EXEC_EMBEDDING            - Use ComputeStage for Embedding lookup
+     *   LLAMINAR_EXEC_LM_HEAD              - Use ComputeStage for LM head projection
+     *   LLAMINAR_EXEC_RMSNORM              - Use ComputeStage for RMSNorm
+     *   LLAMINAR_EXEC_ROPE                 - Use ComputeStage for RoPE
+     *   LLAMINAR_EXEC_ATTENTION            - Use ComputeStage for Attention
+     *   LLAMINAR_EXEC_GEMM                 - Use ComputeStage for GEMM
+     *   LLAMINAR_EXEC_SWIGLU               - Use ComputeStage for SwiGLU
+     *   LLAMINAR_EXEC_RESIDUAL             - Use ComputeStage for residual add
      *
      * Example Usage:
-     *   # Enable executor with RMSNorm only (safe first migration step)
-     *   LLAMINAR_USE_LAYER_EXECUTOR=1 LLAMINAR_EXEC_RMSNORM=1 ./run_llaminar.sh ...
+     *   # Run with profiling enabled
+     *   LLAMINAR_EXECUTOR_PROFILING=1 ./run_llaminar.sh ...
      *
-     *   # Enable all stages with profiling
-     *   LLAMINAR_USE_LAYER_EXECUTOR=1 LLAMINAR_EXECUTOR_PROFILING=1 ./run_llaminar.sh ...
+     *   # Debug: disable only SwiGLU stage (all others remain enabled)
+     *   LLAMINAR_EXEC_SWIGLU=0 ./run_llaminar.sh ...
      */
     struct ExecutionConfig
     {
-        bool use_layer_executor = false;           ///< Master switch for LayerExecutor
+        bool use_layer_executor = true;            ///< Master switch for LayerExecutor (default: ON)
         std::string execution_mode = "sequential"; ///< Execution mode
         bool executor_profiling = false;           ///< Enable stage profiling
         bool executor_validation = false;          ///< Validate outputs after each stage
         bool auto_weight_transfer = true;          ///< Auto-transfer weights to device
-        bool use_graph_buffer_management = false;  ///< Use GraphBufferManager for buffer allocation
-        bool exec_full_forward = false;            ///< Use orchestrator->executeForward() for complete inference
+        bool use_graph_buffer_management = true;   ///< Use GraphBufferManager for buffer allocation (default: ON)
+        bool exec_full_forward = true;             ///< Use orchestrator->executeForward() for complete inference (default: ON)
 
-        // Per-operation feature flags (enable incremental migration)
+        // Per-operation feature flags - ALL ENABLED BY DEFAULT as of Dec 2025
+        // These flags now exist only for debugging (to selectively disable operations)
         // Model-level operations (embedding, final norm, lm head)
-        bool exec_embedding = false; ///< Use ComputeStage for Embedding lookup
-        bool exec_lm_head = false;   ///< Use ComputeStage for LM head projection
+        bool exec_embedding = true; ///< Use ComputeStage for Embedding lookup
+        bool exec_lm_head = true;   ///< Use ComputeStage for LM head projection
         // Layer-level operations
-        bool exec_rmsnorm = false;   ///< Use ComputeStage for RMSNorm
-        bool exec_rope = false;      ///< Use ComputeStage for RoPE
-        bool exec_attention = false; ///< Use ComputeStage for Attention
-        bool exec_gemm = false;      ///< Use ComputeStage for GEMM
-        bool exec_swiglu = false;    ///< Use ComputeStage for SwiGLU
-        bool exec_residual = false;  ///< Use ComputeStage for residual add
+        bool exec_rmsnorm = true;   ///< Use ComputeStage for RMSNorm
+        bool exec_rope = true;      ///< Use ComputeStage for RoPE
+        bool exec_attention = true; ///< Use ComputeStage for Attention
+        bool exec_gemm = true;      ///< Use ComputeStage for GEMM
+        bool exec_swiglu = true;    ///< Use ComputeStage for SwiGLU
+        bool exec_residual = true;  ///< Use ComputeStage for residual add
 
         ExecutionConfig()
         {
@@ -544,28 +548,10 @@ namespace llaminar2
             if (residual_env)
                 exec_residual = (std::atoi(residual_env) != 0);
 
-            // GEMM execution requires all other stages to maintain correct data flow
-            // When exec_gemm=true, implicitly enable the full pipeline
-            if (exec_gemm)
-            {
-                exec_rmsnorm = true;
-                exec_rope = true;
-                exec_attention = true;
-                exec_swiglu = true;
-                exec_residual = true;
-            }
-
-            // Graph buffer management implies full graph execution
-            // (buffers are managed by GraphBufferManager, so all ops must use ComputeStage)
-            if (use_graph_buffer_management)
-            {
-                exec_rmsnorm = true;
-                exec_rope = true;
-                exec_attention = true;
-                exec_gemm = true;
-                exec_swiglu = true;
-                exec_residual = true;
-            }
+            // NOTE: Legacy cascade logic removed (Dec 2025)
+            // All exec_* flags now default to true. The cascade logic below was
+            // for incremental migration - now that Graph is the primary path,
+            // all stages are always enabled unless explicitly disabled for debugging.
         }
     };
 

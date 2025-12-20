@@ -8,6 +8,7 @@
 #include "InferenceRunner.h"
 #include "../pipelines/PipelineFactory.h"
 #include "../pipelines/PipelineBase.h"
+#include "../pipelines/qwen/Qwen2Pipeline.h"
 #include "../pipelines/qwen/Qwen2Graph.h"
 #include "../pipelines/qwen/GraphOrchestrator.h"
 #include "../utils/DebugEnv.h"
@@ -45,15 +46,31 @@ namespace llaminar2
         int device_idx,
         const InferenceRunnerConfig &config)
     {
+        LOG_DEBUG("[InferenceRunner] createInferenceRunner called with mpi_ctx="
+                  << (mpi_ctx ? "valid" : "nullptr")
+                  << " world_size=" << (mpi_ctx ? mpi_ctx->world_size() : -1));
+
         if (!model_ctx)
         {
             LOG_ERROR("[InferenceRunner] model_ctx is null");
             return nullptr;
         }
 
+        // Validate device index - no magic values allowed
+        auto &dm = DeviceManager::instance();
+        if (!dm.isValidDeviceIndex(device_idx))
+        {
+            LOG_ERROR("[InferenceRunner] Invalid device_idx " << device_idx
+                                                              << ". Use DeviceManager::cpuDeviceIndex() for CPU, not -1.");
+            return nullptr;
+        }
+        LOG_DEBUG("[InferenceRunner] Using device index " << device_idx
+                                                          << " (type: " << static_cast<int>(dm.devices()[device_idx].type) << ")");
+
         // Determine execution path
+        // Default: Graph path (as of December 2025 refactor)
         const auto &exec_env = debugEnv().execution;
-        bool use_graph_path = false;
+        bool use_graph_path = true; // NEW DEFAULT: Graph is now the default
 
         if (config.force_pipeline)
         {
@@ -67,13 +84,14 @@ namespace llaminar2
         }
         else if (exec_env.exec_full_forward)
         {
+            // Still honor this flag for backward compatibility
             use_graph_path = true;
-            LOG_INFO("[InferenceRunner] Using GRAPH path (LLAMINAR_EXEC_FULL_FORWARD=1)");
+            LOG_DEBUG("[InferenceRunner] Using GRAPH path (LLAMINAR_EXEC_FULL_FORWARD=1)");
         }
         else
         {
-            use_graph_path = false;
-            LOG_INFO("[InferenceRunner] Using PIPELINE path (default)");
+            // Default to Graph path
+            LOG_INFO("[InferenceRunner] Using GRAPH path (default)");
         }
 
         std::string architecture = model_ctx->architecture();
@@ -101,9 +119,13 @@ namespace llaminar2
         const InferenceRunnerConfig &config,
         const std::string &architecture)
     {
+        // Ensure Qwen2 pipeline is registered (static initialization may not run in static libraries)
+        ensureQwen2Registration();
+
         // Configure pipeline
         PipelineConfig pipeline_config;
         pipeline_config.max_seq_len = config.max_seq_len;
+        pipeline_config.activation_precision = config.activation_precision;
 
         // Create pipeline via factory
         auto pipeline = PipelineFactory::instance().create(
@@ -155,17 +177,31 @@ namespace llaminar2
         if (model.hasMetadata("llama.feed_forward_length"))
         {
             auto it = model.metadata.find("llama.feed_forward_length");
-            if (it != model.metadata.end() && it->second.type == GGUFValueType::UINT64)
+            if (it != model.metadata.end())
             {
-                graph_config.d_ff = static_cast<int>(it->second.asUInt64());
+                if (it->second.type == GGUFValueType::UINT64)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
+                }
+                else if (it->second.type == GGUFValueType::UINT32)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
+                }
             }
         }
         else if (model.hasMetadata("qwen2.feed_forward_length"))
         {
             auto it = model.metadata.find("qwen2.feed_forward_length");
-            if (it != model.metadata.end() && it->second.type == GGUFValueType::UINT64)
+            if (it != model.metadata.end())
             {
-                graph_config.d_ff = static_cast<int>(it->second.asUInt64());
+                if (it->second.type == GGUFValueType::UINT64)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt64());
+                }
+                else if (it->second.type == GGUFValueType::UINT32)
+                {
+                    graph_config.d_ff = static_cast<int>(it->second.asUInt32());
+                }
             }
         }
 
@@ -188,6 +224,10 @@ namespace llaminar2
         GraphCacheConfig cache_config;
         cache_config.enabled = true;
         cache_config.decode_seq_len = 1;
+
+        LOG_DEBUG("[InferenceRunner] About to create GraphOrchestrator with mpi_ctx="
+                  << (mpi_ctx ? "valid" : "nullptr")
+                  << " world_size=" << (mpi_ctx ? mpi_ctx->world_size() : -1));
 
         auto orchestrator = std::make_unique<GraphOrchestrator>(
             graph_config, mpi_ctx, cache_config);

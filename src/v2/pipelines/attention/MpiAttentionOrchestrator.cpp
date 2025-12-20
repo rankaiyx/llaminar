@@ -653,6 +653,7 @@ namespace llaminar2
             gqa_cfg.head_dim = config.head_dim;
             gqa_cfg.causal = config.causal;
             gqa_cfg.window_size = config.window_size;
+            gqa_cfg.seq_len = config.seq_len; // Propagate explicit seq_len
             gqa_cfg.precision = config.precision;
             gqa_cfg.mpi_ctx = config.mpi_ctx;
             gqa_cfg.mpi_strategy = MPIStrategy::None;
@@ -784,17 +785,36 @@ namespace llaminar2
             return false;
         }
 
-        // Infer dimensions from Q shape and batch_size
+        // Determine sequence length and total tokens
+        // CRITICAL: Use explicit config.seq_len when available, NOT tensor shape.
+        // Tensors may be pre-allocated for max_seq_len but only contain seq_len valid rows.
         const auto &q_shape = Q->shape();
-        int total_tokens = static_cast<int>(q_shape[0]);
+        int tensor_total_rows = static_cast<int>(q_shape[0]); // May include padding/pre-allocation
         int effective_batch_size = (batch_size > 0) ? batch_size : 1;
-        int seq_len = total_tokens / effective_batch_size;
+        int seq_len;
+        int total_tokens; // Actual tokens to process (may differ from tensor size)
 
-        if (total_tokens % effective_batch_size != 0)
+        if (config.seq_len > 0)
         {
-            LOG_ERROR("[MpiAttentionOrchestrator] total_tokens (" << total_tokens
-                                                                  << ") not divisible by batch_size (" << effective_batch_size << ")");
-            return false;
+            // Use explicit seq_len from config (avoids incorrect inference when Q is pre-allocated)
+            seq_len = config.seq_len;
+            total_tokens = seq_len * effective_batch_size; // Actual valid tokens
+            LOG_TRACE("[MPI TP] Using explicit seq_len=" << seq_len << " from config, total_tokens=" << total_tokens
+                                                         << " (tensor has " << tensor_total_rows << " rows)");
+        }
+        else
+        {
+            // Legacy: infer from Q tensor shape (only correct when Q is exactly-sized)
+            total_tokens = tensor_total_rows;
+            seq_len = total_tokens / effective_batch_size;
+
+            if (total_tokens % effective_batch_size != 0)
+            {
+                LOG_ERROR("[MpiAttentionOrchestrator] total_tokens (" << total_tokens
+                                                                      << ") not divisible by batch_size (" << effective_batch_size << ")");
+                return false;
+            }
+            LOG_TRACE("[MPI TP] Inferred seq_len=" << seq_len << " from Q shape (legacy)");
         }
 
         LOG_TRACE("[MPI TP] Batch-aware attention: total_tokens=" << total_tokens
@@ -863,6 +883,20 @@ namespace llaminar2
             return false;
         }
 
+        // Debug: Check source Q tensor per-batch data
+        if (rank == 0 && Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG) && effective_batch_size > 1)
+        {
+            const size_t src_head_stride = static_cast<size_t>(config.n_heads) * config.head_dim;
+            const size_t src_batch_stride = static_cast<size_t>(seq_len) * src_head_stride; // With correct total_tokens, this equals tensor stride
+            LOG_DEBUG("[MPI TP] Source Q tensor - batch_stride=" << src_batch_stride << " head_stride=" << src_head_stride);
+            for (int b = 0; b < effective_batch_size && b < 4; ++b)
+            {
+                const float *batch_start = Q_data + b * src_batch_stride;
+                LOG_DEBUG("[MPI TP] Q_data batch " << b << " first4: [" << batch_start[0] << ","
+                                                   << batch_start[1] << "," << batch_start[2] << "," << batch_start[3] << "]");
+            }
+        }
+
         // 2. Broadcast K/V heads to match Q heads (if needed)
         std::vector<float> K_broadcast, V_broadcast;
         const float *K_expanded = K_data;
@@ -885,25 +919,33 @@ namespace llaminar2
         std::vector<float> V_local(local_tensor_elements);
         std::vector<float> local_output(local_tensor_elements, 0.0f);
 
+        // With explicit seq_len from config, total_tokens = seq_len * batch_size (compact layout)
+        // The tensor_stride_per_batch equals seq_len since data is written compactly.
+        const int tensor_stride_per_batch = seq_len; // Stride between batches in source tensor
+
+        LOG_DEBUG("[MPI TP] Batch layout: seq_len=" << seq_len
+                                                    << " total_tokens=" << total_tokens << " batch_size=" << effective_batch_size);
+
         // For batch path, we need to preserve [batch_size, seq_len, n_heads, head_dim] layout
         // For single-sequence path, total_tokens = seq_len, so batch structure doesn't matter
         auto copy_head_slice = [&](const float *src, float *dst)
         {
             if (effective_batch_size > 1)
             {
-                // Batch path: src is [batch_size, seq_len, n_heads, head_dim]
+                // Batch path: src is [batch_size, tensor_stride_per_batch, n_heads, head_dim]
+                // But we only read the first seq_len positions per batch
                 // dst should be [batch_size, seq_len, local_n_heads, head_dim]
                 const size_t seq_head_stride = static_cast<size_t>(config.n_heads) * config.head_dim;
-                const size_t batch_stride = static_cast<size_t>(seq_len) * seq_head_stride;
+                const size_t src_batch_stride = static_cast<size_t>(tensor_stride_per_batch) * seq_head_stride; // Use tensor stride!
                 const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
-                const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
+                const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride; // dst uses logical seq_len
 
                 for (int b = 0; b < effective_batch_size; ++b)
                 {
-                    const float *batch_src = src + b * batch_stride;
-                    float *batch_dst = dst + b * local_batch_stride;
+                    const float *batch_src = src + b * src_batch_stride; // Source uses tensor stride
+                    float *batch_dst = dst + b * local_batch_stride;     // Dest uses logical stride
 
-                    for (int s = 0; s < seq_len; ++s)
+                    for (int s = 0; s < seq_len; ++s) // Only copy seq_len valid positions
                     {
                         const float *seq_src = batch_src + static_cast<size_t>(s) * seq_head_stride;
                         float *seq_dst = batch_dst + static_cast<size_t>(s) * local_seq_head_stride;
@@ -939,6 +981,18 @@ namespace llaminar2
         copy_head_slice(Q_data, Q_local.data());
         copy_head_slice(K_expanded, K_local.data());
         copy_head_slice(V_expanded, V_local.data());
+
+        // Debug: Check Q_local per-batch to verify data copy correctness
+        if (rank == 0 && Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG) && effective_batch_size > 1)
+        {
+            const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_n_heads * config.head_dim;
+            for (int b = 0; b < effective_batch_size && b < 4; ++b)
+            {
+                const float *batch_start = Q_local.data() + b * local_batch_stride;
+                LOG_DEBUG("[MPI TP] Q_local batch " << b << " first4: [" << batch_start[0] << ","
+                                                    << batch_start[1] << "," << batch_start[2] << "," << batch_start[3] << "]");
+            }
+        }
 
         // NOTE: For tensor-parallel attention, we extract raw float data from Q/K/V
         // and create local float buffers. This means Q8_1 tensors are dequantized
@@ -1003,6 +1057,11 @@ namespace llaminar2
         bool local_success;
         if (effective_batch_size > 1)
         {
+            LOG_DEBUG("[MPI TP] Batch path: batch_size=" << effective_batch_size
+                                                         << " needs_mask=" << needs_mask
+                                                         << " mask_tensor=" << mask_tensor
+                                                         << " sequence_lengths=" << (sequence_lengths ? "valid" : "nullptr"));
+
             // Batch path: Call compute_batch with separate batch_size and seq_len
             // Layout: Q_local/K_local/V_local are [batch_size, seq_len, local_n_heads, head_dim] (flattened)
             local_success = attention_kernel->compute_batch(
@@ -1083,6 +1142,21 @@ namespace llaminar2
 
         LOG_DEBUG("[MPI TP] Rank " << rank << ": local_output[0]=" << local_output[0]);
 
+        // Debug: Show local_output per-batch for batched execution
+        if (rank == 0 && effective_batch_size > 1 && Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+        {
+            const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
+            const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
+            LOG_DEBUG("[MPI TP] Batched local_output layout: batch_stride=" << local_batch_stride
+                                                                            << " (batch_size=" << effective_batch_size << " seq_len=" << seq_len << ")");
+            for (int b = 0; b < effective_batch_size && b < 4; ++b)
+            {
+                const float *batch_start = local_output.data() + b * local_batch_stride;
+                LOG_DEBUG("[MPI TP] local_output batch " << b << " first4: [" << batch_start[0] << ","
+                                                         << batch_start[1] << "," << batch_start[2] << "," << batch_start[3] << "]");
+            }
+        }
+
         // 8. Allreduce: Sum local outputs from all ranks
         std::memset(output_data, 0, total_tokens * config.n_heads * config.head_dim * sizeof(float));
 
@@ -1093,12 +1167,12 @@ namespace llaminar2
         // Must preserve batch structure if effective_batch_size > 1
         if (effective_batch_size > 1)
         {
-            // Batch path: local_output is [batch_size, seq_len, local_n_heads, head_dim]
-            // send_buffer should be [batch_size, seq_len, n_heads, head_dim] with only start_head..start_head+local_n_heads filled
+            // Batch path: local_output is [batch_size, seq_len, local_n_heads, head_dim] (compacted)
+            // send_buffer should be [batch_size, tensor_stride_per_batch, n_heads, head_dim] to match input tensor layout
             const size_t seq_head_stride = static_cast<size_t>(config.n_heads) * config.head_dim;
-            const size_t batch_stride = static_cast<size_t>(seq_len) * seq_head_stride;
+            const size_t dst_batch_stride = static_cast<size_t>(tensor_stride_per_batch) * seq_head_stride; // Dest uses tensor stride!
             const size_t local_seq_head_stride = static_cast<size_t>(local_n_heads) * config.head_dim;
-            const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride;
+            const size_t local_batch_stride = static_cast<size_t>(seq_len) * local_seq_head_stride; // local_output is compacted
 
             bool do_parallel = (effective_batch_size * seq_len * static_cast<int>(local_n_heads) > 64);
             auto batch_copy_work = [&]()
@@ -1106,13 +1180,13 @@ namespace llaminar2
 #pragma omp for collapse(3) schedule(static)
                 for (int b = 0; b < effective_batch_size; ++b)
                 {
-                    for (int s = 0; s < seq_len; ++s)
+                    for (int s = 0; s < seq_len; ++s) // Only copy valid positions
                     {
                         for (size_t local_h = 0; local_h < local_n_heads; ++local_h)
                         {
                             size_t global_h = start_head + local_h;
                             const float *src = local_output.data() + b * local_batch_stride + s * local_seq_head_stride + local_h * config.head_dim;
-                            float *dst = send_buffer.data() + b * batch_stride + s * seq_head_stride + global_h * config.head_dim;
+                            float *dst = send_buffer.data() + b * dst_batch_stride + s * seq_head_stride + global_h * config.head_dim;
 #pragma omp simd
                             for (int d = 0; d < config.head_dim; ++d)
                             {

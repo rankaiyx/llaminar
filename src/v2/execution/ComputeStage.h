@@ -584,6 +584,7 @@ namespace llaminar2
             int head_dim = 0;            ///< Dimension per head
             int pos_offset = 0;          ///< Position offset (for KV cache)
             float theta_base = 10000.0f; ///< RoPE theta base
+            int seq_len = 0;             ///< Explicit sequence length (for pre-allocated buffers)
             // Optional MPI context for distributed execution
             const MPIContext *mpi_ctx = nullptr;
             int device_idx = -1;
@@ -603,7 +604,7 @@ namespace llaminar2
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.pos_offset = pos_offset;
-            (void)seq_len; // RoPE doesn't need seq_len update
+            params_.seq_len = seq_len;
         }
 
         /// Get params for testing
@@ -766,12 +767,14 @@ namespace llaminar2
     public:
         struct Params
         {
-            const TensorBase *K = nullptr; ///< Key to append [seq_len, n_kv_heads * head_dim]
-            const TensorBase *V = nullptr; ///< Value to append [seq_len, n_kv_heads * head_dim]
+            const TensorBase *K = nullptr; ///< Key to append [batch_size * seq_len, n_kv_heads * head_dim]
+            const TensorBase *V = nullptr; ///< Value to append [batch_size * seq_len, n_kv_heads * head_dim]
             IUnifiedKVCache *kv_cache = nullptr;
             int layer_idx = 0;
-            int seq_idx = 0;    ///< Sequence index (for batched caches)
-            int num_tokens = 0; ///< Number of tokens to append (0 = full tensor)
+            int seq_idx = 0;    ///< Starting sequence index (for batched caches)
+            int num_tokens = 0; ///< Total tokens to append (0 = full tensor)
+            int batch_size = 1; ///< Number of sequences in batch (for per-seq append)
+            int seq_len = 0;    ///< Tokens per sequence (for slicing K/V per-seq)
         };
 
         explicit KVCacheAppendStage(Params params);
@@ -783,6 +786,84 @@ namespace llaminar2
 
     private:
         Params params_;
+    };
+
+    /**
+     * @brief Gather K/V from multiple cache slots into batched output tensors
+     *
+     * For batched decode with KV cache history, each sequence has K/V stored
+     * at a separate seq_idx in the cache. This stage gathers them into contiguous
+     * tensors suitable for batched attention computation.
+     *
+     * Output layout: [batch_size * max_kv_len, kv_dim]
+     * where each sequence occupies [seq_idx * max_kv_len, (seq_idx+1) * max_kv_len)
+     *
+     * The stage outputs:
+     * - out_K: Gathered key tensor
+     * - out_V: Gathered value tensor
+     * - max_kv_len: Maximum sequence length across all sequences (for masking)
+     * - per_seq_kv_lens: Vector of actual kv_len per sequence (for variable-length masking)
+     *
+     * DAG usage pattern (batched decode):
+     * @code
+     * // Stage 1: Append new tokens to cache
+     * graph.addNode("kv_append", createKVCacheAppend({...}), device);
+     *
+     * // Stage 2: Gather K/V from all batch slots
+     * graph.addNode("kv_gather", createKVCacheGather({
+     *     .kv_cache = cache, .layer_idx = layer,
+     *     .batch_size = batch_size,
+     *     .out_K = gathered_K, .out_V = gathered_V,
+     * }), device);
+     * graph.addDependency("kv_append", "kv_gather");
+     *
+     * // Stage 3: Batched attention with gathered K/V
+     * graph.addNode("attention", createAttentionCompute({
+     *     .Q = Q, .K = gathered_K, .V = gathered_V,
+     *     .batch_size = batch_size, .kv_len = max_kv_len, ...
+     * }), device);
+     * graph.addDependency("kv_gather", "attention");
+     * @endcode
+     *
+     * @see KVCacheAppendStage for appending tokens to cache
+     * @see AttentionComputeStage for attention computation
+     */
+    class KVCacheGatherStage : public IComputeStage
+    {
+    public:
+        struct Params
+        {
+            IUnifiedKVCache *kv_cache = nullptr;
+            int layer_idx = 0;
+            int batch_size = 1; ///< Number of sequences to gather
+
+            TensorBase *out_K = nullptr; ///< Output K [batch_size * max_kv_len, kv_dim]
+            TensorBase *out_V = nullptr; ///< Output V [batch_size * max_kv_len, kv_dim]
+
+            /// After execute(), contains the max kv_len across all sequences
+            int *out_max_kv_len = nullptr;
+
+            /// After execute(), contains per-sequence kv_lens (size = batch_size)
+            std::vector<int> *out_per_seq_kv_lens = nullptr;
+        };
+
+        explicit KVCacheGatherStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override { return ComputeStageType::COPY; } // Data movement
+        bool supportsBackend(ComputeBackendType backend) const override { return true; }
+        StageBufferRequirements getBufferRequirements() const override;
+
+        /// Get the max kv_len from most recent execute() call
+        int getMaxKVLen() const { return last_max_kv_len_; }
+
+        /// Get per-sequence kv_lens from most recent execute() call
+        const std::vector<int> &getPerSeqKVLens() const { return last_per_seq_kv_lens_; }
+
+    private:
+        Params params_;
+        int last_max_kv_len_ = 0;
+        std::vector<int> last_per_seq_kv_lens_;
     };
 
     /**
@@ -914,6 +995,10 @@ namespace llaminar2
             const TensorBase *gate = nullptr; ///< Gate tensor [seq_len, intermediate_dim]
             const TensorBase *up = nullptr;   ///< Up tensor [seq_len, intermediate_dim]
             TensorBase *output = nullptr;     ///< Output tensor [seq_len, intermediate_dim]
+
+            // Explicit seq_len override (for pre-allocated buffers)
+            // If 0, derives from tensor dimensions
+            int seq_len = 0;
 
             // Optional MPI context for distributed execution
             const MPIContext *mpi_ctx = nullptr;
@@ -1313,6 +1398,19 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createKVCacheAppend(
             const KVCacheAppendStage::Params &params);
+
+        /**
+         * @brief Create a KV cache gather stage for batched decode
+         *
+         * Gathers K/V from multiple cache slots into batched output tensors.
+         * Use after KVCacheAppendStage and before AttentionComputeStage for
+         * batched decode with KV cache history.
+         *
+         * @param params Gather parameters (cache, batch_size, output tensors)
+         * @return KVCacheGatherStage instance
+         */
+        static std::unique_ptr<IComputeStage> createKVCacheGather(
+            const KVCacheGatherStage::Params &params);
 
         /**
          * @brief Create a pure attention compute stage using KernelFactory

@@ -35,21 +35,25 @@ namespace llaminar2
 
     /**
      * @brief Configuration for PipelineExecutor
+     *
+     * NOTE: As of December 2025, Graph execution is the primary path.
+     * All flags default to true for full graph-based execution.
      */
     struct PipelineExecutorConfig
     {
-        bool use_layer_executor = false; ///< Enable LayerExecutor for supported ops
-        bool use_compute_graph = false;  ///< Use ComputeGraph for dependency tracking
+        bool use_layer_executor = true; ///< Enable LayerExecutor for supported ops (default: ON)
+        bool use_compute_graph = true;  ///< Use ComputeGraph for dependency tracking (default: ON)
         ExecutionMode execution_mode = ExecutionMode::SEQUENTIAL;
         bool enable_profiling = false;
 
-        // Feature flags for incremental rollout
-        bool executor_ffn_norm = false;      ///< Use executor for FFN norm
-        bool executor_ffn_swiglu = false;    ///< Use executor for SwiGLU
-        bool executor_ffn_residual = false;  ///< Use executor for FFN residual
-        bool executor_attn_norm = false;     ///< Use executor for attention norm
-        bool executor_attn_residual = false; ///< Use executor for attention residual
-        bool executor_rope = false;          ///< Use executor for RoPE operations
+        // Feature flags - ALL ENABLED BY DEFAULT as of Dec 2025
+        // These flags now exist only for debugging (to selectively disable operations)
+        bool executor_ffn_norm = true;      ///< Use executor for FFN norm
+        bool executor_ffn_swiglu = true;    ///< Use executor for SwiGLU
+        bool executor_ffn_residual = true;  ///< Use executor for FFN residual
+        bool executor_attn_norm = true;     ///< Use executor for attention norm
+        bool executor_attn_residual = true; ///< Use executor for attention residual
+        bool executor_rope = true;          ///< Use executor for RoPE operations
     };
 
     /**

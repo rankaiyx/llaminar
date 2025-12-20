@@ -10,6 +10,9 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
 namespace llaminar2
 {
 
@@ -33,6 +36,10 @@ namespace llaminar2
     public:
         virtual ~IInferenceRunner() = default;
 
+        // =====================================================================
+        // Core Inference API
+        // =====================================================================
+
         /**
          * @brief Run forward pass
          *
@@ -48,6 +55,56 @@ namespace llaminar2
          * @return Pointer to logits [vocab_size], or nullptr if unavailable
          */
         virtual const float *logits() const = 0;
+
+        /**
+         * @brief Batched forward pass
+         *
+         * Process multiple sequences in parallel with automatic padding.
+         *
+         * @param token_batches Vector of token sequences
+         * @return true if forward pass succeeded
+         */
+        virtual bool forward_batch(const std::vector<std::vector<int>> &token_batches)
+        {
+            (void)token_batches;
+            return false; // Default: not implemented
+        }
+
+        /**
+         * @brief Get logits for a specific sequence in batch
+         *
+         * Returns logits for the specified sequence index.
+         * For E2E tests that compare all positions.
+         *
+         * @param seq_idx Sequence index in batch (default=0)
+         * @return Pointer to logits [padded_seq_len, vocab_size], or nullptr
+         */
+        virtual const float *getLogits(int seq_idx = 0) const
+        {
+            (void)seq_idx;
+            return logits(); // Default: return single-sequence logits
+        }
+
+        /**
+         * @brief Get current batch size
+         */
+        virtual int batch_size() const { return 1; }
+
+        /**
+         * @brief Get padded sequence length for current batch
+         */
+        virtual int padded_seq_len() const { return 0; }
+
+        /**
+         * @brief Get sequence lengths for current batch
+         *
+         * @return Vector of actual (unpadded) sequence lengths
+         */
+        virtual const std::vector<int> &sequence_lengths() const
+        {
+            static const std::vector<int> empty;
+            return empty;
+        }
 
         /**
          * @brief Get vocabulary size
@@ -73,6 +130,60 @@ namespace llaminar2
          * @brief Get architecture name (e.g., "qwen2")
          */
         virtual const char *architecture() const = 0;
+
+        // =====================================================================
+        // Snapshot Capture API (for E2E parity testing)
+        // =====================================================================
+        // These methods have default no-op implementations for builds without
+        // snapshot support. Override in Pipeline (with ENABLE_PIPELINE_SNAPSHOTS)
+        // or GraphOrchestrator (always available) for actual snapshot capture.
+
+        /**
+         * @brief Enable snapshot capture of intermediate activations
+         *
+         * When enabled, each forward pass will capture intermediate tensor
+         * values at instrumented stages for comparison against ground truth.
+         *
+         * @param output_dir Optional directory to save snapshots (implementation-specific)
+         */
+        virtual void enableSnapshotCapture(const std::string &output_dir = "")
+        {
+            (void)output_dir; // No-op by default
+        }
+
+        /**
+         * @brief Disable snapshot capture and clear stored snapshots
+         */
+        virtual void disableSnapshotCapture() {}
+
+        /**
+         * @brief Clear stored snapshots but keep capture enabled
+         */
+        virtual void clearSnapshots() {}
+
+        /**
+         * @brief Retrieve a captured snapshot by key
+         *
+         * @param key Snapshot identifier (e.g., "layer0_Q_PROJECTION", "EMBEDDING")
+         * @param out_size Output parameter for snapshot size in bytes
+         * @return Pointer to snapshot data (FP32), or nullptr if key doesn't exist
+         */
+        virtual const float *getSnapshot(const std::string &key, size_t &out_size) const
+        {
+            (void)key;
+            out_size = 0;
+            return nullptr; // No snapshot support by default
+        }
+
+        /**
+         * @brief Get list of all captured snapshot keys
+         *
+         * @return Vector of snapshot identifiers
+         */
+        virtual std::vector<std::string> getSnapshotKeys() const
+        {
+            return {}; // No snapshots by default
+        }
     };
 
 } // namespace llaminar2
