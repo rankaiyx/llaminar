@@ -1573,9 +1573,21 @@ namespace llaminar2
          * @param workspace_mask Pre-built attention mask or nullptr
          * @param mpi_ctx MPI context (optional)
          * @param device_idx Device index
+         * @param head_start First query head to compute (0-indexed, default 0)
+         * @param local_n_heads Number of query heads to compute (-1 = all)
+         * @param local_n_kv_heads Number of KV heads for this slice (-1 = all)
          * @return true on success, false on failure or unsupported type combination
          *
          * @note Default returns false. Subclasses should override with type-aware dispatch.
+         *
+         * Tensor Parallelism Usage:
+         * When distributing attention across ranks, each rank computes a subset of heads:
+         *   Rank 0: head_start=0, local_n_heads=n_heads/2
+         *   Rank 1: head_start=n_heads/2, local_n_heads=n_heads/2
+         *
+         * The output tensor is indexed as output[seq, head, dim], so each rank writes
+         * to output[:, head_start:head_start+local_n_heads, :]. After computation,
+         * an AllGather is needed to combine results (handled by caller).
          */
         virtual bool compute_tensor(
             const TensorBase *Q,
@@ -1593,7 +1605,10 @@ namespace llaminar2
             TensorBase *workspace_scores = nullptr,
             TensorBase *workspace_mask = nullptr,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            int head_start = 0,        ///< First query head (TP slice start)
+            int local_n_heads = -1,    ///< Number of query heads (-1 = all)
+            int local_n_kv_heads = -1) ///< Number of KV heads (-1 = all)
         {
             (void)Q;
             (void)K;
@@ -1611,6 +1626,9 @@ namespace llaminar2
             (void)workspace_mask;
             (void)mpi_ctx;
             (void)device_idx;
+            (void)head_start;
+            (void)local_n_heads;
+            (void)local_n_kv_heads;
             return false; // Subclasses override with type-aware dispatch
         }
     };

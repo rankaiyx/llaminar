@@ -189,15 +189,34 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[GEMMStage] Execute GEMM: " << params_.m << "x" << params_.n << "x" << params_.k
+        // Check if this is a sliced (tensor-parallel) GEMM
+        const bool is_sliced = !params_.output_range.empty();
+        const int effective_n = is_sliced ? static_cast<int>(params_.output_range.size()) : params_.n;
+
+        LOG_DEBUG("[GEMMStage] Execute GEMM: " << params_.m << "x" << effective_n << "x" << params_.k
+                                               << (is_sliced ? " (SLICED)" : "")
                                                << " weight ptr=" << static_cast<const void *>(params_.B)
                                                << " weight shape=[" << (params_.B ? params_.B->shape()[0] : 0) << ","
                                                << (params_.B ? params_.B->shape()[1] : 0) << "]"
                                                << " input_type=" << params_.A->dtype_name()
                                                << " output_type=" << params_.C->dtype_name());
 
-        // Get cached kernel from KernelFactory (handles weight packing once)
-        auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.B);
+        // Get kernel - either full or sliced
+        llaminar2::ITensorGemm *gemm = nullptr;
+        if (is_sliced)
+        {
+            // Use sliced kernel for tensor parallelism
+            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
+                params_.B, params_.output_range.start, params_.output_range.end);
+            LOG_DEBUG("[GEMMStage] Using sliced kernel for rows [" << params_.output_range.start
+                                                                   << ", " << params_.output_range.end << ")");
+        }
+        else
+        {
+            // Use full kernel
+            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.B);
+        }
+
         if (!gemm)
         {
             LOG_ERROR("[GEMMStage] Failed to get GEMM kernel for weight tensor");
@@ -216,10 +235,10 @@ namespace llaminar2
             int kernel_n = qgemm->get_n();
             int kernel_k = qgemm->get_k();
             LOG_DEBUG("[GEMMStage] Kernel dimensions: N=" << kernel_n << " K=" << kernel_k
-                                                          << ", params: n=" << params_.n << " k=" << params_.k);
-            if (kernel_n != params_.n || kernel_k != params_.k)
+                                                          << ", params: n=" << effective_n << " k=" << params_.k);
+            if (kernel_n != effective_n || kernel_k != params_.k)
             {
-                LOG_ERROR("[GEMMStage] DIMENSION MISMATCH! kernel N=" << kernel_n << " vs params n=" << params_.n
+                LOG_ERROR("[GEMMStage] DIMENSION MISMATCH! kernel N=" << kernel_n << " vs params n=" << effective_n
                                                                       << ", kernel K=" << kernel_k << " vs params k=" << params_.k);
                 return false;
             }
@@ -234,7 +253,7 @@ namespace llaminar2
                 LOG_DEBUG("[GEMMStage] Using multiply_tensor for Q8_1 output type dispatch");
                 return qgemm->multiply_tensor(
                     params_.A, params_.C,
-                    params_.m, params_.n, params_.k,
+                    params_.m, effective_n, params_.k,
                     params_.transpose_B,
                     params_.alpha, params_.beta,
                     params_.mpi_ctx, params_.device_idx);
@@ -254,7 +273,7 @@ namespace llaminar2
             return qgemm->multiply_fused(
                 input_fp32,
                 output_fp32,
-                params_.m, params_.n, params_.k,
+                params_.m, effective_n, params_.k,
                 params_.bias,           // Fused bias
                 nullptr,                // No attention mask
                 false,                  // No softmax
@@ -268,7 +287,7 @@ namespace llaminar2
 
         // FP32 GEMM fallback (for non-quantized weights)
         // Use multiply_tensor if available for type-aware dispatch
-        if (gemm->multiply_tensor(params_.A, params_.C, params_.m, params_.n, params_.k,
+        if (gemm->multiply_tensor(params_.A, params_.C, params_.m, effective_n, params_.k,
                                   params_.transpose_B, params_.alpha, params_.beta,
                                   params_.mpi_ctx, params_.device_idx))
         {
@@ -288,7 +307,7 @@ namespace llaminar2
         return gemm->multiply(
             input_fp32,
             output_fp32,
-            params_.m, params_.n, params_.k,
+            params_.m, effective_n, params_.k,
             params_.alpha, params_.beta);
     }
 

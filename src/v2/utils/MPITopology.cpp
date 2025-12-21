@@ -26,68 +26,6 @@ namespace llaminar2
 {
 
     // =========================================================================
-    // WorkRange Static Methods
-    // =========================================================================
-
-    WorkRange WorkRange::for_rank_equal(size_t total, int rank, int world_size)
-    {
-        if (world_size <= 0 || rank < 0 || rank >= world_size)
-        {
-            return {0, 0, 0}; // Invalid
-        }
-
-        size_t per_rank = total / world_size;
-        size_t remainder = total % world_size;
-
-        // Distribute remainder among first 'remainder' ranks
-        size_t start = rank * per_rank + std::min(static_cast<size_t>(rank), remainder);
-        size_t end = start + per_rank + (static_cast<size_t>(rank) < remainder ? 1 : 0);
-
-        return {start, end, end - start};
-    }
-
-    WorkRange WorkRange::for_rank_weighted(size_t total, int rank, int world_size,
-                                           const std::vector<float> &weights)
-    {
-        if (world_size <= 0 || rank < 0 || rank >= world_size)
-        {
-            return {0, 0, 0}; // Invalid
-        }
-
-        if (weights.size() != static_cast<size_t>(world_size))
-        {
-            // Fall back to equal distribution if weights don't match
-            return for_rank_equal(total, rank, world_size);
-        }
-
-        // Normalize weights
-        float total_weight = std::accumulate(weights.begin(), weights.end(), 0.0f);
-        if (total_weight <= 0.0f)
-        {
-            return for_rank_equal(total, rank, world_size);
-        }
-
-        // Calculate this rank's portion
-        float cumulative = 0.0f;
-        for (int r = 0; r < rank; ++r)
-        {
-            cumulative += weights[r];
-        }
-
-        size_t start = static_cast<size_t>((cumulative / total_weight) * total);
-        cumulative += weights[rank];
-        size_t end = static_cast<size_t>((cumulative / total_weight) * total);
-
-        // Ensure last rank gets everything remaining
-        if (rank == world_size - 1)
-        {
-            end = total;
-        }
-
-        return {start, end, end - start};
-    }
-
-    // =========================================================================
     // Construction / Destruction
     // =========================================================================
 
@@ -468,11 +406,11 @@ namespace llaminar2
             // Each KV head is assigned to one rank
             if (rank_ < total_kv_heads)
             {
-                return {static_cast<size_t>(rank_), static_cast<size_t>(rank_ + 1), 1};
+                return {static_cast<size_t>(rank_), static_cast<size_t>(rank_ + 1)};
             }
             else
             {
-                return {0, 0, 0}; // Empty range
+                return {0, 0}; // Empty range
             }
         }
         return WorkRange::for_rank_equal(total_kv_heads, rank_, world_size_);

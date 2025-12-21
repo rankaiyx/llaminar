@@ -752,6 +752,19 @@ add_v2_test(V2_Unit_KernelFactory
     MPI_PROCS 1  # Kernel factory tests, single rank
 )
 
+# Test: KernelFactory sliced GEMM for tensor parallelism (Phase 2.1)
+add_executable(v2_test_kernel_factory_sliced unit/Test__KernelFactorySliced.cpp)
+target_link_libraries(v2_test_kernel_factory_sliced
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_KernelFactorySliced
+    COMMAND $<TARGET_FILE:v2_test_kernel_factory_sliced>
+    LABELS "V2;Unit;Kernels;KernelFactory;TensorParallelism;SlicedGEMM;Phase2"
+    MPI_PROCS 1  # Sliced kernel tests, single rank
+)
+
 # Test: KernelFactory automatic cache invalidation on tensor destruction
 add_executable(v2_test_kernel_factory_cache_invalidation unit/Test__KernelFactoryCacheInvalidation.cpp)
 target_link_libraries(v2_test_kernel_factory_cache_invalidation
@@ -3447,4 +3460,50 @@ add_v2_test(V2_Perf_FusedAttentionWo_Tuning
     MPI_PROCS 1
 )
 
+# =============================================================================
+# Multi-Rank MPI Integration Tests for Distributed Architecture (Phase 1, 2, G0)
+# =============================================================================
+
+# Test: MPITopology Multi-Rank Integration Tests (Phase 1)
+# Tests work distribution, capability exchange, and placement determinism
+# across multiple MPI ranks.
+# NOTE: These tests have custom main() with MPI_Init/MPI_Finalize
+add_executable(v2_integration_mpi_topology integration/Test__MPITopologyIntegration.cpp)
+target_link_libraries(v2_integration_mpi_topology
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPITopology
+    COMMAND $<TARGET_FILE:v2_integration_mpi_topology>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;Topology;WorkDistribution;CapabilityExchange;Placement;Phase1"
+)
+
+# Test: Sliced GEMM MPI Integration Tests (Phase 2)
+# Tests row-parallel GEMM with AllGatherv and column-parallel with AllReduce
+# using the new KernelFactory::getOrCreateGemmSliced() API.
+add_executable(v2_integration_sliced_gemm_mpi integration/Test__SlicedGEMM_MPI_Integration.cpp)
+target_link_libraries(v2_integration_sliced_gemm_mpi
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_SlicedGEMM_MPI
+    COMMAND $<TARGET_FILE:v2_integration_sliced_gemm_mpi>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;SlicedGEMM;RowParallel;ColumnParallel;AllGatherv;AllReduce;Phase2;TensorParallel"
+)
+
+# Test: PlacementStrategy MPI Integration Tests (Phase G0)
+# Tests that PlacementStrategy produces identical plans across all ranks
+# and integrates correctly with MPITopology.
+add_executable(v2_integration_placement_strategy_mpi integration/Test__PlacementStrategy_MPI_Integration.cpp)
+target_link_libraries(v2_integration_placement_strategy_mpi
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_PlacementStrategy_MPI
+    COMMAND $<TARGET_FILE:v2_integration_placement_strategy_mpi>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;PlacementStrategy;Determinism;CPUOnly;GPUFirst;PhaseG0"
+)
 

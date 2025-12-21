@@ -655,6 +655,32 @@ namespace llaminar
                 static llaminar2::ITensorGemm *getOrCreateGemm(const llaminar2::TensorBase *tensor);
 
                 /**
+                 * @brief Get or create a cached row-sliced GEMM kernel for tensor parallelism
+                 *
+                 * Creates a kernel that only packs rows [row_start, row_end) from the weight tensor.
+                 * This is used for row-parallel tensor parallelism where each MPI rank computes
+                 * a slice of the output dimension.
+                 *
+                 * For a weight matrix [N, K]:
+                 * - Full kernel: packs all N rows, output C is [M, N]
+                 * - Sliced kernel: packs only (row_end - row_start) rows, output C is [M, row_end - row_start]
+                 *
+                 * @param tensor Weight tensor (quantized)
+                 * @param row_start First row to include (0-indexed)
+                 * @param row_end One past the last row to include
+                 * @return Cached GEMM kernel pointer (lifetime managed by cache)
+                 *
+                 * @note Cache key includes row range, so different slices get different kernels
+                 * @note Thread-safe via mutex protection
+                 * @note The resulting kernel has N = (row_end - row_start), K unchanged
+                 * @note After sliced GEMM, caller is responsible for AllReduce if needed
+                 */
+                static llaminar2::ITensorGemm *getOrCreateGemmSliced(
+                    const llaminar2::TensorBase *tensor,
+                    size_t row_start,
+                    size_t row_end);
+
+                /**
                  * @brief Ensure tensor has packed weights in its cache and return pointer
                  *
                  * This is the canonical way to get packed weights for a tensor. The weights
@@ -698,6 +724,33 @@ namespace llaminar
                 // Cache storage - owns the kernels
                 static std::unordered_map<const llaminar2::TensorBase *, std::unique_ptr<llaminar2::ITensorGemm>> kernel_cache_;
                 static std::mutex cache_mutex_;
+
+                // Sliced GEMM cache - keyed by (tensor, row_start, row_end)
+                struct SlicedCacheKey
+                {
+                    const llaminar2::TensorBase *tensor;
+                    size_t row_start;
+                    size_t row_end;
+
+                    bool operator==(const SlicedCacheKey &other) const
+                    {
+                        return tensor == other.tensor &&
+                               row_start == other.row_start &&
+                               row_end == other.row_end;
+                    }
+                };
+
+                struct SlicedKeyHash
+                {
+                    size_t operator()(const SlicedCacheKey &k) const
+                    {
+                        return std::hash<const void *>()(k.tensor) ^
+                               (std::hash<size_t>()(k.row_start) << 1) ^
+                               (std::hash<size_t>()(k.row_end) << 2);
+                    }
+                };
+
+                static std::unordered_map<SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, SlicedKeyHash> sliced_cache_;
             };
 
         } // namespace kernels

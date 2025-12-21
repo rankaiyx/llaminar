@@ -1356,6 +1356,14 @@ namespace llaminar2
          *
          * Inspects Q tensor native_type() and dispatches to compute() or compute_batch()
          * based on batch_size. Handles FP32, BF16, FP16, and Q8_1 tensors.
+         *
+         * @param head_start First query head to compute (0-indexed, for tensor parallelism)
+         * @param local_n_heads Number of query heads to compute (-1 = all heads)
+         * @param local_n_kv_heads Number of KV heads for this slice (-1 = all KV heads)
+         *
+         * For tensor parallelism across N ranks:
+         *   Rank i: head_start = i * (n_heads/N), local_n_heads = n_heads/N
+         * The caller is responsible for AllGather to combine output slices.
          */
         bool compute_tensor(
             const TensorBase *Q,
@@ -1373,8 +1381,47 @@ namespace llaminar2
             TensorBase *workspace_scores = nullptr,
             TensorBase *workspace_mask = nullptr,
             const MPIContext *mpi_ctx = nullptr,
-            int device_idx = -1) override
+            int device_idx = -1,
+            int head_start = 0,
+            int local_n_heads = -1,
+            int local_n_kv_heads = -1) override
         {
+            // Resolve defaults: -1 means use all heads
+            const int actual_local_n_heads = (local_n_heads < 0) ? n_heads : local_n_heads;
+            const int actual_local_n_kv_heads = (local_n_kv_heads < 0) ? n_kv_heads : local_n_kv_heads;
+
+            // Validate head ranges
+            if (head_start < 0 || head_start >= n_heads)
+            {
+                LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] Invalid head_start: "
+                          << head_start << " (n_heads=" << n_heads << ")");
+                return false;
+            }
+            if (head_start + actual_local_n_heads > n_heads)
+            {
+                LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] head_start + local_n_heads exceeds n_heads: "
+                          << head_start << " + " << actual_local_n_heads << " > " << n_heads);
+                return false;
+            }
+
+            // TODO: For now, we only support full head range (no TP slicing in attention)
+            // When head-sliced attention is implemented, the compute/compute_decode/compute_batch
+            // functions will need to accept head_start/local_n_heads parameters and adjust their
+            // head loops accordingly. This requires updating the inner loop bounds from:
+            //   for (int h = 0; h < n_heads; ++h)
+            // to:
+            //   for (int h = head_start; h < head_start + local_n_heads; ++h)
+            //
+            // For now, log a warning if TP slicing is requested but proceed with full computation
+            if (head_start != 0 || actual_local_n_heads != n_heads)
+            {
+                LOG_WARN("[CPUAttentionKernelTyped::compute_tensor] Head slicing requested (head_start="
+                         << head_start << ", local_n_heads=" << actual_local_n_heads
+                         << ") but not yet implemented. Computing all " << n_heads << " heads.");
+            }
+
+            // Suppress unused variable warnings for TP parameters until implemented
+            (void)actual_local_n_kv_heads;
             if (!Q || !K || !V || !output)
             {
                 LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] Null tensor provided");

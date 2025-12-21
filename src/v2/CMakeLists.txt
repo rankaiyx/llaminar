@@ -601,6 +601,7 @@ add_library(llaminar2_core STATIC
     utils/ArgParser.cpp
     utils/BatchPaddingUtils.cpp
     utils/NUMATopology.cpp
+    utils/MPITopology.cpp
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
     utils/Sampler.cpp

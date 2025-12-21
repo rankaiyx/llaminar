@@ -1789,6 +1789,7 @@ namespace llaminar
 
             std::unordered_map<const llaminar2::TensorBase *, std::unique_ptr<llaminar2::ITensorGemm>> KernelFactory::kernel_cache_;
             std::mutex KernelFactory::cache_mutex_;
+            std::unordered_map<KernelFactory::SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::SlicedKeyHash> KernelFactory::sliced_cache_;
 
             // ==========================================================================
             // Kernel Cache - Implementation
@@ -2152,10 +2153,86 @@ namespace llaminar
                 return raw_ptr;
             }
 
+            llaminar2::ITensorGemm *KernelFactory::getOrCreateGemmSliced(
+                const llaminar2::TensorBase *tensor,
+                size_t row_start,
+                size_t row_end)
+            {
+                if (!tensor)
+                {
+                    LOG_ERROR("[KernelFactory] getOrCreateGemmSliced: tensor is null");
+                    return nullptr;
+                }
+
+                // Validate row range
+                const auto &shape = tensor->shape();
+                if (shape.size() != 2)
+                {
+                    LOG_ERROR("[KernelFactory] Tensor must be 2D for GEMM, got " << shape.size() << "D");
+                    throw std::runtime_error("KernelFactory: tensor must be 2D");
+                }
+                size_t tensor_n = shape[0]; // rows = output features
+                if (row_start >= row_end || row_end > tensor_n)
+                {
+                    LOG_ERROR("[KernelFactory] Invalid row range [" << row_start << ", " << row_end
+                                                                    << ") for tensor with N=" << tensor_n);
+                    throw std::runtime_error("KernelFactory: invalid row range for sliced GEMM");
+                }
+
+                // Check sliced cache
+                SlicedCacheKey key{tensor, row_start, row_end};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto it = sliced_cache_.find(key);
+                if (it != sliced_cache_.end())
+                {
+                    LOG_DEBUG("[KernelFactory] Sliced GEMM cache HIT: tensor=" << tensor
+                                                                               << " rows=[" << row_start << "," << row_end << ")");
+                    return it->second.get();
+                }
+
+                // Cache miss - create sliced kernel
+                LOG_DEBUG("[KernelFactory] Sliced GEMM cache MISS: creating kernel for tensor=" << tensor
+                                                                                                << " rows=[" << row_start << "," << row_end << ")");
+
+                auto dev_type = getDeviceType(tensor->device_index());
+
+                if (dev_type != DeviceType::CPU)
+                {
+                    LOG_ERROR("[KernelFactory] Sliced GEMM currently only supported on CPU, got " << to_string(dev_type));
+                    throw std::runtime_error("KernelFactory: sliced GEMM only supported on CPU");
+                }
+
+                // Create sliced kernel using row-range constructor
+                auto kernel = std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(
+                    tensor, static_cast<int>(row_start), static_cast<int>(row_end));
+
+                auto *raw_ptr = kernel.get();
+                sliced_cache_[key] = std::move(kernel);
+
+                LOG_DEBUG("[KernelFactory] Created sliced GEMM kernel: N=" << (row_end - row_start)
+                                                                           << ", K=" << shape[1]);
+
+                return raw_ptr;
+            }
+
             void KernelFactory::clearCacheFor(const llaminar2::TensorBase *tensor)
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 kernel_cache_.erase(tensor);
+
+                // Also clear any sliced kernels for this tensor
+                for (auto it = sliced_cache_.begin(); it != sliced_cache_.end();)
+                {
+                    if (it->first.tensor == tensor)
+                    {
+                        it = sliced_cache_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
 
                 // Also clean up tensor's packed weights cache if present
                 if (tensor->cache_.has_value())
@@ -2203,6 +2280,7 @@ namespace llaminar
                 }
 
                 kernel_cache_.clear();
+                sliced_cache_.clear();
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
@@ -2210,8 +2288,8 @@ namespace llaminar
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 size_t total_bytes = 0;
                 // Note: Can't easily compute packed_bytes without RTTI to QuantisedGemmKernel
-                // For now, just return count
-                return {kernel_cache_.size(), total_bytes};
+                // For now, just return count (includes both caches)
+                return {kernel_cache_.size() + sliced_cache_.size(), total_bytes};
             }
 
             // ==========================================================================

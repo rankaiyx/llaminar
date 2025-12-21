@@ -27,6 +27,7 @@
 #include "../pipelines/PipelineConfig.h" // For ActivationPrecision
 #include "../tensors/BlockStructures.h"  // For Q8_1Block in StageDumpInfo
 #include "../tensors/TensorKernels.h"    // For AttentionMode enum
+#include "../utils/MPITopology.h"        // For WorkRange (tensor parallelism)
 
 namespace llaminar2
 {
@@ -370,6 +371,12 @@ namespace llaminar2
      * Takes FP32 activations and quantized/FP32 weights, handles quantization internally.
      * For multi-projection patterns (Q/K/V or gate/up), use FusedQKVGEMMStage or
      * FusedGateUpGEMMStage which efficiently share quantization across projections.
+     *
+     * **Tensor Parallelism Support (Phase 2)**:
+     * When `output_range` is set, executes a row-sliced GEMM for tensor parallelism:
+     * - Uses `KernelFactory::getOrCreateGemmSliced()` to create sliced kernel
+     * - Only computes output rows in [output_range.start, output_range.end)
+     * - Caller is responsible for MPI AllReduce after execution if needed
      */
     class GEMMStage : public IComputeStage
     {
@@ -393,6 +400,34 @@ namespace llaminar2
             // MPI context for tensor-parallel execution (optional)
             const MPIContext *mpi_ctx = nullptr;
             int device_idx = -1;
+
+            // =================================================================
+            // Tensor Parallelism Parameters (Phase 2)
+            // =================================================================
+
+            /**
+             * @brief Output row range for row-parallel GEMM
+             *
+             * When set (non-empty), uses sliced kernel to compute only rows
+             * [output_range.start, output_range.end) of the output matrix.
+             * The weight tensor B is sliced accordingly.
+             *
+             * For row-parallel GEMM (e.g., attention output projection):
+             * - Each rank computes a slice of the output
+             * - Results are combined via AllReduce
+             *
+             * When empty (default), computes full GEMM.
+             */
+            WorkRange output_range;
+
+            /**
+             * @brief Whether this GEMM requires AllReduce after execution
+             *
+             * Set to true for row-parallel GEMM where output is distributed.
+             * The AllReduce is NOT performed by this stage - caller must handle it.
+             * This flag is informational for graph analysis.
+             */
+            bool needs_allreduce = false;
         };
 
         explicit GEMMStage(Params params);
@@ -404,6 +439,10 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         StageDumpInfo getDumpInfo() const override;
         StageBufferRequirements getBufferRequirements() const override;
+        bool requiresAllreduce() const override { return params_.needs_allreduce; }
+
+        /// Get params for testing/introspection
+        const Params &getParams() const { return params_; }
 
     private:
         Params params_;
@@ -713,6 +752,41 @@ namespace llaminar2
 
             // Device placement (-1 = CPU, >=0 = GPU device index)
             int device_idx = -1;
+
+            // =================================================================
+            // Tensor Parallelism Parameters (Phase 2.4)
+            // =================================================================
+
+            /**
+             * @brief First query head for this rank (0-indexed)
+             *
+             * Default 0 means start from head 0 (no head-parallel slicing).
+             * With TP: each rank gets a contiguous range of heads.
+             *
+             * Example: 14 heads, 2 ranks
+             *   Rank 0: head_start=0, local_n_heads=7
+             *   Rank 1: head_start=7, local_n_heads=7
+             */
+            int head_start = 0;
+
+            /**
+             * @brief Number of query heads for this rank
+             *
+             * Default -1 means use full n_heads (no slicing).
+             * With TP: set to n_heads / world_size (approximately).
+             */
+            int local_n_heads = -1;
+
+            /**
+             * @brief Number of KV heads for this rank
+             *
+             * Default -1 means use full n_kv_heads (no slicing).
+             * For GQA: may equal local_n_heads / gqa_ratio.
+             *
+             * Note: If n_kv_heads < world_size, some ranks may have 0 KV heads
+             * and must skip attention entirely or participate in collective only.
+             */
+            int local_n_kv_heads = -1;
         };
 
         explicit AttentionWithKVCacheStage(Params params);
