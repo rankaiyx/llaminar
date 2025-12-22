@@ -21,7 +21,7 @@
 #include "MPIContext.h"
 #include "Tokenizer.h"
 #include "Sampler.h"
-#include "../pipelines/PipelineBase.h"
+#include "../inference/IInferenceRunner.h"
 #include "ArgParser.h"
 #include <memory>
 #include <string>
@@ -78,12 +78,12 @@ namespace llaminar2
     public:
         /**
          * @brief Construct benchmark runner
-         * @param pipeline Initialized pipeline for inference
+         * @param runner Initialized inference runner for inference
          * @param tokenizer Tokenizer for encode/decode
          * @param mpi_ctx MPI context for distributed execution
          */
         BenchmarkRunner(
-            std::shared_ptr<PipelineBase> pipeline,
+            std::shared_ptr<IInferenceRunner> runner,
             std::shared_ptr<ITokenizer> tokenizer,
             std::shared_ptr<MPIContext> mpi_ctx);
 
@@ -105,7 +105,7 @@ namespace llaminar2
         void printResults(const BenchmarkResult &result) const;
 
     private:
-        std::shared_ptr<PipelineBase> pipeline_;
+        std::shared_ptr<IInferenceRunner> runner_;
         std::shared_ptr<ITokenizer> tokenizer_;
         std::shared_ptr<MPIContext> mpi_ctx_;
 

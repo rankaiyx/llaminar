@@ -2,6 +2,9 @@
  * @file GQAAttention.cpp
  * @brief Grouped Query Attention (GQA) implementation
  * @author David Sanftenberg
+ *
+ * @deprecated This entire file is deprecated. Use AttentionComputeStage + KernelFactory instead.
+ *             All methods now throw std::runtime_error to catch accidental usage.
  */
 
 #include "GQAAttention.h"
@@ -19,6 +22,7 @@
 #include <cstring>
 #include <cmath>
 #include <sstream>
+#include <stdexcept>
 #include <omp.h>
 #include <atomic>
 
@@ -174,6 +178,18 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
+        // ================================================================
+        // DEPRECATED: This method should not be used for new code.
+        // Use AttentionComputeStage + KernelFactory::createAttention() instead.
+        // Throwing to catch accidental usage in tests and new code.
+        // ================================================================
+        throw std::runtime_error(
+            "[GQAAttention::compute] DEPRECATED - "
+            "This method is deprecated and should not be used. "
+            "Use AttentionComputeStage with use_decomposed_attention=true instead. "
+            "See DISTRIBUTED_ARCHITECTURE_PROPOSAL.md Phase 7 for migration guidance.");
+
+        // Original implementation below (kept for reference but unreachable)
         LOG_TRACE("[GQAAttention::compute] Called with precision=" << static_cast<int>(config.precision));
 
         if (!validate_inputs(Q, K, V, output, config))
@@ -428,6 +444,18 @@ namespace llaminar2
         int batch_size, int seq_len,
         const GQAAttentionConfig &config)
     {
+        // ================================================================
+        // DEPRECATED: This method should not be used for new code.
+        // Use AttentionComputeStage + KernelFactory::createAttention() instead.
+        // Throwing to catch accidental usage in tests and new code.
+        // ================================================================
+        throw std::runtime_error(
+            "[GQAAttention::compute_batch] DEPRECATED - "
+            "This method is deprecated and should not be used. "
+            "Use AttentionComputeStage with use_decomposed_attention=true instead. "
+            "See DISTRIBUTED_ARCHITECTURE_PROPOSAL.md Phase 7 for migration guidance.");
+
+        // Original implementation below (kept for reference but unreachable)
         if (!validate_inputs(Q, K, V, output, config))
         {
             return false;

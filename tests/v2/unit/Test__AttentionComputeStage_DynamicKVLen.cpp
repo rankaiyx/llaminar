@@ -177,6 +177,13 @@ namespace llaminar2
                 }
             }
 
+            // Sharding interface (mock returns non-sharded)
+            bool is_sharded() const override { return false; }
+            int n_kv_heads() const override { return kv_dim_ / 32; } // Approximate head dim
+            int local_n_kv_heads() const override { return kv_dim_ / 32; }
+            int kv_head_start() const override { return 0; }
+            int local_kv_dim() const override { return kv_dim_; }
+
         private:
             int num_layers_;
             int max_seq_len_;

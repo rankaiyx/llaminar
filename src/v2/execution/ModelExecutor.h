@@ -106,7 +106,8 @@ namespace llaminar2
             TensorBase *hidden_states,
             TensorBase *output_logits,
             int total_tokens,
-            int device_idx) override = 0;
+            int device_idx,
+            TensorBase *logits_local = nullptr) override = 0;
 
         // =========================================================================
         // Execution (IModelExecutor interface)
@@ -176,11 +177,13 @@ namespace llaminar2
         /**
          * @brief Execute LM head with timing
          * @param hidden Hidden states tensor
-         * @param logits Output logits tensor
+         * @param logits Output logits tensor (full vocab size)
          * @param total_tokens Number of tokens (batch_size * seq_len)
          * @param device_idx Target device
+         * @param logits_local Optional local logits for column-parallel LM head
          */
-        bool executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, int device_idx);
+        bool executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, int device_idx,
+                           TensorBase *logits_local = nullptr);
 
         /**
          * @brief Record timing for a phase

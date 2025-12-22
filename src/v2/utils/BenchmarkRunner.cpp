@@ -22,10 +22,10 @@ namespace llaminar2
     static constexpr int WARMUP_ITERATIONS = 1;
 
     BenchmarkRunner::BenchmarkRunner(
-        std::shared_ptr<PipelineBase> pipeline,
+        std::shared_ptr<IInferenceRunner> runner,
         std::shared_ptr<ITokenizer> tokenizer,
         std::shared_ptr<MPIContext> mpi_ctx)
-        : pipeline_(std::move(pipeline)), tokenizer_(std::move(tokenizer)), mpi_ctx_(std::move(mpi_ctx))
+        : runner_(std::move(runner)), tokenizer_(std::move(tokenizer)), mpi_ctx_(std::move(mpi_ctx))
     {
     }
 
@@ -93,7 +93,7 @@ namespace llaminar2
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        bool success = pipeline_->forward(tokens.data(), tokens.size());
+        bool success = runner_->forward(tokens.data(), tokens.size());
 
         // Synchronize after forward for accurate timing
         MPI_Barrier(MPI_COMM_WORLD);
@@ -122,7 +122,7 @@ namespace llaminar2
             // Rank 0: Get logits and sample (greedy for deterministic benchmark)
             if (mpi_ctx_->rank() == 0)
             {
-                const float *logits = pipeline_->logits();
+                const float *logits = runner_->logits();
                 size_t vocab_size = tokenizer_->vocab_size();
                 std::vector<float> logits_vec(logits, logits + vocab_size);
 
@@ -148,7 +148,7 @@ namespace llaminar2
             tokens_generated++;
 
             // Forward the token through pipeline
-            if (!pipeline_->forward(&next_token, 1))
+            if (!runner_->forward(&next_token, 1))
             {
                 // Synchronize on failure
                 MPI_Barrier(MPI_COMM_WORLD);
@@ -244,7 +244,7 @@ namespace llaminar2
         }
 
         // Reset pipeline state before warmup
-        pipeline_->clear_cache();
+        runner_->clear_cache();
 
         // Warmup prefill
         auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
@@ -297,7 +297,7 @@ namespace llaminar2
         for (int iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
         {
             // Reset pipeline state before each iteration
-            pipeline_->clear_cache();
+            runner_->clear_cache();
 
             if (mpi_ctx_->rank() == 0)
             {

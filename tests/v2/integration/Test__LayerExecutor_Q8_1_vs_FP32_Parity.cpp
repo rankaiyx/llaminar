@@ -208,7 +208,7 @@ protected:
         config.rope_theta = rope_theta_;
         config.default_device = device_idx_;
         config.activation_precision = precision;
-        config.use_decomposed_attention = true;
+        // NOTE: Decomposed attention is now always used (Phase 7 cleanup)
 
         return std::make_unique<Qwen2LayerExecutor>(config, mpi_ctx_);
     }

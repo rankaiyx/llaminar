@@ -102,6 +102,10 @@ namespace llaminar2
         std::shared_ptr<TensorBase> hidden; ///< [batch_size * seq_len, d_model]
         std::shared_ptr<TensorBase> logits; ///< [batch_size * seq_len, vocab_size]
 
+        /// Local logits for column-parallel LM head [batch_size * seq_len, vocab_local]
+        /// Only allocated when lm_head_column_parallel is enabled
+        std::shared_ptr<TensorBase> logits_local;
+
         // === KV Cache ===
         std::unique_ptr<IUnifiedKVCache> kv_cache; ///< Attention KV history
 

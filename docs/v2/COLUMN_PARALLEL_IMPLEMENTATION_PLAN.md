@@ -1,7 +1,8 @@
 # Column-Parallel Tensor Sharding Implementation Plan
 
 **Date**: December 3, 2025  
-**Status**: Planning  
+**Updated**: December 21, 2025  
+**Status**: Phase 4 Complete ✅  
 **Author**: David Sanftenberg
 
 ## Executive Summary
@@ -28,9 +29,26 @@ This document outlines the implementation plan for column-parallel weight shardi
    - `WeightManager::determineShardingMode()` decides per-weight sharding mode
    - `WeightManager::getShardedWeight()` loads sharded weights
 
-### What's Disabled (Needs Implementation)
+4. **Column-Parallel Q/K/V (Phase 3 - COMPLETE)** ✅ December 21, 2025
+   - Weights: `attn_q.weight`, `attn_k.weight`, `attn_v.weight` + biases
+   - Implementation: `ShardingMode::COLUMN_PARALLEL` in WeightManager
+   - Head distribution: `MPIContext::get_local_slice()` divides heads across ranks
+   - Buffer allocation: `Qwen2BufferSpecBuilder` with local head counts
+   - Graph config: `Qwen2GraphConfig` extended with `head_start`, `local_n_heads`, `local_n_kv_heads`, `qkv_column_parallel`
+   - Unit tests: 6 new tests in `Test__Qwen2BufferSpec.cpp` for local head scenarios
+   - Integration tests: 5 tests in `Test__MPI_ColumnParallelQKV.cpp` (all passing)
 
-Column-parallel sharding is disabled in `WeightManager::determineShardingMode()`:
+5. **Column-Parallel FFN Gate/Up (Phase 4 - COMPLETE)** ✅ December 21, 2025
+   - Weights: `ffn_gate.weight`, `ffn_up.weight` (column-parallel), `ffn_down.weight` (input-parallel)
+   - Implementation: `ShardingMode::COLUMN_PARALLEL` for Gate/Up, `ShardingMode::INPUT_PARALLEL` for Down
+   - Dimension calculation: `d_ff_local = d_ff / world_size` (4864/2 = 2432 for 2 ranks)
+   - Graph config: `Qwen2GraphConfig` extended with `d_ff_local`, `ffn_column_parallel`
+   - Buffer allocation: FFN buffers sized to `d_ff_local` when sharding enabled
+   - Integration tests: 7 tests in `Test__MPI_ColumnParallelFFN.cpp` (all passing)
+
+### What's Next (Phase 5: Full System Integration Testing)
+
+With both QKV and FFN column-parallel sharding complete, the next phase focuses on:
 
 ```cpp
 // Column-parallel weights: DISABLED for Phase 1

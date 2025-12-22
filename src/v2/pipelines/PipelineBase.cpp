@@ -771,17 +771,42 @@ namespace llaminar2
         // Phase 3: Use placement map to detect attention devices per layer
         std::vector<int> attention_devices = detectAttentionDevices(n_layers_);
 
-        // Create unified KV cache matching pipeline's activation precision
-        kv_cache_ = createUnifiedKVCache(config_.activation_precision, effective_mpi_ctx,
-                                         n_layers_, batch_size, max_seq_len, n_kv_heads_, head_dim_,
-                                         attention_devices);
-        current_positions_.clear(); // Will be resized to batch_size in forward_batch()
+        // Phase 6: Use sharded KV cache for tensor parallelism
+        // Each rank stores only its assigned KV heads, reducing memory proportionally
+        if (mpi_strategy_ == MPIStrategy::TensorParallel && mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            // Get KV head distribution for this rank
+            auto [kv_head_start, local_n_kv_heads] = getHeadDistribution(n_kv_heads_);
 
-        LOG_DEBUG("Initialized unified KV cache: " << n_layers_ << " layers, "
-                                                   << "batch_size=" << batch_size << ", "
-                                                   << max_seq_len << " max_seq_len, "
-                                                   << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim"
-                                                   << ", precision: " << static_cast<int>(config_.activation_precision));
+            LOG_DEBUG("Initializing sharded KV cache: " << n_layers_ << " layers, "
+                                                        << "batch_size=" << batch_size << ", "
+                                                        << max_seq_len << " max_seq_len, "
+                                                        << n_kv_heads_ << " total KV heads, "
+                                                        << local_n_kv_heads << " local KV heads (start=" << kv_head_start << "), "
+                                                        << head_dim_ << " head_dim, "
+                                                        << "precision: " << static_cast<int>(config_.activation_precision));
+
+            kv_cache_ = createShardedKVCache(
+                config_.activation_precision, effective_mpi_ctx,
+                n_layers_, batch_size, max_seq_len,
+                n_kv_heads_, static_cast<int>(local_n_kv_heads), static_cast<int>(kv_head_start),
+                head_dim_, attention_devices);
+        }
+        else
+        {
+            // Non-sharded (replicated) KV cache for single-rank or non-tensor-parallel
+            kv_cache_ = createUnifiedKVCache(config_.activation_precision, effective_mpi_ctx,
+                                             n_layers_, batch_size, max_seq_len, n_kv_heads_, head_dim_,
+                                             attention_devices);
+
+            LOG_DEBUG("Initialized unified KV cache: " << n_layers_ << " layers, "
+                                                       << "batch_size=" << batch_size << ", "
+                                                       << max_seq_len << " max_seq_len, "
+                                                       << n_kv_heads_ << " KV heads, " << head_dim_ << " head_dim"
+                                                       << ", precision: " << static_cast<int>(config_.activation_precision));
+        }
+
+        current_positions_.clear(); // Will be resized to batch_size in forward_batch()
     }
 
     // ===== Snapshot Capture Implementation =====

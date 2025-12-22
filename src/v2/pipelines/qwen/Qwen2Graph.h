@@ -80,6 +80,15 @@ namespace llaminar2
         bool ffn_column_parallel = false;
 
         // =================================================================
+        // LM Head TP Parameters (Phase 5: Column-Parallel LM Head)
+        // =================================================================
+        /// Local vocab size per rank (vocab_size / world_size)
+        int vocab_local = 0;
+
+        /// Enable column-parallel LM head projection (weights sharded by vocab)
+        bool lm_head_column_parallel = false;
+
+        // =================================================================
         // Attention TP Parameters (Phase 3: Column-Parallel QKV)
         // =================================================================
         /// First query head for this rank (0-indexed, default 0 = no sharding)
@@ -105,8 +114,9 @@ namespace llaminar2
         bool enable_profiling = false;
         bool enable_validation = false;
 
-        /// Use decomposed attention path (Phase 9): KVCacheAppendStage + AttentionComputeStage
-        bool use_decomposed_attention = false;
+        // NOTE: Decomposed attention (Phase 9: KVCacheAppendStage + AttentionComputeStage)
+        // is now the ONLY supported path. The legacy AttentionWithKVCacheStage path has been
+        // removed as part of Phase 7 cleanup. See DISTRIBUTED_ARCHITECTURE_PROPOSAL.md.
 
         /// Use graph-managed buffer allocation with aliasing optimization.
         /// When true, Qwen2Graph will use GraphBufferManager to allocate activation
@@ -227,6 +237,10 @@ namespace llaminar2
     {
         TensorBase *current_hidden = nullptr; ///< [batch_size * seq_len, d_model]
         TensorBase *logits = nullptr;         ///< [batch_size * seq_len, vocab_size]
+
+        /// Local logits for column-parallel LM head [batch_size * seq_len, vocab_local]
+        /// Only used when lm_head_column_parallel is enabled
+        TensorBase *logits_local = nullptr;
 
         /// Per-layer activation buffers
         Qwen2ActivationBuffers layer_buffers;
@@ -488,16 +502,21 @@ namespace llaminar2
         /**
          * @brief Build LM head projection graph
          * @param hidden_states Final hidden states from transformer layers
-         * @param output_logits Output tensor for logits
+         * @param output_logits Output tensor for full logits [seq_len, vocab_size]
          * @param total_tokens Number of tokens (batch_size * seq_len)
          * @param device_idx Target device
+         * @param logits_local Optional local logits buffer for column-parallel LM head
+         *                     [seq_len, vocab_local]. When lm_head_column_parallel is
+         *                     enabled and this is non-null, the LM head writes to
+         *                     logits_local, then AllGather collects to output_logits.
          * @return LM head compute graph
          */
         ComputeGraph buildLMHeadGraph(
             TensorBase *hidden_states,
             TensorBase *output_logits,
             int total_tokens,
-            int device_idx);
+            int device_idx,
+            TensorBase *logits_local = nullptr);
 
         // =====================================================================
         // Layer-Level Graph Building

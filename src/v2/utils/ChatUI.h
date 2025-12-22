@@ -13,7 +13,7 @@
 #include "ChatTemplate.h"
 #include "Tokenizer.h"
 #include "Sampler.h"
-#include "../pipelines/PipelineBase.h"
+#include "../inference/IInferenceRunner.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -78,11 +78,11 @@ namespace llaminar2
          * @brief Construct ChatUI
          *
          * @param tokenizer Tokenizer for encoding/decoding (must have chat template)
-         * @param pipeline Pipeline for inference
+         * @param runner Inference runner for executing forward passes
          * @param config UI and generation configuration
          */
         ChatUI(std::shared_ptr<ITokenizer> tokenizer,
-               std::shared_ptr<PipelineBase> pipeline,
+               std::shared_ptr<IInferenceRunner> runner,
                const ChatUIConfig &config = {});
 
         /**
@@ -143,7 +143,7 @@ namespace llaminar2
 
         // Dependencies
         std::shared_ptr<ITokenizer> tokenizer_;
-        std::shared_ptr<PipelineBase> pipeline_;
+        std::shared_ptr<IInferenceRunner> runner_;
         ChatUIConfig config_;
 
         // FTXUI
@@ -178,7 +178,7 @@ namespace llaminar2
      * Used for --chat-single mode (non-interactive).
      *
      * @param tokenizer Tokenizer with chat template
-     * @param pipeline Pipeline for inference
+     * @param runner Inference runner for executing forward passes
      * @param prompt User prompt
      * @param system_prompt Optional system prompt
      * @param config Generation configuration
@@ -186,7 +186,7 @@ namespace llaminar2
      */
     std::string runSingleShotChat(
         std::shared_ptr<ITokenizer> tokenizer,
-        std::shared_ptr<PipelineBase> pipeline,
+        std::shared_ptr<IInferenceRunner> runner,
         const std::string &prompt,
         const std::string &system_prompt = "",
         const ChatUIConfig &config = {});

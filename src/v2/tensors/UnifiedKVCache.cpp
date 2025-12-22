@@ -155,7 +155,9 @@ namespace llaminar2
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, int device_idx)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
-          n_kv_heads_(n_kv_heads), head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim)
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads),
+          kv_head_start_(0), head_dim_(head_dim),
+          kv_dim_(n_kv_heads * head_dim), is_sharded_(false)
     {
         tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
         layer_devices_.resize(n_layers_, device_idx);
@@ -178,7 +180,9 @@ namespace llaminar2
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, const std::vector<int> &attention_devices)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
-          n_kv_heads_(n_kv_heads), head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim)
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads),
+          kv_head_start_(0), head_dim_(head_dim),
+          kv_dim_(n_kv_heads * head_dim), is_sharded_(false)
     {
         tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
 
@@ -206,6 +210,82 @@ namespace llaminar2
                                               << ", max_seq_len=" << max_seq_len_ << ", kv_dim=" << kv_dim_
                                               << ", precision=" << static_cast<int>(Precision)
                                               << ", per-layer devices");
+    }
+
+    // =========================================================================
+    // Sharded Constructor Implementations (for Tensor Parallelism)
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    UnifiedKVCache<Precision>::UnifiedKVCache(
+        const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, int device_idx)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads),
+          kv_head_start_(kv_head_start), head_dim_(head_dim),
+          kv_dim_(local_n_kv_heads * head_dim), is_sharded_(true)
+    {
+        tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
+        layer_devices_.resize(n_layers_, device_idx);
+        entries_.resize(n_layers_);
+
+// Parallelize layer initialization - each layer is independent
+#pragma omp parallel for schedule(static) if (n_layers_ >= 4)
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            initialize_layer(layer, device_idx);
+        }
+
+        LOG_DEBUG("UnifiedKVCache (sharded): n_layers=" << n_layers_ << ", batch_size=" << batch_size_
+                                                        << ", max_seq_len=" << max_seq_len_
+                                                        << ", n_kv_heads=" << n_kv_heads_
+                                                        << ", local_n_kv_heads=" << local_n_kv_heads_
+                                                        << ", kv_head_start=" << kv_head_start_
+                                                        << ", kv_dim=" << kv_dim_
+                                                        << ", precision=" << static_cast<int>(Precision));
+    }
+
+    template <ActivationPrecision Precision>
+    UnifiedKVCache<Precision>::UnifiedKVCache(
+        const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, const std::vector<int> &attention_devices)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads),
+          kv_head_start_(kv_head_start), head_dim_(head_dim),
+          kv_dim_(local_n_kv_heads * head_dim), is_sharded_(true)
+    {
+        tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
+
+        // Use provided device list or default to CPU
+        if (attention_devices.size() >= static_cast<size_t>(n_layers_))
+        {
+            layer_devices_ = std::vector<int>(attention_devices.begin(), attention_devices.begin() + n_layers_);
+        }
+        else
+        {
+            layer_devices_.resize(n_layers_, -1);
+            LOG_WARN("UnifiedKVCache (sharded): attention_devices size mismatch, defaulting all layers to CPU");
+        }
+
+        entries_.resize(n_layers_);
+
+// Parallelize layer initialization - each layer is independent
+#pragma omp parallel for schedule(static) if (n_layers_ >= 4)
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            initialize_layer(layer, layer_devices_[layer]);
+        }
+
+        LOG_DEBUG("UnifiedKVCache (sharded): n_layers=" << n_layers_ << ", batch_size=" << batch_size_
+                                                        << ", max_seq_len=" << max_seq_len_
+                                                        << ", n_kv_heads=" << n_kv_heads_
+                                                        << ", local_n_kv_heads=" << local_n_kv_heads_
+                                                        << ", kv_head_start=" << kv_head_start_
+                                                        << ", kv_dim=" << kv_dim_
+                                                        << ", precision=" << static_cast<int>(Precision)
+                                                        << ", per-layer devices");
     }
 
     template <ActivationPrecision Precision>
@@ -755,6 +835,65 @@ namespace llaminar2
             return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices);
         default:
             LOG_ERROR("createUnifiedKVCache: unsupported precision " << static_cast<int>(precision));
+            return nullptr;
+        }
+    }
+
+    // =========================================================================
+    // Sharded Factory Functions (for Tensor Parallelism)
+    // =========================================================================
+
+    std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+        ActivationPrecision precision,
+        const MPIContext &mpi_ctx,
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, int device_idx)
+    {
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+        case ActivationPrecision::BF16:
+            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+        case ActivationPrecision::FP16:
+            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+        case ActivationPrecision::Q8_1:
+            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx);
+        default:
+            LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
+            return nullptr;
+        }
+    }
+
+    std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+        ActivationPrecision precision,
+        const MPIContext &mpi_ctx,
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim,
+        const std::vector<int> &attention_devices)
+    {
+        switch (precision)
+        {
+        case ActivationPrecision::FP32:
+            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+        case ActivationPrecision::BF16:
+            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+        case ActivationPrecision::FP16:
+            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+        case ActivationPrecision::Q8_1:
+            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices);
+        default:
+            LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
         }
     }

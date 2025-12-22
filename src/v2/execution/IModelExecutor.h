@@ -270,16 +270,20 @@ namespace llaminar2
          * @brief Build compute graph for LM head
          *
          * @param hidden_states Final hidden states
-         * @param output_logits Output tensor for logits
+         * @param output_logits Output tensor for full logits [seq_len, vocab_size]
          * @param total_tokens Number of tokens (batch_size * seq_len)
          * @param device_idx Target device
+         * @param logits_local Optional local logits buffer for column-parallel LM head.
+         *                     When provided and column-parallel is enabled, LM head
+         *                     writes to logits_local then AllGather to output_logits.
          * @return LM head compute graph
          */
         virtual ComputeGraph buildLMHeadGraph(
             TensorBase *hidden_states,
             TensorBase *output_logits,
             int total_tokens,
-            int device_idx) = 0;
+            int device_idx,
+            TensorBase *logits_local = nullptr) = 0;
 
         // =========================================================================
         // Execution

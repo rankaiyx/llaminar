@@ -181,15 +181,13 @@ namespace
         exec_config.use_graph_buffer_management = true;
 
         // When this is true, the pipeline should:
-        // 1. Set use_decomposed_attention = true
-        // 2. Use KVCacheAppendStage instead of AttentionWithKVCacheStage
-        // 3. Use AttentionComputeStage for the actual attention computation
-
-        // The actual enforcement is in Qwen2Pipeline::attention_block()
-        // This test verifies the flags are correctly structured
+        // 1. Use KVCacheAppendStage for cache operations
+        // 2. Use AttentionComputeStage for attention computation
+        //
+        // NOTE: As of Phase 7 cleanup, decomposed attention is the ONLY path.
+        // The legacy AttentionWithKVCacheStage has been removed.
 
         EXPECT_TRUE(exec_config.use_graph_buffer_management);
-        // The pipeline code has: if (use_graph_buffer_management) use_decomposed_attention = true;
     }
 
     // =============================================================================

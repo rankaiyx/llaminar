@@ -29,9 +29,9 @@ namespace llaminar2
     // ========================================================================
 
     ChatUI::ChatUI(std::shared_ptr<ITokenizer> tokenizer,
-                   std::shared_ptr<PipelineBase> pipeline,
+                   std::shared_ptr<IInferenceRunner> runner,
                    const ChatUIConfig &config)
-        : tokenizer_(std::move(tokenizer)), pipeline_(std::move(pipeline)), config_(config), screen_(ScreenInteractive::Fullscreen())
+        : tokenizer_(std::move(tokenizer)), runner_(std::move(runner)), config_(config), screen_(ScreenInteractive::Fullscreen())
     {
         // Add system prompt to conversation if provided
         if (!config_.system_prompt.empty())
@@ -412,7 +412,7 @@ namespace llaminar2
             }
 
             // Run prefill forward pass
-            if (!pipeline_->forward(token_ids.data(), static_cast<int>(token_ids.size())))
+            if (!runner_->forward(token_ids.data(), static_cast<int>(token_ids.size())))
             {
                 LOG_ERROR("ChatUI: Prefill failed");
                 is_generating_ = false;
@@ -435,7 +435,7 @@ namespace llaminar2
             for (int i = 0; i < max_decode && !stop_requested_; ++i)
             {
                 // Get logits from last forward pass
-                const float *logits_ptr = pipeline_->logits();
+                const float *logits_ptr = runner_->logits();
                 if (!logits_ptr)
                 {
                     LOG_ERROR("ChatUI: Failed to get logits");
@@ -469,7 +469,7 @@ namespace llaminar2
                 onTokenGenerated(token_text);
 
                 // Forward next token for decode step
-                if (!pipeline_->forward(&next_token, 1))
+                if (!runner_->forward(&next_token, 1))
                 {
                     LOG_ERROR("ChatUI: Decode forward failed at token " << i);
                     break;
@@ -555,7 +555,7 @@ namespace llaminar2
 
     std::string runSingleShotChat(
         std::shared_ptr<ITokenizer> tokenizer,
-        std::shared_ptr<PipelineBase> pipeline,
+        std::shared_ptr<IInferenceRunner> runner,
         const std::string &prompt,
         const std::string &system_prompt,
         const ChatUIConfig &config)
@@ -585,7 +585,7 @@ namespace llaminar2
         LOG_DEBUG("runSingleShotChat: Encoded " << token_ids.size() << " tokens");
 
         // Run prefill
-        if (!pipeline->forward(token_ids.data(), static_cast<int>(token_ids.size())))
+        if (!runner->forward(token_ids.data(), static_cast<int>(token_ids.size())))
         {
             LOG_ERROR("runSingleShotChat: Prefill failed");
             return "";
@@ -608,7 +608,7 @@ namespace llaminar2
         int max_decode = (config.max_tokens == -1) ? INT_MAX : config.max_tokens;
         for (int i = 0; i < max_decode; ++i)
         {
-            const float *logits_ptr = pipeline->logits();
+            const float *logits_ptr = runner->logits();
             if (!logits_ptr)
             {
                 break;
@@ -639,7 +639,7 @@ namespace llaminar2
             std::cout << token_text << std::flush;
 
             // Forward next token
-            if (!pipeline->forward(&next_token, 1))
+            if (!runner->forward(&next_token, 1))
             {
                 break;
             }

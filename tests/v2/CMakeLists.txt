@@ -1397,6 +1397,19 @@ add_v2_test(V2_Unit_UnifiedKVCache
     MPI_PROCS 1
 )
 
+# Test: ShardedKVCache (tensor parallelism support - local KV heads)
+add_executable(v2_test_sharded_kv_cache unit/Test__ShardedKVCache.cpp)
+target_link_libraries(v2_test_sharded_kv_cache 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ShardedKVCache 
+    COMMAND $<TARGET_FILE:v2_test_sharded_kv_cache>
+    LABELS "V2;Unit;KVCache;Sharding;TensorParallelism;FP32;BF16;FP16;Q8_1;DistributedArchitecture"
+    MPI_PROCS 1
+)
+
 # Test: Q4_0 SIMD Unpacking (AVX-512, AVX2, SSE, Scalar)
 add_executable(v2_test_q4_0_simd_unpack unit/tensors/Test__Q4_0_SIMD_Unpack.cpp)
 target_link_libraries(v2_test_q4_0_simd_unpack 
@@ -2336,6 +2349,16 @@ add_v2_test(V2_Unit_ComputeStages
     MPI_PROCS 1
 )
 
+# Test: AllGatherStage (MPI collective for column-parallel LM head)
+# Phase 5: Tests AllGatherStage for collecting distributed logits
+add_executable(v2_test_allgather_stage unit/Test__AllGatherStage.cpp)
+target_link_libraries(v2_test_allgather_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_AllGatherStage
+    COMMAND $<TARGET_FILE:v2_test_allgather_stage>
+    LABELS "V2;Unit;ComputeStage;AllGather;MPI;TensorParallel;LMHead"
+    MPI_PROCS 1
+)
+
 # Test: PipelineExecutor (LayerExecutor-to-pipeline adapter)
 # Tests configuration, device context management, and individual operation execution
 # Bridges new execution framework with existing pipeline infrastructure
@@ -2766,6 +2789,83 @@ add_v2_test(V2_Integration_MPI_ColumnParallelQKV
     COMMAND $<TARGET_FILE:v2_integration_mpi_column_parallel_qkv>
     MPI_PROCS 2
     LABELS "V2;Integration;MPI;ColumnParallel;QKV;TensorParallel;Attention;Phase3"
+)
+
+# Test: Column-Parallel FFN (Phase 4: Gate/Up Column-Parallel, Down Input-Parallel)
+# Tests column-parallel weight sharding for FFN projections:
+# - ShardingMode detection for Gate/Up (COLUMN_PARALLEL) and Down (INPUT_PARALLEL)
+# - Local FFN dimension calculation (d_ff_local = d_ff / world_size)
+# - Column-sliced Gate/Up weight shapes and GEMM correctness
+# - Input-sliced Down weight shape
+# - Buffer dimension validation for local FFN
+add_executable(v2_integration_mpi_column_parallel_ffn integration/Test__MPI_ColumnParallelFFN.cpp)
+target_link_libraries(v2_integration_mpi_column_parallel_ffn
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPI_ColumnParallelFFN
+    COMMAND $<TARGET_FILE:v2_integration_mpi_column_parallel_ffn>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;ColumnParallel;FFN;TensorParallel;Phase4"
+)
+
+# Test: Column-Parallel LM Head (Phase 5: Output Weight Column-Parallel + AllGather)
+# Tests column-parallel weight sharding for LM head projection:
+# - ShardingMode detection for output.weight (COLUMN_PARALLEL)
+# - Local vocab dimension calculation (vocab_local = vocab_size / world_size)
+# - Column-sliced LM head weight shape
+# - AllGather stage collects distributed logits
+# - Full forward data flow with distributed LM head
+add_executable(v2_integration_mpi_column_parallel_lmhead integration/Test__MPI_ColumnParallelLMHead.cpp)
+target_link_libraries(v2_integration_mpi_column_parallel_lmhead
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPI_ColumnParallelLMHead
+    COMMAND $<TARGET_FILE:v2_integration_mpi_column_parallel_lmhead>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;ColumnParallel;LMHead;AllGather;TensorParallel;Phase5"
+)
+
+# Test: Sharded KV Cache (Phase 6 - Tensor Parallelism Memory Optimization)
+# Tests sharded KV cache where each MPI rank stores only its local KV heads.
+# Validates:
+# - Each rank creates independent local cache (no MPI communication needed)
+# - Tensor shapes are reduced proportionally (local_n_kv_heads * head_dim)
+# - Append/clear operations work independently per rank
+# - Memory usage is reduced by world_size factor
+# - All precisions (FP32, BF16, FP16, Q8_1) work correctly
+add_executable(v2_integration_mpi_sharded_kv_cache integration/Test__MPI_ShardedKVCache.cpp)
+target_link_libraries(v2_integration_mpi_sharded_kv_cache
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPI_ShardedKVCache
+    COMMAND $<TARGET_FILE:v2_integration_mpi_sharded_kv_cache>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;KVCache;Sharding;TensorParallelism;Phase6;DistributedArchitecture"
+)
+
+# ============================================================================
+# Test: E2E Tensor-Parallel Inference (Capstone Integration Test)
+# ============================================================================
+# Full end-to-end test of the distributed inference pipeline exercising:
+#   - MPITopology: Device capability exchange, work distribution
+#   - WeightManager: Column/row-parallel weight sharding
+#   - Qwen2Graph: Graph building with TP configuration
+#   - GraphOrchestrator: Full forward execution with all stages
+#   - Sharded KV Cache: Per-rank cache with local heads
+#   - AllReduceStage: After Wo projection, FFN down projection
+#   - AllGatherStage: After LM head for logits aggregation
+add_executable(v2_integration_mpi_e2e_tp_inference integration/Test__MPI_E2E_TensorParallelInference.cpp)
+target_link_libraries(v2_integration_mpi_e2e_tp_inference
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Integration_MPI_E2E_TensorParallelInference
+    COMMAND $<TARGET_FILE:v2_integration_mpi_e2e_tp_inference>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;E2E;TensorParallelism;DistributedArchitecture;Inference;GraphOrchestrator"
 )
 
 # Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)

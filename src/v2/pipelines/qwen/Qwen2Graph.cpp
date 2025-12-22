@@ -395,15 +395,29 @@ namespace llaminar2
         prev_node = "final_norm";
 
         // -------------------------------------------------------------------------
-        // Stage 4: LM Head
+        // Stage 4: LM Head (with optional Column-Parallel + AllGather)
         // -------------------------------------------------------------------------
+        // When lm_head_column_parallel is enabled:
+        // - LM head weight is sharded by vocab: [vocab_local, d_model]
+        // - LM head outputs to buffers_.logits_local: [seq_len, vocab_local]
+        // - AllGather collects to buffers_.logits: [seq_len, vocab_size]
+        // -------------------------------------------------------------------------
+        bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+
+        // Determine output buffer and vocab size for LM head stage
+        TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
+        int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
+
+        LOG_DEBUG("[Qwen2Graph] LM head in buildFullForwardGraph: use_column_parallel="
+                  << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
+
         LMHeadStage::Params lm_params;
         lm_params.hidden_states = buffers_.current_hidden;
         lm_params.lm_head_weight = weights_.lm_head;
-        lm_params.logits = buffers_.logits;
+        lm_params.logits = lm_head_output;
         lm_params.seq_len = total_tokens;
         lm_params.d_model = config_.d_model;
-        lm_params.vocab_size = config_.vocab_size;
+        lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias = nullptr; // Qwen2 has no LM head bias
         lm_params.device_idx = device_idx;
 
@@ -411,6 +425,26 @@ namespace llaminar2
                       ComputeStageFactory::createLMHead(lm_params),
                       device_idx);
         graph.addDependency("lm_head", prev_node);
+        prev_node = "lm_head";
+
+        // Phase 5: AllGather stage for column-parallel LM head
+        if (use_column_parallel && mpi_ctx_)
+        {
+            LOG_DEBUG("[Qwen2Graph] Adding lm_head_allgather in buildFullForwardGraph: world_size="
+                      << mpi_ctx_->world_size() << " total_tokens=" << total_tokens);
+
+            AllGatherStage::Params allgather_params;
+            allgather_params.local_input = buffers_.logits_local;
+            allgather_params.full_output = buffers_.logits;
+            allgather_params.mpi_comm = mpi_ctx_->comm();
+            allgather_params.world_size = mpi_ctx_->world_size();
+            allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+
+            graph.addNode("lm_head_allgather",
+                          ComputeStageFactory::createAllGather(allgather_params),
+                          device_idx);
+            graph.addDependency("lm_head_allgather", prev_node);
+        }
 
         // Set output
         output.logits = buffers_.logits;
@@ -496,9 +530,12 @@ namespace llaminar2
         TensorBase *hidden_states,
         TensorBase *output_logits,
         int total_tokens,
-        int device_idx)
+        int device_idx,
+        TensorBase *logits_local)
     {
-        LOG_DEBUG("[Qwen2Graph] Building LM head graph for " << total_tokens << " tokens");
+        LOG_DEBUG("[Qwen2Graph] Building LM head graph for " << total_tokens << " tokens"
+                                                             << " lm_head_column_parallel=" << config_.lm_head_column_parallel
+                                                             << " vocab_local=" << config_.vocab_local);
 
         ComputeGraph graph;
 
@@ -515,14 +552,33 @@ namespace llaminar2
                       ComputeStageFactory::createRMSNorm(norm_params),
                       device_idx);
 
+        // =================================================================
+        // LM Head Projection - Column-Parallel or Full
+        // =================================================================
+        // When lm_head_column_parallel is enabled:
+        // - LM head weight is sharded by vocab: [vocab_local, d_model]
+        // - LM head outputs to logits_local: [seq_len, vocab_local]
+        // - AllGather collects to output_logits: [seq_len, vocab_size]
+        // =================================================================
+
+        bool use_column_parallel = config_.lm_head_column_parallel && logits_local != nullptr;
+
+        // Determine output buffer and vocab size for LM head stage
+        TensorBase *lm_head_output = use_column_parallel ? logits_local : output_logits;
+        int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
+
+        LOG_DEBUG("[Qwen2Graph] LM head: use_column_parallel=" << use_column_parallel
+                                                               << " lm_head_vocab_size=" << lm_head_vocab_size
+                                                               << " lm_head_output=" << lm_head_output);
+
         // LM Head projection
         LMHeadStage::Params lm_params;
         lm_params.hidden_states = hidden_states;
         lm_params.lm_head_weight = weights_.lm_head;
-        lm_params.logits = output_logits;
+        lm_params.logits = lm_head_output;
         lm_params.seq_len = total_tokens;
         lm_params.d_model = config_.d_model;
-        lm_params.vocab_size = config_.vocab_size;
+        lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias = nullptr;
         lm_params.device_idx = device_idx;
 
@@ -530,6 +586,27 @@ namespace llaminar2
                       ComputeStageFactory::createLMHead(lm_params),
                       device_idx);
         graph.addDependency("lm_head", "final_norm");
+
+        // =================================================================
+        // AllGather stage for column-parallel LM head
+        // =================================================================
+        if (use_column_parallel && mpi_ctx_)
+        {
+            LOG_DEBUG("[Qwen2Graph] Adding lm_head_allgather: world_size=" << mpi_ctx_->world_size()
+                                                                           << " total_tokens=" << total_tokens);
+
+            AllGatherStage::Params allgather_params;
+            allgather_params.local_input = logits_local;
+            allgather_params.full_output = output_logits;
+            allgather_params.mpi_comm = mpi_ctx_->comm();
+            allgather_params.world_size = mpi_ctx_->world_size();
+            allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+
+            graph.addNode("lm_head_allgather",
+                          ComputeStageFactory::createAllGather(allgather_params),
+                          device_idx);
+            graph.addDependency("lm_head_allgather", "lm_head");
+        }
 
         return graph;
     }
@@ -598,29 +675,17 @@ namespace llaminar2
             int k_n = static_cast<int>(layer.wk->shape()[0]);
             int v_n = static_cast<int>(layer.wv->shape()[0]);
 
-            // Extract bias pointers
-            const float *q_bias_ptr = nullptr;
-            const float *k_bias_ptr = nullptr;
-            const float *v_bias_ptr = nullptr;
+            LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " QKV dims: q_n=" << q_n
+                                            << " k_n=" << k_n << " v_n=" << v_n
+                                            << " wq_shape=[" << layer.wq->shape()[0] << "," << layer.wq->shape()[1] << "]"
+                                            << " wk_shape=[" << layer.wk->shape()[0] << "," << layer.wk->shape()[1] << "]");
 
-            if (layer.q_bias)
-            {
-                auto *q_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.q_bias);
-                if (q_bias_fp32)
-                    q_bias_ptr = q_bias_fp32->data();
-            }
-            if (layer.k_bias)
-            {
-                auto *k_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.k_bias);
-                if (k_bias_fp32)
-                    k_bias_ptr = k_bias_fp32->data();
-            }
-            if (layer.v_bias)
-            {
-                auto *v_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.v_bias);
-                if (v_bias_fp32)
-                    v_bias_ptr = v_bias_fp32->data();
-            }
+            // Extract bias pointers
+            // Note: Use TensorBase::data() directly - works for both raw tensors and TensorSlice
+            // (TensorSlice delegates data() to its inner tensor)
+            const float *q_bias_ptr = layer.q_bias ? layer.q_bias->data() : nullptr;
+            const float *k_bias_ptr = layer.k_bias ? layer.k_bias->data() : nullptr;
+            const float *v_bias_ptr = layer.v_bias ? layer.v_bias->data() : nullptr;
 
             FusedQKVGEMMStage::Params qkv_params;
             qkv_params.input = buffers.normalized;
@@ -695,208 +760,160 @@ namespace llaminar2
         }
 
         // Stage 4: Attention computation with KV cache integration
+        // NOTE: Decomposed attention (Phase 9) is now the ONLY supported path.
+        // Legacy AttentionWithKVCacheStage has been removed (Phase 7 cleanup).
         if (env.execution.exec_attention)
         {
-            if (config_.use_decomposed_attention)
+            // Phase 9 Decomposed Path: KVCacheAppendStage + AttentionComputeStage
+            if (kv_cache)
             {
-                // Phase 9 Decomposed Path: KVCacheAppendStage + AttentionComputeStage
-                if (kv_cache)
-                {
-                    // For batched execution, K/V are [batch_size * seq_len, kv_dim]
-                    // Each sequence's K/V is appended to its own seq_idx in the cache
-                    int total_tokens = batch_size * seq_len;
+                // For batched execution, K/V are [batch_size * seq_len, kv_dim]
+                // Each sequence's K/V is appended to its own seq_idx in the cache
+                int total_tokens = batch_size * seq_len;
 
-                    KVCacheAppendStage::Params kv_append_params;
-                    kv_append_params.K = buffers.K;
-                    kv_append_params.V = buffers.V;
-                    kv_append_params.kv_cache = kv_cache;
-                    kv_append_params.layer_idx = layer_idx;
-                    kv_append_params.seq_idx = 0; // Starting seq_idx
-                    kv_append_params.num_tokens = total_tokens;
-                    kv_append_params.batch_size = batch_size; // Phase 3: Per-sequence append
-                    kv_append_params.seq_len = seq_len;       // Phase 3: Tokens per sequence
+                KVCacheAppendStage::Params kv_append_params;
+                kv_append_params.K = buffers.K;
+                kv_append_params.V = buffers.V;
+                kv_append_params.kv_cache = kv_cache;
+                kv_append_params.layer_idx = layer_idx;
+                kv_append_params.seq_idx = 0; // Starting seq_idx
+                kv_append_params.num_tokens = total_tokens;
+                kv_append_params.batch_size = batch_size; // Phase 3: Per-sequence append
+                kv_append_params.seq_len = seq_len;       // Phase 3: Tokens per sequence
 
-                    graph.addNode(prefix + "kv_append",
-                                  ComputeStageFactory::createKVCacheAppend(kv_append_params),
-                                  device_idx);
-
-                    if (env.execution.exec_rope)
-                    {
-                        graph.addDependency(prefix + "kv_append", prefix + "rope");
-                    }
-                    else if (env.execution.exec_gemm)
-                    {
-                        graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
-                    }
-                }
-
-                TensorBase *K_for_attn = buffers.K;
-                TensorBase *V_for_attn = buffers.V;
-                int total_query_tokens = batch_size * seq_len;
-                int kv_len = total_query_tokens; // Static hint for mode detection (actual queried at runtime)
-                bool use_gather_stage = false;
-
-                // For attention K/V source:
-                // - Prefill (cached_tokens == 0): Use projected K/V directly [batch_size * seq_len, kv_dim]
-                // - Decode (cached_tokens > 0 and batch_size == 1): Use cache (single-sequence only)
-                // - Batched decode (cached_tokens > 0 and batch_size > 1): Gather K/V from multiple cache slots
-                if (kv_cache)
-                {
-                    int cached_tokens = kv_cache->get_cached_tokens(layer_idx, 0);
-                    if (cached_tokens > 0 && batch_size == 1)
-                    {
-                        // Single-sequence decode: read K/V from cache
-                        K_for_attn = kv_cache->get_k_base(layer_idx, 0);
-                        V_for_attn = kv_cache->get_v_base(layer_idx, 0);
-                        kv_len = cached_tokens;
-                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using cached K/V (decode mode)");
-                    }
-                    else if (cached_tokens > 0 && batch_size > 1)
-                    {
-                        // Batched decode: gather K/V from multiple cache slots
-                        if (buffers.gathered_K && buffers.gathered_V)
-                        {
-                            use_gather_stage = true;
-                            K_for_attn = buffers.gathered_K;
-                            V_for_attn = buffers.gathered_V;
-                            // kv_len will be updated by gather stage; use cache max for now
-                            kv_len = cached_tokens; // Approximate - actual max determined at gather
-                            LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using gathered K/V (batched decode mode)");
-                        }
-                        else
-                        {
-                            // Fallback: use projected K/V if gather buffers not provided
-                            LOG_WARN("[Qwen2Graph] Layer " << layer_idx
-                                                           << " batched decode but no gather buffers - using projected K/V");
-                        }
-                    }
-                    else
-                    {
-                        // Prefill or batched prefill: use projected K/V directly
-                        // KV cache will be populated but attention uses fresh projections
-                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using projected K/V (prefill/batch mode)");
-                    }
-                }
-
-                // Add KVCacheGatherStage if batched decode
-                if (use_gather_stage)
-                {
-                    KVCacheGatherStage::Params gather_params;
-                    gather_params.kv_cache = kv_cache;
-                    gather_params.layer_idx = layer_idx;
-                    gather_params.batch_size = batch_size;
-                    gather_params.out_K = buffers.gathered_K;
-                    gather_params.out_V = buffers.gathered_V;
-                    // Note: out_max_kv_len and out_per_seq_kv_lens can be retrieved from stage after execute
-
-                    graph.addNode(prefix + "kv_gather",
-                                  ComputeStageFactory::createKVCacheGather(gather_params),
-                                  device_idx);
-
-                    // Gather depends on append (must append new tokens before gathering full history)
-                    graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
-                }
-
-                AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
-                LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                << " attention mode: " << attention_mode_name(mode)
-                                                << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
-
-                AttentionComputeStage::Params attn_params;
-                attn_params.Q = buffers.Q;
-                attn_params.K = K_for_attn;
-                attn_params.V = V_for_attn;
-                attn_params.output = buffers.attn_output;
-                attn_params.batch_size = batch_size;
-                attn_params.seq_len = seq_len;
-                attn_params.kv_len = kv_len;               // Static hint, actual queried from kv_cache at runtime
-                attn_params.n_heads = local_n_heads;       // Use local head count for TP
-                attn_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
-                attn_params.head_dim = config_.head_dim;
-                attn_params.causal = true;
-                attn_params.window_size = -1;
-                attn_params.attention_mode = mode;
-                attn_params.auto_detect_mode = true; // Re-detect at runtime with actual kv_len
-                attn_params.workspace_scores = buffers.workspace_scores;
-                attn_params.workspace_context = buffers.workspace_context;
-                attn_params.workspace_mask = buffers.workspace_mask;
-                attn_params.kv_cache = kv_cache; // Pass for dynamic kv_len query at execution
-                attn_params.layer_idx = layer_idx;
-                attn_params.position_offset = position_ids ? position_ids[0] : 0;
-                attn_params.mpi_ctx = mpi_ctx_.get();
-                attn_params.device_idx = device_idx;
-
-                graph.addNode(prefix + "attention",
-                              ComputeStageFactory::createAttentionCompute(attn_params),
-                              device_idx);
-
-                if (use_gather_stage)
-                {
-                    // Batched decode: attention depends on gather
-                    graph.addDependency(prefix + "attention", prefix + "kv_gather");
-                }
-                else if (kv_cache)
-                {
-                    graph.addDependency(prefix + "attention", prefix + "kv_append");
-                }
-                else if (env.execution.exec_rope)
-                {
-                    graph.addDependency(prefix + "attention", prefix + "rope");
-                }
-                else if (env.execution.exec_gemm)
-                {
-                    graph.addDependency(prefix + "attention", prefix + "qkv_proj");
-                }
-
-                LOG_DEBUG("[Qwen2Graph] Using decomposed attention path (Phase 9)");
-            }
-            else
-            {
-                // Legacy Path: AttentionWithKVCacheStage
-                AttentionWithKVCacheStage::Params attn_params;
-                attn_params.Q = buffers.Q;
-                attn_params.K = buffers.K;
-                attn_params.V = buffers.V;
-                attn_params.output = buffers.attn_output;
-                attn_params.kv_cache = kv_cache;
-                attn_params.layer_idx = layer_idx;
-                attn_params.mode = AttentionWithKVCacheStage::Mode::AUTO;
-                attn_params.batch_size = batch_size;
-                attn_params.seq_len = seq_len;
-                attn_params.n_heads = local_n_heads;       // Use local head count for TP
-                attn_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
-                attn_params.head_dim = config_.head_dim;
-                attn_params.causal = true;
-                attn_params.window_size = -1;
-                attn_params.mpi_ctx = mpi_ctx_;
-                MPIStrategy mpi_strategy = MPIStrategy::None;
-                if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
-                {
-                    mpi_strategy = MPIStrategy::TensorParallel;
-                }
-                attn_params.mpi_strategy = static_cast<int>(mpi_strategy);
-                attn_params.workspace_scores = buffers.workspace_scores;
-                attn_params.workspace_context = buffers.workspace_context;
-                attn_params.workspace_mask = buffers.workspace_mask;
-                // Pass sequence_lengths for proper batch-aware attention masking
-                attn_params.sequence_lengths = sequence_lengths;
-                attn_params.position_offset = position_ids ? position_ids[0] : 0;
-
-                graph.addNode(prefix + "attention",
-                              ComputeStageFactory::createAttentionWithKVCache(attn_params),
+                graph.addNode(prefix + "kv_append",
+                              ComputeStageFactory::createKVCacheAppend(kv_append_params),
                               device_idx);
 
                 if (env.execution.exec_rope)
                 {
-                    graph.addDependency(prefix + "attention", prefix + "rope");
+                    graph.addDependency(prefix + "kv_append", prefix + "rope");
                 }
                 else if (env.execution.exec_gemm)
                 {
-                    graph.addDependency(prefix + "attention", prefix + "q_proj");
-                    graph.addDependency(prefix + "attention", prefix + "k_proj");
-                    graph.addDependency(prefix + "attention", prefix + "v_proj");
+                    graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
                 }
             }
+
+            TensorBase *K_for_attn = buffers.K;
+            TensorBase *V_for_attn = buffers.V;
+            int total_query_tokens = batch_size * seq_len;
+            int kv_len = total_query_tokens; // Static hint for mode detection (actual queried at runtime)
+            bool use_gather_stage = false;
+
+            // For attention K/V source:
+            // - Prefill (cached_tokens == 0): Use projected K/V directly [batch_size * seq_len, kv_dim]
+            // - Decode (cached_tokens > 0 and batch_size == 1): Use cache (single-sequence only)
+            // - Batched decode (cached_tokens > 0 and batch_size > 1): Gather K/V from multiple cache slots
+            if (kv_cache)
+            {
+                int cached_tokens = kv_cache->get_cached_tokens(layer_idx, 0);
+                if (cached_tokens > 0 && batch_size == 1)
+                {
+                    // Single-sequence decode: read K/V from cache
+                    K_for_attn = kv_cache->get_k_base(layer_idx, 0);
+                    V_for_attn = kv_cache->get_v_base(layer_idx, 0);
+                    kv_len = cached_tokens;
+                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using cached K/V (decode mode)");
+                }
+                else if (cached_tokens > 0 && batch_size > 1)
+                {
+                    // Batched decode: gather K/V from multiple cache slots
+                    if (buffers.gathered_K && buffers.gathered_V)
+                    {
+                        use_gather_stage = true;
+                        K_for_attn = buffers.gathered_K;
+                        V_for_attn = buffers.gathered_V;
+                        // kv_len will be updated by gather stage; use cache max for now
+                        kv_len = cached_tokens; // Approximate - actual max determined at gather
+                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using gathered K/V (batched decode mode)");
+                    }
+                    else
+                    {
+                        // Fallback: use projected K/V if gather buffers not provided
+                        LOG_WARN("[Qwen2Graph] Layer " << layer_idx
+                                                       << " batched decode but no gather buffers - using projected K/V");
+                    }
+                }
+                else
+                {
+                    // Prefill or batched prefill: use projected K/V directly
+                    // KV cache will be populated but attention uses fresh projections
+                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using projected K/V (prefill/batch mode)");
+                }
+            }
+
+            // Add KVCacheGatherStage if batched decode
+            if (use_gather_stage)
+            {
+                KVCacheGatherStage::Params gather_params;
+                gather_params.kv_cache = kv_cache;
+                gather_params.layer_idx = layer_idx;
+                gather_params.batch_size = batch_size;
+                gather_params.out_K = buffers.gathered_K;
+                gather_params.out_V = buffers.gathered_V;
+                // Note: out_max_kv_len and out_per_seq_kv_lens can be retrieved from stage after execute
+
+                graph.addNode(prefix + "kv_gather",
+                              ComputeStageFactory::createKVCacheGather(gather_params),
+                              device_idx);
+
+                // Gather depends on append (must append new tokens before gathering full history)
+                graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
+            }
+
+            AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
+            LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
+                                            << " attention mode: " << attention_mode_name(mode)
+                                            << " (batch_size=" << batch_size << ", seq_len=" << seq_len << ", kv_len=" << kv_len << ")");
+
+            AttentionComputeStage::Params attn_params;
+            attn_params.Q = buffers.Q;
+            attn_params.K = K_for_attn;
+            attn_params.V = V_for_attn;
+            attn_params.output = buffers.attn_output;
+            attn_params.batch_size = batch_size;
+            attn_params.seq_len = seq_len;
+            attn_params.kv_len = kv_len;               // Static hint, actual queried from kv_cache at runtime
+            attn_params.n_heads = local_n_heads;       // Use local head count for TP
+            attn_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
+            attn_params.head_dim = config_.head_dim;
+            attn_params.causal = true;
+            attn_params.window_size = -1;
+            attn_params.attention_mode = mode;
+            attn_params.auto_detect_mode = true; // Re-detect at runtime with actual kv_len
+            attn_params.workspace_scores = buffers.workspace_scores;
+            attn_params.workspace_context = buffers.workspace_context;
+            attn_params.workspace_mask = buffers.workspace_mask;
+            attn_params.kv_cache = kv_cache; // Pass for dynamic kv_len query at execution
+            attn_params.layer_idx = layer_idx;
+            attn_params.position_offset = position_ids ? position_ids[0] : 0;
+            attn_params.mpi_ctx = mpi_ctx_.get();
+            attn_params.device_idx = device_idx;
+
+            graph.addNode(prefix + "attention",
+                          ComputeStageFactory::createAttentionCompute(attn_params),
+                          device_idx);
+
+            if (use_gather_stage)
+            {
+                // Batched decode: attention depends on gather
+                graph.addDependency(prefix + "attention", prefix + "kv_gather");
+            }
+            else if (kv_cache)
+            {
+                graph.addDependency(prefix + "attention", prefix + "kv_append");
+            }
+            else if (env.execution.exec_rope)
+            {
+                graph.addDependency(prefix + "attention", prefix + "rope");
+            }
+            else if (env.execution.exec_gemm)
+            {
+                graph.addDependency(prefix + "attention", prefix + "qkv_proj");
+            }
+
+            LOG_DEBUG("[Qwen2Graph] Using decomposed attention path (Phase 9)");
         }
 
         // Stage 5: Output projection (Wo)
@@ -904,6 +921,11 @@ namespace llaminar2
         {
             int wo_n = static_cast<int>(layer.wo->shape()[0]);
             int wo_k = static_cast<int>(layer.wo->shape()[1]);
+
+            LOG_DEBUG("[Qwen2Graph] Layer " << layer_idx << " Wo dims: wo_n=" << wo_n
+                                            << " wo_k=" << wo_k
+                                            << " wo_shape=[" << layer.wo->shape()[0] << "," << layer.wo->shape()[1] << "]"
+                                            << " attn_output_shape=" << buffers.attn_output->shape()[0] << "x" << buffers.attn_output->shape()[1]);
 
             graph.addNode(prefix + "wo_proj",
                           ComputeStageFactory::createGEMM(
@@ -924,11 +946,15 @@ namespace llaminar2
 
             if (wo_is_sharded && has_multi_rank)
             {
+                // AllReduce the actual data, not full buffer capacity
+                size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+
                 graph.addNode(prefix + "wo_allreduce",
                               ComputeStageFactory::createAllreduce(
                                   AllreduceStage::Params{
                                       buffers.attn_proj,
-                                      getMPIComm(mpi_ctx_.get())}),
+                                      getMPIComm(mpi_ctx_.get()),
+                                      allreduce_count}),
                               device_idx);
 
                 graph.addDependency(prefix + "wo_allreduce", prefix + "wo_proj");
@@ -1106,7 +1132,8 @@ namespace llaminar2
                               ComputeStageFactory::createAllreduce(
                                   AllreduceStage::Params{
                                       buffers.attn_proj,
-                                      comm}),
+                                      comm,
+                                      allreduce_count}),
                               device_idx);
 
                 graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");
@@ -1536,12 +1563,28 @@ namespace llaminar2
             if (buf_n_kv_heads <= 0)
                 buf_n_kv_heads = config_.n_kv_heads;
 
+            // =================================================================
+            // Phase 4: Use local FFN dimension for buffer allocation when TP is enabled
+            // =================================================================
+            // When ffn_column_parallel is enabled:
+            // - Gate buffer: [seq_len, d_ff_local]
+            // - Up buffer: [seq_len, d_ff_local]
+            // - FFN output buffer: [seq_len, d_ff_local]
+            // =================================================================
+            int buf_d_ff = config_.ffn_column_parallel
+                               ? config_.d_ff_local
+                               : config_.d_ff;
+
+            // Validate (safety check for uninitialized config)
+            if (buf_d_ff <= 0)
+                buf_d_ff = config_.d_ff;
+
             buffer_spec_builder_ = std::make_unique<Qwen2BufferSpecBuilder>(
                 config_.d_model,
                 buf_n_heads,    // Use local head count for TP
                 buf_n_kv_heads, // Use local KV head count for TP
                 config_.head_dim,
-                config_.d_ff,
+                buf_d_ff, // Use local FFN dimension for TP
                 config_.vocab_size,
                 activation_type,
                 config_.default_device);
@@ -1549,7 +1592,9 @@ namespace llaminar2
             LOG_DEBUG("[Qwen2Graph] Buffer spec builder: "
                       << "n_heads=" << buf_n_heads << " (config_.n_heads=" << config_.n_heads << "), "
                       << "n_kv_heads=" << buf_n_kv_heads << " (config_.n_kv_heads=" << config_.n_kv_heads << "), "
-                      << "qkv_column_parallel=" << config_.qkv_column_parallel);
+                      << "d_ff=" << buf_d_ff << " (config_.d_ff=" << config_.d_ff << "), "
+                      << "qkv_column_parallel=" << config_.qkv_column_parallel << ", "
+                      << "ffn_column_parallel=" << config_.ffn_column_parallel);
         }
 
         // Verify TensorFactory is set

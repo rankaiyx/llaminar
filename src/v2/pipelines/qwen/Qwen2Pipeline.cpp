@@ -735,28 +735,11 @@ namespace llaminar2
         }
 
         // Extract bias pointers (nullptr if model doesn't have biases)
-        const float *q_bias_ptr = nullptr;
-        const float *k_bias_ptr = nullptr;
-        const float *v_bias_ptr = nullptr;
-
-        if (layer.q_bias)
-        {
-            auto *q_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.q_bias.get());
-            if (q_bias_fp32)
-                q_bias_ptr = q_bias_fp32->data();
-        }
-        if (layer.k_bias)
-        {
-            auto *k_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.k_bias.get());
-            if (k_bias_fp32)
-                k_bias_ptr = k_bias_fp32->data();
-        }
-        if (layer.v_bias)
-        {
-            auto *v_bias_fp32 = dynamic_cast<FP32Tensor *>(layer.v_bias.get());
-            if (v_bias_fp32)
-                v_bias_ptr = v_bias_fp32->data();
-        }
+        // Note: Use TensorBase::data() directly - works for both raw tensors and TensorSlice
+        // (TensorSlice delegates data() to its inner tensor)
+        const float *q_bias_ptr = layer.q_bias ? layer.q_bias->data() : nullptr;
+        const float *k_bias_ptr = layer.k_bias ? layer.k_bias->data() : nullptr;
+        const float *v_bias_ptr = layer.v_bias ? layer.v_bias->data() : nullptr;
 
         // Execute Q/K/V projection based on activation precision
         if (config_.activation_precision == ActivationPrecision::Q8_1)
@@ -777,6 +760,11 @@ namespace llaminar2
 
             // Check if normalized buffer is Q8_1 - if so, use Q8_1→Q8_1 path to avoid double quantization
             auto *normalized_q8_1 = dynamic_cast<Q8_1Tensor *>(buffers.normalized.get());
+            // Get actual weight dimensions (may be sharded for tensor parallelism)
+            // Q: [n_heads_local * head_dim, d_model], K/V: [n_kv_heads_local * head_dim, d_model]
+            int q_out_dim = static_cast<int>(layer.wq->shape()[0]);
+            int kv_out_dim = static_cast<int>(layer.wk->shape()[0]);
+
             if (normalized_q8_1)
             {
                 // Pure Q8_1 path: Q8_1 input → Q8_1 output (no double quantization)
@@ -788,7 +776,7 @@ namespace llaminar2
                                 V_q8_1->mutable_q8_1_blocks(),
                                 q_bias_ptr, k_bias_ptr, v_bias_ptr,
                                 effective_seq_len,
-                                n_heads_ * head_dim_, n_kv_heads_ * head_dim_,
+                                q_out_dim, kv_out_dim,
                                 d_model_,
                                 mpi_ctx_.get(), attn_device),
                             "Fused Q/K/V projection (Q8_1→Q8_1)");
@@ -803,7 +791,7 @@ namespace llaminar2
                                 V_q8_1->mutable_q8_1_blocks(),
                                 q_bias_ptr, k_bias_ptr, v_bias_ptr,
                                 effective_seq_len,
-                                n_heads_ * head_dim_, n_kv_heads_ * head_dim_,
+                                q_out_dim, kv_out_dim,
                                 d_model_,
                                 mpi_ctx_.get(), attn_device),
                             "Fused Q/K/V projection (FP32→Q8_1)");
@@ -811,6 +799,10 @@ namespace llaminar2
         }
         else
         {
+            // Get actual weight dimensions (may be sharded for tensor parallelism)
+            int q_out_dim = static_cast<int>(layer.wq->shape()[0]);
+            int kv_out_dim = static_cast<int>(layer.wk->shape()[0]);
+
             // FP32/BF16/FP16 path: Standard execute
             VALIDATE_OP(layer.qkv_fused->execute(
                             buffers.normalized->data(),
@@ -819,7 +811,7 @@ namespace llaminar2
                             buffers.V->mutable_data(),
                             q_bias_ptr, k_bias_ptr, v_bias_ptr,
                             effective_seq_len,
-                            n_heads_ * head_dim_, n_kv_heads_ * head_dim_, n_kv_heads_ * head_dim_,
+                            q_out_dim, kv_out_dim, kv_out_dim,
                             d_model_,
                             mpi_ctx_.get(), attn_device),
                         "Fused Q/K/V projection");

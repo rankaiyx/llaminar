@@ -25,26 +25,55 @@
 - [x] **2.6** Update `CPUAttentionKernelTyped::compute_tensor()` (stub with validation) ✅
 - [x] **2.7** Unit tests for sliced GEMM (11 tests in `Test__KernelFactorySliced.cpp`) ✅
 
-### Phase 3: Column-Parallel QKV
-- [ ] **3.1** Add column-parallel weight loading to `WeightManager`
-- [ ] **3.2** Update `Qwen2Graph::buildAttentionGraph()` to pass head ranges
-- [ ] **3.3** Modify Q/K/V buffer allocation for local dimensions
-- [ ] **3.4** Integration test: 2-rank QKV sharding
+### Phase 3: Column-Parallel QKV ✅ COMPLETE (December 21, 2025)
+- [x] **3.1** Add column-parallel weight loading to `WeightManager` ✅
+  - `attn_q.weight`, `attn_k.weight`, `attn_v.weight` → `COLUMN_PARALLEL`
+  - `attn_q.bias`, `attn_k.bias`, `attn_v.bias` → `COLUMN_PARALLEL`
+- [x] **3.2** Update `Qwen2Graph::buildAttentionGraph()` to pass head ranges ✅
+  - `Qwen2GraphConfig` extended with `head_start`, `local_n_heads`, `local_n_kv_heads`, `qkv_column_parallel`
+  - RoPE and Attention stages use `local_n_heads` when TP enabled
+- [x] **3.3** Modify Q/K/V buffer allocation for local dimensions ✅
+  - `Qwen2BufferSpecBuilder` uses `buf_n_heads` = `local_n_heads` when `qkv_column_parallel=true`
+  - Unit tests: 6 tests in `Test__Qwen2BufferSpec.cpp` for local head scenarios
+- [x] **3.4** Integration test: 2-rank QKV sharding ✅
+  - `Test__MPI_ColumnParallelQKV.cpp` with 5 tests (all passing)
+  - Allreduce after Wo projection for row-parallel output
 
-### Phase 4: Column-Parallel FFN
-- [ ] **4.1** Add column-parallel Gate/Up weight loading
-- [ ] **4.2** Update `Qwen2Graph::buildFFNGraph()` for local FFN dim
-- [ ] **4.3** Add `AllreduceStage` after Down projection
-- [ ] **4.4** Integration test: 2-rank FFN sharding
+### Phase 4: Column-Parallel FFN ✅ COMPLETE (December 21, 2025)
+- [x] **4.1** Add column-parallel Gate/Up weight loading ✅
+  - `ffn_gate.weight`, `ffn_up.weight` → `COLUMN_PARALLEL`
+  - `ffn_down.weight` → `INPUT_PARALLEL` (matches Gate/Up output dimension)
+- [x] **4.2** Update `Qwen2Graph::buildFFNGraph()` for local FFN dim ✅
+  - `Qwen2GraphConfig` extended with `d_ff_local`, `ffn_column_parallel`
+  - FFN stages use weight shapes directly (auto-adapts to sharded dimensions)
+- [x] **4.3** Add `AllreduceStage` after Down projection ✅
+  - Conditional allreduce when `ffn_column_parallel=true` OR `down_is_row_sharded`
+  - Uses `getMPIComm()` helper for MPI communicator
+- [x] **4.4** Integration test: 2-rank FFN sharding ✅
+  - `Test__MPI_ColumnParallelFFN.cpp` with 7 tests (all passing)
 
-### Phase 5: Column-Parallel LM Head
-- [ ] **5.1** Shard `lm_head` by vocab dimension
-- [ ] **5.2** Add `AllGatherStage` before sampling
-- [ ] **5.3** (Optional) Efficient distributed argmax
+### Phase 5: Column-Parallel LM Head ✅ COMPLETE (December 22, 2025)
+- [x] **5.1** Shard `lm_head` by vocab dimension ✅
+  - `output.weight` → `COLUMN_PARALLEL` in `WeightManager::determineShardingMode()`
+  - `vocab_local = vocab_size / world_size` (e.g., 151936/2 = 75968)
+- [x] **5.2** Add `AllGatherStage` before sampling ✅
+  - `AllGatherStage` class with MPI_Allgather for collecting distributed logits
+  - Factory method `ComputeStageFactory::createAllGather()`
+  - Updated `buildLMHeadGraph()` and `buildFullForwardGraph()` to add AllGather after LM head GEMM
+- [x] **5.3** Unit tests: 8 tests in `Test__AllGatherStage.cpp` ✅
+- [x] **5.4** Integration test: 5 tests in `Test__MPI_ColumnParallelLMHead.cpp` ✅
 
 ### Phase 6: Sharded KV Cache
-- [ ] **6.1** Modify `UnifiedKVCache` for local head storage
-- [ ] **6.2** Update cache append stages
+- [x] **6.1** Modify `UnifiedKVCache` for local head storage ✅
+  - Added `IUnifiedKVCache` sharding interface: `is_sharded()`, `n_kv_heads()`, `local_n_kv_heads()`, `kv_head_start()`, `local_kv_dim()`
+  - Added sharded constructors accepting `local_n_kv_heads` and `kv_head_start`
+  - Added `createShardedKVCache()` factory functions
+- [x] **6.2** `KVCacheAppendStage` already works - derives kv_dim from tensor shapes ✅
+- [x] **6.3** `KVCacheGatherStage` already works - uses cache's internal kv_dim_ ✅
+- [x] **6.4** Updated `PipelineBase::initializeKVCache` for sharded cache ✅
+- [x] **6.4b** Updated `GraphOrchestrator::initializeInferenceState` for sharded cache ✅
+- [x] **6.5** Unit tests: 13 tests in `Test__ShardedKVCache.cpp` ✅
+- [x] **6.6** Integration test: 7 tests in `Test__MPI_ShardedKVCache.cpp` ✅
 
 ### Phase 7: Cleanup
 - [ ] **7.1** Remove `MpiAttentionOrchestrator`
@@ -1039,11 +1068,79 @@ void Qwen2Graph::buildFFNGraph(int layer_idx, ComputeGraph& graph) {
 
 ---
 
-## Phase 5: Column-Parallel LM Head
+## Phase 5: Column-Parallel LM Head ✅ COMPLETE
 
-**Proposal Reference**: Section "Migration Path → Phase 5"
+**Proposal Reference**: Section "Migration Path → Phase 5"  
+**Status**: ✅ Implemented December 22, 2025
 
-**Goal**: Avoid computing full 151K vocab logits on every rank.
+**Goal**: Avoid computing full 151K vocab logits on every rank. Each rank computes `vocab_local = vocab_size / world_size` logits, then AllGather combines them.
+
+### Implementation Summary
+
+| Task | Status | Files Modified |
+|------|--------|----------------|
+| 5.1 LM Head Sharding | ✅ | `WeightManager.cpp` |
+| 5.2 AllGatherStage | ✅ | `ComputeStage.h/.cpp` |
+| 5.3 Graph Integration | ✅ | `Qwen2Graph.h/.cpp`, `GraphOrchestrator.cpp`, `InferenceRunner.cpp` |
+| 5.4 Unit Tests | ✅ | `Test__AllGatherStage.cpp` (8 tests) |
+| 5.5 Integration Tests | ✅ | `Test__MPI_ColumnParallelLMHead.cpp` (5 tests) |
+
+### Key Changes
+
+**WeightManager.cpp** - Added column-parallel sharding for LM head:
+```cpp
+if (name == "output.weight") {
+    return ShardingMode::COLUMN_PARALLEL;  // Split vocab dimension
+}
+```
+
+**ComputeStage.h/.cpp** - Created AllGatherStage:
+```cpp
+class AllGatherStage : public IComputeStage {
+public:
+    struct Params {
+        TensorBase* local_input = nullptr;   // [seq_len, vocab_local]
+        TensorBase* full_output = nullptr;   // [seq_len, vocab_size]
+        void* mpi_comm = nullptr;
+        int world_size = 1;
+    };
+    bool execute(IDeviceContext* ctx) override;  // Uses MPI_Allgather
+};
+```
+
+**Qwen2Graph.h/.cpp** - Added config and buffer support:
+```cpp
+struct Qwen2GraphConfig {
+    // Phase 5: Column-parallel LM head
+    int vocab_local = 0;              // vocab_size / world_size when sharded
+    bool lm_head_column_parallel = false;
+};
+
+struct Qwen2ModelBuffers {
+    std::shared_ptr<TensorBase> logits_local;  // For column-parallel LM head
+};
+```
+
+**buildLMHeadGraph()** now:
+1. Uses `vocab_local` dimension when `lm_head_column_parallel=true`
+2. Adds `AllGatherStage` after LM head GEMM to collect distributed logits
+
+### Test Coverage
+
+**Unit Tests** (`Test__AllGatherStage.cpp`):
+- StageTypeIsAllGather
+- SupportsAllBackends (CPU, CUDA, ROCm, Vulkan)
+- FailsWithNullLocalInput, FailsWithNullFullOutput, FailsWithNullMpiComm
+- FailsWithInvalidWorldSize
+- BufferRequirementsAreCorrect
+- FactoryCreatesStage
+
+**Integration Tests** (`Test__MPI_ColumnParallelLMHead.cpp`):
+- ShardingModeDetection - Verifies output.weight uses COLUMN_PARALLEL
+- LocalVocabDimensionCalculation - Verifies vocab_local = vocab_size / world_size
+- WeightShapeValidation - Verifies sharded weight shape [vocab_local, d_model]
+- AllGatherStageIntegration - Verifies AllGather collects distributed logits correctly
+- FullForwardDataFlow - Full pipeline with distributed LM head and argmax consistency
 
 ```cpp
 // src/v2/pipelines/qwen/Qwen2Graph.cpp - In buildLMHeadGraph()
@@ -1074,6 +1171,138 @@ void Qwen2Graph::buildLMHeadGraph(ComputeGraph& graph) {
     
     graph.addStage(std::make_unique<AllGatherStage>(gather_params), "gather_logits");
 }
+```
+
+---
+
+## Phase 6: Sharded KV Cache
+
+**Proposal Reference**: Section "Migration Path → Phase 6"  
+**Status**: ✅ COMPLETE (January 2025)
+
+**Goal**: When using column-parallel QKV (Phase 3), each rank only computes local K/V heads. The KV cache should only store these local heads rather than full heads, reducing memory usage proportionally.
+
+### Implementation Progress
+
+#### 6.1 UnifiedKVCache Sharding Support ✅ COMPLETE
+
+**Files Modified**:
+- `src/v2/tensors/UnifiedKVCache.h`
+- `src/v2/tensors/UnifiedKVCache.cpp`
+
+**Changes**:
+1. Extended `IUnifiedKVCache` interface with sharding methods:
+   - `is_sharded()` - Returns true if using local KV heads
+   - `n_kv_heads()` - Total KV heads across all ranks
+   - `local_n_kv_heads()` - KV heads on this rank
+   - `kv_head_start()` - Starting head index for this rank
+   - `local_kv_dim()` - local_n_kv_heads * head_dim
+
+2. Added sharded constructors to `UnifiedKVCache<Precision>`:
+   ```cpp
+   // Sharded with default device
+   UnifiedKVCache(const MPIContext& mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+                  int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                  int head_dim, int device_idx = -1);
+   
+   // Sharded with per-layer devices
+   UnifiedKVCache(const MPIContext& mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+                  int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                  int head_dim, const std::vector<int>& attention_devices);
+   ```
+
+3. Added factory functions:
+   ```cpp
+   std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+       ActivationPrecision precision,
+       const MPIContext& mpi_ctx,
+       int n_layers, int batch_size, int max_seq_len,
+       int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+       int head_dim, int device_idx = -1);
+   
+   std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+       ActivationPrecision precision,
+       const MPIContext& mpi_ctx,
+       int n_layers, int batch_size, int max_seq_len,
+       int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+       int head_dim, const std::vector<int>& attention_devices);
+   ```
+
+4. Updated non-sharded constructors to initialize sharding fields with defaults:
+   - `is_sharded_ = false`
+   - `local_n_kv_heads_ = n_kv_heads_`
+   - `kv_head_start_ = 0`
+
+#### 6.5 Unit Tests ✅ COMPLETE
+
+**File**: `tests/v2/unit/Test__ShardedKVCache.cpp`
+
+13 tests covering:
+- Non-sharded cache backward compatibility
+- Sharded cache metadata (is_sharded, n_kv_heads, local_n_kv_heads, kv_head_start)
+- Tensor shape verification (local KV dim)
+- Memory savings (50% reduction with 2-way sharding)
+- Append/clear operations
+- All precisions (FP32, BF16, FP16, Q8_1)
+- Per-layer device placement
+
+#### 6.6 MPI Integration Tests ✅ COMPLETE
+
+**File**: `tests/v2/integration/Test__MPI_ShardedKVCache.cpp`
+
+7 tests with 2 MPI ranks covering:
+- Each rank creates independent local sharded cache
+- Tensor shapes are local on each rank
+- Append/clear work independently (no MPI communication)
+- Memory usage reduced proportionally across ranks
+- All precisions work in MPI environment
+- Sequential decode simulation (prefill + decode)
+
+### Design Overview
+
+With column-parallel QKV:
+- Each rank computes `local_n_kv_heads = n_kv_heads / world_size` KV heads
+- K/V projections output `[seq_len, local_n_kv_heads * head_dim]`
+- KV cache should store `[max_seq_len, local_n_kv_heads * head_dim]` per layer
+
+**Memory Savings** (Qwen 2.5 0.5B with 2 ranks):
+- Full KV cache: `[4096, 2 * 64]` = 512KB per layer per sequence
+- Sharded: `[4096, 1 * 64]` = 256KB per layer per sequence (50% reduction)
+
+### Completed Work
+
+**6.2 KVCacheAppendStage** ✅ COMPLETE (No Changes Needed)
+- Stage derives `kv_dim` from input tensor shape (`params_.K->shape()[1]`)
+- Works automatically with sharded K/V tensors
+
+**6.3 KVCacheGatherStage** ✅ COMPLETE (No Changes Needed)
+- Delegates to `gather_kv_batched()` which validates against cache's internal `kv_dim_`
+- Output uses local dimensions automatically
+
+**6.4 Pipeline Integration** ✅ COMPLETE
+- `PipelineBase::initializeKVCache()` creates sharded cache when `mpi_strategy_ == TensorParallel`
+- `GraphOrchestrator::initializeInferenceState()` creates sharded cache when `local_n_kv_heads` set
+
+### Key Insight: No MPI Communication Needed
+
+Unlike LM head (which requires AllGather), sharded KV cache does NOT need MPI communication:
+- Each rank computes its local Q/K/V heads
+- Each rank stores its local K/V in cache
+- Attention computation is local (Q_local @ K_local^T → scores → softmax → @ V_local)
+- Only the attention output projection (Wo) needs AllReduce (already handled in Phase 3)
+
+```cpp
+// After Phase 6, the flow is:
+// Rank 0:
+//   Q0, K0, V0 = local_qkv_proj(hidden)  // [seq, local_kv_heads * head_dim]
+//   kv_cache.append(K0, V0)               // Local cache only
+//   attn0 = attention(Q0, K0, V0)         // Local computation
+//   output = Wo @ attn0                    // Sharded Wo, needs AllReduce
+// Rank 1:
+//   Q1, K1, V1 = local_qkv_proj(hidden)  // Different heads
+//   kv_cache.append(K1, V1)               // Local cache only
+//   attn1 = attention(Q1, K1, V1)         // Local computation
+//   output = Wo @ attn1                    // AllReduce combines
 ```
 
 ---

@@ -122,11 +122,17 @@ TEST_F(WeightManagerShardingTest, DeterminesReplicateForNorms)
 
 TEST_F(WeightManagerShardingTest, DeterminesReplicateForEmbeddings)
 {
-    // Embeddings should always be replicated
+    // Token embeddings should always be replicated
     EXPECT_EQ(WeightManager::determineShardingMode("token_embd.weight"),
               ShardingMode::REPLICATE);
+}
+
+TEST_F(WeightManagerShardingTest, DeterminesColumnParallelForLMHead)
+{
+    // LM head (output.weight) is column-parallel since Phase 5
+    // Split vocab dimension across ranks, AllGather before sampling
     EXPECT_EQ(WeightManager::determineShardingMode("output.weight"),
-              ShardingMode::REPLICATE);
+              ShardingMode::COLUMN_PARALLEL);
 }
 
 // =============================================================================

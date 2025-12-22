@@ -192,11 +192,12 @@ namespace llaminar2
         return true;
     }
 
-    bool ModelExecutor::executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, int device_idx)
+    bool ModelExecutor::executeLMHead(TensorBase *hidden, TensorBase *logits, int total_tokens, int device_idx,
+                                      TensorBase *logits_local)
     {
         auto start = std::chrono::high_resolution_clock::now();
 
-        ComputeGraph graph = buildLMHeadGraph(hidden, logits, total_tokens, device_idx);
+        ComputeGraph graph = buildLMHeadGraph(hidden, logits, total_tokens, device_idx, logits_local);
         IDeviceContext *ctx = getDeviceContext(device_idx);
 
         if (!ctx)

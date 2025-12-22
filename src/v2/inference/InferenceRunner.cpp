@@ -252,6 +252,68 @@ namespace llaminar2
             graph_config.qkv_column_parallel = false;
         }
 
+        // =====================================================================
+        // Phase 4: Tensor-Parallel Configuration for Column-Parallel FFN
+        // =====================================================================
+        // When running with multiple MPI ranks, compute local FFN dimension:
+        // - Each rank handles d_ff_local = d_ff / world_size
+        // - Gate/Up weights: [d_ff, d_model] → [d_ff_local, d_model]
+        // - Down weight remains row-parallel: [d_model, d_ff_local] per rank
+        // =====================================================================
+        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        {
+            int world_size = mpi_ctx->world_size();
+            if (graph_config.d_ff % world_size != 0)
+            {
+                LOG_ERROR("[InferenceRunner] d_ff (" << graph_config.d_ff
+                                                     << ") not divisible by world_size (" << world_size << ")");
+                throw std::runtime_error("FFN dimension not divisible by world_size for tensor parallelism");
+            }
+            graph_config.d_ff_local = graph_config.d_ff / world_size;
+            graph_config.ffn_column_parallel = true;
+
+            LOG_INFO("[InferenceRunner] FFN Column-Parallel enabled: "
+                     << "d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff
+                     << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
+        }
+        else
+        {
+            // Single rank: use full FFN dimension (no sharding)
+            graph_config.d_ff_local = graph_config.d_ff;
+            graph_config.ffn_column_parallel = false;
+        }
+
+        // =====================================================================
+        // Phase 5: Tensor-Parallel Configuration for Column-Parallel LM Head
+        // =====================================================================
+        // When running with multiple MPI ranks, compute local vocab dimension:
+        // - Each rank handles vocab_local = vocab_size / world_size
+        // - LM head weight: [vocab_size, d_model] → [vocab_local, d_model]
+        // - Output: [seq, vocab_local] per rank, then AllGather to [seq, vocab_size]
+        // =====================================================================
+        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        {
+            int world_size = mpi_ctx->world_size();
+            if (graph_config.vocab_size % world_size != 0)
+            {
+                LOG_ERROR("[InferenceRunner] vocab_size (" << graph_config.vocab_size
+                                                           << ") not divisible by world_size (" << world_size << ")");
+                throw std::runtime_error("Vocab size not divisible by world_size for tensor parallelism");
+            }
+            graph_config.vocab_local = graph_config.vocab_size / world_size;
+            graph_config.lm_head_column_parallel = true;
+
+            LOG_INFO("[InferenceRunner] LM Head Column-Parallel enabled: "
+                     << "vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size
+                     << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
+        }
+        else
+        {
+            // Single rank: use full vocab size (no sharding)
+            graph_config.vocab_local = graph_config.vocab_size;
+            graph_config.lm_head_column_parallel = false;
+        }
+
         LOG_DEBUG("[InferenceRunner] GraphConfig: "
                   << "vocab=" << graph_config.vocab_size
                   << ", d_model=" << graph_config.d_model

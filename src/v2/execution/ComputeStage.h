@@ -1255,6 +1255,7 @@ namespace llaminar2
         {
             TensorBase *buffer = nullptr; ///< Buffer to allreduce (in-place)
             void *mpi_comm = nullptr;     ///< MPI communicator (cast to MPI_Comm)
+            size_t count = 0;             ///< Number of elements to reduce (0 = use buffer->numel())
         };
 
         explicit AllreduceStage(Params params);
@@ -1262,6 +1263,40 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::ALLREDUCE; }
         bool requiresAllreduce() const override { return true; }
+        bool supportsBackend(ComputeBackendType backend) const override;
+        StageBufferRequirements getBufferRequirements() const override;
+
+    private:
+        Params params_;
+    };
+
+    /**
+     * @brief MPI AllGather stage for collecting distributed tensor slices
+     *
+     * Used after column-parallel GEMM to reconstruct full output tensor.
+     * For example, after LM head projection where each rank computes logits
+     * for a slice of the vocabulary, AllGather combines them into full logits.
+     *
+     * Input: local_input [seq_len, vocab_local] on each rank
+     * Output: full_output [seq_len, vocab_size] on ALL ranks (same data)
+     */
+    class AllGatherStage : public IComputeStage
+    {
+    public:
+        struct Params
+        {
+            TensorBase *local_input = nullptr; ///< This rank's local slice (input)
+            TensorBase *full_output = nullptr; ///< Full tensor on all ranks (output)
+            void *mpi_comm = nullptr;          ///< MPI communicator (cast to MPI_Comm)
+            int world_size = 1;                ///< Number of ranks for validation
+            size_t actual_seq_len = 0;         ///< Actual sequence length (0 = use buffer shape)
+        };
+
+        explicit AllGatherStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override { return ComputeStageType::ALLGATHER; }
+        bool requiresAllreduce() const override { return true; } // MPI collective
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
 
@@ -1451,6 +1486,19 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createAllreduce(
             const AllreduceStage::Params &params);
+
+        /**
+         * @brief Create an AllGather stage for MPI collective gather
+         *
+         * Used after column-parallel GEMM (e.g., LM head) to collect distributed
+         * output slices into a full tensor on all ranks. Each rank contributes
+         * its local slice, and all ranks receive the complete result.
+         *
+         * Input: local_input [seq_len, dim_local] - this rank's portion
+         * Output: full_output [seq_len, dim_full] - complete tensor on ALL ranks
+         */
+        static std::unique_ptr<IComputeStage> createAllGather(
+            const AllGatherStage::Params &params);
 
         /**
          * @brief Create a production attention stage with KV cache and MPI support

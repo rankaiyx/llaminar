@@ -6,7 +6,7 @@
  * - Device manager initialization
  * - Multi-GPU heterogeneous support
  * - Direct kernel orchestration
- * - Architecture-agnostic pipeline creation via PipelineFactory
+ * - Architecture-agnostic pipeline creation via InferenceRunner factory
  *
  * @author David Sanftenberg
  */
@@ -21,7 +21,8 @@
 #include "utils/ChatTemplate.h"
 #include "utils/BenchmarkRunner.h"
 #include "backends/ComputeBackend.h"
-#include "pipelines/PipelineFactory.h"
+#include "inference/InferenceRunner.h"
+#include "inference/IInferenceRunner.h"
 #include "pipelines/PipelineConfig.h"
 #include "pipelines/qwen/Qwen2Pipeline.h"
 #include "loaders/ModelLoader.h"
@@ -467,22 +468,17 @@ int main(int argc, char *argv[])
         LOG_DEBUG("Activation precision: " << activation_prec_name);
     }
 
-    // Create pipeline using factory
-    auto pipeline = PipelineFactory::instance().create(architecture, model_ctx, mpi_ctx, device_idx, pipeline_config);
-    if (!pipeline)
+    // Create inference runner using factory (auto-selects graph path by default)
+    InferenceRunnerConfig runner_config;
+    runner_config.max_seq_len = pipeline_config.max_seq_len;
+    runner_config.activation_precision = pipeline_config.activation_precision;
+
+    auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx, runner_config);
+    if (!runner)
     {
         if (mpi_ctx->rank() == 0)
         {
-            LOG_ERROR("Error: Failed to create pipeline for architecture: " << architecture);
-            std::string supported_archs = "Supported architectures: ";
-            auto supported = PipelineFactory::instance().supportedArchitectures();
-            for (size_t i = 0; i < supported.size(); ++i)
-            {
-                supported_archs += supported[i];
-                if (i + 1 < supported.size())
-                    supported_archs += ", ";
-            }
-            LOG_ERROR(supported_archs);
+            LOG_ERROR("Error: Failed to create inference runner for architecture: " << architecture);
         }
         MPI_Finalize();
         return 1;
@@ -596,9 +592,9 @@ int main(int argc, char *argv[])
             chat_config.top_p = args.top_p;
 
             // Convert unique_ptr to shared_ptr for ChatUI
-            std::shared_ptr<PipelineBase> shared_pipeline(std::move(pipeline));
+            std::shared_ptr<IInferenceRunner> shared_runner(std::move(runner));
 
-            ChatUI chat_ui(tokenizer, shared_pipeline, chat_config);
+            ChatUI chat_ui(tokenizer, shared_runner, chat_config);
             int result = chat_ui.run();
 
             MPI_Finalize();
@@ -685,7 +681,7 @@ int main(int argc, char *argv[])
             LOG_DEBUG("Running prefill (" << token_count << " tokens)...");
         }
 
-        if (!pipeline->forward(token_ids.data(), token_count))
+        if (!runner->forward(token_ids.data(), token_count))
         {
             if (mpi_ctx->rank() == 0)
             {
@@ -724,7 +720,7 @@ int main(int argc, char *argv[])
             // Rank 0: sample next token
             if (mpi_ctx->rank() == 0)
             {
-                const float *logits = pipeline->logits();
+                const float *logits = runner->logits();
                 size_t vocab_size = tokenizer->vocab_size();
                 std::vector<float> logits_vec(logits, logits + vocab_size);
 
@@ -760,7 +756,7 @@ int main(int argc, char *argv[])
             }
 
             // All ranks forward the next token
-            if (!pipeline->forward(&next_token, 1))
+            if (!runner->forward(&next_token, 1))
             {
                 if (mpi_ctx->rank() == 0)
                 {
@@ -792,9 +788,9 @@ int main(int argc, char *argv[])
         }
 
         // Convert unique_ptr to shared_ptr for BenchmarkRunner
-        std::shared_ptr<PipelineBase> shared_pipeline(std::move(pipeline));
+        std::shared_ptr<IInferenceRunner> shared_runner(std::move(runner));
 
-        BenchmarkRunner benchmark(shared_pipeline, tokenizer, mpi_ctx);
+        BenchmarkRunner benchmark(shared_runner, tokenizer, mpi_ctx);
         BenchmarkResult result = benchmark.run(args);
         benchmark.printResults(result);
 
@@ -871,7 +867,7 @@ int main(int argc, char *argv[])
         LOG_DEBUG("Running prefill (" << tokens.size() << " tokens)...");
     }
 
-    if (!pipeline->forward(tokens.data(), tokens.size()))
+    if (!runner->forward(tokens.data(), tokens.size()))
     {
         if (mpi_ctx->rank() == 0)
         {
@@ -905,7 +901,7 @@ int main(int argc, char *argv[])
 
         // Get logits from last forward pass
         LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Getting logits...");
-        const float *logits = pipeline->logits();
+        const float *logits = runner->logits();
         LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Logits retrieved");
 
         // Get vocabulary size from tokenizer
@@ -963,7 +959,7 @@ int main(int argc, char *argv[])
 
         // Forward next token through pipeline (single token decode)
         LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Entering decode forward...");
-        if (!pipeline->forward(&next_token, 1))
+        if (!runner->forward(&next_token, 1))
         {
             LOG_ERROR("[Rank " << mpi_ctx->rank() << "] Decode forward FAILED at token " << (i + 1));
             if (mpi_ctx->rank() == 0)

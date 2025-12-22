@@ -575,10 +575,23 @@ namespace llaminar2
         int head_dim = config.head_dim;
         int d_ff = config.d_ff;
 
+        // For tensor parallelism, use local head counts for buffer allocation
+        // When qkv_column_parallel is enabled, each rank processes only its subset of heads
+        int buffer_n_heads = config.qkv_column_parallel ? config.local_n_heads : n_heads;
+        int buffer_n_kv_heads = config.qkv_column_parallel ? config.local_n_kv_heads : n_kv_heads;
+        int buffer_d_ff = config.ffn_column_parallel ? config.d_ff_local : d_ff;
+
         LOG_INFO("[GraphOrchestrator] Initializing inference state: batch_size=" << batch_size
                                                                                  << " max_seq_len=" << max_seq_len
                                                                                  << " d_model=" << d_model
                                                                                  << " vocab_size=" << vocab_size);
+
+        if (config.qkv_column_parallel)
+        {
+            LOG_DEBUG("[GraphOrchestrator] Using local buffer sizes for TP: n_heads=" << buffer_n_heads
+                                                                                      << "/" << n_heads << " n_kv_heads=" << buffer_n_kv_heads << "/" << n_kv_heads
+                                                                                      << " d_ff=" << buffer_d_ff << "/" << d_ff);
+        }
 
         // Create a default MPI context if none was provided
         std::shared_ptr<MPIContext> local_mpi_ctx = mpi_ctx_;
@@ -600,6 +613,16 @@ namespace llaminar2
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
             device_idx);
 
+        // Phase 5: Allocate local logits buffer for column-parallel LM head
+        if (config.lm_head_column_parallel && config.vocab_local > 0)
+        {
+            state_.logits_local = factory.createFP32(
+                std::vector<size_t>{static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(config.vocab_local)},
+                device_idx);
+            LOG_DEBUG("[GraphOrchestrator] Allocated logits_local buffer: ["
+                      << batch_size * max_seq_len << ", " << config.vocab_local << "]");
+        }
+
         // Allocate activation buffers
         state_.normalized = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
@@ -608,58 +631,86 @@ namespace llaminar2
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
 
-        // QKV buffers
+        // QKV buffers - use local head counts for tensor parallelism
         state_.Q = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(n_heads * head_dim)},
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
             device_idx);
         state_.K = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(n_kv_heads * head_dim)},
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
             device_idx);
         state_.V = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(n_kv_heads * head_dim)},
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
             device_idx);
         state_.attn_output = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(n_heads * head_dim)},
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
             device_idx);
         state_.attn_proj = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device_idx);
 
-        // FFN buffers
+        // FFN buffers - use local d_ff for tensor parallelism
         state_.gate = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_ff)},
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
             device_idx);
         state_.up = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_ff)},
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
             device_idx);
         state_.ffn_output = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_d_ff)},
             device_idx);
 
-        // Attention workspace
-        // scores: [batch_size * n_heads, max_seq_len, max_seq_len]
+        // Attention workspace - use local head counts for tensor parallelism
+        // scores: [batch_size * buffer_n_heads, max_seq_len, max_seq_len]
         state_.workspace_scores = factory.createFP32(
-            {static_cast<size_t>(batch_size * n_heads * max_seq_len), static_cast<size_t>(max_seq_len)},
+            {static_cast<size_t>(batch_size * buffer_n_heads * max_seq_len), static_cast<size_t>(max_seq_len)},
             device_idx);
-        // context: [batch_size * n_heads, max_seq_len, head_dim]
+        // context: [batch_size * buffer_n_heads, max_seq_len, head_dim]
         state_.workspace_context = factory.createFP32(
-            {static_cast<size_t>(batch_size * n_heads * max_seq_len), static_cast<size_t>(head_dim)},
+            {static_cast<size_t>(batch_size * buffer_n_heads * max_seq_len), static_cast<size_t>(head_dim)},
             device_idx);
         // mask: [batch_size, max_seq_len, max_seq_len]
         state_.workspace_mask = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(max_seq_len)},
             device_idx);
 
-        // Create KV cache
-        state_.kv_cache = createUnifiedKVCache(
-            ActivationPrecision::FP32,
-            *local_mpi_ctx,
-            n_layers,
-            batch_size,
-            max_seq_len,
-            n_kv_heads,
-            head_dim,
-            device_idx);
+        // Create KV cache - use sharded cache for tensor parallelism
+        // Check if tensor parallelism is enabled (indicated by local_n_kv_heads set)
+        bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
+        if (use_sharded_cache && mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            // Compute KV head distribution from local_n_kv_heads
+            // kv_head_start = rank * local_n_kv_heads (assumes even distribution)
+            int kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
+
+            LOG_DEBUG("[GraphOrchestrator] Creating sharded KV cache: "
+                      << n_kv_heads << " total KV heads, "
+                      << config.local_n_kv_heads << " local KV heads (start=" << kv_head_start << ")");
+
+            state_.kv_cache = createShardedKVCache(
+                ActivationPrecision::FP32,
+                *local_mpi_ctx,
+                n_layers,
+                batch_size,
+                max_seq_len,
+                n_kv_heads,
+                config.local_n_kv_heads,
+                kv_head_start,
+                head_dim,
+                device_idx);
+        }
+        else
+        {
+            // Non-sharded (replicated) KV cache for single-rank or non-tensor-parallel
+            state_.kv_cache = createUnifiedKVCache(
+                ActivationPrecision::FP32,
+                *local_mpi_ctx,
+                n_layers,
+                batch_size,
+                max_seq_len,
+                n_kv_heads,
+                head_dim,
+                device_idx);
+        }
 
         // Initialize position tracking
         state_.positions.assign(batch_size, 0);
@@ -725,6 +776,12 @@ namespace llaminar2
         Qwen2ModelBuffers model_buffers;
         model_buffers.current_hidden = state_.hidden.get();
         model_buffers.logits = state_.logits.get();
+
+        // Phase 5: Set local logits buffer for column-parallel LM head
+        if (state_.logits_local)
+        {
+            model_buffers.logits_local = state_.logits_local.get();
+        }
 
         // Populate layer buffers
         model_buffers.layer_buffers.current_hidden = state_.hidden.get();

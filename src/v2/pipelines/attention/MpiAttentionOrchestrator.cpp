@@ -2,6 +2,9 @@
  * @file MpiAttentionOrchestrator.cpp
  * @brief Grouped Query Attention (GQA) implementation
  * @author David Sanftenberg
+ *
+ * @deprecated This entire file is deprecated. Use AttentionComputeStage + KernelFactory instead.
+ *             Tensor-parallel methods now throw std::runtime_error to catch accidental usage.
  */
 
 #include "MpiAttentionOrchestrator.h"
@@ -18,6 +21,7 @@
 #include <cstring>
 #include <cmath>
 #include <sstream>
+#include <stdexcept>
 #include <omp.h>
 #include <atomic>
 
@@ -756,6 +760,18 @@ namespace llaminar2
         int batch_size,
         const std::vector<int> *sequence_lengths)
     {
+        // ================================================================
+        // DEPRECATED: This method should not be used for new code.
+        // Use AttentionComputeStage + KernelFactory::createAttention() instead.
+        // Throwing to catch accidental usage in tests and new code.
+        // ================================================================
+        throw std::runtime_error(
+            "[MpiAttentionOrchestrator::compute_tensor_parallel] DEPRECATED - "
+            "This method is deprecated and should not be used. "
+            "Use AttentionComputeStage with use_decomposed_attention=true instead. "
+            "See DISTRIBUTED_ARCHITECTURE_PROPOSAL.md Phase 7 for migration guidance.");
+
+        // Original implementation below (kept for reference but unreachable)
         LOG_TRACE("[MpiAttentionOrchestrator::compute_tensor_parallel] precision="
                   << static_cast<int>(config.precision)
                   << ", Q type=" << (dynamic_cast<Q8_1Tensor *>(Q) ? "Q8_1" : "FP32")

@@ -70,8 +70,8 @@ namespace llaminar2
                 LOG_DEBUG("[WeightManager] Sharding enabled with " << mpi_ctx_->world_size() << " ranks");
                 LOG_DEBUG("[WeightManager] Column-parallel: Gate/Up (split output dim, local output)");
                 LOG_DEBUG("[WeightManager] Input-parallel: Down (split input dim to match Gate/Up, allreduce after)");
-                LOG_DEBUG("[WeightManager] Row-parallel: Wo (split output dim, allreduce after)");
-                LOG_DEBUG("[WeightManager] Replicated: QKV, norms, biases, embeddings, LM head");
+                LOG_DEBUG("[WeightManager] Input-parallel: Wo (split input dim to match column-parallel QKV, allreduce after)");
+                LOG_DEBUG("[WeightManager] Replicated: QKV (column-parallel via head sharding), norms, biases, embeddings, LM head");
             }
         }
     }
@@ -231,17 +231,22 @@ namespace llaminar2
         //    - Allreduce needed to sum partial results
         //
         // Pattern matching for GGUF weight names:
-        // - Column-parallel: attn_q, attn_k, attn_v, ffn_gate, ffn_up (split output dim)
+        // - Column-parallel: attn_q, attn_k, attn_v, ffn_gate, ffn_up, output.weight (split output dim)
         // - Row-parallel: attn_output (Wo) - split input dim matching local heads
         // - Input-parallel: ffn_down (split input dim to match Gate/Up output)
-        // - Replicated: norms, embeddings, lm_head
+        // - Replicated: norms, embeddings
         // =========================================================================
 
-        // Row-parallel weights: Split output dimension, requires allgather
-        // Only Wo uses row-parallel in Phase 4b-1
+        // Input-parallel weights: Wo (attn_output.weight)
+        // Wo uses input-parallel to match column-parallel QKV:
+        // - Full Wo: [d_model, d_model] where d_model = n_heads * head_dim
+        // - With column-parallel QKV, attention output is [seq, local_heads * head_dim]
+        // - Wo needs input dim split: [d_model, d_model/world_size] per rank
+        // - GEMM: [seq, local_dim] @ [local_dim, d_model]^T = [seq, d_model] partial
+        // - Outputs need AllReduce to sum partial results
         if (name.find("attn_output.weight") != std::string::npos)
         {
-            return ShardingMode::ROW_PARALLEL;
+            return ShardingMode::INPUT_PARALLEL;
         }
 
         // Column-parallel weights: FFN Gate/Up (Phase 4b-1)
@@ -278,6 +283,16 @@ namespace llaminar2
         if (name.find("attn_q.bias") != std::string::npos ||
             name.find("attn_k.bias") != std::string::npos ||
             name.find("attn_v.bias") != std::string::npos)
+        {
+            return ShardingMode::COLUMN_PARALLEL;
+        }
+
+        // Column-parallel weights: LM Head (Phase 5)
+        // LM head [vocab_size, d_model] splits output dimension (vocab_size rows)
+        // - Weight: [vocab_size, d_model] → [vocab_local, d_model] per rank
+        // - Output: [seq, vocab_local] (each rank computes logits for different vocab tokens)
+        // - AllGather needed before sampling to reconstruct full vocab logits
+        if (name == "output.weight")
         {
             return ShardingMode::COLUMN_PARALLEL;
         }
@@ -518,27 +533,42 @@ namespace llaminar2
             }
 
             // Handle 1D tensors (biases)
+            // For biases like Q/K/V biases [n_heads * head_dim], we load full then slice in memory.
+            // This is acceptable since biases are tiny (e.g., 896 floats = 3.5KB).
             if (info->dimensions.size() == 1)
             {
                 size_t total_elements = info->dimensions[0];
                 size_t elements_per_rank = total_elements / world_size;
                 size_t start = elements_per_rank * rank;
                 size_t end = (rank == world_size - 1) ? total_elements : start + elements_per_rank;
+                size_t slice_elements = end - start;
 
-                // Load only this rank's slice (for biases, use row slice on 1D tensor)
-                auto slice_tensor = loader_.loadTensorRowSlice(
-                    name, start, end, device_idx, WeightPrecision::NATIVE);
-
-                if (!slice_tensor)
+                // Load full 1D tensor first (biases are small, ~3KB)
+                auto full_tensor = loader_.loadTensor(name, device_idx, WeightPrecision::NATIVE);
+                if (!full_tensor)
                 {
-                    LOG_ERROR("[WeightManager] Rank " << rank << " failed to load 1D slice for: " << name);
+                    LOG_ERROR("[WeightManager] Rank " << rank << " failed to load 1D tensor for: " << name);
                     return nullptr;
                 }
 
+                // Cast to FP32 (biases are stored as FP32)
+                auto *fp32_full = dynamic_cast<FP32Tensor *>(full_tensor.get());
+                if (!fp32_full)
+                {
+                    LOG_ERROR("[WeightManager] 1D tensor is not FP32 for: " << name);
+                    return nullptr;
+                }
+
+                // Create sliced 1D tensor
+                auto slice_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{slice_elements});
+                std::memcpy(slice_tensor->mutable_data(),
+                            fp32_full->data() + start,
+                            slice_elements * sizeof(float));
+
                 LOG_TRACE("[WeightManager] Rank " << rank << " column-parallel 1D " << name
                                                   << " [" << total_elements
-                                                  << "] -> loaded elements [" << start << ", " << end
-                                                  << ") = " << (end - start) << " elements");
+                                                  << "] -> sliced elements [" << start << ", " << end
+                                                  << ") = " << slice_elements << " elements");
 
                 // For 1D tensors, use row-parallel metadata with cols=1
                 auto meta = SliceMetadata::forRowParallel(

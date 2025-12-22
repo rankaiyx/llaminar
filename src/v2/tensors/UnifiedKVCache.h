@@ -53,6 +53,13 @@ namespace llaminar2
         virtual int batch_size() const = 0;
         virtual int max_seq_len() const = 0;
 
+        // Sharding (Tensor Parallelism) info
+        virtual bool is_sharded() const = 0;      ///< True if using local KV heads
+        virtual int n_kv_heads() const = 0;       ///< Total KV heads (across all ranks)
+        virtual int local_n_kv_heads() const = 0; ///< Local KV heads (this rank)
+        virtual int kv_head_start() const = 0;    ///< Starting KV head index
+        virtual int local_kv_dim() const = 0;     ///< local_n_kv_heads * head_dim
+
         // Per-sequence token tracking
         virtual int get_cached_tokens(int layer, int seq_idx = 0) const = 0;
 
@@ -240,6 +247,33 @@ namespace llaminar2
         UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim, const std::vector<int> &attention_devices);
 
+        /**
+         * @brief Construct unified KV cache with sharded (local) KV heads for tensor parallelism
+         *
+         * When using column-parallel QKV (Phase 3 TP), each rank computes only a subset
+         * of KV heads. This constructor creates a cache that stores only local heads.
+         *
+         * @param mpi_ctx MPI context for NUMA-aware allocation
+         * @param n_layers Number of transformer layers
+         * @param batch_size Number of sequences (1 for single-sequence mode)
+         * @param max_seq_len Maximum sequence length (cache capacity per sequence)
+         * @param n_kv_heads Total number of KV heads (GQA) across all ranks
+         * @param local_n_kv_heads Number of KV heads on this rank (n_kv_heads / world_size)
+         * @param kv_head_start Starting KV head index for this rank
+         * @param head_dim Dimension per head
+         * @param device_idx Default device for all layers (-1 = CPU)
+         */
+        UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+                       int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                       int head_dim, int device_idx = -1);
+
+        /**
+         * @brief Construct unified KV cache with sharded KV heads and per-layer device placement
+         */
+        UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+                       int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                       int head_dim, const std::vector<int> &attention_devices);
+
         // IUnifiedKVCache interface implementation
         ActivationPrecision precision() const override { return Precision; }
         int num_layers() const override { return n_layers_; }
@@ -276,6 +310,35 @@ namespace llaminar2
         void reset_eviction_counter() override { total_evicted_ = 0; }
 
         // =====================================================================
+        // Sharding (Tensor Parallelism) Accessors
+        // =====================================================================
+
+        /**
+         * @brief Check if cache is sharded (local heads only)
+         */
+        bool is_sharded() const override { return is_sharded_; }
+
+        /**
+         * @brief Get total KV heads (across all ranks)
+         */
+        int n_kv_heads() const override { return n_kv_heads_; }
+
+        /**
+         * @brief Get local KV heads (this rank's heads, == n_kv_heads if not sharded)
+         */
+        int local_n_kv_heads() const override { return local_n_kv_heads_; }
+
+        /**
+         * @brief Get starting KV head index for this rank (0 if not sharded)
+         */
+        int kv_head_start() const override { return kv_head_start_; }
+
+        /**
+         * @brief Get local KV dimension (local_n_kv_heads * head_dim)
+         */
+        int local_kv_dim() const override { return kv_dim_; }
+
+        // =====================================================================
         // Typed accessors (for direct use when precision is known at compile time)
         // =====================================================================
 
@@ -299,9 +362,12 @@ namespace llaminar2
         int n_layers_;
         int batch_size_;
         int max_seq_len_;
-        int n_kv_heads_;
+        int n_kv_heads_;       // Total KV heads (across all ranks)
+        int local_n_kv_heads_; // Local KV heads (this rank), == n_kv_heads_ if not sharded
+        int kv_head_start_;    // Starting KV head index (0 if not sharded)
         int head_dim_;
-        int kv_dim_; // n_kv_heads * head_dim
+        int kv_dim_;      // local_n_kv_heads * head_dim (storage dimension)
+        bool is_sharded_; // True if using local KV heads (TP enabled)
         int total_evicted_ = 0;
 
         // Cache storage: [n_layers][batch_size]
@@ -354,6 +420,45 @@ namespace llaminar2
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
+        const std::vector<int> &attention_devices);
+
+    // ============================================================================
+    // Sharded KV Cache Factory Functions (for Tensor Parallelism)
+    // ============================================================================
+
+    /**
+     * @brief Create sharded unified KV cache for tensor parallelism
+     *
+     * Each MPI rank stores only its assigned KV heads, reducing memory
+     * proportionally to the number of ranks.
+     *
+     * @param precision Activation precision (FP32, BF16, FP16, Q8_1)
+     * @param mpi_ctx MPI context for device affinity
+     * @param n_layers Number of transformer layers
+     * @param batch_size Maximum batch size
+     * @param max_seq_len Maximum sequence length
+     * @param n_kv_heads Total number of KV heads (before sharding)
+     * @param local_n_kv_heads Number of KV heads stored on this rank
+     * @param kv_head_start Starting KV head index for this rank
+     * @param head_dim Dimension per head
+     * @param device_idx Device index for all layers (-1 for CPU)
+     */
+    std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+        ActivationPrecision precision,
+        const MPIContext &mpi_ctx,
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, int device_idx = -1);
+
+    /**
+     * @brief Create sharded unified KV cache with per-layer device placement
+     */
+    std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+        ActivationPrecision precision,
+        const MPIContext &mpi_ctx,
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim,
         const std::vector<int> &attention_devices);
 
 } // namespace llaminar2

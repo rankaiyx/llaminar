@@ -99,7 +99,9 @@ namespace
             config.rms_norm_eps = RMS_EPS;
             config.rope_theta = ROPE_THETA;
             config.default_device = device_idx_;
-            config.use_decomposed_attention = use_decomposed;
+            // NOTE: Decomposed attention is now always used (Phase 7 cleanup)
+            // The use_decomposed parameter is ignored but kept for test parameterization
+            (void)use_decomposed;
 
             auto mpi = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
             return std::make_unique<Qwen2LayerExecutor>(config, mpi);

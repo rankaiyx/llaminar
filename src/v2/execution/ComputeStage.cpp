@@ -16,6 +16,7 @@
 #include "../tensors/UnifiedKVCache.h"
 #include "../tensors/SIMDHelpers.h"
 #include "../tensors/Tensors.h" // For TensorBase::rows(), cols(), dtype_name()
+#include "../tensors/TensorSlice.h"
 #include "../pipelines/attention/MpiAttentionOrchestrator.h"
 #include "../pipelines/MPIStrategy.h"
 #include "../utils/MPIContext.h"
@@ -198,8 +199,22 @@ namespace llaminar2
                                                << " weight ptr=" << static_cast<const void *>(params_.B)
                                                << " weight shape=[" << (params_.B ? params_.B->shape()[0] : 0) << ","
                                                << (params_.B ? params_.B->shape()[1] : 0) << "]"
+                                               << " input ptr=" << static_cast<const void *>(params_.A)
                                                << " input_type=" << params_.A->dtype_name()
                                                << " output_type=" << params_.C->dtype_name());
+
+        // Debug: Log input values for Wo projection (weight shape [896, 448] or [896, 896])
+        if (params_.B && params_.B->shape()[0] == 896 && (params_.B->shape()[1] == 448 || params_.B->shape()[1] == 896))
+        {
+            const float *input_data = params_.A->data();
+            if (input_data)
+            {
+                LOG_INFO("[GEMMStage] Wo input[0:8]=" << std::setprecision(10)
+                                                      << input_data[0] << "," << input_data[1] << "," << input_data[2] << "," << input_data[3] << ","
+                                                      << input_data[4] << "," << input_data[5] << "," << input_data[6] << "," << input_data[7]
+                                                      << " weight_k=" << params_.B->shape()[1]);
+            }
+        }
 
         // Get kernel - either full or sliced
         llaminar2::ITensorGemm *gemm = nullptr;
@@ -600,6 +615,12 @@ namespace llaminar2
             LOG_ERROR("[FusedQKVGEMMStage] multiply_fused failed");
             return false;
         }
+
+        // Debug: Log Q output for comparison
+        LOG_INFO("[FusedQKVGEMMStage] Q output[0:8]=" << std::setprecision(10)
+                                                      << output_q_fp32[0] << "," << output_q_fp32[1] << "," << output_q_fp32[2] << "," << output_q_fp32[3] << ","
+                                                      << output_q_fp32[4] << "," << output_q_fp32[5] << "," << output_q_fp32[6] << "," << output_q_fp32[7]
+                                                      << " n_q=" << params_.n_q);
 
         LOG_DEBUG("[FusedQKVGEMMStage] Complete");
         return true;
@@ -1738,7 +1759,8 @@ namespace llaminar2
             return false;
         }
 
-        size_t count = params_.buffer->numel();
+        // Use explicit count if provided, otherwise use buffer size
+        size_t count = params_.count > 0 ? params_.count : params_.buffer->numel();
         LOG_DEBUG("[AllreduceStage] Execute: buffer=" << params_.buffer
                                                       << " count=" << count << " has_comm=" << (params_.mpi_comm != nullptr));
         if (!params_.mpi_comm)
@@ -1760,6 +1782,11 @@ namespace llaminar2
             {
                 data_ptr = fp32_tensor->mutable_data();
                 mpi_type = MPI_FLOAT;
+
+                // Debug: dump values before AllReduce
+                float *f = static_cast<float *>(data_ptr);
+                LOG_DEBUG("[AllreduceStage] Before AllReduce: data[0:4]="
+                          << f[0] << "," << f[1] << "," << f[2] << "," << f[3]);
             }
         }
         // Add other types as needed (BF16, FP16, etc.)
@@ -1778,6 +1805,14 @@ namespace llaminar2
             mpi_type,
             MPI_SUM,
             comm);
+
+        // Debug: dump values after AllReduce
+        if (mpi_type == MPI_FLOAT)
+        {
+            float *f = static_cast<float *>(data_ptr);
+            LOG_DEBUG("[AllreduceStage] After AllReduce: data[0:4]="
+                      << f[0] << "," << f[1] << "," << f[2] << "," << f[3]);
+        }
 
         LOG_DEBUG("[AllreduceStage] MPI_Allreduce returned " << result);
         return result == MPI_SUCCESS;
@@ -1799,6 +1834,233 @@ namespace llaminar2
         {
             BufferTensorType buf_type = toBufferTensorType(params_.buffer->native_type());
             reqs.addInout("buffer", params_.buffer->shape(), buf_type);
+        }
+
+        return reqs;
+    }
+
+    // =============================================================================
+    // AllGatherStage Implementation
+    // =============================================================================
+
+    AllGatherStage::AllGatherStage(Params params) : params_(std::move(params)) {}
+
+    bool AllGatherStage::execute(IDeviceContext *ctx)
+    {
+        (void)ctx;
+
+        if (!params_.local_input)
+        {
+            LOG_ERROR("[AllGatherStage] Null local_input buffer");
+            return false;
+        }
+
+        if (!params_.full_output)
+        {
+            LOG_ERROR("[AllGatherStage] Null full_output buffer");
+            return false;
+        }
+
+        if (!params_.mpi_comm)
+        {
+            LOG_ERROR("[AllGatherStage] Null MPI communicator");
+            return false;
+        }
+
+        if (params_.world_size <= 0)
+        {
+            LOG_ERROR("[AllGatherStage] Invalid world_size=" << params_.world_size);
+            return false;
+        }
+
+        // Get shapes: local_input = [seq_len, vocab_local], full_output = [seq_len, vocab_size]
+        const auto &local_shape = params_.local_input->shape();
+        const auto &full_shape = params_.full_output->shape();
+
+        if (local_shape.size() != 2 || full_shape.size() != 2)
+        {
+            LOG_ERROR("[AllGatherStage] Expected 2D tensors, got local_shape.size()="
+                      << local_shape.size() << " full_shape.size()=" << full_shape.size());
+            return false;
+        }
+
+        // Use actual_seq_len if provided, otherwise use buffer shape
+        size_t buffer_seq_len = local_shape[0];
+        size_t seq_len = params_.actual_seq_len > 0 ? params_.actual_seq_len : buffer_seq_len;
+        size_t vocab_local = local_shape[1];
+        size_t vocab_full = full_shape[0] == buffer_seq_len ? full_shape[1] : full_shape[0];
+
+        // Validate seq_len doesn't exceed buffer capacity
+        if (seq_len > buffer_seq_len)
+        {
+            LOG_ERROR("[AllGatherStage] actual_seq_len=" << seq_len
+                                                         << " exceeds buffer capacity=" << buffer_seq_len);
+            return false;
+        }
+
+        size_t expected_vocab_full = vocab_local * static_cast<size_t>(params_.world_size);
+        if (vocab_full != expected_vocab_full)
+        {
+            LOG_WARN("[AllGatherStage] vocab_full=" << vocab_full
+                                                    << " expected=" << expected_vocab_full
+                                                    << " - proceeding anyway");
+        }
+
+        LOG_DEBUG("[AllGatherStage] Execute: seq_len=" << seq_len
+                                                       << " vocab_local=" << vocab_local
+                                                       << " vocab_full=" << vocab_full
+                                                       << " world_size=" << params_.world_size);
+
+        MPI_Comm comm = static_cast<MPI_Comm>(params_.mpi_comm);
+
+        // Get data pointers based on tensor type
+        const float *send_ptr = nullptr;
+        float *recv_ptr = nullptr;
+
+        if (params_.local_input->native_type() == TensorType::FP32)
+        {
+            auto *input_fp32 = dynamic_cast<FP32Tensor *>(params_.local_input);
+            auto *output_fp32 = dynamic_cast<FP32Tensor *>(params_.full_output);
+            if (input_fp32 && output_fp32)
+            {
+                send_ptr = input_fp32->data();
+                recv_ptr = output_fp32->mutable_data();
+            }
+        }
+
+        if (!send_ptr || !recv_ptr)
+        {
+            LOG_ERROR("[AllGatherStage] Unsupported tensor type for allgather");
+            return false;
+        }
+
+        // =========================================================================
+        // Optimized AllGather using MPI_Type_vector for strided data
+        // =========================================================================
+        // Each rank has [seq_len, vocab_local] data laid out contiguously.
+        // We need output [seq_len, vocab_full] where each row interleaves all ranks' data:
+        //   row_i: [rank0's vocab_local elements, rank1's vocab_local elements, ...]
+        //
+        // Strategy: Use MPI_Type_vector to describe strided placement in output buffer.
+        // - Send type: seq_len blocks of vocab_local, stride vocab_local (contiguous)
+        // - Recv type: seq_len blocks of vocab_local, stride vocab_full (strided)
+        //
+        // MPI_Allgather with derived types places each rank's recv_type starting at:
+        //   rank * recvcount * sizeof(recv_type_extent)
+        // But we need placement at: rank * vocab_local elements within each row.
+        //
+        // Solution: Create a resized recv type where the extent equals vocab_local elements,
+        // so rank r's data lands at offset r * vocab_local within the vocab dimension.
+        // =========================================================================
+
+        // Step 1: Create the basic strided vector type
+        // seq_len blocks of vocab_local floats, each block starting vocab_full floats apart
+        MPI_Datatype strided_type;
+        int mpi_result = MPI_Type_vector(
+            static_cast<int>(seq_len),     // count: number of blocks (rows)
+            static_cast<int>(vocab_local), // blocklength: elements per block
+            static_cast<int>(vocab_full),  // stride: distance between block starts (in elements)
+            MPI_FLOAT,
+            &strided_type);
+
+        if (mpi_result != MPI_SUCCESS)
+        {
+            LOG_ERROR("[AllGatherStage] MPI_Type_vector failed with error " << mpi_result);
+            return false;
+        }
+
+        // Step 2: Resize the type so its extent = vocab_local * sizeof(float)
+        // This ensures consecutive ranks' data are placed vocab_local apart in each row
+        MPI_Datatype resized_type;
+        MPI_Aint lb = 0;
+        MPI_Aint extent = static_cast<MPI_Aint>(vocab_local) * sizeof(float);
+
+        mpi_result = MPI_Type_create_resized(strided_type, lb, extent, &resized_type);
+        MPI_Type_free(&strided_type);
+
+        if (mpi_result != MPI_SUCCESS)
+        {
+            LOG_ERROR("[AllGatherStage] MPI_Type_create_resized failed with error " << mpi_result);
+            return false;
+        }
+
+        mpi_result = MPI_Type_commit(&resized_type);
+        if (mpi_result != MPI_SUCCESS)
+        {
+            LOG_ERROR("[AllGatherStage] MPI_Type_commit failed with error " << mpi_result);
+            MPI_Type_free(&resized_type);
+            return false;
+        }
+
+        // Step 3: Use MPI_Allgather with the resized type
+        // Send: seq_len * vocab_local contiguous floats
+        // Recv: 1 resized_type per rank (each type covers seq_len strided blocks)
+        mpi_result = MPI_Allgather(
+            send_ptr,
+            static_cast<int>(seq_len * vocab_local),
+            MPI_FLOAT,
+            recv_ptr,
+            1,
+            resized_type,
+            comm);
+
+        // Clean up the derived type
+        MPI_Type_free(&resized_type);
+
+        if (mpi_result != MPI_SUCCESS)
+        {
+            LOG_ERROR("[AllGatherStage] MPI_Allgather (strided) failed with error " << mpi_result);
+            return false;
+        }
+
+        // Debug: dump gathered logits at last position
+        LOG_DEBUG("[AllGatherStage] Gathered logits (last row, first 8): "
+                  << recv_ptr[(seq_len - 1) * vocab_full + 0] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + 1] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + 2] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + 3] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + 4] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + 5] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + 6] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + 7]);
+        // Also dump from second half (rank 1's data)
+        LOG_DEBUG("[AllGatherStage] Gathered logits (last row, at vocab_local+0:+8): "
+                  << recv_ptr[(seq_len - 1) * vocab_full + vocab_local + 0] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + vocab_local + 1] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + vocab_local + 2] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + vocab_local + 3] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + vocab_local + 4] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + vocab_local + 5] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + vocab_local + 6] << ","
+                  << recv_ptr[(seq_len - 1) * vocab_full + vocab_local + 7]);
+
+        LOG_DEBUG("[AllGatherStage] Optimized AllGather (MPI_Type_vector) completed for "
+                  << seq_len << " rows");
+        return true;
+    }
+
+    bool AllGatherStage::supportsBackend(ComputeBackendType backend) const
+    {
+        // AllGather is backend-agnostic (works with any device that has MPI support)
+        (void)backend;
+        return true;
+    }
+
+    StageBufferRequirements AllGatherStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+
+        // AllGather has separate input and output buffers
+        if (params_.local_input)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.local_input->native_type());
+            reqs.addInput("local_input", params_.local_input->shape(), buf_type);
+        }
+
+        if (params_.full_output)
+        {
+            BufferTensorType buf_type = toBufferTensorType(params_.full_output->native_type());
+            reqs.addOutput("full_output", params_.full_output->shape(), buf_type);
         }
 
         return reqs;
@@ -3294,6 +3556,24 @@ namespace llaminar2
             return false;
         }
 
+        // Debug: dump hidden states input at last position
+        {
+            const float *hidden = params_.hidden_states->fp32_data();
+            if (hidden && params_.seq_len > 0)
+            {
+                size_t last_row_offset = (params_.seq_len - 1) * params_.d_model;
+                LOG_DEBUG("[LMHeadStage] Hidden states input (last row, first 8): "
+                          << hidden[last_row_offset + 0] << ","
+                          << hidden[last_row_offset + 1] << ","
+                          << hidden[last_row_offset + 2] << ","
+                          << hidden[last_row_offset + 3] << ","
+                          << hidden[last_row_offset + 4] << ","
+                          << hidden[last_row_offset + 5] << ","
+                          << hidden[last_row_offset + 6] << ","
+                          << hidden[last_row_offset + 7]);
+            }
+        }
+
         // Get or create GEMM kernel for LM head weight
         // The kernel handles quantized weights and typed activations
         ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.lm_head_weight);
@@ -3321,6 +3601,25 @@ namespace llaminar2
         {
             LOG_ERROR("[LMHeadStage] GEMM failed");
             return false;
+        }
+
+        // Debug: dump local logits at last position
+        {
+            const float *logits_data = params_.logits->fp32_data();
+            if (logits_data && params_.seq_len > 0)
+            {
+                // Get last row logits
+                size_t last_row_offset = (params_.seq_len - 1) * params_.vocab_size;
+                LOG_DEBUG("[LMHeadStage] Local logits (last row, first 8): "
+                          << logits_data[last_row_offset + 0] << ","
+                          << logits_data[last_row_offset + 1] << ","
+                          << logits_data[last_row_offset + 2] << ","
+                          << logits_data[last_row_offset + 3] << ","
+                          << logits_data[last_row_offset + 4] << ","
+                          << logits_data[last_row_offset + 5] << ","
+                          << logits_data[last_row_offset + 6] << ","
+                          << logits_data[last_row_offset + 7]);
+            }
         }
 
         // Apply bias if present
@@ -3521,6 +3820,13 @@ namespace llaminar2
     {
         // Allreduce is backend-agnostic (uses MPI directly)
         return std::make_unique<AllreduceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createAllGather(
+        const AllGatherStage::Params &params)
+    {
+        // AllGather is backend-agnostic (uses MPI directly)
+        return std::make_unique<AllGatherStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionWithKVCache(
