@@ -17,6 +17,7 @@
 #include "../../tensors/Tensors.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/MPIStrategy.h"
+#include "../../execution/GraphBuildUtils.h"
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
@@ -24,41 +25,8 @@
 namespace llaminar2
 {
 
-    // =============================================================================
-    // Helper Functions
-    // =============================================================================
-
-    /**
-     * @brief Check if a weight tensor is sharded row-parallel
-     */
-    static bool isRowParallelSharded(const TensorBase *weight)
-    {
-        if (!weight)
-            return false;
-
-        const auto *slice = dynamic_cast<const TensorSlice *>(weight);
-        bool result = slice && slice->is_row_parallel();
-        LOG_DEBUG("[isRowParallelSharded] weight=" << weight << " is_slice=" << (slice != nullptr)
-                                                   << " is_row_parallel=" << (slice ? slice->is_row_parallel() : false)
-                                                   << " result=" << result);
-        return result;
-    }
-
-    /**
-     * @brief Get MPI communicator as void* for AllreduceStage
-     */
-    static void *getMPIComm(const MPIContext *mpi_ctx)
-    {
-        if (!mpi_ctx)
-        {
-            LOG_WARN("[getMPIComm] mpi_ctx is null!");
-            return nullptr;
-        }
-        MPI_Comm comm = mpi_ctx->comm();
-        void *result = static_cast<void *>(comm);
-        LOG_DEBUG("[getMPIComm] mpi_ctx=" << mpi_ctx << " comm=" << comm << " result=" << result);
-        return result;
-    }
+    // Import graph_utils for cleaner code
+    using namespace graph_utils;
 
     // =============================================================================
     // Constructors
@@ -79,39 +47,9 @@ namespace llaminar2
                                                                << " n_heads=" << config_.n_heads
                                                                << " n_kv_heads=" << config_.n_kv_heads);
 
-        // Configure underlying GraphExecutor
-        GraphExecutorConfig exec_config = config.executor_config;
-        exec_config.default_device = config.default_device;
-        exec_config.enable_profiling = config.enable_profiling;
-        exec_config.enable_validation = config.enable_validation;
-
-        // Parse execution mode from environment
-        const auto &env = debugEnv();
-        if (env.execution.execution_mode == "parallel")
-        {
-            exec_config.mode = ExecutionMode::PARALLEL;
-        }
-        else if (env.execution.execution_mode == "pipelined")
-        {
-            exec_config.mode = ExecutionMode::PIPELINED;
-        }
-        else
-        {
-            exec_config.mode = ExecutionMode::SEQUENTIAL;
-        }
-
-        executor_ = GraphExecutor(exec_config);
-
-        // Propagate MPI rank to executor for stage dumping
-        if (mpi_ctx_)
-        {
-            executor_.setMPIRank(mpi_ctx_->rank());
-        }
-
         LOG_INFO("[Qwen2Graph] Initialized (full) with " << config_.n_layers
                                                          << " layers, precision="
-                                                         << (config_.activation_precision == ActivationPrecision::Q8_1 ? "Q8_1" : "FP32")
-                                                         << ", mode=" << executionModeName(exec_config.mode));
+                                                         << (config_.activation_precision == ActivationPrecision::Q8_1 ? "Q8_1" : "FP32"));
     }
 
     Qwen2Graph::Qwen2Graph(const Qwen2GraphConfig &config,
@@ -129,61 +67,7 @@ namespace llaminar2
                                                                     << " mpi_ctx=" << (mpi_ctx_ ? "valid" : "nullptr")
                                                                     << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1));
 
-        // Configure underlying GraphExecutor
-        GraphExecutorConfig exec_config = config.executor_config;
-        exec_config.default_device = config.default_device;
-        exec_config.enable_profiling = config.enable_profiling;
-        exec_config.enable_validation = config.enable_validation;
-
-        // Parse execution mode from environment
-        const auto &env = debugEnv();
-        if (env.execution.execution_mode == "parallel")
-        {
-            exec_config.mode = ExecutionMode::PARALLEL;
-        }
-        else if (env.execution.execution_mode == "pipelined")
-        {
-            exec_config.mode = ExecutionMode::PIPELINED;
-        }
-        else
-        {
-            exec_config.mode = ExecutionMode::SEQUENTIAL;
-        }
-
-        executor_ = GraphExecutor(exec_config);
-
-        // Propagate MPI rank to executor for stage dumping
-        if (mpi_ctx_)
-        {
-            executor_.setMPIRank(mpi_ctx_->rank());
-        }
-
-        LOG_DEBUG("[Qwen2Graph] Initialized (layer-only), mode=" << executionModeName(exec_config.mode));
-    }
-
-    // =============================================================================
-    // Device Context Management
-    // =============================================================================
-
-    IDeviceContext *Qwen2Graph::getDeviceContext(int device_idx)
-    {
-        auto it = device_contexts_.find(device_idx);
-        if (it != device_contexts_.end())
-        {
-            return it->second.get();
-        }
-
-        // Create new context
-        auto ctx = IDeviceContext::create(device_idx);
-        if (!ctx)
-        {
-            LOG_ERROR("[Qwen2Graph] Failed to create device context for device " << device_idx);
-            return nullptr;
-        }
-
-        IDeviceContext *raw_ptr = ctx.get();
-        device_contexts_[device_idx] = std::move(ctx);
-        return raw_ptr;
+        LOG_DEBUG("[Qwen2Graph] Initialized (layer-only)");
     }
 
     // =============================================================================
@@ -307,11 +191,12 @@ namespace llaminar2
 
         // Position IDs must be provided externally (or use fallback for backward compat)
         const int *position_ids = input.position_ids;
+        std::vector<int> local_position_ids;
         if (!position_ids)
         {
             // Fallback: build position IDs internally (deprecated path)
-            position_ids_buffer_ = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
-            position_ids = position_ids_buffer_.data();
+            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
+            position_ids = local_position_ids.data();
             LOG_DEBUG("[Qwen2Graph] Position IDs built internally (deprecated - prefer external input)");
         }
 
@@ -449,6 +334,154 @@ namespace llaminar2
         output.logits = buffers_.logits;
 
         LOG_DEBUG("[Qwen2Graph] Built full forward graph with "
+                  << graph.size() << " nodes");
+
+        return graph;
+    }
+
+    // =========================================================================
+    // Schema-Based Graph Building (Phase 4d)
+    // =========================================================================
+
+    ComputeGraph Qwen2Graph::buildForwardGraphFromSchema(
+        const Qwen2ForwardInput &input,
+        Qwen2ForwardOutput &output)
+    {
+        LOG_DEBUG("[Qwen2Graph] Building forward graph from schema: "
+                  << "batch_size=" << input.batch_size
+                  << ", seq_len=" << input.seq_len);
+
+        // =====================================================================
+        // Step 1: Create the declarative schema
+        // =====================================================================
+        Qwen2SchemaFactory factory;
+        GraphSchema schema = factory.createSchema();
+
+        // =====================================================================
+        // Step 2: Build runtime configuration
+        // =====================================================================
+        GraphResolverConfig config;
+
+        // MPI / Tensor Parallelism
+        config.world_size = mpi_ctx_ ? mpi_ctx_->world_size() : 1;
+        config.rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+        config.mpi_comm = mpi_ctx_ ? mpi_ctx_->comm() : MPI_COMM_NULL;
+
+        // Execution dimensions
+        config.batch_size = input.batch_size;
+        config.seq_len = input.seq_len;
+        config.default_device = config_.default_device;
+
+        // Model dimensions
+        config.n_layers = config_.n_layers;
+        config.d_model = config_.d_model;
+        config.n_heads = config_.n_heads;
+        config.n_kv_heads = config_.n_kv_heads;
+        config.head_dim = config_.head_dim;
+        config.d_ff = config_.d_ff;
+        config.vocab_size = config_.vocab_size;
+
+        // TP-adjusted dimensions
+        config.local_n_heads = config_.qkv_column_parallel ? config_.local_n_heads : config_.n_heads;
+        config.local_n_kv_heads = config_.qkv_column_parallel ? config_.local_n_kv_heads : config_.n_kv_heads;
+        config.local_d_ff = config_.ffn_column_parallel ? config_.d_ff_local : config_.d_ff;
+        config.local_vocab = config_.lm_head_column_parallel ? config_.vocab_local : config_.vocab_size;
+
+        // Model parameters
+        config.rms_norm_eps = config_.rms_norm_eps;
+        config.rope_theta = config_.rope_theta;
+
+        // KV cache state
+        config.has_kv_cache = (input.kv_cache != nullptr);
+        if (config.has_kv_cache)
+        {
+            config.cached_tokens = input.kv_cache->get_cached_tokens(0, 0);
+        }
+
+        // Execution policy from debugEnv
+        config.exec_policy = ExecutionPolicyFlags::fromDebugEnv();
+
+        // =====================================================================
+        // Step 3: Build TensorContext for name → tensor resolution
+        // =====================================================================
+        TensorContext tensors;
+
+        // Activation buffers
+        tensors.buffers["hidden"] = buffers_.current_hidden;
+        tensors.buffers["normalized"] = buffers_.layer_buffers.normalized;
+        tensors.buffers["Q"] = buffers_.layer_buffers.Q;
+        tensors.buffers["K"] = buffers_.layer_buffers.K;
+        tensors.buffers["V"] = buffers_.layer_buffers.V;
+        tensors.buffers["attn_output"] = buffers_.layer_buffers.attn_output;
+        tensors.buffers["attn_proj"] = buffers_.layer_buffers.attn_proj;
+        tensors.buffers["gate"] = buffers_.layer_buffers.gate;
+        tensors.buffers["up"] = buffers_.layer_buffers.up;
+        tensors.buffers["logits"] = buffers_.logits;
+        tensors.buffers["logits_local"] = buffers_.logits_local;
+
+        // Model-level weights
+        tensors.model_weights["embedding_table"] = weights_.embedding_table;
+        tensors.model_weights["final_norm"] = weights_.final_norm;
+        tensors.model_weights["lm_head"] = weights_.lm_head;
+
+        // Layer weight accessor
+        tensors.get_layer_weight = [this](int layer_idx, const std::string &name) -> TensorBase *
+        {
+            if (!weights_.get_layer_weights)
+                return nullptr;
+
+            Qwen2LayerWeights layer = weights_.get_layer_weights(layer_idx);
+
+            if (name == "wq")
+                return layer.wq;
+            if (name == "wk")
+                return layer.wk;
+            if (name == "wv")
+                return layer.wv;
+            if (name == "wo")
+                return layer.wo;
+            if (name == "attn_norm")
+                return layer.attn_norm;
+            if (name == "q_bias")
+                return layer.q_bias;
+            if (name == "k_bias")
+                return layer.k_bias;
+            if (name == "v_bias")
+                return layer.v_bias;
+            if (name == "gate_proj")
+                return layer.gate_proj;
+            if (name == "up_proj")
+                return layer.up_proj;
+            if (name == "down_proj")
+                return layer.down_proj;
+            if (name == "ffn_norm")
+                return layer.ffn_norm;
+
+            LOG_WARN("[TensorContext] Unknown layer weight: " << name);
+            return nullptr;
+        };
+
+        // =====================================================================
+        // Step 4: Resolve schema to concrete graph spec
+        // =====================================================================
+        GraphResolver resolver;
+        ResolvedGraphSpec resolved = resolver.resolve(schema, config, tensors);
+
+        LOG_DEBUG("[Qwen2Graph] Schema resolved: " << resolved.stages.size() << " stages"
+                                                   << " (emitted=" << resolved.stats.stages_emitted
+                                                   << ", skipped=" << resolved.stats.stages_skipped
+                                                   << ", allreduce=" << resolved.stats.allreduce_inserted
+                                                   << ", allgather=" << resolved.stats.allgather_inserted << ")");
+
+        // =====================================================================
+        // Step 5: Build the ComputeGraph
+        // =====================================================================
+        ComputeGraph graph = GraphBuilder::build(resolved);
+
+        // Set output
+        output.logits = buffers_.logits;
+
+        LOG_DEBUG("[Qwen2Graph] Built schema-based forward graph with "
                   << graph.size() << " nodes");
 
         return graph;
@@ -941,7 +974,7 @@ namespace llaminar2
                           device_idx);
 
             bool wo_is_sharded = isRowParallelSharded(layer.wo);
-            bool has_multi_rank = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+            bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
             if (wo_is_sharded && has_multi_rank)
             {
@@ -952,7 +985,7 @@ namespace llaminar2
                               ComputeStageFactory::createAllreduce(
                                   AllreduceStage::Params{
                                       buffers.attn_proj,
-                                      getMPIComm(mpi_ctx_.get()),
+                                      getMPICommPtr(mpi_ctx_.get()),
                                       allreduce_count}),
                               device_idx);
 
@@ -984,7 +1017,7 @@ namespace llaminar2
             if (env.execution.exec_gemm && layer.wo)
             {
                 bool wo_is_sharded = isRowParallelSharded(layer.wo);
-                bool has_multi_rank = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+                bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
                 if (wo_is_sharded && has_multi_rank)
                 {
@@ -1116,12 +1149,12 @@ namespace llaminar2
 
             bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
             bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
-            bool has_multi_rank = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+            bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
             if (needs_allreduce && has_multi_rank)
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * down_n;
-                MPI_Comm comm = static_cast<MPI_Comm>(getMPIComm(mpi_ctx_.get()));
+                MPI_Comm comm = static_cast<MPI_Comm>(getMPICommPtr(mpi_ctx_.get()));
 
                 LOG_DEBUG("[buildFFNGraph] Adding down_allreduce: ffn_column_parallel="
                           << config_.ffn_column_parallel << " down_is_row_sharded=" << down_is_row_sharded
@@ -1156,7 +1189,7 @@ namespace llaminar2
             {
                 bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
                 bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
-                bool has_multi_rank = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+                bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
                 if (needs_allreduce && has_multi_rank)
                 {
@@ -1170,274 +1203,6 @@ namespace llaminar2
         }
 
         return graph;
-    }
-
-    // =============================================================================
-    // Execution Methods
-    // =============================================================================
-
-    bool Qwen2Graph::executeForward(
-        const Qwen2ForwardInput &input,
-        Qwen2ForwardOutput &output)
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        if (!input.token_ids && !input.batches)
-        {
-            LOG_ERROR("[Qwen2Graph] No token input provided");
-            return false;
-        }
-
-        if (input.seq_len <= 0)
-        {
-            LOG_ERROR("[Qwen2Graph] Invalid sequence length: " << input.seq_len);
-            return false;
-        }
-
-        LOG_TRACE("[Qwen2Graph] executeForward: batch_size=" << input.batch_size
-                                                             << ", seq_len=" << input.seq_len
-                                                             << ", device=" << input.device_idx);
-
-        // Build and execute full forward graph
-        ComputeGraph graph = buildFullForwardGraph(input, output);
-
-        if (graph.size() == 0)
-        {
-            LOG_ERROR("[Qwen2Graph] Empty forward graph");
-            return false;
-        }
-
-        // Get device context
-        IDeviceContext *ctx = getDeviceContext(input.device_idx);
-        if (!ctx)
-        {
-            LOG_ERROR("[Qwen2Graph] Failed to get device context");
-            return false;
-        }
-
-        // Execute
-        bool success = executor_.execute(graph, ctx);
-
-        auto end = std::chrono::high_resolution_clock::now();
-        double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
-
-        LOG_DEBUG("[Qwen2Graph] Forward completed in " << ms << "ms, success=" << success);
-
-        return success;
-    }
-
-    bool Qwen2Graph::execute(ComputeGraph &graph, IDeviceContext *ctx)
-    {
-        return executor_.execute(graph, ctx);
-    }
-
-    bool Qwen2Graph::executeAttention(
-        const Qwen2LayerWeights &layer,
-        Qwen2ActivationBuffers &buffers,
-        int layer_idx,
-        int seq_len,
-        IUnifiedKVCache *kv_cache,
-        const int *position_ids,
-        int device_idx)
-    {
-        const auto &env = debugEnv();
-
-        // Debug: dump input to attention (for layer 0 only)
-        if (layer_idx == 0)
-        {
-            const float *input = buffers.current_hidden->fp32_data();
-            LOG_INFO("[EXEC_ATTN_INPUT] layer=" << layer_idx << " seq_len=" << seq_len
-                                                << " input[0:4]=" << input[0] << "," << input[1] << "," << input[2] << "," << input[3]);
-        }
-
-        // Get device context
-        IDeviceContext *ctx = getDeviceContext(device_idx);
-        if (!ctx)
-        {
-            return false;
-        }
-
-        // =============================================================================
-        // Phase 10: Graph Caching for Decode Mode
-        // =============================================================================
-        // For decode mode (seq_len=1), we can cache and reuse the attention graph.
-        // Only the position offset changes between decode steps.
-        // =============================================================================
-        int pos_offset = position_ids ? position_ids[0] : 0;
-
-        if (graph_caching_enabled_ && seq_len == 1 &&
-            layer_idx >= 0 && static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
-        {
-            auto &cache = layer_graph_cache_[layer_idx];
-
-            // Check if we have a valid cached graph for decode mode
-            if (cache.attention_decode && cache.cached_seq_len == 1 && cache.valid)
-            {
-                LOG_DEBUG("[Qwen2Graph] Reusing cached attention graph for layer " << layer_idx << " (pos_offset=" << pos_offset << ")");
-
-                // Update dynamic parameters (position offset)
-                updateCachedGraphParams(*cache.attention_decode, pos_offset, seq_len);
-
-                // Execute cached graph
-                bool success = executor_.execute(*cache.attention_decode, ctx);
-                if (!success)
-                {
-                    LOG_ERROR("[Qwen2Graph] Cached attention graph failed at layer " << layer_idx);
-                }
-                cache.attention_decode->reset(); // Reset for next execution
-                return success;
-            }
-
-            // Build and cache the graph
-            LOG_DEBUG("[Qwen2Graph] Building and caching attention graph for layer " << layer_idx << " (decode mode)");
-            cache.attention_decode = std::make_unique<ComputeGraph>(
-                buildAttentionGraph(layer, buffers, layer_idx, seq_len, 1, kv_cache, position_ids, device_idx, nullptr));
-            cache.cached_seq_len = seq_len;
-            cache.valid = true;
-
-            // Execute the newly built graph
-            bool success = executor_.execute(*cache.attention_decode, ctx);
-            if (!success)
-            {
-                LOG_ERROR("[Qwen2Graph] Attention block failed at layer " << layer_idx);
-            }
-            cache.attention_decode->reset();
-            return success;
-        }
-
-        // =============================================================================
-        // Non-cached path (prefill or caching disabled)
-        // =============================================================================
-        ComputeGraph graph = buildAttentionGraph(layer, buffers, layer_idx, seq_len,
-                                                 1, kv_cache, position_ids, device_idx, nullptr);
-
-        // Debug: log graph structure
-        if (layer_idx == 0)
-        {
-            auto order = graph.getExecutionOrder();
-            LOG_INFO("[EXEC_ATTN] Graph has " << graph.size() << " nodes, execution order:");
-            for (const auto &name : order)
-            {
-                LOG_INFO("[EXEC_ATTN]   - " << name);
-            }
-        }
-
-        bool success = executor_.execute(graph, ctx);
-
-        // Debug: dump intermediate buffers (for layer 0 only)
-        if (layer_idx == 0 && buffers.normalized && buffers.Q && buffers.attn_output && buffers.attn_proj)
-        {
-            const float *normalized = buffers.normalized->fp32_data();
-            const float *Q = buffers.Q->fp32_data();
-            const float *attn_output = buffers.attn_output->fp32_data();
-            const float *attn_proj = buffers.attn_proj->fp32_data();
-            const float *output = buffers.current_hidden->fp32_data();
-            LOG_INFO("[EXEC_ATTN_OUTPUT] layer=" << layer_idx << " seq_len=" << seq_len
-                                                 << " output[0:4]=" << output[0] << "," << output[1] << "," << output[2] << "," << output[3]);
-        }
-
-        if (!success)
-        {
-            LOG_ERROR("[Qwen2Graph] Attention block failed at layer " << layer_idx);
-        }
-
-        return success;
-    }
-
-    bool Qwen2Graph::executeFFN(
-        const Qwen2LayerWeights &layer,
-        Qwen2ActivationBuffers &buffers,
-        int layer_idx,
-        int seq_len,
-        int device_idx)
-    {
-        // Get device context
-        IDeviceContext *ctx = getDeviceContext(device_idx);
-        if (!ctx)
-        {
-            return false;
-        }
-
-        // =============================================================================
-        // Phase 10: Graph Caching for Decode Mode
-        // =============================================================================
-        // FFN graphs have no dynamic parameters (no position offset).
-        // For decode mode (seq_len=1), we can cache and reuse directly.
-        // =============================================================================
-        if (graph_caching_enabled_ && seq_len == 1 &&
-            layer_idx >= 0 && static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
-        {
-            auto &cache = layer_graph_cache_[layer_idx];
-
-            // Check if we have a valid cached FFN graph
-            if (cache.ffn_decode && cache.valid)
-            {
-                LOG_DEBUG("[Qwen2Graph] Reusing cached FFN graph for layer " << layer_idx);
-
-                // Execute cached graph (no params to update for FFN)
-                bool success = executor_.execute(*cache.ffn_decode, ctx);
-                if (!success)
-                {
-                    LOG_ERROR("[Qwen2Graph] Cached FFN graph failed at layer " << layer_idx);
-                }
-                cache.ffn_decode->reset();
-                return success;
-            }
-
-            // Build and cache the graph
-            LOG_DEBUG("[Qwen2Graph] Building and caching FFN graph for layer " << layer_idx << " (decode mode)");
-            cache.ffn_decode = std::make_unique<ComputeGraph>(
-                buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device_idx)); // batch_size=1 for decode
-
-            // Execute the newly built graph
-            bool success = executor_.execute(*cache.ffn_decode, ctx);
-            if (!success)
-            {
-                LOG_ERROR("[Qwen2Graph] FFN block failed at layer " << layer_idx);
-            }
-            cache.ffn_decode->reset();
-            return success;
-        }
-
-        // =============================================================================
-        // Non-cached path (prefill or caching disabled)
-        // =============================================================================
-        ComputeGraph graph = buildFFNGraph(layer, buffers, layer_idx, seq_len, 1, device_idx); // batch_size=1 for deprecated path
-
-        bool success = executor_.execute(graph, ctx);
-
-        if (!success)
-        {
-            LOG_ERROR("[Qwen2Graph] FFN block failed at layer " << layer_idx);
-        }
-
-        return success;
-    }
-
-    bool Qwen2Graph::executeLayer(
-        const Qwen2LayerWeights &layer,
-        Qwen2ActivationBuffers &buffers,
-        int layer_idx,
-        int seq_len,
-        IUnifiedKVCache *kv_cache,
-        const int *position_ids,
-        int device_idx)
-    {
-        LOG_INFO("[Qwen2Graph::executeLayer] LAYER_EXEC_ENTERED layer_idx=" << layer_idx << " seq_len=" << seq_len);
-
-        // Execute attention block
-        if (!executeAttention(layer, buffers, layer_idx, seq_len, kv_cache, position_ids, device_idx))
-        {
-            return false;
-        }
-
-        // Execute FFN block
-        if (!executeFFN(layer, buffers, layer_idx, seq_len, device_idx))
-        {
-            return false;
-        }
-
-        return true;
     }
 
     // =============================================================================
@@ -1457,6 +1222,82 @@ namespace llaminar2
         }
 
         return pos_ids;
+    }
+
+    GraphSchema Qwen2Graph::getSchema() const
+    {
+        Qwen2SchemaFactory factory;
+        return factory.createSchema();
+    }
+
+    GraphResolverConfig Qwen2Graph::getResolverConfig(int seq_len) const
+    {
+        GraphResolverConfig config;
+
+        // MPI context
+        if (mpi_ctx_)
+        {
+            config.world_size = mpi_ctx_->world_size();
+            config.rank = mpi_ctx_->rank();
+            config.mpi_comm = mpi_ctx_->comm();
+            config.mpi_ctx = mpi_ctx_.get();
+        }
+
+        // Sequence configuration
+        config.seq_len = seq_len;
+        config.batch_size = 1;
+
+        // Device configuration
+        config.default_device = config_.default_device;
+
+        // Model architecture
+        config.n_layers = config_.n_layers;
+        config.d_model = config_.d_model;
+        config.n_heads = config_.n_heads;
+        config.n_kv_heads = config_.n_kv_heads;
+        config.head_dim = config_.head_dim;
+        config.d_ff = config_.d_ff;
+        config.vocab_size = config_.vocab_size;
+        config.rms_norm_eps = config_.rms_norm_eps;
+        config.rope_theta = config_.rope_theta;
+
+        // TP-adjusted local dimensions
+        // Use local head counts when QKV is column-parallel
+        config.local_n_heads = config_.qkv_column_parallel
+                                   ? config_.local_n_heads
+                                   : config_.n_heads;
+        config.local_n_kv_heads = config_.qkv_column_parallel
+                                      ? config_.local_n_kv_heads
+                                      : config_.n_kv_heads;
+
+        // Validate (safety check for uninitialized config)
+        if (config.local_n_heads <= 0)
+            config.local_n_heads = config_.n_heads;
+        if (config.local_n_kv_heads <= 0)
+            config.local_n_kv_heads = config_.n_kv_heads;
+
+        // Use local FFN dimension when FFN is column-parallel
+        config.local_d_ff = config_.ffn_column_parallel
+                                ? config_.d_ff_local
+                                : config_.d_ff;
+        if (config.local_d_ff <= 0)
+            config.local_d_ff = config_.d_ff;
+
+        // Use local vocab when LM head is column-parallel
+        config.local_vocab = config_.lm_head_column_parallel
+                                 ? config_.vocab_local
+                                 : config_.vocab_size;
+        if (config.local_vocab <= 0)
+            config.local_vocab = config_.vocab_size;
+
+        LOG_DEBUG("[Qwen2Graph::getResolverConfig] Created config: "
+                  << "seq_len=" << config.seq_len << ", "
+                  << "local_n_heads=" << config.local_n_heads << " (n_heads=" << config.n_heads << "), "
+                  << "local_n_kv_heads=" << config.local_n_kv_heads << " (n_kv_heads=" << config.n_kv_heads << "), "
+                  << "local_d_ff=" << config.local_d_ff << " (d_ff=" << config.d_ff << "), "
+                  << "local_vocab=" << config.local_vocab << " (vocab_size=" << config.vocab_size << ")");
+
+        return config;
     }
 
     void Qwen2Graph::addFinalNormToGraph(
@@ -1482,296 +1323,6 @@ namespace llaminar2
         {
             graph.addDependency("final_norm", prev_node);
         }
-    }
-
-    void Qwen2Graph::clearCache()
-    {
-        position_ids_buffer_.clear();
-
-        // Clear cached graphs (Phase 10)
-        for (auto &cache : layer_graph_cache_)
-        {
-            cache.attention_decode.reset();
-            cache.ffn_decode.reset();
-            cache.cached_seq_len = 0;
-            cache.valid = false;
-        }
-        last_pos_offset_ = -1;
-
-        LOG_DEBUG("[Qwen2Graph] Cache cleared (including " << layer_graph_cache_.size() << " layer graph caches)");
-    }
-
-    bool Qwen2Graph::hasValidCachedGraph(int layer_idx, bool is_attention) const
-    {
-        if (!graph_caching_enabled_)
-            return false;
-        if (layer_idx < 0 || static_cast<size_t>(layer_idx) >= layer_graph_cache_.size())
-            return false;
-
-        const auto &cache = layer_graph_cache_[layer_idx];
-        if (!cache.valid)
-            return false;
-
-        if (is_attention)
-            return cache.attention_decode != nullptr;
-        else
-            return cache.ffn_decode != nullptr;
-    }
-
-    // =============================================================================
-    // Graph Buffer Management (Phase 5)
-    // =============================================================================
-
-    bool Qwen2Graph::initializeBuffers(int seq_len)
-    {
-        if (!config_.use_graph_buffer_management)
-        {
-            LOG_WARN("[Qwen2Graph] initializeBuffers called but use_graph_buffer_management=false");
-            return false;
-        }
-
-        LOG_INFO("[Qwen2Graph] Initializing buffers with graph management, seq_len=" << seq_len);
-
-        // Create buffer spec builder if not already created
-        if (!buffer_spec_builder_)
-        {
-            // Determine activation tensor type
-            BufferTensorType activation_type =
-                (config_.activation_precision == ActivationPrecision::Q8_1)
-                    ? BufferTensorType::Q8_1
-                    : BufferTensorType::FP32;
-
-            // =================================================================
-            // Phase 3: Use local head counts for buffer allocation when TP is enabled
-            // =================================================================
-            // When qkv_column_parallel is enabled:
-            // - Q buffer: [seq_len, local_n_heads * head_dim]
-            // - K/V buffers: [seq_len, local_n_kv_heads * head_dim]
-            // - Attention output: [seq_len, local_n_heads * head_dim]
-            // =================================================================
-            int buf_n_heads = config_.qkv_column_parallel
-                                  ? config_.local_n_heads
-                                  : config_.n_heads;
-            int buf_n_kv_heads = config_.qkv_column_parallel
-                                     ? config_.local_n_kv_heads
-                                     : config_.n_kv_heads;
-
-            // Validate (safety check for uninitialized config)
-            if (buf_n_heads <= 0)
-                buf_n_heads = config_.n_heads;
-            if (buf_n_kv_heads <= 0)
-                buf_n_kv_heads = config_.n_kv_heads;
-
-            // =================================================================
-            // Phase 4: Use local FFN dimension for buffer allocation when TP is enabled
-            // =================================================================
-            // When ffn_column_parallel is enabled:
-            // - Gate buffer: [seq_len, d_ff_local]
-            // - Up buffer: [seq_len, d_ff_local]
-            // - FFN output buffer: [seq_len, d_ff_local]
-            // =================================================================
-            int buf_d_ff = config_.ffn_column_parallel
-                               ? config_.d_ff_local
-                               : config_.d_ff;
-
-            // Validate (safety check for uninitialized config)
-            if (buf_d_ff <= 0)
-                buf_d_ff = config_.d_ff;
-
-            buffer_spec_builder_ = std::make_unique<Qwen2BufferSpecBuilder>(
-                config_.d_model,
-                buf_n_heads,    // Use local head count for TP
-                buf_n_kv_heads, // Use local KV head count for TP
-                config_.head_dim,
-                buf_d_ff, // Use local FFN dimension for TP
-                config_.vocab_size,
-                activation_type,
-                config_.default_device);
-
-            LOG_DEBUG("[Qwen2Graph] Buffer spec builder: "
-                      << "n_heads=" << buf_n_heads << " (config_.n_heads=" << config_.n_heads << "), "
-                      << "n_kv_heads=" << buf_n_kv_heads << " (config_.n_kv_heads=" << config_.n_kv_heads << "), "
-                      << "d_ff=" << buf_d_ff << " (config_.d_ff=" << config_.d_ff << "), "
-                      << "qkv_column_parallel=" << config_.qkv_column_parallel << ", "
-                      << "ffn_column_parallel=" << config_.ffn_column_parallel);
-        }
-
-        // Verify TensorFactory is set
-        if (!tensor_factory_)
-        {
-            LOG_ERROR("[Qwen2Graph] TensorFactory not set. Call setTensorFactory() before initializeBuffers()");
-            return false;
-        }
-
-        // Create buffer manager with TensorFactory
-        buffer_manager_ = std::make_unique<GraphBufferManager>(
-            tensor_factory_, mpi_ctx_.get());
-
-        // Build layer buffer specifications
-        auto layer_specs = buffer_spec_builder_->buildLayerSpecs(seq_len);
-        auto layer_reqs = toBufferRequirements(layer_specs);
-
-        // Allocate layer buffers (iterate over vector)
-        for (const auto &desc : layer_reqs.buffers)
-        {
-            if (!buffer_manager_->allocateBuffer("layer", desc))
-            {
-                LOG_ERROR("[Qwen2Graph] Failed to allocate layer buffer: " << desc.name);
-                return false;
-            }
-        }
-
-        // Build model-level buffer specifications (current_hidden, logits)
-        auto model_specs = buffer_spec_builder_->buildModelSpecs(1, seq_len);
-        auto model_reqs = toBufferRequirements(model_specs);
-
-        for (const auto &desc : model_reqs.buffers)
-        {
-            if (!buffer_manager_->allocateBuffer("model", desc))
-            {
-                LOG_ERROR("[Qwen2Graph] Failed to allocate model buffer: " << desc.name);
-                return false;
-            }
-        }
-
-        // Bind allocated buffers to buffers_ struct
-        bindGraphManagedBuffers(seq_len);
-
-        auto &stats = buffer_manager_->stats();
-        LOG_INFO("[Qwen2Graph] Buffer initialization complete: "
-                 << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB, "
-                 << "scratch=" << (stats.scratch_bytes / (1024.0 * 1024.0)) << " MB, "
-                 << "output=" << (stats.output_bytes / (1024.0 * 1024.0)) << " MB");
-
-        // Log theoretical aliasing savings
-        auto [original, optimized] = buffer_spec_builder_->estimateMemorySavings(seq_len);
-        double savings = (original > 0) ? 100.0 * (original - optimized) / original : 0.0;
-        LOG_INFO("[Qwen2Graph] Theoretical aliasing savings: "
-                 << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
-                 << " (" << savings << "% reduction)");
-
-        // =============================================================================
-        // Phase 10: Enable Graph Caching
-        // =============================================================================
-        // With graph-managed buffers, buffer pointers are stable across executions.
-        // This means we can cache the built graphs and reuse them.
-        // =============================================================================
-        graph_caching_enabled_ = true;
-        layer_graph_cache_.resize(config_.n_layers);
-        LOG_INFO("[Qwen2Graph] Graph caching ENABLED for " << config_.n_layers << " layers");
-
-        return true;
-    }
-
-    void Qwen2Graph::releaseBuffers()
-    {
-        // Clear cached graphs first (they reference buffers)
-        for (auto &cache : layer_graph_cache_)
-        {
-            cache.attention_decode.reset();
-            cache.ffn_decode.reset();
-            cache.cached_seq_len = 0;
-            cache.valid = false;
-        }
-        graph_caching_enabled_ = false;
-
-        if (buffer_manager_)
-        {
-            buffer_manager_->releaseAll();
-            buffer_manager_.reset();
-            LOG_INFO("[Qwen2Graph] Buffers released");
-        }
-
-        owned_buffers_.clear();
-        buffer_spec_builder_.reset();
-
-        // Clear buffer pointers
-        buffers_ = Qwen2ModelBuffers{};
-    }
-
-    const BufferAllocationStats *Qwen2Graph::bufferStats() const
-    {
-        if (!buffer_manager_)
-        {
-            return nullptr;
-        }
-        return &buffer_manager_->stats();
-    }
-
-    void Qwen2Graph::bindGraphManagedBuffers(int seq_len)
-    {
-        if (!buffer_manager_)
-        {
-            LOG_ERROR("[Qwen2Graph] bindGraphManagedBuffers: buffer_manager_ is null");
-            return;
-        }
-
-        // Bind layer buffers
-        auto &lb = buffers_.layer_buffers;
-
-        lb.residual = buffer_manager_->getBuffer("layer", BufferNames::RESIDUAL);
-        lb.normalized = buffer_manager_->getBuffer("layer", BufferNames::NORMALIZED);
-
-        // Attention buffers
-        lb.Q = buffer_manager_->getBuffer("layer", BufferNames::Q);
-        lb.K = buffer_manager_->getBuffer("layer", BufferNames::K);
-        lb.V = buffer_manager_->getBuffer("layer", BufferNames::V);
-        lb.attn_output = buffer_manager_->getBuffer("layer", BufferNames::ATTN_OUTPUT);
-        lb.attn_proj = buffer_manager_->getBuffer("layer", BufferNames::ATTN_PROJ);
-        lb.workspace_scores = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_SCORES);
-        lb.workspace_context = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_CONTEXT);
-        lb.workspace_mask = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_MASK);
-
-        // FFN buffers
-        lb.gate = buffer_manager_->getBuffer("layer", BufferNames::GATE);
-        lb.up = buffer_manager_->getBuffer("layer", BufferNames::UP);
-        lb.ffn_output = buffer_manager_->getBuffer("layer", BufferNames::FFN_OUTPUT);
-
-        // Model-level buffers
-        buffers_.current_hidden = buffer_manager_->getBuffer("model", BufferNames::CURRENT_HIDDEN);
-        buffers_.logits = buffer_manager_->getBuffer("model", BufferNames::LOGITS);
-
-        LOG_DEBUG("[Qwen2Graph] Bound graph-managed buffers: "
-                  << "residual=" << lb.residual
-                  << " Q=" << lb.Q
-                  << " gate=" << lb.gate
-                  << " current_hidden=" << buffers_.current_hidden
-                  << " logits=" << buffers_.logits);
-    }
-
-    // =============================================================================
-    // Graph Caching Helper Methods (Phase 10)
-    // =============================================================================
-
-    bool Qwen2Graph::canUseCachedGraph(int layer_idx, int seq_len) const
-    {
-        if (!graph_caching_enabled_)
-            return false;
-        if (layer_idx < 0 || static_cast<size_t>(layer_idx) >= layer_graph_cache_.size())
-            return false;
-
-        const auto &cache = layer_graph_cache_[layer_idx];
-        return cache.valid && cache.cached_seq_len == seq_len;
-    }
-
-    void Qwen2Graph::updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len)
-    {
-        // Update all stages in the graph that have dynamic parameters
-        // The graph structure allows us to iterate through all nodes
-        auto order = graph.getExecutionOrder();
-
-        for (const auto &node_name : order)
-        {
-            ComputeNode *node = graph.getNode(node_name);
-            if (!node || !node->stage)
-                continue;
-
-            // Update dynamic params (pos_offset, seq_len)
-            // Only stages that override updateDynamicParams will actually do anything
-            node->stage->updateDynamicParams(pos_offset, seq_len);
-        }
-
-        LOG_TRACE("[Qwen2Graph] Updated cached graph params: pos_offset=" << pos_offset << " seq_len=" << seq_len);
     }
 
 } // namespace llaminar2

@@ -145,8 +145,9 @@ namespace llaminar2
 
             WeightManager wm(loader, mpi_ctx, nullptr, WeightDistributionStrategy::SHARDED);
 
-            // Load row-parallel weight
-            const std::string tensor_name = "blk.0.attn_output.weight";
+            // Load COLUMN_PARALLEL weight (row-sliced)
+            // ffn_gate.weight is [4864, 896] -> each rank gets [2432, 896] (rows sliced, K preserved)
+            const std::string tensor_name = "blk.0.ffn_gate.weight";
             auto weight = wm.getWeight(tensor_name, 0);
             ASSERT_NE(weight, nullptr);
 
@@ -161,9 +162,11 @@ namespace llaminar2
             ASSERT_NE(gemm, nullptr) << "Failed to get GEMM kernel from pre-sliced data";
 
             // Prepare test input: [batch=4, K=896]
+            // ffn_gate.weight [4864, 896] sliced to [2432, 896]
+            // GEMM: output[m, n_local] = input[m, k] * W^T, where n_local=2432, k=896
             int m = 4;
             int k = 896;
-            int n = 448; // Output is slice rows (448 for rank 0)
+            int n = 2432; // Output is slice rows (2432 for rank 0)
 
             std::vector<float> input(m * k, 0.1f);
             std::vector<float> output(m * n, 0.0f);
@@ -196,8 +199,10 @@ namespace llaminar2
             }
 
             // Load full tensor with REPLICATED strategy (no sharding)
+            // Use ffn_gate.weight which is COLUMN_PARALLEL (row-sliced)
+            // Shape: [4864, 896] -> each rank gets [2432, 896]
             WeightManager wm_full(loader_single, mpi_ctx_single, nullptr, WeightDistributionStrategy::REPLICATED);
-            const std::string tensor_name = "blk.0.attn_output.weight";
+            const std::string tensor_name = "blk.0.ffn_gate.weight";
             auto full_weight = wm_full.getWeight(tensor_name, 0);
             ASSERT_NE(full_weight, nullptr);
 

@@ -183,6 +183,171 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Graph Buffer Management (Phase 3 - moved from Qwen2Graph)
+    // =========================================================================
+
+    bool GraphOrchestrator::initializeBuffers(int seq_len)
+    {
+        if (!graph_builder_)
+        {
+            LOG_ERROR("[GraphOrchestrator] initializeBuffers called but graph_builder not set");
+            return false;
+        }
+
+        const auto &config = graph_builder_->config();
+        if (!config.use_graph_buffer_management)
+        {
+            LOG_WARN("[GraphOrchestrator] initializeBuffers called but use_graph_buffer_management=false");
+            return false;
+        }
+
+        LOG_INFO("[GraphOrchestrator] Initializing buffers with graph management, seq_len=" << seq_len);
+
+        // Get schema and resolver config from graph builder
+        GraphSchema schema = graph_builder_->getSchema();
+        GraphResolverConfig resolver_config = graph_builder_->getResolverConfig(seq_len);
+
+        // Verify TensorFactory is set
+        if (!tensor_factory_)
+        {
+            LOG_ERROR("[GraphOrchestrator] TensorFactory not set. Call setTensorFactory() before initializeBuffers()");
+            return false;
+        }
+
+        // Create buffer manager with TensorFactory
+        buffer_manager_ = std::make_unique<GraphBufferManager>(
+            tensor_factory_, mpi_ctx_.get());
+
+        // Build layer buffer specifications using BufferAllocator
+        auto layer_reqs = BufferAllocator::resolveLayerBuffers(schema, resolver_config);
+
+        // Allocate layer buffers (iterate over vector)
+        for (const auto &desc : layer_reqs.buffers)
+        {
+            if (!buffer_manager_->allocateBuffer("layer", desc))
+            {
+                LOG_ERROR("[GraphOrchestrator] Failed to allocate layer buffer: " << desc.name);
+                return false;
+            }
+        }
+
+        // Build model-level buffer specifications (current_hidden, logits)
+        auto model_reqs = BufferAllocator::resolveModelBuffers(schema, resolver_config);
+
+        for (const auto &desc : model_reqs.buffers)
+        {
+            if (!buffer_manager_->allocateBuffer("model", desc))
+            {
+                LOG_ERROR("[GraphOrchestrator] Failed to allocate model buffer: " << desc.name);
+                return false;
+            }
+        }
+
+        // Bind allocated buffers to managed_buffers_ struct
+        bindGraphManagedBuffers(seq_len);
+
+        auto &stats = buffer_manager_->stats();
+        LOG_INFO("[GraphOrchestrator] Buffer initialization complete: "
+                 << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB, "
+                 << "scratch=" << (stats.scratch_bytes / (1024.0 * 1024.0)) << " MB, "
+                 << "output=" << (stats.output_bytes / (1024.0 * 1024.0)) << " MB");
+
+        // Log theoretical aliasing savings
+        auto [original, optimized] = BufferAllocator::estimateMemorySavings(schema, resolver_config);
+        double savings = (original > 0) ? 100.0 * (original - optimized) / original : 0.0;
+        LOG_INFO("[GraphOrchestrator] Theoretical aliasing savings: "
+                 << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
+                 << " (" << savings << "% reduction)");
+
+        // Also update the graph builder's buffers reference
+        graph_builder_->setBuffers(managed_buffers_);
+
+        return true;
+    }
+
+    void GraphOrchestrator::releaseBuffers()
+    {
+        if (buffer_manager_)
+        {
+            buffer_manager_->releaseAll();
+            buffer_manager_.reset();
+            LOG_INFO("[GraphOrchestrator] Buffers released");
+        }
+
+        owned_buffers_.clear();
+
+        // Clear buffer pointers
+        managed_buffers_ = Qwen2ModelBuffers{};
+    }
+
+    Qwen2ActivationBuffers &GraphOrchestrator::getInternalBuffers()
+    {
+        return managed_buffers_.layer_buffers;
+    }
+
+    const Qwen2ActivationBuffers &GraphOrchestrator::getInternalBuffers() const
+    {
+        return managed_buffers_.layer_buffers;
+    }
+
+    const Qwen2ModelBuffers &GraphOrchestrator::getModelBuffers() const
+    {
+        return managed_buffers_;
+    }
+
+    const BufferAllocationStats *GraphOrchestrator::bufferStats() const
+    {
+        if (!buffer_manager_)
+        {
+            return nullptr;
+        }
+        return &buffer_manager_->stats();
+    }
+
+    void GraphOrchestrator::bindGraphManagedBuffers(int seq_len)
+    {
+        (void)seq_len; // May be used for validation in the future
+
+        if (!buffer_manager_)
+        {
+            LOG_ERROR("[GraphOrchestrator] bindGraphManagedBuffers: buffer_manager_ is null");
+            return;
+        }
+
+        // Bind layer buffers
+        auto &lb = managed_buffers_.layer_buffers;
+
+        lb.residual = buffer_manager_->getBuffer("layer", BufferNames::RESIDUAL);
+        lb.normalized = buffer_manager_->getBuffer("layer", BufferNames::NORMALIZED);
+
+        // Attention buffers
+        lb.Q = buffer_manager_->getBuffer("layer", BufferNames::Q);
+        lb.K = buffer_manager_->getBuffer("layer", BufferNames::K);
+        lb.V = buffer_manager_->getBuffer("layer", BufferNames::V);
+        lb.attn_output = buffer_manager_->getBuffer("layer", BufferNames::ATTN_OUTPUT);
+        lb.attn_proj = buffer_manager_->getBuffer("layer", BufferNames::ATTN_PROJ);
+        lb.workspace_scores = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_SCORES);
+        lb.workspace_context = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_CONTEXT);
+        lb.workspace_mask = buffer_manager_->getBuffer("layer", BufferNames::WORKSPACE_MASK);
+
+        // FFN buffers
+        lb.gate = buffer_manager_->getBuffer("layer", BufferNames::GATE);
+        lb.up = buffer_manager_->getBuffer("layer", BufferNames::UP);
+        lb.ffn_output = buffer_manager_->getBuffer("layer", BufferNames::FFN_OUTPUT);
+
+        // Model-level buffers
+        managed_buffers_.current_hidden = buffer_manager_->getBuffer("model", BufferNames::CURRENT_HIDDEN);
+        managed_buffers_.logits = buffer_manager_->getBuffer("model", BufferNames::LOGITS);
+
+        LOG_DEBUG("[GraphOrchestrator] Bound graph-managed buffers: "
+                  << "residual=" << lb.residual
+                  << " Q=" << lb.Q
+                  << " gate=" << lb.gate
+                  << " current_hidden=" << managed_buffers_.current_hidden
+                  << " logits=" << managed_buffers_.logits);
+    }
+
+    // =========================================================================
     // Execution Methods
     // =========================================================================
 

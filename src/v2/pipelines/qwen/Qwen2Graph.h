@@ -30,12 +30,13 @@
 #include "../../execution/ExecutionPolicy.h"
 #include "../../execution/IGraphBuilder.h"
 #include "../../execution/RuntimeConfig.h"
+#include "../../execution/GraphResolver.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/UnifiedKVCache.h"
 #include "../../loaders/ModelContext.h"
 #include "../../utils/MPIContext.h"
-#include "Qwen2BufferSpec.h"
+#include "Qwen2Schema.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -352,70 +353,52 @@ namespace llaminar2
          */
         void setTensorFactory(TensorFactory *factory) { tensor_factory_ = factory; }
 
+        /**
+         * @brief Get the declarative schema for this architecture
+         *
+         * Returns the Qwen2 GraphSchema which defines all buffers, stages,
+         * and their relationships declaratively.
+         *
+         * @return GraphSchema for Qwen2 architecture
+         */
+        GraphSchema getSchema() const;
+
+        /**
+         * @brief Get resolver config for buffer allocation
+         *
+         * Creates a GraphResolverConfig populated with this graph's
+         * configuration, including tensor-parallel local dimensions.
+         * Used by BufferAllocator to resolve buffer shapes.
+         *
+         * @param seq_len Sequence length for buffer sizing
+         * @return GraphResolverConfig with model dimensions
+         */
+        GraphResolverConfig getResolverConfig(int seq_len) const;
+
         // =====================================================================
-        // Graph-Managed Buffer Allocation (Phase 5)
+        // Buffer Management
         // =====================================================================
-
-        /**
-         * @brief Initialize activation buffers using GraphBufferManager
-         *
-         * Allocates all activation buffers with automatic aliasing optimization
-         * for SCRATCH buffers. This is an alternative to setBuffers().
-         *
-         * Requires config.use_graph_buffer_management = true.
-         *
-         * @param seq_len Maximum sequence length for buffer allocation
-         * @return true if allocation successful
-         */
-        bool initializeBuffers(int seq_len);
-
-        /**
-         * @brief Release all graph-managed buffers
-         *
-         * Call this when buffers are no longer needed to free memory.
-         */
-        void releaseBuffers();
-
-        /**
-         * @brief Check if graph buffer management is enabled
-         */
-        bool hasGraphManagedBuffers() const { return buffer_manager_ != nullptr; }
-
-        /**
-         * @brief Get internal activation buffers (for graph-managed mode)
-         *
-         * When using graph-managed buffers, the pipeline should use these
-         * instead of creating its own buffer mappings.
-         *
-         * @return Reference to internal activation buffers
-         */
-        Qwen2ActivationBuffers &getInternalBuffers() { return buffers_.layer_buffers; }
-        const Qwen2ActivationBuffers &getInternalBuffers() const { return buffers_.layer_buffers; }
-
-        /**
-         * @brief Get model-level buffers (current_hidden, logits)
-         *
-         * When using graph-managed buffers, these are allocated by the graph.
-         *
-         * @return Reference to model buffers
-         */
-        const Qwen2ModelBuffers &getModelBuffers() const { return buffers_; }
-
-        /**
-         * @brief Get buffer manager statistics
-         *
-         * @return BufferAllocationStats or nullptr if not using graph buffer management
-         */
-        const BufferAllocationStats *bufferStats() const;
+        // NOTE: Buffer lifecycle management (initializeBuffers, releaseBuffers, etc.)
+        // has been moved to GraphOrchestrator as part of the declarative refactor.
+        // Use GraphOrchestrator::initializeBuffers() for graph-managed allocation.
+        // =====================================================================
 
         /**
          * @brief Set snapshot callback for debugging
+         *
+         * Note: The callback is stored for use by GraphOrchestrator when it executes
+         * graphs built by this Qwen2Graph.
          */
         void setSnapshotCallback(StageSnapshotCallback callback)
         {
             snapshot_callback_ = std::move(callback);
-            executor_.setSnapshotCallback(snapshot_callback_);
+            // Note: GraphOrchestrator will call its own executor_.setSnapshotCallback()
         }
+
+        /**
+         * @brief Get the current snapshot callback
+         */
+        const StageSnapshotCallback &getSnapshotCallback() const { return snapshot_callback_; }
 
         // =====================================================================
         // IGraphBuilder Interface Implementation
@@ -461,8 +444,32 @@ namespace llaminar2
 
         /**
          * @brief Build complete forward graph (embedding → layers → LM head)
+         *
+         * LEGACY: This method uses imperative graph building.
+         * For new code, prefer buildForwardGraphFromSchema().
          */
         ComputeGraph buildFullForwardGraph(
+            const Qwen2ForwardInput &input,
+            Qwen2ForwardOutput &output);
+
+        /**
+         * @brief Build forward graph using declarative schema
+         *
+         * This method uses the new three-layer architecture:
+         * 1. Qwen2Schema - Declarative graph structure
+         * 2. GraphResolver - Evaluates runtime conditionals
+         * 3. GraphBuilder - Constructs the ComputeGraph
+         *
+         * Benefits:
+         * - All TP/MPI logic shared with other models
+         * - All debugEnv toggling handled uniformly
+         * - Graph structure defined declaratively (could be YAML)
+         *
+         * @param input Forward pass input
+         * @param output Forward pass output (modified)
+         * @return Constructed ComputeGraph
+         */
+        ComputeGraph buildForwardGraphFromSchema(
             const Qwen2ForwardInput &input,
             Qwen2ForwardOutput &output);
 
@@ -542,115 +549,10 @@ namespace llaminar2
             int batch_size,
             int device_idx);
 
-        // =====================================================================
-        // Execution Methods (DEPRECATED - Use GraphOrchestrator)
-        // =====================================================================
-        //
-        // These methods are deprecated. Qwen2Graph should only BUILD graphs.
-        // Use GraphOrchestrator for execution, which provides:
-        // - Graph caching with cache hit statistics
-        // - Device context management
-        // - Batched execution support
-        // =====================================================================
-
-        /**
-         * @brief Execute full forward pass
-         *
-         * @deprecated Use GraphOrchestrator::executeForward() instead.
-         *             Qwen2Graph should only build graphs, not execute them.
-         *
-         * Builds and executes the complete forward graph.
-         */
-        [[deprecated("Use GraphOrchestrator::executeForward() instead")]]
-        bool executeForward(
-            const Qwen2ForwardInput &input,
-            Qwen2ForwardOutput &output);
-
-        /**
-         * @brief Execute a pre-built graph
-         *
-         * @deprecated Use GraphOrchestrator::execute() instead.
-         */
-        [[deprecated("Use GraphOrchestrator::execute() instead")]]
-        bool execute(ComputeGraph &graph, IDeviceContext *ctx);
-
-        /**
-         * @brief Execute attention block
-         *
-         * @deprecated Use GraphOrchestrator::executeAttention() instead.
-         */
-        [[deprecated("Use GraphOrchestrator::executeAttention() instead")]]
-        bool executeAttention(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
-            int layer_idx,
-            int seq_len,
-            IUnifiedKVCache *kv_cache,
-            const int *position_ids,
-            int device_idx);
-
-        /**
-         * @brief Execute FFN block
-         *
-         * @deprecated Use GraphOrchestrator::executeFFN() instead.
-         */
-        [[deprecated("Use GraphOrchestrator::executeFFN() instead")]]
-        bool executeFFN(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
-            int layer_idx,
-            int seq_len,
-            int device_idx);
-
-        /**
-         * @brief Execute full transformer layer (attention + FFN)
-         *
-         * @deprecated Use GraphOrchestrator::executeLayer() instead.
-         */
-        [[deprecated("Use GraphOrchestrator::executeLayer() instead")]]
-        bool executeLayer(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
-            int layer_idx,
-            int seq_len,
-            IUnifiedKVCache *kv_cache,
-            const int *position_ids,
-            int device_idx);
-
-        // =====================================================================
-        // Statistics and State
-        // =====================================================================
-
-        const GraphExecutorStats &stats() const { return executor_.stats(); }
-        void resetStats() { executor_.resetStats(); }
-        void clearCache();
-
-        // =====================================================================
-        // Graph Caching Accessors (for testing)
-        // =====================================================================
-
-        /**
-         * @brief Check if graph caching is enabled
-         * @return true if caching is enabled (after initializeBuffers() with graph buffer management)
-         */
-        bool isGraphCachingEnabled() const { return graph_caching_enabled_; }
-
-        /**
-         * @brief Get the size of the layer graph cache
-         * @return Number of layers in the cache (0 if caching disabled)
-         */
-        size_t getCacheSize() const { return layer_graph_cache_.size(); }
-
-        /**
-         * @brief Check if a valid cached graph exists for a layer
-         * @param layer_idx Layer index (0-based)
-         * @param is_attention true for attention graph, false for FFN graph
-         * @return true if a valid cached graph exists
-         */
-        bool hasValidCachedGraph(int layer_idx, bool is_attention) const;
-
     private:
+        // =====================================================================
         // Configuration
+        // =====================================================================
         Qwen2GraphConfig config_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::shared_ptr<MPIContext> mpi_ctx_;
@@ -662,108 +564,8 @@ namespace llaminar2
         Qwen2ModelWeights weights_;
         Qwen2ModelBuffers buffers_;
 
-        // Graph executor for actual execution
-        GraphExecutor executor_;
-
-        // Device contexts (created lazily)
-        std::unordered_map<int, std::unique_ptr<IDeviceContext>> device_contexts_;
-
         // Snapshot callback
         StageSnapshotCallback snapshot_callback_;
-
-        // Position IDs buffer - DEPRECATED: Position IDs should be provided externally via Qwen2ForwardInput
-        // Kept temporarily for backward compatibility with execute*() methods
-        std::vector<int> position_ids_buffer_;
-
-        // =====================================================================
-        // Graph Caching (Phase 10: Execution Optimization)
-        // =====================================================================
-        //
-        // When graph_caching_enabled_ is true, we cache pre-built graphs per layer
-        // and reuse them across executions. This avoids the overhead of:
-        // - Creating ComputeGraph objects
-        // - Allocating stage unique_ptrs
-        // - Building dependency maps
-        //
-        // Cached graphs work because:
-        // 1. Buffer pointers are stable (graph-managed buffers)
-        // 2. Weight pointers are stable (owned by ModelLoader)
-        // 3. Only dynamic params (seq_len, pos_offset) change
-        //
-        // For each layer, we cache:
-        // - Attention graph (for seq_len=1 decode mode)
-        // - FFN graph (always reusable)
-        //
-        // Dynamic params are updated via stage setters before execution.
-        // =====================================================================
-
-        /// Enable graph caching (auto-enabled when using graph-managed buffers)
-        bool graph_caching_enabled_ = false;
-
-        /// Cached attention graphs per layer [layer_idx]
-        /// Key is: (layer_idx, seq_len) for different graph variants
-        struct CachedLayerGraphs
-        {
-            std::unique_ptr<ComputeGraph> attention_decode; ///< seq_len=1
-            std::unique_ptr<ComputeGraph> ffn_decode;       ///< seq_len=1
-            int cached_seq_len = 0;                         ///< seq_len used for cached graphs
-            bool valid = false;                             ///< Whether cache is valid
-        };
-        std::vector<CachedLayerGraphs> layer_graph_cache_;
-
-        /// Last position offset used (for RoPE update detection)
-        int last_pos_offset_ = -1;
-
-        /**
-         * @brief Check if we can use cached graph for this execution
-         */
-        bool canUseCachedGraph(int layer_idx, int seq_len) const;
-
-        /**
-         * @brief Get or build attention graph (with caching)
-         */
-        ComputeGraph &getOrBuildAttentionGraph(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
-            int layer_idx,
-            int seq_len,
-            IUnifiedKVCache *kv_cache,
-            const int *position_ids,
-            int device_idx);
-
-        /**
-         * @brief Get or build FFN graph (with caching)
-         */
-        ComputeGraph &getOrBuildFFNGraph(
-            const Qwen2LayerWeights &layer,
-            Qwen2ActivationBuffers &buffers,
-            int layer_idx,
-            int seq_len,
-            int device_idx);
-
-        /**
-         * @brief Update dynamic parameters in cached graph
-         */
-        void updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len);
-
-        // =====================================================================
-        // Graph Buffer Management (Phase 5)
-        // =====================================================================
-
-        /// Buffer manager for graph-managed allocation (nullptr if using setBuffers())
-        std::unique_ptr<GraphBufferManager> buffer_manager_;
-
-        /// Owned tensors when using graph-managed allocation
-        std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
-
-        /// Buffer spec builder for generating buffer specifications
-        std::unique_ptr<Qwen2BufferSpecBuilder> buffer_spec_builder_;
-
-        // =====================================================================
-        // Helper Methods
-        // =====================================================================
-
-        IDeviceContext *getDeviceContext(int device_idx);
 
     public:
         /**
@@ -785,11 +587,6 @@ namespace llaminar2
             const std::string &prev_node,
             int seq_len,
             int device_idx);
-
-        /**
-         * @brief Populate buffers_ from graph-managed allocations
-         */
-        void bindGraphManagedBuffers(int seq_len);
     };
 
 } // namespace llaminar2

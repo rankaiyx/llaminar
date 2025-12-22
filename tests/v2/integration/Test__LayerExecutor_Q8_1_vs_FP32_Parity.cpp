@@ -27,6 +27,7 @@
 #include <fstream>
 
 #include "v2/pipelines/qwen/Qwen2Graph.h"
+#include "v2/execution/GraphOrchestrator.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/tensors/UnifiedKVCache.h"
@@ -195,8 +196,11 @@ protected:
 
     /**
      * @brief Create executor with specified activation precision
+     *
+     * Returns a GraphOrchestrator wrapping a Qwen2Graph, as the Qwen2Graph
+     * execute methods are deprecated.
      */
-    std::unique_ptr<Qwen2Graph> createExecutor(ActivationPrecision precision)
+    std::unique_ptr<GraphOrchestrator> createExecutor(ActivationPrecision precision)
     {
         Qwen2GraphConfig config;
         config.d_model = d_model_;
@@ -210,7 +214,8 @@ protected:
         config.activation_precision = precision;
         // NOTE: Decomposed attention is now always used (Phase 7 cleanup)
 
-        return std::make_unique<Qwen2Graph>(config, mpi_ctx_);
+        auto graph = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
+        return std::make_unique<GraphOrchestrator>(graph, mpi_ctx_);
     }
 
     /**

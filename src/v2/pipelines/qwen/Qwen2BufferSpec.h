@@ -1,12 +1,20 @@
 /**
  * @file Qwen2BufferSpec.h
- * @brief Formal buffer specification for Qwen2 pipeline
+ * @brief Runtime buffer allocation for Qwen2 pipeline
  * @author David Sanftenberg
  * @date January 2025
  *
- * This file defines the formal buffer specification for Qwen2 pipeline,
- * enabling automatic buffer allocation and lifecycle management through
- * GraphBufferManager with aliasing optimization.
+ * This file provides runtime buffer allocation utilities for Qwen2 pipeline.
+ * It computes actual byte sizes from model configuration and allocates tensors.
+ *
+ * ## Relationship to Qwen2Schema
+ *
+ * Buffer specifications are now **consolidated** in Qwen2Schema.h:
+ * - Qwen2Schema defines buffer names, shapes (as formulas), and aliasing groups
+ * - Qwen2BufferSpecBuilder computes actual sizes for allocation at runtime
+ *
+ * The schema is the **single source of truth** for buffer semantics and aliasing.
+ * This builder is a **runtime helper** that evaluates shape formulas.
  *
  * ## Buffer Role Semantics
  *
@@ -15,7 +23,7 @@
  * - **INOUT**: Modified in-place (residual connections)
  * - **SCRATCH**: Temporary workspace, can be aliased
  *
- * ## Aliasing Opportunities
+ * ## Aliasing Opportunities (defined in Qwen2Schema)
  *
  * SCRATCH buffers with non-overlapping lifetimes can share physical memory:
  * - Attention phase: Q, K, V, attn_output are consumed before FFN
@@ -23,6 +31,9 @@
  * - Therefore: Q ↔ gate, K ↔ up, V ↔ ffn_output can alias
  *
  * This saves ~35% activation memory per layer.
+ *
+ * @see Qwen2Schema.h for declarative buffer definitions
+ * @see GraphSchema.h for BufferSpec and AliasGroupSpec structures
  */
 
 #pragma once

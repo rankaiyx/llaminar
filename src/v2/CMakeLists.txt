@@ -509,6 +509,7 @@ add_library(llaminar2_core STATIC
     execution/ComputeStage.cpp
     execution/GraphExecutor.cpp
     execution/GraphBufferManager.cpp
+    execution/GraphResolver.cpp
     execution/LivenessAnalyzer.cpp
     execution/LayerExecutor.cpp
     execution/ModelExecutor.cpp
@@ -524,7 +525,6 @@ add_library(llaminar2_core STATIC
     loaders/WeightPlacementMap.cpp
     loaders/DeviceOrchestrator.cpp
     pipelines/qwen/Qwen2Graph.cpp
-    pipelines/qwen/Qwen2BufferSpec.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp

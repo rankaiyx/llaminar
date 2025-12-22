@@ -32,6 +32,7 @@
 #include "../pipelines/qwen/Qwen2Graph.h"
 #include "IInferenceRunner.h"
 #include "GraphExecutor.h"
+#include "GraphBufferManager.h"
 #include "DeviceContext.h"
 #include "ComputeStage.h" // For StageDumpInfo
 #include <memory>
@@ -389,6 +390,72 @@ namespace llaminar2
          * @brief Check if weights are configured for full forward
          */
         bool hasGlobalWeights() const;
+
+        // =========================================================================
+        // Graph Buffer Management (Phase 3 - moved from Qwen2Graph)
+        // =========================================================================
+
+        /**
+         * @brief Set TensorFactory for graph-managed buffer allocation
+         * @param factory TensorFactory pointer (not owned)
+         */
+        void setTensorFactory(TensorFactory *factory) { tensor_factory_ = factory; }
+
+        /**
+         * @brief Get TensorFactory
+         * @return TensorFactory pointer (nullptr if not set)
+         */
+        TensorFactory *tensorFactory() const { return tensor_factory_; }
+
+        /**
+         * @brief Initialize activation buffers using GraphBufferManager
+         *
+         * Allocates all activation buffers with automatic aliasing optimization
+         * for SCRATCH buffers. This is an alternative to manual buffer allocation.
+         *
+         * @param seq_len Maximum sequence length for buffer allocation
+         * @return true if allocation successful
+         */
+        bool initializeBuffers(int seq_len);
+
+        /**
+         * @brief Release all graph-managed buffers
+         *
+         * Call this when buffers are no longer needed to free memory.
+         */
+        void releaseBuffers();
+
+        /**
+         * @brief Check if graph buffer management is active
+         */
+        bool hasGraphManagedBuffers() const { return buffer_manager_ != nullptr; }
+
+        /**
+         * @brief Get internal activation buffers (for graph-managed mode)
+         *
+         * When using graph-managed buffers, the pipeline should use these
+         * instead of creating its own buffer mappings.
+         *
+         * @return Reference to internal activation buffers
+         */
+        Qwen2ActivationBuffers &getInternalBuffers();
+        const Qwen2ActivationBuffers &getInternalBuffers() const;
+
+        /**
+         * @brief Get model-level buffers (current_hidden, logits)
+         *
+         * When using graph-managed buffers, these are allocated by the orchestrator.
+         *
+         * @return Reference to model buffers
+         */
+        const Qwen2ModelBuffers &getModelBuffers() const;
+
+        /**
+         * @brief Get buffer manager statistics
+         *
+         * @return BufferAllocationStats or nullptr if not using graph buffer management
+         */
+        const BufferAllocationStats *bufferStats() const;
 
         // =========================================================================
         // Inference State Management (Phase 5)
@@ -930,6 +997,28 @@ namespace llaminar2
 
         /// Captured snapshots (key -> FP32 data)
         std::unordered_map<std::string, std::vector<float>> snapshots_;
+
+        // =========================================================================
+        // Graph Buffer Management Members (Phase 3 - moved from Qwen2Graph)
+        // =========================================================================
+
+        /// TensorFactory for buffer allocation (not owned)
+        TensorFactory *tensor_factory_ = nullptr;
+
+        /// Buffer manager for graph-managed allocation (nullptr if using manual buffers)
+        std::unique_ptr<GraphBufferManager> buffer_manager_;
+
+        /// Owned tensors when using graph-managed allocation
+        std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
+
+        /// Model-level buffers (when using graph-managed allocation)
+        Qwen2ModelBuffers managed_buffers_;
+
+        /**
+         * @brief Populate managed_buffers_ from graph-managed allocations
+         * @param seq_len Sequence length for buffer sizing
+         */
+        void bindGraphManagedBuffers(int seq_len);
     };
 
 } // namespace llaminar2

@@ -2165,40 +2165,15 @@ add_v2_test(V2_Unit_LivenessAnalyzer
     MPI_PROCS 1
 )
 
-# Test: Qwen2BufferSpec (formal buffer specification for Qwen2 pipeline)
-# Tests buffer specification builder, memory estimation, and aliasing group suggestions.
-# Part of Phase 5: Qwen2Graph Integration
-add_executable(v2_test_qwen2_buffer_spec unit/Test__Qwen2BufferSpec.cpp)
-target_link_libraries(v2_test_qwen2_buffer_spec llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_Qwen2BufferSpec
-    COMMAND $<TARGET_FILE:v2_test_qwen2_buffer_spec>
-    LABELS "V2;Unit;Qwen2;BufferSpec;BufferManagement;MemoryOptimization"
-    MPI_PROCS 1
-)
-
-# Test: Qwen2GraphBufferManagement (GraphBufferManager integration with Qwen2Graph)
+# Test: Qwen2GraphBufferManagement (GraphBufferManager integration with GraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.
-# Part of Phase 5: Qwen2Graph Integration
-add_executable(v2_test_qwen2_graph_buffer_mgmt unit/Test__Qwen2GraphBufferManagement.cpp)
-target_link_libraries(v2_test_qwen2_graph_buffer_mgmt llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_Qwen2GraphBufferManagement
-    COMMAND $<TARGET_FILE:v2_test_qwen2_graph_buffer_mgmt>
-    LABELS "V2;Unit;Qwen2;Qwen2Graph;BufferManagement;GraphBufferManager"
-    MPI_PROCS 1
-)
-
-# Test: Qwen2GraphCaching (Phase 10: Graph caching optimization)
-# Tests graph caching functionality for decode mode:
-# - Caching enabled after initializeBuffers()
-# - Cached graphs reused in decode mode (seq_len=1)
-# - Dynamic parameter updates (pos_offset)
-# - Cache cleared properly on clearCache()/releaseBuffers()
-add_executable(v2_test_qwen2_graph_caching unit/Test__Qwen2GraphCaching.cpp)
-target_link_libraries(v2_test_qwen2_graph_caching llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_Qwen2GraphCaching
-    COMMAND $<TARGET_FILE:v2_test_qwen2_graph_caching>
-    LABELS "V2;Unit;Qwen2;Qwen2Graph;GraphCaching;Phase10;Optimization"
+# Part of Phase 3: Buffer Management moved to GraphOrchestrator
+add_executable(v2_test_graph_orchestrator_buffer_mgmt unit/Test__GraphOrchestratorBufferManagement.cpp)
+target_link_libraries(v2_test_graph_orchestrator_buffer_mgmt llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphOrchestratorBufferManagement
+    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_buffer_mgmt>
+    LABELS "V2;Unit;GraphOrchestrator;BufferManagement;GraphBufferManager"
     MPI_PROCS 1
 )
 
@@ -2213,6 +2188,29 @@ target_link_libraries(v2_test_graph_orchestrator llaminar2_core GTest::gtest GTe
 add_v2_test(V2_Unit_GraphOrchestrator
     COMMAND $<TARGET_FILE:v2_test_graph_orchestrator>
     LABELS "V2;Unit;Qwen2;GraphOrchestrator;GraphExecution;DeclarativeDesign"
+    MPI_PROCS 1
+)
+
+# Test: GraphResolver (declarative schema resolution for multi-model support)
+# Tests the three-layer architecture: GraphSchema -> GraphResolver -> ComputeGraph
+# Part of Phase 4: Schema-based graph building for model scalability
+add_executable(v2_test_graph_resolver unit/Test__GraphResolver.cpp)
+target_link_libraries(v2_test_graph_resolver llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphResolver
+    COMMAND $<TARGET_FILE:v2_test_graph_resolver>
+    LABELS "V2;Unit;GraphResolver;GraphSchema;DeclarativeDesign;MultiModel"
+    MPI_PROCS 1
+)
+
+# Test: Qwen2GraphSchema (schema-based Qwen2Graph building - Phase 4d)
+# Tests the new buildForwardGraphFromSchema() method that uses
+# Qwen2Schema + GraphResolver + GraphBuilder architecture.
+# Validates that schema-based graphs match legacy imperative graphs.
+add_executable(v2_test_qwen2_graph_schema unit/Test__Qwen2GraphSchema.cpp)
+target_link_libraries(v2_test_qwen2_graph_schema llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Qwen2GraphSchema
+    COMMAND $<TARGET_FILE:v2_test_qwen2_graph_schema>
+    LABELS "V2;Unit;Qwen2;GraphSchema;DeclarativeDesign;Phase4d"
     MPI_PROCS 1
 )
 
