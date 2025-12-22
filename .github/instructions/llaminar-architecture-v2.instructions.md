@@ -9,13 +9,13 @@ This document is a high-level but concrete map of the Llaminar V2 stack: tensors
 V2 is a **kernel-centric, operator-free** architecture:
 
 - **Per-tensor device affinity** – each tensor knows which device it lives on.
-- **Unified inference interface** – `IInferenceRunner` abstracts execution strategy (Pipeline or Graph).
+- **Declarative graph execution** – `GraphOrchestrator` executes DAGs of compute stages.
 - **Heterogeneous execution** – CPU / CUDA / ROCm / (future) backends can be mixed in one run.
 - **Quantization-aware kernels** – unified GEMM/attention interfaces that work with FP32/BF16 and quantized formats.
 - **MPI-aware orchestration** – multi-rank inference (tensor parallelism) lives in orchestrators, not kernels.
 - **Centralized kernel dispatch** – `KernelFactory` provides unified kernel creation with caching.
 - **Weight sharding** – automatic tensor parallelism distributes weight matrices across MPI ranks.
-- **Declarative compute graphs** – `Qwen2Graph` builds DAGs with automatic dependency tracking and MPI synchronization.
+- **Graph caching** – `Qwen2Graph` builds DAGs that are cached and reused during decode for performance.
 
 The mental model:
 
@@ -23,21 +23,20 @@ The mental model:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          INFERENCE LAYER                                     │
 │                                                                              │
-│   createInferenceRunner()  ──→  IInferenceRunner                            │
+│   createInferenceRunner()  ──→  IInferenceRunner (GraphOrchestrator)        │
 │                                      │                                       │
-│              ┌───────────────────────┴───────────────────────┐              │
-│              ▼                                               ▼              │
-│    ┌──────────────────┐                        ┌─────────────────────────┐  │
-│    │   PipelineBase   │                        │   GraphOrchestrator    │  │
-│    │  (Qwen2Pipeline) │                        │  (Graph-based exec)    │  │
-│    └──────────────────┘                        └─────────────────────────┘  │
-│              │                                               │              │
-│              │ direct kernel calls                           │ DAG stages   │
-│              ▼                                               ▼              │
-│    ┌──────────────────┐                        ┌─────────────────────────┐  │
-│    │    Composite     │                        │   ComputeGraph DAG      │  │
-│    │   Operations     │                        │  + GraphExecutor        │  │
-│    └──────────────────┘                        └─────────────────────────┘  │
+│                                      ▼                                       │
+│                        ┌─────────────────────────┐                          │
+│                        │   GraphOrchestrator     │                          │
+│                        │  (Declarative graphs)   │                          │
+│                        └─────────────────────────┘                          │
+│                                      │                                       │
+│                                      │ DAG stages                            │
+│                                      ▼                                       │
+│                        ┌─────────────────────────┐                          │
+│                        │   ComputeGraph DAG      │                          │
+│                        │  + GraphExecutor        │                          │
+│                        └─────────────────────────┘                          │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -65,13 +64,13 @@ The mental model:
 
 ---
 
-## 2. Unified Inference Interface
+## 2. Inference Interface
 
 ### 2.1 IInferenceRunner
 
 Location: `src/v2/inference/IInferenceRunner.h`
 
-The `IInferenceRunner` interface provides a unified API for inference execution, implemented by both `PipelineBase` and `GraphOrchestrator`:
+The `IInferenceRunner` interface provides the public API for inference execution:
 
 ```cpp
 class IInferenceRunner {
@@ -88,13 +87,12 @@ public:
     
     // Metadata
     virtual int vocab_size() const = 0;
-    virtual ExecutionPath executionPath() const = 0;
     virtual const char* architecture() const = 0;
-};
-
-enum class ExecutionPath {
-    PIPELINE,  // Traditional imperative execution
-    GRAPH      // Graph-based declarative execution
+    
+    // Snapshot capture (for E2E testing)
+    virtual void enableSnapshotCapture(const std::string& dir) = 0;
+    virtual std::vector<std::string> getSnapshotKeys() const = 0;
+    virtual const float* getSnapshot(const std::string& key, size_t& size) const = 0;
 };
 ```
 
@@ -103,7 +101,7 @@ enum class ExecutionPath {
 Location: `src/v2/inference/InferenceRunner.h`
 
 ```cpp
-// Factory creates appropriate runner based on config/environment
+// Factory creates a GraphOrchestrator-based runner
 std::unique_ptr<IInferenceRunner> createInferenceRunner(
     std::shared_ptr<ModelContext> model_ctx,
     std::shared_ptr<MPIContext> mpi_ctx,
@@ -111,29 +109,26 @@ std::unique_ptr<IInferenceRunner> createInferenceRunner(
     const InferenceRunnerConfig& config = {});
 ```
 
-**Selection Logic:**
-1. `config.force_pipeline` → Pipeline path
-2. `config.force_graph` → Graph path  
-3. `LLAMINAR_EXEC_FULL_FORWARD=1` → Graph path
-4. Otherwise → Pipeline path (default)
+The factory creates a `GraphOrchestrator` for the model architecture (e.g., Qwen2).
 
 ### 2.3 Usage Pattern
 
 ```cpp
-// Create runner (automatically selects execution path)
-auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx, config);
+// Create runner
+auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx);
 
-// Check which path was selected
-if (runner->executionPath() == ExecutionPath::GRAPH) {
-    LOG_INFO("Using graph-based execution");
-}
-
-// Inference (works regardless of path)
+// Inference
 runner->forward(tokens.data(), seq_len);
 const float* logits = runner->logits();
 
 // Sampling
 int next_token = argmax(logits, runner->vocab_size());
+
+// Decode loop
+while (next_token != eos_token) {
+    runner->forward(&next_token, 1);
+    next_token = argmax(runner->logits(), runner->vocab_size());
+}
 
 // Reset for new sequence
 runner->clear_cache();
@@ -486,14 +481,17 @@ class ITensorAttention {
 };
 ```
 
-### 7.2 GQAAttention
+### 7.2 AttentionComputeStage
 
-Location: `src/v2/pipelines/attention/GQAAttention.*`
+Location: `src/v2/execution/stages/AttentionComputeStage.h`
 
-Front-end for GQA/MQA/MHA semantics:
-- Validation (shapes, head counts)
-- Mask construction (causal, padding)
-- Kernel dispatch via `ITensorAttention`
+The attention compute stage encapsulates full attention computation:
+- RoPE application to Q/K
+- KV cache append/gather
+- Attention scoring with causal masking
+- Context aggregation
+
+Created via `KernelFactory::createAttention()` which dispatches to the appropriate kernel based on tensor type and device.
 
 ---
 
@@ -544,27 +542,30 @@ for (const auto& key : keys) {
 | Inference factory | `src/v2/inference/InferenceRunner.{h,cpp}` |
 | GraphOrchestrator | `src/v2/pipelines/qwen/GraphOrchestrator.{h,cpp}` |
 | Graph builder | `src/v2/pipelines/qwen/Qwen2Graph.{h,cpp}` |
+| Buffer allocation | `src/v2/pipelines/qwen/Qwen2BufferSpec.{h,cpp}` |
 | ComputeGraph/Stages | `src/v2/execution/` |
 | KernelFactory | `src/v2/kernels/KernelFactory.{h,cpp}` |
 | Tensors | `src/v2/tensors/` |
 | CPU kernels | `src/v2/kernels/cpu/` |
-| MPI utilities | `src/v2/utils/MPIContext.h` |
+| MPI utilities | `src/v2/utils/MPIContext.h`, `src/v2/utils/MPITopology.h` |
 | Weight sharding | `src/v2/loaders/WeightManager.{h,cpp}` |
+| Placement strategy | `src/v2/execution/PlacementStrategy.h` |
 
 ### 9.2 Key Design Rules
 
 1. **Use `IInferenceRunner`** for inference – Don't call `GraphOrchestrator` directly from Main/ChatUI
-2. **Keep MPI out of kernels** – MPI lives in `AllreduceStage` and orchestrators
+2. **Keep MPI out of kernels** – MPI sync lives in `AllreduceStage` and `AllGatherStage`
 3. **Use KernelFactory** – Prefer `getOrCreateGemm()` for cached kernel access
-4. **Graph Executor for new code** – Prefer declarative graphs over imperative kernel calls
+4. **Declarative graphs** – Build computation as DAGs of `ComputeStage` nodes
+5. **Graph caching** – Reuse cached graphs in decode mode for performance
 
 ### 9.3 Environment Variables
 
 | Variable | Effect |
 |----------|--------|
-| `LLAMINAR_EXEC_FULL_FORWARD=1` | Force graph execution path |
-| `LLAMINAR_USE_LAYER_EXECUTOR=1` | Enable LayerExecutor |
-| `LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT=1` | Enable automatic buffer aliasing |
+| `LLAMINAR_PROFILE_KERNELS=1` | Enable per-kernel timing in benchmark mode |
+| `LLAMINAR_LOG_LEVEL=DEBUG` | Set logging verbosity |
+| `LLAMINAR_SNAPSHOT_TENSOR_DUMP=1` | Enable raw tensor dumps for debugging |
 
 ### 9.4 Running Tests
 
@@ -581,4 +582,46 @@ ctest --test-dir build_v2_e2e_release -R "^V2_E2E_" --output-on-failure
 
 ---
 
-This architecture is intentionally modular: small, focused abstractions connected by narrow interfaces. The `IInferenceRunner` interface ensures that callers (Main.cpp, ChatUI, tests) remain decoupled from the specific execution strategy, whether using traditional pipelines or the graph-based system.
+This architecture is intentionally modular: small, focused abstractions connected by narrow interfaces. The `IInferenceRunner` interface ensures that callers (Main.cpp, ChatUI, tests) remain decoupled from implementation details of the `GraphOrchestrator`.
+
+---
+
+## 10. MPI Tensor Parallelism Details
+
+### 10.1 Sharding Patterns
+
+Llaminar implements **Megatron-style tensor parallelism** with automatic weight sharding:
+
+| Weight | Sharding Mode | Description |
+|--------|---------------|-------------|
+| `attn_q.weight`, `attn_k.weight`, `attn_v.weight` | COLUMN_PARALLEL | Split output dim (heads) |
+| `attn_output.weight` (Wo) | ROW_PARALLEL | Split input dim, allreduce after |
+| `ffn_gate.weight`, `ffn_up.weight` | COLUMN_PARALLEL | Split output dim (d_ff) |
+| `ffn_down.weight` | INPUT_PARALLEL | Split input dim, allreduce after |
+| `output.weight` (LM head) | COLUMN_PARALLEL | Split vocab, allgather logits |
+| Norms, embeddings | REPLICATE | Full copy on each rank |
+
+### 10.2 MPI Synchronization Stages
+
+| Stage | When Used | Operation |
+|-------|-----------|----------|
+| `AllreduceStage` | After Wo, after Down | MPI_Allreduce(SUM) |
+| `AllGatherStage` | After LM head | MPI_Allgather for full logits |
+
+### 10.3 MPITopology
+
+Location: `src/v2/utils/MPITopology.h`
+
+Manages work distribution across ranks:
+
+```cpp
+class MPITopology {
+    // Work range calculations
+    WorkRange get_head_range(int total_heads) const;     // For attention
+    WorkRange get_column_range(int total_cols) const;    // For column-parallel
+    WorkRange get_vocab_range(int vocab_size) const;     // For LM head
+    
+    // Device capabilities
+    const std::vector<RankPlacement>& all_placements() const;
+};
+```
