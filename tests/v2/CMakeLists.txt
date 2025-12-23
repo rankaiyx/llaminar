@@ -950,28 +950,15 @@ add_v2_test(V2_Unit_CPURoPEKernelT
     MPI_PROCS 1  # CPURoPEKernelT tests are CPU-only, single rank
 )
 
-# Test: CpuAttentionKernelT (template-based attention kernel)
-add_executable(v2_test_cpu_attention_kernel_t unit/Test__CpuAttentionKernelT.cpp)
+# Test: CPUAttentionKernelT (Enum-based attention kernel via Factory)
+add_executable(v2_test_cpu_attention_kernel_t unit/Test__CPUAttentionKernelT.cpp)
 target_link_libraries(v2_test_cpu_attention_kernel_t
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_CpuAttentionKernelT
+add_v2_test(V2_Unit_CPUAttentionKernelT
     COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_t>
-    LABELS "V2;Unit;Kernels;Attention;FP32;TemplateKernel;CPU;MHA;GQA;CausalMasking"
-    MPI_PROCS 1  # CpuAttentionKernelT tests are CPU-only, single rank
-)
-
-# Test: CPUAttentionKernelTyped (Enum-based attention kernel via Factory)
-add_executable(v2_test_cpu_attention_kernel_typed unit/Test__CPUAttentionKernelTyped.cpp)
-target_link_libraries(v2_test_cpu_attention_kernel_typed
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CPUAttentionKernelTyped
-    COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_typed>
     LABELS "V2;Unit;Kernels;Attention;FP32;BF16;FP16;TypedKernel;CPU;FactoryWiring"
     MPI_PROCS 1
 )
@@ -1000,32 +987,6 @@ add_v2_test(V2_Unit_CPUSoftmaxKernelT
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax_kernel_typed>
     LABELS "V2;Unit;Kernels;Softmax;FP32;BF16;FP16;Q8_1;TypedKernel;CPU"
     MPI_PROCS 1
-)
-
-# Test: CpuAttentionKernelT Batch Attention (comprehensive batch testing)
-add_executable(v2_test_cpu_attention_kernel_t_batch unit/Test__CpuAttentionKernelT_Batch.cpp)
-target_link_libraries(v2_test_cpu_attention_kernel_t_batch
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CpuAttentionKernelT_Batch
-    COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_t_batch>
-    LABELS "V2;Unit;Kernels;Attention;FP32;BatchAttention;Equivalence;Independence;GQA;CausalMasking"
-    MPI_PROCS 1  # Batch attention tests are CPU-only, single rank
-)
-
-# Test: CpuAttentionKernelT Padding Mask (critical batch padding bug tests)
-add_executable(v2_test_cpu_attention_kernel_t_padding_mask unit/Test__CpuAttentionKernelT_PaddingMask.cpp)
-target_link_libraries(v2_test_cpu_attention_kernel_t_padding_mask
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CpuAttentionKernelT_PaddingMask
-    COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_t_padding_mask>
-    LABELS "V2;Unit;Kernels;Attention;FP32;BatchAttention;PaddingMask;MaskApplication;OutputZeroing;SequentialVsBatch"
-    MPI_PROCS 1  # CPU-only padding mask tests, single rank
 )
 
 # Test: BF16 SIMD Accuracy (Stage 2 - SIMD-optimized BF16 conversion)
@@ -2228,7 +2189,7 @@ add_v2_test(V2_Unit_ExecutionConfigAutoEnable
 
 # Test: CPUKernelDeviceIndex (regression test for device_idx validation bug)
 # Tests that CPU kernels accept any device_idx value (not just -1) for NUMA support.
-# Covers the bug where CPUAttentionKernelTyped rejected device_idx=0 or 1.
+# Covers the bug where CPUAttentionKernelT rejected device_idx=0 or 1.
 add_executable(v2_test_cpu_kernel_device_index unit/Test__CPUKernelDeviceIndex.cpp)
 target_link_libraries(v2_test_cpu_kernel_device_index llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_CPUKernelDeviceIndex

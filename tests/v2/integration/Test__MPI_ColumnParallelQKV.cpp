@@ -25,6 +25,7 @@
 #include <iomanip>
 
 #include "loaders/WeightManager.h"
+#include "models/qwen/Qwen2Schema.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
@@ -48,6 +49,27 @@ protected:
     static constexpr int N_HEADS = 14;
     static constexpr int N_KV_HEADS = 2;
     static constexpr int HEAD_DIM = 64;
+    WeightShardingConfig sharding_config_;
+
+    /**
+     * @brief Helper to get sharding mode using schema config
+     */
+    ShardingMode getShardingMode(const std::string &name) const
+    {
+        WeightShardingMode mode = sharding_config_.getMode(name);
+        switch (mode)
+        {
+        case WeightShardingMode::ColumnParallel:
+            return ShardingMode::COLUMN_PARALLEL;
+        case WeightShardingMode::RowParallel:
+            return ShardingMode::ROW_PARALLEL;
+        case WeightShardingMode::InputParallel:
+            return ShardingMode::INPUT_PARALLEL;
+        case WeightShardingMode::Replicate:
+        default:
+            return ShardingMode::REPLICATE;
+        }
+    }
 
     void SetUp() override
     {
@@ -55,6 +77,10 @@ protected:
         MPI_Comm_size(MPI_COMM_WORLD, &world_size_);
         mpi_ctx_ = std::make_shared<MPIContext>(rank_, world_size_, MPI_COMM_WORLD);
         factory_ = std::make_shared<TensorFactory>(*mpi_ctx_);
+
+        // Load Qwen2 sharding config
+        Qwen2SchemaFactory schema_factory;
+        sharding_config_ = schema_factory.getWeightShardingConfig();
     }
 
     void TearDown() override
@@ -154,29 +180,29 @@ protected:
 
 TEST_F(Test__MPI_ColumnParallelQKV, ShardingModeDetection)
 {
-    // Verify WeightManager correctly identifies Q/K/V as COLUMN_PARALLEL
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_q.weight"),
+    // Verify sharding config correctly identifies Q/K/V as COLUMN_PARALLEL
+    EXPECT_EQ(getShardingMode("blk.0.attn_q.weight"),
               ShardingMode::COLUMN_PARALLEL)
         << "Q weight should be COLUMN_PARALLEL";
 
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_k.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_k.weight"),
               ShardingMode::COLUMN_PARALLEL)
         << "K weight should be COLUMN_PARALLEL";
 
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_v.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_v.weight"),
               ShardingMode::COLUMN_PARALLEL)
         << "V weight should be COLUMN_PARALLEL";
 
     // Verify biases are also column-parallel
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_q.bias"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_q.bias"),
               ShardingMode::COLUMN_PARALLEL)
         << "Q bias should be COLUMN_PARALLEL";
 
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_k.bias"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_k.bias"),
               ShardingMode::COLUMN_PARALLEL)
         << "K bias should be COLUMN_PARALLEL";
 
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_v.bias"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_v.bias"),
               ShardingMode::COLUMN_PARALLEL)
         << "V bias should be COLUMN_PARALLEL";
 

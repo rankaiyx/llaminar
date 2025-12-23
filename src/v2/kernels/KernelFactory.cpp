@@ -13,7 +13,7 @@
 #include "cpu/ops/CPUSoftmaxKernelT.h"
 #include "cpu/ops/CPURMSNormKernelT.h"
 #include "cpu/ops/CPUEmbeddingKernelT.h"
-#include "cpu/attention/CPUAttentionKernelTyped.h"
+#include "cpu/attention/CPUAttentionKernelT.h"
 
 #include "../tensors/Tensors.h"
 #include "../backends/ComputeBackend.h"
@@ -1561,22 +1561,22 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                     LOG_DEBUG("[KernelFactory] FP32 Attention: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
                     LOG_DEBUG("[KernelFactory] FP32 Attention: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP32>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
                 }
             }
 
@@ -1587,22 +1587,22 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                     LOG_DEBUG("[KernelFactory] BF16 Attention: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
                     LOG_DEBUG("[KernelFactory] BF16 Attention: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::BF16>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
                 }
             }
 
@@ -1613,22 +1613,22 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                     LOG_DEBUG("[KernelFactory] FP16 Attention: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
                     LOG_DEBUG("[KernelFactory] FP16 Attention: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::FP16>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
                 }
             }
 
@@ -1639,22 +1639,22 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::Q8_1>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::Q8_1>>();
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                     LOG_DEBUG("[KernelFactory] Q8_1 Attention: CUDA not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::Q8_1>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::Q8_1>>();
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
                     LOG_DEBUG("[KernelFactory] Q8_1 Attention: ROCm not implemented, using CPU fallback");
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::Q8_1>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::Q8_1>>();
 #endif
 
                 default:
-                    return std::make_unique<llaminar2::CPUAttentionKernelTyped<llaminar2::ActivationPrecision::Q8_1>>();
+                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::Q8_1>>();
                 }
             }
 

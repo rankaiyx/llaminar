@@ -1,6 +1,6 @@
 /**
  * @file Test__AttentionMaskApplication.cpp
- * @brief Unit tests for attention mask application in CpuAttentionKernelT
+ * @brief Unit tests for attention mask application in CPUAttentionKernelT
  * @author David Sanftenberg
  *
  * Tests that verify attention masks are correctly applied to attention scores
@@ -8,7 +8,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "v2/kernels/cpu/attention/CpuAttentionKernelT.h"
+#include "v2/kernels/cpu/attention/CPUAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/kernels/cpu/attention/AttentionUtils.h"
 #include <cmath>
@@ -101,7 +101,7 @@ TEST_F(Test__AttentionMaskApplication, SingleHead_SimplePaddingMask)
     }
 
     // Create attention kernel
-    CpuAttentionKernelT<FP32Tensor> attention;
+    CPUAttentionKernelT<ActivationPrecision::FP32> attention;
 
     // Compute attention
     bool success = attention.compute(
@@ -214,7 +214,7 @@ TEST_F(Test__AttentionMaskApplication, BatchAttention_PerSequenceMasks)
         /*causal=*/false, /*window_size=*/-1);
 
     // Create attention kernel and compute
-    CpuAttentionKernelT<FP32Tensor> attention;
+    CPUAttentionKernelT<ActivationPrecision::FP32> attention;
 
     bool success = attention.compute_batch(
         Q.data(), K.data(), V.data(), output.data(),

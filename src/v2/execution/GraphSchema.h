@@ -262,6 +262,105 @@ namespace llaminar2
         float estimated_savings_percent = 0.0f;
     };
 
+    // =========================================================================
+    // Weight Sharding Configuration
+    // =========================================================================
+
+    /**
+     * @brief Sharding mode for weight tensors in tensor parallelism
+     *
+     * This enum is architecture-independent - the pattern→mode mapping
+     * is defined per-model in the schema.
+     */
+    enum class WeightShardingMode
+    {
+        Replicate,      ///< Full copy on each rank (norms, biases, embeddings)
+        ColumnParallel, ///< Split output dimension (rows of weight) - QKV, Gate/Up, LM head
+        RowParallel,    ///< Split output dimension + allreduce - Wo projection
+        InputParallel   ///< Split input dimension (columns of weight) + allreduce - Down proj
+    };
+
+    /**
+     * @brief Pattern-based weight sharding rule
+     *
+     * Used to map GGUF tensor names to sharding modes.
+     * Patterns are matched using string contains (find != npos).
+     */
+    struct WeightShardingPattern
+    {
+        std::string pattern;     ///< Substring pattern to match (e.g., "attn_q.weight")
+        WeightShardingMode mode; ///< Sharding mode for matched weights
+        std::string description; ///< Human-readable explanation
+    };
+
+    /**
+     * @brief Weight sharding configuration for a model architecture
+     *
+     * Defines how GGUF weight tensors should be distributed across
+     * MPI ranks for tensor parallelism. Patterns are evaluated in order;
+     * first match wins. Unmatched weights default to Replicate.
+     */
+    struct WeightShardingConfig
+    {
+        /// Patterns evaluated in order (first match wins)
+        std::vector<WeightShardingPattern> patterns;
+
+        /// Exact-match overrides (checked before patterns)
+        std::unordered_map<std::string, WeightShardingMode> exact_matches;
+
+        /// Default mode for unmatched weights
+        WeightShardingMode default_mode = WeightShardingMode::Replicate;
+
+        /**
+         * @brief Determine sharding mode for a weight tensor
+         * @param name GGUF tensor name (e.g., "blk.0.attn_q.weight")
+         * @return Sharding mode for this weight
+         */
+        WeightShardingMode getMode(const std::string &name) const
+        {
+            // Check exact matches first
+            auto it = exact_matches.find(name);
+            if (it != exact_matches.end())
+            {
+                return it->second;
+            }
+
+            // Check patterns in order
+            for (const auto &rule : patterns)
+            {
+                if (name.find(rule.pattern) != std::string::npos)
+                {
+                    return rule.mode;
+                }
+            }
+
+            return default_mode;
+        }
+
+        /**
+         * @brief Check if a weight should be excluded from GEMM packing
+         *
+         * Non-GEMM weights (norms, biases, embeddings) need raw data retained.
+         * GEMM weights can have raw data released after packing.
+         *
+         * @param name GGUF tensor name
+         * @return true if this is NOT a GEMM weight
+         */
+        bool isNonGemmWeight(const std::string &name) const
+        {
+            // Norms are 1D
+            if (name.find("_norm.weight") != std::string::npos)
+                return true;
+            // Biases are 1D
+            if (name.find(".bias") != std::string::npos)
+                return true;
+            // Embeddings are used directly
+            if (name.find("token_embd") != std::string::npos)
+                return true;
+            return false;
+        }
+    };
+
     /**
      * @brief Complete schema for a model architecture
      *
@@ -381,6 +480,9 @@ namespace llaminar2
 
         /// Architecture name (e.g., "qwen2")
         virtual std::string architectureName() const = 0;
+
+        /// Get weight sharding configuration for tensor parallelism
+        virtual WeightShardingConfig getWeightShardingConfig() const = 0;
     };
 
 } // namespace llaminar2

@@ -1,18 +1,19 @@
 #!/bin/bash
 # Show gcov coverage metrics for Llaminar V2 project
+# Reports line and branch coverage for all source files, sorted by coverage %
 
 cd "$(dirname "$0")/.."
 
 echo ""
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║         V2 Test Coverage Summary (gcov)                    ║"
-echo "╚════════════════════════════════════════════════════════════╝"
+echo "=============================================================================="
+echo "                    V2 Test Coverage Summary (gcov)                           "
+echo "=============================================================================="
 echo ""
 
-GCDA_COUNT=$(find build_v2 -name '*.gcda' 2>/dev/null | wc -l)
+GCDA_COUNT=$(find build_v2/CMakeFiles/llaminar2_core.dir -name '*.gcda' 2>/dev/null | wc -l)
 
 if [ "$GCDA_COUNT" -eq 0 ]; then
-    echo "❌ No coverage data found."
+    echo "No coverage data found."
     echo ""
     echo "Make sure you:"
     echo "  1. Built with coverage enabled (Debug build with --coverage)"
@@ -23,11 +24,11 @@ if [ "$GCDA_COUNT" -eq 0 ]; then
     exit 1
 fi
 
-# Find all .gcno files for llaminar2_core
-GCNO_COUNT=$(find build_v2/src -name "*.gcno" 2>/dev/null | wc -l)
+# Find all .gcno files for llaminar2_core (in CMakeFiles directory)
+GCNO_COUNT=$(find build_v2/CMakeFiles/llaminar2_core.dir -name "*.gcno" 2>/dev/null | wc -l)
 
 if [ "$GCNO_COUNT" -eq 0 ]; then
-    echo "❌ No .gcno files found. Rebuild with coverage enabled."
+    echo "No .gcno files found. Rebuild with coverage enabled."
     echo ""
     echo "Rebuild with:"
     echo "  cmake -B build_v2 -S src/v2 -DCMAKE_BUILD_TYPE=Debug \\"
@@ -37,87 +38,120 @@ if [ "$GCNO_COUNT" -eq 0 ]; then
     exit 1
 fi
 
-echo "Found $GCDA_COUNT coverage data files from $GCNO_COUNT instrumented sources"
+echo "Analyzing $GCNO_COUNT instrumented source files..."
 echo ""
 
-# Change to build directory
-cd build_v2
-
-# Key V2 source files to report on
-KEY_FILES=(
-    "src/v2/pipelines/qwen/Qwen2Pipeline.cpp"
-    "src/v2/pipelines/PipelineBase.cpp"
-    "src/v2/loaders/ModelLoader.cpp"
-    "src/v2/tensors/IQ4_NLTensor.cpp"
-    "src/v2/tensors/FP32Tensor.cpp"
-    "src/v2/tensors/BF16Tensor.cpp"
-    "src/v2/tensors/TensorFactory.cpp"
-    "src/v2/kernels/cpu/QuantizedGemm.cpp"
-    "src/v2/backends/DeviceOrchestrator.cpp"
-    "src/v2/utils/ArgParser.cpp"
-)
-
-echo "Coverage Report (Key Files):"
-echo "═══════════════════════════════════════════════════════════"
+# Create temp file for results
+RESULTS_FILE=$(mktemp)
+trap "rm -f $RESULTS_FILE" EXIT
 
 TOTAL_LINES=0
 COVERED_LINES=0
+TOTAL_BRANCHES=0
+COVERED_BRANCHES=0
+FILE_COUNT=0
 
-for srcfile in "${KEY_FILES[@]}"; do
-    # Find corresponding .gcno file
-    GCNO_FILE=$(find . -name "$(basename ${srcfile}).gcno" | head -1)
+# Process all .gcda files (coverage data)
+for gcda_file in $(find build_v2/CMakeFiles/llaminar2_core.dir -name "*.gcda" 2>/dev/null); do
+    # Get corresponding source file name
+    gcno_file="${gcda_file%.gcda}.gcno"
     
-    if [ -f "$GCNO_FILE" ]; then
-        # Run gcov and capture output
-        GCOV_OUTPUT=$(gcov -n "$GCNO_FILE" 2>&1)
+    if [ -f "$gcno_file" ]; then
+        # Run gcov with branch coverage (-b) on the gcda file
+        # Use -n for no output files, redirect to capture
+        GCOV_OUTPUT=$(gcov -b -n "$gcda_file" 2>&1)
         
-        # Extract coverage percentage
-        COVERAGE=$(echo "$GCOV_OUTPUT" | grep "Lines executed:" | head -1 | sed 's/Lines executed://' | xargs)
+        # Extract the source file name from gcov output
+        SOURCE_FILE=$(echo "$GCOV_OUTPUT" | grep "File '" | head -1 | sed "s/File '\\(.*\\)'/\\1/")
         
-        if [ -n "$COVERAGE" ]; then
-            # Parse percentage
-            PERCENT=$(echo "$COVERAGE" | grep -oE '[0-9]+\.[0-9]+%' | head -1)
-            LINES_INFO=$(echo "$COVERAGE" | grep -oE '[0-9]+ of [0-9]+' | head -1)
+        # Skip if no source file found or it's a system header
+        if [ -z "$SOURCE_FILE" ] || [[ "$SOURCE_FILE" == /usr/* ]] || [[ "$SOURCE_FILE" == *"_deps"* ]]; then
+            continue
+        fi
+        
+        # Extract line coverage: "Lines executed:XX.XX% of Y"
+        LINE_INFO=$(echo "$GCOV_OUTPUT" | grep "Lines executed:" | head -1)
+        LINE_PERCENT=$(echo "$LINE_INFO" | grep -oE '[0-9]+\.[0-9]+%' | head -1)
+        LINE_TOTAL=$(echo "$LINE_INFO" | grep -oE 'of [0-9]+' | head -1 | sed 's/of //')
+        
+        # Extract branch coverage: "Branches executed:XX.XX% of Y"
+        BRANCH_INFO=$(echo "$GCOV_OUTPUT" | grep "Branches executed:" | head -1)
+        BRANCH_PERCENT=$(echo "$BRANCH_INFO" | grep -oE '[0-9]+\.[0-9]+%' | head -1)
+        BRANCH_TOTAL=$(echo "$BRANCH_INFO" | grep -oE 'of [0-9]+' | head -1 | sed 's/of //')
+        
+        if [ -n "$LINE_PERCENT" ] && [ -n "$LINE_TOTAL" ]; then
+            # Get just the filename
+            BASENAME=$(basename "$SOURCE_FILE")
             
-            if [ -n "$PERCENT" ]; then
-                # Extract numeric values for totals
-                COVERED=$(echo "$LINES_INFO" | cut -d' ' -f1)
-                TOTAL=$(echo "$LINES_INFO" | cut -d' ' -f3)
-                
-                TOTAL_LINES=$((TOTAL_LINES + TOTAL))
-                COVERED_LINES=$((COVERED_LINES + COVERED))
-                
-                # Color code based on percentage
-                PERCENT_NUM=$(echo "$PERCENT" | sed 's/%//')
-                if (( $(echo "$PERCENT_NUM >= 80" | bc -l) )); then
-                    COLOR="\033[0;32m" # Green
-                elif (( $(echo "$PERCENT_NUM >= 50" | bc -l) )); then
-                    COLOR="\033[0;33m" # Yellow
-                else
-                    COLOR="\033[0;31m" # Red
-                fi
-                NC="\033[0m" # No color
-                
-                printf "${COLOR}%-50s %6s  (%s)${NC}\n" "$(basename $srcfile)" "$PERCENT" "$LINES_INFO"
+            # Calculate covered lines from percentage
+            LINE_PCT_NUM=${LINE_PERCENT%\%}
+            LINE_COVERED=$(echo "$LINE_PCT_NUM $LINE_TOTAL" | awk '{printf "%.0f", $1 * $2 / 100}')
+            
+            # Accumulate totals
+            TOTAL_LINES=$((TOTAL_LINES + LINE_TOTAL))
+            COVERED_LINES=$((COVERED_LINES + LINE_COVERED))
+            
+            if [ -n "$BRANCH_PERCENT" ] && [ -n "$BRANCH_TOTAL" ]; then
+                BRANCH_PCT_NUM=${BRANCH_PERCENT%\%}
+                BRANCH_COVERED=$(echo "$BRANCH_PCT_NUM $BRANCH_TOTAL" | awk '{printf "%.0f", $1 * $2 / 100}')
+                TOTAL_BRANCHES=$((TOTAL_BRANCHES + BRANCH_TOTAL))
+                COVERED_BRANCHES=$((COVERED_BRANCHES + BRANCH_COVERED))
+                BRANCH_STR="$BRANCH_PERCENT"
+            else
+                BRANCH_STR="  n/a  "
             fi
+            
+            # Store for sorting: sort key (numeric), then the display line
+            SORT_KEY=$(echo "$LINE_PERCENT" | sed 's/%//')
+            
+            echo "$SORT_KEY|$BASENAME|$LINE_PERCENT|$LINE_COVERED/$LINE_TOTAL|$BRANCH_STR" >> "$RESULTS_FILE"
+            FILE_COUNT=$((FILE_COUNT + 1))
         fi
     fi
 done
 
-echo "═══════════════════════════════════════════════════════════"
+# Sort the results file for display
+SORTED_FILE=$(mktemp)
+sort -t'|' -k1 -rn "$RESULTS_FILE" > "$SORTED_FILE"
 
+# Print header
+printf "%-45s %10s %12s %10s\n" "Source File" "Lines" "Covered" "Branches"
+echo "--------------------------------------------------------------------------"
+
+# Display with colors (using process substitution to avoid subshell)
+while IFS='|' read -r sort_key basename line_pct line_counts branch_pct; do
+    # Color code based on percentage
+    PERCENT_INT=${sort_key%.*}
+    if [ "$PERCENT_INT" -ge 80 ] 2>/dev/null; then
+        COLOR="\033[0;32m" # Green
+    elif [ "$PERCENT_INT" -ge 50 ] 2>/dev/null; then
+        COLOR="\033[0;33m" # Yellow
+    else
+        COLOR="\033[0;31m" # Red
+    fi
+    NC="\033[0m"
+    
+    printf "${COLOR}%-45s %10s %12s %10s${NC}\n" "$basename" "$line_pct" "$line_counts" "$branch_pct"
+done < "$SORTED_FILE"
+
+rm -f "$SORTED_FILE"
+
+echo "--------------------------------------------------------------------------"
+
+# Calculate and display totals
+echo ""
 if [ "$TOTAL_LINES" -gt 0 ]; then
-    OVERALL_PERCENT=$(echo "scale=2; $COVERED_LINES * 100 / $TOTAL_LINES" | bc)
-    echo ""
-    echo "Overall Coverage (Key Files): ${OVERALL_PERCENT}% ($COVERED_LINES of $TOTAL_LINES lines)"
+    OVERALL_LINE_PCT=$((COVERED_LINES * 100 / TOTAL_LINES))
+    echo "Line Coverage:   $OVERALL_LINE_PCT% ($COVERED_LINES of $TOTAL_LINES lines)"
 fi
 
-cd ..
+if [ "$TOTAL_BRANCHES" -gt 0 ]; then
+    OVERALL_BRANCH_PCT=$((COVERED_BRANCHES * 100 / TOTAL_BRANCHES))
+    echo "Branch Coverage: $OVERALL_BRANCH_PCT% ($COVERED_BRANCHES of $TOTAL_BRANCHES branches)"
+fi
 
 echo ""
-echo "✓ Coverage data available for $GCDA_COUNT test runs"
+echo "Files analyzed: $FILE_COUNT"
 echo ""
-echo "For detailed per-line coverage:"
-echo "  1. Open a source file in VS Code"
-echo "  2. Ctrl+Shift+P → 'Coverage Gutters: Display Coverage'"
+echo "Legend: Green >= 80% | Yellow >= 50% | Red < 50%"
 echo ""

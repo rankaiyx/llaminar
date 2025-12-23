@@ -7,6 +7,7 @@
 
 #include "InferenceRunnerFactory.h"
 #include "../models/qwen/Qwen2Graph.h"
+#include "../models/qwen/Qwen2Schema.h"
 #include "GraphOrchestrator.h"
 #include "../loaders/ModelContext.h"
 #include "../loaders/ModelLoader.h"
@@ -82,6 +83,15 @@ namespace llaminar2
         {
             LOG_ERROR("[InferenceRunner] Only qwen2 architecture is supported, got: " << architecture);
             return nullptr;
+        }
+
+        // Configure weight sharding from Qwen2 schema
+        auto weight_mgr = model_ctx->weightManager();
+        if (weight_mgr)
+        {
+            Qwen2SchemaFactory schema_factory;
+            weight_mgr->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+            LOG_DEBUG("[InferenceRunner] Applied Qwen2 sharding config to WeightManager");
         }
 
         // Get model metadata

@@ -7,10 +7,12 @@
  * - SHARDED: Partition across ranks (memory efficient, requires Allreduce)
  * - INTERLEAVED: NUMA-aware global allocation (shared memory optimization)
  *
- * For SHARDED strategy, weights are partitioned as follows:
- * - Column-parallel weights (QKV, Gate/Up): Split output dimension
- * - Row-parallel weights (Wo, Down): Split input dimension
- * - Non-parallel weights (norms, embeddings): Replicated
+ * For SHARDED strategy, weights are partitioned based on model-specific
+ * sharding configuration defined in the model's schema (e.g., Qwen2Schema).
+ * This keeps WeightManager generic and model-agnostic.
+ *
+ * @see GraphSchema.h for WeightShardingConfig structure
+ * @see models/qwen/Qwen2Schema.h for Qwen2-specific sharding patterns
  *
  * @author David Sanftenberg
  */
@@ -19,6 +21,7 @@
 
 #include "ModelLoader.h"
 #include "WeightPlacementMap.h"
+#include "../execution/GraphSchema.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
@@ -111,6 +114,21 @@ namespace llaminar2
         void clearCache() { cache_.clear(); }
 
         /**
+         * @brief Set model-specific weight sharding configuration
+         *
+         * This should be called after construction with the config from
+         * the model's schema factory (e.g., Qwen2SchemaFactory).
+         *
+         * @param config Weight sharding configuration from model schema
+         */
+        void setWeightShardingConfig(const WeightShardingConfig &config)
+        {
+            sharding_config_ = config;
+            has_sharding_config_ = true;
+            sharding_mode_cache_.clear(); // Invalidate cache
+        }
+
+        /**
          * @brief Check if a weight is sharded (only valid for SHARDED strategy)
          * @param name Weight tensor name
          * @return true if weight is column or row parallel sharded
@@ -127,30 +145,16 @@ namespace llaminar2
         /**
          * @brief Check if a weight is used for GEMM operations
          *
-         * GEMM weights (2D matrices for matmul) should have their raw data
-         * released after GEMM packing to save memory. Non-GEMM weights like
-         * norms, biases, and embeddings need their raw data retained.
+         * Uses the model's sharding config if set, otherwise uses default patterns.
          *
          * @param name Weight tensor name
          * @return true if weight is a GEMM matrix (should release raw data after packing)
          */
-        static bool isGemmWeight(const std::string &name);
+        bool isGemmWeight(const std::string &name) const;
 
         // =========================================================================
-        // Static utility methods (public for testing and reuse)
+        // Static utility methods (public for tensor slicing)
         // =========================================================================
-
-        /**
-         * @brief Determine sharding mode from weight name (static for testability)
-         *
-         * Pattern matching (Phase 1 - row-parallel only):
-         * - Row-parallel: attn_output, ffn_down
-         * - Replicate: everything else (QKV, Gate/Up, norms, biases, embeddings)
-         *
-         * @param name Weight tensor name
-         * @return ShardingMode indicating partition strategy
-         */
-        static ShardingMode determineShardingMode(const std::string &name);
 
         /**
          * @brief Slice tensor columns for column-parallel sharding
@@ -214,13 +218,27 @@ namespace llaminar2
          */
         std::shared_ptr<TensorBase> getInterleavedWeight(const std::string &name, int device_idx);
 
-        ModelLoader &loader_;                                                ///< GGUF loader
-        std::shared_ptr<MPIContext> mpi_ctx_;                                ///< MPI context (nullptr = single rank)
-        std::shared_ptr<WeightPlacementMap> placement_map_;                  ///< Fine-grained placement decisions
-        WeightDistributionStrategy strategy_;                                ///< Distribution strategy
-        WeightPrecision weight_precision_;                                   ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
-        std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_; ///< Weight cache
-        std::unordered_map<std::string, ShardingMode> sharding_mode_cache_;  ///< Cached sharding modes
+        /**
+         * @brief Determine sharding mode using config or legacy patterns
+         *
+         * Uses sharding_config_ if set, otherwise falls back to legacy hardcoded patterns.
+         */
+        ShardingMode determineShardingMode(const std::string &name) const;
+
+        /**
+         * @brief Convert WeightShardingMode (from schema) to ShardingMode (internal)
+         */
+        static ShardingMode toShardingMode(WeightShardingMode mode);
+
+        ModelLoader &loader_;                                                       ///< GGUF loader
+        std::shared_ptr<MPIContext> mpi_ctx_;                                       ///< MPI context (nullptr = single rank)
+        std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
+        WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
+        WeightPrecision weight_precision_;                                          ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
+        std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_;        ///< Weight cache
+        mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
+        WeightShardingConfig sharding_config_;                                      ///< Model-specific sharding patterns
+        bool has_sharding_config_ = false;                                          ///< True if config was set explicitly
     };
 
 } // namespace llaminar2

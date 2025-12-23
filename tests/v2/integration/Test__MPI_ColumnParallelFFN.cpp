@@ -17,6 +17,7 @@
 
 #include "loaders/WeightManager.h"
 #include "loaders/ModelLoader.h"
+#include "models/qwen/Qwen2Schema.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"
@@ -56,12 +57,17 @@ protected:
             GTEST_SKIP() << "Model file not found: " << MODEL_PATH;
         }
 
-        // Create weight manager with SHARDED strategy
+        // Create weight manager with SHARDED strategy and Qwen2 sharding config
         weight_manager_ = std::make_unique<WeightManager>(
             *loader_,
             mpi_ctx_,
             nullptr, // placement_map
             WeightDistributionStrategy::SHARDED);
+
+        // Set Qwen2 sharding configuration
+        Qwen2SchemaFactory schema_factory;
+        weight_manager_->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+        sharding_config_ = schema_factory.getWeightShardingConfig();
     }
 
     void TearDown() override
@@ -76,6 +82,27 @@ protected:
     std::unique_ptr<WeightManager> weight_manager_;
     std::shared_ptr<MPIContext> mpi_ctx_;
     std::shared_ptr<TensorFactory> factory_;
+    WeightShardingConfig sharding_config_;
+
+    /**
+     * @brief Helper to get sharding mode using schema config
+     */
+    ShardingMode getShardingMode(const std::string &name) const
+    {
+        WeightShardingMode mode = sharding_config_.getMode(name);
+        switch (mode)
+        {
+        case WeightShardingMode::ColumnParallel:
+            return ShardingMode::COLUMN_PARALLEL;
+        case WeightShardingMode::RowParallel:
+            return ShardingMode::ROW_PARALLEL;
+        case WeightShardingMode::InputParallel:
+            return ShardingMode::INPUT_PARALLEL;
+        case WeightShardingMode::Replicate:
+        default:
+            return ShardingMode::REPLICATE;
+        }
+    }
 };
 
 // =============================================================================
@@ -85,15 +112,15 @@ protected:
 TEST_F(Test__MPI_ColumnParallelFFN, ShardingModeDetection)
 {
     // Gate should be COLUMN_PARALLEL
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.ffn_gate.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.ffn_gate.weight"),
               ShardingMode::COLUMN_PARALLEL);
 
     // Up should be COLUMN_PARALLEL
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.ffn_up.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.ffn_up.weight"),
               ShardingMode::COLUMN_PARALLEL);
 
     // Down should be INPUT_PARALLEL (split input dimension to match Gate/Up output)
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.ffn_down.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.ffn_down.weight"),
               ShardingMode::INPUT_PARALLEL);
 
     LOG_INFO("[Test] FFN sharding mode detection PASSED - "

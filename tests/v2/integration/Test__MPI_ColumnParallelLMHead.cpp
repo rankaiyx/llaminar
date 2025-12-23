@@ -22,6 +22,7 @@
 
 #include "loaders/WeightManager.h"
 #include "loaders/ModelLoader.h"
+#include "models/qwen/Qwen2Schema.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "kernels/KernelFactory.h"
@@ -68,6 +69,11 @@ protected:
             mpi_ctx_,
             nullptr, // placement_map
             WeightDistributionStrategy::SHARDED);
+
+        // Set Qwen2 sharding configuration
+        Qwen2SchemaFactory schema_factory;
+        weight_manager_->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+        sharding_config_ = schema_factory.getWeightShardingConfig();
     }
 
     void TearDown() override
@@ -82,6 +88,27 @@ protected:
     std::unique_ptr<WeightManager> weight_manager_;
     std::shared_ptr<MPIContext> mpi_ctx_;
     std::shared_ptr<TensorFactory> factory_;
+    WeightShardingConfig sharding_config_;
+
+    /**
+     * @brief Helper to get sharding mode using schema config
+     */
+    ShardingMode getShardingMode(const std::string &name) const
+    {
+        WeightShardingMode mode = sharding_config_.getMode(name);
+        switch (mode)
+        {
+        case WeightShardingMode::ColumnParallel:
+            return ShardingMode::COLUMN_PARALLEL;
+        case WeightShardingMode::RowParallel:
+            return ShardingMode::ROW_PARALLEL;
+        case WeightShardingMode::InputParallel:
+            return ShardingMode::INPUT_PARALLEL;
+        case WeightShardingMode::Replicate:
+        default:
+            return ShardingMode::REPLICATE;
+        }
+    }
 };
 
 // =============================================================================
@@ -91,7 +118,7 @@ protected:
 TEST_F(Test__MPI_ColumnParallelLMHead, ShardingModeDetection)
 {
     // output.weight should be COLUMN_PARALLEL (split by vocab dimension)
-    EXPECT_EQ(WeightManager::determineShardingMode("output.weight"),
+    EXPECT_EQ(getShardingMode("output.weight"),
               ShardingMode::COLUMN_PARALLEL);
 
     LOG_INFO("[Test] LM Head sharding mode detection PASSED - "

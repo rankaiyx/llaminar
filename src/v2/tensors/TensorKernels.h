@@ -1390,8 +1390,7 @@ namespace llaminar2
      * - Multiple activation precisions via typed implementations
      *
      * Implementations:
-     * - CpuAttentionKernelT<TensorT>: Template-based CPU kernel (legacy)
-     * - CPUAttentionKernelTyped<Precision>: Precision-enum based kernel (preferred)
+     * - CPUAttentionKernelT<Precision>: Precision-enum based kernel
      */
     class ITensorAttention : public ITensorKernel
     {

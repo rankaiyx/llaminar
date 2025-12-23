@@ -1,9 +1,8 @@
 /**
- * @file CPUAttentionKernelTyped.h
- * @brief Typed CPU attention kernel supporting all activation precisions
+ * @file CPUAttentionKernelT.h
+ * @brief CPU attention kernel supporting all activation precisions
  *
- * Replaces CpuAttentionKernelT with a precision-agnostic template implementation
- * based on ActivationPrecision enum.
+ * Precision-agnostic template implementation based on ActivationPrecision enum.
  *
  * Benefits:
  * - Single implementation supports FP32, BF16, FP16, Q8_1 (zero code duplication)
@@ -81,7 +80,7 @@ namespace llaminar2
      * - allocate_workspace(): Precision-specific workspace allocation
      */
     template <ActivationPrecision Precision>
-    class CPUAttentionKernelTyped : public ITensorAttention, public CPUKernelBase
+    class CPUAttentionKernelT : public ITensorAttention, public CPUKernelBase
     {
     public:
         using TensorT = typename detail::PrecisionToTensor<Precision>::Type;
@@ -89,8 +88,8 @@ namespace llaminar2
         using ElementType = typename primitives::ActivationTraits<TensorT>::ElementType;
         using Traits = primitives::ActivationTraits<TensorT>;
 
-        CPUAttentionKernelTyped() = default;
-        ~CPUAttentionKernelTyped() override = default;
+        CPUAttentionKernelT() = default;
+        ~CPUAttentionKernelT() override = default;
 
         /**
          * @brief Check if kernel supports specific device
@@ -258,7 +257,7 @@ namespace llaminar2
             // Only Q8_1 precision supports this path
             if constexpr (!std::is_same_v<TensorT, Q8_1Tensor>)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped] compute_q8_1 called on non-Q8_1 kernel");
+                LOG_ERROR("[CPUAttentionKernelT] compute_q8_1 called on non-Q8_1 kernel");
                 return false;
             }
             else
@@ -304,7 +303,7 @@ namespace llaminar2
             // Only Q8_1 precision supports this path
             if constexpr (!std::is_same_v<TensorT, Q8_1Tensor>)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped] compute_batch_q8_1 called on non-Q8_1 kernel");
+                LOG_ERROR("[CPUAttentionKernelT] compute_batch_q8_1 called on non-Q8_1 kernel");
                 return false;
             }
             else
@@ -416,9 +415,9 @@ namespace llaminar2
             static bool logged = false;
             if (!logged)
             {
-                LOG_INFO("[CPUAttentionKernelTyped] Using FP32 scores mode for Q8_1 attention (LLAMINAR_Q8_ATTENTION_FP32_SCORES=1)");
-                LOG_INFO("[CPUAttentionKernelTyped] FP32 scores params: seq_len=" << seq_len << " kv_len=" << kv_len
-                                                                                  << " n_heads=" << n_heads << " head_dim=" << head_dim << " causal=" << causal);
+                LOG_INFO("[CPUAttentionKernelT] Using FP32 scores mode for Q8_1 attention (LLAMINAR_Q8_ATTENTION_FP32_SCORES=1)");
+                LOG_INFO("[CPUAttentionKernelT] FP32 scores params: seq_len=" << seq_len << " kv_len=" << kv_len
+                                                                              << " n_heads=" << n_heads << " head_dim=" << head_dim << " causal=" << causal);
                 logged = true;
             }
 
@@ -670,7 +669,7 @@ namespace llaminar2
                 static bool logged = false;
                 if (!logged)
                 {
-                    LOG_INFO("[CPUAttentionKernelTyped] Using JIT kernel for head_dim=" << head_dim);
+                    LOG_INFO("[CPUAttentionKernelT] Using JIT kernel for head_dim=" << head_dim);
                     logged = true;
                 }
             }
@@ -678,8 +677,8 @@ namespace llaminar2
             // Fallback to reference implementation for unsupported head_dim
             if (!jit_kernel)
             {
-                LOG_WARN("[CPUAttentionKernelTyped] head_dim=" << head_dim
-                                                               << " not supported by JIT, falling back to reference implementation");
+                LOG_WARN("[CPUAttentionKernelT] head_dim=" << head_dim
+                                                           << " not supported by JIT, falling back to reference implementation");
 
                 // Use reference implementation (nested-safe)
                 auto fallback_work = [&]()
@@ -809,20 +808,20 @@ namespace llaminar2
             // Validate inputs
             if (!Q || !K || !V || !output)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped] compute: null tensor data");
+                LOG_ERROR("[CPUAttentionKernelT] compute: null tensor data");
                 return false;
             }
 
             if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0 || kv_len <= 0)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped] compute: invalid dimensions");
+                LOG_ERROR("[CPUAttentionKernelT] compute: invalid dimensions");
                 return false;
             }
 
             if (n_heads % n_kv_heads != 0)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped] compute: n_heads (" << n_heads
-                                                                         << ") must be divisible by n_kv_heads (" << n_kv_heads << ")");
+                LOG_ERROR("[CPUAttentionKernelT] compute: n_heads (" << n_heads
+                                                                     << ") must be divisible by n_kv_heads (" << n_kv_heads << ")");
                 return false;
             }
 
@@ -1275,16 +1274,16 @@ namespace llaminar2
                 // DEBUG: Print Q_typed values for this batch (only for FP32)
                 if constexpr (std::is_same_v<ElementType, float>)
                 {
-                    LOG_DEBUG("[CPUAttentionKernelTyped::compute_batch] batch=" << b << " q_offset=" << q_offset
-                                                                                << " k_offset=" << k_offset << " v_offset=" << v_offset
-                                                                                << " Q_typed[0..3]=[" << Q_typed[q_offset] << ","
-                                                                                << Q_typed[q_offset + 1] << ","
-                                                                                << Q_typed[q_offset + 2] << ","
-                                                                                << Q_typed[q_offset + 3] << "]"
-                                                                                << " K_typed[0..3]=[" << K_typed[k_offset] << ","
-                                                                                << K_typed[k_offset + 1] << ","
-                                                                                << K_typed[k_offset + 2] << ","
-                                                                                << K_typed[k_offset + 3] << "]");
+                    LOG_DEBUG("[CPUAttentionKernelT::compute_batch] batch=" << b << " q_offset=" << q_offset
+                                                                            << " k_offset=" << k_offset << " v_offset=" << v_offset
+                                                                            << " Q_typed[0..3]=[" << Q_typed[q_offset] << ","
+                                                                            << Q_typed[q_offset + 1] << ","
+                                                                            << Q_typed[q_offset + 2] << ","
+                                                                            << Q_typed[q_offset + 3] << "]"
+                                                                            << " K_typed[0..3]=[" << K_typed[k_offset] << ","
+                                                                            << K_typed[k_offset + 1] << ","
+                                                                            << K_typed[k_offset + 2] << ","
+                                                                            << K_typed[k_offset + 3] << "]");
                 }
 
                 // Scores: [batch_size, n_heads, seq_len, seq_len] (always float)
@@ -1320,11 +1319,11 @@ namespace llaminar2
                 const ElementType *V_slice = V_typed + v_offset;
 
                 // DEBUG: Print pointer values before compute_typed
-                LOG_DEBUG("[CPUAttentionKernelTyped::compute_batch] batch=" << b
-                                                                            << " Q_slice=" << (void *)Q_slice
-                                                                            << " K_slice=" << (void *)K_slice
-                                                                            << " V_slice=" << (void *)V_slice
-                                                                            << " output_ptr=" << (void *)(output + out_offset));
+                LOG_DEBUG("[CPUAttentionKernelT::compute_batch] batch=" << b
+                                                                        << " Q_slice=" << (void *)Q_slice
+                                                                        << " K_slice=" << (void *)K_slice
+                                                                        << " V_slice=" << (void *)V_slice
+                                                                        << " output_ptr=" << (void *)(output + out_offset));
 
                 bool success = compute_typed(
                     Q_slice,
@@ -1340,9 +1339,9 @@ namespace llaminar2
                     seq_len); // kv_len = seq_len for batch compute
 
                 // DEBUG: Print output values after compute_typed
-                LOG_DEBUG("[CPUAttentionKernelTyped::compute_batch] batch=" << b << " out_offset=" << out_offset
-                                                                            << " output[0..3]=[" << output[out_offset] << "," << output[out_offset + 1]
-                                                                            << "," << output[out_offset + 2] << "," << output[out_offset + 3] << "]");
+                LOG_DEBUG("[CPUAttentionKernelT::compute_batch] batch=" << b << " out_offset=" << out_offset
+                                                                        << " output[0..3]=[" << output[out_offset] << "," << output[out_offset + 1]
+                                                                        << "," << output[out_offset + 2] << "," << output[out_offset + 3] << "]");
 
                 if (!success)
                     return false;
@@ -1393,13 +1392,13 @@ namespace llaminar2
             // Validate head ranges
             if (head_start < 0 || head_start >= n_heads)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] Invalid head_start: "
+                LOG_ERROR("[CPUAttentionKernelT::compute_tensor] Invalid head_start: "
                           << head_start << " (n_heads=" << n_heads << ")");
                 return false;
             }
             if (head_start + actual_local_n_heads > n_heads)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] head_start + local_n_heads exceeds n_heads: "
+                LOG_ERROR("[CPUAttentionKernelT::compute_tensor] head_start + local_n_heads exceeds n_heads: "
                           << head_start << " + " << actual_local_n_heads << " > " << n_heads);
                 return false;
             }
@@ -1415,7 +1414,7 @@ namespace llaminar2
             // For now, log a warning if TP slicing is requested but proceed with full computation
             if (head_start != 0 || actual_local_n_heads != n_heads)
             {
-                LOG_WARN("[CPUAttentionKernelTyped::compute_tensor] Head slicing requested (head_start="
+                LOG_WARN("[CPUAttentionKernelT::compute_tensor] Head slicing requested (head_start="
                          << head_start << ", local_n_heads=" << actual_local_n_heads
                          << ") but not yet implemented. Computing all " << n_heads << " heads.");
             }
@@ -1424,7 +1423,7 @@ namespace llaminar2
             (void)actual_local_n_kv_heads;
             if (!Q || !K || !V || !output)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] Null tensor provided");
+                LOG_ERROR("[CPUAttentionKernelT::compute_tensor] Null tensor provided");
                 return false;
             }
 
@@ -1445,7 +1444,7 @@ namespace llaminar2
 
             if (Q->native_type() != expected_type)
             {
-                LOG_ERROR("[CPUAttentionKernelTyped::compute_tensor] Q tensor type mismatch: expected "
+                LOG_ERROR("[CPUAttentionKernelT::compute_tensor] Q tensor type mismatch: expected "
                           << static_cast<int>(expected_type) << ", got " << static_cast<int>(Q->native_type()));
                 return false;
             }
@@ -1514,8 +1513,8 @@ namespace llaminar2
     };
 
     // Explicit instantiations
-    extern template class CPUAttentionKernelTyped<ActivationPrecision::FP32>;
-    extern template class CPUAttentionKernelTyped<ActivationPrecision::BF16>;
-    extern template class CPUAttentionKernelTyped<ActivationPrecision::FP16>;
-    extern template class CPUAttentionKernelTyped<ActivationPrecision::Q8_1>;
+    extern template class CPUAttentionKernelT<ActivationPrecision::FP32>;
+    extern template class CPUAttentionKernelT<ActivationPrecision::BF16>;
+    extern template class CPUAttentionKernelT<ActivationPrecision::FP16>;
+    extern template class CPUAttentionKernelT<ActivationPrecision::Q8_1>;
 } // namespace llaminar2

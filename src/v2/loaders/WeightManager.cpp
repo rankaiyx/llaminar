@@ -145,41 +145,15 @@ namespace llaminar2
         return tensor;
     }
 
-    bool WeightManager::isGemmWeight(const std::string &name)
+    bool WeightManager::isGemmWeight(const std::string &name) const
     {
-        // GEMM weights are 2D matrices used for matmul operations
-        // These should have their raw data released after GEMM packing
-        //
-        // GEMM weights:
-        //   - attn_q.weight, attn_k.weight, attn_v.weight, attn_output.weight
-        //   - ffn_gate.weight, ffn_up.weight, ffn_down.weight
-        //   - output.weight (LM head)
-        //
-        // NOT GEMM weights (keep raw data):
-        //   - *_norm.weight (RMSNorm, 1D)
-        //   - token_embd.weight (embeddings, used directly)
-        //   - *.bias (1D biases)
-
-        // Exclude norms (1D tensors)
-        if (name.find("_norm.weight") != std::string::npos)
+        if (!has_sharding_config_)
         {
-            return false;
+            throw std::runtime_error(
+                "[WeightManager] isGemmWeight called without sharding config. "
+                "Call setWeightShardingConfig() with model schema first.");
         }
-
-        // Exclude biases (1D tensors)
-        if (name.find(".bias") != std::string::npos)
-        {
-            return false;
-        }
-
-        // Exclude embeddings (used directly, not via GEMM)
-        if (name.find("token_embd") != std::string::npos)
-        {
-            return false;
-        }
-
-        // All other .weight tensors are GEMM weights
-        return name.find(".weight") != std::string::npos;
+        return !sharding_config_.isNonGemmWeight(name);
     }
 
     std::shared_ptr<TensorBase> WeightManager::getReplicatedWeight(const std::string &name, int device_idx)
@@ -198,107 +172,32 @@ namespace llaminar2
         return tensor;
     }
 
-    ShardingMode WeightManager::determineShardingMode(const std::string &name)
+    ShardingMode WeightManager::toShardingMode(WeightShardingMode mode)
     {
-        // =========================================================================
-        // Weight Sharding Strategy for Tensor Parallelism
-        // =========================================================================
-        //
-        // Attention Tensor Parallelism (Phase 3):
-        // ========================================
-        // Q/K/V are COLUMN-PARALLEL (split output dimension = heads)
-        //   - Weight: [n_heads * head_dim, d_model] → [local_heads * head_dim, d_model]
-        //   - Output: [seq, local_heads * head_dim] (each rank has different heads)
-        //   - Biases: [n_heads * head_dim] → [local_heads * head_dim]
-        //   - No allreduce needed (heads are independent)
-        //
-        // Wo is ROW-PARALLEL (split output dimension, allreduce after)
-        //   - Weight: [d_model, n_heads * head_dim] → [d_model, local_heads * head_dim]
-        //   - Input: [seq, local_heads * head_dim] (from local Q*K*V attention)
-        //   - Output: [seq, d_model] partial sum, needs allreduce
-        //
-        // FFN Tensor Parallelism Pattern (Phase 4b-1):
-        // =============================================
-        // 1. Gate/Up are COLUMN-PARALLEL (split output d_ff dimension)
-        //    - Weight: [d_ff, d_model] → [d_ff_local, d_model] per rank
-        //    - Output: [seq, d_ff_local] (each rank has different neurons)
-        //    - No allreduce needed
-        //
-        // 2. Down is INPUT-PARALLEL (split input d_ff dimension to match Gate/Up output)
-        //    - Weight: [d_model, d_ff] → [d_model, d_ff_local] per rank
-        //    - Input: [seq, d_ff_local] (matches Gate/Up output)
-        //    - Output: [seq, d_model] partial sum
-        //    - Allreduce needed to sum partial results
-        //
-        // Pattern matching for GGUF weight names:
-        // - Column-parallel: attn_q, attn_k, attn_v, ffn_gate, ffn_up, output.weight (split output dim)
-        // - Row-parallel: attn_output (Wo) - split input dim matching local heads
-        // - Input-parallel: ffn_down (split input dim to match Gate/Up output)
-        // - Replicated: norms, embeddings
-        // =========================================================================
-
-        // Input-parallel weights: Wo (attn_output.weight)
-        // Wo uses input-parallel to match column-parallel QKV:
-        // - Full Wo: [d_model, d_model] where d_model = n_heads * head_dim
-        // - With column-parallel QKV, attention output is [seq, local_heads * head_dim]
-        // - Wo needs input dim split: [d_model, d_model/world_size] per rank
-        // - GEMM: [seq, local_dim] @ [local_dim, d_model]^T = [seq, d_model] partial
-        // - Outputs need AllReduce to sum partial results
-        if (name.find("attn_output.weight") != std::string::npos)
+        switch (mode)
         {
+        case WeightShardingMode::ColumnParallel:
+            return ShardingMode::COLUMN_PARALLEL;
+        case WeightShardingMode::RowParallel:
+            return ShardingMode::ROW_PARALLEL;
+        case WeightShardingMode::InputParallel:
             return ShardingMode::INPUT_PARALLEL;
+        case WeightShardingMode::Replicate:
+        default:
+            return ShardingMode::REPLICATE;
         }
+    }
 
-        // Column-parallel weights: FFN Gate/Up (Phase 4b-1)
-        // Gate/Up split output dimension (d_ff rows of weight matrix)
-        if (name.find("ffn_gate.weight") != std::string::npos ||
-            name.find("ffn_up.weight") != std::string::npos)
+    ShardingMode WeightManager::determineShardingMode(const std::string &name) const
+    {
+        if (!has_sharding_config_)
         {
-            return ShardingMode::COLUMN_PARALLEL;
+            throw std::runtime_error(
+                "[WeightManager] determineShardingMode called without sharding config. "
+                "Call setWeightShardingConfig() with model schema first.");
         }
-
-        // Input-parallel weights: FFN Down (Phase 4b-1)
-        // Down splits input dimension (d_ff columns of weight matrix) to match Gate/Up output
-        if (name.find("ffn_down.weight") != std::string::npos)
-        {
-            return ShardingMode::INPUT_PARALLEL;
-        }
-
-        // Column-parallel weights: Attention Q/K/V (Phase 3)
-        // Q/K/V split output dimension (n_heads * head_dim) so each rank computes local heads
-        // - Weight: [n_heads * head_dim, d_model] → [local_heads * head_dim, d_model] per rank
-        // - Output: [seq, local_heads * head_dim] (each rank has different heads)
-        // - No allreduce needed (heads are independent)
-        // - Wo projection uses row-parallel (already enabled) with allreduce
-        if (name.find("attn_q.weight") != std::string::npos ||
-            name.find("attn_k.weight") != std::string::npos ||
-            name.find("attn_v.weight") != std::string::npos)
-        {
-            return ShardingMode::COLUMN_PARALLEL;
-        }
-
-        // Column-parallel biases: Attention Q/K/V biases (Phase 3)
-        // Biases must be sharded to match their corresponding weight sharding
-        // - Bias: [n_heads * head_dim] → [local_heads * head_dim] per rank
-        if (name.find("attn_q.bias") != std::string::npos ||
-            name.find("attn_k.bias") != std::string::npos ||
-            name.find("attn_v.bias") != std::string::npos)
-        {
-            return ShardingMode::COLUMN_PARALLEL;
-        }
-
-        // Column-parallel weights: LM Head (Phase 5)
-        // LM head [vocab_size, d_model] splits output dimension (vocab_size rows)
-        // - Weight: [vocab_size, d_model] → [vocab_local, d_model] per rank
-        // - Output: [seq, vocab_local] (each rank computes logits for different vocab tokens)
-        // - AllGather needed before sampling to reconstruct full vocab logits
-        if (name == "output.weight")
-        {
-            return ShardingMode::COLUMN_PARALLEL;
-        }
-
-        // Everything else is replicated
-        return ShardingMode::REPLICATE;
+        WeightShardingMode mode = sharding_config_.getMode(name);
+        return toShardingMode(mode);
     }
 
     ShardingMode WeightManager::getShardingMode(const std::string &name) const
@@ -310,9 +209,9 @@ namespace llaminar2
             return it->second;
         }
 
-        // Determine and cache
+        // Determine and cache (cache is mutable)
         ShardingMode mode = determineShardingMode(name);
-        const_cast<WeightManager *>(this)->sharding_mode_cache_[name] = mode;
+        sharding_mode_cache_[name] = mode;
         return mode;
     }
 

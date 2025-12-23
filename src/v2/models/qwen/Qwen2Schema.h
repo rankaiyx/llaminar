@@ -75,6 +75,78 @@ namespace llaminar2
 
         std::string architectureName() const override { return "qwen2"; }
 
+        /**
+         * @brief Get weight sharding configuration for Qwen2 tensor parallelism
+         *
+         * Qwen2 Tensor Parallelism Strategy:
+         * ==================================
+         *
+         * Attention:
+         * - Q/K/V projections: COLUMN_PARALLEL (split by heads)
+         *   - Weight: [n_heads * head_dim, d_model] → [local_heads * head_dim, d_model]
+         * - Wo projection: INPUT_PARALLEL (allreduce after)
+         *   - Weight: [d_model, n_heads * head_dim] → [d_model, local_heads * head_dim]
+         *
+         * FFN (SwiGLU):
+         * - Gate/Up projections: COLUMN_PARALLEL (split d_ff)
+         *   - Weight: [d_ff, d_model] → [d_ff_local, d_model]
+         * - Down projection: INPUT_PARALLEL (allreduce after)
+         *   - Weight: [d_model, d_ff] → [d_model, d_ff_local]
+         *
+         * LM Head:
+         * - output.weight: COLUMN_PARALLEL (split vocab, allgather logits)
+         *
+         * Replicated (full copy on each rank):
+         * - Norms, biases, embeddings
+         */
+        WeightShardingConfig getWeightShardingConfig() const override
+        {
+            WeightShardingConfig config;
+
+            // Exact match for LM head (no blk prefix)
+            config.exact_matches["output.weight"] = WeightShardingMode::ColumnParallel;
+
+            // Pattern rules (evaluated in order, first match wins)
+            config.patterns = {
+                // ===== Attention Weights =====
+                // Wo (attn_output) uses INPUT_PARALLEL - split input dim to match local heads
+                {"attn_output.weight", WeightShardingMode::InputParallel,
+                 "Wo projection - split input dim, allreduce after"},
+
+                // QKV use COLUMN_PARALLEL - split output dim (heads)
+                {"attn_q.weight", WeightShardingMode::ColumnParallel,
+                 "Q projection - split by heads"},
+                {"attn_k.weight", WeightShardingMode::ColumnParallel,
+                 "K projection - split by heads"},
+                {"attn_v.weight", WeightShardingMode::ColumnParallel,
+                 "V projection - split by heads"},
+
+                // QKV biases follow their weights
+                {"attn_q.bias", WeightShardingMode::ColumnParallel,
+                 "Q bias - matches Q weight sharding"},
+                {"attn_k.bias", WeightShardingMode::ColumnParallel,
+                 "K bias - matches K weight sharding"},
+                {"attn_v.bias", WeightShardingMode::ColumnParallel,
+                 "V bias - matches V weight sharding"},
+
+                // ===== FFN Weights =====
+                // Gate/Up use COLUMN_PARALLEL - split output dim (d_ff)
+                {"ffn_gate.weight", WeightShardingMode::ColumnParallel,
+                 "Gate projection - split d_ff dimension"},
+                {"ffn_up.weight", WeightShardingMode::ColumnParallel,
+                 "Up projection - split d_ff dimension"},
+
+                // Down uses INPUT_PARALLEL - split input dim to match Gate/Up output
+                {"ffn_down.weight", WeightShardingMode::InputParallel,
+                 "Down projection - split input dim, allreduce after"},
+            };
+
+            // Default: replicate (norms, embeddings, unmatched weights)
+            config.default_mode = WeightShardingMode::Replicate;
+
+            return config;
+        }
+
         GraphSchema createSchema() const override
         {
             GraphSchema schema;

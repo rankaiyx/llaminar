@@ -3,7 +3,7 @@
  * @brief Precision-specific traits for activation tensor operations
  * @author David Sanftenberg
  *
- * Provides compile-time traits for CpuAttentionKernelT<TensorType> to dispatch
+ * Provides compile-time traits for CPUAttentionKernelT<Precision> to dispatch
  * precision-specific operations (softmax, GEMM, workspace allocation).
  *
  * Pattern:

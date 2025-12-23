@@ -3087,7 +3087,7 @@ namespace llaminar2
         }
 
         // Step 4: Create attention kernel via KernelFactory (device-aware dispatch)
-        // This uses the typed kernel path (CPUAttentionKernelTyped) which properly
+        // This uses the typed kernel path (CPUAttentionKernelT) which properly
         // handles decode mode where Q.seq_len != K.seq_len
         const int device_idx = params_.device_idx;
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx);

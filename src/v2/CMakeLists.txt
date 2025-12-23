@@ -21,6 +21,19 @@ mark_as_advanced(CMAKE_CXX_FLAGS_E2ERELEASE CMAKE_C_FLAGS_E2ERELEASE CMAKE_EXE_L
 # Add E2ERelease to valid build types
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease" CACHE STRING "" FORCE)
 
+# =============================================================================
+# Code Coverage Support (Debug builds only)
+# =============================================================================
+# When coverage flags are detected in CMAKE_CXX_FLAGS_DEBUG, ensure gcov
+# library is linked to all targets. This is required because --coverage
+# generates profiling calls that need libgcov at link time.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    if(CMAKE_CXX_FLAGS_DEBUG MATCHES "--coverage")
+        message(STATUS "V2: Code coverage enabled - linking gcov library")
+        link_libraries(gcov)
+    endif()
+endif()
+
 # Enable native CPU optimizations (AVX512/AVX2/FMA)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 
@@ -571,8 +584,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUSoftmaxKernelT.cpp  # Typed Softmax with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp   # Typed SwiGLU with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/ops/CPUEmbeddingKernelT.cpp    # Typed Embedding lookup with native precision paths (FP32/BF16/FP16/Q8_1)
-    kernels/cpu/attention/CpuAttentionKernelT.cpp  # Template-based attention with ActivationTraits (FP32/BF16/FP16/INT32/Q8_0)
-    kernels/cpu/attention/CPUAttentionKernelTyped.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
+    kernels/cpu/attention/CPUAttentionKernelT.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
     # Microkernels for fused attention + Wo projection (composable, testable units)
     kernels/cpu/microkernels/q8_1/Q8DotProduct.cpp       # μK1: Q8_1 dot product with VNNI
     kernels/cpu/microkernels/q8_1/OnlineSoftmax.cpp      # μK2: Streaming online softmax

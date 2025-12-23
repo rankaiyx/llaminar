@@ -18,8 +18,7 @@
 #include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 
 #include "../kernels/cpu/ops/CPUEmbeddingKernelT.h"
-#include "../kernels/cpu/attention/CpuAttentionKernelT.h"
-#include "../kernels/cpu/attention/CPUAttentionKernelTyped.h"
+#include "../kernels/cpu/attention/CPUAttentionKernelT.h"
 #include <cstring>
 #include <stdexcept>
 #include <iostream>

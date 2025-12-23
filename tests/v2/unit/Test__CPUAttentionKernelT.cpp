@@ -1,6 +1,6 @@
 /**
- * @file Test__CPUAttentionKernelTyped.cpp
- * @brief Unit tests for CPUAttentionKernelTyped via IActivationTensor factory
+ * @file Test__CPUAttentionKernelT.cpp
+ * @brief Unit tests for CPUAttentionKernelT via IActivationTensor factory
  * @author David Sanftenberg
  *
  * Tests:
@@ -27,7 +27,7 @@ namespace
     constexpr float BF16_TOLERANCE = 5e-2f; // BF16 has lower precision
     constexpr float FP16_TOLERANCE = 5e-3f;
 
-    class Test__CPUAttentionKernelTyped : public ::testing::Test
+    class Test__CPUAttentionKernelT : public ::testing::Test
     {
     protected:
         MPIContext mpi_ctx_{0, 1, MPI_COMM_WORLD}; // Mock MPI context
@@ -44,7 +44,7 @@ namespace
         }
     };
 
-    TEST_F(Test__CPUAttentionKernelTyped, FactoryWiring_FP32)
+    TEST_F(Test__CPUAttentionKernelT, FactoryWiring_FP32)
     {
         TensorFactory factory(mpi_ctx_);
         auto tensor = factory.createFP32({1, 1}, device_idx_);
@@ -56,7 +56,7 @@ namespace
         EXPECT_TRUE(kernel->supports_device(-1));
     }
 
-    TEST_F(Test__CPUAttentionKernelTyped, FactoryWiring_BF16)
+    TEST_F(Test__CPUAttentionKernelT, FactoryWiring_BF16)
     {
         TensorFactory factory(mpi_ctx_);
         auto tensor = factory.createBF16({1, 1});
@@ -68,7 +68,7 @@ namespace
         EXPECT_TRUE(kernel->supports_device(-1));
     }
 
-    TEST_F(Test__CPUAttentionKernelTyped, FactoryWiring_FP16)
+    TEST_F(Test__CPUAttentionKernelT, FactoryWiring_FP16)
     {
         TensorFactory factory(mpi_ctx_);
         auto tensor = factory.createFP16({1, 1});
@@ -80,7 +80,7 @@ namespace
         EXPECT_TRUE(kernel->supports_device(-1));
     }
 
-    TEST_F(Test__CPUAttentionKernelTyped, Compute_FP32_Small)
+    TEST_F(Test__CPUAttentionKernelT, Compute_FP32_Small)
     {
         // Dimensions
         int seq_len = 2;

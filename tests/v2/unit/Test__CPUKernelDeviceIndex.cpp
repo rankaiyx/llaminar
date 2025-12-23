@@ -8,7 +8,7 @@
  * CPU attention kernels rejected device_idx values other than -1.
  *
  * Root Cause (fixed):
- *   CPUAttentionKernelTyped had strict validation:
+ *   CPUAttentionKernelT had strict validation:
  *     if (device_idx != -1) { LOG_ERROR(...); return false; }
  *   This broke multi-socket CPU systems where device_idx=0 or 1 indicates
  *   NUMA node placement for CPU-only execution.
@@ -141,7 +141,7 @@ namespace
      *
      * Bug scenario (before fix):
      *   - GraphBufferManager uses device_idx=0 for first NUMA node
-     *   - CPUAttentionKernelTyped rejected device_idx != -1
+     *   - CPUAttentionKernelT rejected device_idx != -1
      *   - Attention compute failed with "device_idx must be -1"
      *
      * After fix:

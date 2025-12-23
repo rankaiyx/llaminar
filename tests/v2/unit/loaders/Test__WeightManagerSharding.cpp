@@ -3,7 +3,7 @@
  * @brief Unit tests for WeightManager weight sharding functionality
  *
  * Tests the tensor parallelism weight sharding implementation:
- * - ShardingMode determination based on weight names
+ * - ShardingMode determination based on weight names (via Qwen2Schema)
  * - Column slicing (for column-parallel weights)
  * - Row slicing (for row-parallel weights)
  * - Integration with WeightDistributionStrategy::SHARDED
@@ -17,6 +17,7 @@
 #include <cmath>
 
 #include "loaders/WeightManager.h"
+#include "models/qwen/Qwen2Schema.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 
@@ -33,6 +34,10 @@ protected:
     {
         // Create test tensors
         createTestTensors();
+
+        // Get Qwen2 sharding config for testing
+        Qwen2SchemaFactory schema_factory;
+        sharding_config_ = schema_factory.getWeightShardingConfig();
     }
 
     void createTestTensors()
@@ -51,11 +56,32 @@ protected:
         }
     }
 
+    /**
+     * @brief Helper to get sharding mode using Qwen2 schema config
+     */
+    ShardingMode getShardingMode(const std::string &name) const
+    {
+        WeightShardingMode mode = sharding_config_.getMode(name);
+        switch (mode)
+        {
+        case WeightShardingMode::ColumnParallel:
+            return ShardingMode::COLUMN_PARALLEL;
+        case WeightShardingMode::RowParallel:
+            return ShardingMode::ROW_PARALLEL;
+        case WeightShardingMode::InputParallel:
+            return ShardingMode::INPUT_PARALLEL;
+        case WeightShardingMode::Replicate:
+        default:
+            return ShardingMode::REPLICATE;
+        }
+    }
+
     std::shared_ptr<FP32Tensor> test_tensor_;
+    WeightShardingConfig sharding_config_;
 };
 
 // =============================================================================
-// ShardingMode Determination Tests
+// ShardingMode Determination Tests (using Qwen2Schema)
 // =============================================================================
 
 TEST_F(WeightManagerShardingTest, DeterminesInputParallelForAttnOutput)
@@ -64,11 +90,11 @@ TEST_F(WeightManagerShardingTest, DeterminesInputParallelForAttnOutput)
     // Wo: [d_model, n_heads * head_dim] → [d_model, local_heads * head_dim] per rank
     // Input: [seq, local_heads * head_dim] from local attention
     // Output: [seq, d_model] partial sum, needs AllReduce
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_output.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_output.weight"),
               ShardingMode::INPUT_PARALLEL);
-    EXPECT_EQ(WeightManager::determineShardingMode("layers.5.self_attn.o_proj.weight"),
-              ShardingMode::REPLICATE); // Different naming convention
-    EXPECT_EQ(WeightManager::determineShardingMode("attn_output.weight"),
+    EXPECT_EQ(getShardingMode("layers.5.self_attn.o_proj.weight"),
+              ShardingMode::REPLICATE); // Different naming convention - not in Qwen2 schema
+    EXPECT_EQ(getShardingMode("attn_output.weight"),
               ShardingMode::INPUT_PARALLEL);
 }
 
@@ -76,9 +102,9 @@ TEST_F(WeightManagerShardingTest, DeterminesInputParallelForFFNDown)
 {
     // Phase 4b-2: ffn_down.weight is INPUT_PARALLEL (column-sliced) to match Gate/Up output
     // Down splits its input dimension (columns) since Gate/Up produce [seq, d_ff_local]
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.ffn_down.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.ffn_down.weight"),
               ShardingMode::INPUT_PARALLEL);
-    EXPECT_EQ(WeightManager::determineShardingMode("ffn_down.weight"),
+    EXPECT_EQ(getShardingMode("ffn_down.weight"),
               ShardingMode::INPUT_PARALLEL);
 }
 
@@ -87,18 +113,18 @@ TEST_F(WeightManagerShardingTest, DeterminesColumnParallelForQKV)
     // Phase 3: QKV weights are column-parallel (split output dimension by head)
     // Q: [n_heads * head_dim, d_model] -> [local_n_heads * head_dim, d_model]
     // K/V: [n_kv_heads * head_dim, d_model] -> [local_n_kv_heads * head_dim, d_model]
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_q.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_q.weight"),
               ShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_k.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_k.weight"),
               ShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_v.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_v.weight"),
               ShardingMode::COLUMN_PARALLEL);
     // Biases are also column-parallel
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_q.bias"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_q.bias"),
               ShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_k.bias"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_k.bias"),
               ShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_v.bias"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_v.bias"),
               ShardingMode::COLUMN_PARALLEL);
 }
 
@@ -106,27 +132,27 @@ TEST_F(WeightManagerShardingTest, DeterminesColumnParallelForGateUp)
 {
     // Phase 4b-1: Gate/Up weights are column-parallel (split output dimension)
     // Each rank produces [seq, d_ff_local] where d_ff_local = d_ff / world_size
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.ffn_gate.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.ffn_gate.weight"),
               ShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.ffn_up.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.ffn_up.weight"),
               ShardingMode::COLUMN_PARALLEL);
 }
 
 TEST_F(WeightManagerShardingTest, DeterminesReplicateForNorms)
 {
     // Norms should always be replicated
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.attn_norm.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.attn_norm.weight"),
               ShardingMode::REPLICATE);
-    EXPECT_EQ(WeightManager::determineShardingMode("blk.0.ffn_norm.weight"),
+    EXPECT_EQ(getShardingMode("blk.0.ffn_norm.weight"),
               ShardingMode::REPLICATE);
-    EXPECT_EQ(WeightManager::determineShardingMode("output_norm.weight"),
+    EXPECT_EQ(getShardingMode("output_norm.weight"),
               ShardingMode::REPLICATE);
 }
 
 TEST_F(WeightManagerShardingTest, DeterminesReplicateForEmbeddings)
 {
     // Token embeddings should always be replicated
-    EXPECT_EQ(WeightManager::determineShardingMode("token_embd.weight"),
+    EXPECT_EQ(getShardingMode("token_embd.weight"),
               ShardingMode::REPLICATE);
 }
 
@@ -134,7 +160,7 @@ TEST_F(WeightManagerShardingTest, DeterminesColumnParallelForLMHead)
 {
     // LM head (output.weight) is column-parallel since Phase 5
     // Split vocab dimension across ranks, AllGather before sampling
-    EXPECT_EQ(WeightManager::determineShardingMode("output.weight"),
+    EXPECT_EQ(getShardingMode("output.weight"),
               ShardingMode::COLUMN_PARALLEL);
 }
 
