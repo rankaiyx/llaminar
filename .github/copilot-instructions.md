@@ -461,22 +461,72 @@ auto gemm = KernelFactory::createGemm(dynamic_cast<IQ4_NLTensor*>(tensor), Devic
 2. **Vectorized Tail Handling**: AVX512 16-way → AVX2 8-way → AVX 4-way → SSE 2-way → scalar
 3. **Prefetch**: Prefetch upcoming sequential reads
 
-### OpenMP Nested-Safe Pattern
+### OpenMP Nested-Safe Parallelism (`OMP_WORKSHARE_REGION`)
 
-Use `OMP_WORKSHARE_REGION` macro to avoid fork/join overhead:
+**CRITICAL**: All kernel-level OpenMP parallelization MUST use the `OMP_WORKSHARE_REGION` macro from `utils/OpenMPUtils.h`. This enables "layer-level fusion" where an outer parallel region can encompass multiple kernel calls, eliminating thread fork/join overhead.
+
+**Why it matters**: Creating a new `#pragma omp parallel` region has ~10-50μs overhead. For decode (one token at a time), this overhead can dominate runtime. The macro checks `omp_in_parallel()` and only creates a new region if not already inside one.
+
+**Available Macros**:
+
+| Macro | Use Case |
+|-------|----------|
+| `OMP_WORKSHARE_REGION(fn)` | Standard worksharing with implicit barrier |
+| `OMP_WORKSHARE_REGION_SYNC(fn)` | Explicit barrier after work |
+| `OMP_WORKSHARE_REGION_IF(fn, cond)` | Conditional parallelization |
+| `OMP_SINGLE(fn)` | Single-thread execution (for MPI collectives) |
+
+**Correct Pattern**:
 
 ```cpp
 #include "utils/OpenMPUtils.h"
 
 void my_kernel(float* data, int n) {
+    // Define ALL work including thread-local allocations inside the lambda
     auto do_work = [&]() {
+        // Thread-local buffers (allocated per-thread automatically)
+        alignas(64) float local_buffer[256];
+        
         #pragma omp for schedule(static)
         for (int i = 0; i < n; ++i) {
-            data[i] = process(data[i]);
+            data[i] = process(data[i], local_buffer);
         }
     };
     OMP_WORKSHARE_REGION(do_work);
 }
+```
+
+**Anti-Pattern (WRONG)**:
+
+```cpp
+// DON'T DO THIS - creates parallel region every call
+void my_kernel(float* data, int n) {
+    #pragma omp parallel for  // <-- BAD: always creates new parallel region
+    for (int i = 0; i < n; ++i) {
+        data[i] = process(data[i]);
+    }
+}
+```
+
+**Multi-Phase Work in Single Region**:
+
+```cpp
+auto do_attention_work = [&]() {
+    // Phase 1: Parallel head processing
+    #pragma omp for schedule(static) nowait
+    for (int h = 0; h < num_heads; ++h) {
+        process_head(h, head_outputs[h]);
+    }
+    
+    // Implicit barrier between phases (remove 'nowait' if needed)
+    
+    // Phase 2: Parallel reduction
+    #pragma omp for schedule(static)
+    for (int i = 0; i < seq_len; ++i) {
+        reduce_heads_to_output(head_outputs, output[i]);
+    }
+};
+OMP_WORKSHARE_REGION(do_attention_work);
 ```
 
 ---

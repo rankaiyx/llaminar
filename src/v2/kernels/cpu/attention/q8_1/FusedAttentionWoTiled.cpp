@@ -6,6 +6,7 @@
  * - K/V tiles loaded into L2, reused across multiple queries
  * - Per-query softmax state maintained across KV tiles
  * - Wo projection fused at end of each Q tile
+ * - OpenMP parallelization across attention heads (FA2-style)
  *
  * @author David Sanftenberg
  * @date December 2025
@@ -19,11 +20,13 @@
 #include "microkernels/WoProjection.h"
 #include "microkernels/FastExp.h"
 #include "../../../../utils/Logger.h"
+#include "../../../../utils/OpenMPUtils.h"
 
 #include <cstring>
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <omp.h>
 
 #ifdef __x86_64__
 #include <xmmintrin.h> // For _mm_prefetch
@@ -125,7 +128,7 @@ namespace llaminar::v2::kernels
     }
 
     // ============================================================================
-    // Batch Item Processing (Tiled)
+    // Batch Item Processing (Tiled with OpenMP Head Parallelism)
     // ============================================================================
 
     void FusedAttentionWoTiled::process_batch_item_tiled(
@@ -133,6 +136,8 @@ namespace llaminar::v2::kernels
         int batch_idx,
         const TileConfig &config)
     {
+        using namespace llaminar::v2;
+
         const int seq_len = params.seq_len;
         const int num_heads = params.num_heads;
         const int head_dim = params.head_dim;
@@ -148,78 +153,237 @@ namespace llaminar::v2::kernels
         const size_t output_batch_stride = static_cast<size_t>(seq_len) * d_model;
         float *output_base = params.output + batch_idx * output_batch_stride;
 
-        // Allocate buffers for Q tile processing
-        // context_buffers: [Q_TILE][head_dim] - one context per query in tile
-        std::vector<float> context_buffers(q_tile * head_dim);
-
-        // softmax_states: [Q_TILE] - one softmax state per query in tile
-        std::vector<OnlineSoftmaxStateTiled> softmax_states(q_tile);
-
         // Process query positions in tiles
         for (int q_start = 0; q_start < seq_len; q_start += q_tile)
         {
             const int q_end = std::min(q_start + q_tile, seq_len);
             const int q_count = q_end - q_start;
 
-            // Process each attention head for this Q tile
-            for (int h = 0; h < num_heads; ++h)
+            // ================================================================
+            // FA2-Style: Parallel head processing with per-head Wo outputs
+            // ================================================================
+            // Each thread processes one or more heads independently.
+            // Wo projection outputs are accumulated into per-head buffers,
+            // then reduced to final output to avoid thread contention.
+            //
+            // Uses OMP_WORKSHARE_REGION for nested-safe parallelism:
+            // - If called from within an existing parallel region, reuses threads
+            // - If called standalone, creates new parallel region
+            // ================================================================
+
+            // Per-head Wo output buffers: [num_heads][q_count][d_model]
+            // Each head writes its contribution here, then we reduce.
+            std::vector<float> head_outputs(num_heads * q_count * d_model, 0.0f);
+
+            // Define all parallel work in a single lambda for OMP_WORKSHARE_REGION
+            auto do_attention_work = [&]()
             {
-                // Reset context buffers and softmax states for this head
-                std::memset(context_buffers.data(), 0, q_count * head_dim * sizeof(float));
-                for (int i = 0; i < q_count; ++i)
+                // Thread-local buffers for context and softmax state
+                // Allocated per-thread inside the parallel region to avoid false sharing
+                alignas(64) std::vector<float> context_buffers(q_count * head_dim);
+                std::vector<OnlineSoftmaxStateTiled> softmax_states(q_count);
+
+// Phase 1: Process heads in parallel
+#pragma omp for schedule(static)
+                for (int h = 0; h < num_heads; ++h)
                 {
-                    softmax_states[i] = OnlineSoftmaxStateTiled();
+                    // Reset context buffers and softmax states for this head
+                    std::memset(context_buffers.data(), 0, q_count * head_dim * sizeof(float));
+                    for (int i = 0; i < q_count; ++i)
+                    {
+                        softmax_states[i] = OnlineSoftmaxStateTiled();
+                    }
+
+                    // Process this head with tiling
+                    process_head_tiled(
+                        params, batch_idx, h,
+                        q_start, q_end,
+                        kv_len, pos_offset,
+                        config,
+                        context_buffers.data(),
+                        softmax_states.data());
+
+                    // Finalize softmax and project through Wo for each query in tile
+                    // Write to per-head output buffer (no contention)
+                    float *head_output_base = head_outputs.data() + h * q_count * d_model;
+
+                    for (int qi = 0; qi < q_count; ++qi)
+                    {
+                        float *context = context_buffers.data() + qi * head_dim;
+                        const OnlineSoftmaxStateTiled &state = softmax_states[qi];
+
+                        // Normalize context by 1/sum_exp
+                        if (state.sum_exp > 0.0f)
+                        {
+                            const float inv_sum = 1.0f / state.sum_exp;
+                            for (int d = 0; d < head_dim; ++d)
+                            {
+                                context[d] *= inv_sum;
+                            }
+                        }
+
+                        // Project through Wo into per-head buffer (no accumulate - fresh buffer)
+                        float *head_output_row = head_output_base + qi * d_model;
+
+                        microkernels::WoProjectionParams wo_params;
+                        wo_params.context = context;
+                        wo_params.wo_weights = params.Wo;
+                        wo_params.wo_type = params.wo_type;
+                        wo_params.head_dim = head_dim;
+                        wo_params.d_model = d_model;
+                        wo_params.head_idx = h;
+                        wo_params.n_heads = num_heads;
+                        wo_params.output = head_output_row;
+                        wo_params.accumulate = false; // Write directly (we'll reduce later)
+
+                        microkernels::wo_projection_ref(wo_params);
+                    }
                 }
 
-                // Process this head with tiling
-                process_head_tiled(
-                    params, batch_idx, h,
-                    q_start, q_end,
-                    kv_len, pos_offset,
-                    config,
-                    context_buffers.data(),
-                    softmax_states.data());
+// Implicit barrier after #pragma omp for
 
-                // Finalize softmax and project through Wo for each query in tile
+// Phase 2: Reduce per-head outputs into final output (parallel reduction)
+#pragma omp for schedule(static)
                 for (int qi = 0; qi < q_count; ++qi)
                 {
                     const int m = q_start + qi;
-                    float *context = context_buffers.data() + qi * head_dim;
-                    const OnlineSoftmaxStateTiled &state = softmax_states[qi];
-
-                    // Normalize context by 1/sum_exp
-                    if (state.sum_exp > 0.0f)
-                    {
-                        const float inv_sum = 1.0f / state.sum_exp;
-                        for (int d = 0; d < head_dim; ++d)
-                        {
-                            context[d] *= inv_sum;
-                        }
-                    }
-
-                    // Project through Wo (accumulates into output)
                     float *output_row = output_base + m * d_model;
 
-                    microkernels::WoProjectionParams wo_params;
-                    wo_params.context = context;
-                    wo_params.wo_weights = params.Wo;
-                    wo_params.wo_type = params.wo_type;
-                    wo_params.head_dim = head_dim;
-                    wo_params.d_model = d_model;
-                    wo_params.head_idx = h;
-                    wo_params.n_heads = num_heads;
-                    wo_params.output = output_row;
-                    wo_params.accumulate = true;
-
-                    microkernels::wo_projection_ref(wo_params);
+                    // Sum contributions from all heads
+                    for (int h = 0; h < num_heads; ++h)
+                    {
+                        const float *head_output_row = head_outputs.data() +
+                                                       h * q_count * d_model + qi * d_model;
+                        for (int d = 0; d < d_model; ++d)
+                        {
+                            output_row[d] += head_output_row[d];
+                        }
+                    }
                 }
-            }
+            }; // end do_attention_work lambda
+
+            // Execute using OMP_WORKSHARE_REGION for nested-safe parallelism
+            OMP_WORKSHARE_REGION(do_attention_work);
         }
     }
 
     // ============================================================================
     // Head Processing (Tiled Core Algorithm)
     // ============================================================================
+
+    /**
+     * @brief FA2-style tile-wise softmax batching
+     *
+     * Instead of updating softmax state per KV position, we:
+     * 1. Compute ALL scores in the KV tile first
+     * 2. Find the tile maximum in one pass
+     * 3. Update softmax state ONCE per tile
+     * 4. Apply correction and accumulate all V values
+     *
+     * This reduces per-position overhead by ~tile_size× (typically 64×).
+     */
+    void FusedAttentionWoTiled::process_kv_tile_batched(
+        const FusedAttentionWoParams &params,
+        int batch_idx,
+        int head_idx,
+        int kv_head,
+        int q_idx,                // Which query position
+        int kv_start,             // Start of KV tile
+        int kv_end,               // End of KV tile
+        const Q8_1Block *Q_row,   // Q for this query position
+        const Q8_1Block *K_batch, // K tensor base for this batch
+        const Q8_1Block *V_batch, // V tensor base for this batch
+        int num_blocks,
+        int num_kv_heads,
+        float *context, // [head_dim] output accumulator
+        OnlineSoftmaxStateTiled &state,
+        float *tile_scores) // [kv_tile] scratch buffer for scores
+    {
+        using namespace microkernels;
+
+        const int head_dim = params.head_dim;
+        const int tile_len = kv_end - kv_start;
+
+        // ================================================================
+        // Phase 1: Compute all Q·K scores for this tile
+        // ================================================================
+        for (int t = 0; t < tile_len; ++t)
+        {
+            const int n = kv_start + t;
+            const Q8_1Block *K_row = K_batch +
+                                     (static_cast<size_t>(n) * num_kv_heads + kv_head) * num_blocks;
+
+            Q8DotProductParams dot_params;
+            dot_params.q_blocks = Q_row;
+            dot_params.k_blocks = K_row;
+            dot_params.num_blocks = num_blocks;
+            dot_params.global_scale = params.scale;
+
+            tile_scores[t] = q8_dot_product_ref(dot_params).score;
+        }
+
+        // ================================================================
+        // Phase 2: Find tile maximum
+        // ================================================================
+        float tile_max = tile_scores[0];
+        for (int t = 1; t < tile_len; ++t)
+        {
+            if (tile_scores[t] > tile_max)
+            {
+                tile_max = tile_scores[t];
+            }
+        }
+
+        // ================================================================
+        // Phase 3: Update softmax state ONCE for entire tile
+        // ================================================================
+        float correction = 1.0f;
+
+        if (!state.initialized)
+        {
+            // First tile: initialize state with tile_max
+            state.max_score = tile_max;
+            state.initialized = true;
+        }
+        else if (tile_max > state.max_score)
+        {
+            // New global maximum: compute correction for existing context
+            correction = fast_exp_poly(state.max_score - tile_max);
+            state.sum_exp *= correction;
+            state.max_score = tile_max;
+
+            // Apply correction to context ONCE per tile (not per position!)
+            for (int d = 0; d < head_dim; ++d)
+            {
+                context[d] *= correction;
+            }
+        }
+
+        // ================================================================
+        // Phase 4: Compute weights and accumulate V for entire tile
+        // ================================================================
+        for (int t = 0; t < tile_len; ++t)
+        {
+            const int n = kv_start + t;
+
+            // Compute weight relative to current global max
+            float weight = fast_exp_poly(tile_scores[t] - state.max_score);
+            state.sum_exp += weight;
+
+            // Get V row and accumulate weighted V
+            const Q8_1Block *V_row = V_batch +
+                                     (static_cast<size_t>(n) * num_kv_heads + kv_head) * num_blocks;
+
+            VWeightedAccumParams accum_params;
+            accum_params.v_blocks = V_row;
+            accum_params.weight = weight;
+            accum_params.correction = 1.0f; // Correction already applied above
+            accum_params.context = context;
+            accum_params.num_blocks = num_blocks;
+
+            v_weighted_accum_ref(accum_params);
+        }
+    }
 
     void FusedAttentionWoTiled::process_head_tiled(
         const FusedAttentionWoParams &params,
@@ -242,6 +406,10 @@ namespace llaminar::v2::kernels
         const int kv_head = head_idx / (params.num_heads / num_kv_heads); // GQA mapping
         const int kv_tile = config.kv_tile;
         const int q_count = q_end - q_start;
+
+        // Thread-local scratch buffer for tile scores (FA2 batching)
+        // Sized to hold one KV tile worth of scores
+        alignas(64) std::vector<float> tile_scores(kv_tile);
 
         // Compute batch strides
         const size_t q_batch_stride = static_cast<size_t>(params.seq_len) *
@@ -294,67 +462,15 @@ namespace llaminar::v2::kernels
                     effective_kv_end = std::min(effective_kv_end, max_attend);
                 }
 
-                // Process each KV position in this tile
-                for (int n = effective_kv_start; n < effective_kv_end; ++n)
-                {
-                    // Get K row (should be in L2 cache now)
-                    const Q8_1Block *K_row = K_batch +
-                                             (static_cast<size_t>(n) * num_kv_heads + kv_head) * num_blocks;
-
-                    // μK1: Compute Q·K score
-                    Q8DotProductParams dot_params;
-                    dot_params.q_blocks = Q_row;
-                    dot_params.k_blocks = K_row;
-                    dot_params.num_blocks = num_blocks;
-                    dot_params.global_scale = params.scale;
-
-                    float score = q8_dot_product_ref(dot_params).score;
-
-                    // μK2: Online softmax update
-                    float old_max = state.max_score;
-                    float weight;
-
-                    if (!state.initialized)
-                    {
-                        state.max_score = score;
-                        state.sum_exp = 1.0f;
-                        state.initialized = true;
-                        weight = 1.0f;
-                    }
-                    else if (score > state.max_score)
-                    {
-                        // New maximum: rescale existing accumulation
-                        float correction = fast_exp_poly(old_max - score);
-                        state.sum_exp *= correction;
-                        state.max_score = score;
-                        state.sum_exp += 1.0f;
-                        weight = 1.0f;
-
-                        // Apply correction to context
-                        for (int d = 0; d < head_dim; ++d)
-                        {
-                            context[d] *= correction;
-                        }
-                    }
-                    else
-                    {
-                        weight = fast_exp_poly(score - state.max_score);
-                        state.sum_exp += weight;
-                    }
-
-                    // μK3: Accumulate weighted V (V should also be in L2)
-                    const Q8_1Block *V_row = V_batch +
-                                             (static_cast<size_t>(n) * num_kv_heads + kv_head) * num_blocks;
-
-                    VWeightedAccumParams accum_params;
-                    accum_params.v_blocks = V_row;
-                    accum_params.weight = weight;
-                    accum_params.correction = 1.0f; // Already applied above
-                    accum_params.context = context;
-                    accum_params.num_blocks = num_blocks;
-
-                    v_weighted_accum_ref(accum_params);
-                }
+                // FA2-style: Process entire KV tile with batched softmax
+                // This computes all scores first, finds tile max, then updates state ONCE
+                process_kv_tile_batched(
+                    params, batch_idx, head_idx, kv_head, qi,
+                    effective_kv_start, effective_kv_end,
+                    Q_row, K_batch, V_batch,
+                    num_blocks, num_kv_heads,
+                    context, state,
+                    tile_scores.data());
             }
         }
     }

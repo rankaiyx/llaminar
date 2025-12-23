@@ -1,0 +1,365 @@
+/**
+ * @file RegisterAllocation.h
+ * @brief Compile-time safe register allocation framework for JIT code generation
+ *
+ * This framework provides type-safe wrappers around Xbyak registers to prevent
+ * register clobbering bugs at compile time. Instead of relying on comments and
+ * conventions, register assignments are encoded in the C++ type system.
+ *
+ * Key concepts:
+ * 1. **Register Zones**: Disjoint sets of registers for different purposes
+ * 2. **Typed Registers**: Template wrappers that encode the register index in the type
+ * 3. **Zone Membership**: Functions can use SFINAE/static_assert to verify zone membership
+ *
+ * Example usage:
+ * @code
+ * // Define your register layout
+ * using MyAccum0 = TypedZmm<AccumulatorZone, 0>;  // zmm0
+ * using MyAccum1 = TypedZmm<AccumulatorZone, 1>;  // zmm1
+ * using MyScratch0 = TypedZmm<ScratchZone, 0>;    // zmm20
+ *
+ * // Functions can enforce zone membership via static_assert
+ * template<typename ScratchReg>
+ * void emit_something(const ScratchReg& scratch) {
+ *     static_assert(std::is_same_v<typename ScratchReg::zone_type, ScratchZone>,
+ *                   "Must pass a scratch register");
+ * }
+ * @endcode
+ */
+
+#pragma once
+
+#include <type_traits>
+#include "../../../../external/onednn/third_party/xbyak/xbyak.h"
+
+namespace llaminar2::jit
+{
+
+    // ============================================================================
+    // Register Zone Definitions
+    // ============================================================================
+
+    /**
+     * @brief Base zone tag for CRTP pattern
+     */
+    struct RegisterZoneBase
+    {
+    };
+
+    /**
+     * @brief Accumulator zone: zmm0-zmm7 (8 registers for V accumulation)
+     */
+    struct AccumulatorZone : RegisterZoneBase
+    {
+        static constexpr int base_index = 0;
+        static constexpr int count = 8;
+        static constexpr const char *name = "Accumulator";
+    };
+
+    /**
+     * @brief Q vector zone: zmm8-zmm15 (8 registers for Q tiles)
+     */
+    struct QVectorZone : RegisterZoneBase
+    {
+        static constexpr int base_index = 8;
+        static constexpr int count = 8;
+        static constexpr const char *name = "QVector";
+    };
+
+    /**
+     * @brief State zone: zmm16-zmm19 (online softmax state)
+     *
+     * Layout:
+     *   zmm16 = max (running maximum for numerical stability)
+     *   zmm17 = sum (running sum of exp weights)
+     *   zmm18 = weight (current attention weight)
+     *   zmm19 = corr (correction factor for rescaling)
+     */
+    struct StateZone : RegisterZoneBase
+    {
+        static constexpr int base_index = 16;
+        static constexpr int count = 4;
+        static constexpr const char *name = "State";
+
+        // Named indices within zone
+        static constexpr int MAX_IDX = 0;    // zmm16
+        static constexpr int SUM_IDX = 1;    // zmm17
+        static constexpr int WEIGHT_IDX = 2; // zmm18
+        static constexpr int CORR_IDX = 3;   // zmm19
+    };
+
+    /**
+     * @brief Scratch zone: zmm20-zmm25 (6 temporary registers)
+     *
+     * CRITICAL: When used as XMM/YMM overlays, these share the same physical registers!
+     *   xmm20 overlays zmm20, etc.
+     *
+     * For FA2 tiling, xmm20-xmm23 hold scores, so zmm20-zmm23 cannot be used
+     * simultaneously for other scratch purposes.
+     */
+    struct ScratchZone : RegisterZoneBase
+    {
+        static constexpr int base_index = 20;
+        static constexpr int count = 6;
+        static constexpr const char *name = "Scratch";
+    };
+
+    /**
+     * @brief Score zone: xmm20-xmm23 (4 scalar scores for FA2 tiling)
+     *
+     * WARNING: Physically overlaps ScratchZone zmm20-zmm23!
+     * Using ScoreZone marks those scratch registers as unavailable.
+     */
+    struct ScoreZone : RegisterZoneBase
+    {
+        static constexpr int base_index = 20;
+        static constexpr int count = 4;
+        static constexpr const char *name = "Score";
+    };
+
+    /**
+     * @brief Reserved zone: zmm26-zmm31 (for future use / callee-saved)
+     */
+    struct ReservedZone : RegisterZoneBase
+    {
+        static constexpr int base_index = 26;
+        static constexpr int count = 6;
+        static constexpr const char *name = "Reserved";
+    };
+
+    // ============================================================================
+    // Zone Conflict Detection (Compile-Time)
+    // ============================================================================
+
+    /**
+     * @brief Check if two zones overlap (share physical registers)
+     */
+    template <typename Zone1, typename Zone2>
+    struct ZonesOverlap
+    {
+        static constexpr int z1_start = Zone1::base_index;
+        static constexpr int z1_end = Zone1::base_index + Zone1::count;
+        static constexpr int z2_start = Zone2::base_index;
+        static constexpr int z2_end = Zone2::base_index + Zone2::count;
+
+        static constexpr bool value = (z1_start < z2_end) && (z2_start < z1_end);
+    };
+
+    template <typename Zone1, typename Zone2>
+    inline constexpr bool zones_overlap_v = ZonesOverlap<Zone1, Zone2>::value;
+
+    // Static assertion: ScoreZone overlaps ScratchZone (by design, they alias)
+    static_assert(zones_overlap_v<ScoreZone, ScratchZone>,
+                  "ScoreZone and ScratchZone should overlap (XMM/ZMM aliasing)");
+
+    // Static assertion: Core zones don't overlap
+    static_assert(!zones_overlap_v<AccumulatorZone, StateZone>,
+                  "Accumulator and State zones must not overlap");
+    static_assert(!zones_overlap_v<StateZone, ScratchZone>,
+                  "State and Scratch zones must not overlap");
+    static_assert(!zones_overlap_v<AccumulatorZone, QVectorZone>,
+                  "Accumulator and QVector zones must not overlap");
+
+    // ============================================================================
+    // Typed Register Wrappers
+    // ============================================================================
+
+    /**
+     * @brief Compile-time typed ZMM register
+     *
+     * The zone and index are encoded in the type, enabling compile-time checks.
+     *
+     * @tparam Zone The register zone (AccumulatorZone, ScratchZone, etc.)
+     * @tparam LocalIdx Index within the zone (0 to Zone::count-1)
+     */
+    template <typename Zone, int LocalIdx>
+    struct TypedZmm
+    {
+        static_assert(std::is_base_of_v<RegisterZoneBase, Zone>,
+                      "Zone must derive from RegisterZoneBase");
+        static_assert(LocalIdx >= 0 && LocalIdx < Zone::count,
+                      "LocalIdx out of range for this zone");
+
+        using zone_type = Zone;
+        static constexpr int local_index = LocalIdx;
+        static constexpr int absolute_index = Zone::base_index + LocalIdx;
+
+        /// Get the underlying Xbyak register (for use with Xbyak APIs)
+        constexpr Xbyak::Zmm zmm() const { return Xbyak::Zmm(absolute_index); }
+
+        /// Implicit conversion to Xbyak::Zmm
+        constexpr operator Xbyak::Zmm() const { return zmm(); }
+
+        /// Get as YMM (lower 256 bits)
+        constexpr Xbyak::Ymm ymm() const { return Xbyak::Ymm(absolute_index); }
+
+        /// Get as XMM (lower 128 bits)
+        constexpr Xbyak::Xmm xmm() const { return Xbyak::Xmm(absolute_index); }
+    };
+
+    /**
+     * @brief Compile-time typed XMM register
+     *
+     * Similar to TypedZmm but for scalar/128-bit operations.
+     * IMPORTANT: XMM registers alias the low bits of ZMM registers!
+     */
+    template <typename Zone, int LocalIdx>
+    struct TypedXmm
+    {
+        static_assert(std::is_base_of_v<RegisterZoneBase, Zone>,
+                      "Zone must derive from RegisterZoneBase");
+        static_assert(LocalIdx >= 0 && LocalIdx < Zone::count,
+                      "LocalIdx out of range for this zone");
+
+        using zone_type = Zone;
+        static constexpr int local_index = LocalIdx;
+        static constexpr int absolute_index = Zone::base_index + LocalIdx;
+
+        /// Get the underlying Xbyak register
+        constexpr Xbyak::Xmm xmm() const { return Xbyak::Xmm(absolute_index); }
+
+        /// Implicit conversion to Xbyak::Xmm
+        constexpr operator Xbyak::Xmm() const { return xmm(); }
+
+        /// WARNING: Accessing as ZMM means you're using the full register
+        constexpr Xbyak::Zmm as_zmm() const { return Xbyak::Zmm(absolute_index); }
+    };
+
+    // ============================================================================
+    // Type Traits for Zone-Based Constraints (C++17 compatible)
+    // ============================================================================
+
+    /**
+     * @brief Type trait: Register belongs to a specific zone
+     */
+    template <typename Reg, typename Zone>
+    struct is_zone : std::is_same<typename Reg::zone_type, Zone>
+    {
+    };
+
+    template <typename Reg, typename Zone>
+    inline constexpr bool is_zone_v = is_zone<Reg, Zone>::value;
+
+    /**
+     * @brief Type trait: Register is NOT from a specific zone
+     */
+    template <typename Reg, typename Zone>
+    inline constexpr bool is_not_zone_v = !is_zone_v<Reg, Zone>;
+
+    /**
+     * @brief Type trait: Register is from any of the listed zones
+     */
+    template <typename Reg, typename... Zones>
+    inline constexpr bool is_any_zone_v = (is_zone_v<Reg, Zones> || ...);
+
+    // ============================================================================
+    // Convenient Type Aliases
+    // ============================================================================
+
+    // Accumulator registers (zmm0-zmm7)
+    template <int N>
+    using AccumZmm = TypedZmm<AccumulatorZone, N>;
+    using Accum0 = AccumZmm<0>;
+    using Accum1 = AccumZmm<1>;
+    using Accum2 = AccumZmm<2>;
+    using Accum3 = AccumZmm<3>;
+    using Accum4 = AccumZmm<4>;
+    using Accum5 = AccumZmm<5>;
+    using Accum6 = AccumZmm<6>;
+    using Accum7 = AccumZmm<7>;
+
+    // Q vector registers (zmm8-zmm15) - also called "Input" zone
+    template <int N>
+    using QVecZmm = TypedZmm<QVectorZone, N>;
+    using Input0 = QVecZmm<0>; // zmm8
+    using Input1 = QVecZmm<1>; // zmm9
+    using Input2 = QVecZmm<2>; // zmm10
+    using Input3 = QVecZmm<3>; // zmm11
+    using Input4 = QVecZmm<4>; // zmm12
+    using Input5 = QVecZmm<5>; // zmm13
+    using Input6 = QVecZmm<6>; // zmm14
+    using Input7 = QVecZmm<7>; // zmm15
+
+    // State registers (zmm16-zmm19)
+    using StateMax = TypedZmm<StateZone, StateZone::MAX_IDX>;
+    using StateSum = TypedZmm<StateZone, StateZone::SUM_IDX>;
+    using StateWeight = TypedZmm<StateZone, StateZone::WEIGHT_IDX>;
+    using StateCorr = TypedZmm<StateZone, StateZone::CORR_IDX>;
+
+    // Scratch registers (zmm20-zmm25)
+    template <int N>
+    using ScratchZmm = TypedZmm<ScratchZone, N>;
+    using Scratch0 = ScratchZmm<0>; // zmm20 - WARNING: aliases xmm20 (Score0)
+    using Scratch1 = ScratchZmm<1>; // zmm21 - WARNING: aliases xmm21 (Score1)
+    using Scratch2 = ScratchZmm<2>; // zmm22 - WARNING: aliases xmm22 (Score2)
+    using Scratch3 = ScratchZmm<3>; // zmm23 - WARNING: aliases xmm23 (Score3)
+    using Scratch4 = ScratchZmm<4>; // zmm24 - Safe during FA2 scoring
+    using Scratch5 = ScratchZmm<5>; // zmm25 - Safe during FA2 scoring
+
+    // Score registers (xmm20-xmm23) - for FA2 4-way tile processing
+    template <int N>
+    using ScoreXmm = TypedXmm<ScoreZone, N>;
+    using Score0 = ScoreXmm<0>; // xmm20
+    using Score1 = ScoreXmm<1>; // xmm21
+    using Score2 = ScoreXmm<2>; // xmm22
+    using Score3 = ScoreXmm<3>; // xmm23
+
+    // ============================================================================
+    // Register Set for Function Signatures
+    // ============================================================================
+
+    /**
+     * @brief Declare what registers a function uses (for documentation + future checking)
+     *
+     * This is primarily for documentation now, but could be extended to
+     * do runtime or compile-time conflict detection.
+     */
+    template <typename... Regs>
+    struct UsesRegisters
+    {
+        static constexpr size_t count = sizeof...(Regs);
+
+        // Check if any pair conflicts (same absolute index)
+        static constexpr bool has_conflicts()
+        {
+            if constexpr (count < 2)
+            {
+                return false;
+            }
+            else
+            {
+                constexpr int indices[] = {Regs::absolute_index...};
+                for (size_t i = 0; i < count; ++i)
+                {
+                    for (size_t j = i + 1; j < count; ++j)
+                    {
+                        if (indices[i] == indices[j])
+                            return true;
+                    }
+                }
+                return false;
+            }
+        }
+
+        static_assert(!has_conflicts(), "Register set contains conflicting registers!");
+    };
+
+    // ============================================================================
+    // SFINAE helpers for constrained function templates (C++17)
+    // ============================================================================
+
+    /**
+     * @brief Enable function if Reg is from Zone
+     */
+    template <typename Reg, typename Zone>
+    using require_zone = std::enable_if_t<is_zone_v<Reg, Zone>, bool>;
+
+    /**
+     * @brief Enable function if Reg is from ScratchZone and is safe during FA2
+     * (i.e., local_index >= 4, meaning zmm24 or zmm25)
+     */
+    template <typename Reg>
+    using require_safe_scratch_for_fa2 = std::enable_if_t<
+        is_zone_v<Reg, ScratchZone> && (Reg::local_index >= 4), bool>;
+
+} // namespace llaminar2::jit

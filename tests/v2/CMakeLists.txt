@@ -222,6 +222,31 @@ add_v2_test(V2_Unit_TensorBasics
     LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
 )
 
+# Test: JIT Register Allocation Framework
+# Compile-time safe register allocation for JIT code generation
+add_executable(v2_test_register_allocation unit/Test__RegisterAllocation.cpp)
+target_link_libraries(v2_test_register_allocation 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RegisterAllocation 
+    COMMAND $<TARGET_FILE:v2_test_register_allocation>
+    LABELS "V2;Unit;JIT;RegisterAllocation;AVX512"
+)
+
+# Test: RegisterGuard - RAII-based register conflict detection
+add_executable(v2_test_register_guard unit/kernels/cpu/jit/Test__RegisterGuard.cpp)
+target_link_libraries(v2_test_register_guard 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_RegisterGuard 
+    COMMAND $<TARGET_FILE:v2_test_register_guard>
+    LABELS "V2;Unit;JIT;RegisterGuard;AVX512"
+)
+
 # Test: SwiGLU formula correctness (regression test for gate/up swap bug)
 # This test verifies that SwiGLU computes silu(gate) * up, NOT gate * silu(up)
 add_executable(v2_test_swiglu_formula unit/Test__SwiGLUFormula.cpp)
@@ -3184,6 +3209,21 @@ target_link_libraries(v2_test_jit_fused_attention_wo_debug
 add_v2_test(V2_Unit_JitFusedAttentionWo_Debug 
     COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_debug>
     LABELS "V2;Unit;JIT;FusedAttention;Debug"
+    MPI_PROCS 1
+)
+
+# Test: JIT Fused Attention + Wo - FA2 vs FA1 Parity Tests
+# Tests that FA2 tiling (use_fa2_tiling=true) produces identical output to FA1
+# Validates tile boundary handling, remainder processing, various KV lengths
+add_executable(v2_test_jit_fused_attention_wo_fa2parity unit/attention/Test__JitFusedAttentionWo_FA2Parity.cpp)
+target_link_libraries(v2_test_jit_fused_attention_wo_fa2parity 
+    llaminar2_core
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_JitFusedAttentionWo_FA2Parity 
+    COMMAND $<TARGET_FILE:v2_test_jit_fused_attention_wo_fa2parity>
+    LABELS "V2;Unit;JIT;FusedAttention;FA2;Parity;AVX512;Q8_1;FlashAttention"
     MPI_PROCS 1
 )
 

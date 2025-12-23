@@ -42,6 +42,7 @@
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
 #include "kernels/KernelFactory.h"
+#include "models/qwen/Qwen2Schema.h"
 
 using namespace llaminar2;
 using namespace llaminar2::gemm_v4;
@@ -1629,6 +1630,10 @@ TEST_F(Test__Q8_1_FusedAttention, JIT_vs_FP32_Strided_Qwen05B_CausalMask)
     {
         GTEST_SKIP() << "Model not found: " << model_path;
     }
+
+    // Configure weight sharding from Qwen2 schema (required before getWeight())
+    Qwen2SchemaFactory schema_factory;
+    model_ctx->weightManager()->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     const auto &metadata = model_ctx->model();
 

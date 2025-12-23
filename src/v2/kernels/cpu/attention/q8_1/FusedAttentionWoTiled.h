@@ -197,6 +197,50 @@ namespace llaminar::v2::kernels
             int kv_end,
             int num_kv_heads,
             int num_blocks);
+
+        /**
+         * @brief FA2-style tile-wise batched softmax processing.
+         *
+         * Instead of updating softmax state per KV position, this function:
+         * 1. Computes ALL Q·K scores for the KV tile first
+         * 2. Finds the tile maximum in one pass
+         * 3. Updates softmax state ONCE per tile
+         * 4. Applies correction and accumulates all V values
+         *
+         * This reduces per-position overhead by ~tile_size× (typically 64×).
+         *
+         * @param params Kernel parameters
+         * @param batch_idx Batch index
+         * @param head_idx Head index
+         * @param kv_head KV head index (for GQA)
+         * @param q_idx Query position index
+         * @param kv_start Start of KV tile
+         * @param kv_end End of KV tile (exclusive)
+         * @param Q_row Q blocks for this query position
+         * @param K_batch K tensor base for this batch
+         * @param V_batch V tensor base for this batch
+         * @param num_blocks Blocks per head (head_dim / 32)
+         * @param num_kv_heads Total number of KV heads
+         * @param context Context accumulator [head_dim]
+         * @param state Softmax state for this query
+         * @param tile_scores Scratch buffer for scores [kv_tile]
+         */
+        static void process_kv_tile_batched(
+            const FusedAttentionWoParams &params,
+            int batch_idx,
+            int head_idx,
+            int kv_head,
+            int q_idx,
+            int kv_start,
+            int kv_end,
+            const Q8_1Block *Q_row,
+            const Q8_1Block *K_batch,
+            const Q8_1Block *V_batch,
+            int num_blocks,
+            int num_kv_heads,
+            float *context,
+            struct OnlineSoftmaxStateTiled &state,
+            float *tile_scores);
     };
 
     /**

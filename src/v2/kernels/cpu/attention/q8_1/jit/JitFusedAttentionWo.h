@@ -38,6 +38,7 @@
 #include "JitVWeightedAccum.h"
 #include "JitWoProjection.h"
 #include "JitFastExp.h"
+#include "../../../jit/RegisterAllocation.h" // Typed register allocation for FA2
 
 #include <memory>
 #include <unordered_map>
@@ -46,6 +47,8 @@
 
 namespace llaminar::v2::kernels::jit
 {
+    // Import typed register aliases for FA2 tile processing
+    using namespace llaminar2::jit;
 
     /**
      * @brief Attention computation mode
@@ -80,6 +83,8 @@ namespace llaminar::v2::kernels::jit
         WoFormat wo_format = WoFormat::Q8_1;      // Output projection weight format
         bool causal = true;                       // Whether to apply causal masking
         AttentionMode mode = AttentionMode::AUTO; // Kernel mode selection
+        bool use_fa2_tiling = false;              // Enable FA2-style KV tile processing (4x batched)
+        bool enable_register_tracking = false;    // Enable register conflict detection during JIT
 
         /**
          * @brief Get the effective mode based on batch_size
@@ -102,7 +107,9 @@ namespace llaminar::v2::kernels::jit
                    batch_size == other.batch_size &&
                    wo_format == other.wo_format &&
                    causal == other.causal &&
-                   effectiveMode() == other.effectiveMode();
+                   effectiveMode() == other.effectiveMode() &&
+                   use_fa2_tiling == other.use_fa2_tiling &&
+                   enable_register_tracking == other.enable_register_tracking;
         }
     };
 
@@ -125,6 +132,8 @@ namespace std
             h ^= std::hash<bool>()(cfg.causal) + 0x9e3779b9 + (h << 6) + (h >> 2);
             // Include effective mode in hash to cache decode and prefill kernels separately
             h ^= std::hash<int>()(static_cast<int>(cfg.effectiveMode())) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<bool>()(cfg.use_fa2_tiling) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<bool>()(cfg.enable_register_tracking) + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -170,6 +179,13 @@ namespace llaminar::v2::kernels::jit
               ,
               config_(config)
         {
+            // Enable register tracking if requested
+            if (config_.enable_register_tracking)
+            {
+                enable_register_tracking();
+                debug_emit("[TRACKING] Register tracking ENABLED for this kernel");
+            }
+
             // Calculate optimal Q_TILE_SIZE based on kernel mode and head_dim
             //
             // CRITICAL CONSTRAINT: Context accumulators must fit in registers!
@@ -332,8 +348,9 @@ namespace llaminar::v2::kernels::jit
          * ZMM Register Zones (see JitMicrokernelBase.h for details):
          *   ┌───────────┬────────────────────────────────────────────────────┐
          *   │ zmm0-7    │ ACCUM: Context accumulators (32 floats each)       │
-         *   │ zmm8-15   │ INPUT: Loaded operands (clobbered by emitters)     │
+         *   │ zmm8-9    │ INPUT: V accumulation scratch                      │
          *   │ zmm10-13  │ INPUT: Q head data (persists across KV loop)       │
+         *   │ zmm14-15  │ INPUT: emit_fast_exp scratch (available)           │
          *   │ zmm16     │ STATE: Running softmax maximum                     │
          *   │ zmm17     │ STATE: Running softmax sum                         │
          *   │ zmm18     │ STATE: Current attention weight (broadcasted)      │
@@ -3734,20 +3751,79 @@ namespace llaminar::v2::kernels::jit
                 Reg64 reg_kv_idx = rcx; // Reuse rcx (Wo moved to rbp)
                 xor_(reg_kv_idx, reg_kv_idx);
 
-                L(loop_label.c_str());
-                cmp(reg_kv_idx, reg_max_kv_pos); // Compare against max_kv_pos (causal-aware)
-                jge(end_label.c_str(), T_NEAR);
+                if (config_.use_fa2_tiling)
+                {
+                    // ═══════════════════════════════════════════════════════════════
+                    // FA2-STYLE KV LOOP: Process 4 positions at a time
+                    // ═══════════════════════════════════════════════════════════════
+                    // Benefits:
+                    //   - Context rescale once per tile (not 4x)
+                    //   - Single softmax state update per tile
+                    //   - Interleaved V loads hide memory latency
 
-                emit_single_head_attention(
-                    reg_Q_base, reg_K, reg_V,
-                    reg_kv_idx, h, kv_head,
-                    num_blocks, spill_base_offset,
-                    q_stack_offset, head_label);
+                    std::string fa2_tile_loop = head_label + "_fa2_tile_loop";
+                    std::string fa2_tile_end = head_label + "_fa2_tile_end";
+                    std::string fa2_remainder_loop = head_label + "_fa2_remainder";
+                    std::string fa2_remainder_end = head_label + "_fa2_remainder_end";
 
-                inc(reg_kv_idx);
-                jmp(loop_label.c_str(), T_NEAR);
+                    // Calculate tile loop bound: (max_kv_pos / 4) * 4
+                    // This gives us the last position where we can do a full 4x tile
+                    Reg64 reg_tile_bound = r8;
+                    mov(reg_tile_bound, reg_max_kv_pos);
+                    and_(reg_tile_bound, ~3); // Round down to multiple of 4
 
-                L(end_label.c_str());
+                    // FA2 Tile Loop: Process 4 KV positions at a time
+                    L(fa2_tile_loop.c_str());
+                    cmp(reg_kv_idx, reg_tile_bound);
+                    jge(fa2_tile_end.c_str(), T_NEAR);
+
+                    emit_fa2_tile_attention_4x(
+                        reg_Q_base, reg_K, reg_V,
+                        reg_kv_idx, h, kv_head,
+                        num_blocks, spill_base_offset,
+                        head_label);
+
+                    add(reg_kv_idx, 4); // Advance by 4 positions
+                    jmp(fa2_tile_loop.c_str(), T_NEAR);
+
+                    L(fa2_tile_end.c_str());
+
+                    // Remainder Loop: Process remaining 0-3 positions one at a time
+                    L(fa2_remainder_loop.c_str());
+                    cmp(reg_kv_idx, reg_max_kv_pos);
+                    jge(fa2_remainder_end.c_str(), T_NEAR);
+
+                    emit_single_head_attention(
+                        reg_Q_base, reg_K, reg_V,
+                        reg_kv_idx, h, kv_head,
+                        num_blocks, spill_base_offset,
+                        q_stack_offset, head_label);
+
+                    inc(reg_kv_idx);
+                    jmp(fa2_remainder_loop.c_str(), T_NEAR);
+
+                    L(fa2_remainder_end.c_str());
+                }
+                else
+                {
+                    // ═══════════════════════════════════════════════════════════════
+                    // ORIGINAL KV LOOP: One position at a time (FA1 style)
+                    // ═══════════════════════════════════════════════════════════════
+                    L(loop_label.c_str());
+                    cmp(reg_kv_idx, reg_max_kv_pos); // Compare against max_kv_pos (causal-aware)
+                    jge(end_label.c_str(), T_NEAR);
+
+                    emit_single_head_attention(
+                        reg_Q_base, reg_K, reg_V,
+                        reg_kv_idx, h, kv_head,
+                        num_blocks, spill_base_offset,
+                        q_stack_offset, head_label);
+
+                    inc(reg_kv_idx);
+                    jmp(loop_label.c_str(), T_NEAR);
+
+                    L(end_label.c_str());
+                }
 
                 // Normalize context by 1/sum for this head
                 Zmm zmm_inv_sum = zmm_scratch(4);
@@ -3850,6 +3926,11 @@ namespace llaminar::v2::kernels::jit
          * Output (persistent across KV loop):
          *   zmm10 + b: Q data for block b (converted to unsigned INT8)
          *
+         * Uses zmm10-13 for Q data (up to 4 blocks = head_dim 128).
+         * This is safe because:
+         *   - emit_fast_exp uses zmm8, zmm14, zmm15 (not zmm10-13)
+         *   - V accumulation uses zmm8-9 (not zmm10+)
+         *
          * The Q scale values are stored in memory and loaded dynamically
          * during dot product computation.
          *
@@ -3873,7 +3954,11 @@ namespace llaminar::v2::kernels::jit
                 int src_offset = q_head_offset + b * 36;
 
                 // Load Q data (32 int8) -> ZMM (10 + b)
-                // Use zmm10-13 to avoid conflict with StateRegs (16-19) and ConstRegs (26-31)
+                // Use zmm10-13 for Q data, avoiding:
+                //   - zmm8-9: V accumulation scratch
+                //   - zmm14-15: emit_fast_exp scratch
+                //   - zmm16-19: StateRegs
+                //   - zmm26-31: ConstRegs
                 Ymm ymm_q(10 + b);
                 vmovdqu8(ymm_q, ptr[reg_Q_base + src_offset + 4]);
 
@@ -4755,6 +4840,233 @@ namespace llaminar::v2::kernels::jit
             //         V is dequantized from Q8_1 blocks at reg_V_ptr
             // ───────────────────────────────────────────────────────────────────
             v_accum_emitter_.emit_weighted_accum(*this, reg_V_ptr, num_blocks, spill_base_offset);
+        }
+
+        /**
+         * @brief FA2-style tile processing: 4 KV positions at once
+         *
+         * FlashAttention-2 optimization: Process 4 KV positions in a single call,
+         * computing scores, finding tile max, updating softmax state ONCE, and
+         * accumulating weighted V with interleaved loads.
+         *
+         * ═══════════════════════════════════════════════════════════════════════
+         * ALGORITHM (FA2 Tile Processing)
+         * ═══════════════════════════════════════════════════════════════════════
+         *
+         * For a tile of 4 KV positions [kv, kv+1, kv+2, kv+3]:
+         *
+         *   1. Compute 4 scores simultaneously:
+         *      score[0..3] = Q · K[kv+0..3] * scale
+         *
+         *   2. Find tile max:
+         *      tile_max = max(score[0], score[1], score[2], score[3])
+         *
+         *   3. Update softmax state ONCE per tile:
+         *      if tile_max > running_max:
+         *          correction = exp(running_max - tile_max)
+         *          context *= correction     // Rescale once, not 4 times!
+         *          running_sum *= correction
+         *          running_max = tile_max
+         *
+         *   4. Compute weights:
+         *      weight[i] = exp(score[i] - running_max)
+         *      running_sum += weight[0] + weight[1] + weight[2] + weight[3]
+         *
+         *   5. Interleaved V accumulation:
+         *      context += weight[0] * V[kv+0]
+         *      context += weight[1] * V[kv+1]
+         *      context += weight[2] * V[kv+2]
+         *      context += weight[3] * V[kv+3]
+         *      (Loads are interleaved with FMAs to hide memory latency)
+         *
+         * ═══════════════════════════════════════════════════════════════════════
+         * PERFORMANCE BENEFITS
+         * ═══════════════════════════════════════════════════════════════════════
+         *
+         * vs. calling emit_single_head_attention 4 times:
+         *   - Context rescale: 1× instead of up to 4×
+         *   - Softmax branches: 1× instead of 4×
+         *   - V load/compute overlap: pipelined across 4 rows
+         *
+         * @param reg_Q_ptr      Register holding Q tensor base pointer
+         * @param reg_K          Register holding K tensor base pointer
+         * @param reg_V          Register holding V tensor base pointer
+         * @param reg_kv_idx     Register holding current KV position index (start of tile)
+         * @param head_idx       Query head index
+         * @param kv_head_idx    KV head index (for GQA)
+         * @param num_blocks     Number of Q8_1 blocks per head (head_dim / 32)
+         * @param spill_base_offset Stack offset for spilled accumulators
+         * @param label_prefix   Unique prefix for internal jump labels
+         */
+        void emit_fa2_tile_attention_4x(
+            const Xbyak::Reg64 &reg_Q_ptr,
+            const Xbyak::Reg64 &reg_K,
+            const Xbyak::Reg64 &reg_V,
+            const Xbyak::Reg64 &reg_kv_idx,
+            int head_idx,
+            int kv_head_idx,
+            int num_blocks,
+            int spill_base_offset,
+            const std::string &label_prefix)
+        {
+            using namespace Xbyak;
+            using namespace llaminar2::jit;
+
+            debug_emit("emit_fa2_tile_attention_4x (FA2 tile processing)");
+
+            // ═══════════════════════════════════════════════════════════════════
+            // REGISTER TRACKING: If enabled, track all register borrows
+            // ═══════════════════════════════════════════════════════════════════
+            if (tracking_enabled())
+            {
+                reset_borrows(); // Start fresh for this tile
+                debug_emit("  [TRACKING] Register tracking enabled for FA2 tile");
+            }
+
+            // ───────────────────────────────────────────────────────────────────
+            // STEP 1: Calculate K pointer for this KV tile
+            //         K_ptr = K_base + kv_idx * k_stride + kv_head * head_size
+            // ───────────────────────────────────────────────────────────────────
+            Reg64 reg_K_ptr = rdi;
+            int k_stride = config_.num_kv_heads * num_blocks * 36;
+            int kv_head_offset = kv_head_idx * num_blocks * 36;
+
+            mov(reg_K_ptr, reg_kv_idx);
+            imul(reg_K_ptr, reg_K_ptr, k_stride);
+            add(reg_K_ptr, kv_head_offset);
+            add(reg_K_ptr, reg_K);
+
+            // ───────────────────────────────────────────────────────────────────
+            // STEP 2: Compute 4 Q·K scores simultaneously
+            //         Using FA2 vectorized dot product emitter
+            //         Q is pre-loaded in zmm10-13 by emit_load_q_head_to_registers
+            // ───────────────────────────────────────────────────────────────────
+            // BORROW: Score0-3 (xmm20-23) for dot product outputs
+            auto guard_score0 = borrow<Score0>();
+            auto guard_score1 = borrow<Score1>();
+            auto guard_score2 = borrow<Score2>();
+            auto guard_score3 = borrow<Score3>();
+
+            // BORROW: Scratch4 (xmm24) for local scale copy
+            auto guard_scale = borrow<Scratch4>();
+            Xmm xmm_scale_local = guard_scale.xmm();
+
+            // BORROW: Q data registers (Input2-5 = zmm10-13) - these were loaded
+            //         by emit_load_q_head_to_registers and are read during dot products.
+            //         We borrow them here so we know when they can be released.
+            auto guard_q0 = borrow<Input2>(); // zmm10 - Q block 0 low
+            auto guard_q1 = borrow<Input3>(); // zmm11 - Q block 0 high
+            auto guard_q2 = borrow<Input4>(); // zmm12 - Q block 1 low (if num_blocks >= 2)
+            auto guard_q3 = borrow<Input5>(); // zmm13 - Q block 1 high (if num_blocks >= 2)
+
+            // Load attention scale (1/sqrt(head_dim))
+            vmovss(xmm_scale_local, Xmm(zmm_scale().getIdx()));
+
+            // Q data is pre-loaded in zmm10+ by emit_load_q_head_to_registers
+            // d_Q scales are loaded on-demand inside emit_dot_product_4x to avoid register pressure.
+
+            int q_head_offset = head_idx * num_blocks * 36;
+
+            // emit_dot_product_4x: Q data in zmm10+, d_Q loaded from memory
+            dot_emitter_.emit_dot_product_4x(
+                *this,
+                guard_score0.xmm(), guard_score1.xmm(), guard_score2.xmm(), guard_score3.xmm(),
+                reg_K_ptr, k_stride,
+                num_blocks, xmm_scale_local, 10, reg_Q_ptr, q_head_offset);
+
+            // ═══════════════════════════════════════════════════════════════════
+            // Q DATA NO LONGER NEEDED - RELEASE Q REGISTERS
+            // After dot products, Q is not used again. Release these registers
+            // so emit_interleaved_v_accum_4x can use Input2-3 (zmm10-11) for V loading.
+            // ═══════════════════════════════════════════════════════════════════
+            guard_q0.release(); // zmm10 now available
+            guard_q1.release(); // zmm11 now available
+            guard_q2.release(); // zmm12 now available
+            guard_q3.release(); // zmm13 now available
+
+            // ───────────────────────────────────────────────────────────────────
+            // STEP 3: Find tile max (max of 4 scores)
+            //         Using typed registers: Scratch4 (zmm24) is SAFE because it
+            //         does NOT overlap ScoreZone (xmm20-23).
+            //
+            //         NOTE: We already borrowed Scratch4 for xmm_scale_local above.
+            //         After vmovss, xmm24 has the scale in element 0, but the upper
+            //         bits of zmm24 are undefined. We can reuse it for tile_max
+            //         because emit_tile_max_reduction_4_typed will overwrite it.
+            // ───────────────────────────────────────────────────────────────────
+            // Scratch4 already borrowed above as guard_scale
+            Zmm tile_max = guard_scale.zmm(); // Reuse zmm24
+
+            softmax_emitter_.emit_tile_max_reduction_4_typed(
+                *this, Scratch4{}, score0(), score1(), score2(), score3());
+
+            // ───────────────────────────────────────────────────────────────────
+            // STEP 4: Update softmax state ONCE for the tile
+            //         Compare tile_max with running_max, apply correction if needed
+            // ───────────────────────────────────────────────────────────────────
+            std::string tile_label = label_prefix + "_fa2_tile";
+            softmax_emitter_.emit_tile_state_update(*this, tile_max, tile_label);
+
+            // ───────────────────────────────────────────────────────────────────
+            // STEP 5: Rescale context accumulators ONCE
+            //         correction factor is in zmm_corr() after emit_tile_state_update
+            // ───────────────────────────────────────────────────────────────────
+            v_accum_emitter_.emit_rescale_context(*this, num_blocks, spill_base_offset);
+
+            // ───────────────────────────────────────────────────────────────────
+            // STEP 6: Compute weights and accumulate sum for all 4 positions
+            //         weight[i] = exp(score[i] - running_max)
+            //         running_sum += weight[0] + weight[1] + weight[2] + weight[3]
+            //
+            //         NOTE: Weights are output to Scratch0-3 (zmm20-23), which
+            //         ALIAS Score0-3 (xmm20-23). We RELEASE the score guards first
+            //         and then BORROW the scratch registers for weights.
+            // ───────────────────────────────────────────────────────────────────
+            // RELEASE Score0-3 before reusing as Scratch0-3
+            guard_score0.release();
+            guard_score1.release();
+            guard_score2.release();
+            guard_score3.release();
+
+            // BORROW: Scratch0-3 (zmm20-23) for weights
+            // These alias the same physical registers as Score0-3, but now
+            // we're using them as ZMM (full 512-bit) instead of XMM (128-bit)
+            auto guard_weight0 = borrow<Scratch0>();
+            auto guard_weight1 = borrow<Scratch1>();
+            auto guard_weight2 = borrow<Scratch2>();
+            auto guard_weight3 = borrow<Scratch3>();
+
+            // Read the scalar scores (still in xmm20-23) and write full ZMM weights
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score0().xmm(), guard_weight0.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score1().xmm(), guard_weight1.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score2().xmm(), guard_weight2.zmm());
+            softmax_emitter_.emit_compute_weight_and_accumulate(*this, score3().xmm(), guard_weight3.zmm());
+
+            // ───────────────────────────────────────────────────────────────────
+            // STEP 7: Calculate V pointer for this KV tile
+            // ───────────────────────────────────────────────────────────────────
+            Reg64 reg_V_ptr = rdi;
+            int v_stride = config_.num_kv_heads * num_blocks * 36;
+
+            mov(reg_V_ptr, reg_kv_idx);
+            imul(reg_V_ptr, reg_V_ptr, v_stride);
+            add(reg_V_ptr, kv_head_offset);
+            add(reg_V_ptr, reg_V);
+
+            // ───────────────────────────────────────────────────────────────────
+            // STEP 8: Interleaved V accumulation for 4 positions
+            //         Overlaps V loads with FMA to hide memory latency
+            //         The weights are broadcast in weight0-3 (zmm20-23), so the
+            //         low element (accessible via xmm) is the scalar weight.
+            // ───────────────────────────────────────────────────────────────────
+            v_accum_emitter_.emit_interleaved_v_accum_4x(
+                *this,
+                reg_V_ptr, v_stride,
+                num_blocks,
+                guard_weight0.xmm(), guard_weight1.xmm(), guard_weight2.xmm(), guard_weight3.xmm(),
+                spill_base_offset);
+
+            // Guards released automatically at end of scope
         }
     };
 

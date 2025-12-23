@@ -14,15 +14,24 @@
  * - Each JIT microkernel is independently testable
  * - Microkernels can be composed into fused kernels
  * - Register conventions ensure composability without conflicts
+ *
+ * Register Aliasing Warning:
+ * - XMM, YMM, and ZMM registers with the same index share physical storage
+ * - xmm0 is the lower 128 bits of ymm0 and zmm0
+ * - Writing to ymm0 zeroes the upper 384 bits of zmm0
+ * - Use RegisterAllocation.h typed registers to prevent aliasing bugs
  */
 
 #pragma once
 
 #include "../../../../../../../external/onednn/third_party/xbyak/xbyak.h"
+#include "../../../jit/RegisterAllocation.h"
+#include "../../../jit/RegisterGuard.h"
 #include <array>
 #include <cstdint>
 #include <string>
 #include <iostream>
+#include <memory>
 
 namespace llaminar::v2::kernels::jit
 {
@@ -141,7 +150,7 @@ namespace llaminar::v2::kernels::jit
         Xbyak::Zmm zmm_128() const { return Xbyak::Zmm(ConstRegs::ZMM_128); }
         Xbyak::Zmm zmm_scale() const { return Xbyak::Zmm(ConstRegs::ZMM_SCALE); }
         Xbyak::Zmm zmm_neg_inf() const { return Xbyak::Zmm(ConstRegs::ZMM_NEG_INF); }
-        Xbyak::Zmm zmm_16() const { return Xbyak::Zmm(ConstRegs::ZMM_16); }  ///< 16.0f for Q8_1 correction
+        Xbyak::Zmm zmm_16() const { return Xbyak::Zmm(ConstRegs::ZMM_16); } ///< 16.0f for Q8_1 correction
         Xbyak::Zmm zmm_one() const { return Xbyak::Zmm(ConstRegs::ZMM_ONE); }
         Xbyak::Zmm zmm_log2e() const { return Xbyak::Zmm(ConstRegs::ZMM_LOG2E); }
         Xbyak::Zmm zmm_exp_min() const { return Xbyak::Zmm(ConstRegs::ZMM_EXP_MIN); }
@@ -171,10 +180,121 @@ namespace llaminar::v2::kernels::jit
         }
 
         // ========================================================================
+        // Typed Register Accessors (compile-time safe)
+        // ========================================================================
+        // These return typed registers from RegisterAllocation.h, enabling
+        // compile-time checking of register conflicts.
+
+        // State registers (zmm16-19) - online softmax state
+        static constexpr llaminar2::jit::StateMax state_max() { return {}; }
+        static constexpr llaminar2::jit::StateSum state_sum() { return {}; }
+        static constexpr llaminar2::jit::StateWeight state_weight() { return {}; }
+        static constexpr llaminar2::jit::StateCorr state_corr() { return {}; }
+
+        // Score registers (xmm20-23) - FA2 tile scores
+        // WARNING: These alias Scratch0-3 (zmm20-23)!
+        static constexpr llaminar2::jit::Score0 score0() { return {}; }
+        static constexpr llaminar2::jit::Score1 score1() { return {}; }
+        static constexpr llaminar2::jit::Score2 score2() { return {}; }
+        static constexpr llaminar2::jit::Score3 score3() { return {}; }
+
+        // Scratch registers (zmm20-25) - temporaries
+        // WARNING: Scratch0-3 alias Score0-3!
+        static constexpr llaminar2::jit::Scratch0 scratch0() { return {}; }
+        static constexpr llaminar2::jit::Scratch1 scratch1() { return {}; }
+        static constexpr llaminar2::jit::Scratch2 scratch2() { return {}; }
+        static constexpr llaminar2::jit::Scratch3 scratch3() { return {}; }
+        static constexpr llaminar2::jit::Scratch4 scratch4() { return {}; } // Safe during FA2
+        static constexpr llaminar2::jit::Scratch5 scratch5() { return {}; } // Safe during FA2
+
+        // Accumulator registers (zmm0-7) - context accumulators
+        static constexpr llaminar2::jit::Accum0 accum0() { return {}; }
+        static constexpr llaminar2::jit::Accum1 accum1() { return {}; }
+        static constexpr llaminar2::jit::Accum2 accum2() { return {}; }
+        static constexpr llaminar2::jit::Accum3 accum3() { return {}; }
+        static constexpr llaminar2::jit::Accum4 accum4() { return {}; }
+        static constexpr llaminar2::jit::Accum5 accum5() { return {}; }
+        static constexpr llaminar2::jit::Accum6 accum6() { return {}; }
+        static constexpr llaminar2::jit::Accum7 accum7() { return {}; }
+
+        // ========================================================================
+        // Register Tracking (Runtime Conflict Detection)
+        // ========================================================================
+
+        /**
+         * @brief Enable register tracking for debugging register conflicts
+         *
+         * When enabled, all borrow<RegType>() calls will assert if the register
+         * (or an aliased register) is already borrowed.
+         */
+        void enable_register_tracking()
+        {
+            tracker_ = std::make_unique<llaminar2::jit::RegisterTracker>();
+        }
+
+        /**
+         * @brief Check if register tracking is enabled
+         */
+        bool tracking_enabled() const { return tracker_ != nullptr; }
+
+        /**
+         * @brief Get the register tracker (for use by emitters)
+         * @return Pointer to tracker, or nullptr if tracking disabled
+         */
+        llaminar2::jit::RegisterTracker *tracker() { return tracker_.get(); }
+
+        /**
+         * @brief Borrow a typed register with tracking (if enabled)
+         *
+         * If tracking is enabled, this returns an RAII guard that will:
+         * - Assert if the register is already borrowed
+         * - Automatically release when the guard goes out of scope
+         *
+         * If tracking is disabled, returns a guard that just wraps the register
+         * without any checking (zero overhead).
+         *
+         * @tparam RegType Typed register (e.g., Score0, Scratch4, Accum0)
+         */
+        template <typename RegType>
+        [[nodiscard]] auto borrow()
+        {
+            if (tracker_)
+            {
+                return tracker_->borrow<RegType>();
+            }
+            // Return a "fake" guard that doesn't track (zero overhead when disabled)
+            return llaminar2::jit::RegisterGuard<RegType>(nullptr, RegType{});
+        }
+
+        /**
+         * @brief Reset all register borrows (for starting a new phase)
+         */
+        void reset_borrows()
+        {
+            if (tracker_)
+            {
+                tracker_->reset();
+            }
+        }
+
+        /**
+         * @brief Get debug string of currently borrowed registers
+         */
+        std::string borrowed_registers_debug() const
+        {
+            if (tracker_)
+            {
+                return tracker_->debug_string();
+            }
+            return "(tracking disabled)";
+        }
+
+        // ========================================================================
         // Common SIMD Patterns (public for use by Emitter classes)
         // ========================================================================
 
         bool debug_ = false;
+        std::unique_ptr<llaminar2::jit::RegisterTracker> tracker_;
 
         // ========================================================================
         // Common SIMD Patterns

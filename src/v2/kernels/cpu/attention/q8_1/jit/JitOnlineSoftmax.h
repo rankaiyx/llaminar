@@ -21,17 +21,36 @@
  *
  * This enables single-pass attention without materializing the full NxN score matrix.
  *
- * Register conventions:
- * - State: zmm_max(), zmm_sum() hold running state (broadcast scalars)
- * - Input: score in XMM (scalar)
- * - Output: weight in zmm_weight() (broadcast)
- * - Scratch: zmm20-25 freely clobbered
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * TYPED REGISTER ALLOCATION (via RegisterAllocation.h)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * StateZone (zmm16-19): Online softmax state
+ *   - StateMax (zmm16): Running max for numerical stability
+ *   - StateSum (zmm17): Running sum of exp weights
+ *   - StateWeight (zmm18): Current attention weight
+ *   - StateCorr (zmm19): Correction factor for context rescaling
+ *
+ * ScoreZone (xmm20-23): FA2 tile scores (alias Scratch0-3)
+ *   - Score0 (xmm20): Q·K[kv+0]
+ *   - Score1 (xmm21): Q·K[kv+1]
+ *   - Score2 (xmm22): Q·K[kv+2]
+ *   - Score3 (xmm23): Q·K[kv+3]
+ *
+ * ScratchZone (zmm20-25): Temporary registers
+ *   - Scratch0-3 (zmm20-23): ALIAS ScoreZone! Use for weight outputs AFTER scores consumed
+ *   - Scratch4 (zmm24): Safe for tile_max - does NOT clobber scores
+ *   - Scratch5 (zmm25): Safe for additional scratch
  */
 
 #pragma once
 
 #include "JitMicrokernelBase.h"
 #include "JitFastExp.h"
+#include "../../../jit/RegisterAllocation.h"
+
+// Import typed register aliases for convenience
+using namespace llaminar2::jit;
 
 namespace llaminar::v2::kernels::jit
 {
@@ -171,6 +190,243 @@ namespace llaminar::v2::kernels::jit
             // inv_sum = 1.0 / sum
             // Use precise division (not approximate vrcp14ps)
             gen.vdivps(dst_zmm, gen.zmm_one(), gen.zmm_sum());
+        }
+
+        /**
+         * @brief FA2 Tile Max Reduction: Find maximum across N scores
+         *
+         * For FA2-style tile processing, we compute all scores in a tile first,
+         * then find the tile maximum in one pass. This is used to:
+         *   1. Determine if we need to rescale existing context (tile_max > running_max)
+         *   2. Compute all weights relative to the tile_max
+         *
+         * Input: scores in Score0-3 (xmm20-23) from ScoreZone
+         * Output: tile_max broadcast in dst_zmm (must be Scratch4 or Scratch5!)
+         *
+         * CRITICAL: dst_zmm must NOT be Scratch0-3 (zmm20-23) as those alias
+         * the Score registers we're reading from!
+         *
+         * @param gen Code generator
+         * @param dst_zmm Output ZMM with max broadcast to all lanes (use zmm24/25)
+         * @param score_xmm0..3 Input XMM registers containing scalar scores
+         * @param num_scores Number of scores (1-4)
+         */
+        void emit_tile_max_reduction_4(
+            JitMicrokernelBase &gen,
+            const Xbyak::Zmm &dst_zmm,
+            const Xbyak::Xmm &score_xmm0,
+            const Xbyak::Xmm &score_xmm1,
+            const Xbyak::Xmm &score_xmm2,
+            const Xbyak::Xmm &score_xmm3,
+            int num_scores = 4)
+        {
+            using namespace Xbyak;
+
+            gen.debug_emit("emit_tile_max_reduction_4 (" + std::to_string(num_scores) + " scores)");
+
+            // Verify we're not clobbering scores (runtime check for safety)
+            // In typed version below, this is a compile-time check
+            assert(dst_zmm.getIdx() >= 24 && "dst_zmm must be zmm24 or zmm25 to avoid clobbering scores!");
+
+            // Start with first score
+            gen.vmovss(Xmm(dst_zmm.getIdx()), score_xmm0);
+
+            // Max with remaining scores
+            if (num_scores >= 2)
+            {
+                gen.vmaxss(Xmm(dst_zmm.getIdx()), Xmm(dst_zmm.getIdx()), score_xmm1);
+            }
+            if (num_scores >= 3)
+            {
+                gen.vmaxss(Xmm(dst_zmm.getIdx()), Xmm(dst_zmm.getIdx()), score_xmm2);
+            }
+            if (num_scores >= 4)
+            {
+                gen.vmaxss(Xmm(dst_zmm.getIdx()), Xmm(dst_zmm.getIdx()), score_xmm3);
+            }
+
+            // Broadcast result to all lanes
+            gen.vbroadcastss(dst_zmm, Xmm(dst_zmm.getIdx()));
+        }
+
+        /**
+         * @brief FA2 Tile Max Reduction with compile-time safe registers
+         *
+         * Type-safe variant using typed registers from RegisterAllocation.h.
+         * The template constraint enforces that output is Scratch4 or Scratch5,
+         * preventing the bug where tile_max output clobbers score registers.
+         *
+         * Example usage:
+         *   emit_tile_max_reduction_4_typed(gen, gen.scratch4(),
+         *                                   gen.score0(), gen.score1(),
+         *                                   gen.score2(), gen.score3());
+         *
+         * @tparam OutputReg Must satisfy require_safe_scratch_for_fa2
+         * @param gen Code generator
+         * @param output Typed register for output (compile-time verified as zmm24/25)
+         * @param score0..3 Typed score registers
+         * @param num_scores Number of scores (1-4)
+         */
+        template <typename OutputReg,
+                  require_safe_scratch_for_fa2<OutputReg> = true>
+        void emit_tile_max_reduction_4_typed(
+            JitMicrokernelBase &gen,
+            const OutputReg &output,
+            const Score0 &s0,
+            const Score1 &s1,
+            const Score2 &s2,
+            const Score3 &s3,
+            int num_scores = 4)
+        {
+            emit_tile_max_reduction_4(gen, output.zmm(),
+                                      s0.xmm(), s1.xmm(), s2.xmm(), s3.xmm(),
+                                      num_scores);
+        }
+
+        /**
+         * @brief FA2 Batched Softmax State Update
+         *
+         * Updates softmax state for an entire tile of scores at once.
+         * This is more efficient than per-score updates because:
+         *   1. Context rescaling happens at most once per tile (not per score)
+         *   2. Sum accumulation is batched
+         *
+         * Algorithm:
+         *   if tile_max > running_max:
+         *     correction = exp(running_max - tile_max)
+         *     sum *= correction
+         *     [caller rescales context]
+         *     running_max = tile_max
+         *   for each score in tile:
+         *     weight[i] = exp(score[i] - running_max)
+         *     sum += weight[i]
+         *
+         * Uses typed state registers:
+         *   - StateMax (zmm16): Running maximum
+         *   - StateSum (zmm17): Running sum
+         *   - StateCorr (zmm19): Correction factor
+         *
+         * REGISTER GUARDS:
+         * - emit_fast_exp borrows Input0 (zmm8), Input6 (zmm14), Input7 (zmm15)
+         * - tile_max_zmm is caller-owned (should be Scratch4 = zmm24)
+         * - StateMax/StateSum/StateCorr are state zone (zmm16-19)
+         *
+         * @param gen Code generator
+         * @param tile_max_zmm ZMM with tile max broadcast (should be Scratch4/5)
+         * @param label_prefix Unique prefix for jump labels
+         */
+        void emit_tile_state_update(
+            JitMicrokernelBase &gen,
+            const Xbyak::Zmm &tile_max_zmm,
+            const std::string &label_prefix)
+        {
+            using namespace Xbyak;
+
+            gen.debug_emit("emit_tile_state_update");
+
+            // Use typed state accessors for clarity
+            Zmm zmm_max = gen.state_max().zmm();
+            Zmm zmm_sum = gen.state_sum().zmm();
+            Zmm zmm_corr = gen.state_corr().zmm();
+
+            // Initialize correction to 1.0 (no rescale needed by default)
+            gen.load_constant_f32(zmm_corr, 1.0f);
+
+            // Compare tile_max with running_max
+            gen.vcomiss(Xmm(tile_max_zmm.getIdx()), Xmm(zmm_max.getIdx()));
+
+            std::string label_no_rescale = label_prefix + "_no_rescale";
+            gen.jbe(label_no_rescale.c_str(), Xbyak::CodeGenerator::T_NEAR);
+
+            // tile_max > running_max: need to rescale
+            gen.debug_emit("  tile_max > running_max branch");
+            {
+                // CRITICAL FIX: Save tile_max to running_max BEFORE calling emit_fast_exp!
+                // emit_fast_exp uses Scratch4 (zmm24) and Scratch5 (zmm25) internally,
+                // which clobbers tile_max_zmm if it's in zmm24/zmm25.
+                // By copying tile_max to zmm_max first, we preserve the value.
+
+                // Step 1: Compute (running_max - tile_max) into zmm_corr
+                //         This uses the OLD running_max before we overwrite it
+                gen.vsubps(zmm_corr, zmm_max, tile_max_zmm);
+
+                // Step 2: Save tile_max to running_max NOW (before exp clobbers it)
+                gen.vmovaps(zmm_max, tile_max_zmm);
+
+                // Step 3: exp(old_max - new_max) = correction factor
+                //         NOTE: emit_fast_exp clobbers zmm24/zmm25, but tile_max
+                //         is now safely stored in zmm_max (zmm16)
+                exp_emitter_.emit_fast_exp(gen, zmm_corr, zmm_corr);
+
+                // Step 4: sum *= correction
+                gen.vmulps(zmm_sum, zmm_sum, zmm_corr);
+
+                // zmm_corr now contains correction factor for context rescaling
+            }
+
+            gen.L(label_no_rescale.c_str());
+        }
+
+        /**
+         * @brief Compute weight for a single score and accumulate sum
+         *
+         * After tile_state_update, compute weight = exp(score - running_max)
+         * and accumulate into sum.
+         *
+         * Uses typed state registers:
+         *   - StateMax (zmm16): Current running maximum
+         *   - StateSum (zmm17): Running sum (updated)
+         *
+         * REGISTER GUARDS:
+         * - emit_fast_exp internally borrows Input0 (zmm8), Input6 (zmm14), Input7 (zmm15)
+         * - The caller's weight_zmm is written but not borrowed here (caller owns it)
+         *
+         * @param gen Code generator
+         * @param score_xmm Input scalar score (typically Score0-3)
+         * @param weight_zmm Output weight (broadcast to all lanes)
+         */
+        void emit_compute_weight_and_accumulate(
+            JitMicrokernelBase &gen,
+            const Xbyak::Xmm &score_xmm,
+            const Xbyak::Zmm &weight_zmm)
+        {
+            using namespace Xbyak;
+
+            gen.debug_emit("emit_compute_weight_and_accumulate");
+
+            // Use typed state accessors
+            Zmm zmm_max = gen.state_max().zmm();
+            Zmm zmm_sum = gen.state_sum().zmm();
+
+            // weight = exp(score - running_max)
+            gen.vbroadcastss(weight_zmm, score_xmm);
+            gen.vsubps(weight_zmm, weight_zmm, zmm_max);
+
+            // emit_fast_exp uses Input0 (zmm8), Input6 (zmm14), Input7 (zmm15)
+            // Those guards are managed inside emit_fast_exp/emit_exp2_poly
+            exp_emitter_.emit_fast_exp(gen, weight_zmm, weight_zmm);
+
+            // sum += weight
+            gen.vaddps(zmm_sum, zmm_sum, weight_zmm);
+        }
+
+        /**
+         * @brief Typed variant of emit_compute_weight_and_accumulate
+         *
+         * @tparam ScoreReg Typed score register (Score0-3)
+         * @param gen Code generator
+         * @param score Typed score register
+         * @param weight_zmm Output weight ZMM
+         */
+        template <typename ScoreReg>
+        void emit_compute_weight_and_accumulate_typed(
+            JitMicrokernelBase &gen,
+            const ScoreReg &score,
+            const Xbyak::Zmm &weight_zmm)
+        {
+            static_assert(is_zone_v<ScoreReg, ScoreZone>,
+                          "score must be from ScoreZone (Score0-3)");
+            emit_compute_weight_and_accumulate(gen, score.xmm(), weight_zmm);
         }
 
     private:

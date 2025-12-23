@@ -22,6 +22,7 @@
 #pragma once
 
 #include "JitMicrokernelBase.h"
+#include "../../../jit/RegisterGuard.h"
 
 namespace llaminar::v2::kernels::jit
 {
@@ -116,7 +117,8 @@ namespace llaminar::v2::kernels::jit
                     int spill_lo = spill_base_offset + (b - 2) * 128;
                     int spill_hi = spill_lo + 64;
 
-                    Zmm zmm_tmp = gen.zmm_scratch(0);
+                    // Use Scratch1 (zmm21) for temp, NOT Scratch0 (zmm20) which holds weight!
+                    Zmm zmm_tmp = gen.zmm_scratch(1);
 
                     // Low half
                     gen.vmovups(zmm_tmp, gen.ptr[gen.rsp + spill_lo]);
@@ -163,7 +165,13 @@ namespace llaminar::v2::kernels::jit
             // Rescale spilled blocks
             if (num_blocks > 2)
             {
-                Zmm zmm_tmp = gen.zmm_scratch(0);
+                // CRITICAL: Use Scratch5 (zmm25) for temp, NOT Scratch0-3 (zmm20-23)!
+                // During FA2 tile processing, Score0-3 (xmm20-23) are still live and
+                // contain the attention scores. Using zmm20-23 would clobber them
+                // before they're used for weight computation.
+                //
+                // Scratch4 (zmm24) holds tile_max, so use Scratch5 (zmm25).
+                Zmm zmm_tmp = gen.zmm_scratch(5); // zmm25 - safe during FA2
 
                 for (int b = 2; b < num_blocks; ++b)
                 {
@@ -344,18 +352,216 @@ namespace llaminar::v2::kernels::jit
                 else if (b == 2)
                 {
                     // For head_dim=128 (4 blocks), use additional scratch registers
-                    // zmm_scratch(6) and zmm_scratch(7) for block 2
-                    gen.vfmadd231ps(gen.zmm_scratch(6), zmm_v_lo, gen.zmm_weight());
-                    gen.vfmadd231ps(gen.zmm_scratch(7), zmm_v_hi, gen.zmm_weight());
+                    // Avoid zmm20 (Scratch0) which holds weight!
+                    // Use zmm21-22 (Scratch1-2) for block 2
+                    gen.vfmadd231ps(gen.zmm_scratch(1), zmm_v_lo, gen.zmm_weight());
+                    gen.vfmadd231ps(gen.zmm_scratch(2), zmm_v_hi, gen.zmm_weight());
                 }
                 else if (b == 3)
                 {
-                    // zmm_scratch(8) and zmm_scratch(9) for block 3
-                    // Note: This uses zmm28-29 which should be safe
-                    gen.vfmadd231ps(Zmm(28), zmm_v_lo, gen.zmm_weight());
-                    gen.vfmadd231ps(Zmm(29), zmm_v_hi, gen.zmm_weight());
+                    // Use zmm23-24 (Scratch3-4) for block 3
+                    gen.vfmadd231ps(gen.zmm_scratch(3), zmm_v_lo, gen.zmm_weight());
+                    gen.vfmadd231ps(gen.zmm_scratch(4), zmm_v_hi, gen.zmm_weight());
                 }
                 // For larger head_dim, we'd need to spill to memory
+            }
+        }
+
+        /**
+         * @brief FA2 Interleaved V Accumulation for 4 KV positions
+         *
+         * Processes 4 V rows simultaneously with interleaved loads and FMAs
+         * to hide memory latency. This is the FA2 optimization that pipelines
+         * V data loading with compute.
+         *
+         * Pattern:
+         *   Load V[0] block
+         *   Load V[1] block | FMA V[0]
+         *   Load V[2] block | FMA V[1]
+         *   Load V[3] block | FMA V[2]
+         *                   | FMA V[3]
+         *
+         * This overlaps memory access with compute, reducing stalls.
+         *
+         * @param gen Code generator
+         * @param reg_V_ptr Pointer to first V row (V[kv_start])
+         * @param v_stride Bytes between consecutive V rows
+         * @param num_blocks Number of Q8_1 blocks per head
+         * @param weight_xmm0..3 Scalar weights for V[0..3]
+         * @param spill_base_offset Stack offset for spilled accumulators
+         */
+        void emit_interleaved_v_accum_4x(
+            JitMicrokernelBase &gen,
+            const Xbyak::Reg64 &reg_V_ptr,
+            int64_t v_stride,
+            int num_blocks,
+            const Xbyak::Xmm &weight_xmm0,
+            const Xbyak::Xmm &weight_xmm1,
+            const Xbyak::Xmm &weight_xmm2,
+            const Xbyak::Xmm &weight_xmm3,
+            int spill_base_offset)
+        {
+            using namespace Xbyak;
+            using namespace llaminar2::jit;
+
+            gen.debug_emit("emit_interleaved_v_accum_4x (" + std::to_string(num_blocks) + " blocks)");
+
+            // === REGISTER GUARDS ===
+            // Borrow registers used internally by this function.
+            // NOTE: weight_xmm0-3 are passed in by caller, so caller owns them.
+            //       We don't borrow them here - caller is responsible for their lifetime.
+
+            // V data loading registers:
+            // - Use Input0-1 (zmm8-9) for V[0] data (safe, doesn't conflict with Q)
+            // - Use Accum4-5 (zmm4-5) for V[1] data (CHANGED from Input2-3 to avoid Q conflict!)
+            //   Q data is in zmm10-13, so we CANNOT use zmm10-11 for V loading!
+            auto guard_v_lo_0 = gen.borrow<Input0>(); // zmm8
+            auto guard_v_hi_0 = gen.borrow<Input1>(); // zmm9
+            auto guard_v_lo_1 = gen.borrow<Accum4>(); // zmm4 - CHANGED from Input2 to avoid Q conflict!
+            auto guard_v_hi_1 = gen.borrow<Accum5>(); // zmm5 - CHANGED from Input3 to avoid Q conflict!
+
+            // V scale register (Scratch5 = zmm25)
+            auto guard_d_v = gen.borrow<Scratch5>();
+
+            // Use the passed-in weight XMMs directly for broadcast targets
+            // Broadcast into the SAME registers they came from
+            Zmm zmm_w0 = Zmm(weight_xmm0.getIdx());
+            Zmm zmm_w1 = Zmm(weight_xmm1.getIdx());
+            Zmm zmm_w2 = Zmm(weight_xmm2.getIdx());
+            Zmm zmm_w3 = Zmm(weight_xmm3.getIdx());
+
+            gen.vbroadcastss(zmm_w0, weight_xmm0);
+            gen.vbroadcastss(zmm_w1, weight_xmm1);
+            gen.vbroadcastss(zmm_w2, weight_xmm2);
+            gen.vbroadcastss(zmm_w3, weight_xmm3);
+
+            // V data registers for interleaving
+            Zmm zmm_v_lo_0 = guard_v_lo_0.zmm();
+            Zmm zmm_v_hi_0 = guard_v_hi_0.zmm();
+            Zmm zmm_v_lo_1 = guard_v_lo_1.zmm();
+            Zmm zmm_v_hi_1 = guard_v_hi_1.zmm();
+            Zmm zmm_d_v = guard_d_v.zmm();
+
+            for (int b = 0; b < num_blocks; ++b)
+            {
+                gen.debug_emit("  Block " + std::to_string(b) + " (4x interleaved)");
+
+                int v_block_offset = b * 36;
+
+                // Determine which accumulators to use for this block
+                Zmm zmm_ctx_lo, zmm_ctx_hi;
+                bool use_spill = false;
+                int spill_lo = 0, spill_hi = 0;
+
+                if (b == 0)
+                {
+                    zmm_ctx_lo = gen.zmm_accum(0);
+                    zmm_ctx_hi = gen.zmm_accum(1);
+                }
+                else if (b == 1)
+                {
+                    zmm_ctx_lo = gen.zmm_accum(2);
+                    zmm_ctx_hi = gen.zmm_accum(3);
+                }
+                else
+                {
+                    // Spilled blocks
+                    use_spill = true;
+                    spill_lo = spill_base_offset + (b - 2) * 128;
+                    spill_hi = spill_lo + 64;
+                    // zmm20-23 hold weights! Cannot use them.
+                    // zmm10-13 (Input2-5) are free (Q released).
+                    zmm_ctx_lo = gen.zmm_input(2); // zmm10
+                    zmm_ctx_hi = gen.zmm_input(3); // zmm11
+                }
+
+                if (use_spill)
+                {
+                    // Load spilled context
+                    gen.vmovups(zmm_ctx_lo, gen.ptr[gen.rsp + spill_lo]);
+                    gen.vmovups(zmm_ctx_hi, gen.ptr[gen.rsp + spill_hi]);
+                }
+
+                // ================================================================
+                // Interleaved load/compute pattern for 4 V rows
+                // ================================================================
+
+                // --- V[0]: Load and dequantize ---
+                gen.vpbroadcastw(Xmm(zmm_d_v.getIdx()), gen.ptr[reg_V_ptr + v_block_offset]);
+                gen.vcvtph2ps(Xmm(zmm_d_v.getIdx()), Xmm(zmm_d_v.getIdx()));
+                gen.vbroadcastss(zmm_d_v, Xmm(zmm_d_v.getIdx()));
+
+                gen.vpmovsxbd(zmm_v_lo_0, gen.ptr[reg_V_ptr + v_block_offset + 4]);
+                gen.vpmovsxbd(zmm_v_hi_0, gen.ptr[reg_V_ptr + v_block_offset + 4 + 16]);
+                gen.vcvtdq2ps(zmm_v_lo_0, zmm_v_lo_0);
+                gen.vcvtdq2ps(zmm_v_hi_0, zmm_v_hi_0);
+                gen.vmulps(zmm_v_lo_0, zmm_v_lo_0, zmm_d_v);
+                gen.vmulps(zmm_v_hi_0, zmm_v_hi_0, zmm_d_v);
+
+                // --- V[1]: Load scale while V[0] is ready for FMA ---
+                int64_t v1_offset = v_stride + v_block_offset;
+                gen.vpbroadcastw(Xmm(zmm_d_v.getIdx()), gen.ptr[reg_V_ptr + v1_offset]);
+                gen.vcvtph2ps(Xmm(zmm_d_v.getIdx()), Xmm(zmm_d_v.getIdx()));
+                gen.vbroadcastss(zmm_d_v, Xmm(zmm_d_v.getIdx()));
+
+                // FMA V[0] while loading V[1] data
+                gen.vfmadd231ps(zmm_ctx_lo, zmm_v_lo_0, zmm_w0);
+                gen.vpmovsxbd(zmm_v_lo_1, gen.ptr[reg_V_ptr + v1_offset + 4]);
+
+                gen.vfmadd231ps(zmm_ctx_hi, zmm_v_hi_0, zmm_w0);
+                gen.vpmovsxbd(zmm_v_hi_1, gen.ptr[reg_V_ptr + v1_offset + 4 + 16]);
+
+                gen.vcvtdq2ps(zmm_v_lo_1, zmm_v_lo_1);
+                gen.vcvtdq2ps(zmm_v_hi_1, zmm_v_hi_1);
+                gen.vmulps(zmm_v_lo_1, zmm_v_lo_1, zmm_d_v);
+                gen.vmulps(zmm_v_hi_1, zmm_v_hi_1, zmm_d_v);
+
+                // --- V[2]: Load scale while V[1] is ready for FMA ---
+                int64_t v2_offset = 2 * v_stride + v_block_offset;
+                gen.vpbroadcastw(Xmm(zmm_d_v.getIdx()), gen.ptr[reg_V_ptr + v2_offset]);
+                gen.vcvtph2ps(Xmm(zmm_d_v.getIdx()), Xmm(zmm_d_v.getIdx()));
+                gen.vbroadcastss(zmm_d_v, Xmm(zmm_d_v.getIdx()));
+
+                // FMA V[1] while loading V[2] data
+                gen.vfmadd231ps(zmm_ctx_lo, zmm_v_lo_1, zmm_w1);
+                gen.vpmovsxbd(zmm_v_lo_0, gen.ptr[reg_V_ptr + v2_offset + 4]); // Reuse zmm_v_lo_0
+
+                gen.vfmadd231ps(zmm_ctx_hi, zmm_v_hi_1, zmm_w1);
+                gen.vpmovsxbd(zmm_v_hi_0, gen.ptr[reg_V_ptr + v2_offset + 4 + 16]);
+
+                gen.vcvtdq2ps(zmm_v_lo_0, zmm_v_lo_0);
+                gen.vcvtdq2ps(zmm_v_hi_0, zmm_v_hi_0);
+                gen.vmulps(zmm_v_lo_0, zmm_v_lo_0, zmm_d_v);
+                gen.vmulps(zmm_v_hi_0, zmm_v_hi_0, zmm_d_v);
+
+                // --- V[3]: Load scale while V[2] is ready for FMA ---
+                int64_t v3_offset = 3 * v_stride + v_block_offset;
+                gen.vpbroadcastw(Xmm(zmm_d_v.getIdx()), gen.ptr[reg_V_ptr + v3_offset]);
+                gen.vcvtph2ps(Xmm(zmm_d_v.getIdx()), Xmm(zmm_d_v.getIdx()));
+                gen.vbroadcastss(zmm_d_v, Xmm(zmm_d_v.getIdx()));
+
+                // FMA V[2] while loading V[3] data
+                gen.vfmadd231ps(zmm_ctx_lo, zmm_v_lo_0, zmm_w2);
+                gen.vpmovsxbd(zmm_v_lo_1, gen.ptr[reg_V_ptr + v3_offset + 4]); // Reuse zmm_v_lo_1
+
+                gen.vfmadd231ps(zmm_ctx_hi, zmm_v_hi_0, zmm_w2);
+                gen.vpmovsxbd(zmm_v_hi_1, gen.ptr[reg_V_ptr + v3_offset + 4 + 16]);
+
+                gen.vcvtdq2ps(zmm_v_lo_1, zmm_v_lo_1);
+                gen.vcvtdq2ps(zmm_v_hi_1, zmm_v_hi_1);
+                gen.vmulps(zmm_v_lo_1, zmm_v_lo_1, zmm_d_v);
+                gen.vmulps(zmm_v_hi_1, zmm_v_hi_1, zmm_d_v);
+
+                // --- FMA V[3] (final) ---
+                gen.vfmadd231ps(zmm_ctx_lo, zmm_v_lo_1, zmm_w3);
+                gen.vfmadd231ps(zmm_ctx_hi, zmm_v_hi_1, zmm_w3);
+
+                if (use_spill)
+                {
+                    // Store spilled context back
+                    gen.vmovups(gen.ptr[gen.rsp + spill_lo], zmm_ctx_lo);
+                    gen.vmovups(gen.ptr[gen.rsp + spill_hi], zmm_ctx_hi);
+                }
             }
         }
     };
