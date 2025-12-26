@@ -338,7 +338,7 @@ namespace llaminar2
 
             // Compute scale factor (d = max_abs / 32767 for int16 range)
             const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
-            block.d = fp32_to_fp16(d);
+            block.d = d; // FP32 scale, no conversion needed
 
             // Quantize AND compute sum simultaneously
             int64_t sum_i64 = 0;
@@ -616,7 +616,7 @@ namespace llaminar2
             }
 
             const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
-            block.d = fp32_to_fp16(d);
+            block.d = d; // FP32 scale, no conversion needed
 
             int64_t sum_i64 = 0;
             if (d > 1e-10f)
@@ -751,7 +751,7 @@ namespace llaminar2
             }
 
             const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
-            block.d = fp32_to_fp16(d);
+            block.d = d; // FP32 scale, no conversion needed
 
             int64_t sum_i64 = 0;
             if (d > 1e-10f)
@@ -965,7 +965,7 @@ namespace llaminar2
 
     void Q16_1Tensor::decodeBlockScalar(const Q16_1Block &block, float *output)
     {
-        const float scale = fp16_to_fp32(block.d);
+        const float scale = block.d; // FP32 scale, no conversion needed
         for (size_t i = 0; i < Q16_1Block::BLOCK_SIZE; ++i)
         {
             output[i] = scale * static_cast<float>(block.qs[i]);
@@ -986,7 +986,7 @@ namespace llaminar2
 #if defined(__AVX512F__)
     void Q16_1Tensor::decodeBlockAVX512(const Q16_1Block &block, float *output)
     {
-        const float scale = fp16_to_fp32(block.d);
+        const float scale = block.d; // FP32 scale, no conversion needed
         const __m512 vscale = _mm512_set1_ps(scale);
 
         // Process 16 int16 values at a time (2 iterations for 32 elements)
@@ -1009,7 +1009,7 @@ namespace llaminar2
 #if defined(__AVX2__)
     void Q16_1Tensor::decodeBlockAVX2(const Q16_1Block &block, float *output)
     {
-        const float scale = fp16_to_fp32(block.d);
+        const float scale = block.d; // FP32 scale, no conversion needed
         const __m256 vscale = _mm256_set1_ps(scale);
 
         // Process 8 int16 values at a time (4 iterations for 32 elements)
@@ -1073,7 +1073,7 @@ namespace llaminar2
 
             // Compute scale factor (d = max_abs / 32767 for int16 range)
             const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
-            block.d = fp32_to_fp16(d);
+            block.d = d; // FP32 scale, no conversion needed
 
             // Quantize AND compute sum simultaneously
             int64_t sum_i64 = 0;
@@ -1139,7 +1139,7 @@ namespace llaminar2
             }
 
             const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
-            block.d = fp32_to_fp16(d);
+            block.d = d; // FP32 scale, no conversion needed
 
             int64_t sum_i64 = 0;
             if (d > 1e-10f)

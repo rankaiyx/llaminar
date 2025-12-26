@@ -334,6 +334,19 @@ add_v2_test(V2_Unit_Q8_1Tensor
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
 
+# Test: Q16_1Tensor class (high-precision quantized activations)
+add_executable(v2_test_q16_1_tensor unit/tensors/Test__Q16_1Tensor.cpp)
+target_link_libraries(v2_test_q16_1_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16_1Tensor 
+    COMMAND $<TARGET_FILE:v2_test_q16_1_tensor>
+    LABELS "V2;Unit;TensorOperations;Q16_1;Quantization;Residuals;HighPrecision"
+    MPI_PROCS 1  # Quantized activation tests are CPU-only
+)
+
 # Test: Q8_1 Block-Aligned Slicing for tensor-parallel GEMM
 # Phase 6.4: Validates slice_k_blocks() for k-dimension splitting at 32-element boundaries
 add_executable(v2_test_q8_1_block_aligned_slicing unit/tensors/Test__Q8_1_BlockAlignedSlicing.cpp)

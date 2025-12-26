@@ -81,18 +81,19 @@ namespace llaminar2
      * Designed for residual stream where error accumulation is critical.
      *
      * Layout:
-     * - uint16_t d: FP16 scale factor (same as Q8_1)
+     * - float d: FP32 scale factor (4 bytes) - higher precision than Q8_1's FP16 scale!
      * - int32_t sum_qs: INT32 pre-computed sum of qs[i] values (wider range needed)
      * - int16_t qs[32]: 32 quantized int16 values
      *
-     * Memory: 2 + 4 + 2 (padding) + 64 = 72 bytes per block (2× Q8_1)
+     * Memory: 4 + 4 + 64 = 72 bytes per block (2× Q8_1)
      *
      * Range: [-32767, 32767] per element vs [-127, 127] for Q8_1
      * This provides 256× finer granularity at 2× memory cost.
+     * FP32 scale eliminates scale quantization error that limited Q8_1.
      */
     struct Q16_1Block
     {
-        uint16_t d;     ///< FP16 scale factor
+        float d;        ///< FP32 scale factor (higher precision than Q8_1's FP16!)
         int32_t sum_qs; ///< INT32 pre-computed sum: Σ(qs[i]) - wider range for int16 values!
         int16_t qs[32]; ///< 32 quantized int16 values
         static constexpr size_t BLOCK_SIZE = 32;
