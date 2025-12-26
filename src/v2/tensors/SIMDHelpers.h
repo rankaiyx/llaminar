@@ -1760,6 +1760,534 @@ namespace llaminar2
             }
         }
 
+        // ==================== Q16_1 Native Operations ====================
+
+        /**
+         * @brief Native Q16_1 + Q16_1 addition with SIMD acceleration
+         *
+         * Adds two Q16_1 tensors element-wise, producing a Q16_1 result.
+         * This is the key operation for high-precision typed residual connections.
+         *
+         * Algorithm per block:
+         * 1. Dequantize both blocks to FP32 (in registers) - FP32 scale, no conversion needed
+         * 2. Add FP32 values
+         * 3. Find new max_abs for quantization
+         * 4. Requantize to Q16_1 (int16 range: [-32767, 32767])
+         *
+         * Key differences from Q8_1:
+         * - Uses FP32 scale directly (no FP16 conversion)
+         * - int16_t quantized values (256× finer than int8)
+         * - INT32 sum_qs (wider range for int16 sums)
+         *
+         * @param a First Q16_1 block buffer
+         * @param b Second Q16_1 block buffer
+         * @param output Output Q16_1 block buffer
+         * @param count Number of elements (must be multiple of 32)
+         */
+        inline void q16_1_add_q16_1(
+            const Q16_1Block *a, const Q16_1Block *b, Q16_1Block *output, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q16_1Block &block_a = a[blk];
+                const Q16_1Block &block_b = b[blk];
+                Q16_1Block &block_out = output[blk];
+
+                // Q16_1 uses FP32 scale directly - no conversion needed!
+                const float scale_a = block_a.d;
+                const float scale_b = block_b.d;
+
+#ifdef __AVX512F__
+                // Load and dequant A (16 int16 values → 16 floats, 2 iterations for 32 elements)
+                __m256i qa_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_a.qs));
+                __m256i qa_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_a.qs + 16));
+                __m512 fa0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_lo)), _mm512_set1_ps(scale_a));
+                __m512 fa1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_hi)), _mm512_set1_ps(scale_a));
+
+                // Load and dequant B
+                __m256i qb_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_b.qs));
+                __m256i qb_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_b.qs + 16));
+                __m512 fb0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_lo)), _mm512_set1_ps(scale_b));
+                __m512 fb1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_hi)), _mm512_set1_ps(scale_b));
+
+                // Add
+                __m512 sum0 = _mm512_add_ps(fa0, fb0);
+                __m512 sum1 = _mm512_add_ps(fa1, fb1);
+
+                // Find max_abs for requantization
+                __m512 abs0 = _mm512_abs_ps(sum0);
+                __m512 abs1 = _mm512_abs_ps(sum1);
+                __m512 vmax = _mm512_max_ps(abs0, abs1);
+                float max_abs = _mm512_reduce_max_ps(vmax);
+
+                // Handle near-zero case
+                if (max_abs < 1e-10f)
+                {
+                    block_out.d = 0.0f;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 64); // 32 × int16 = 64 bytes
+                    continue;
+                }
+
+                // Compute scale and inverse (Q16_1 uses FP32 scale, int16 range)
+                float out_scale = max_abs / 32767.0f;
+                block_out.d = out_scale; // FP32 scale, no conversion!
+                float inv_scale = 32767.0f / max_abs;
+
+                // Quantize: round(sum * inv_scale), clamp to [-32767, 32767]
+                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(sum0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(sum1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+
+                // Clamp to [-32767, 32767] and pack to int16
+                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(32767)), _mm512_set1_epi32(-32767));
+                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(32767)), _mm512_set1_epi32(-32767));
+
+                // Pack 32-bit to 16-bit
+                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
+                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block_out.qs), packed0);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block_out.qs + 16), packed1);
+
+                // Compute sum_qs (raw integer sum, INT32 for Q16_1)
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    sum_qs += static_cast<int64_t>(block_out.qs[i]);
+                }
+                block_out.sum_qs = static_cast<int32_t>(sum_qs);
+
+#elif defined(__AVX2__)
+                // Dequant A and B, add, and store to temp buffer
+                alignas(32) float temp[32];
+                __m256 scale_a_vec = _mm256_set1_ps(scale_a);
+                __m256 scale_b_vec = _mm256_set1_ps(scale_b);
+
+                // Process 8 int16 values at a time (4 iterations for 32 elements)
+                for (int i = 0; i < 4; ++i)
+                {
+                    __m128i qa16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_a.qs + i * 8));
+                    __m128i qb16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_b.qs + i * 8));
+                    __m256i ia32 = _mm256_cvtepi16_epi32(qa16);
+                    __m256i ib32 = _mm256_cvtepi16_epi32(qb16);
+                    __m256 fa = _mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec);
+                    __m256 fb = _mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec);
+                    __m256 sum = _mm256_add_ps(fa, fb);
+                    _mm256_store_ps(temp + i * 8, sum);
+                }
+
+                // Find max_abs
+                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp));
+                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 8));
+                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 16));
+                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 24));
+                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
+                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                float max_abs = _mm_cvtss_f32(vmax128);
+
+                if (max_abs < 1e-10f)
+                {
+                    block_out.d = 0.0f;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                block_out.d = out_scale;
+                float inv_scale = 32767.0f / max_abs;
+
+                // Quantize to int16
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block_out.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += static_cast<int64_t>(q);
+                }
+                block_out.sum_qs = static_cast<int32_t>(sum_qs);
+
+#else
+                // Scalar fallback
+                alignas(32) float temp[32];
+
+                // Dequant and add
+                for (int i = 0; i < 32; ++i)
+                {
+                    float va = scale_a * static_cast<float>(block_a.qs[i]);
+                    float vb = scale_b * static_cast<float>(block_b.qs[i]);
+                    temp[i] = va + vb;
+                }
+
+                // Find max_abs
+                float max_abs = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp[i]));
+                }
+
+                if (max_abs < 1e-10f)
+                {
+                    block_out.d = 0.0f;
+                    block_out.sum_qs = 0;
+                    std::memset(block_out.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                block_out.d = out_scale;
+                float inv_scale = 32767.0f / max_abs;
+
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block_out.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += static_cast<int64_t>(q);
+                }
+                block_out.sum_qs = static_cast<int32_t>(sum_qs);
+#endif
+            }
+        }
+
+        /**
+         * @brief Q16_1 + FP32 addition (add FP32 delta to Q16_1 residual)
+         *
+         * Common pattern: residual (Q16_1) += attention_output (FP32)
+         * This is slightly faster than converting FP32 to Q16_1 first.
+         *
+         * @param residual Q16_1 block buffer (input and output)
+         * @param delta FP32 values to add
+         * @param count Number of elements (must be multiple of 32)
+         */
+        inline void q16_1_add_fp32(
+            Q16_1Block *residual, const float *delta, size_t count)
+        {
+            const size_t n_blocks = count / 32;
+
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                Q16_1Block &block = residual[blk];
+                const float *delta_ptr = delta + blk * 32;
+
+                const float scale = block.d;
+
+#ifdef __AVX512F__
+                // Load and dequant residual
+                __m256i qr_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
+                __m256i qr_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + 16));
+                __m512 fr0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale));
+                __m512 fr1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale));
+
+                // Load delta (already FP32)
+                __m512 fd0 = _mm512_loadu_ps(delta_ptr);
+                __m512 fd1 = _mm512_loadu_ps(delta_ptr + 16);
+
+                // Add
+                __m512 sum0 = _mm512_add_ps(fr0, fd0);
+                __m512 sum1 = _mm512_add_ps(fr1, fd1);
+
+                // Find max_abs for requantization
+                __m512 abs0 = _mm512_abs_ps(sum0);
+                __m512 abs1 = _mm512_abs_ps(sum1);
+                __m512 vmax = _mm512_max_ps(abs0, abs1);
+                float max_abs = _mm512_reduce_max_ps(vmax);
+
+                if (max_abs < 1e-10f)
+                {
+                    block.d = 0.0f;
+                    block.sum_qs = 0;
+                    std::memset(block.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                block.d = out_scale;
+                float inv_scale = 32767.0f / max_abs;
+
+                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(sum0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(sum1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+
+                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(32767)), _mm512_set1_epi32(-32767));
+                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(32767)), _mm512_set1_epi32(-32767));
+
+                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
+                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block.qs), packed0);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block.qs + 16), packed1);
+
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    sum_qs += static_cast<int64_t>(block.qs[i]);
+                }
+                block.sum_qs = static_cast<int32_t>(sum_qs);
+
+#elif defined(__AVX2__)
+                alignas(32) float temp[32];
+                __m256 scale_vec = _mm256_set1_ps(scale);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    __m128i qr16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + i * 8));
+                    __m256i qr32 = _mm256_cvtepi16_epi32(qr16);
+                    __m256 fr = _mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_vec);
+                    __m256 fd = _mm256_loadu_ps(delta_ptr + i * 8);
+                    __m256 sum = _mm256_add_ps(fr, fd);
+                    _mm256_store_ps(temp + i * 8, sum);
+                }
+
+                // Find max_abs
+                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp));
+                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 8));
+                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 16));
+                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 24));
+                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
+                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                float max_abs = _mm_cvtss_f32(vmax128);
+
+                if (max_abs < 1e-10f)
+                {
+                    block.d = 0.0f;
+                    block.sum_qs = 0;
+                    std::memset(block.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                block.d = out_scale;
+                float inv_scale = 32767.0f / max_abs;
+
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += static_cast<int64_t>(q);
+                }
+                block.sum_qs = static_cast<int32_t>(sum_qs);
+
+#else
+                // Scalar fallback
+                alignas(32) float temp[32];
+
+                for (int i = 0; i < 32; ++i)
+                {
+                    float vr = scale * static_cast<float>(block.qs[i]);
+                    temp[i] = vr + delta_ptr[i];
+                }
+
+                float max_abs = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp[i]));
+                }
+
+                if (max_abs < 1e-10f)
+                {
+                    block.d = 0.0f;
+                    block.sum_qs = 0;
+                    std::memset(block.qs, 0, 64);
+                    continue;
+                }
+
+                float out_scale = max_abs / 32767.0f;
+                block.d = out_scale;
+                float inv_scale = 32767.0f / max_abs;
+
+                int64_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-32767, std::min(32767, q));
+                    block.qs[i] = static_cast<int16_t>(q);
+                    sum_qs += static_cast<int64_t>(q);
+                }
+                block.sum_qs = static_cast<int32_t>(sum_qs);
+#endif
+            }
+        }
+
+        /**
+         * @brief Convert Q16_1 to Q8_1 with optimized SIMD packing
+         *
+         * Used for Q16_1 residual → Q8_1 activation conversion before GEMM.
+         * Faster than to_q8_1() for bulk conversion in the inference path.
+         *
+         * @param src Q16_1 source blocks
+         * @param dst Q8_1 destination blocks
+         * @param n_blocks Number of blocks to convert
+         */
+        inline void q16_1_to_q8_1_packed(
+            const Q16_1Block *src, Q8_1Block *dst, size_t n_blocks)
+        {
+            for (size_t blk = 0; blk < n_blocks; ++blk)
+            {
+                const Q16_1Block &src_block = src[blk];
+                Q8_1Block &dst_block = dst[blk];
+
+                const float scale = src_block.d;
+
+#ifdef __AVX512F__
+                // Dequant Q16_1 to FP32
+                __m256i q16_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src_block.qs));
+                __m256i q16_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src_block.qs + 16));
+                __m512 f0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(q16_lo)), _mm512_set1_ps(scale));
+                __m512 f1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(q16_hi)), _mm512_set1_ps(scale));
+
+                // Find max_abs for Q8_1 requantization
+                __m512 abs0 = _mm512_abs_ps(f0);
+                __m512 abs1 = _mm512_abs_ps(f1);
+                __m512 vmax = _mm512_max_ps(abs0, abs1);
+                float max_abs = _mm512_reduce_max_ps(vmax);
+
+                if (max_abs < 1e-6f)
+                {
+                    dst_block.d = 0;
+                    dst_block.sum_qs = 0;
+                    std::memset(dst_block.qs, 0, 32);
+                    continue;
+                }
+
+                // Q8_1 uses FP16 scale, int8 range
+                float out_scale = max_abs / 127.0f;
+                dst_block.d = fp32_to_fp16(out_scale);
+                float inv_scale = 127.0f / max_abs;
+
+                __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(f0, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(f1, inv_scale_vec), _MM_FROUND_TO_NEAREST_INT));
+
+                __m512i clamped0 = _mm512_max_epi32(_mm512_min_epi32(q0, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127));
+                __m512i clamped1 = _mm512_max_epi32(_mm512_min_epi32(q1, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127));
+
+                // Pack 32-bit → 16-bit → 8-bit
+                __m256i packed0 = _mm512_cvtepi32_epi16(clamped0);
+                __m256i packed1 = _mm512_cvtepi32_epi16(clamped1);
+                __m128i bytes0 = _mm256_cvtepi16_epi8(packed0);
+                __m128i bytes1 = _mm256_cvtepi16_epi8(packed1);
+
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_block.qs), bytes0);
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(dst_block.qs + 16), bytes1);
+
+                int32_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    sum_qs += dst_block.qs[i];
+                }
+                dst_block.sum_qs = static_cast<int16_t>(sum_qs);
+
+#elif defined(__AVX2__)
+                alignas(32) float temp[32];
+                __m256 scale_vec = _mm256_set1_ps(scale);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    __m128i q16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src_block.qs + i * 8));
+                    __m256i q32 = _mm256_cvtepi16_epi32(q16);
+                    __m256 f = _mm256_mul_ps(_mm256_cvtepi32_ps(q32), scale_vec);
+                    _mm256_store_ps(temp + i * 8, f);
+                }
+
+                // Find max_abs
+                __m256 vmax0 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp));
+                __m256 vmax1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 8));
+                __m256 vmax2 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 16));
+                __m256 vmax3 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), _mm256_load_ps(temp + 24));
+                __m256 vmax_01 = _mm256_max_ps(vmax0, vmax1);
+                __m256 vmax_23 = _mm256_max_ps(vmax2, vmax3);
+                __m256 vmax_all = _mm256_max_ps(vmax_01, vmax_23);
+                __m128 lo = _mm256_castps256_ps128(vmax_all);
+                __m128 hi = _mm256_extractf128_ps(vmax_all, 1);
+                __m128 vmax128 = _mm_max_ps(lo, hi);
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(1, 0, 3, 2)));
+                vmax128 = _mm_max_ps(vmax128, _mm_shuffle_ps(vmax128, vmax128, _MM_SHUFFLE(0, 0, 0, 1)));
+                float max_abs = _mm_cvtss_f32(vmax128);
+
+                if (max_abs < 1e-6f)
+                {
+                    dst_block.d = 0;
+                    dst_block.sum_qs = 0;
+                    std::memset(dst_block.qs, 0, 32);
+                    continue;
+                }
+
+                float out_scale = max_abs / 127.0f;
+                dst_block.d = fp32_to_fp16(out_scale);
+                float inv_scale = 127.0f / max_abs;
+
+                int32_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    dst_block.qs[i] = static_cast<int8_t>(q);
+                    sum_qs += q;
+                }
+                dst_block.sum_qs = static_cast<int16_t>(sum_qs);
+
+#else
+                // Scalar fallback
+                alignas(32) float temp[32];
+
+                for (int i = 0; i < 32; ++i)
+                {
+                    temp[i] = scale * static_cast<float>(src_block.qs[i]);
+                }
+
+                float max_abs = 0.0f;
+                for (int i = 0; i < 32; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(temp[i]));
+                }
+
+                if (max_abs < 1e-6f)
+                {
+                    dst_block.d = 0;
+                    dst_block.sum_qs = 0;
+                    std::memset(dst_block.qs, 0, 32);
+                    continue;
+                }
+
+                float out_scale = max_abs / 127.0f;
+                dst_block.d = fp32_to_fp16(out_scale);
+                float inv_scale = 127.0f / max_abs;
+
+                int32_t sum_qs = 0;
+                for (int i = 0; i < 32; ++i)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(temp[i] * inv_scale));
+                    q = std::max(-127, std::min(127, q));
+                    dst_block.qs[i] = static_cast<int8_t>(q);
+                    sum_qs += q;
+                }
+                dst_block.sum_qs = static_cast<int16_t>(sum_qs);
+#endif
+            }
+        }
+
+        // ==================== End Q16_1 Native Operations ====================
+
         /**
          * @brief Sum multiple FP16 arrays into one (N-way reduction)
          *

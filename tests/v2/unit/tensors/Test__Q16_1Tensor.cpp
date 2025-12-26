@@ -554,3 +554,273 @@ TEST(Test__Q16_1Tensor, LargeTensorStressTest)
     EXPECT_LT(error, 0.001f)
         << "Q16_1 large tensor error exceeds 0.1% threshold";
 }
+
+// ==================== Q16_1 SIMD Native Operation Tests ====================
+
+/**
+ * @brief Test native Q16_1 + Q16_1 addition
+ *
+ * Verifies that q16_1_add_q16_1() produces correct results by comparing
+ * against reference FP32 addition.
+ */
+TEST(Test__Q16_1Tensor, NativeQ16_1Addition)
+{
+    const int rows = 64;
+    const int cols = 128;
+    const size_t elements = static_cast<size_t>(rows) * cols;
+    const size_t n_blocks = elements / 32;
+
+    // Generate two random float arrays
+    std::vector<float> data_a(elements);
+    std::vector<float> data_b(elements);
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+
+    for (size_t i = 0; i < elements; ++i)
+    {
+        data_a[i] = dist(gen);
+        data_b[i] = dist(gen);
+    }
+
+    // Compute reference (FP32 add)
+    std::vector<float> reference(elements);
+    for (size_t i = 0; i < elements; ++i)
+    {
+        reference[i] = data_a[i] + data_b[i];
+    }
+
+    // Quantize both to Q16_1
+    auto tensor_a = Q16_1Tensor::quantize_from_fp32(
+        data_a.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+    auto tensor_b = Q16_1Tensor::quantize_from_fp32(
+        data_b.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    // Create output tensor with raw storage
+    std::vector<uint8_t> raw_output(n_blocks * sizeof(Q16_1Block), 0);
+    auto tensor_out = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        raw_output);
+
+    // Get raw block pointers using proper accessors
+    const Q16_1Block *blocks_a = tensor_a->q16_1_blocks();
+    const Q16_1Block *blocks_b = tensor_b->q16_1_blocks();
+    Q16_1Block *blocks_out = tensor_out->mutable_q16_1_blocks();
+
+    // Perform native Q16_1 addition
+    simd::q16_1_add_q16_1(blocks_a, blocks_b, blocks_out, elements);
+
+    // Dequantize result
+    std::vector<float> result(elements);
+    tensor_out->to_fp32(result.data());
+
+    // Compare to reference
+    float error = compute_relative_l2_error(result.data(), reference.data(), elements);
+    float max_error = compute_max_abs_error(result.data(), reference.data(), elements);
+
+    std::cout << "[Q16_1 Native Add] Relative L2 error: " << (error * 100.0f) << "%" << std::endl;
+    std::cout << "[Q16_1 Native Add] Max abs error: " << max_error << std::endl;
+
+    // Q16_1 addition should be very accurate (cumulative quant error from 3 operations)
+    // Input quant + Input quant + Output quant = ~3× single quant error
+    EXPECT_LT(error, 0.01f) // < 1% relative error
+        << "Q16_1 native addition error exceeds 1% threshold";
+    EXPECT_LT(max_error, 0.01f) // Max abs error < 0.01
+        << "Q16_1 native addition max abs error too high";
+}
+
+/**
+ * @brief Test Q16_1 + FP32 addition (residual += delta pattern)
+ *
+ * Verifies that q16_1_add_fp32() correctly adds FP32 delta to Q16_1 residual.
+ */
+TEST(Test__Q16_1Tensor, NativeQ16_1AddFP32)
+{
+    const int rows = 32;
+    const int cols = 256;
+    const size_t elements = static_cast<size_t>(rows) * cols;
+    const size_t n_blocks = elements / 32;
+
+    // Generate random residual and delta
+    std::vector<float> residual_fp32(elements);
+    std::vector<float> delta_fp32(elements);
+    std::mt19937 gen(123);
+    std::uniform_real_distribution<float> dist(-1.5f, 1.5f);
+
+    for (size_t i = 0; i < elements; ++i)
+    {
+        residual_fp32[i] = dist(gen);
+        delta_fp32[i] = dist(gen);
+    }
+
+    // Compute reference
+    std::vector<float> reference(elements);
+    for (size_t i = 0; i < elements; ++i)
+    {
+        reference[i] = residual_fp32[i] + delta_fp32[i];
+    }
+
+    // Create Q16_1 residual tensor with raw storage
+    auto temp_tensor = Q16_1Tensor::quantize_from_fp32(
+        residual_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    // Copy to mutable tensor
+    std::vector<uint8_t> raw_residual(n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual.data(), temp_tensor->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+    auto residual = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        raw_residual);
+
+    Q16_1Block *blocks = residual->mutable_q16_1_blocks();
+
+    // Add FP32 delta in-place
+    simd::q16_1_add_fp32(blocks, delta_fp32.data(), elements);
+
+    // Dequantize result
+    std::vector<float> result(elements);
+    residual->to_fp32(result.data());
+
+    // Compare to reference
+    float error = compute_relative_l2_error(result.data(), reference.data(), elements);
+    float max_error = compute_max_abs_error(result.data(), reference.data(), elements);
+
+    std::cout << "[Q16_1 + FP32] Relative L2 error: " << (error * 100.0f) << "%" << std::endl;
+    std::cout << "[Q16_1 + FP32] Max abs error: " << max_error << std::endl;
+
+    // Should be slightly better than Q16_1+Q16_1 (only 2 quant ops: input + output)
+    EXPECT_LT(error, 0.005f) // < 0.5% relative error
+        << "Q16_1 + FP32 error exceeds 0.5% threshold";
+    EXPECT_LT(max_error, 0.005f)
+        << "Q16_1 + FP32 max abs error too high";
+}
+
+/**
+ * @brief Test optimized Q16_1 → Q8_1 conversion
+ *
+ * Verifies that q16_1_to_q8_1_packed() produces correct Q8_1 output.
+ */
+TEST(Test__Q16_1Tensor, Q16_1ToQ8_1Packed)
+{
+    const int rows = 16;
+    const int cols = 128;
+    const size_t elements = static_cast<size_t>(rows) * cols;
+    const size_t n_blocks = elements / 32;
+
+    // Generate random data
+    std::vector<float> data(elements);
+    std::mt19937 gen(456);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+
+    for (size_t i = 0; i < elements; ++i)
+    {
+        data[i] = dist(gen);
+    }
+
+    // Quantize to Q16_1
+    auto q16_tensor = Q16_1Tensor::quantize_from_fp32(
+        data.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    // Allocate Q8_1 output
+    std::vector<Q8_1Block> q8_blocks(n_blocks);
+
+    // Convert using SIMD function with proper accessor
+    const Q16_1Block *q16_blocks = q16_tensor->q16_1_blocks();
+    simd::q16_1_to_q8_1_packed(q16_blocks, q8_blocks.data(), n_blocks);
+
+    // Dequantize Q8_1 result manually
+    std::vector<float> q8_result(elements);
+    for (size_t blk = 0; blk < n_blocks; ++blk)
+    {
+        float scale = simd::fp16_to_fp32(q8_blocks[blk].d);
+        for (int j = 0; j < 32; ++j)
+        {
+            q8_result[blk * 32 + j] = scale * static_cast<float>(q8_blocks[blk].qs[j]);
+        }
+    }
+
+    // Compare to original data (should have Q8 precision, ~0.4% error)
+    float error = compute_relative_l2_error(q8_result.data(), data.data(), elements);
+    float max_error = compute_max_abs_error(q8_result.data(), data.data(), elements);
+
+    std::cout << "[Q16_1 → Q8_1 Packed] Relative L2 error: " << (error * 100.0f) << "%" << std::endl;
+    std::cout << "[Q16_1 → Q8_1 Packed] Max abs error: " << max_error << std::endl;
+
+    // Should match Q8 precision (the conversion loses Q16 precision)
+    EXPECT_LT(error, 0.01f) // < 1% (Q8 precision + Q16 input precision)
+        << "Q16_1 → Q8_1 conversion error too high";
+}
+
+/**
+ * @brief Test Q16_1 native add with edge cases
+ *
+ * Tests near-zero values and very large values.
+ */
+TEST(Test__Q16_1Tensor, NativeQ16_1AddEdgeCases)
+{
+    const int rows = 4;
+    const int cols = 32; // 1 row of blocks
+    const size_t elements = static_cast<size_t>(rows) * cols;
+    const size_t n_blocks = elements / 32;
+
+    // Test 1: Near-zero values
+    {
+        std::vector<float> data_a(elements, 1e-8f);
+        std::vector<float> data_b(elements, -1e-8f);
+
+        auto tensor_a = Q16_1Tensor::quantize_from_fp32(
+            data_a.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+        auto tensor_b = Q16_1Tensor::quantize_from_fp32(
+            data_b.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+        std::vector<uint8_t> raw_output(n_blocks * sizeof(Q16_1Block), 0);
+        auto tensor_out = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            raw_output);
+
+        const Q16_1Block *blocks_a = tensor_a->q16_1_blocks();
+        const Q16_1Block *blocks_b = tensor_b->q16_1_blocks();
+        Q16_1Block *blocks_out = tensor_out->mutable_q16_1_blocks();
+
+        simd::q16_1_add_q16_1(blocks_a, blocks_b, blocks_out, elements);
+
+        // Result should be all zeros (or very close)
+        std::vector<float> result(elements);
+        tensor_out->to_fp32(result.data());
+
+        for (size_t i = 0; i < elements; ++i)
+        {
+            EXPECT_NEAR(result[i], 0.0f, 1e-6f) << "Near-zero add failed at index " << i;
+        }
+    }
+
+    // Test 2: Large canceling values
+    {
+        std::vector<float> data_a(elements, 1000.0f);
+        std::vector<float> data_b(elements, -1000.0f);
+
+        auto tensor_a = Q16_1Tensor::quantize_from_fp32(
+            data_a.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+        auto tensor_b = Q16_1Tensor::quantize_from_fp32(
+            data_b.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+        std::vector<uint8_t> raw_output(n_blocks * sizeof(Q16_1Block), 0);
+        auto tensor_out = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            raw_output);
+
+        const Q16_1Block *blocks_a = tensor_a->q16_1_blocks();
+        const Q16_1Block *blocks_b = tensor_b->q16_1_blocks();
+        Q16_1Block *blocks_out = tensor_out->mutable_q16_1_blocks();
+
+        simd::q16_1_add_q16_1(blocks_a, blocks_b, blocks_out, elements);
+
+        std::vector<float> result(elements);
+        tensor_out->to_fp32(result.data());
+
+        for (size_t i = 0; i < elements; ++i)
+        {
+            EXPECT_NEAR(result[i], 0.0f, 0.1f) << "Large cancel add failed at index " << i;
+        }
+    }
+
+    std::cout << "[Q16_1 Edge Cases] All edge case tests passed" << std::endl;
+}
