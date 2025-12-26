@@ -824,3 +824,220 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddEdgeCases)
 
     std::cout << "[Q16_1 Edge Cases] All edge case tests passed" << std::endl;
 }
+
+/**
+ * @brief Test Q16_1 += Q8_1 residual addition (the core typed residual pattern)
+ *
+ * This is the most common operation in typed residual inference:
+ *   residual (Q16_1) += layer_output (Q8_1)
+ *
+ * Verifies that:
+ * 1. Round-trip error is only quantization noise
+ * 2. Result matches FP32 reference within expected tolerance
+ * 3. Precision is bounded by the Q8_1 input (not Q16_1 output)
+ */
+TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1)
+{
+    const int rows = 32;
+    const int cols = 256;
+    const size_t elements = static_cast<size_t>(rows) * cols;
+    const size_t n_blocks = elements / 32;
+
+    // Generate random residual (Q16_1) and delta (Q8_1) data
+    std::vector<float> residual_fp32(elements);
+    std::vector<float> delta_fp32(elements);
+    std::mt19937 gen(789);
+    std::uniform_real_distribution<float> dist(-1.5f, 1.5f);
+
+    for (size_t i = 0; i < elements; ++i)
+    {
+        residual_fp32[i] = dist(gen);
+        delta_fp32[i] = dist(gen);
+    }
+
+    // Compute FP32 reference
+    std::vector<float> reference(elements);
+    for (size_t i = 0; i < elements; ++i)
+    {
+        reference[i] = residual_fp32[i] + delta_fp32[i];
+    }
+
+    // Create Q16_1 residual (copy to mutable tensor)
+    auto temp_residual = Q16_1Tensor::quantize_from_fp32(
+        residual_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+    std::vector<uint8_t> raw_residual(n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual.data(), temp_residual->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+    auto residual = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        raw_residual);
+
+    // Create Q8_1 delta
+    auto delta = Q8_1Tensor::quantize_from_fp32(
+        delta_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    // Get block pointers
+    Q16_1Block *residual_blocks = residual->mutable_q16_1_blocks();
+    const Q8_1Block *delta_blocks = delta->q8_1_blocks();
+
+    // Add Q8_1 delta to Q16_1 residual in-place
+    simd::q16_1_add_q8_1(residual_blocks, delta_blocks, elements);
+
+    // Dequantize result
+    std::vector<float> result(elements);
+    residual->to_fp32(result.data());
+
+    // Compare to FP32 reference
+    float error = compute_relative_l2_error(result.data(), reference.data(), elements);
+    float max_error = compute_max_abs_error(result.data(), reference.data(), elements);
+
+    std::cout << "[Q16_1 += Q8_1] Relative L2 error: " << (error * 100.0f) << "%" << std::endl;
+    std::cout << "[Q16_1 += Q8_1] Max abs error: " << max_error << std::endl;
+
+    // Error is dominated by Q8_1 input quantization (~0.4%) + Q16_1 output (~0.002%)
+    // Total should be < 1% (2 quant ops: Q8_1 input + Q16_1 output, plus Q16_1 input)
+    EXPECT_LT(error, 0.01f) // < 1% relative error
+        << "Q16_1 += Q8_1 error exceeds 1% threshold";
+    EXPECT_LT(max_error, 0.02f)
+        << "Q16_1 += Q8_1 max abs error too high";
+}
+
+/**
+ * @brief Compare Q16_1 += Q8_1 vs converting Q8_1 → FP32 first
+ *
+ * Verifies that the native operation produces equivalent results to
+ * the two-step approach: q16_1_add_fp32(residual, q8_1.to_fp32()).
+ */
+TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1_vs_TwoStep)
+{
+    const int rows = 16;
+    const int cols = 128;
+    const size_t elements = static_cast<size_t>(rows) * cols;
+    const size_t n_blocks = elements / 32;
+
+    // Generate random data
+    std::vector<float> residual_fp32(elements);
+    std::vector<float> delta_fp32(elements);
+    std::mt19937 gen(999);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+
+    for (size_t i = 0; i < elements; ++i)
+    {
+        residual_fp32[i] = dist(gen);
+        delta_fp32[i] = dist(gen);
+    }
+
+    // Create Q16_1 residual (two copies for comparison)
+    auto temp_residual = Q16_1Tensor::quantize_from_fp32(
+        residual_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    std::vector<uint8_t> raw_residual1(n_blocks * sizeof(Q16_1Block));
+    std::vector<uint8_t> raw_residual2(n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual1.data(), temp_residual->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual2.data(), temp_residual->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+
+    auto residual1 = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        raw_residual1);
+    auto residual2 = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        raw_residual2);
+
+    // Create Q8_1 delta
+    auto delta_q8 = Q8_1Tensor::quantize_from_fp32(
+        delta_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    // Method 1: Native Q16_1 += Q8_1
+    simd::q16_1_add_q8_1(residual1->mutable_q16_1_blocks(), delta_q8->q8_1_blocks(), elements);
+
+    // Method 2: Convert Q8_1 → FP32, then Q16_1 += FP32
+    std::vector<float> delta_fp32_dequant(elements);
+    delta_q8->to_fp32(delta_fp32_dequant.data());
+    simd::q16_1_add_fp32(residual2->mutable_q16_1_blocks(), delta_fp32_dequant.data(), elements);
+
+    // Dequantize both results
+    std::vector<float> result1(elements);
+    std::vector<float> result2(elements);
+    residual1->to_fp32(result1.data());
+    residual2->to_fp32(result2.data());
+
+    // Compare the two methods
+    float diff = compute_relative_l2_error(result1.data(), result2.data(), elements);
+    float max_diff = compute_max_abs_error(result1.data(), result2.data(), elements);
+
+    std::cout << "[Q16_1 += Q8_1 vs TwoStep] Relative L2 diff: " << (diff * 100.0f) << "%" << std::endl;
+    std::cout << "[Q16_1 += Q8_1 vs TwoStep] Max abs diff: " << max_diff << std::endl;
+
+    // Both methods should produce nearly identical results
+    // Difference is only from numerical ordering of FP32 operations
+    EXPECT_LT(diff, 0.001f) // < 0.1% difference
+        << "Native vs two-step methods diverge too much";
+    EXPECT_LT(max_diff, 0.001f)
+        << "Native vs two-step max diff too high";
+}
+
+/**
+ * @brief Test Q16_1 += Q8_1 with realistic layer output magnitudes
+ *
+ * Simulates typical attention/FFN output magnitudes being added to residual.
+ */
+TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1_RealisticMagnitudes)
+{
+    const int rows = 8;
+    const int cols = 896; // Qwen2-0.5B hidden dim
+    const size_t elements = static_cast<size_t>(rows) * cols;
+    const size_t n_blocks = elements / 32;
+
+    std::mt19937 gen(42);
+
+    // Residual stream: typically larger magnitude (accumulated from previous layers)
+    std::uniform_real_distribution<float> residual_dist(-3.0f, 3.0f);
+    std::vector<float> residual_fp32(elements);
+    for (size_t i = 0; i < elements; ++i)
+    {
+        residual_fp32[i] = residual_dist(gen);
+    }
+
+    // Layer output: typically smaller (one layer's contribution)
+    std::uniform_real_distribution<float> delta_dist(-0.5f, 0.5f);
+    std::vector<float> delta_fp32(elements);
+    for (size_t i = 0; i < elements; ++i)
+    {
+        delta_fp32[i] = delta_dist(gen);
+    }
+
+    // Compute FP32 reference
+    std::vector<float> reference(elements);
+    for (size_t i = 0; i < elements; ++i)
+    {
+        reference[i] = residual_fp32[i] + delta_fp32[i];
+    }
+
+    // Create quantized tensors
+    auto temp_residual = Q16_1Tensor::quantize_from_fp32(
+        residual_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+    std::vector<uint8_t> raw_residual(n_blocks * sizeof(Q16_1Block));
+    std::memcpy(raw_residual.data(), temp_residual->q16_1_blocks(), n_blocks * sizeof(Q16_1Block));
+    auto residual = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        raw_residual);
+
+    auto delta = Q8_1Tensor::quantize_from_fp32(
+        delta_fp32.data(), {static_cast<size_t>(rows), static_cast<size_t>(cols)});
+
+    // Add
+    simd::q16_1_add_q8_1(residual->mutable_q16_1_blocks(), delta->q8_1_blocks(), elements);
+
+    // Compare
+    std::vector<float> result(elements);
+    residual->to_fp32(result.data());
+
+    float error = compute_relative_l2_error(result.data(), reference.data(), elements);
+    float max_error = compute_max_abs_error(result.data(), reference.data(), elements);
+
+    std::cout << "[Q16_1 += Q8_1 Realistic] Relative L2 error: " << (error * 100.0f) << "%" << std::endl;
+    std::cout << "[Q16_1 += Q8_1 Realistic] Max abs error: " << max_error << std::endl;
+
+    // Should maintain good precision even with asymmetric magnitudes
+    EXPECT_LT(error, 0.01f)
+        << "Q16_1 += Q8_1 realistic magnitudes error too high";
+}
