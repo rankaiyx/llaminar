@@ -946,6 +946,59 @@ add_v2_test(V2_Unit_IndexSoftmax
     MPI_PROCS 1
 )
 
+# Test: Q16 Microkernels (DotProduct, PVAccumulate, WoProjectionVNNI)
+# Note: Integer softmax tested separately via Exp2FixedSoftmax
+add_executable(v2_test_q16_microkernels unit/Test__Q16Microkernels.cpp)
+target_link_libraries(v2_test_q16_microkernels
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16Microkernels
+    COMMAND $<TARGET_FILE:v2_test_q16_microkernels>
+    LABELS "V2;Unit;Attention;Q16;Microkernels;DotProduct;WoProjection;VPDPWSSD"
+    MPI_PROCS 1
+)
+
+# Test: Q16 Integer-Domain Attention Parity vs FP32 Reference
+add_executable(v2_test_q16_integer_domain_parity unit/Test__Q16IntegerDomainParity.cpp)
+target_link_libraries(v2_test_q16_integer_domain_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16IntegerDomainParity
+    COMMAND $<TARGET_FILE:v2_test_q16_integer_domain_parity>
+    LABELS "V2;Unit;Attention;Q16;IntegerDomain;Parity;FP32Reference;Exp2Softmax"
+    MPI_PROCS 1
+)
+
+# Test: Q16 Integer-Domain + VPDPWSSD Wo Projection Parity vs FP32 Reference
+add_executable(v2_test_q16_integer_domain_wo_projection unit/Test__Q16IntegerDomainWoProjection.cpp)
+target_link_libraries(v2_test_q16_integer_domain_wo_projection
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16IntegerDomainWoProjection
+    COMMAND $<TARGET_FILE:v2_test_q16_integer_domain_wo_projection>
+    LABELS "V2;Unit;Attention;Q16;IntegerDomain;WoProjection;VPDPWSSD;Parity;FP32Reference"
+    MPI_PROCS 1
+)
+
+# Test: Q16 Full Pipeline Parity (end-to-end PURE INTEGER vs FP32)
+add_executable(v2_test_q16_full_pipeline_parity unit/Test__Q16FullPipelineParity.cpp)
+target_link_libraries(v2_test_q16_full_pipeline_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16FullPipelineParity
+    COMMAND $<TARGET_FILE:v2_test_q16_full_pipeline_parity>
+    LABELS "V2;Unit;Attention;Q16;IntegerDomain;WoProjection;ResidualAdd;FullPipeline;Parity;FP32Reference"
+    MPI_PROCS 1
+)
+
 # Test: Quantised JIT GEMM kernel
 add_executable(v2_test_quantised_gemm_kernel unit/kernels/gemm/Test__QuantisedGemmKernel.cpp)
 target_link_libraries(v2_test_quantised_gemm_kernel
@@ -2132,11 +2185,12 @@ add_v2_test(V2_Unit_ExecutionPolicy
 # Test: EmbeddingStage Q16_1 Output
 # Tests that EmbeddingStage correctly produces Q16_1 output for HybridQ16 mode
 # Verifies FP32 → Q16_1 quantization preserves embedding values
+# NOTE: This is an Integration test (slow, requires model loading)
 add_executable(v2_test_embedding_stage_q16_1 unit/stages/Test__EmbeddingStage_Q16_1Output.cpp)
 target_link_libraries(v2_test_embedding_stage_q16_1 llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_EmbeddingStage_Q16_1Output
+add_v2_test(V2_Integration_EmbeddingStage_Q16_1Output
     COMMAND $<TARGET_FILE:v2_test_embedding_stage_q16_1>
-    LABELS "V2;Unit;Execution;ComputeStage;Embedding;Q16_1;HybridQ16;Quantization"
+    LABELS "V2;Integration;Execution;ComputeStage;Embedding;Q16_1;HybridQ16;Quantization"
     MPI_PROCS 1
 )
 

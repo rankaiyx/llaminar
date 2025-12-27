@@ -606,6 +606,13 @@ add_library(llaminar2_core STATIC
     kernels/cpu/attention/q8_1/jit/WoProjectionVNNIPacked.cpp       # JIT helper thunk for VNNI-packed Wo GEMM
     kernels/cpu/attention/q8_1/FusedAttentionWoRef.cpp             # Reference implementation
     kernels/cpu/attention/q8_1/FusedAttentionWoTiled.cpp           # Cache-blocked tiled implementation
+    # Q16_1 fused attention (PURE INTEGER PIPELINE)
+    kernels/cpu/attention/q16_1/ref/Q16FusedAttentionRef.cpp       # Scalar reference implementation
+    kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProductRef.cpp    # μK: Q×K^T dot product (INT16×INT16→INT32)
+    kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmaxRef.cpp # μK: exp2 fixed-point softmax (INT32→INT16)
+    kernels/cpu/attention/q16_1/ref/microkernels/Int8RequantRef.cpp      # μK: INT8 requant for stable alpha computation
+    kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulateRef.cpp     # μK: P×V accumulation (INT16×INT16→INT32)
+    kernels/cpu/attention/q16_1/ref/microkernels/WoProjectionVNNIRef.cpp # μK: Wo projection VPDPWSSD (INT16×INT16→Q16_1)
     # Fused kernels (operator fusion framework)
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)

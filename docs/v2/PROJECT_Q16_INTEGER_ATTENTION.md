@@ -38,6 +38,35 @@ This document describes the design for a **fully integer-domain FA2-style fused 
 4. **Wo projection** (streaming weight repack)
 5. **Residual add** (Q16_1 output)
 
+### Critical: AVX512-VNNI Hardware Constraints
+
+**All integer arithmetic must work within AVX512-VNNI limitations:**
+
+| Instruction | Operation | Constraint |
+|-------------|-----------|------------|
+| `VPDPWSSD` | INT16 × INT16 → INT32 | **Signed** multiply-accumulate |
+| `VPDPBUSD` | UINT8 × INT8 → INT32 | Unsigned × Signed multiply-accumulate |
+| Output | INT32 accumulator | Cannot use INT64 in hardware |
+| Weights | Must be INT16 | Values >32767 interpreted as negative! |
+
+**Design Implications:**
+- **Index16Softmax outputs INT16** weights in range `[0, 32767]` (not UINT16)
+- **P×V uses INT32 accumulators** (not INT64) to match VPDPWSSD output
+- **LUT max value = 32767** (15 bits precision, always non-negative)
+- **FP32 only at final normalization** (after all integer accumulation)
+
+### VNNI Instruction Usage in Q16 Pipeline
+
+| Stage | Left Operand | Right Operand | Instruction |
+|-------|--------------|---------------|-------------|
+| Q×K^T (requant) | INT8 Q_requant | INT8 K_requant | scalar (or VPDPBUSD) |
+| P×V accumulation | INT16 softmax weights | INT16 V values | **VPDPWSSD** |
+| Wo projection | UINT8 (Q8_1 context) | INT8 (packed Wo) | **VPDPBUSD** |
+| FFN projections | UINT8 (Q8_1 activations) | INT8 (packed weights) | **VPDPBUSD** |
+
+**Key Clarification**: Model weights (Wo, FFN, etc.) are **always INT8 VNNI-packed**.
+VPDPWSSD is used **only** for P×V where both operands are runtime activations (INT16).
+
 ### Implementation Strategy
 
 ```
@@ -64,9 +93,10 @@ This document describes the design for a **fully integer-domain FA2-style fused 
 1. **Single fused kernel** — FA2-style tiling, not separate microkernels
 2. **All-integer dataflow** — No FP32 dequantization until output
 3. **Q16_1 precision preservation** — 16-bit integers throughout
-4. **Index16Softmax** — UINT16 LUT-based softmax (65535 levels)
-5. **Wo + Residual fusion** — Complete attention block in one kernel call
-6. **Scalar-first development** — Reference implementation before JIT
+4. **Index16Softmax** — INT16 LUT-based softmax (32767 levels, VNNI-compatible)
+5. **INT32 accumulators** — Match VPDPWSSD hardware output width
+6. **Wo + Residual fusion** — Complete attention block in one kernel call
+7. **Scalar-first development** — Reference implementation before JIT
 
 ### Expected Benefits
 
@@ -141,15 +171,16 @@ The current `HybridQ16` attention mode achieves only **0.799 cosine similarity**
 │  ║      ┌────────────────────────────────────────────────────────────┐  ║   │
 │  ║      │ STEP 2: Online Index16Softmax                               │  ║   │
 │  ║      │   m_new = max(m, rowmax(S))                                │  ║   │
-│  ║      │   P[Br, Bc] = Index16Softmax(S, m_new) → UINT16            │  ║   │
+│  ║      │   P[Br, Bc] = Index16Softmax(S, m_new) → INT16             │  ║   │
+│  ║      │   (VNNI: weights must be signed INT16 in [0, 32767])       │  ║   │
 │  ║      │   l_new = l × exp_ratio + rowsum(P)                        │  ║   │
 │  ║      │   O_acc = O_acc × exp_ratio (rescale previous accum)       │  ║   │
 │  ║      └────────────────────────────────────────────────────────────┘  ║   │
 │  ║                              │                                        ║   │
 │  ║                              ▼                                        ║   │
 │  ║      ┌────────────────────────────────────────────────────────────┐  ║   │
-│  ║      │ STEP 3: UINT16×INT16 V Accumulation                        │  ║   │
-│  ║      │   O_acc += P × V_tile  (INT64 accumulator)                 │  ║   │
+│  ║      │ STEP 3: INT16×INT16 V Accumulation (VNNI VPDPWSSD)          │  ║   │
+│  ║      │   O_acc += P × V_tile  (INT32 accumulator)                 │  ║   │
 │  ║      └────────────────────────────────────────────────────────────┘  ║   │
 │  ║                                                                       ║   │
 │  ║    end kv_tile loop                                                  ║   │
@@ -161,10 +192,10 @@ The current `HybridQ16` attention mode achieves only **0.799 cosine similarity**
 │  ║                              │                                        ║   │
 │  ║                              ▼                                        ║   │
 │  ║    ┌──────────────────────────────────────────────────────────────┐  ║   │
-│  ║    │ STEP 5: Fused Wo Projection (Streaming Repack)               │  ║   │
-│  ║    │   for each output row in d_model:                            │  ║   │
-│  ║    │     Wo_int16 = sign_extend(Wo_q8)  (on-the-fly)             │  ║   │
-│  ║    │     proj[row] = O × Wo_int16  (vpdpwssd)                    │  ║   │
+│  ║    │ STEP 5: Wo Projection (FP32 context → Q8_1 → VNNI GEMM)      │  ║   │
+│  ║    │   context_q8_1 = quantize_q8_1(O)  (per-block quantization) │  ║   │
+│  ║    │   proj[d_model] = context_q8_1 × Wo_packed  (vpdpbusd)      │  ║   │
+│  ║    │   (Wo is INT8 VNNI-packed, uses existing GEMM infrastructure)│  ║   │
 │  ║    └──────────────────────────────────────────────────────────────┘  ║   │
 │  ║                              │                                        ║   │
 │  ║                              ▼                                        ║   │
@@ -201,10 +232,754 @@ For CPU with L2 cache ~1MB per core:
 | Br (query tile) | 16 | 16 × 128 × 2 = 4KB |
 | Bc (kv tile) | 64 | 64 × 128 × 2 = 16KB |
 | S tile | 16×64 | 16 × 64 × 4 = 4KB |
-| P tile | 16×64 | 16 × 64 × 2 = 2KB |
+| P tile (INT16) | 16×64 | 16 × 64 × 2 = 2KB |
 | V tile | 64×128 | 64 × 128 × 2 = 16KB |
-| O accumulator | 16×128 | 16 × 128 × 8 = 16KB |
-| **Total** | | **~58KB** ✓ fits L2 |
+| O accumulator (INT32) | 16×128 | 16 × 128 × 4 = 8KB |
+| **Total** | | **~50KB** ✓ fits L2 |
+
+---
+
+## Cache Hierarchy Strategy
+
+### Overview
+
+The Q16 fused attention kernel operates on a three-level cache hierarchy. We use **dynamic detection** via `CPUFeatures.h` to adapt tile sizes and prefetch strategies at JIT compile time.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CACHE HIERARCHY ASSIGNMENT                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ L1 DATA CACHE (32KB typical, per-core private)                       │    │
+│  │ ═══════════════════════════════════════════════════════════════════ │    │
+│  │ • Register spill area for ZMM registers                              │    │
+│  │ • Current Q/K/V block being processed (Q16_1 blocks)                │    │
+│  │ • Score accumulator tile (S[Br, Bc_micro] or s[Bc_micro] for decode)│    │
+│  │ • Index16Softmax LUT (256 bytes)                                    │    │
+│  │ • Active softmax state (m, l per row)                               │    │
+│  │                                                                      │    │
+│  │ Prefetch: PREFETCHT0 (non-temporal to L1)                           │    │
+│  │ Distance: 2-8 KV positions ahead                                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ L2 CACHE (256KB-1MB typical, per-core private)                       │    │
+│  │ ═══════════════════════════════════════════════════════════════════ │    │
+│  │ DECODE (Flash Decode):                                               │    │
+│  │   • q vector (head_dim × 2B = 256B for 128-dim)                     │    │
+│  │   • O accumulator (head_dim × 8B = 1KB for INT64)                   │    │
+│  │   • Streaming K/V through L2 → L1                                    │    │
+│  │                                                                      │    │
+│  │ PREFILL (FA2):                                                       │    │
+│  │   • Q tile [Br × head_dim] (Br=16, 128-dim → 4KB)                   │    │
+│  │   • K tile [Bc × head_dim] (Bc=64, 128-dim → 16KB)                  │    │
+│  │   • V tile [Bc × head_dim] (Bc=64, 128-dim → 16KB)                  │    │
+│  │   • O accumulators [Br × head_dim × 8B] (16KB)                      │    │
+│  │   • S/P tiles [Br × Bc] (~6KB)                                      │    │
+│  │   Total: ~58KB per tile iteration                                    │    │
+│  │                                                                      │    │
+│  │ Prefetch: PREFETCHT1 (to L2)                                        │    │
+│  │ Distance: 8-32 KV positions ahead                                    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ L3 CACHE (8-40MB typical, shared across cores)                       │    │
+│  │ ═══════════════════════════════════════════════════════════════════ │    │
+│  │ DECODE:                                                              │    │
+│  │   • KV cache for current head (streams through)                      │    │
+│  │   • Next head's KV data (prefetched)                                 │    │
+│  │                                                                      │    │
+│  │ PREFILL:                                                             │    │
+│  │   • KV cache tiles beyond current working set                        │    │
+│  │   • Wo weight blocks (for projection phase)                          │    │
+│  │                                                                      │    │
+│  │ Prefetch: PREFETCHT2 (to L3, non-temporal)                          │    │
+│  │ Distance: 32-128 KV positions ahead (for XL sequences)               │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ MAIN MEMORY (DRAM)                                                   │    │
+│  │ ═══════════════════════════════════════════════════════════════════ │    │
+│  │ • Full KV cache (may be TBs for long context)                        │    │
+│  │ • Wo weight matrix (d_model² elements)                               │    │
+│  │ • Q, residual tensors (seq_len × d_model)                           │    │
+│  │                                                                      │    │
+│  │ Strategy: Sequential access for KV, blocked access for Wo            │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Flash Decode: Cache Strategy
+
+Flash Decode processes all KV positions in a single pass without tiling. The key is to **keep q in registers** and **stream K/V sequentially**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FLASH DECODE CACHE FLOW                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────┐                                                       │
+│  │ REGISTERS (ZMM)  │  q[head_dim]: 4 ZMM for 128-dim                       │
+│  │ ════════════════ │  O_acc[head_dim]: 8 ZMM for INT64 accumulator         │
+│  │ Total: 12 ZMM    │  m, l: 2 scalars (softmax state)                      │
+│  └────────┬─────────┘  Scratch: 8 ZMM for K/V streaming                     │
+│           │                                                                  │
+│           │ K/V stream: 4 positions per micro-iteration                      │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                       │
+│  │ L1 (32KB)        │  Current K/V block: 4×72B = 288B                       │
+│  │ ════════════════ │  LUT: 256B                                            │
+│  │ Working: ~1KB    │  Scores: 4×4B = 16B                                    │
+│  └────────┬─────────┘  Weights: 4×2B = 8B                                    │
+│           │                                                                  │
+│           │ Prefetch T0: 8 positions ahead                                   │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                       │
+│  │ L2 (256KB-1MB)   │  Streaming buffer: ~16KB (next 64 positions)          │
+│  │ ════════════════ │  Output buffer: head_dim × 8B = 1KB                    │
+│  │ Working: ~20KB   │                                                        │
+│  └────────┬─────────┘                                                        │
+│           │                                                                  │
+│           │ Prefetch T1/T2: 32-128 positions ahead (sequence-dependent)      │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                       │
+│  │ L3 / DRAM        │  Full KV cache: kv_len × head_dim × 72 bytes          │
+│  │ ════════════════ │  For 4K context, 128-dim: ~37MB per KV head            │
+│  └──────────────────┘                                                        │
+│                                                                              │
+│  PREFETCH STRATEGY:                                                          │
+│  ──────────────────                                                          │
+│  • KV fits in L2 (short seq): PREFETCHT0, distance=4                        │
+│  • KV fits in L3 (medium seq): PREFETCHT1, distance=16                      │
+│  • KV exceeds L3 (long seq): PREFETCHT2, distance=64                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Flash Decode Data Layout per Stage**:
+
+| Stage | L1 | L2 | L3/DRAM | Notes |
+|-------|----|----|---------|-------|
+| **Q×K^T** | K[4, head_dim], LUT | q (from reg), scores | KV cache | Stream K, q pinned in registers |
+| **Softmax** | scores[4], weights[4], (m,l) | - | - | All in registers/L1 |
+| **P×V** | V[4, head_dim], weights[4] | O_acc[head_dim] | KV cache | Stream V, accumulate to L2 |
+| **Wo** | Wo block[d, 32] | O_norm[n_heads×head_dim] | Wo matrix | Stream Wo rows |
+| **Residual** | proj[d_model] | residual I/O | - | In-place update |
+
+### FA2 Prefill: Cache Strategy
+
+FA2 Prefill processes in tiles [Br × Bc]. The key is to **fit all working data in L2** and **amortize K/V loads across Br queries**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FA2 PREFILL CACHE FLOW                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────┐                                                       │
+│  │ REGISTERS (ZMM)  │  Q micro-tile[4, head_dim]: 4 ZMM                      │
+│  │ ════════════════ │  K micro-tile[4, head_dim]: 4 ZMM                      │
+│  │ Total: 24 ZMM    │  S micro-tile[4, 4]: 4 ZMM (INT32 scores)              │
+│  │                  │  O accumulators[4, head_dim]: 8 ZMM (INT64)            │
+│  └────────┬─────────┘  Constants: 4 ZMM                                      │
+│           │                                                                  │
+│           │ Micro-tile: 4×4 GEMM blocking                                    │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                       │
+│  │ L1 (32KB)        │  LUT: 256B                                             │
+│  │ ════════════════ │  P micro-tile[4, Bc]: 512B                             │
+│  │ Working: ~2KB    │  Score scratch: 256B                                   │
+│  └────────┬─────────┘                                                        │
+│           │                                                                  │
+│           │ Tile buffers                                                     │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                       │
+│  │ L2 (256KB-1MB)   │  Q tile[Br, head_dim]: 4KB (Br=16, 128-dim)            │
+│  │ ════════════════ │  K tile[Bc, head_dim]: 16KB (Bc=64)                    │
+│  │ Working: ~58KB   │  V tile[Bc, head_dim]: 16KB                            │
+│  │                  │  S tile[Br, Bc]: 4KB (INT32)                           │
+│  │                  │  P tile[Br, Bc]: 2KB (UINT16)                          │
+│  │                  │  O_acc[Br, head_dim]: 16KB (INT64)                     │
+│  └────────┬─────────┘                                                        │
+│           │                                                                  │
+│           │ KV cache and Wo streaming                                        │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                       │
+│  │ L3 / DRAM        │  Full KV cache                                         │
+│  │ ════════════════ │  Wo matrix (streamed for projection)                   │
+│  └──────────────────┘  Next Q tile (prefetched)                              │
+│                                                                              │
+│  PREFETCH STRATEGY:                                                          │
+│  ──────────────────                                                          │
+│  • Next KV tile: PREFETCHT1 (to L2), 1 tile ahead                           │
+│  • Next Q tile: PREFETCHT2 (to L3), when nearing end of KV loop             │
+│  • Wo weights: PREFETCHT2 (stream from L3/DRAM during Wo phase)             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**FA2 Prefill Tile Sizing Formula**:
+
+```cpp
+// Dynamic tile sizing based on detected cache
+struct Q16TileConfig {
+    int Br;  // Query tile size
+    int Bc;  // KV tile size
+    
+    static Q16TileConfig compute(int head_dim) {
+        const auto& cache = llaminar2::cache_info();
+        
+        // Target: 50% of L2 for working set
+        size_t l2_budget = cache.l2_size / 2;
+        
+        // Per-query overhead: head_dim × 2 (Q) + head_dim × 8 (O_acc) = 10 × head_dim
+        size_t per_query = head_dim * 10;
+        
+        // Per-KV overhead: head_dim × 4 (K + V as Q16_1 = 72B blocks)
+        //                  + Br × 4 (S) + Br × 2 (P)
+        // For Br=16: head_dim × 4 + 96 per KV position
+        size_t per_kv = head_dim * 4 + 96;  // assuming Br=16
+        
+        // Start with Br=16 (good register blocking)
+        int Br = 16;
+        size_t q_budget = Br * per_query;  // ~20KB for 128-dim
+        
+        // Remaining budget for K/V tiles
+        size_t kv_budget = l2_budget - q_budget;
+        int Bc = kv_budget / per_kv;
+        
+        // Round down to multiple of 4 (VNNI blocking)
+        Bc = (Bc / 4) * 4;
+        
+        // Clamp to reasonable range
+        Bc = std::max(16, std::min(256, Bc));
+        
+        return {Br, Bc};
+    }
+};
+```
+
+### Wo Projection: Cache Strategy
+
+Wo projection is **memory-bound** because the weight matrix is large. We use **row-streaming** with **batch accumulation**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Wo PROJECTION CACHE FLOW                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  DECODE (Single Row GEMV):                                                   │
+│  ─────────────────────────                                                   │
+│  • Input: O_norm[n_heads × head_dim] in L2                                  │
+│  • Wo: d_model rows × (n_heads × head_dim) cols                             │
+│  • Strategy: Stream Wo rows, keep O_norm in L2                              │
+│                                                                              │
+│  for each output_row in d_model:                                            │
+│      proj[row] = O_norm · Wo[row, :]                                        │
+│      // Wo row loaded once, O_norm reused from L2                           │
+│                                                                              │
+│  Memory traffic: d_model × (n_heads × head_dim) × weight_size               │
+│  For 3584×3584 Q8_0: ~13MB streamed                                         │
+│                                                                              │
+│  ───────────────────────────────────────────────────────────────────────    │
+│                                                                              │
+│  PREFILL (Batched GEMM):                                                     │
+│  ───────────────────────                                                     │
+│  • Input: O_norm[seq_len_q, n_heads × head_dim] in L3                       │
+│  • Wo: d_model × (n_heads × head_dim)                                       │
+│  • Strategy: Batch queries to amortize Wo loads                             │
+│                                                                              │
+│  // Wo batch size computed dynamically (see CacheInfo::optimal_wo_batch_size)│
+│  for each wo_batch in seq_len_q / batch_size:                               │
+│      // Load batch of O_norm into L2 (~batch_size × d_model × 4B)           │
+│      // Stream Wo once, computing batch_size outputs                        │
+│      proj[batch, :] = O_norm[batch, :] × Wo^T                               │
+│                                                                              │
+│  Memory traffic: seq_len_q × d_model² / batch_size (Wo reuse)               │
+│  With batch=8: 8× reduction in Wo memory traffic                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Residual Add: Cache Strategy
+
+Residual add is **simple** — the projection output and residual are both in L2/L3 from previous stages.
+
+| Mode | Input Location | Strategy |
+|------|---------------|----------|
+| Decode | proj[d_model] in L2, residual row in L2 | In-place, single pass |
+| Prefill | proj[seq_len, d_model] in L3, residual in L3 | Streaming, row-by-row |
+
+### Q16_1 Block Memory Layout
+
+Understanding the Q16_1 block layout is critical for prefetch efficiency:
+
+```
+Q16_1 Block (72 bytes, 32 elements):
+┌─────────────────────────────────────────────────────────────┐
+│ d (float, 4B) │ sum_qs (int32_t, 4B) │ qs[32] (int16_t, 64B)│
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+For head_dim=128: 4 blocks per head → 288 bytes per KV position per head
+```
+
+**Prefetch Distance Calculation**:
+
+```cpp
+// From CPUFeatures.h - AttentionCacheConfig::prefetch_config()
+// Compute optimal prefetch distance based on cache level and latency hiding
+
+size_t bytes_per_kv_pos = (head_dim / 32) * 72;  // K only, or ×2 for K+V
+
+// L1 prefetch: hide ~4 cycle latency, ~4 cache lines
+int l1_distance = std::max(2, (4 * 64) / bytes_per_kv_pos);
+
+// L2 prefetch: hide ~12 cycle latency, ~16 cache lines  
+int l2_distance = std::max(8, (16 * 64) / bytes_per_kv_pos);
+
+// L3/DRAM prefetch: hide ~100+ cycle latency, ~64 cache lines
+int l3_distance = std::max(32, (64 * 64) / bytes_per_kv_pos);
+```
+
+### Dynamic Configuration via CPUFeatures.h
+
+The JIT kernel queries cache sizes at compile time:
+
+```cpp
+// In JIT kernel constructor
+void Q16AttentionJit::configure() {
+    const auto& cache = llaminar2::cache_info();
+    
+    // Determine work size class
+    AttentionCacheConfig cfg(head_dim_, num_kv_heads_, kv_seq_len_);
+    work_size_ = cfg.work_size();
+    prefetch_ = cfg.prefetch_config();
+    
+    // Set tile sizes based on cache
+    if (seq_len_q_ == 1) {
+        // Flash Decode: no Q tiling, process all KV
+        Br_ = 1;
+        Bc_ = kv_seq_len_;  // Process all at once
+        kv_micro_tile_ = cfg.prefer_kv8_tile() ? 8 : 4;
+    } else {
+        // FA2 Prefill: tile both Q and KV
+        auto tiles = Q16TileConfig::compute(head_dim_);
+        Br_ = tiles.Br;
+        Bc_ = tiles.Bc;
+    }
+    
+    // Configure Wo batching
+    wo_batch_size_ = cache.optimal_wo_batch_size(d_model_);
+}
+```
+
+### Summary: Cache Assignment Table
+
+| Data | Flash Decode | FA2 Prefill | Notes |
+|------|-------------|-------------|-------|
+| **q vector** | Registers (ZMM0-3) | L2 (Q tile) | Decode: pinned; Prefill: tiled |
+| **K tile** | L1 (streaming) | L2 | Prefetched from L3/DRAM |
+| **V tile** | L1 (streaming) | L2 | Loaded with K |
+| **S scores** | L1 (micro-tile) | L2 (S tile) | INT32 |
+| **P weights** | L1 (micro-tile) | L2 (P tile) | UINT16 |
+| **O accumulator** | L2 | L2 | INT64, head_dim sized |
+| **Softmax state** | Registers | L1 | (m, l) per row |
+| **Index16 LUT** | L1 | L1 | 256 bytes |
+| **Wo weights** | L3→L2 (streaming) | L3→L2 (streaming) | Batched in prefill |
+| **Residual** | L2 | L3 | In-place output |
+
+---
+
+## Register Allocation Contract
+
+### Overview
+
+The Q16 attention JIT kernel uses the **Register Guard** system from `src/v2/kernels/cpu/jit/` to enforce a contract on register usage across all microkernels. This prevents register clobbering bugs at compile time.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZMM REGISTER ZONE LAYOUT                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  zmm0-7   │ ACCUMULATOR ZONE   │ O accumulators (INT64 context output)     │
+│           │ [VEX-safe LOW]     │ 8 regs × 64B = 512B (4 head_dim blocks)   │
+│  ─────────┼────────────────────┼─────────────────────────────────────────── │
+│  zmm8-15  │ INPUT ZONE         │ Q vectors (decode) / Q tile row (prefill) │
+│           │ [VEX-safe LOW]     │ Also K/V streaming during dot product     │
+│  ─────────┼────────────────────┼─────────────────────────────────────────── │
+│  zmm16-19 │ STATE ZONE         │ Online softmax state (m, l, weight, corr) │
+│           │ [EVEX-only HIGH]   │ Persistent across KV iterations           │
+│  ─────────┼────────────────────┼─────────────────────────────────────────── │
+│  zmm20-25 │ SCRATCH ZONE       │ Temporaries, intermediate results         │
+│           │ [EVEX-only HIGH]   │ NOTE: zmm20-23 alias xmm20-23 (ScoreZone) │
+│  ─────────┼────────────────────┼─────────────────────────────────────────── │
+│  zmm26-31 │ RESERVED ZONE      │ Preloaded constants (never modified)      │
+│           │ [EVEX-only HIGH]   │ scale, LUT base, thresholds, etc.         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    XMM OVERLAY (ScoreZone)                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  xmm20-23 │ SCORE ZONE         │ FA2 scalar scores (aliases Scratch0-3)    │
+│           │ [EVEX-only HIGH]   │ 4 scores for 4×4 micro-tile               │
+│                                                                              │
+│  CRITICAL: Using ScoreZone invalidates Scratch0-3 until scores consumed!    │
+│            Safe scratch during scoring: Scratch4 (zmm24), Scratch5 (zmm25)  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Q16 Reserved Constants (zmm26-31)
+
+| Register | Alias | Contents | Usage |
+|----------|-------|----------|-------|
+| zmm26 | `Const128` | 128.0f broadcast | Q16 dequant: val × d / 128 |
+| zmm27 | `ConstScale` | 1/√head_dim | Attention scale factor |
+| zmm28 | `ConstClipC` | 6.6f broadcast | Index16Softmax clip threshold |
+| zmm29 | `ConstLUTStep` | 31.0f / 6.6f | LUT index calculation |
+| zmm30 | `ConstOne` | 1.0f broadcast | Various normalization |
+| zmm31 | `ConstZero` | 0.0f broadcast | Initialization, masking |
+
+### Microkernel Register Contracts
+
+Each microkernel declares its register usage. The JIT kernel orchestrates handoffs between microkernels, ensuring no conflicts.
+
+#### Q16DotProduct (Q×K^T)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Q16 DOT PRODUCT MICROKERNEL                                                │
+│  Purpose: Compute s[kv] = q · k[kv] for INT32 scores                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  INPUTS (read-only):                                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Input0-3 (zmm8-11)  │ Q vector: 4 blocks × 32 INT16 = head_dim=128    │ │
+│  │                     │ Loaded once per query, reused across all K       │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  STREAMING (cyclic reuse):                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Input4-7 (zmm12-15) │ K vectors: Stream 4 KV positions at a time      │ │
+│  │                     │ Block-by-block: k[kv, block] for dot product    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  OUTPUTS (write):                                                           │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch0-3 (zmm20-23) │ INT32 scores: 4 KV positions per iteration    │ │
+│  │                       │ s[kv] = Σ_block (q[block] · k[kv, block])     │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  SCRATCH (internal temporaries):                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch4-5 (zmm24-25) │ Intermediate dot products, scale factors      │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  CONSTANTS (read-only):                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Const128 (zmm26)      │ For dequant scale computation                 │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Index16Softmax
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  INDEX16 SOFTMAX MICROKERNEL                                                │
+│  Purpose: Convert INT32 scores → UINT16 weights via LUT                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  INPUTS (read, then overwritten):                                           │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch0-3 (zmm20-23) │ INT32 scores from Q16DotProduct               │ │
+│  │                       │ Consumed and overwritten with UINT16 weights  │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  OUTPUTS (overwrite input registers):                                       │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch0-3 (zmm20-23) │ UINT16 weights: LUT[max - score]              │ │
+│  │                       │ Packed: 32 UINT16 per ZMM register            │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  STATE (persistent across KV iterations - FA2 only):                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ StateMax (zmm16)    │ Running max score (INT32) for online softmax    │ │
+│  │ StateSum (zmm17)    │ Running sum of weights (INT64) for normalization│ │
+│  │ StateWeight (zmm18) │ Current max weight (for rescaling check)        │ │
+│  │ StateCorr (zmm19)   │ Correction factor (rescale accumulator)         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  SCRATCH (internal temporaries):                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch4-5 (zmm24-25) │ Delta computation, LUT index mapping          │ │
+│  │ Input4-7 (zmm12-15)   │ LUT entries (loaded from memory)              │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  CONSTANTS (read-only):                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ ConstClipC (zmm28)    │ c = 6.6 clipping threshold                    │ │
+│  │ ConstLUTStep (zmm29)  │ 31 / c for index calculation                  │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  FLASH DECODE vs FA2 PREFILL:                                               │
+│  • Flash Decode: StateZone unused (single-pass, no online tracking)         │
+│  • FA2 Prefill: StateZone tracks running (m, l) across KV tiles             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### PVAccumulate (P×V)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PV ACCUMULATE MICROKERNEL                                                  │
+│  Purpose: O_acc[d] += Σ_kv weight[kv] × V[kv, d]                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  INPUTS (read-only):                                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch0-3 (zmm20-23) │ UINT16 weights from Index16Softmax            │ │
+│  │                       │ 4 KV positions × 32 weights (though only 1    │ │
+│  │                       │ weight per KV position actually used)         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  STREAMING (cyclic reuse):                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Input4-7 (zmm12-15) │ V vectors: 4 KV positions, block-by-block       │ │
+│  │                     │ V[kv, block] loaded and immediately consumed    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  OUTPUTS (accumulate):                                                      │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Accum0-7 (zmm0-7)   │ INT64 accumulators: O_acc[head_dim]             │ │
+│  │                     │ 8 regs × 8 INT64 = 64 elements (head_dim=128    │ │
+│  │                     │ requires 2 passes through 64-element chunks)    │ │
+│  │                     │ Accumulated: += weight × V_int16                │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  SCRATCH (internal temporaries):                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch4-5 (zmm24-25) │ Broadcast weight, intermediate products       │ │
+│  │ Input0-3 (zmm8-11)    │ Widened V values (INT16 → INT32 for multiply) │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  CONSTANTS (read-only):                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ (none required)       │ Pure integer multiply-accumulate             │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  NOTE: After all KV processed, Accum0-7 contain INT64 weighted sums.       │
+│        Normalization (÷ weight_sum) and dequant happen in finalization.    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### WoProjection
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  WO PROJECTION MICROKERNEL                                                  │
+│  Purpose: proj[d_model] = O_norm[n_heads×head_dim] × Wo^T                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  INPUTS (read-only):                                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Input0-7 (zmm8-15)  │ O_norm: Normalized attention output (FP32)      │ │
+│  │                     │ 8 regs × 16 FP32 = 128 elements (head_dim)      │ │
+│  │                     │ Concatenated from all heads: [n_heads×head_dim] │ │
+│  │                     │ For models with input_dim > 128, reload in tiles│ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  STREAMING (from L3/DRAM):                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch0-3 (zmm20-23) │ Wo weight rows: Q8_0 blocks, dequantized      │ │
+│  │                       │ One output element per row of Wo              │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  OUTPUTS (write to memory):                                                 │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Accum0-3 (zmm0-3)   │ proj[4]: 4 output elements accumulated          │ │
+│  │                     │ Stream out to memory in chunks of 4             │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  SCRATCH (internal temporaries):                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch4-5 (zmm24-25) │ Dequant temporaries, FMA intermediates        │ │
+│  │ Accum4-7 (zmm4-7)     │ Additional accumulators for 8-way unroll      │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  CONSTANTS (read-only):                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Const128 (zmm26)      │ Q8_0 dequant: val / 127.0 (or similar)        │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### ResidualAddQ16
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  RESIDUAL ADD Q16 MICROKERNEL                                               │
+│  Purpose: output_q16 = residual_q16 + projection_fp32                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  INPUTS (read from memory):                                                 │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Input0-3 (zmm8-11)  │ Residual Q16_1 blocks: dequantized FP32         │ │
+│  │                     │ 4 blocks × 32 elements = 128 (d_model chunk)    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Input4-7 (zmm12-15) │ Projection FP32 from Wo (same chunk)            │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  OUTPUTS (write to memory):                                                 │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Accum0-3 (zmm0-3)   │ Sum: residual + projection (FP32)               │ │
+│  │                     │ Then quantized back to Q16_1 and stored         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  SCRATCH (internal temporaries):                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Scratch0-3 (zmm20-23) │ Find max for scale, quantization temps        │ │
+│  │ Scratch4-5 (zmm24-25) │ Scale computation, rounding                   │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  CONSTANTS (read-only):                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Const128 (zmm26)      │ Quantization: scale = max / 32767             │ │
+│  │ ConstOne (zmm30)      │ Rounding: add 0.5 before truncation           │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Register Flow: Flash Decode Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              FLASH DECODE: REGISTER FLOW (seq_len_q = 1)                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  INITIALIZATION:                                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Load Q[head] → Input0-3 (zmm8-11)                                      │ │
+│  │ Clear Accum0-7 (zmm0-7) ← 0                                            │ │
+│  │ Initialize m = INT32_MIN, l = 0 (scalars or StateZone if needed)       │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                              │                                               │
+│                              ▼                                               │
+│  KV LOOP (kv = 0; kv < kv_len; kv += 4):                                    │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ STEP 1: Q×K^T (Q16DotProduct)                                          │ │
+│  │   Input0-3 (Q, read-only) × K[kv:kv+4] → Scratch0-3 (scores)           │ │
+│  │   K loaded via Input4-7 (streaming)                                    │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │ STEP 2: Softmax (Index16Softmax)                                       │ │
+│  │   Scratch0-3 (scores) → Scratch0-3 (UINT16 weights)                    │ │
+│  │   Update m, l for normalization                                        │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │ STEP 3: P×V (PVAccumulate)                                             │ │
+│  │   Scratch0-3 (weights) × V[kv:kv+4] → Accum0-7 (accumulate)            │ │
+│  │   V loaded via Input4-7 (streaming)                                    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                              │                                               │
+│                              ▼ (repeat for all KV)                           │
+│  FINALIZATION:                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ O_norm = Accum0-7 / l × d_v_scale → Input0-7                           │ │
+│  │   (Normalize INT64 accumulators to FP32 attention output)              │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │ STEP 4: Wo Projection (WoProjection)                                   │ │
+│  │   Input0-7 (O_norm) × Wo → proj (to memory via Accum0-3)               │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │ STEP 5: Residual Add (ResidualAddQ16)                                  │ │
+│  │   proj + residual → output_q16 (to memory)                             │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Register Flow: FA2 Prefill Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              FA2 PREFILL: REGISTER FLOW (seq_len_q > 1)                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  OUTER LOOP: Q tiles (q_tile = 0; q_tile < seq_len_q; q_tile += Br)         │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Load Q[q_tile:q_tile+Br] → L2 buffer (not registers - too large)       │ │
+│  │ Clear O_acc[Br × head_dim] in L2                                       │ │
+│  │ Initialize StateZone: m[Br] = INT32_MIN, l[Br] = 0                     │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                              │                                               │
+│    INNER LOOP: KV tiles (kv_tile = 0; kv_tile < kv_len; kv_tile += Bc)      │
+│    ┌──────────────────────────────────────────────────────────────────────┐ │
+│    │ For each Q row in tile (q_local = 0; q_local < Br; q_local++):       │ │
+│    │   Load Q[q_tile + q_local] → Input0-3 (single row at a time)         │ │
+│    │                                                                      │ │
+│    │   For kv in KV tile (process 4 at a time):                           │ │
+│    │     STEP 1: Q×K^T → Scratch0-3 (4 scores)                            │ │
+│    │     STEP 2: Index16Softmax → Scratch0-3 (4 weights)                  │ │
+│    │             Update StateZone for online softmax                      │ │
+│    │     STEP 3: P×V → Accum0-7 (accumulate for this Q row)               │ │
+│    │                                                                      │ │
+│    │   Store Accum0-7 back to O_acc[q_local] in L2                        │ │
+│    └──────────────────────────────────────────────────────────────────────┘ │
+│                              │                                               │
+│                              ▼ (after all KV tiles)                          │
+│  Q TILE FINALIZATION:                                                       │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ For each Q row in tile:                                                │ │
+│  │   Normalize O_acc[q_local] by l[q_local]                               │ │
+│  │   STEP 4: Wo Projection (batched or row-by-row)                        │ │
+│  │   STEP 5: Residual Add                                                 │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Register Guard Integration
+
+The JIT kernel uses `borrow<RegType>()` to obtain tracked access to registers:
+
+```cpp
+// Example: Q16DotProduct JIT emission
+void emit_q16_dot_product(Xbyak::CodeGenerator& gen, RegisterTracker& tracker) {
+    // Borrow Q input registers (read-only, but tracked)
+    auto q0 = tracker.borrow<Input0>();
+    auto q1 = tracker.borrow<Input1>();
+    auto q2 = tracker.borrow<Input2>();
+    auto q3 = tracker.borrow<Input3>();
+    
+    // Borrow K streaming registers
+    auto k0 = tracker.borrow<Input4>();
+    auto k1 = tracker.borrow<Input5>();
+    auto k2 = tracker.borrow<Input6>();
+    auto k3 = tracker.borrow<Input7>();
+    
+    // Borrow score output registers
+    auto s0 = tracker.borrow<Scratch0>();
+    auto s1 = tracker.borrow<Scratch1>();
+    auto s2 = tracker.borrow<Scratch2>();
+    auto s3 = tracker.borrow<Scratch3>();
+    
+    // Clear accumulators
+    gen.vpxord(s0.zmm(), s0.zmm(), s0.zmm());
+    gen.vpxord(s1.zmm(), s1.zmm(), s1.zmm());
+    // ... emit VPMADDWD / VPADDD for dot product ...
+    
+    // Guards automatically release at scope end
+}
+```
 
 ---
 
@@ -1195,57 +1970,117 @@ void int_rmsnorm(
 
 ---
 
-### μK5: Streaming Wo Projection (`StreamWoGemmMicrokernel`)
+### μK5: Wo Projection with VPDPWSSD (INT16×INT16) (`WoProjectionVNNI`)
 
-**Purpose**: Project attention context through Wo weights with streaming repack
+**Purpose**: Project attention context through Wo weights using VPDPWSSD for maximum precision,
+with sign-extended INT8 weights and INT16 context.
 
-**Key Innovation**: Wo weights are stored as Q8_0/Q4_0 (quantized). Instead of dequantizing to FP32, we:
-1. Stream Q8 weights in tiles
-2. Sign-extend to INT16 on-the-fly
-3. Use `vpdpwssd` for INT16×INT16 GEMM
+**Key Insight**: INT8 context quantization loses too much precision!
+```
+WRONG:  INT32 context → INT8 (Q8_1) → VPDPBUSD  (loses 8 bits of precision!)
+RIGHT:  INT32 context → INT16       → VPDPWSSD  (keeps 16 bits of precision!)
+```
+
+Model weights arrive as INT8 VNNI-packed, but we **sign-extend to INT16** at runtime.
+This is essentially free (`vpmovsxbw` instruction).
+
+**ALL-INTEGER Data Flow (MAXIMUM PRECISION)**:
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  VPDPWSSD (INT16×INT16) Wo PROJECTION → Q16_1 OUTPUT                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  P×V Output: INT32 accumulators                                             │
+│       │                                                                     │
+│       │  int32_context[num_heads × head_dim]                                │
+│       │  + weight_sum (INT32, sum of softmax weights)                       │
+│       │  + v_scale_product (FP32 scale, tracked separately)                 │
+│       │                                                                     │
+│       ▼                                                                     │
+│  requantize_int32_to_int16_context() ─── KEEPS 16 BITS!                     │
+│       │                                                                     │
+│       │  Computes: maxabs of INT32 values                                   │
+│       │  Scale: combined_scale = maxabs/32767 * v_scale / weight_sum        │
+│       │  Output: INT16 packed context (16-bit precision preserved!)         │
+│       │                                                                     │
+│       ▼                                                                     │
+│  INT16 context_packed[inner_dim]                                            │
+│       │                                                                     │
+│       └───────────────┬────────────────┐                                    │
+│                       │                │                                    │
+│                       ▼                ▼                                    │
+│               Wo_int8[K][N] ──► vpmovsxbw ──► Wo_int16[K][N]                │
+│                       │         (sign-extend, FREE!)                        │
+│                       ▼                                                     │
+│               VPDPWSSD (INT16 × INT16 → INT32) ← Maximum precision!         │
+│                       │                                                     │
+│                       ▼                                                     │
+│               INT32 GEMM output[d_model]                                    │
+│                       │                                                     │
+│                       ▼                                                     │
+│               requantize_int32_to_q16_1() ─── Integer-to-Integer            │
+│                       │                                                     │
+│                       ▼                                                     │
+│               Q16_1 output[d_model / 32 blocks]                             │
+│                       │                                                     │
+│                       ▼                                                     │
+│               q16_1_add_q16_1() ─── Native Q16_1 + Q16_1 residual!          │
+│                       │             (from SIMDHelpers.h)                    │
+│                       ▼                                                     │
+│               Q16_1 updated_residual[d_model / 32 blocks]                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**VNNI Instruction Comparison**:
+| Instruction | Operands | Use Case |
+|-------------|----------|----------|
+| VPDPBUSD | UINT8 × INT8 → INT32 | Original Q8_0 GEMM (loses context precision) |
+| VPDPWSSD | INT16 × INT16 → INT32 | **Our choice** (preserves context precision) |
 
 **Input**:
-- `context_int16`: INT16 attention context [n_heads × head_dim]
-- `Wo_q8`: Q8_0 weight matrix [d_model × n_heads × head_dim]
+- `IntegerContext`: INT32 P×V accumulators + weight_sum + v_scale_product
+- `Wo_packed`: QuantisedPackedWeights (INT8, sign-extended to INT16 at runtime)
 
 **Output**:
-- `output_int32`: INT32 projection output [d_model]
+- `Q16_1Projection`: Q16_1 blocks [(d_model + 31) / 32] - ready for native residual add!
 
 **Algorithm**:
 ```cpp
-void stream_wo_gemm(
-    const int16_t* context,      // [n_heads * head_dim]
-    const Q8_0Block* Wo,         // Q8_0 [d_model, n_heads * head_dim]
-    int32_t* output,             // [d_model]
-    int d_model,
-    int inner_dim)               // n_heads * head_dim
+void wo_projection_vpdpwssd_to_q16_1_gemv(
+    const WoProjectionVNNIParams& params,
+    const IntegerContext& context,      // INT32 from P×V
+    Q16_1Projection& output)            // Q16_1 output
 {
-    // Tile size for weight streaming
-    constexpr int TILE_K = 64;  // Process 64 elements at a time
-    
-    alignas(64) int16_t wo_tile_int16[TILE_K];
-    
-    for (int row = 0; row < d_model; ++row) {
-        int32_t accum = 0;
-        
-        for (int k = 0; k < inner_dim; k += TILE_K) {
-            // Stream and repack Q8 to INT16
-            const Q8_0Block* block = &Wo[row * (inner_dim / QK8_0) + k / QK8_0];
-            
-            // Sign-extend INT8 → INT16 (vectorized)
-            for (int i = 0; i < TILE_K; ++i) {
-                wo_tile_int16[i] = static_cast<int16_t>(block->qs[i % QK8_0]);
-            }
-            
-            // VNNI dot product
-            __m512i ctx_vec = _mm512_loadu_si512(&context[k]);
-            __m512i wo_vec = _mm512_loadu_si512(wo_tile_int16);
-            accum = _mm512_dpwssd_epi32(_mm512_set1_epi32(accum), ctx_vec, wo_vec);
+    // Step 1: Requantize INT32 context to INT16 (KEEP 16 bits!)
+    std::vector<int16_t> context_int16(input_dim);
+    requantize_int32_to_int16_context(context.int32_data, ...);
+
+    // Step 2: VPDPWSSD GEMV (INT16 × INT16 → INT32)
+    // Sign-extend INT8 weights to INT16 on the fly (vpmovsxbw)
+    std::vector<int32_t> int32_output(d_model);
+    for (int n = 0; n < d_model; ++n) {
+        for (int k = 0; k < input_dim; ++k) {
+            int16_t ctx_val = context_int16[k];
+            int16_t w_int16 = static_cast<int16_t>(Wo_int8[k, n]);  // Sign-extend!
+            int32_output[n] += ctx_val * w_int16;  // VPDPWSSD
         }
-        
-        output[row] = accum;
     }
+
+    // Step 3: Requantize INT32 → Q16_1
+    requantize_int32_to_q16_1(int32_output.data(), d_model, scale, output.blocks);
+    
+    // Now caller can do native Q16_1 residual add:
+    // q16_1_add_q16_1(residual, output.blocks, residual, d_model);
 }
+```
+
+**Key Benefits**:
+- **2× context precision**: INT32→INT16 vs INT32→INT8
+- **Lossless weight upscaling**: INT8→INT16 sign-extension is exact
+- **Same throughput**: VPDPWSSD has same throughput as VPDPBUSD
+- **Zero FP32 conversions** in entire attention → residual path
+- **Native Q16_1 residual add**: Uses `q16_1_add_q16_1()` from SIMDHelpers.h
 ```
 
 ---
@@ -1257,51 +2092,50 @@ void stream_wo_gemm(
 **Input**:
 - `residual_q16`: Q16_1 residual tensor [d_model]
 - `projection_int32`: INT32 Wo output [d_model]
-- `proj_scale`: FP32 scale factor from projection
+---
+
+### μK6: Q16_1 + Q16_1 Residual Add (NATIVE - uses SIMDHelpers)
+
+**Purpose**: Add Wo projection (Q16_1) to Q16_1 residual - uses existing native operation!
+
+**Key Insight**: Since μK5 now outputs Q16_1 directly, we use the existing
+`q16_1_add_q16_1()` from `SIMDHelpers.h` - NO custom microkernel needed!
+
+**Input**:
+- `residual_q16`: Q16_1 residual tensor [d_model / 32 blocks]
+- `projection_q16`: Q16_1 Wo output [d_model / 32 blocks] (from μK5)
 
 **Output**:
-- `residual_q16`: Updated Q16_1 residual (in-place)
+- `residual_q16`: Updated Q16_1 residual (in-place or to separate output)
 
-**Algorithm**:
+**Usage** (no new code needed!):
 ```cpp
-void q16_residual_add(
-    Q16_1Tensor* residual,
-    const int32_t* projection,
-    float proj_scale,
+#include "tensors/SIMDHelpers.h"
+
+void apply_attention_residual(
+    Q16_1Block* residual,           // Q16_1 residual
+    const Q16_1Block* projection,   // Q16_1 from wo_projection_vnni_to_q16_1_gemv
     int d_model)
 {
-    // Compute new scale based on combined range
-    float res_scale = residual->scale();
+    // Native Q16_1 + Q16_1 addition - SIMD accelerated!
+    simd::q16_1_add_q16_1(residual, projection, residual, d_model);
     
-    // Find max magnitude of sum for new scale
-    int64_t max_sum = 0;
-    for (int d = 0; d < d_model; ++d) {
-        int32_t res_val = residual->qs[d];
-        int32_t proj_val = static_cast<int32_t>(projection[d] * (proj_scale / res_scale));
-        int64_t sum = static_cast<int64_t>(res_val) + proj_val;
-        max_sum = std::max(max_sum, std::abs(sum));
-    }
-    
-    // Compute new scale to fit in INT16
-    float new_scale = static_cast<float>(max_sum) / 32767.0f;
-    float scale_ratio = res_scale / new_scale;
-    float proj_ratio = proj_scale / new_scale;
-    
-    // Add and requantize
-    for (int d = 0; d < d_model; ++d) {
-        int32_t res_scaled = static_cast<int32_t>(residual->qs[d] * scale_ratio);
-        int32_t proj_scaled = static_cast<int32_t>(projection[d] * proj_ratio);
-        int32_t sum = res_scaled + proj_scaled;
-        
-        // Clamp to INT16 range
-        residual->qs[d] = static_cast<int16_t>(
-            std::max(-32767, std::min(32767, sum))
-        );
-    }
-    
-    residual->set_scale(new_scale);
+    // That's it! No FP32 conversions, no custom logic.
 }
 ```
+
+**Why This Works**:
+- `q16_1_add_q16_1` already implements the full algorithm:
+  1. Dequant both blocks to FP32 in registers (minimal - just scale multiply)
+  2. Add FP32 values
+  3. Find new max_abs for requantization
+  4. Requantize to Q16_1
+
+**Performance**:
+- AVX-512 vectorized (32 elements per iteration)
+- Works entirely in registers
+- No intermediate memory allocation
+- Already battle-tested in typed residual pipeline
 
 ---
 
@@ -1790,6 +2624,12 @@ Support both Q16 and legacy FP32/Hybrid modes:
 
 ## Appendix A: VNNI Instruction Reference
 
+### Critical Hardware Constraint
+
+> **VPDPWSSD interprets both operands as SIGNED INT16.** Values in range [32768, 65535]
+> are treated as negative numbers [-32768, -1]. This means **UINT16 softmax weights
+> cannot be used directly** — we must use INT16 weights in range [0, 32767].
+
 ### `vpdpwssd` — Packed Dot Product of Signed Words with Dword Accumulation
 
 ```
@@ -1798,11 +2638,16 @@ vpdpwssd zmm1, zmm2, zmm3
 For each dword position i:
     zmm1[i] += zmm2[i].word[0] * zmm3[i].word[0] 
              + zmm2[i].word[1] * zmm3[i].word[1]
+
+CRITICAL: Both word[0] and word[1] are interpreted as SIGNED INT16!
+         Range: [-32768, 32767]
+         Output: INT32 accumulator
 ```
 
-- Input: Two ZMM registers with INT16 pairs
+- Input: Two ZMM registers with **signed** INT16 pairs
 - Output: INT32 accumulation in destination
 - Throughput: 0.5 CPI on recent Intel CPUs
+- **Constraint**: Cannot use UINT16 values > 32767 (would be negative)
 
 ### `vpmovsxbw` — Sign-Extend INT8 to INT16
 
@@ -1821,19 +2666,27 @@ For each position i:
 
 ## Appendix B: Index16Softmax LUT Generation
 
+**VNNI Constraint**: LUT must output INT16 values in range [0, 32767] (not 65535).
+
 ```python
 import numpy as np
 
-def generate_uint16_lut(b=5, c=6.6):
-    """Generate UINT16 LUT for Index16Softmax."""
+def generate_int16_lut(b=5, c=6.6):
+    """Generate INT16 LUT for Index16Softmax (VNNI-compatible).
+    
+    CRITICAL: Max value is 32767 (not 65535) because VPDPWSSD
+    interprets operands as SIGNED INT16. Values > 32767 would
+    be treated as negative, causing sign inversion in P×V.
+    """
     n_entries = 2 ** b  # 32 entries for b=5
     lut = []
     
     for i in range(n_entries):
         x = c * i / (n_entries - 1)  # x in [0, c]
         exp_val = np.exp(-x)
-        uint16_val = int(round(65535 * exp_val))
-        lut.append(uint16_val)
+        # Scale to INT16 range [0, 32767] instead of [0, 65535]
+        int16_val = int(round(32767 * exp_val))
+        lut.append(int16_val)
     
     # Force last entry to 0 (saturated)
     lut[-1] = 0
@@ -1841,8 +2694,9 @@ def generate_uint16_lut(b=5, c=6.6):
     return lut
 
 # Generate and print
-lut = generate_uint16_lut()
-print("static constexpr uint16_t INDEX16_SOFTMAX_LUT[32] = {")
+lut = generate_int16_lut()
+print("// VNNI-compatible: INT16 range [0, 32767]")
+print("static constexpr int16_t INDEX16_SOFTMAX_LUT[32] = {")
 for i in range(0, 32, 8):
     row = ", ".join(f"{v:5d}" for v in lut[i:i+8])
     print(f"    {row},")

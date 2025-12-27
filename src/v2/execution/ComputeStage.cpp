@@ -4728,7 +4728,7 @@ namespace llaminar2
         // This is used for HybridQ16 mode where the residual stream is Q16_1
         LOG_DEBUG("[EmbeddingStage] Q16_1 output path: FP32 lookup + quantization");
 
-        auto *q16_output = dynamic_cast<Q16_1Tensor *>(params_.outputhybridpre);
+        auto *q16_output = dynamic_cast<Q16_1Tensor *>(params_.output);
         if (!q16_output)
         {
             LOG_ERROR("[EmbeddingStage] Failed to cast output to Q16_1Tensor");

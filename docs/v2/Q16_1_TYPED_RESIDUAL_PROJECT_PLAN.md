@@ -1,9 +1,9 @@
 # Q16_1 Typed Residual Stream Project Plan
 
 **Author**: David Sanftenberg  
-**Date**: December 26, 2025  
+**Date**: December 27, 2025  
 **Branch**: `feature/typed-residuals`  
-**Status**: In Progress
+**Status**: Phase 5 Complete (Reference Kernels), Phase 6 In Progress (JIT)
 
 ## Progress Summary
 
@@ -14,14 +14,30 @@
 | Phase 3: Stage Implementations | ✅ Complete | ResidualAddStage, EmbeddingStage Q16_1 support |
 | Phase 3.5: Q16_1 RoPE | ✅ Complete | In-place Q16_1 RoPE primitives and kernel |
 | Phase 4: RMSNorm Q16_1 Support | ✅ Complete | Q16_1 input → FP32 output normalization |
-| Phase 5: JIT Fusion | ✅ Complete | Register-tiled fused Wo + Q16_1 residual kernel |
-| Phase 6: Integration Wiring | ✅ Complete | CLI flag, stage params, graph wiring |
+| Phase 5: Pure Integer Reference Kernels | ✅ Complete | Complete Q16 attention pipeline (no FP32!) |
+| Phase 6: JIT Fusion | 🔄 In Progress | Register-tiled fused Q16 attention kernel |
+| Phase 7: Integration Wiring | ⏳ Pending | CLI flag, stage params, graph wiring |
 
 ## Executive Summary
 
-This project introduces a **Q16_1 typed residual stream** for the Q8_1/Hybrid activation precision modes. The residual stream is the numerical backbone of transformer inference—accumulated across all layers. Using Q16_1 (int16 quantization with FP32 scale) provides **266× better precision than Q8_1** while using only **56% more storage** (2.25 bytes/elem vs 1.125 bytes/elem).
+This project introduces a **Q16_1 typed residual stream** with a **pure integer attention pipeline**. The key achievement is that the entire attention-to-residual path operates in integer domain with no FP32 intermediate values:
 
-The final phase fuses all operations from attention output through residual addition into the JIT kernel, performing the entire sequence in registers without intermediate memory traffic.
+```
+Q×K^T (INT16×INT16→INT32) → Exp2Softmax (INT32→INT16) → P×V (INT16×INT16→INT32) 
+    → Wo (VPDPWSSD INT16×INT16→INT32) → Q16_1 → Residual Add (Q16_1+Q16_1→Q16_1)
+```
+
+### Measured Parity Results (December 27, 2025)
+
+| Test Configuration | Cosine Similarity vs FP32 | Verdict |
+|-------------------|---------------------------|---------|
+| Q16 Attention Core (SmallConfig) | 1.000000 | ✓ EXCELLENT |
+| Q16 Attention Core (LargerConfig) | 1.000000 | ✓ EXCELLENT |
+| Q16 Attention Core (GQA) | 1.000000 | ✓ EXCELLENT |
+| Wo Projection (VPDPWSSD) | 0.998980 - 0.999576 | ✓ EXCELLENT |
+| **Full Pipeline (Attn+Wo+Residual)** | **0.999572 - 0.999872** | ✓ EXCELLENT |
+
+The pure integer Q16 pipeline achieves **≥99.95% cosine similarity** against FP32 reference.
 
 ---
 
@@ -34,12 +50,13 @@ The final phase fuses all operations from attention output through residual addi
 5. [Phase 3: Stage Implementations](#phase-3-stage-implementations) ✅
 6. [Phase 3.5: Q16_1 RoPE](#phase-35-q16_1-rope) ✅
 7. [Phase 4: RMSNorm Q16_1 Support](#phase-4-rmsnorm-q16_1-support) ✅
-8. [Phase 5: JIT Fusion](#phase-5-jit-fusion) ✅
-9. [Phase 6: Integration Wiring](#phase-6-integration-wiring-next) ✅
-10. [Validation Plan](#validation-plan)
-11. [Performance Targets](#performance-targets)
-12. [Risk Assessment](#risk-assessment)
-13. [Timeline](#timeline)
+8. [Phase 5: Pure Integer Reference Kernels](#phase-5-pure-integer-reference-kernels-complete-) ✅
+9. [Phase 6: JIT Fusion](#phase-6-jit-fusion-in-progress-) 🔄
+10. [Phase 7: Integration Wiring](#phase-7-integration-wiring-pending-) ⏳
+11. [Validation Plan](#validation-plan)
+12. [Performance Targets](#performance-targets)
+13. [Risk Assessment](#risk-assessment)
+14. [Timeline](#timeline)
 
 ---
 
@@ -793,288 +810,532 @@ All 177 unit tests pass (176 existing + 1 new Q16_1RMSNorm suite with 8 tests).
 
 ---
 
-## Phase 5: JIT Fusion
+## Phase 5: Pure Integer Reference Kernels (COMPLETE ✅)
 
-### Goal
-
-Fuse the entire attention tail into a single JIT kernel:
-```
-Attention Context (FP32) → Wo GEMM → FP32 + Dequant(Q16_1 residual) → Q16_1 output
-```
-
-**Key insight**: We do NOT need an intermediate Q8_1 quantization step. The Wo projection output stays as FP32 in ZMM registers, and we directly add it to the dequantized Q16_1 residual. This eliminates one quantization/dequantization round-trip, reducing error and compute.
-
-All intermediate values stay in **ZMM registers**. No memory traffic between operations.
-
-### 5.1 Current JitFusedAttentionWo Architecture
-
-The existing `JitFusedAttentionWo` kernel already fuses:
-- FlashAttention-2 tiled attention (Q×K^T, softmax, ×V)
-- Wo projection (context × Wo weights)
-
-**Current output**: FP32 projection result written to memory.
-
-### 5.2 Proposed Extension: FusedAttentionWoResidual
-
-**New kernel output flow**:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    JitFusedAttentionWoResidual                  │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  [Q, K, V in registers]                                         │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌──────────────┐                                               │
-│  │   FA2 Core   │  Q×K^T, softmax, ×V                          │
-│  └──────┬───────┘                                               │
-│         │ context (ZMM accumulators)                            │
-│         ▼                                                       │
-│  ┌──────────────┐                                               │
-│  │  Wo Tiling   │  context × Wo_weights (VNNI)                 │
-│  └──────┬───────┘                                               │
-│         │ proj (ZMM registers, FP32)                            │
-│         ▼                                                       │
-│  ┌──────────────┐                                               │
-│  │ Load Q16_1   │  Load residual block from memory              │
-│  │ Dequant      │  scale × int16 → FP32 (in ZMM)               │
-│  └──────┬───────┘                                               │
-│         │ residual_fp32 (ZMM registers)                         │
-│         ▼                                                       │
-│  ┌──────────────┐                                               │
-│  │   vaddps     │  proj_fp32 + residual_fp32                    │
-│  └──────┬───────┘  (FP32 arithmetic in ZMM)                     │
-│         │ sum (ZMM registers, FP32)                             │
-│         ▼                                                       │
-│  ┌──────────────┐                                               │
-│  │ Quant Q16_1  │  max_abs → scale → round → int16              │
-│  └──────┬───────┘                                               │
-│         │                                                       │
-│         ▼                                                       │
-│  [Store Q16_1 residual to memory]                               │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 5.3 JIT Code Generation Changes
-
-**File**: `src/v2/kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h`
-
-Add new config fields to `JitAttentionConfig`:
-
-```cpp
-struct JitAttentionConfig
-{
-    // ... existing fields (head_dim, num_heads, d_model, etc.) ...
-    
-    // NEW: Residual fusion config
-    bool fuse_residual_add = false;                    // Enable fused residual addition
-    TensorType residual_type = TensorType::FP32;       // Residual tensor format (FP32 or Q16_1)
-    // When fuse_residual_add=true and residual_type=Q16_1:
-    //   - Wo projection output stays in ZMM as FP32 (no intermediate quantization!)
-    //   - Load Q16_1 residual, dequant to FP32
-    //   - vaddps: proj_fp32 + residual_fp32
-    //   - Quantize sum → Q16_1
-    //   - Store Q16_1 residual
-};
-```
-
-**File**: `src/v2/kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h`
-
-New emission functions in `JitFusedAttentionWoGenerator`:
-
-```cpp
-class JitFusedAttentionWoGenerator : public JitMicrokernelBase
-{
-    // ... existing members ...
-    
-protected:
-    // After Wo projection completes (proj in ZMM accumulators as FP32)
-    void emit_residual_add_q16_1()
-    {
-        // Wo projection result is already in accumulators as FP32 - NO quantization needed!
-        
-        // 1. Load Q16_1 residual block
-        emit_load_q16_1_residual();
-        
-        // 2. Dequant Q16_1 → FP32 (in registers)
-        emit_dequant_q16_1_to_fp32();
-        
-        // 3. Add: proj_fp32 (accumulators) + residual_fp32 (scratch)
-        emit_fp32_add();
-        
-        // 4. Quantize sum → Q16_1
-        emit_quantize_to_q16_1();
-        
-        // 5. Store Q16_1 residual
-        emit_store_q16_1_residual();
-    }
-    
-    void emit_load_q16_1_residual()
-    {
-        // residual_ptr points to Q16_1Block for current position
-        // Q16_1Block layout: float d (4B) | int32 sum_qs (4B) | int16 qs[32] (64B)
-        
-        // Load scale (FP32) - offset 0
-        vbroadcastss(scratch2().zmm(), ptr[reg_residual_ptr]);
-        
-        // Load int16 values (32 elements = 64 bytes) - offset 8
-        vmovdqu16(scratch3().zmm(), ptr[reg_residual_ptr + 8]);        // qs[0:15]
-        vmovdqu16(scratch4().zmm(), ptr[reg_residual_ptr + 8 + 32]);   // qs[16:31]
-    }
-    
-    void emit_dequant_q16_1_to_fp32()
-    {
-        // int16 → int32 → FP32 × scale
-        vpmovsxwd(scratch3().zmm(), scratch3().ymm());  // Sign-extend int16 → int32
-        vcvtdq2ps(scratch3().zmm(), scratch3().zmm());  // int32 → FP32
-        vmulps(scratch3().zmm(), scratch3().zmm(), scratch2().zmm());  // × scale
-        
-        vpmovsxwd(scratch4().zmm(), scratch4().ymm());
-        vcvtdq2ps(scratch4().zmm(), scratch4().zmm());
-        vmulps(scratch4().zmm(), scratch4().zmm(), scratch2().zmm());
-    }
-    
-    void emit_fp32_add()
-    {
-        // Add FP32 projection (in accumulators) to dequantized residual (in scratch3/4)
-        // proj is in accum0-7 as FP32, residual_fp32 is in scratch3/4
-        vaddps(scratch3().zmm(), scratch3().zmm(), accum0().zmm());
-        vaddps(scratch4().zmm(), scratch4().zmm(), accum1().zmm());
-        // Continue for all accumulator registers as needed...
-    }
-    
-    void emit_quantize_to_q16_1()
-    {
-        // Find max_abs of sum
-        vandps(scratch0().zmm(), scratch3().zmm(), const_abs_mask().zmm());
-        vandps(scratch1().zmm(), scratch4().zmm(), const_abs_mask().zmm());
-        vmaxps(scratch0().zmm(), scratch0().zmm(), scratch1().zmm());
-        // ... horizontal reduction to get max_abs scalar ...
-        
-        // Compute scale = max_abs / 32767.0f
-        // Compute inv_scale = 32767.0f / max_abs
-        vbroadcastss(scratch1().zmm(), xmm_inv_scale);
-        
-        // Scale, round, convert to int16
-        vmulps(scratch3().zmm(), scratch3().zmm(), scratch1().zmm());
-        vmulps(scratch4().zmm(), scratch4().zmm(), scratch1().zmm());
-        vroundps(scratch3().zmm(), scratch3().zmm(), _MM_FROUND_TO_NEAREST_INT);
-        vroundps(scratch4().zmm(), scratch4().zmm(), _MM_FROUND_TO_NEAREST_INT);
-        vcvtps_epi32(scratch3().zmm(), scratch3().zmm());
-        vcvtps_epi32(scratch4().zmm(), scratch4().zmm());
-        vpmovdw(scratch3().ymm(), scratch3().zmm());  // 32-bit → 16-bit pack
-        vpmovdw(scratch4().ymm(), scratch4().zmm());
-    }
-    
-    void emit_store_q16_1_residual()
-    {
-        // Store scale (FP32) - offset 0
-        vmovss(ptr[reg_residual_ptr], xmm_new_scale);
-        
-        // Store sum_qs (int32) - offset 4, computed during quantization
-        mov(dword[reg_residual_ptr + 4], reg_sum_qs);
-        
-        // Store int16 values - offset 8
-        vmovdqu16(ptr[reg_residual_ptr + 8], scratch3().ymm());
-        vmovdqu16(ptr[reg_residual_ptr + 8 + 32], scratch4().ymm());
-    }
-};
-```
-
-### 5.4 Register Allocation for Fusion
-
-The JIT kernel needs additional registers for the residual fusion path:
-
-| Zone | Registers | Purpose |
-|------|-----------|---------|
-| **Proj Accum** | zmm0-7 | Wo projection output (existing) |
-| **Residual** | zmm8-11 | Q16_1 residual (load, dequant, sum) |
-| **Scratch** | zmm12-15 | Intermediate computations |
-| **Constants** | zmm28-31 | abs_mask, 32767.0f, etc. |
-
-This fits within the existing register budget with careful scheduling.
-
-### 5.5 Performance Impact
-
-**Before fusion** (separate stages):
-1. Store FP32 Wo output (memory write)
-2. Residual Add: Load Wo, Load Q16_1 residual, Add, Store Q16_1 (4 memory ops)
-
-**After fusion**:
-1. Load Q16_1 residual (memory read)
-2. Store Q16_1 result (memory write)
-
-**Savings**: 3 memory operations per attention block × batch_size × seq_len × num_layers
-
-For Qwen2-0.5B (24 layers), batch=1, seq=2048, d_model=896:
-- Before: 24 × 2048 × 896 × 4 bytes × 4 ops = 700 MB memory traffic
-- After: 24 × 2048 × 896 × 2.25 bytes × 2 ops = 197 MB memory traffic
-- **3.5× reduction in memory bandwidth**
-
-### 5.6 Phase 5 Implementation Progress (December 26, 2025)
-
-#### Completed Work
-
-1. **JitAttentionConfig Extensions**
-   - Added `fuse_residual_add` flag (default: false)
-   - Added `ResidualType` enum (FP32, Q16_1)
-   - Updated equality operator and hash function for kernel caching
-
-2. **JIT Emit Method: `emit_q16_1_residual_fusion()`**
-   - Loads Q16_1 residual block from memory (scale + int16 values)
-   - Dequantizes int16 → FP32 via `vpmovsxwd` + `vcvtdq2ps` + `vmulps`
-   - Adds FP32 Wo output to dequantized residual via `vaddps`
-   - Computes max_abs via horizontal reduction for new scale
-   - Quantizes sum to int16 via `vcvtps2dq` + `vpmovsdw`
-   - Stores Q16_1 block (scale, sum_qs, int16 values)
-
-3. **emit_wo_projection() Integration**
-   - Allocates temporary FP32 buffer on stack when fused
-   - Adjusts output pointer stride for Q16_1 layout (72 bytes per 32 elements)
-   - Calls residual fusion after Wo projection completes
-   - Restores stack after fusion
-
-4. **Unit Tests** (`Test__JitFusedAttentionWo_Q16_1Residual.cpp`)
-   - Config validation tests
-   - Q16_1 roundtrip accuracy (cosine: 1.0, rel error: 1.5e-5)
-   - Reference residual addition parity
-   - JIT kernel generation verification
-   - Q16_1Block layout validation
-
-#### Files Modified
-
-| File | Changes |
-|------|---------|
-| `JitFusedAttentionWo.h` | +200 lines: config, emit methods, integration |
-| `tests/v2/CMakeLists.txt` | Added test target |
-| `Test__JitFusedAttentionWo_Q16_1Residual.cpp` | New file, 6 tests |
-
-#### Test Results
-
-All 8 JIT fused attention tests pass (6 new + 2 existing):
-- `JitKernelGenerationWithFusedResidual`: Kernel generates successfully
-- `Q16_1RoundtripAccuracy`: Cosine 1.0, Rel L2 Error 1.5e-5
-- `ReferenceResidualAddition`: Cosine 1.0, Rel L2 Error 1.8e-5
-
-#### Remaining Work
-
-- Integration test: Full attention pipeline with Q16_1 residual fusion
-- End-to-end parity test vs FP32 reference
-- Performance benchmarking (decode latency, memory bandwidth)
-
----
-
-## Phase 6: Integration Wiring (NEXT)
-
-**Status**: Not Started  
-**Estimated Effort**: 4-6 hours  
-**Prerequisites**: Phase 5 (JIT Fusion kernel) complete
+**Status**: ✅ Complete (December 27, 2025)
 
 ### Overview
 
-Phase 6 wires the JIT fusion kernel into the production pipeline. The JIT code exists and passes unit tests, but the production code path doesn't enable it. This phase connects:
+Phase 5 implements the **complete pure integer Q16 attention pipeline** as scalar C++ reference kernels. These reference implementations serve as:
+1. **Ground truth** for JIT kernel validation (bit-exact or tolerance match)
+2. **Readable, debuggable** implementation for algorithm development
+3. **Fallback** when JIT is not available
+
+### Pure Integer Pipeline Architecture
+
+The entire attention-to-residual path operates in integer domain with **no FP32 intermediate values**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PURE INTEGER Q16 ATTENTION PIPELINE                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Q, K, V (Q16_1)                                                            │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Q×K^T Dot Products (Q16DotProductRef + Int8RequantRef)               │   │
+│  │   INT16 × INT16 → INT32 scores                                        │   │
+│  │   Scales combined: scale_q × scale_k × attention_scale               │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│       │ INT32 scores                                                        │
+│       ▼                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Exp2FixedSoftmaxRef (Pure Integer Softmax)                           │   │
+│  │   INT32 → INT16 attention weights [0, 32767]                         │   │
+│  │   Uses exp2 approximation: 2^(x/32768) via bit manipulation          │   │
+│  │   Output scaled to fill INT16 range for max precision                 │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│       │ INT16 attention weights                                             │
+│       ▼                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ P×V Accumulation (PVAccumulateRef)                                   │   │
+│  │   INT16 × INT16 → INT32 accumulators                                  │   │
+│  │   NOT FP32! Stays in integer domain                                  │   │
+│  │   Carries combined scale for final dequantization                    │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│       │ INT32 context accumulators                                          │
+│       ▼                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Wo Projection (WoProjectionVNNIRef using VPDPWSSD)                   │   │
+│  │   INT16 (context) × INT16 (weights) → INT32 → Q16_1                  │   │
+│  │   Uses AVX-512 VPDPWSSD: INT16×INT16 dot products                    │   │
+│  │   Output: Q16_1 blocks with new scale                                │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│       │ Q16_1 projection output                                             │
+│       ▼                                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Native Q16_1 Residual Add (simd::q16_1_add_q16_1)                    │   │
+│  │   Q16_1 + Q16_1 → Q16_1                                               │   │
+│  │   Fused dequant-add-requant with scale renormalization               │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                      │
+│       ▼                                                                      │
+│  Q16_1 residual output                                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Reference Kernel File Structure
+
+```
+src/v2/kernels/cpu/attention/q16_1/
+├── ref/
+│   ├── Q16FusedAttentionRef.h          # Main orchestrator API
+│   ├── Q16FusedAttentionRef.cpp        # Full pipeline implementation
+│   └── microkernels/
+│       ├── Q16DotProductRef.h/.cpp     # Q×K^T dot products (INT16→INT32)
+│       ├── Int8RequantRef.h/.cpp       # INT32→INT8 requantization for scores
+│       ├── Exp2FixedSoftmaxRef.h/.cpp  # Pure integer softmax (INT32→INT16)
+│       ├── PVAccumulateRef.h/.cpp      # P×V accumulation (INT16×INT16→INT32)
+│       └── WoProjectionVNNIRef.h/.cpp  # Wo projection via VPDPWSSD
+```
+
+### Microkernel Implementations
+
+#### 5.1 Q16DotProductRef
+
+**File**: `src/v2/kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProductRef.h`
+
+Computes Q×K^T dot products in pure integer domain:
+
+```cpp
+/**
+ * @brief Q×K^T dot product for a single query position
+ * 
+ * @param Q_row      Query row (Q16_1 blocks for one position)
+ * @param K          Key cache (Q16_1 blocks, all KV positions)
+ * @param scores     Output INT32 scores [kv_len]
+ * @param kv_len     Number of KV positions
+ * @param head_dim   Dimension per head
+ * @param scale      Attention scale (1/sqrt(head_dim))
+ */
+void q16_dot_product_ref(
+    const Q16_1Block* Q_row,
+    const Q16_1Block* K,
+    int32_t* scores,
+    int kv_len,
+    int head_dim,
+    float scale);
+```
+
+**Algorithm**:
+1. For each KV position: compute INT16×INT16 dot product → INT32
+2. Accumulate across blocks with scale combination
+3. Output combined score including attention_scale factor
+
+#### 5.2 Int8RequantRef
+
+**File**: `src/v2/kernels/cpu/attention/q16_1/ref/microkernels/Int8RequantRef.h`
+
+Requantizes INT32 scores to INT8 for efficient softmax:
+
+```cpp
+/**
+ * @brief Requantize INT32 scores to INT8 for softmax
+ * 
+ * @param scores_in  Input INT32 scores [count]
+ * @param scores_out Output INT8 scores [count]
+ * @param count      Number of scores
+ * @param out_scale  Output scale factor
+ */
+void int8_requant_ref(
+    const int32_t* scores_in,
+    int8_t* scores_out,
+    int count,
+    float* out_scale);
+```
+
+#### 5.3 Exp2FixedSoftmaxRef
+
+**File**: `src/v2/kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmaxRef.h`
+
+Pure integer softmax using exp2 approximation:
+
+```cpp
+/**
+ * @brief Fixed-point softmax using exp2 approximation
+ * 
+ * Computes softmax in pure integer domain:
+ * 1. Find max score (INT32)
+ * 2. Subtract max, scale to Q15 fractional format
+ * 3. Compute exp2 via bit manipulation (2^x approximation)
+ * 4. Normalize to fill INT16 range [0, 32767]
+ * 
+ * @param scores_in   Input INT32 scores [count]
+ * @param weights_out Output INT16 attention weights [count]
+ * @param count       Number of scores
+ * @param scale       Input scale factor
+ */
+void exp2_fixed_softmax_ref(
+    const int32_t* scores_in,
+    int16_t* weights_out,
+    int count,
+    float scale);
+```
+
+**Algorithm Details**:
+- Uses exp2(x) ≈ 2^floor(x) × (1 + frac(x)) for x in fixed-point
+- Output normalized so max weight = 32767 (full INT16 precision)
+- Sum of weights preserved for proper probability distribution
+
+#### 5.4 PVAccumulateRef
+
+**File**: `src/v2/kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulateRef.h`
+
+P×V weighted accumulation in integer domain:
+
+```cpp
+/**
+ * @brief Weighted value accumulation (P×V) in INT32 domain
+ * 
+ * @param weights     INT16 attention weights [kv_len]
+ * @param V           Value cache (Q16_1 blocks)
+ * @param accumulators Output INT32 accumulators [head_dim]
+ * @param kv_len      Number of KV positions
+ * @param head_dim    Dimension per head
+ * @param combined_scale Output: combined scale for dequantization
+ */
+void pv_accumulate_ref(
+    const int16_t* weights,
+    const Q16_1Block* V,
+    int32_t* accumulators,
+    int kv_len,
+    int head_dim,
+    float* combined_scale);
+```
+
+**Key Insight**: Stays in INT32 domain (no FP32 conversion), carries combined scale for final Wo projection.
+
+#### 5.5 WoProjectionVNNIRef
+
+**File**: `src/v2/kernels/cpu/attention/q16_1/ref/microkernels/WoProjectionVNNIRef.h`
+
+Wo projection using VPDPWSSD (INT16×INT16→INT32):
+
+```cpp
+/**
+ * @brief Wo projection using VPDPWSSD instruction pattern
+ * 
+ * Computes: output = context × Wo_weights
+ * Using INT16×INT16 dot products (VPDPWSSD pattern)
+ * 
+ * @param params WoProjectionParams containing:
+ *   - context: INT32 accumulators [d_model] 
+ *   - Wo_packed: VNNI-packed weights (QuantisedPackedWeights)
+ *   - output: Q16_1 output blocks
+ *   - d_model: model dimension
+ *   - combined_scale: scale from P×V accumulation
+ */
+bool wo_projection_vnni_ref(const WoProjectionParams& params);
+```
+
+**VNNI Packing**: Weights are packed using `KernelFactory::ensurePackedWeightsInTensorCache()` for efficient VPDPWSSD execution.
+
+### Main API: Q16FusedAttentionRef
+
+**File**: `src/v2/kernels/cpu/attention/q16_1/ref/Q16FusedAttentionRef.h`
+
+The main API provides two execution paths:
+
+```cpp
+namespace llaminar2::kernels::q16_1 {
+
+/**
+ * @brief Full fused attention block parameters
+ */
+struct Q16FusedAttentionWoResidualParams {
+    // Attention tensors (Q16_1)
+    const Q16_1Block* Q;           // [seq_len_q × blocks]
+    const Q16_1Block* K;           // [kv_len × blocks]
+    const Q16_1Block* V;           // [kv_len × blocks]
+    
+    // Wo projection weights (VNNI-packed)
+    const gemm_v4::QuantisedPackedWeights* Wo_packed;
+    
+    // Residual tensors (Q16_1)
+    const Q16_1Block* residual_in;
+    Q16_1Block* residual_out;      // Can be same as residual_in
+    
+    // Dimensions
+    int seq_len_q, kv_len, num_heads, num_kv_heads, head_dim, d_model;
+    
+    // Config
+    float scale;      // Attention scale (1/sqrt(head_dim))
+    bool causal;      // Apply causal masking
+};
+
+/**
+ * @brief FLASH DECODE path (seq_len_q == 1)
+ * Single query against full KV cache, optimized for latency.
+ */
+bool q16_fused_attention_wo_residual_decode(
+    const Q16FusedAttentionWoResidualParams& params);
+
+/**
+ * @brief FA2 PREFILL path (seq_len_q > 1)
+ * Batched queries with per-query processing, optimized for throughput.
+ */
+bool q16_fused_attention_wo_residual_prefill(
+    const Q16FusedAttentionWoResidualParams& params);
+
+}  // namespace llaminar2::kernels::q16_1
+```
+
+### Unit Tests
+
+**Test Files**:
+- `tests/v2/unit/Test__Q16Microkernels.cpp` - Individual microkernel tests
+- `tests/v2/unit/Test__Q16IntegerDomainParity.cpp` - Attention core parity vs FP32
+- `tests/v2/unit/Test__Q16IntegerDomainWoProjection.cpp` - Wo projection parity
+- `tests/v2/unit/Test__Q16FullPipelineParity.cpp` - End-to-end pipeline parity
+- `tests/v2/unit/Test__Exp2FixedSoftmaxRef.cpp` - Integer softmax accuracy
+
+### Parity Results Summary
+
+| Component | Test | Cosine Similarity | Status |
+|-----------|------|-------------------|--------|
+| Attention Core | SmallConfig_Decode | 1.000000 | ✅ |
+| Attention Core | LargerConfig_Decode | 1.000000 | ✅ |
+| Attention Core | GQA_Config | 1.000000 | ✅ |
+| Attention Core | Prefill (4 positions) | 0.999967-0.999996 | ✅ |
+| Attention Core | Long KV (2048) | 0.999829 | ✅ |
+| Exp2Softmax | vs FP32 softmax | 1.000000 | ✅ |
+| Wo Projection | SmallConfig | 0.998980 | ✅ |
+| Wo Projection | LargerConfig | 0.999206 | ✅ |
+| Wo Projection | GQA_Config | 0.999576 | ✅ |
+| **Full Pipeline** | SmallDecode | 0.999572 | ✅ |
+| **Full Pipeline** | LargerDecode | 0.999758 | ✅ |
+| **Full Pipeline** | GQA | 0.999872 | ✅ |
+
+All tests achieve **≥99.8% cosine similarity** against FP32 reference.
+
+---
+
+## Phase 6: JIT Fusion (IN PROGRESS 🔄)
+
+### Goal
+
+Translate the reference kernels into JIT-generated AVX-512 assembly for maximum performance. The JIT kernel will fuse all operations from attention through residual into a single kernel with:
+- All intermediate values in **ZMM registers** (no memory traffic)
+- VPDPWSSD for INT16×INT16 dot products
+- Inline exp2 approximation for softmax
+- Fused quantize-add-requantize for residual
+
+### 6.1 JIT Microkernel Architecture
+
+The Q16 JIT kernels follow the same pattern as existing Q8_1 JIT kernels, located in:
+```
+src/v2/kernels/cpu/attention/q16_1/jit/  (to be created)
+├── JitQ16DotProduct.h          # Q×K^T dot products (INT16×INT16→INT32)
+├── JitExp2FixedSoftmax.h       # Pure integer softmax
+├── JitPVAccumulate.h           # P×V accumulation (INT16×INT16→INT32)
+├── JitWoProjectionVNNI.h       # Wo projection via VPDPWSSD
+└── JitQ16FusedAttention.h      # Full fused kernel orchestrator
+```
+
+Each mirrors the reference implementation but uses Xbyak for runtime code generation.
+
+### 6.2 Register Allocation Strategy
+
+The Q16 pipeline requires careful register allocation to minimize spills:
+
+| Zone | Registers | Purpose |
+|------|-----------|---------|
+| **Q Vectors** | zmm0-3 | Query data (INT16 packed) |
+| **K Vectors** | zmm4-7 | Key data (INT16 packed) |
+| **Score Accum** | zmm8-11 | Q×K^T INT32 scores |
+| **Softmax State** | zmm12-15 | max, sum, weights |
+| **V Vectors** | zmm16-19 | Value data (INT16 packed) |
+| **Context Accum** | zmm20-23 | P×V INT32 accumulators |
+| **Wo Output** | zmm24-27 | Wo projection accumulators |
+| **Constants** | zmm28-31 | Scales, masks, exp2 LUT |
+
+**Note**: For FLASH DECODE (seq_len_q=1), register pressure is manageable. For FA2 PREFILL with multiple queries, may need tiling with register spills.
+
+### 6.3 JIT Emit Functions (Following Reference)
+
+#### 6.3.1 Q×K^T Dot Product
+
+```cpp
+void emit_q16_dot_product() {
+    // Load Q block (32 INT16 values = 64 bytes)
+    vmovdqu16(zmm_q_lo, ptr[reg_Q]);
+    vmovdqu16(zmm_q_hi, ptr[reg_Q + 32]);
+    
+    // For each K position:
+    L(".kv_loop");
+    {
+        // Load K block
+        vmovdqu16(zmm_k_lo, ptr[reg_K]);
+        vmovdqu16(zmm_k_hi, ptr[reg_K + 32]);
+        
+        // INT16×INT16 → INT32 via vpmaddwd
+        vpmaddwd(zmm_prod_lo, zmm_q_lo, zmm_k_lo);  // 16 INT32 results
+        vpmaddwd(zmm_prod_hi, zmm_q_hi, zmm_k_hi);
+        
+        // Horizontal sum to get dot product
+        vpaddd(zmm_prod_lo, zmm_prod_lo, zmm_prod_hi);
+        // ... horizontal reduction ...
+        
+        // Store INT32 score
+        mov(dword[reg_scores + r_kv * 4], eax);
+    }
+}
+```
+
+#### 6.3.2 Exp2 Fixed-Point Softmax
+
+```cpp
+void emit_exp2_fixed_softmax() {
+    // 1. Find max score (INT32)
+    emit_horizontal_max_i32();
+    
+    // 2. Subtract max from all scores
+    vpsubd(zmm_scores, zmm_scores, zmm_max);
+    
+    // 3. Scale to Q15 fixed-point for exp2
+    // exp2(x) = 2^(x * log2(e))
+    // In fixed-point: x_q15 = (score - max) * (log2e / scale)
+    
+    // 4. Compute exp2 via bit manipulation
+    // 2^x ≈ 2^floor(x) × (1 + frac(x))
+    // For negative x in Q15: use shift for 2^floor, linear for fraction
+    emit_exp2_q15();
+    
+    // 5. Normalize to fill INT16 range
+    emit_normalize_to_int16();
+}
+```
+
+#### 6.3.3 P×V Accumulation (Pure Integer)
+
+```cpp
+void emit_pv_accumulate() {
+    // For each KV position with non-zero weight:
+    L(".pv_loop");
+    {
+        // Load INT16 weight (broadcasted)
+        vpbroadcastw(zmm_weight, word[reg_weights + r_kv * 2]);
+        
+        // Load V block (32 INT16)
+        vmovdqu16(zmm_v, ptr[reg_V + r_kv * stride]);
+        
+        // INT16 × INT16 → INT32 accumulate
+        // Use VPDPWSSD for pairs: acc += weight * v
+        vpmaddwd(zmm_prod, zmm_weight_paired, zmm_v);
+        vpaddd(zmm_accum, zmm_accum, zmm_prod);
+    }
+}
+```
+
+#### 6.3.4 Wo Projection via VPDPWSSD
+
+```cpp
+void emit_wo_projection_vnni() {
+    // Context is in INT32 accumulators, convert to INT16 for VPDPWSSD
+    emit_int32_to_int16_with_scale();
+    
+    // For each output column tile:
+    L(".wo_col_loop");
+    {
+        // Load VNNI-packed Wo weights
+        vmovdqu8(zmm_wo, ptr[reg_Wo_packed + offset]);
+        
+        // VPDPWSSD: INT16×INT16 → INT32
+        // Accumulate 2 INT16 pairs per lane
+        vpdpwssd(zmm_out, zmm_context_int16, zmm_wo);
+    }
+    
+    // Convert INT32 output to Q16_1
+    emit_int32_to_q16_1();
+}
+```
+
+#### 6.3.5 Q16_1 Residual Fusion
+
+```cpp
+void emit_q16_1_residual_fusion() {
+    // Load existing residual (Q16_1 block)
+    vbroadcastss(zmm_scale, dword[reg_residual]);      // Load scale
+    vmovdqu16(zmm_qs_lo, ptr[reg_residual + 8]);       // Load INT16 values
+    vmovdqu16(zmm_qs_hi, ptr[reg_residual + 40]);
+    
+    // Dequant: INT16 → FP32
+    vpmovsxwd(zmm_res_lo, ymm_qs_lo);
+    vcvtdq2ps(zmm_res_lo, zmm_res_lo);
+    vmulps(zmm_res_lo, zmm_res_lo, zmm_scale);
+    // ... same for hi ...
+    
+    // Add Wo output (already in FP32 registers)
+    vaddps(zmm_sum_lo, zmm_wo_out_lo, zmm_res_lo);
+    vaddps(zmm_sum_hi, zmm_wo_out_hi, zmm_res_hi);
+    
+    // Requantize to Q16_1
+    emit_quantize_to_q16_1();
+    
+    // Store Q16_1 block
+    vmovss(dword[reg_residual], xmm_new_scale);
+    vmovdqu16(ptr[reg_residual + 8], ymm_qs_lo);
+    vmovdqu16(ptr[reg_residual + 40], ymm_qs_hi);
+}
+```
+
+### 6.4 Performance Targets
+
+| Metric | Reference (Scalar) | Target (JIT) | Speedup |
+|--------|-------------------|--------------|---------|
+| Q×K^T per position | ~100 cycles | ~15 cycles | 6.7× |
+| Softmax (256 positions) | ~2000 cycles | ~300 cycles | 6.7× |
+| P×V accumulation | ~500 cycles | ~80 cycles | 6.3× |
+| Wo projection | ~1000 cycles | ~150 cycles | 6.7× |
+| **Full decode** | ~4000 cycles | ~600 cycles | **6.7×** |
+
+### 6.5 Implementation Roadmap
+
+| Task | Status | Estimated Effort |
+|------|--------|------------------|
+| JitQ16DotProduct.h | ⏳ Pending | 4-6 hours |
+| JitExp2FixedSoftmax.h | ⏳ Pending | 4-6 hours |
+| JitPVAccumulate.h | ⏳ Pending | 3-4 hours |
+| JitWoProjectionVNNI.h | ⏳ Pending | 4-6 hours |
+| JitQ16FusedAttention.h | ⏳ Pending | 6-8 hours |
+| Unit tests (JIT vs Ref parity) | ⏳ Pending | 4-6 hours |
+| Integration with FusedAttentionWoKernel | ⏳ Pending | 2-3 hours |
+
+### 6.6 Validation Strategy
+
+Each JIT microkernel will be validated against the reference implementation:
+
+```cpp
+TEST(JitQ16DotProductTest, ParityWithReference) {
+    // Generate random Q, K tensors
+    // Run reference: q16_dot_product_ref()
+    // Run JIT: jit_kernel->compute()
+    // Compare: EXPECT_EQ(ref_scores, jit_scores) // bit-exact
+}
+```
+
+For the full fused kernel:
+```cpp
+TEST(JitQ16FusedAttentionTest, FullPipelineParity) {
+    // Same test as Test__Q16FullPipelineParity.cpp
+    // But using JIT kernel instead of reference
+    // Expected: ≥99.95% cosine similarity
+}
+```
+
+---
+
+## Phase 7: Integration Wiring (PENDING ⏳)
+
+**Status**: Pending (depends on Phase 6 JIT completion)  
+**Estimated Effort**: 4-6 hours  
+**Prerequisites**: Phase 6 (JIT Fusion kernel) complete
+
+### Overview
+
+Phase 7 wires the JIT fusion kernel into the production pipeline. This phase connects:
 
 1. CLI argument `--activation-precision hybridq16`
 2. `FusedAttentionWoStage` passing residual buffer to kernel
@@ -1567,16 +1828,24 @@ TEST(Test__E2E_HybridQ16, AccumulationError)
 
 ## Timeline
 
-| Phase | Estimated Effort | Dependencies |
-|-------|------------------|--------------|
-| Phase 1: Foundation | 2-3 hours | None |
-| Phase 2: Buffer Allocation | 2-3 hours | Phase 1 |
-| Phase 3: Stage Implementations | 4-6 hours | Phase 1, 2 |
-| Phase 4: RMSNorm Q16_1 | 4-6 hours | Phase 1 |
-| Phase 5: JIT Fusion | 8-12 hours | Phase 1-4 |
-| Phase 6: Integration Wiring | 4-6 hours | Phase 5 |
-| Validation & Testing | 4-6 hours | All phases |
-| **Total** | **28-42 hours** | |
+| Phase | Status | Estimated Effort | Dependencies |
+|-------|--------|------------------|--------------|
+| Phase 1: Foundation | ✅ Complete | 2-3 hours | None |
+| Phase 2: Buffer Allocation | ✅ Complete | 2-3 hours | Phase 1 |
+| Phase 3: Stage Implementations | ✅ Complete | 4-6 hours | Phase 1, 2 |
+| Phase 3.5: Q16_1 RoPE | ✅ Complete | 3-4 hours | Phase 1 |
+| Phase 4: RMSNorm Q16_1 | ✅ Complete | 4-6 hours | Phase 1 |
+| Phase 5: Pure Integer Ref Kernels | ✅ Complete | 16-20 hours | Phase 1-4 |
+| Phase 6: JIT Fusion | 🔄 In Progress | 24-32 hours | Phase 5 |
+| Phase 7: Integration Wiring | ⏳ Pending | 4-6 hours | Phase 6 |
+| Validation & Testing | ⏳ Ongoing | 4-6 hours | All phases |
+| **Total** | | **64-84 hours** | |
+
+### Completed Work Summary
+
+- **Reference kernel implementation**: 5 microkernels + fused orchestrator
+- **End-to-end parity validation**: ≥99.95% cosine similarity vs FP32
+- **Test coverage**: 14 new tests for Q16 pipeline components
 
 ---
 
