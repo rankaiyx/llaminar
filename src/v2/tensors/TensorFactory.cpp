@@ -129,6 +129,19 @@ namespace llaminar2
         return std::make_unique<Q16_1Tensor>(shape, device_idx);
     }
 
+    std::unique_ptr<Q16_1Tensor> TensorFactory::createQ16_1(const std::vector<size_t> &shape,
+                                                            Q16BlockSize block_size,
+                                                            int device_idx)
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+
+        // Use the mutable activation buffer constructor with custom block size
+        return std::make_unique<Q16_1Tensor>(shape, block_size, device_idx);
+    }
+
     std::unique_ptr<TensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
                                                                 ActivationPrecision precision,
                                                                 int device_idx)

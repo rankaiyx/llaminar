@@ -1,4 +1,4 @@
-#include "Exp2FixedSoftmaxRef.h"
+#include "Exp2FixedSoftmaxRef.deprecated.h"
 
 #include <algorithm>
 #include <array>

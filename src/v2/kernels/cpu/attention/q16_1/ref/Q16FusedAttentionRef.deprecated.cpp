@@ -54,11 +54,11 @@
  * @date December 2025
  */
 
-#include "Q16FusedAttentionRef.h"
-#include "microkernels/Q16DotProductRef.h"
-#include "microkernels/Exp2FixedSoftmaxRef.h"
-#include "microkernels/Int8RequantRef.h"
-#include "microkernels/WoProjectionVNNIRef.h"
+#include "Q16FusedAttentionRef.deprecated.h"
+#include "microkernels/Q16DotProductRef.deprecated.h"
+#include "microkernels/Exp2FixedSoftmaxRef.deprecated.h"
+#include "microkernels/Int8RequantRef.deprecated.h"
+#include "microkernels/WoProjectionVNNIRef.deprecated.h"
 #include "tensors/SIMDHelpers.h"
 #include "utils/Assertions.h"
 #include "utils/DebugEnv.h"
@@ -221,11 +221,11 @@ namespace llaminar2::kernels::q16_1
             const auto &cfg = debugEnv().q16_attention_dump;
             if (cfg.enabled && params.layer_idx == cfg.layer && head == cfg.head)
             {
-                LOG_DEBUG("[Q16AttnDump] SLOW_SCORE_ELEM layer=" << params.layer_idx << " head=" << head
-                                                                 << " q_row=" << q_row << " kv_pos=0"
-                                                                 << " q_start_col=" << q_start_col << " k_start_col=" << k_start_col
-                                                                 << " q_blocks_per_row=" << q_blocks_per_row << " kv_blocks_per_row=" << kv_blocks_per_row);
-
+                LOG_DEBUG("[Q16AttnDump] SLOW_SCORE_ELEM layer=" << params.layer_idx << " head=" << head 
+                          << " q_row=" << q_row << " kv_pos=0"
+                          << " q_start_col=" << q_start_col << " k_start_col=" << k_start_col
+                          << " q_blocks_per_row=" << q_blocks_per_row << " kv_blocks_per_row=" << kv_blocks_per_row);
+                
                 // Recompute for kv_pos=0 with element-level trace
                 const Q16_1Block *k0_row_ptr = params.K + 0 * kv_blocks_per_row;
                 double trace_sum = 0.0;
@@ -885,18 +885,18 @@ namespace llaminar2::kernels::q16_1
                 if (kv_end > 0)
                 {
                     LOG_DEBUG("[Q16AttnDump] worst_score idx=" << worst_score_idx
-                                                               << " fast=" << fp32_scores[worst_score_idx]
-                                                               << " slow=" << slow_scores[static_cast<size_t>(worst_score_idx)]
-                                                               << " w_int=" << w_int[static_cast<size_t>(worst_score_idx)]
-                                                               << " fast_w=" << fp32_weights[static_cast<size_t>(worst_score_idx)]
-                                                               << " slow_w=" << slow_weights[static_cast<size_t>(worst_score_idx)]);
+                                                             << " fast=" << fp32_scores[worst_score_idx]
+                                                             << " slow=" << slow_scores[static_cast<size_t>(worst_score_idx)]
+                                                             << " w_int=" << w_int[static_cast<size_t>(worst_score_idx)]
+                                                             << " fast_w=" << fp32_weights[static_cast<size_t>(worst_score_idx)]
+                                                             << " slow_w=" << slow_weights[static_cast<size_t>(worst_score_idx)]);
 
                     LOG_DEBUG("[Q16AttnDump] worst_weight idx=" << worst_w_idx
-                                                                << " fast=" << fp32_scores[worst_w_idx]
-                                                                << " slow=" << slow_scores[static_cast<size_t>(worst_w_idx)]
-                                                                << " w_int=" << w_int[static_cast<size_t>(worst_w_idx)]
-                                                                << " fast_w=" << fp32_weights[static_cast<size_t>(worst_w_idx)]
-                                                                << " slow_w=" << slow_weights[static_cast<size_t>(worst_w_idx)]);
+                                                               << " fast=" << fp32_scores[worst_w_idx]
+                                                               << " slow=" << slow_scores[static_cast<size_t>(worst_w_idx)]
+                                                               << " w_int=" << w_int[static_cast<size_t>(worst_w_idx)]
+                                                               << " fast_w=" << fp32_weights[static_cast<size_t>(worst_w_idx)]
+                                                               << " slow_w=" << slow_weights[static_cast<size_t>(worst_w_idx)]);
                 }
             }
 
@@ -1345,18 +1345,18 @@ namespace llaminar2::kernels::q16_1
                 if (kv_end > 0)
                 {
                     LOG_DEBUG("[Q16AttnDump] worst_score idx=" << worst_score_idx
-                                                               << " fast=" << fp32_scores[worst_score_idx]
-                                                               << " slow=" << slow_scores[static_cast<size_t>(worst_score_idx)]
-                                                               << " w_int=" << w_int[static_cast<size_t>(worst_score_idx)]
-                                                               << " fast_w=" << fp32_weights[static_cast<size_t>(worst_score_idx)]
-                                                               << " slow_w=" << slow_weights[static_cast<size_t>(worst_score_idx)]);
+                                                             << " fast=" << fp32_scores[worst_score_idx]
+                                                             << " slow=" << slow_scores[static_cast<size_t>(worst_score_idx)]
+                                                             << " w_int=" << w_int[static_cast<size_t>(worst_score_idx)]
+                                                             << " fast_w=" << fp32_weights[static_cast<size_t>(worst_score_idx)]
+                                                             << " slow_w=" << slow_weights[static_cast<size_t>(worst_score_idx)]);
 
                     LOG_DEBUG("[Q16AttnDump] worst_weight idx=" << worst_w_idx
-                                                                << " fast=" << fp32_scores[worst_w_idx]
-                                                                << " slow=" << slow_scores[static_cast<size_t>(worst_w_idx)]
-                                                                << " w_int=" << w_int[static_cast<size_t>(worst_w_idx)]
-                                                                << " fast_w=" << fp32_weights[static_cast<size_t>(worst_w_idx)]
-                                                                << " slow_w=" << slow_weights[static_cast<size_t>(worst_w_idx)]);
+                                                               << " fast=" << fp32_scores[worst_w_idx]
+                                                               << " slow=" << slow_scores[static_cast<size_t>(worst_w_idx)]
+                                                               << " w_int=" << w_int[static_cast<size_t>(worst_w_idx)]
+                                                               << " fast_w=" << fp32_weights[static_cast<size_t>(worst_w_idx)]
+                                                               << " slow_w=" << slow_weights[static_cast<size_t>(worst_w_idx)]);
                 }
             }
 

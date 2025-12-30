@@ -530,6 +530,152 @@ namespace llaminar2::primitives
         RoPEPersistentState *persistent_state = nullptr);
 
     // ============================================================================
+    // Templated Q16 RoPE Primitives (Variable Block Size Support)
+    // ============================================================================
+    // These templated functions support all Q16 block sizes (32, 64, 128, 192).
+    // The block type determines BLOCK_SIZE at compile time for optimal vectorization.
+    //
+    // Template parameter BlockType must have:
+    //   - static constexpr size_t BLOCK_SIZE
+    //   - float d (scale factor)
+    //   - int32_t sum_qs (pre-computed sum)
+    //   - int16_t qs[BLOCK_SIZE] (quantized values)
+    //
+    // Supported block types: Q16_1Block, Q16_1Block_64, Q16_1Block_128, Q16_1Block_192
+    // ============================================================================
+
+    /**
+     * @brief Templated scalar RoPE implementation for any Q16 block type
+     *
+     * Reference implementation that works with any block size.
+     * Used for testing and as fallback for non-vectorized paths.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, etc.)
+     * @param head_blocks Q16 blocks for one head (1 block for 1-block-per-head)
+     * @param num_blocks Number of blocks in the head
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer_head_scalar(
+        BlockType *head_blocks,
+        int num_blocks,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+    /**
+     * @brief Templated AVX2 RoPE implementation for any Q16 block type
+     *
+     * Processes 8 elements at a time using AVX2 intrinsics.
+     * Uses a loop over chunks for variable block sizes.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, etc.)
+     * @param head_blocks Q16 blocks for one head
+     * @param num_blocks Number of blocks in the head
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer_head_avx2(
+        BlockType *head_blocks,
+        int num_blocks,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Templated AVX512 RoPE implementation for any Q16 block type
+     *
+     * Processes 16 elements at a time using AVX512 intrinsics.
+     * Uses a loop over chunks for variable block sizes.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, etc.)
+     * @param head_blocks Q16 blocks for one head
+     * @param num_blocks Number of blocks in the head
+     * @param cos_q15 Pre-computed cosine values in Q15 [head_dim/2]
+     * @param sin_q15 Pre-computed sine values in Q15 [head_dim/2]
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer_head_avx512(
+        BlockType *head_blocks,
+        int num_blocks,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+#endif
+
+    /**
+     * @brief Templated auto-dispatching RoPE implementation
+     *
+     * Automatically selects optimal implementation (AVX512 > AVX2 > scalar).
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, etc.)
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer_head(
+        BlockType *head_blocks,
+        int num_blocks,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15);
+
+    /**
+     * @brief Apply in-place RoPE to Q16 Q and K tensors (templated version)
+     *
+     * High-level wrapper for any Q16 block size.
+     *
+     * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, etc.)
+     * @param Q Q16 Q tensor [seq_len * n_heads * blocks_per_head]
+     * @param K Q16 K tensor [seq_len * n_kv_heads * blocks_per_head] or nullptr
+     * @param position_ids Position indices [seq_len], -1 = padding
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension (must be divisible by BlockType::BLOCK_SIZE)
+     * @param rope_theta RoPE base frequency (e.g., 10000.0f)
+     * @param persistent_state Optional persistent state for decode optimization
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer(
+        BlockType *Q,
+        BlockType *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        RoPEPersistentState *persistent_state = nullptr);
+
+    /**
+     * @brief Apply RoPE with runtime block size selection
+     *
+     * Dispatches to correct template instantiation based on Q16BlockSize enum.
+     *
+     * @param Q Q16 Q tensor (void* for runtime polymorphism)
+     * @param K Q16 K tensor or nullptr
+     * @param block_size Runtime block size selector
+     * @param position_ids Position indices [seq_len]
+     * @param seq_len Sequence length
+     * @param n_heads Number of query heads
+     * @param n_kv_heads Number of key/value heads
+     * @param head_dim Head dimension
+     * @param rope_theta RoPE base frequency
+     * @param persistent_state Optional persistent state
+     */
+    void apply_rope_q16_integer_dispatch(
+        void *Q,
+        void *K,
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        RoPEPersistentState *persistent_state = nullptr);
+
+    // ============================================================================
     // Q8_1 → Q16_1 RoPE Primitives (HybridQ16 Mode)
     // ============================================================================
     // These primitives take Q8_1 input, apply RoPE rotation, and output Q16_1.

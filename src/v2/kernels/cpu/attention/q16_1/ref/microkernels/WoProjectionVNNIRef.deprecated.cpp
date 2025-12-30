@@ -10,7 +10,7 @@
  * Then: Q16_1(projection) + Q16_1(residual) → Q16_1 (via simd::q16_1_add_q16_1)
  */
 
-#include "WoProjectionVNNIRef.h"
+#include "WoProjectionVNNIRef.deprecated.h"
 #include <cstring>
 #include <cmath>
 #include <algorithm>

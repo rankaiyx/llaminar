@@ -25,6 +25,7 @@
 #include "../../../execution/RuntimeConfig.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorKernels.h" // For ITensorRoPE
+#include "../primitives/RoPEPrimitives.h"   // For RoPEPersistentState
 
 #include <cstdint>
 
@@ -562,10 +563,30 @@ namespace llaminar2
                 .withScalar("rope_theta", "RoPE frequency base");
         }
 
-        // Internal typed implementation
+        // Internal typed implementation (32-element blocks for backward compatibility)
         bool apply_typed(
             Q16_1Block *Q,
             Q16_1Block *K,
+            const int *position_ids,
+            int seq_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            float rope_theta = 10000.0f,
+            int device_idx = -1);
+
+        /**
+         * @brief Templated apply for variable Q16 block sizes
+         *
+         * Calls the appropriate templated RoPE primitive for the given block type.
+         * Supports: Q16_1Block (32), Q16_1Block_64, Q16_1Block_128, Q16_1Block_192
+         *
+         * @tparam BlockType Q16 block type
+         */
+        template <typename BlockType>
+        bool apply_typed_block(
+            BlockType *Q,
+            BlockType *K,
             const int *position_ids,
             int seq_len,
             int n_heads,
@@ -605,6 +626,7 @@ namespace llaminar2
             float theta_base, int device_idx) override;
 
         // ITensorRoPE interface - apply_tensor() with automatic dispatch
+        // Dispatches to correct block size based on Q16_1Tensor::q16_block_size()
         bool apply_tensor(
             TensorBase *Q,
             TensorBase *K,
@@ -616,6 +638,9 @@ namespace llaminar2
             float rope_theta,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
+
+    private:
+        primitives::RoPEPersistentState tls_state_;
     };
 
 } // namespace llaminar2

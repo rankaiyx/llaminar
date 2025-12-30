@@ -159,6 +159,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief All-reduce sum operation for variable-size Q16 blocks (in-place)
+         *
+         * Templated version that supports Q16_1Block (32), Q16_1Block_64 (64),
+         * Q16_1Block_128 (128), and Q16_1Block_192 (192) element blocks.
+         *
+         * Uses allgather + vectorized local reduction with AVX512/AVX2 SIMD.
+         *
+         * Memory: Temporarily allocates n_blocks * world_size * sizeof(BlockType) bytes.
+         *
+         * @tparam BlockType Q16 block type (Q16_1Block, Q16_1Block_64, Q16_1Block_128, Q16_1Block_192)
+         * @param data Q16 block buffer (input and output)
+         * @param n_blocks Number of Q16 blocks per rank
+         */
+        template <typename BlockType>
+        void allreduce_q16_inplace(BlockType *data, size_t n_blocks) const
+        {
+            if (world_size_ == 1)
+            {
+                return; // No reduction needed for single rank
+            }
+
+            const size_t block_bytes = sizeof(BlockType);
+            const size_t total_bytes = n_blocks * block_bytes;
+            const size_t gathered_blocks = n_blocks * world_size_;
+
+            // Allocate buffer for all ranks' contributions
+            std::vector<BlockType> gathered(gathered_blocks);
+
+            // Allgather Q16 blocks from all ranks
+            MPI_Allgather(data, total_bytes, MPI_BYTE,
+                          gathered.data(), total_bytes, MPI_BYTE, comm_);
+
+            // Sum all contributions using AVX512/AVX2 vectorized reduction
+            // q16_sum_n processes one block at a time, so loop over blocks
+            std::vector<const BlockType *> inputs(world_size_);
+            for (size_t b = 0; b < n_blocks; ++b)
+            {
+                // Build pointer array for this block position across all ranks
+                for (int r = 0; r < world_size_; ++r)
+                {
+                    inputs[r] = gathered.data() + r * n_blocks + b;
+                }
+                simd::q16_sum_n<BlockType>(inputs.data(), world_size_, data + b);
+            }
+        }
+
+        /**
          * @brief All-reduce sum operation for FP16 elements (in-place)
          *
          * Performs N-way reduction of FP16 values across all MPI ranks without

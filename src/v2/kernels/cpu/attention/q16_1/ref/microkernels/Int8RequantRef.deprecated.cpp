@@ -3,7 +3,7 @@
  * @brief INT8 requantization utilities for Q16_1 attention
  */
 
-#include "Int8RequantRef.h"
+#include "Int8RequantRef.deprecated.h"
 
 #include <algorithm>
 #include <cmath>

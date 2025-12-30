@@ -57,6 +57,9 @@ namespace llaminar2
             q16_params.attention_output_snapshot = params.wo_output_snapshot;
             q16_params.attention_residual_snapshot = params.attention_residual_snapshot;
 
+            // Debug metadata
+            q16_params.layer_idx = params.layer_idx;
+
             return q16_params;
         }
 

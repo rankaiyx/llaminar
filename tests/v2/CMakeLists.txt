@@ -357,6 +357,19 @@ add_v2_test(V2_Unit_BF16Tensor
     LABELS "V2;Unit;TensorOperations;BF16;Quantization;GEMM;ViewSupport"
 )
 
+# Test: Q16_1 Block Structures (variable block sizes for integer attention)
+add_executable(v2_test_q16_block_structures unit/tensors/Test__Q16BlockStructures.cpp)
+target_link_libraries(v2_test_q16_block_structures 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16BlockStructures 
+    COMMAND $<TARGET_FILE:v2_test_q16_block_structures>
+    LABELS "V2;Unit;TensorOperations;Q16_1;BlockStructures;IntegerAttention"
+    MPI_PROCS 1
+)
+
 # Test: Q8_1Tensor class
 add_executable(v2_test_q8_1_tensor unit/tensors/Test__Q8_1Tensor.cpp)
 target_link_libraries(v2_test_q8_1_tensor 
@@ -410,6 +423,21 @@ target_link_libraries(v2_test_tensor_factory_device_idx
 add_v2_test(V2_Unit_TensorFactory_DeviceIndex 
     COMMAND $<TARGET_FILE:v2_test_tensor_factory_device_idx>
     LABELS "V2;Unit;TensorOperations;TensorFactory;DeviceManagement;RegressionTest"
+    MPI_PROCS 1  # Single-rank test, no MPI needed
+)
+
+# Test: TensorFactory Q16_1 variable block size creation (Phase 3)
+# Verifies that createQ16_1(shape, block_size, device_idx) creates tensors
+# with correct block sizes (BLOCK_64, BLOCK_128, BLOCK_192) for different head_dims.
+add_executable(v2_test_tensor_factory_q16_block_size unit/Test__TensorFactory_Q16BlockSize.cpp)
+target_link_libraries(v2_test_tensor_factory_q16_block_size 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorFactory_Q16BlockSize 
+    COMMAND $<TARGET_FILE:v2_test_tensor_factory_q16_block_size>
+    LABELS "V2;Unit;TensorOperations;TensorFactory;Q16;VariableBlockSize"
     MPI_PROCS 1  # Single-rank test, no MPI needed
 )
 
@@ -1139,6 +1167,19 @@ add_v2_test(V2_Unit_CPURoPEKernelT
     MPI_PROCS 1  # CPURoPEKernelT tests are CPU-only, single rank
 )
 
+# Test: CPURoPEKernelT<Q16_1> with variable block sizes (32, 64, 128, 192)
+add_executable(v2_test_rope_q16_block_sizes unit/Test__CPURoPEKernelT_Q16_1_BlockSizes.cpp)
+target_link_libraries(v2_test_rope_q16_block_sizes
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPURoPEKernelT_Q16_1_BlockSizes
+    COMMAND $<TARGET_FILE:v2_test_rope_q16_block_sizes>
+    LABELS "V2;Unit;Kernels;RoPE;Q16_1;BlockSizes;TypedResidual;CPU"
+    MPI_PROCS 1
+)
+
 # Test: CPUAttentionKernelT (Enum-based attention kernel via Factory)
 add_executable(v2_test_cpu_attention_kernel_t unit/Test__CPUAttentionKernelT.cpp)
 target_link_libraries(v2_test_cpu_attention_kernel_t
@@ -1247,6 +1288,19 @@ add_v2_test(V2_Unit_Q16_1RoPE_Correctness
     COMMAND $<TARGET_FILE:v2_test_q16_1_rope>
     LABELS "V2;Unit;Primitives;RoPE;Q16_1;SIMD;AVX2;AVX512;Correctness;Performance;CPU"
     MPI_PROCS 1  # RoPE is CPU-only, single rank
+)
+
+# Test: Q16 Variable Block Size SIMD Operations
+add_executable(v2_test_q16_variable_block_simd unit/Test__Q16VariableBlockSIMD.cpp)
+target_link_libraries(v2_test_q16_variable_block_simd 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q16VariableBlockSIMD 
+    COMMAND $<TARGET_FILE:v2_test_q16_variable_block_simd>
+    LABELS "V2;Unit;SIMD;Q16_1;AVX2;AVX512;Correctness;Performance;CPU;ResidualAdd"
+    MPI_PROCS 1
 )
 
 # Test: Q8_1 RoPE SIMD correctness and performance
@@ -2663,6 +2717,19 @@ add_v2_test(V2_Integration_QuantisedGemmSlicedParity
     LABELS "V2;Integration;GEMM;Slicing;MPI;Parity;TensorParallel"
 )
 
+# Test: Q16 MPI Allreduce (variable block size allreduce across 2 MPI ranks)
+# Validates templated allreduce_q16_inplace<BlockType>() for BLOCK_32/64/128/192
+add_executable(v2_integration_q16_mpi_allreduce integration/Test__Q16MPI_Allreduce.cpp)
+target_link_libraries(v2_integration_q16_mpi_allreduce 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Integration_Q16MPI_Allreduce 
+    COMMAND $<TARGET_FILE:v2_integration_q16_mpi_allreduce>
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;Q16;Allreduce;VariableBlockSize;TensorParallel"
+)
+
 # Test: QuantisedGemmKernel Fused Operations (Bias, Softmax, SwiGLU)
 # Validates mathematical correctness of fused ops against separate primitives
 add_executable(v2_integration_quantised_gemm_fused integration/Test__QuantisedGemmFused.cpp)
@@ -3885,4 +3952,21 @@ add_v2_test(V2_Integration_GraphSnapshotCallbackInvocation
     COMMAND $<TARGET_FILE:v2_test_graph_snapshot_callback_invocation>
     LABELS "V2;Integration;Graph;Snapshot;Callback"
     MPI_PROCS 1
+)
+# =============================================================================
+# Q16 Integer Attention v2 Tests
+# =============================================================================
+
+# Test: Exp2FixedSoftmax microkernel
+# Integer-only softmax using exp2 LUT approximation (256 entries)
+# Produces INT16 weights in [0, 32767] for VNNI compatibility
+add_executable(v2_test_exp2_fixed_softmax unit/kernels/cpu/q16_attention/Test__Exp2FixedSoftmax.cpp)
+target_link_libraries(v2_test_exp2_fixed_softmax
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Exp2FixedSoftmax
+    COMMAND $<TARGET_FILE:v2_test_exp2_fixed_softmax>
+    LABELS "V2;Unit;Kernels;Attention;Q16;Softmax;Integer"
 )

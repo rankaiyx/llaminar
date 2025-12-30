@@ -24,7 +24,7 @@
 #include "tensors/TensorKernels.h"
 #include "tensors/KernelSnapshotInfo.h"
 #include "tensors/BlockStructures.h"
-#include "ref/Q16FusedAttentionRef.h"
+#include "ref/Q16FusedAttentionRef.deprecated.h"
 #include <memory>
 
 namespace llaminar2

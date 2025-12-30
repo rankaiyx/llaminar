@@ -148,6 +148,52 @@ namespace llaminar2
                                                                  << "], blocks=" << n_blocks << ", bytes=" << required_bytes);
     }
 
+    Q16_1Tensor::Q16_1Tensor(const std::vector<size_t> &shape, Q16BlockSize block_size, int device_idx)
+        : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_idx_(device_idx), device_blocks_(nullptr),
+          is_mutable_(true), cache_dirty_(false), block_size_(block_size)
+    {
+        if (shape.empty())
+        {
+            throw std::invalid_argument("Q16_1Tensor: shape cannot be empty");
+        }
+        if (shape.size() != 2)
+        {
+            throw std::invalid_argument("Q16_1Tensor: mutable activation buffer requires 2D shape");
+        }
+
+        const size_t rows = shape[0];
+        const size_t cols = shape[1];
+        const size_t bs = static_cast<size_t>(block_size);
+        const size_t blocks_per_row_ = (cols + bs - 1) / bs;
+        const size_t n_blocks = rows * blocks_per_row_;
+
+        // Calculate bytes based on block size
+        size_t block_bytes = 0;
+        switch (block_size)
+        {
+        case Q16BlockSize::BLOCK_32:
+            block_bytes = sizeof(Q16_1Block);
+            break;
+        case Q16BlockSize::BLOCK_64:
+            block_bytes = sizeof(Q16_1Block_64);
+            break;
+        case Q16BlockSize::BLOCK_128:
+            block_bytes = sizeof(Q16_1Block_128);
+            break;
+        case Q16BlockSize::BLOCK_192:
+            block_bytes = sizeof(Q16_1Block_192);
+            break;
+        }
+        const size_t required_bytes = n_blocks * block_bytes;
+
+        raw_data_.resize(required_bytes, 0);
+
+        LOG_TRACE("[Q16_1Tensor] Created MUTABLE tensor shape=[" << shape[0] << "," << shape[1]
+                                                                 << "], block_size=" << static_cast<int>(block_size)
+                                                                 << ", blocks=" << n_blocks << ", bytes=" << required_bytes);
+    }
+
     Q16_1Tensor::Q16_1Tensor(const std::vector<size_t> &shape,
                              const uint8_t *parent_raw_data,
                              size_t byte_offset,
@@ -277,6 +323,95 @@ namespace llaminar2
             raw_data_.clear();
             raw_data_.shrink_to_fit();
             raw_data_released_ = true;
+        }
+    }
+
+    // ============================================================================
+    // ITensorGemmTileDataProvider interface - Variable block size support
+    // ============================================================================
+
+    namespace
+    {
+        /**
+         * @brief Templated decode helper for variable Q16 block sizes
+         */
+        template <typename BlockType>
+        void decode_q16_block(const void *block_ptr, float *output)
+        {
+            const BlockType &block = *static_cast<const BlockType *>(block_ptr);
+            const float scale = block.d;
+            for (size_t i = 0; i < BlockType::BLOCK_SIZE; ++i)
+            {
+                output[i] = static_cast<float>(block.qs[i]) * scale;
+            }
+        }
+    } // anonymous namespace
+
+    void Q16_1Tensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
+    {
+        const size_t bs = static_cast<size_t>(block_size_);
+        const size_t blocks_per_row_ = (shape_[1] + bs - 1) / bs;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+
+        switch (block_size_)
+        {
+        case Q16BlockSize::BLOCK_32:
+        {
+            const Q16_1Block *blocks = reinterpret_cast<const Q16_1Block *>(data_ptr);
+            decode_q16_block<Q16_1Block>(&blocks[row_idx * blocks_per_row_ + k_block_offset], output);
+            break;
+        }
+        case Q16BlockSize::BLOCK_64:
+        {
+            const Q16_1Block_64 *blocks = reinterpret_cast<const Q16_1Block_64 *>(data_ptr);
+            decode_q16_block<Q16_1Block_64>(&blocks[row_idx * blocks_per_row_ + k_block_offset], output);
+            break;
+        }
+        case Q16BlockSize::BLOCK_128:
+        {
+            const Q16_1Block_128 *blocks = reinterpret_cast<const Q16_1Block_128 *>(data_ptr);
+            decode_q16_block<Q16_1Block_128>(&blocks[row_idx * blocks_per_row_ + k_block_offset], output);
+            break;
+        }
+        case Q16BlockSize::BLOCK_192:
+        {
+            const Q16_1Block_192 *blocks = reinterpret_cast<const Q16_1Block_192 *>(data_ptr);
+            decode_q16_block<Q16_1Block_192>(&blocks[row_idx * blocks_per_row_ + k_block_offset], output);
+            break;
+        }
+        }
+    }
+
+    const void *Q16_1Tensor::get_raw_block_at(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t bs = static_cast<size_t>(block_size_);
+        const size_t blocks_per_row_ = (shape_[1] + bs - 1) / bs;
+        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+
+        switch (block_size_)
+        {
+        case Q16BlockSize::BLOCK_32:
+        {
+            const Q16_1Block *blocks = reinterpret_cast<const Q16_1Block *>(data_ptr);
+            return &blocks[row_idx * blocks_per_row_ + k_block_offset];
+        }
+        case Q16BlockSize::BLOCK_64:
+        {
+            const Q16_1Block_64 *blocks = reinterpret_cast<const Q16_1Block_64 *>(data_ptr);
+            return &blocks[row_idx * blocks_per_row_ + k_block_offset];
+        }
+        case Q16BlockSize::BLOCK_128:
+        {
+            const Q16_1Block_128 *blocks = reinterpret_cast<const Q16_1Block_128 *>(data_ptr);
+            return &blocks[row_idx * blocks_per_row_ + k_block_offset];
+        }
+        case Q16BlockSize::BLOCK_192:
+        {
+            const Q16_1Block_192 *blocks = reinterpret_cast<const Q16_1Block_192 *>(data_ptr);
+            return &blocks[row_idx * blocks_per_row_ + k_block_offset];
+        }
+        default:
+            return nullptr;
         }
     }
 
@@ -1185,6 +1320,67 @@ namespace llaminar2
         return true;
     }
 
+    namespace
+    {
+        /**
+         * @brief Templated quantization helper for variable Q16 block sizes
+         */
+        template <typename BlockType>
+        void quantize_fp32_to_q16_blocks(const float *src_data, void *dst_blocks,
+                                         size_t total_elements, size_t n_blocks)
+        {
+            constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
+            BlockType *blocks = static_cast<BlockType *>(dst_blocks);
+
+#pragma omp parallel for if (n_blocks > 4)
+            for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
+            {
+                const size_t offset = block_idx * BLOCK_SIZE;
+                const size_t count = std::min(BLOCK_SIZE, total_elements - offset);
+
+                BlockType &block = blocks[block_idx];
+
+                float max_abs = 0.0f;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    max_abs = std::max(max_abs, std::abs(src_data[offset + i]));
+                }
+
+                const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
+                block.d = d;
+
+                int64_t sum_i64 = 0;
+                if (d > 1e-10f)
+                {
+                    const float inv_d = 1.0f / d;
+                    for (size_t i = 0; i < count; ++i)
+                    {
+                        const float scaled = src_data[offset + i] * inv_d;
+                        const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
+                        const int16_t quantized = static_cast<int16_t>(std::round(clamped));
+                        block.qs[i] = quantized;
+                        sum_i64 += static_cast<int64_t>(quantized);
+                    }
+                }
+                else
+                {
+                    for (size_t i = 0; i < count; ++i)
+                    {
+                        block.qs[i] = 0;
+                    }
+                }
+
+                // Zero-fill any remaining elements in the block
+                for (size_t i = count; i < BLOCK_SIZE; ++i)
+                {
+                    block.qs[i] = 0;
+                }
+
+                block.sum_qs = static_cast<int32_t>(sum_i64);
+            }
+        }
+    } // anonymous namespace
+
     bool Q16_1Tensor::copyFrom_fp32(const float *src_data)
     {
         if (!src_data)
@@ -1193,54 +1389,28 @@ namespace llaminar2
         }
 
         const size_t total_elements = element_count();
-        const size_t n_blocks = (total_elements + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+        const size_t bs = static_cast<size_t>(block_size_);
+        const size_t n_blocks = (total_elements + bs - 1) / bs;
 
-        Q16_1Block *blocks = mutable_q16_1_blocks();
+        void *raw_blocks = raw_mutable_data();
 
-#pragma omp parallel for if (n_blocks > 4)
-        for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
+        switch (block_size_)
         {
-            const size_t offset = block_idx * Q16_1Block::BLOCK_SIZE;
-            const size_t count = std::min(static_cast<size_t>(Q16_1Block::BLOCK_SIZE), total_elements - offset);
-
-            Q16_1Block &block = blocks[block_idx];
-
-            float max_abs = 0.0f;
-            for (size_t i = 0; i < count; ++i)
-            {
-                max_abs = std::max(max_abs, std::abs(src_data[offset + i]));
-            }
-
-            const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
-            block.d = d; // FP32 scale, no conversion needed
-
-            int64_t sum_i64 = 0;
-            if (d > 1e-10f)
-            {
-                const float inv_d = 1.0f / d;
-                for (size_t i = 0; i < count; ++i)
-                {
-                    const float scaled = src_data[offset + i] * inv_d;
-                    const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
-                    const int16_t quantized = static_cast<int16_t>(std::round(clamped));
-                    block.qs[i] = quantized;
-                    sum_i64 += static_cast<int64_t>(quantized);
-                }
-            }
-            else
-            {
-                for (size_t i = 0; i < count; ++i)
-                {
-                    block.qs[i] = 0;
-                }
-            }
-
-            for (size_t i = count; i < Q16_1Block::BLOCK_SIZE; ++i)
-            {
-                block.qs[i] = 0;
-            }
-
-            block.sum_qs = static_cast<int32_t>(sum_i64);
+        case Q16BlockSize::BLOCK_32:
+            quantize_fp32_to_q16_blocks<Q16_1Block>(src_data, raw_blocks, total_elements, n_blocks);
+            break;
+        case Q16BlockSize::BLOCK_64:
+            quantize_fp32_to_q16_blocks<Q16_1Block_64>(src_data, raw_blocks, total_elements, n_blocks);
+            break;
+        case Q16BlockSize::BLOCK_128:
+            quantize_fp32_to_q16_blocks<Q16_1Block_128>(src_data, raw_blocks, total_elements, n_blocks);
+            break;
+        case Q16BlockSize::BLOCK_192:
+            quantize_fp32_to_q16_blocks<Q16_1Block_192>(src_data, raw_blocks, total_elements, n_blocks);
+            break;
+        default:
+            LOG_ERROR("[Q16_1Tensor::copyFrom_fp32] Unknown block size");
+            return false;
         }
 
         dequant_cache_.clear();

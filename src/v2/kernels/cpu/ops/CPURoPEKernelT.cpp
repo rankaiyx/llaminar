@@ -4,7 +4,9 @@
  * @author David Sanftenberg
  *
  * This file implements the CPURoPEKernelT template specializations for
- * FP32, BF16, FP16, and Q8_1 precision types.
+ * FP32, BF16, FP16, Q8_1, and Q16_1 precision types.
+ *
+ * Q16_1 supports variable block sizes (32, 64, 128, 192) via templated dispatch.
  *
  * Implementation mirrors CPURoPEKernelT - uses existing primitives with n_past
  * and handles position_ids at the kernel level.
@@ -714,6 +716,7 @@ namespace llaminar2
     // Q16_1 Specialization Implementation (High-Precision Integer)
     // ============================================================================
 
+    // 32-element block apply_typed (backward compatibility)
     bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed(
         Q16_1Block *Q,
         Q16_1Block *K,
@@ -741,8 +744,8 @@ namespace llaminar2
             return false;
         }
 
-        // Call Q16_1 RoPE primitive
-        primitives::apply_rope_q16_1_integer(
+        // Call Q16_1 RoPE primitive (32-element blocks)
+        primitives::apply_rope_q16_integer<Q16_1Block>(
             Q, K,
             position_ids,
             seq_len,
@@ -753,6 +756,60 @@ namespace llaminar2
 
         return true;
     }
+
+    // Templated apply for variable block sizes
+    template <typename BlockType>
+    bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block(
+        BlockType *Q,
+        BlockType *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        int device_idx)
+    {
+        (void)device_idx; // Unused for CPU kernel
+
+        if (!Q)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q16_1>: Null Q pointer");
+            return false;
+        }
+
+        constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
+
+        // Validate head_dim divisibility by block size
+        if (head_dim % BLOCK_SIZE != 0)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q16_1>: head_dim ("
+                      << head_dim << ") must be divisible by " << BLOCK_SIZE);
+            return false;
+        }
+
+        // Call templated Q16 RoPE primitive
+        primitives::apply_rope_q16_integer<BlockType>(
+            Q, K,
+            position_ids,
+            seq_len,
+            n_heads, n_kv_heads,
+            head_dim,
+            rope_theta,
+            (seq_len == 1) ? &tls_state_ : nullptr);
+
+        return true;
+    }
+
+    // Explicit template instantiations for all block sizes
+    template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block>(
+        Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, int);
+    template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block_64>(
+        Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, int);
+    template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block_128>(
+        Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, int);
+    template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block_192>(
+        Q16_1Block_192 *, Q16_1Block_192 *, const int *, int, int, int, int, float, int);
 
     // --- Q16_1 apply_q16_1() ---
     bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_q16_1(
@@ -798,12 +855,50 @@ namespace llaminar2
                 return false;
             }
             k_q16 = dynamic_cast<Q16_1Tensor *>(K);
+
+            // Ensure both tensors have the same block size
+            if (k_q16->q16_block_size() != q_q16->q16_block_size())
+            {
+                LOG_ERROR("CPURoPEKernelT<Q16_1>::apply_tensor: Q and K must have same block size");
+                return false;
+            }
         }
 
-        return apply_typed(
-            q_q16->mutable_typed_data(),
-            k_q16 ? k_q16->mutable_typed_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+        // Dispatch based on block size
+        // Note: raw_mutable_data() returns void*, we cast to the correct block type
+        void *q_raw = q_q16->raw_mutable_data();
+        void *k_raw = k_q16 ? k_q16->raw_mutable_data() : nullptr;
+
+        switch (q_q16->q16_block_size())
+        {
+        case Q16BlockSize::BLOCK_32:
+            return apply_typed_block<Q16_1Block>(
+                static_cast<Q16_1Block *>(q_raw),
+                static_cast<Q16_1Block *>(k_raw),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+
+        case Q16BlockSize::BLOCK_64:
+            return apply_typed_block<Q16_1Block_64>(
+                static_cast<Q16_1Block_64 *>(q_raw),
+                static_cast<Q16_1Block_64 *>(k_raw),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+
+        case Q16BlockSize::BLOCK_128:
+            return apply_typed_block<Q16_1Block_128>(
+                static_cast<Q16_1Block_128 *>(q_raw),
+                static_cast<Q16_1Block_128 *>(k_raw),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+
+        case Q16BlockSize::BLOCK_192:
+            return apply_typed_block<Q16_1Block_192>(
+                static_cast<Q16_1Block_192 *>(q_raw),
+                static_cast<Q16_1Block_192 *>(k_raw),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+
+        default:
+            LOG_ERROR("CPURoPEKernelT<Q16_1>::apply_tensor: Unknown block size");
+            return false;
+        }
     }
 
     // ============================================================================

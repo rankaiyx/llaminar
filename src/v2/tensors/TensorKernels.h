@@ -1767,6 +1767,16 @@ namespace llaminar2
          */
         float *attention_residual_snapshot = nullptr;
 
+        // ============== Optional debug metadata ==============
+
+        /**
+         * @brief Layer index for debug/snapshot correlation
+         *
+         * Not required for kernel correctness. When set, debug instrumentation can
+         * gate dumps to a specific layer to keep logs manageable.
+         */
+        int layer_idx = -1;
+
         // ============== Helper methods ==============
 
         /**

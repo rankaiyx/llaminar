@@ -1041,3 +1041,217 @@ TEST(Test__Q16_1Tensor, NativeQ16_1AddQ8_1_RealisticMagnitudes)
     EXPECT_LT(error, 0.01f)
         << "Q16_1 += Q8_1 realistic magnitudes error too high";
 }
+
+
+// ============================================================================
+// Variable Block Size Tests
+// ============================================================================
+
+/**
+ * @brief Test Q16_1Tensor constructor with default block size (32)
+ */
+TEST(Test__Q16_1Tensor, Constructor_DefaultBlockSize)
+{
+    const int rows = 4;
+    const int cols = 128;
+    
+    auto tensor = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)});
+    
+    EXPECT_EQ(tensor->block_size(), 32);
+    EXPECT_EQ(tensor->q16_block_size(), Q16BlockSize::BLOCK_32);
+    EXPECT_EQ(tensor->blocks_per_row(), 4);  // 128 / 32 = 4
+    EXPECT_EQ(tensor->total_blocks(), 16);   // 4 rows * 4 blocks
+}
+
+/**
+ * @brief Test Q16_1Tensor constructor with BLOCK_64
+ */
+TEST(Test__Q16_1Tensor, Constructor_Block64)
+{
+    const int rows = 4;
+    const int cols = 64; // Exactly one 64-element block per row
+    
+    auto tensor = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        Q16BlockSize::BLOCK_64);
+    
+    EXPECT_EQ(tensor->block_size(), 64);
+    EXPECT_EQ(tensor->q16_block_size(), Q16BlockSize::BLOCK_64);
+    EXPECT_EQ(tensor->blocks_per_row(), 1);  // 64 / 64 = 1
+    EXPECT_EQ(tensor->total_blocks(), 4);    // 4 rows * 1 block
+}
+
+/**
+ * @brief Test Q16_1Tensor constructor with BLOCK_128
+ */
+TEST(Test__Q16_1Tensor, Constructor_Block128)
+{
+    const int rows = 4;
+    const int cols = 128; // Exactly one 128-element block per row
+    
+    auto tensor = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        Q16BlockSize::BLOCK_128);
+    
+    EXPECT_EQ(tensor->block_size(), 128);
+    EXPECT_EQ(tensor->q16_block_size(), Q16BlockSize::BLOCK_128);
+    EXPECT_EQ(tensor->blocks_per_row(), 1);  // 128 / 128 = 1
+    EXPECT_EQ(tensor->total_blocks(), 4);    // 4 rows * 1 block
+}
+
+/**
+ * @brief Test Q16_1Tensor constructor with BLOCK_192
+ */
+TEST(Test__Q16_1Tensor, Constructor_Block192)
+{
+    const int rows = 4;
+    const int cols = 192; // Exactly one 192-element block per row
+    
+    auto tensor = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        Q16BlockSize::BLOCK_192);
+    
+    EXPECT_EQ(tensor->block_size(), 192);
+    EXPECT_EQ(tensor->q16_block_size(), Q16BlockSize::BLOCK_192);
+    EXPECT_EQ(tensor->blocks_per_row(), 1);  // 192 / 192 = 1
+    EXPECT_EQ(tensor->total_blocks(), 4);    // 4 rows * 1 block
+}
+
+/**
+ * @brief Test memory allocation sizes for different block sizes
+ */
+TEST(Test__Q16_1Tensor, Constructor_MemoryAllocation)
+{
+    const int rows = 8;
+    
+    // BLOCK_32: 72 bytes per block
+    {
+        const int cols = 64; // 2 blocks per row
+        auto tensor = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            Q16BlockSize::BLOCK_32);
+        // 8 rows * 2 blocks/row * 72 bytes/block = 1152 bytes
+        EXPECT_EQ(tensor->size_bytes(), 8 * 2 * 72);
+    }
+    
+    // BLOCK_64: 136 bytes per block
+    {
+        const int cols = 64; // 1 block per row
+        auto tensor = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            Q16BlockSize::BLOCK_64);
+        // 8 rows * 1 block/row * 136 bytes/block = 1088 bytes
+        EXPECT_EQ(tensor->size_bytes(), 8 * 1 * 136);
+    }
+    
+    // BLOCK_128: 264 bytes per block
+    {
+        const int cols = 128; // 1 block per row
+        auto tensor = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            Q16BlockSize::BLOCK_128);
+        // 8 rows * 1 block/row * 264 bytes/block = 2112 bytes
+        EXPECT_EQ(tensor->size_bytes(), 8 * 1 * 264);
+    }
+    
+    // BLOCK_192: 392 bytes per block
+    {
+        const int cols = 192; // 1 block per row
+        auto tensor = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            Q16BlockSize::BLOCK_192);
+        // 8 rows * 1 block/row * 392 bytes/block = 3136 bytes
+        EXPECT_EQ(tensor->size_bytes(), 8 * 1 * 392);
+    }
+}
+
+/**
+ * @brief Test blocks_per_row calculation with partial blocks
+ */
+TEST(Test__Q16_1Tensor, BlocksPerRow_PartialBlocks)
+{
+    const int rows = 1;
+    
+    // 100 elements with BLOCK_64 = ceil(100/64) = 2 blocks
+    {
+        auto tensor = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), 100},
+            Q16BlockSize::BLOCK_64);
+        EXPECT_EQ(tensor->blocks_per_row(), 2);
+    }
+    
+    // 100 elements with BLOCK_128 = ceil(100/128) = 1 block
+    {
+        auto tensor = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), 100},
+            Q16BlockSize::BLOCK_128);
+        EXPECT_EQ(tensor->blocks_per_row(), 1);
+    }
+    
+    // 200 elements with BLOCK_192 = ceil(200/192) = 2 blocks
+    {
+        auto tensor = std::make_shared<Q16_1Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), 200},
+            Q16BlockSize::BLOCK_192);
+        EXPECT_EQ(tensor->blocks_per_row(), 2);
+    }
+}
+
+/**
+ * @brief Test optimal block size selection for Qwen2-0.5B (head_dim=64)
+ */
+TEST(Test__Q16_1Tensor, OptimalBlockSize_Qwen2_05B)
+{
+    const int head_dim = 64; // Qwen2-0.5B head dimension
+    const Q16BlockSize optimal = optimal_q16_block_size(head_dim);
+    
+    EXPECT_EQ(optimal, Q16BlockSize::BLOCK_64);
+    
+    // Create tensor with optimal block size
+    auto tensor = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(head_dim)},
+        optimal);
+    
+    // Should have exactly 1 block per head
+    EXPECT_EQ(tensor->blocks_per_row(), 1);
+}
+
+/**
+ * @brief Test optimal block size selection for Llama3-8B (head_dim=128)
+ */
+TEST(Test__Q16_1Tensor, OptimalBlockSize_Llama3)
+{
+    const int head_dim = 128; // Llama3 head dimension
+    const Q16BlockSize optimal = optimal_q16_block_size(head_dim);
+    
+    EXPECT_EQ(optimal, Q16BlockSize::BLOCK_128);
+    
+    // Create tensor with optimal block size
+    auto tensor = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(head_dim)},
+        optimal);
+    
+    // Should have exactly 1 block per head
+    EXPECT_EQ(tensor->blocks_per_row(), 1);
+}
+
+/**
+ * @brief Test optimal block size selection for DeepSeek V3 MLA (head_dim=192)
+ */
+TEST(Test__Q16_1Tensor, OptimalBlockSize_DeepSeekV3_MLA)
+{
+    const int head_dim = 192; // DeepSeek V3 MLA Q/K dimension (128 nope + 64 rope)
+    const Q16BlockSize optimal = optimal_q16_block_size(head_dim);
+    
+    EXPECT_EQ(optimal, Q16BlockSize::BLOCK_192);
+    
+    // Create tensor with optimal block size
+    auto tensor = std::make_shared<Q16_1Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(head_dim)},
+        optimal);
+    
+    // Should have exactly 1 block per head
+    EXPECT_EQ(tensor->blocks_per_row(), 1);
+}
+

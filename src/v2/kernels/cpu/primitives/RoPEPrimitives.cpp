@@ -3736,4 +3736,834 @@ namespace llaminar2::primitives
         }
     }
 
+    // ============================================================================
+    // Templated Q16 RoPE Primitives (Variable Block Size Support)
+    // ============================================================================
+
+    /**
+     * @brief Templated scalar RoPE implementation for any Q16 block type
+     *
+     * This implementation uses BlockType::BLOCK_SIZE at compile time for optimal
+     * code generation. The algorithm processes paired half-blocks for rotation:
+     * - blockA contains first half of head dimension
+     * - blockB contains second half of head dimension
+     * - Rotation: x' = x*cos - y*sin, y' = x*sin + y*cos
+     *
+     * Handles two cases:
+     * 1. Multi-block per head (num_blocks >= 2): rotation across blocks
+     * 2. Single-block per head (num_blocks == 1): rotation within block
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer_head_scalar(
+        BlockType *head_blocks,
+        int num_blocks,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+        constexpr int BLOCK_SIZE = static_cast<int>(BlockType::BLOCK_SIZE);
+
+        if (num_blocks == 1)
+        {
+            // Single-block case: rotation within the block
+            // First half = qs[0:BLOCK_SIZE/2-1], Second half = qs[BLOCK_SIZE/2:BLOCK_SIZE-1]
+            BlockType &block = head_blocks[0];
+            const int HALF_BLOCK = BLOCK_SIZE / 2;
+            float scale = block.d;
+
+            float rot_first[HALF_BLOCK];
+            float rot_second[HALF_BLOCK];
+
+            // Dequant + Rotate
+            for (int i = 0; i < HALF_BLOCK; ++i)
+            {
+                float x = static_cast<float>(block.qs[i]) * scale;
+                float y = static_cast<float>(block.qs[i + HALF_BLOCK]) * scale;
+                float c = static_cast<float>(cos_q15[i]) * Q15_TO_FP32;
+                float s = static_cast<float>(sin_q15[i]) * Q15_TO_FP32;
+                rot_first[i] = x * c - y * s;
+                rot_second[i] = x * s + y * c;
+            }
+
+            // Requantize entire block
+            float max_val = 0.0f;
+            for (int i = 0; i < HALF_BLOCK; ++i)
+            {
+                max_val = std::max(max_val, std::abs(rot_first[i]));
+                max_val = std::max(max_val, std::abs(rot_second[i]));
+            }
+
+            float new_scale = max_val / 32767.0f;
+            if (new_scale < 1e-20f)
+                new_scale = 1e-20f;
+            float inv_scale = 1.0f / new_scale;
+
+            int64_t sum_qs = 0;
+            for (int i = 0; i < HALF_BLOCK; ++i)
+            {
+                int32_t q = static_cast<int32_t>(std::round(rot_first[i] * inv_scale));
+                q = std::max(-32767, std::min(32767, q));
+                block.qs[i] = static_cast<int16_t>(q);
+                sum_qs += q;
+            }
+            for (int i = 0; i < HALF_BLOCK; ++i)
+            {
+                int32_t q = static_cast<int32_t>(std::round(rot_second[i] * inv_scale));
+                q = std::max(-32767, std::min(32767, q));
+                block.qs[i + HALF_BLOCK] = static_cast<int16_t>(q);
+                sum_qs += q;
+            }
+            block.d = new_scale;
+            block.sum_qs = static_cast<int32_t>(sum_qs);
+        }
+        else
+        {
+            // Multi-block case: rotation across blocks (original algorithm)
+            const int half_blocks = num_blocks / 2;
+
+            for (int b = 0; b < half_blocks; ++b)
+            {
+                BlockType &blockA = head_blocks[b];
+                BlockType &blockB = head_blocks[b + half_blocks];
+
+                float scaleA = blockA.d;
+                float scaleB = blockB.d;
+
+                const int16_t *cos_ptr = cos_q15 + b * BLOCK_SIZE;
+                const int16_t *sin_ptr = sin_q15 + b * BLOCK_SIZE;
+
+                // Stack allocate rotation buffers (compile-time size known)
+                float rotA[BLOCK_SIZE];
+                float rotB[BLOCK_SIZE];
+
+                // Dequant + Rotate
+                for (int i = 0; i < BLOCK_SIZE; ++i)
+                {
+                    float x = static_cast<float>(blockA.qs[i]) * scaleA;
+                    float y = static_cast<float>(blockB.qs[i]) * scaleB;
+                    float c = static_cast<float>(cos_ptr[i]) * Q15_TO_FP32;
+                    float s = static_cast<float>(sin_ptr[i]) * Q15_TO_FP32;
+                    rotA[i] = x * c - y * s;
+                    rotB[i] = x * s + y * c;
+                }
+
+                // Requantize blockA
+                {
+                    float max_val = 0.0f;
+                    for (int i = 0; i < BLOCK_SIZE; ++i)
+                        max_val = std::max(max_val, std::abs(rotA[i]));
+
+                    float new_scale = max_val / 32767.0f;
+                    if (new_scale < 1e-20f)
+                        new_scale = 1e-20f;
+                    float inv_scale = 1.0f / new_scale;
+
+                    int64_t sum_qs = 0;
+                    for (int i = 0; i < BLOCK_SIZE; ++i)
+                    {
+                        int32_t q = static_cast<int32_t>(std::round(rotA[i] * inv_scale));
+                        q = std::max(-32767, std::min(32767, q));
+                        blockA.qs[i] = static_cast<int16_t>(q);
+                        sum_qs += q;
+                    }
+                    blockA.d = new_scale;
+                    blockA.sum_qs = static_cast<int32_t>(sum_qs);
+                }
+
+                // Requantize blockB
+                {
+                    float max_val = 0.0f;
+                    for (int i = 0; i < BLOCK_SIZE; ++i)
+                        max_val = std::max(max_val, std::abs(rotB[i]));
+
+                    float new_scale = max_val / 32767.0f;
+                    if (new_scale < 1e-20f)
+                        new_scale = 1e-20f;
+                    float inv_scale = 1.0f / new_scale;
+
+                    int64_t sum_qs = 0;
+                    for (int i = 0; i < BLOCK_SIZE; ++i)
+                    {
+                        int32_t q = static_cast<int32_t>(std::round(rotB[i] * inv_scale));
+                        q = std::max(-32767, std::min(32767, q));
+                        blockB.qs[i] = static_cast<int16_t>(q);
+                        sum_qs += q;
+                    }
+                    blockB.d = new_scale;
+                    blockB.sum_qs = static_cast<int32_t>(sum_qs);
+                }
+            }
+        }
+    }
+
+    // Explicit template instantiations for scalar
+    template void apply_rope_q16_integer_head_scalar<Q16_1Block>(Q16_1Block *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_scalar<Q16_1Block_64>(Q16_1Block_64 *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_scalar<Q16_1Block_128>(Q16_1Block_128 *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_scalar<Q16_1Block_192>(Q16_1Block_192 *, int, const int16_t *, const int16_t *);
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+    /**
+     * @brief Templated AVX2 RoPE implementation for any Q16 block type
+     *
+     * Processes 8 elements at a time using AVX2 intrinsics.
+     * Handles two cases:
+     * 1. Single-block per head: rotation within the block (first half vs second half)
+     * 2. Multi-block per head: rotation across blocks
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer_head_avx2(
+        BlockType *head_blocks,
+        int num_blocks,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+        constexpr int BLOCK_SIZE = static_cast<int>(BlockType::BLOCK_SIZE);
+        static_assert(BLOCK_SIZE % 8 == 0, "Block size must be divisible by 8 for AVX2");
+
+        const __m256 q15_scale = _mm256_set1_ps(Q15_TO_FP32);
+        const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+        const __m256i clamp_min = _mm256_set1_epi32(-32767);
+        const __m256i clamp_max = _mm256_set1_epi32(32767);
+
+        if (num_blocks == 1)
+        {
+            // Single-block case: rotation within the block
+            // First half = qs[0:BLOCK_SIZE/2-1], Second half = qs[BLOCK_SIZE/2:BLOCK_SIZE-1]
+            constexpr int HALF_BLOCK = BLOCK_SIZE / 2;
+            constexpr int HALF_CHUNKS = HALF_BLOCK / 8;
+
+            BlockType &block = head_blocks[0];
+            const __m256 scale_vec = _mm256_set1_ps(block.d);
+
+            // Stack allocate rotation results
+            alignas(32) __m256 rot_first_chunks[HALF_CHUNKS];
+            alignas(32) __m256 rot_second_chunks[HALF_CHUNKS];
+
+            // PHASE 1: Dequant + Rotate
+            for (int c = 0; c < HALF_CHUNKS; ++c)
+            {
+                const int offset = c * 8;
+
+                // Load from first and second halves
+                __m128i qx_i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + offset));
+                __m128i qy_i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + HALF_BLOCK + offset));
+                __m128i cos_i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(cos_q15 + offset));
+                __m128i sin_i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(sin_q15 + offset));
+
+                __m256 x = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(qx_i16)), scale_vec);
+                __m256 y = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(qy_i16)), scale_vec);
+                __m256 cos_f = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(cos_i16)), q15_scale);
+                __m256 sin_f = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(sin_i16)), q15_scale);
+
+                rot_first_chunks[c] = _mm256_fmsub_ps(x, cos_f, _mm256_mul_ps(y, sin_f));
+                rot_second_chunks[c] = _mm256_fmadd_ps(x, sin_f, _mm256_mul_ps(y, cos_f));
+            }
+
+            // PHASE 2: Find max_abs across entire block (both halves)
+            __m256 max_all = _mm256_setzero_ps();
+            for (int c = 0; c < HALF_CHUNKS; ++c)
+            {
+                __m256 abs_first = _mm256_andnot_ps(sign_mask, rot_first_chunks[c]);
+                __m256 abs_second = _mm256_andnot_ps(sign_mask, rot_second_chunks[c]);
+                max_all = _mm256_max_ps(max_all, abs_first);
+                max_all = _mm256_max_ps(max_all, abs_second);
+            }
+
+            // Horizontal max reduction
+            __m128 max_lo = _mm256_castps256_ps128(max_all);
+            __m128 max_hi = _mm256_extractf128_ps(max_all, 1);
+            __m128 max_128 = _mm_max_ps(max_lo, max_hi);
+            max_128 = _mm_max_ps(max_128, _mm_shuffle_ps(max_128, max_128, _MM_SHUFFLE(1, 0, 3, 2)));
+            max_128 = _mm_max_ps(max_128, _mm_shuffle_ps(max_128, max_128, _MM_SHUFFLE(0, 0, 0, 1)));
+            float max_val = _mm_cvtss_f32(max_128);
+
+            float new_scale = max_val / 32767.0f;
+            if (new_scale < 1e-20f)
+                new_scale = 1e-20f;
+            __m256 inv_scale = _mm256_set1_ps(1.0f / new_scale);
+
+            // PHASE 3: Requantize and store
+            __m256i sum_vec = _mm256_setzero_si256();
+
+            // First half
+            for (int c = 0; c < HALF_CHUNKS; ++c)
+            {
+                const int offset = c * 8;
+                __m256 scaled = _mm256_mul_ps(rot_first_chunks[c], inv_scale);
+                __m256i q = _mm256_cvtps_epi32(_mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                q = _mm256_max_epi32(_mm256_min_epi32(q, clamp_max), clamp_min);
+                __m128i q_16 = _mm_packs_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(block.qs + offset), q_16);
+                sum_vec = _mm256_add_epi32(sum_vec, q);
+            }
+
+            // Second half
+            for (int c = 0; c < HALF_CHUNKS; ++c)
+            {
+                const int offset = c * 8;
+                __m256 scaled = _mm256_mul_ps(rot_second_chunks[c], inv_scale);
+                __m256i q = _mm256_cvtps_epi32(_mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                q = _mm256_max_epi32(_mm256_min_epi32(q, clamp_max), clamp_min);
+                __m128i q_16 = _mm_packs_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(block.qs + HALF_BLOCK + offset), q_16);
+                sum_vec = _mm256_add_epi32(sum_vec, q);
+            }
+
+            // Horizontal sum
+            __m128i sum_lo = _mm256_castsi256_si128(sum_vec);
+            __m128i sum_hi = _mm256_extracti128_si256(sum_vec, 1);
+            __m128i sum_128 = _mm_add_epi32(sum_lo, sum_hi);
+            sum_128 = _mm_add_epi32(sum_128, _mm_shuffle_epi32(sum_128, _MM_SHUFFLE(1, 0, 3, 2)));
+            sum_128 = _mm_add_epi32(sum_128, _mm_shuffle_epi32(sum_128, _MM_SHUFFLE(0, 0, 0, 1)));
+
+            block.d = new_scale;
+            block.sum_qs = _mm_cvtsi128_si32(sum_128);
+        }
+        else
+        {
+            // Multi-block case: rotation across blocks
+            constexpr int CHUNKS_PER_BLOCK = BLOCK_SIZE / 8;
+            const int half_blocks = num_blocks / 2;
+
+            for (int b = 0; b < half_blocks; ++b)
+            {
+                BlockType &blockA = head_blocks[b];
+                BlockType &blockB = head_blocks[b + half_blocks];
+
+                if (b + 1 < half_blocks)
+                {
+                    _mm_prefetch(reinterpret_cast<const char *>(&head_blocks[b + 1]), _MM_HINT_T0);
+                    _mm_prefetch(reinterpret_cast<const char *>(&head_blocks[b + 1 + half_blocks]), _MM_HINT_T0);
+                }
+
+                const __m256 scaleA = _mm256_set1_ps(blockA.d);
+                const __m256 scaleB = _mm256_set1_ps(blockB.d);
+                const int16_t *cos_ptr = cos_q15 + b * BLOCK_SIZE;
+                const int16_t *sin_ptr = sin_q15 + b * BLOCK_SIZE;
+
+                alignas(32) __m256 rotA_chunks[CHUNKS_PER_BLOCK];
+                alignas(32) __m256 rotB_chunks[CHUNKS_PER_BLOCK];
+
+                // PHASE 1: Dequant + Rotate
+                for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                {
+                    const int offset = c * 8;
+                    __m128i qa_i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(blockA.qs + offset));
+                    __m128i qb_i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(blockB.qs + offset));
+                    __m128i cos_i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(cos_ptr + offset));
+                    __m128i sin_i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(sin_ptr + offset));
+
+                    __m256 x = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(qa_i16)), scaleA);
+                    __m256 y = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(qb_i16)), scaleB);
+                    __m256 cos_f = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(cos_i16)), q15_scale);
+                    __m256 sin_f = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(sin_i16)), q15_scale);
+
+                    rotA_chunks[c] = _mm256_fmsub_ps(x, cos_f, _mm256_mul_ps(y, sin_f));
+                    rotB_chunks[c] = _mm256_fmadd_ps(x, sin_f, _mm256_mul_ps(y, cos_f));
+                }
+
+                // PHASE 2: Requantize blockA
+                {
+                    __m256 maxA = _mm256_setzero_ps();
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                    {
+                        __m256 absA = _mm256_andnot_ps(sign_mask, rotA_chunks[c]);
+                        maxA = _mm256_max_ps(maxA, absA);
+                    }
+
+                    __m128 maxA_lo = _mm256_castps256_ps128(maxA);
+                    __m128 maxA_hi = _mm256_extractf128_ps(maxA, 1);
+                    __m128 maxA_128 = _mm_max_ps(maxA_lo, maxA_hi);
+                    maxA_128 = _mm_max_ps(maxA_128, _mm_shuffle_ps(maxA_128, maxA_128, _MM_SHUFFLE(1, 0, 3, 2)));
+                    maxA_128 = _mm_max_ps(maxA_128, _mm_shuffle_ps(maxA_128, maxA_128, _MM_SHUFFLE(0, 0, 0, 1)));
+                    float maxA_val = _mm_cvtss_f32(maxA_128);
+
+                    float scaleA_new = maxA_val / 32767.0f;
+                    if (scaleA_new < 1e-20f)
+                        scaleA_new = 1e-20f;
+                    __m256 invScaleA = _mm256_set1_ps(1.0f / scaleA_new);
+
+                    __m256i sumA_vec = _mm256_setzero_si256();
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                    {
+                        const int offset = c * 8;
+                        __m256 scaled = _mm256_mul_ps(rotA_chunks[c], invScaleA);
+                        __m256i q = _mm256_cvtps_epi32(_mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                        q = _mm256_max_epi32(_mm256_min_epi32(q, clamp_max), clamp_min);
+                        __m128i q_16 = _mm_packs_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+                        _mm_storeu_si128(reinterpret_cast<__m128i *>(blockA.qs + offset), q_16);
+                        sumA_vec = _mm256_add_epi32(sumA_vec, q);
+                    }
+
+                    __m128i sumA_lo = _mm256_castsi256_si128(sumA_vec);
+                    __m128i sumA_hi = _mm256_extracti128_si256(sumA_vec, 1);
+                    __m128i sumA_128 = _mm_add_epi32(sumA_lo, sumA_hi);
+                    sumA_128 = _mm_add_epi32(sumA_128, _mm_shuffle_epi32(sumA_128, _MM_SHUFFLE(1, 0, 3, 2)));
+                    sumA_128 = _mm_add_epi32(sumA_128, _mm_shuffle_epi32(sumA_128, _MM_SHUFFLE(0, 0, 0, 1)));
+
+                    blockA.d = scaleA_new;
+                    blockA.sum_qs = _mm_cvtsi128_si32(sumA_128);
+                }
+
+                // PHASE 3: Requantize blockB
+                {
+                    __m256 maxB = _mm256_setzero_ps();
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                    {
+                        __m256 absB = _mm256_andnot_ps(sign_mask, rotB_chunks[c]);
+                        maxB = _mm256_max_ps(maxB, absB);
+                    }
+
+                    __m128 maxB_lo = _mm256_castps256_ps128(maxB);
+                    __m128 maxB_hi = _mm256_extractf128_ps(maxB, 1);
+                    __m128 maxB_128 = _mm_max_ps(maxB_lo, maxB_hi);
+                    maxB_128 = _mm_max_ps(maxB_128, _mm_shuffle_ps(maxB_128, maxB_128, _MM_SHUFFLE(1, 0, 3, 2)));
+                    maxB_128 = _mm_max_ps(maxB_128, _mm_shuffle_ps(maxB_128, maxB_128, _MM_SHUFFLE(0, 0, 0, 1)));
+                    float maxB_val = _mm_cvtss_f32(maxB_128);
+
+                    float scaleB_new = maxB_val / 32767.0f;
+                    if (scaleB_new < 1e-20f)
+                        scaleB_new = 1e-20f;
+                    __m256 invScaleB = _mm256_set1_ps(1.0f / scaleB_new);
+
+                    __m256i sumB_vec = _mm256_setzero_si256();
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                    {
+                        const int offset = c * 8;
+                        __m256 scaled = _mm256_mul_ps(rotB_chunks[c], invScaleB);
+                        __m256i q = _mm256_cvtps_epi32(_mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                        q = _mm256_max_epi32(_mm256_min_epi32(q, clamp_max), clamp_min);
+                        __m128i q_16 = _mm_packs_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+                        _mm_storeu_si128(reinterpret_cast<__m128i *>(blockB.qs + offset), q_16);
+                        sumB_vec = _mm256_add_epi32(sumB_vec, q);
+                    }
+
+                    __m128i sumB_lo = _mm256_castsi256_si128(sumB_vec);
+                    __m128i sumB_hi = _mm256_extracti128_si256(sumB_vec, 1);
+                    __m128i sumB_128 = _mm_add_epi32(sumB_lo, sumB_hi);
+                    sumB_128 = _mm_add_epi32(sumB_128, _mm_shuffle_epi32(sumB_128, _MM_SHUFFLE(1, 0, 3, 2)));
+                    sumB_128 = _mm_add_epi32(sumB_128, _mm_shuffle_epi32(sumB_128, _MM_SHUFFLE(0, 0, 0, 1)));
+
+                    blockB.d = scaleB_new;
+                    blockB.sum_qs = _mm_cvtsi128_si32(sumB_128);
+                }
+            }
+        }
+    }
+
+    // Explicit template instantiations for AVX2
+    template void apply_rope_q16_integer_head_avx2<Q16_1Block>(Q16_1Block *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_avx2<Q16_1Block_64>(Q16_1Block_64 *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_avx2<Q16_1Block_128>(Q16_1Block_128 *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_avx2<Q16_1Block_192>(Q16_1Block_192 *, int, const int16_t *, const int16_t *);
+#endif // __AVX2__
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Templated AVX512 RoPE implementation for any Q16 block type
+     *
+     * Processes 16 elements at a time using AVX512 intrinsics.
+     * Handles two cases:
+     * 1. Single-block per head: rotation within the block (first half vs second half)
+     * 2. Multi-block per head: rotation across blocks
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer_head_avx512(
+        BlockType *head_blocks,
+        int num_blocks,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+        constexpr int BLOCK_SIZE = static_cast<int>(BlockType::BLOCK_SIZE);
+        constexpr int CHUNKS_PER_BLOCK = BLOCK_SIZE / 16; // AVX512 processes 16 floats at a time
+        static_assert(BLOCK_SIZE % 16 == 0, "Block size must be divisible by 16 for AVX512");
+
+        const __m512 q15_scale = _mm512_set1_ps(Q15_TO_FP32);
+        const __m512i clamp_min = _mm512_set1_epi32(-32767);
+        const __m512i clamp_max = _mm512_set1_epi32(32767);
+
+        if (num_blocks == 1)
+        {
+            // Single-block case: rotation within the block
+            // First half = qs[0:BLOCK_SIZE/2-1], Second half = qs[BLOCK_SIZE/2:BLOCK_SIZE-1]
+            constexpr int HALF_BLOCK = BLOCK_SIZE / 2;
+            constexpr int HALF_CHUNKS = HALF_BLOCK / 16;
+
+            BlockType &block = head_blocks[0];
+            const __m512 scale_vec = _mm512_set1_ps(block.d);
+
+            // Stack allocate rotation results
+            alignas(64) __m512 rot_first_chunks[HALF_CHUNKS];
+            alignas(64) __m512 rot_second_chunks[HALF_CHUNKS];
+
+            // PHASE 1: Dequant + Rotate
+            for (int c = 0; c < HALF_CHUNKS; ++c)
+            {
+                const int offset = c * 16;
+
+                // Load from first and second halves
+                __m256i qx_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + offset));
+                __m256i qy_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + HALF_BLOCK + offset));
+                __m256i cos_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(cos_q15 + offset));
+                __m256i sin_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(sin_q15 + offset));
+
+                __m512 x = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qx_i16)), scale_vec);
+                __m512 y = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qy_i16)), scale_vec);
+                __m512 cos_f = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(cos_i16)), q15_scale);
+                __m512 sin_f = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(sin_i16)), q15_scale);
+
+                rot_first_chunks[c] = _mm512_fmsub_ps(x, cos_f, _mm512_mul_ps(y, sin_f));
+                rot_second_chunks[c] = _mm512_fmadd_ps(x, sin_f, _mm512_mul_ps(y, cos_f));
+            }
+
+            // PHASE 2: Find max_abs across entire block (both halves)
+            __m512 max_all = _mm512_setzero_ps();
+            for (int c = 0; c < HALF_CHUNKS; ++c)
+            {
+                __m512 abs_first = _mm512_abs_ps(rot_first_chunks[c]);
+                __m512 abs_second = _mm512_abs_ps(rot_second_chunks[c]);
+                max_all = _mm512_max_ps(max_all, abs_first);
+                max_all = _mm512_max_ps(max_all, abs_second);
+            }
+
+            float max_val = _mm512_reduce_max_ps(max_all);
+
+            float new_scale = max_val / 32767.0f;
+            if (new_scale < 1e-20f)
+                new_scale = 1e-20f;
+            __m512 inv_scale = _mm512_set1_ps(1.0f / new_scale);
+
+            // PHASE 3: Requantize and store
+            __m512i sum_vec = _mm512_setzero_si512();
+
+            // First half
+            for (int c = 0; c < HALF_CHUNKS; ++c)
+            {
+                const int offset = c * 16;
+                __m512 scaled = _mm512_mul_ps(rot_first_chunks[c], inv_scale);
+                __m512i q = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                q = _mm512_max_epi32(_mm512_min_epi32(q, clamp_max), clamp_min);
+                __m256i q_16 = _mm512_cvtsepi32_epi16(q);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block.qs + offset), q_16);
+                sum_vec = _mm512_add_epi32(sum_vec, q);
+            }
+
+            // Second half
+            for (int c = 0; c < HALF_CHUNKS; ++c)
+            {
+                const int offset = c * 16;
+                __m512 scaled = _mm512_mul_ps(rot_second_chunks[c], inv_scale);
+                __m512i q = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                q = _mm512_max_epi32(_mm512_min_epi32(q, clamp_max), clamp_min);
+                __m256i q_16 = _mm512_cvtsepi32_epi16(q);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(block.qs + HALF_BLOCK + offset), q_16);
+                sum_vec = _mm512_add_epi32(sum_vec, q);
+            }
+
+            block.d = new_scale;
+            block.sum_qs = _mm512_reduce_add_epi32(sum_vec);
+        }
+        else
+        {
+            // Multi-block case: rotation across blocks
+            const int half_blocks = num_blocks / 2;
+
+            for (int b = 0; b < half_blocks; ++b)
+            {
+                BlockType &blockA = head_blocks[b];
+                BlockType &blockB = head_blocks[b + half_blocks];
+
+                if (b + 1 < half_blocks)
+                {
+                    _mm_prefetch(reinterpret_cast<const char *>(&head_blocks[b + 1]), _MM_HINT_T0);
+                    _mm_prefetch(reinterpret_cast<const char *>(&head_blocks[b + 1 + half_blocks]), _MM_HINT_T0);
+                }
+
+                const __m512 scaleA = _mm512_set1_ps(blockA.d);
+                const __m512 scaleB = _mm512_set1_ps(blockB.d);
+                const int16_t *cos_ptr = cos_q15 + b * BLOCK_SIZE;
+                const int16_t *sin_ptr = sin_q15 + b * BLOCK_SIZE;
+
+                alignas(64) __m512 rotA_chunks[CHUNKS_PER_BLOCK];
+                alignas(64) __m512 rotB_chunks[CHUNKS_PER_BLOCK];
+
+                // PHASE 1: Dequant + Rotate
+                for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                {
+                    const int offset = c * 16;
+                    __m256i qa_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(blockA.qs + offset));
+                    __m256i qb_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(blockB.qs + offset));
+                    __m256i cos_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(cos_ptr + offset));
+                    __m256i sin_i16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(sin_ptr + offset));
+
+                    __m512 x = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_i16)), scaleA);
+                    __m512 y = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_i16)), scaleB);
+                    __m512 cos_f = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(cos_i16)), q15_scale);
+                    __m512 sin_f = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(sin_i16)), q15_scale);
+
+                    rotA_chunks[c] = _mm512_fmsub_ps(x, cos_f, _mm512_mul_ps(y, sin_f));
+                    rotB_chunks[c] = _mm512_fmadd_ps(x, sin_f, _mm512_mul_ps(y, cos_f));
+                }
+
+                // PHASE 2: Requantize blockA
+                {
+                    __m512 maxA = _mm512_setzero_ps();
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                    {
+                        __m512 absA = _mm512_abs_ps(rotA_chunks[c]);
+                        maxA = _mm512_max_ps(maxA, absA);
+                    }
+
+                    float maxA_val = _mm512_reduce_max_ps(maxA);
+
+                    float scaleA_new = maxA_val / 32767.0f;
+                    if (scaleA_new < 1e-20f)
+                        scaleA_new = 1e-20f;
+                    __m512 invScaleA = _mm512_set1_ps(1.0f / scaleA_new);
+
+                    __m512i sumA_vec = _mm512_setzero_si512();
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                    {
+                        const int offset = c * 16;
+                        __m512 scaled = _mm512_mul_ps(rotA_chunks[c], invScaleA);
+                        __m512i q = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                        q = _mm512_max_epi32(_mm512_min_epi32(q, clamp_max), clamp_min);
+                        __m256i q_16 = _mm512_cvtsepi32_epi16(q);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(blockA.qs + offset), q_16);
+                        sumA_vec = _mm512_add_epi32(sumA_vec, q);
+                    }
+
+                    blockA.d = scaleA_new;
+                    blockA.sum_qs = _mm512_reduce_add_epi32(sumA_vec);
+                }
+
+                // PHASE 3: Requantize blockB
+                {
+                    __m512 maxB = _mm512_setzero_ps();
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                    {
+                        __m512 absB = _mm512_abs_ps(rotB_chunks[c]);
+                        maxB = _mm512_max_ps(maxB, absB);
+                    }
+
+                    float maxB_val = _mm512_reduce_max_ps(maxB);
+
+                    float scaleB_new = maxB_val / 32767.0f;
+                    if (scaleB_new < 1e-20f)
+                        scaleB_new = 1e-20f;
+                    __m512 invScaleB = _mm512_set1_ps(1.0f / scaleB_new);
+
+                    __m512i sumB_vec = _mm512_setzero_si512();
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c)
+                    {
+                        const int offset = c * 16;
+                        __m512 scaled = _mm512_mul_ps(rotB_chunks[c], invScaleB);
+                        __m512i q = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                        q = _mm512_max_epi32(_mm512_min_epi32(q, clamp_max), clamp_min);
+                        __m256i q_16 = _mm512_cvtsepi32_epi16(q);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(blockB.qs + offset), q_16);
+                        sumB_vec = _mm512_add_epi32(sumB_vec, q);
+                    }
+
+                    blockB.d = scaleB_new;
+                    blockB.sum_qs = _mm512_reduce_add_epi32(sumB_vec);
+                }
+            }
+        }
+    }
+
+    // Explicit template instantiations for AVX512
+    template void apply_rope_q16_integer_head_avx512<Q16_1Block>(Q16_1Block *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_avx512<Q16_1Block_64>(Q16_1Block_64 *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_avx512<Q16_1Block_128>(Q16_1Block_128 *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head_avx512<Q16_1Block_192>(Q16_1Block_192 *, int, const int16_t *, const int16_t *);
+#endif // __AVX512F__
+
+    /**
+     * @brief Templated auto-dispatching RoPE implementation
+     *
+     * Automatically selects optimal implementation based on CPU features.
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer_head(
+        BlockType *head_blocks,
+        int num_blocks,
+        const int16_t *cos_q15,
+        const int16_t *sin_q15)
+    {
+#if defined(__AVX512F__)
+        apply_rope_q16_integer_head_avx512<BlockType>(head_blocks, num_blocks, cos_q15, sin_q15);
+#elif defined(__AVX2__)
+        apply_rope_q16_integer_head_avx2<BlockType>(head_blocks, num_blocks, cos_q15, sin_q15);
+#else
+        apply_rope_q16_integer_head_scalar<BlockType>(head_blocks, num_blocks, cos_q15, sin_q15);
+#endif
+    }
+
+    // Explicit template instantiations for dispatch
+    template void apply_rope_q16_integer_head<Q16_1Block>(Q16_1Block *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head<Q16_1Block_64>(Q16_1Block_64 *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head<Q16_1Block_128>(Q16_1Block_128 *, int, const int16_t *, const int16_t *);
+    template void apply_rope_q16_integer_head<Q16_1Block_192>(Q16_1Block_192 *, int, const int16_t *, const int16_t *);
+
+    /**
+     * @brief Templated high-level RoPE wrapper for Q16 tensors
+     *
+     * Handles position ID processing, sin/cos computation, and parallelization.
+     */
+    template <typename BlockType>
+    void apply_rope_q16_integer(
+        BlockType *Q,
+        BlockType *K,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        RoPEPersistentState *persistent_state)
+    {
+        constexpr int BLOCK_SIZE = static_cast<int>(BlockType::BLOCK_SIZE);
+
+        if (!Q)
+        {
+            LOG_ERROR("apply_rope_q16_integer: Q must not be null");
+            return;
+        }
+
+        if (head_dim % BLOCK_SIZE != 0)
+        {
+            LOG_ERROR("apply_rope_q16_integer: head_dim (" << head_dim << ") must be divisible by block size (" << BLOCK_SIZE << ")");
+            return;
+        }
+
+        const int half_dim = head_dim / 2;
+        const int blocks_per_head = head_dim / BLOCK_SIZE;
+        const int q_stride_blocks = n_heads * blocks_per_head;
+        const int k_stride_blocks = n_kv_heads * blocks_per_head;
+
+        // Get inverse frequencies
+        const auto &inv_freq = get_inv_freq_cached(head_dim, rope_theta);
+
+        // Compute sin/cos for all positions
+        std::vector<int16_t> cos_q15(seq_len * half_dim);
+        std::vector<int16_t> sin_q15(seq_len * half_dim);
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            int pos = position_ids ? position_ids[t] : t;
+            if (pos < 0)
+                continue;
+
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float angle = static_cast<float>(pos) * inv_freq[i];
+                float c = std::cos(angle);
+                float s = std::sin(angle);
+                cos_q15[t * half_dim + i] = static_cast<int16_t>(std::round(c * 32767.0f));
+                sin_q15[t * half_dim + i] = static_cast<int16_t>(std::round(s * 32767.0f));
+            }
+        }
+
+        // Process Q tensor
+        auto do_q_work = [&]()
+        {
+#pragma omp for collapse(2)
+            for (int t = 0; t < seq_len; ++t)
+            {
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    int pos = position_ids ? position_ids[t] : t;
+                    if (pos < 0)
+                        continue;
+
+                    BlockType *head_ptr = Q + t * q_stride_blocks + h * blocks_per_head;
+                    const int16_t *c_ptr = cos_q15.data() + t * half_dim;
+                    const int16_t *s_ptr = sin_q15.data() + t * half_dim;
+
+                    apply_rope_q16_integer_head<BlockType>(head_ptr, blocks_per_head, c_ptr, s_ptr);
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(do_q_work);
+
+        // Process K tensor if provided
+        if (K)
+        {
+            auto do_k_work = [&]()
+            {
+#pragma omp for collapse(2)
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    for (int h = 0; h < n_kv_heads; ++h)
+                    {
+                        int pos = position_ids ? position_ids[t] : t;
+                        if (pos < 0)
+                            continue;
+
+                        BlockType *head_ptr = K + t * k_stride_blocks + h * blocks_per_head;
+                        const int16_t *c_ptr = cos_q15.data() + t * half_dim;
+                        const int16_t *s_ptr = sin_q15.data() + t * half_dim;
+
+                        apply_rope_q16_integer_head<BlockType>(head_ptr, blocks_per_head, c_ptr, s_ptr);
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(do_k_work);
+        }
+    }
+
+    // Explicit template instantiations for high-level wrapper
+    template void apply_rope_q16_integer<Q16_1Block>(Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, RoPEPersistentState *);
+    template void apply_rope_q16_integer<Q16_1Block_64>(Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, RoPEPersistentState *);
+    template void apply_rope_q16_integer<Q16_1Block_128>(Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, RoPEPersistentState *);
+    template void apply_rope_q16_integer<Q16_1Block_192>(Q16_1Block_192 *, Q16_1Block_192 *, const int *, int, int, int, int, float, RoPEPersistentState *);
+
+    /**
+     * @brief Runtime dispatch for Q16 RoPE based on Q16BlockSize enum
+     */
+    void apply_rope_q16_integer_dispatch(
+        void *Q,
+        void *K,
+        Q16BlockSize block_size,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        RoPEPersistentState *persistent_state)
+    {
+        switch (block_size)
+        {
+        case Q16BlockSize::BLOCK_32:
+            apply_rope_q16_integer<Q16_1Block>(
+                static_cast<Q16_1Block *>(Q),
+                static_cast<Q16_1Block *>(K),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
+            break;
+        case Q16BlockSize::BLOCK_64:
+            apply_rope_q16_integer<Q16_1Block_64>(
+                static_cast<Q16_1Block_64 *>(Q),
+                static_cast<Q16_1Block_64 *>(K),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
+            break;
+        case Q16BlockSize::BLOCK_128:
+            apply_rope_q16_integer<Q16_1Block_128>(
+                static_cast<Q16_1Block_128 *>(Q),
+                static_cast<Q16_1Block_128 *>(K),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
+            break;
+        case Q16BlockSize::BLOCK_192:
+            apply_rope_q16_integer<Q16_1Block_192>(
+                static_cast<Q16_1Block_192 *>(Q),
+                static_cast<Q16_1Block_192 *>(K),
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, persistent_state);
+            break;
+        default:
+            LOG_ERROR("apply_rope_q16_integer_dispatch: unsupported block size");
+            break;
+        }
+    }
+
 } // namespace llaminar2::primitives

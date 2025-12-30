@@ -52,7 +52,10 @@ namespace llaminar2
     std::shared_ptr<Q16_1Tensor> UnifiedKVCache<ActivationPrecision::Q16_1>::allocate_tensor(
         size_t rows, size_t cols, int device_idx)
     {
-        return tensor_factory_->createQ16_1({rows, cols}, device_idx);
+        // Auto-select optimal Q16 block size based on head dimension for 1-block-per-head
+        // This eliminates per-block scale tracking overhead in integer attention
+        const Q16BlockSize block_size = optimal_q16_block_size(head_dim_);
+        return tensor_factory_->createQ16_1({rows, cols}, block_size, device_idx);
     }
 
     // =========================================================================
@@ -111,15 +114,21 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::Q16_1>::copy_append_data(
         Q16_1Tensor *dst, const Q16_1Tensor *src, int offset_tokens, int new_tokens)
     {
-        Q16_1Block *dst_blocks = dst->mutable_typed_data();
-        const Q16_1Block *src_blocks = src->typed_data();
+        // Use tensor's actual block size for variable-size Q16 blocks
+        const Q16BlockSize bs = dst->q16_block_size();
+        const size_t block_bytes = q16_block_size_bytes(bs);
+        const size_t block_elements = q16_block_size_elements(bs);
 
-        size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+        uint8_t *dst_bytes = static_cast<uint8_t *>(dst->raw_mutable_data());
+        const uint8_t *src_bytes = static_cast<const uint8_t *>(src->raw_data());
+
+        size_t blocks_per_row = (kv_dim_ + block_elements - 1) / block_elements;
         size_t offset_blocks = static_cast<size_t>(offset_tokens) * blocks_per_row;
         size_t copy_blocks = static_cast<size_t>(new_tokens) * blocks_per_row;
-        size_t copy_size = copy_blocks * sizeof(Q16_1Block);
+        size_t offset_bytes = offset_blocks * block_bytes;
+        size_t copy_size = copy_blocks * block_bytes;
 
-        std::memcpy(dst_blocks + offset_blocks, src_blocks, copy_size);
+        std::memcpy(dst_bytes + offset_bytes, src_bytes, copy_size);
     }
 
     // =========================================================================
@@ -172,12 +181,18 @@ namespace llaminar2
     void UnifiedKVCache<ActivationPrecision::Q16_1>::shift_evict_data(
         Q16_1Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
-        Q16_1Block *blocks = tensor->mutable_typed_data();
-        size_t blocks_per_row = (kv_dim_ + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+        // Use tensor's actual block size for variable-size Q16 blocks
+        const Q16BlockSize bs = tensor->q16_block_size();
+        const size_t block_bytes = q16_block_size_bytes(bs);
+        const size_t block_elements = q16_block_size_elements(bs);
+
+        uint8_t *data = static_cast<uint8_t *>(tensor->raw_mutable_data());
+        size_t blocks_per_row = (kv_dim_ + block_elements - 1) / block_elements;
         size_t evict_blocks = static_cast<size_t>(tokens_to_evict) * blocks_per_row;
         size_t keep_blocks = static_cast<size_t>(tokens_to_keep) * blocks_per_row;
-        size_t keep_size = keep_blocks * sizeof(Q16_1Block);
-        std::memmove(blocks, blocks + evict_blocks, keep_size);
+        size_t evict_offset = evict_blocks * block_bytes;
+        size_t keep_size = keep_blocks * block_bytes;
+        std::memmove(data, data + evict_offset, keep_size);
     }
 
     // =========================================================================

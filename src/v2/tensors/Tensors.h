@@ -85,7 +85,7 @@
 #pragma once
 
 #include "ITensor.h"
-#include "TypedTensorBase.h"  // CRTP base for type-safe typed_data() access
+#include "TypedTensorBase.h" // CRTP base for type-safe typed_data() access
 #include "TensorKernels.h"
 #include "FP16Utils.h"
 #include "BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
@@ -1578,11 +1578,11 @@ namespace llaminar2
      * **Usage**: Activation tensor for FP16 inference (2× memory savings, GPU-optimized).
      */
     class FP16Tensor : public TypedTensorBase<FP16Tensor, uint16_t>,
-                        public TensorBase,
-                        public IActivationTensor,
-                        public ITensorGemmTileDataProvider,
-                        public IQ8_0Decodable,
-                        public IQ8_1Decodable
+                       public TensorBase,
+                       public IActivationTensor,
+                       public ITensorGemmTileDataProvider,
+                       public IQ8_0Decodable,
+                       public IQ8_1Decodable
     {
     public:
         /// Native storage type (same as TypedTensorBase::value_type)
@@ -1792,11 +1792,11 @@ namespace llaminar2
      * **Usage**: Preferred activation tensor for CPU/GPU mixed precision (better overflow resistance than FP16).
      */
     class BF16Tensor : public TypedTensorBase<BF16Tensor, uint16_t>,
-                        public TensorBase,
-                        public IActivationTensor,
-                        public ITensorGemmTileDataProvider,
-                        public IQ8_0Decodable,
-                        public IQ8_1Decodable
+                       public TensorBase,
+                       public IActivationTensor,
+                       public ITensorGemmTileDataProvider,
+                       public IQ8_0Decodable,
+                       public IQ8_1Decodable
     {
     public:
         /// Native storage type (same as TypedTensorBase::value_type)
@@ -1998,8 +1998,8 @@ namespace llaminar2
      * **NOT implemented**: IActivationTensor (INT8Tensor represents weights, not activations)
      */
     class INT8Tensor : public TypedTensorBase<INT8Tensor, int8_t>,
-                        public TensorBase,
-                        public ITensorGemmTileDataProvider
+                       public TensorBase,
+                       public ITensorGemmTileDataProvider
     {
     public:
         /// Native storage type (same as TypedTensorBase::value_type)
@@ -2151,7 +2151,7 @@ namespace llaminar2
      * - `to_fp32()`: Dequantize to FP32 for final output or parity testing
      */
     class INT32Tensor : public TypedTensorBase<INT32Tensor, int32_t>,
-                         public TensorBase
+                        public TensorBase
     {
     public:
         /// Native storage type (same as TypedTensorBase::value_type)
@@ -2753,11 +2753,11 @@ namespace llaminar2
      *   next_kernel->apply_q8_1(output->q8_1_blocks(), ...);
      */
     class Q8_1Tensor : public TypedTensorBase<Q8_1Tensor, Q8_1Block>,
-                        public TensorBase,
-                        public IActivationTensor,
-                        public ITensorGemmTileDataProvider,
-                        public IQ8_1Decodable,
-                        public IINT8Unpackable
+                       public TensorBase,
+                       public IActivationTensor,
+                       public ITensorGemmTileDataProvider,
+                       public IQ8_1Decodable,
+                       public IINT8Unpackable
     {
     public:
         /// Native storage type (same as TypedTensorBase::value_type)
@@ -3197,9 +3197,9 @@ namespace llaminar2
      * across 20+ transformer layers causes token prediction divergence with Q8_1.
      */
     class Q16_1Tensor : public TypedTensorBase<Q16_1Tensor, Q16_1Block>,
-                         public TensorBase,
-                         public IActivationTensor,
-                         public ITensorGemmTileDataProvider
+                        public TensorBase,
+                        public IActivationTensor,
+                        public ITensorGemmTileDataProvider
     {
     public:
         /// Native storage type (same as TypedTensorBase::value_type)
@@ -3229,6 +3229,12 @@ namespace llaminar2
 
         /// Construct mutable Q16_1 activation buffer - the primary use case
         explicit Q16_1Tensor(const std::vector<size_t> &shape, int device_idx = -1);
+
+        /// Construct mutable Q16_1 activation buffer with custom block size
+        /// @param shape Tensor shape [rows, cols]
+        /// @param block_size Block size for quantization (32, 64, 128, or 192)
+        /// @param device_idx Device index (-1 for CPU)
+        Q16_1Tensor(const std::vector<size_t> &shape, Q16BlockSize block_size, int device_idx = -1);
 
         ~Q16_1Tensor() override;
 
@@ -3316,28 +3322,16 @@ namespace llaminar2
             size_t offset = 0) override;
 
         // ITensorGemmTileDataProvider interface
-        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
-        {
-            const size_t blocks_per_row_ = (shape_[1] + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
-            const Q16_1Block *blocks = reinterpret_cast<const Q16_1Block *>(data_ptr);
-            const Q16_1Block &block = blocks[row_idx * blocks_per_row_ + k_block_offset];
-            decodeBlock(block, output);
-        }
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
 
-        __attribute__((always_inline))
-        const void *
-        get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t blocks_per_row_ = (shape_[1] + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
-            const Q16_1Block *blocks = reinterpret_cast<const Q16_1Block *>(data_ptr);
-            return &blocks[row_idx * blocks_per_row_ + k_block_offset];
-        }
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
         size_t decoder_cols() const override { return shape_[1]; }
-        size_t block_size() const override { return Q16_1Block::BLOCK_SIZE; }
+        size_t block_size() const override { return static_cast<size_t>(block_size_); }
+
+        /// Get the block size enum value
+        Q16BlockSize q16_block_size() const { return block_size_; }
 
         // ===== Q16_1-Specific Native Accessors =====
 
@@ -3366,7 +3360,8 @@ namespace llaminar2
 
         size_t blocks_per_row() const
         {
-            return (shape_[1] + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
+            const size_t bs = static_cast<size_t>(block_size_);
+            return (shape_[1] + bs - 1) / bs;
         }
 
         size_t total_blocks() const
@@ -3429,6 +3424,10 @@ namespace llaminar2
         bool raw_data_released_ = false;
         bool is_mutable_ = false;
         mutable bool cache_dirty_ = false;
+
+        /// Block size for Q16_1 quantization (32, 64, 128, or 192 elements per block)
+        /// Default is BLOCK_32 for backward compatibility with existing code
+        Q16BlockSize block_size_ = Q16BlockSize::BLOCK_32;
 
     public:
         // Copy from FP32 data (quantizes to Q16_1 blocks)

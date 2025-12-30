@@ -446,6 +446,68 @@ namespace llaminar2
     };
 
     /**
+     * @brief Q16 attention debug dump configuration
+     *
+     * Environment Variables:
+     *   LLAMINAR_Q16_ATTN_DUMP            - Enable targeted Q16 attention dumps (default: 0)
+     *   LLAMINAR_Q16_ATTN_DUMP_ONCE       - Dump only once per process (default: 1)
+     *   LLAMINAR_Q16_ATTN_DUMP_LAYER      - Layer index to dump (default: -1 = any)
+     *   LLAMINAR_Q16_ATTN_DUMP_HEAD       - Query head index to dump (default: 0)
+     *   LLAMINAR_Q16_ATTN_DUMP_ROW        - Query row to dump (default: -1 = last row)
+     *   LLAMINAR_Q16_ATTN_DUMP_TOPK       - Top-k entries to print for scores/weights (default: 8)
+     */
+    struct Q16AttentionDumpConfig
+    {
+        bool enabled = false;
+        bool once = true;
+        int layer = -1;
+        int head = 0;
+        int row = -1;
+        int topk = 8;
+
+        Q16AttentionDumpConfig() { reload(); }
+
+        void reload()
+        {
+            const char *enabled_env = std::getenv("LLAMINAR_Q16_ATTN_DUMP");
+            if (enabled_env)
+            {
+                enabled = (std::atoi(enabled_env) != 0);
+            }
+
+            const char *once_env = std::getenv("LLAMINAR_Q16_ATTN_DUMP_ONCE");
+            if (once_env)
+            {
+                once = (std::atoi(once_env) != 0);
+            }
+
+            const char *layer_env = std::getenv("LLAMINAR_Q16_ATTN_DUMP_LAYER");
+            if (layer_env)
+            {
+                layer = std::atoi(layer_env);
+            }
+
+            const char *head_env = std::getenv("LLAMINAR_Q16_ATTN_DUMP_HEAD");
+            if (head_env)
+            {
+                head = std::atoi(head_env);
+            }
+
+            const char *row_env = std::getenv("LLAMINAR_Q16_ATTN_DUMP_ROW");
+            if (row_env)
+            {
+                row = std::atoi(row_env);
+            }
+
+            const char *topk_env = std::getenv("LLAMINAR_Q16_ATTN_DUMP_TOPK");
+            if (topk_env)
+            {
+                topk = std::atoi(topk_env);
+            }
+        }
+    };
+
+    /**
      * @brief Execution framework configuration group
      *
      * Controls the Graph-based execution system (LayerExecutor / GraphOrchestrator).
@@ -1262,7 +1324,8 @@ namespace llaminar2
         GemmConfig gemm;
         ProfileConfig profile;
         RMSNormConfig rmsnorm;
-        AttentionConfig attention;    ///< Q8_1 attention precision configuration
+        AttentionConfig attention; ///< Q8_1 attention precision configuration
+        Q16AttentionDumpConfig q16_attention_dump;
         ExecutionConfig execution;    ///< LayerExecutor framework configuration
         SnapshotConfig snapshot;      ///< Snapshot and tensor dump configuration
         StageDumpConfig stage_dump;   ///< Compute stage input/output dumping
@@ -1277,6 +1340,7 @@ namespace llaminar2
             profile.reload();
             rmsnorm.reload();
             attention.reload();
+            q16_attention_dump.reload();
             execution.reload();
             snapshot.reload();
             stage_dump.reload();

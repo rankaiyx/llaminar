@@ -641,14 +641,17 @@ add_library(llaminar2_core STATIC
     kernels/cpu/attention/q8_1/jit/WoProjectionVNNIPacked.cpp       # JIT helper thunk for VNNI-packed Wo GEMM
     kernels/cpu/attention/q8_1/FusedAttentionWoRef.cpp             # Reference implementation
     kernels/cpu/attention/q8_1/FusedAttentionWoTiled.cpp           # Cache-blocked tiled implementation
-    # Q16_1 fused attention (PURE INTEGER PIPELINE)
+    # Q16_1 fused attention (TRUE INTEGER PIPELINE v2)
     kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.cpp        # ITensorFusedAttentionWo implementation
-    kernels/cpu/attention/q16_1/ref/Q16FusedAttentionRef.cpp       # Scalar reference implementation
-    kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProductRef.cpp    # μK: Q×K^T dot product (INT16×INT16→INT32)
-    kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmaxRef.cpp # μK: exp2 fixed-point softmax (INT32→INT16)
-    kernels/cpu/attention/q16_1/ref/microkernels/Int8RequantRef.cpp      # μK: INT8 requant for stable alpha computation
-    kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulateRef.cpp     # μK: P×V accumulation (INT16×INT16→INT32)
-    kernels/cpu/attention/q16_1/ref/microkernels/WoProjectionVNNIRef.cpp # μK: Wo projection VPDPWSSD (INT16×INT16→Q16_1)
+    kernels/cpu/attention/q16_1/ref/Q16IntegerAttentionRef.cpp     # v2: TRUE integer attention (replaces Q16FusedAttentionRef)
+    kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmax.cpp    # v2: exp2 fixed-point softmax (INT32→INT16)
+    # Deprecated v1 kernels - kept for existing infrastructure until v2 is wired up
+    kernels/cpu/attention/q16_1/ref/Q16FusedAttentionRef.deprecated.cpp       # v1: Scalar reference (DEPRECATED)
+    kernels/cpu/attention/q16_1/ref/microkernels/Q16DotProductRef.deprecated.cpp    # v1 μK (DEPRECATED)
+    kernels/cpu/attention/q16_1/ref/microkernels/Exp2FixedSoftmaxRef.deprecated.cpp # v1 μK (DEPRECATED)
+    kernels/cpu/attention/q16_1/ref/microkernels/Int8RequantRef.deprecated.cpp      # v1 μK (DEPRECATED)
+    kernels/cpu/attention/q16_1/ref/microkernels/PVAccumulateRef.deprecated.cpp     # v1 μK (DEPRECATED)
+    kernels/cpu/attention/q16_1/ref/microkernels/WoProjectionVNNIRef.deprecated.cpp # v1 μK (DEPRECATED)
     # Fused kernels (operator fusion framework)
     kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)

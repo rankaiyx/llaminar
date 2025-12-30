@@ -3,7 +3,7 @@
  * @brief Reference implementation of Q16_1 dot product microkernel
  */
 
-#include "Q16DotProductRef.h"
+#include "Q16DotProductRef.deprecated.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include <algorithm>
@@ -129,9 +129,9 @@ namespace llaminar2::kernels::q16_1::microkernels
             if (do_trace && k_row == 0 && q_row == cfg.row)
             {
                 LOG_DEBUG("[Q16AttnDump] FAST_DOT head=" << params.q_head << " kv_head=" << params.kv_head
-                                                         << " q_row=" << q_row << " k_row=" << k_row
-                                                         << " q_start_col=" << q_start_col << " k_start_col=" << k_start_col
-                                                         << " raw_dot=" << dot << " scaled=" << scores[kv]);
+                          << " q_row=" << q_row << " k_row=" << k_row
+                          << " q_start_col=" << q_start_col << " k_start_col=" << k_start_col
+                          << " raw_dot=" << dot << " scaled=" << scores[kv]);
 
                 // Block-level trace to understand the accumulation
                 constexpr int BLOCK_SIZE = Q16_1Block::BLOCK_SIZE;
@@ -147,7 +147,7 @@ namespace llaminar2::kernels::q16_1::microkernels
                     const Q16_1Block &q_block = params.Q[q_row * params.q_blocks_per_row + q_block_idx];
                     const Q16_1Block &k_block = params.K[k_row * params.kv_blocks_per_row + k_block_idx];
                     int elems_in_block = std::min(BLOCK_SIZE, params.head_dim - b * BLOCK_SIZE);
-
+                    
                     int32_t block_dot = 0;
                     for (int i = 0; i < elems_in_block; ++i)
                     {
@@ -155,7 +155,7 @@ namespace llaminar2::kernels::q16_1::microkernels
                     }
                     float block_contrib = static_cast<float>(block_dot) * q_block.d * k_block.d;
                     recomputed_dot += block_contrib;
-                    block_trace << "b" << b << ":(idx_q=" << q_block_idx << ",idx_k=" << k_block_idx
+                    block_trace << "b" << b << ":(idx_q=" << q_block_idx << ",idx_k=" << k_block_idx 
                                 << ",int_dot=" << block_dot << ",qd=" << q_block.d << ",kd=" << k_block.d
                                 << ",contrib=" << block_contrib << ") ";
                 }

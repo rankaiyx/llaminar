@@ -118,6 +118,21 @@ namespace llaminar2
                                                  int device_idx = -1);
 
         /**
+         * @brief Create Q16_1 tensor with custom block size
+         *
+         * Creates Q16_1 tensor with variable block sizes for head-aligned
+         * quantization in models with non-standard head dimensions.
+         *
+         * @param shape Tensor dimensions (logical element count)
+         * @param block_size Block size for quantization (Q16_32, Q16_64, Q16_128, Q16_192)
+         * @param device_idx Optional device index (-1 = CPU)
+         * @return Q16_1 tensor with specified block size
+         */
+        std::unique_ptr<Q16_1Tensor> createQ16_1(const std::vector<size_t> &shape,
+                                                 Q16BlockSize block_size,
+                                                 int device_idx = -1);
+
+        /**
          * @brief Create activation tensor based on precision setting
          *
          * Convenience method that creates the appropriate tensor type based on

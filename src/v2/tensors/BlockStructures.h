@@ -100,6 +100,162 @@ namespace llaminar2
     };
     static_assert(sizeof(Q16_1Block) == 72, "Q16_1Block must be 72 bytes");
 
+    // ========================================================================
+    // Q16_1 Variable Block Size Formats (for Integer Attention v2)
+    // ========================================================================
+    //
+    // These block sizes enable 1-block-per-head attention computation, eliminating
+    // the need for per-block scale tracking during Q×K^T and P×V accumulation.
+    //
+    // Block size selection based on model head_dim:
+    //   - 64:  Qwen2.5-0.5B, GPT-2 (1 block per head)
+    //   - 128: Qwen3, Llama-3, Mistral (1 block per head)
+    //   - 192: DeepSeek V3, Kimi K2 MLA Q/K (1 block per head)
+    //
+    // The original Q16_1Block (32 elements) is preserved for GEMM compatibility.
+    // ========================================================================
+
+    /**
+     * @brief Q16BlockSize enum for compile-time block size selection
+     */
+    enum class Q16BlockSize : uint8_t
+    {
+        BLOCK_32 = 32,   ///< Legacy, GEMM compatibility (Q16_1Block)
+        BLOCK_64 = 64,   ///< Universal for attention (head_dim=64)
+        BLOCK_128 = 128, ///< Optimal for head_dim=128 (Llama-3, Qwen3)
+        BLOCK_192 = 192  ///< Optimal for MLA Q/K (DeepSeek V3, Kimi K2)
+    };
+
+    /**
+     * @brief Q16_1 block with 64 elements (optimal for head_dim=64)
+     *
+     * Memory: 4 + 4 + 128 = 136 bytes per block
+     * Overhead: 8/64 = 12.5% (vs 25% for 32-element blocks)
+     */
+    struct alignas(4) Q16_1Block_64
+    {
+        float d;        ///< FP32 scale factor
+        int32_t sum_qs; ///< INT32 pre-computed sum: Σ(qs[i])
+        int16_t qs[64]; ///< 64 quantized int16 values
+        static constexpr size_t BLOCK_SIZE = 64;
+    };
+    static_assert(sizeof(Q16_1Block_64) == 136, "Q16_1Block_64 must be 136 bytes");
+
+    /**
+     * @brief Q16_1 block with 128 elements (optimal for head_dim=128)
+     *
+     * Memory: 4 + 4 + 256 = 264 bytes per block
+     * Overhead: 8/128 = 6.25% (vs 25% for 32-element blocks)
+     */
+    struct alignas(4) Q16_1Block_128
+    {
+        float d;         ///< FP32 scale factor
+        int32_t sum_qs;  ///< INT32 pre-computed sum: Σ(qs[i])
+        int16_t qs[128]; ///< 128 quantized int16 values
+        static constexpr size_t BLOCK_SIZE = 128;
+    };
+    static_assert(sizeof(Q16_1Block_128) == 264, "Q16_1Block_128 must be 264 bytes");
+
+    /**
+     * @brief Q16_1 block with 192 elements (optimal for MLA 192-dim Q/K)
+     *
+     * Memory: 4 + 4 + 384 = 392 bytes per block
+     * Overhead: 8/192 = 4.2% (vs 25% for 32-element blocks)
+     */
+    struct alignas(4) Q16_1Block_192
+    {
+        float d;         ///< FP32 scale factor
+        int32_t sum_qs;  ///< INT32 pre-computed sum: Σ(qs[i])
+        int16_t qs[192]; ///< 192 quantized int16 values
+        static constexpr size_t BLOCK_SIZE = 192;
+    };
+    static_assert(sizeof(Q16_1Block_192) == 392, "Q16_1Block_192 must be 392 bytes");
+
+    /**
+     * @brief Type trait to get Q16_1 block type from Q16BlockSize enum
+     */
+    template <Q16BlockSize Size>
+    struct Q16BlockType;
+
+    template <>
+    struct Q16BlockType<Q16BlockSize::BLOCK_32>
+    {
+        using type = Q16_1Block;
+    };
+    template <>
+    struct Q16BlockType<Q16BlockSize::BLOCK_64>
+    {
+        using type = Q16_1Block_64;
+    };
+    template <>
+    struct Q16BlockType<Q16BlockSize::BLOCK_128>
+    {
+        using type = Q16_1Block_128;
+    };
+    template <>
+    struct Q16BlockType<Q16BlockSize::BLOCK_192>
+    {
+        using type = Q16_1Block_192;
+    };
+
+    template <Q16BlockSize Size>
+    using Q16BlockType_t = typename Q16BlockType<Size>::type;
+
+    /**
+     * @brief Select optimal Q16 block size for a given head dimension
+     *
+     * Returns the block size that achieves 1 block per head (optimal) or
+     * minimizes blocks per head for non-standard dimensions.
+     */
+    constexpr Q16BlockSize optimal_q16_block_size(int head_dim)
+    {
+        if (head_dim == 64)
+            return Q16BlockSize::BLOCK_64;
+        if (head_dim == 128)
+            return Q16BlockSize::BLOCK_128;
+        if (head_dim == 192)
+            return Q16BlockSize::BLOCK_192;
+        // Fallback: use largest block that divides evenly, or 64 as universal
+        if (head_dim % 192 == 0)
+            return Q16BlockSize::BLOCK_192;
+        if (head_dim % 128 == 0)
+            return Q16BlockSize::BLOCK_128;
+        if (head_dim % 64 == 0)
+            return Q16BlockSize::BLOCK_64;
+        return Q16BlockSize::BLOCK_64; // Universal fallback (GCD of common head dims)
+    }
+
+    /**
+     * @brief Get the byte size of a Q16 block given its element count
+     *
+     * Each Q16 block has: float d (4) + int32_t sum_qs (4) + int16_t qs[N] (2*N)
+     * Total: 8 + 2*N bytes
+     */
+    constexpr size_t q16_block_size_bytes(Q16BlockSize size)
+    {
+        switch (size)
+        {
+        case Q16BlockSize::BLOCK_32:
+            return sizeof(Q16_1Block); // 72 bytes
+        case Q16BlockSize::BLOCK_64:
+            return sizeof(Q16_1Block_64); // 136 bytes
+        case Q16BlockSize::BLOCK_128:
+            return sizeof(Q16_1Block_128); // 264 bytes
+        case Q16BlockSize::BLOCK_192:
+            return sizeof(Q16_1Block_192); // 392 bytes
+        default:
+            return sizeof(Q16_1Block); // Fallback
+        }
+    }
+
+    /**
+     * @brief Get the element count for a Q16 block size
+     */
+    constexpr size_t q16_block_size_elements(Q16BlockSize size)
+    {
+        return static_cast<size_t>(size);
+    }
+
     /** @brief Q4_0 block: 4-bit quantization (32 elements per block, 18 bytes) */
     struct Q4_0Block
     {

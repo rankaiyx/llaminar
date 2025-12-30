@@ -3,7 +3,7 @@
  * @brief Reference implementation of P×V accumulation microkernel
  */
 
-#include "PVAccumulateRef.h"
+#include "PVAccumulateRef.deprecated.h"
 #include <algorithm>
 #include <cstring>
 #include <cmath>

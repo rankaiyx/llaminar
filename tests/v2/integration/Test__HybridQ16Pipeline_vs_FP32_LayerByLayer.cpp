@@ -57,6 +57,12 @@
 using namespace llaminar2;
 
 // =============================================================================
+// Model Constants for Qwen2-0.5B
+// =============================================================================
+static constexpr int QWEN2_05B_NUM_HEADS = 14;
+static constexpr int QWEN2_05B_HEAD_DIM = 64;
+
+// =============================================================================
 // Comparison Utilities
 // =============================================================================
 
@@ -103,6 +109,84 @@ static double mean_abs_diff(const float *a, const float *b, size_t n)
         sum += std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
     }
     return sum / static_cast<double>(n);
+}
+
+/**
+ * @brief Compute per-head cosine similarities for ATTENTION_CONTEXT tensors
+ *
+ * Layout: [seq_len × num_heads × head_dim] - head interleaved within each row
+ * For each sequence position, all heads are stored contiguously.
+ *
+ * @param ref_data Reference (FP32) context data
+ * @param test_data Test (HybridQ16) context data
+ * @param total_size Total number of floats (seq_len * num_heads * head_dim)
+ * @param num_heads Number of attention heads
+ * @param head_dim Head dimension
+ * @return Vector of per-head cosine similarities
+ */
+static std::vector<double> per_head_cosine_context(
+    const float *ref_data, const float *test_data, size_t total_size,
+    int num_heads, int head_dim)
+{
+    size_t seq_len = total_size / (num_heads * head_dim);
+    std::vector<double> head_cosines(num_heads, 0.0);
+
+    // For each head, compute cosine across all seq positions
+    for (int h = 0; h < num_heads; ++h)
+    {
+        double dot = 0.0, norm_ref = 0.0, norm_test = 0.0;
+
+        // Layout: data[seq][head][elem]
+        // For head h: indices are seq * (num_heads * head_dim) + h * head_dim + elem
+        for (size_t s = 0; s < seq_len; ++s)
+        {
+            size_t base = s * num_heads * head_dim + h * head_dim;
+            for (int e = 0; e < head_dim; ++e)
+            {
+                double ref_val = static_cast<double>(ref_data[base + e]);
+                double test_val = static_cast<double>(test_data[base + e]);
+                dot += ref_val * test_val;
+                norm_ref += ref_val * ref_val;
+                norm_test += test_val * test_val;
+            }
+        }
+
+        if (norm_ref < 1e-12 || norm_test < 1e-12)
+            head_cosines[h] = 0.0;
+        else
+            head_cosines[h] = dot / (std::sqrt(norm_ref) * std::sqrt(norm_test));
+    }
+
+    return head_cosines;
+}
+
+/**
+ * @brief Compute per-row (sequence position) cosine similarities for ATTENTION_CONTEXT
+ *
+ * @param ref_data Reference context data
+ * @param test_data Test context data
+ * @param total_size Total floats
+ * @param num_heads Number of attention heads
+ * @param head_dim Head dimension
+ * @return Vector of per-row cosine similarities
+ */
+static std::vector<double> per_row_cosine_context(
+    const float *ref_data, const float *test_data, size_t total_size,
+    int num_heads, int head_dim)
+{
+    size_t seq_len = total_size / (num_heads * head_dim);
+    size_t row_size = num_heads * head_dim;
+    std::vector<double> row_cosines(seq_len, 0.0);
+
+    for (size_t s = 0; s < seq_len; ++s)
+    {
+        row_cosines[s] = cosine_similarity(
+            ref_data + s * row_size,
+            test_data + s * row_size,
+            row_size);
+    }
+
+    return row_cosines;
 }
 
 // =============================================================================
@@ -615,6 +699,93 @@ TEST_F(Test__HybridQ16Pipeline_LayerByLayer, Prefill_SnapshotComparison)
     LOG_INFO("╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝");
     LOG_INFO("");
 
+    // ===== Per-head breakdown for ATTENTION_CONTEXT at worst layers =====
+    // This helps identify which specific heads are causing the cosine drop
+    {
+        LOG_INFO("╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
+        LOG_INFO("║  PER-HEAD ATTENTION_CONTEXT BREAKDOWN (layers with cos < 0.95)                                                    ║");
+        LOG_INFO("╠═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣");
+
+        bool any_breakdown = false;
+        for (const auto &s : all_stages)
+        {
+            // Only show breakdown for ATTENTION_CONTEXT stages with low cosine
+            if (s.name.find("ATTENTION_CONTEXT") == std::string::npos)
+                continue;
+            if (s.hybridq16_cos >= 0.95)
+                continue;
+
+            any_breakdown = true;
+
+            // Get the data for this stage
+            size_t fp32_size = 0, q16_size = 0;
+            const float *fp32_data = runner_fp32->getSnapshot(s.name, fp32_size);
+            const float *q16_data = runner_hybridq16->getSnapshot(s.name, q16_size);
+
+            if (!fp32_data || !q16_data || fp32_size != q16_size)
+            {
+                LOG_WARN("║  " << s.name << ": cannot compute breakdown (data mismatch)");
+                continue;
+            }
+
+            // Per-head cosines
+            auto head_cos = per_head_cosine_context(fp32_data, q16_data, fp32_size,
+                                                    QWEN2_05B_NUM_HEADS, QWEN2_05B_HEAD_DIM);
+
+            // Find worst heads
+            std::vector<std::pair<double, int>> sorted_heads;
+            for (int h = 0; h < QWEN2_05B_NUM_HEADS; ++h)
+                sorted_heads.push_back({head_cos[h], h});
+            std::sort(sorted_heads.begin(), sorted_heads.end());
+
+            LOG_INFO("║  " << std::left << std::setw(40) << s.name << " (overall cos=" << std::fixed << std::setprecision(4) << s.hybridq16_cos << ")");
+            LOG_INFO("║    Per-head cosines (worst first):");
+
+            std::ostringstream head_line;
+            head_line << "║      ";
+            for (int i = 0; i < QWEN2_05B_NUM_HEADS; ++i)
+            {
+                int h = sorted_heads[i].second;
+                double cos = sorted_heads[i].first;
+                head_line << "h" << std::setw(2) << h << "=" << std::fixed << std::setprecision(3) << cos;
+                if (i < QWEN2_05B_NUM_HEADS - 1)
+                    head_line << " ";
+            }
+            LOG_INFO(head_line.str());
+
+            // Per-row cosines
+            auto row_cos = per_row_cosine_context(fp32_data, q16_data, fp32_size,
+                                                  QWEN2_05B_NUM_HEADS, QWEN2_05B_HEAD_DIM);
+
+            // Find worst rows
+            std::vector<std::pair<double, int>> sorted_rows;
+            for (size_t r = 0; r < row_cos.size(); ++r)
+                sorted_rows.push_back({row_cos[r], static_cast<int>(r)});
+            std::sort(sorted_rows.begin(), sorted_rows.end());
+
+            LOG_INFO("║    Per-row cosines (worst first):");
+            std::ostringstream row_line;
+            row_line << "║      ";
+            for (size_t i = 0; i < row_cos.size(); ++i)
+            {
+                int r = sorted_rows[i].second;
+                double cos = sorted_rows[i].first;
+                row_line << "r" << std::setw(1) << r << "=" << std::fixed << std::setprecision(3) << cos;
+                if (i < row_cos.size() - 1)
+                    row_line << " ";
+            }
+            LOG_INFO(row_line.str());
+            LOG_INFO("║");
+        }
+
+        if (!any_breakdown)
+        {
+            LOG_INFO("║  (no ATTENTION_CONTEXT stages below 0.95 cosine threshold)                                                        ║");
+        }
+        LOG_INFO("╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝");
+        LOG_INFO("");
+    }
+
     // ===== Compare final logits =====
     size_t fp32_logit_size = 0, hybridq16_logit_size = 0;
     const float *fp32_logits = runner_fp32->getSnapshot("LM_HEAD", fp32_logit_size);
@@ -904,7 +1075,8 @@ TEST_F(Test__HybridQ16Pipeline_LayerByLayer, ResidualStages_Q16_1Benefit)
         // producing ATTENTION_RESIDUAL snapshots. Now the Q16 kernel captures all
         // snapshot stages (ATTENTION_CONTEXT, ATTENTION_OUTPUT, ATTENTION_RESIDUAL)
         // matching the FP32 pipeline, enabling full comparison.
-        for (const std::string &suffix : {"ATTENTION_RESIDUAL", "FFN_RESIDUAL"})
+        // Compare all attention/FFN stages for full visibility
+        for (const std::string &suffix : {"ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL", "FFN_RESIDUAL"})
         {
             std::string key = "layer" + std::to_string(layer) + "_" + suffix;
 
@@ -940,15 +1112,12 @@ TEST_F(Test__HybridQ16Pipeline_LayerByLayer, ResidualStages_Q16_1Benefit)
             total_improvement += improvement;
             layer_count++;
 
-            // Print every 4 layers to keep output manageable
-            if (layer % 4 == 0 || layer == num_layers - 1)
-            {
-                LOG_INFO("  " << std::setw(5) << layer << " │ " << std::left << std::setw(18) << suffix.substr(0, 18)
-                              << " │ " << std::fixed << std::setprecision(6) << hybridq16_cos
-                              << "     │ " << std::setprecision(6) << hybrid_cos
-                              << " │ " << (improvement >= 0 ? "+" : "") << std::setprecision(4) << improvement
-                              << "    │ " << winner);
-            }
+            // Print EVERY layer for full visibility
+            LOG_INFO("  " << std::setw(5) << layer << " │ " << std::left << std::setw(18) << suffix.substr(0, 18)
+                          << " │ " << std::fixed << std::setprecision(6) << hybridq16_cos
+                          << "     │ " << std::setprecision(6) << hybrid_cos
+                          << " │ " << (improvement >= 0 ? "+" : "") << std::setprecision(4) << improvement
+                          << "    │ " << winner);
         }
     }
 

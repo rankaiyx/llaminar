@@ -14,6 +14,7 @@
 #include "../../../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"
 #include "../../../kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.h"
 #include <cmath>
+#include <limits>
 
 namespace llaminar2
 {
@@ -158,15 +159,164 @@ namespace llaminar2
                 return false;
             }
 
-            // Debug: Check Q/K/V scale factors for first few blocks
-            if (params_.layer_idx == 0)
+            // Debug: spot-check quantization and saturation for layers that diverge.
+            // Keep this extremely lightweight (small prefill seq_len) and only on selected layers.
+            if (params_.layer_idx == 0 || params_.layer_idx == 22 || params_.layer_idx == 23)
             {
-                LOG_DEBUG("[FusedAttentionWoStage] Layer 0 Q16_1 scales: Q[0].d=" << q_q16->typed_data()[0].d
-                                                                                  << " K[0].d=" << k_q16->typed_data()[0].d
-                                                                                  << " V[0].d=" << v_q16->typed_data()[0].d);
-                LOG_DEBUG("[FusedAttentionWoStage] Layer 0 Q16_1 first qs: Q[0].qs[0]=" << q_q16->typed_data()[0].qs[0]
-                                                                                        << " K[0].qs[0]=" << k_q16->typed_data()[0].qs[0]
-                                                                                        << " V[0].qs[0]=" << v_q16->typed_data()[0].qs[0]);
+                auto dump_q16_stats = [&](const char *label,
+                                          const Q16_1Block *blocks,
+                                          int rows,
+                                          int blocks_per_row,
+                                          int max_rows)
+                {
+                    if (!blocks || rows <= 0 || blocks_per_row <= 0)
+                    {
+                        LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx << " " << label
+                                                                   << " stats: <invalid>");
+                        return;
+                    }
+
+                    const int rows_to_scan = std::min(rows, max_rows);
+                    float d_min = blocks[0].d;
+                    float d_max = blocks[0].d;
+                    int16_t qs_min = blocks[0].qs[0];
+                    int16_t qs_max = blocks[0].qs[0];
+                    int sat_count = 0;
+                    int total_qs = 0;
+
+                    for (int r = 0; r < rows_to_scan; ++r)
+                    {
+                        const Q16_1Block *row = blocks + r * blocks_per_row;
+                        for (int b = 0; b < blocks_per_row; ++b)
+                        {
+                            const Q16_1Block &blk = row[b];
+                            d_min = std::min(d_min, blk.d);
+                            d_max = std::max(d_max, blk.d);
+                            for (int i = 0; i < Q16_1Block::BLOCK_SIZE; ++i)
+                            {
+                                const int16_t v = blk.qs[i];
+                                qs_min = std::min(qs_min, v);
+                                qs_max = std::max(qs_max, v);
+                                sat_count += (v == INT16_MIN || v == INT16_MAX) ? 1 : 0;
+                                total_qs++;
+                            }
+                        }
+                    }
+
+                    LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx << " " << label
+                                                               << " stats: rows_scanned=" << rows_to_scan
+                                                               << " d[min,max]=" << d_min << "," << d_max
+                                                               << " qs[min,max]=" << qs_min << "," << qs_max
+                                                               << " sat=" << sat_count << "/" << total_qs);
+                };
+
+                const int q_rows = params_.seq_len;
+                const int kv_rows = effective_kv_len;
+                const int q_blocks_per_row_dbg = (params_.n_heads * params_.head_dim) / Q16_1Block::BLOCK_SIZE;
+                const int kv_blocks_per_row_dbg = (params_.n_kv_heads * params_.head_dim) / Q16_1Block::BLOCK_SIZE;
+
+                LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                           << " Q16_1 first scales: Q[0].d=" << q_q16->typed_data()[0].d
+                                                           << " K[0].d=" << k_q16->typed_data()[0].d
+                                                           << " V[0].d=" << v_q16->typed_data()[0].d);
+                LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                           << " Q16_1 first qs: Q[0].qs[0]=" << q_q16->typed_data()[0].qs[0]
+                                                           << " K[0].qs[0]=" << k_q16->typed_data()[0].qs[0]
+                                                           << " V[0].qs[0]=" << v_q16->typed_data()[0].qs[0]);
+
+                // Scan only the small prefill window (seq_len/kv_len are tiny in parity tests).
+                dump_q16_stats("Q", q_q16->typed_data(), q_rows, q_blocks_per_row_dbg, /*max_rows=*/q_rows);
+                dump_q16_stats("K(cache)", k_q16->typed_data(), kv_rows, kv_blocks_per_row_dbg, /*max_rows=*/kv_rows);
+                dump_q16_stats("V(cache)", v_q16->typed_data(), kv_rows, kv_blocks_per_row_dbg, /*max_rows=*/kv_rows);
+
+                // Diagnostic: compute a simple FP32 score/softmax summary from Q16_1 blocks
+                // for the last query row (most sensitive) and head0.
+                // This is for investigating late-layer attention divergence; it does not affect math.
+                if (params_.seq_len == effective_kv_len && position_offset == 0 && params_.seq_len <= 16)
+                {
+                    const int head = 0;
+                    const int row = params_.seq_len - 1;
+                    const int group_size = params_.n_heads / params_.n_kv_heads;
+                    const int kv_head = head / group_size;
+                    const float attention_scale = 1.0f / std::sqrt(static_cast<float>(params_.head_dim));
+
+                    auto q16_at = [&](const Q16_1Block *row_blocks, int col) -> float
+                    {
+                        const int b = col / Q16_1Block::BLOCK_SIZE;
+                        const int i = col % Q16_1Block::BLOCK_SIZE;
+                        const Q16_1Block &blk = row_blocks[b];
+                        return blk.d * static_cast<float>(blk.qs[i]);
+                    };
+
+                    const Q16_1Block *q_row_blocks = q_q16->typed_data() + row * q_blocks_per_row_dbg;
+
+                    // Compute masked scores for kv positions [0..kv_len-1]
+                    float max_score = -std::numeric_limits<float>::infinity();
+                    float second_score = -std::numeric_limits<float>::infinity();
+                    int max_idx = -1;
+                    for (int t = 0; t < effective_kv_len; ++t)
+                    {
+                        if (params_.causal && t > row)
+                        {
+                            continue;
+                        }
+
+                        const Q16_1Block *k_row_blocks = k_q16->typed_data() + t * kv_blocks_per_row_dbg;
+                        float dot = 0.0f;
+                        const int q_base = head * params_.head_dim;
+                        const int k_base = kv_head * params_.head_dim;
+                        for (int d = 0; d < params_.head_dim; ++d)
+                        {
+                            dot += q16_at(q_row_blocks, q_base + d) * q16_at(k_row_blocks, k_base + d);
+                        }
+                        const float score = dot * attention_scale;
+                        if (score > max_score)
+                        {
+                            second_score = max_score;
+                            max_score = score;
+                            max_idx = t;
+                        }
+                        else if (score > second_score)
+                        {
+                            second_score = score;
+                        }
+                    }
+
+                    // Softmax top weight estimate.
+                    float weight_sum = 0.0f;
+                    float max_weight = 0.0f;
+                    for (int t = 0; t < effective_kv_len; ++t)
+                    {
+                        if (params_.causal && t > row)
+                        {
+                            continue;
+                        }
+                        const Q16_1Block *k_row_blocks = k_q16->typed_data() + t * kv_blocks_per_row_dbg;
+                        float dot = 0.0f;
+                        const int q_base = head * params_.head_dim;
+                        const int k_base = kv_head * params_.head_dim;
+                        for (int d = 0; d < params_.head_dim; ++d)
+                        {
+                            dot += q16_at(q_row_blocks, q_base + d) * q16_at(k_row_blocks, k_base + d);
+                        }
+                        const float score = dot * attention_scale;
+                        const float w = std::exp(score - max_score);
+                        weight_sum += w;
+                        if (w > max_weight)
+                        {
+                            max_weight = w;
+                        }
+                    }
+
+                    const float top_prob = (weight_sum > 0.0f) ? (max_weight / weight_sum) : 0.0f;
+                    LOG_DEBUG("[FusedAttentionWoStage] Layer " << params_.layer_idx
+                                                               << " head0 row" << row
+                                                               << " score_max=" << max_score
+                                                               << " score_2nd=" << second_score
+                                                               << " gap=" << (max_score - second_score)
+                                                               << " argmax=" << max_idx
+                                                               << " top_prob=" << top_prob);
+                }
             }
 
             q16_params.Q = q_q16->typed_data();
@@ -221,6 +371,9 @@ namespace llaminar2
             q16_params.n_kv_heads = params_.n_kv_heads;
             q16_params.head_dim = params_.head_dim;
             q16_params.d_model = params_.d_model;
+
+            // Debug metadata
+            q16_params.layer_idx = params_.layer_idx;
 
             // Attention config
             q16_params.scale = 1.0f / std::sqrt(static_cast<float>(params_.head_dim));
