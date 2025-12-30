@@ -2377,8 +2377,7 @@ enum class SoftmaxPrecision {
 
 **Use Q16_1 throughout attention** (Q, K, V, context, residual) with:
 - INT16 softmax probabilities [0, 32767]
-- INT64 accumulators where needed
-- Single FP32 scale per tensor (not per-element)
+- INT32 accumulators
 
 This provides ~100× precision improvement over Q8 approaches with ~2× memory usage.
 
