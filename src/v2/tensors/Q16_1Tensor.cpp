@@ -437,7 +437,7 @@ namespace llaminar2
             return false;
         }
 
-        // Quantize FP32 source directly to Q16_1 blocks using SIMD
+        // Quantize FP32 source directly to Q16_1 blocks
         const size_t total_elements = element_count();
         const size_t n_blocks = (total_elements + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
 
@@ -450,17 +450,48 @@ namespace llaminar2
             const size_t count = std::min(static_cast<size_t>(Q16_1Block::BLOCK_SIZE), total_elements - offset);
 
             Q16_1Block &block = blocks[block_idx];
-            const float *src = src_data + offset;
 
-            // Use SIMD helpers for quantization
-            if (count == Q16_1Block::BLOCK_SIZE)
+            // Find max absolute value in block
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
             {
-                simd::quantize_fp32_to_q16_1_block(src, block);
+                max_abs = std::max(max_abs, std::abs(src_data[offset + i]));
+            }
+
+            // Compute scale factor (d = max_abs / 32767 for int16 range)
+            const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
+            block.d = d; // FP32 scale, no conversion needed
+
+            // Quantize AND compute sum simultaneously
+            int64_t sum_i64 = 0;
+            if (d > 1e-10f)
+            {
+                const float inv_d = 1.0f / d;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const float val = src_data[offset + i];
+                    const float scaled = val * inv_d;
+                    const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
+                    block.qs[i] = static_cast<int16_t>(std::round(clamped));
+                    sum_i64 += static_cast<int64_t>(block.qs[i]);
+                }
             }
             else
             {
-                simd::quantize_fp32_to_q16_1_block_partial(src, count, block);
+                for (size_t i = 0; i < count; ++i)
+                {
+                    block.qs[i] = 0;
+                }
             }
+
+            // Zero-fill partial block tail
+            for (size_t i = count; i < Q16_1Block::BLOCK_SIZE; ++i)
+            {
+                block.qs[i] = 0;
+            }
+
+            // Store sum (int32 range: 32 × int16 values sum to [-1048544, 1048544], safe for INT32)
+            block.sum_qs = static_cast<int32_t>(sum_i64);
         }
 
         return true;
@@ -684,7 +715,7 @@ namespace llaminar2
             col_scales,
             bias);
 
-        // Then quantize FP32 to Q16_1 using SIMD
+        // Then quantize FP32 to Q16_1
         Q16_1Block *blocks = mutable_q16_1_blocks();
 
 #pragma omp parallel for if (total_blocks > 4)
@@ -694,17 +725,43 @@ namespace llaminar2
             const size_t count = std::min(static_cast<size_t>(Q16_1Block::BLOCK_SIZE), total_elements - offset);
 
             Q16_1Block &block = blocks[block_idx];
-            const float *src = temp_fp32.data() + offset;
 
-            // Use SIMD helpers for quantization
-            if (count == Q16_1Block::BLOCK_SIZE)
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
             {
-                simd::quantize_fp32_to_q16_1_block(src, block);
+                max_abs = std::max(max_abs, std::abs(temp_fp32[offset + i]));
+            }
+
+            const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
+            block.d = d; // FP32 scale, no conversion needed
+
+            int64_t sum_i64 = 0;
+            if (d > 1e-10f)
+            {
+                const float inv_d = 1.0f / d;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const float scaled = temp_fp32[offset + i] * inv_d;
+                    const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
+                    const int16_t quantized = static_cast<int16_t>(std::round(clamped));
+                    block.qs[i] = quantized;
+                    sum_i64 += static_cast<int64_t>(quantized);
+                }
             }
             else
             {
-                simd::quantize_fp32_to_q16_1_block_partial(src, count, block);
+                for (size_t i = 0; i < count; ++i)
+                {
+                    block.qs[i] = 0;
+                }
             }
+
+            for (size_t i = count; i < Q16_1Block::BLOCK_SIZE; ++i)
+            {
+                block.qs[i] = 0;
+            }
+
+            block.sum_qs = static_cast<int32_t>(sum_i64);
         }
 
         dequant_cache_.clear();
@@ -795,7 +852,6 @@ namespace llaminar2
         const size_t n_blocks = (total_elements + Q16_1Block::BLOCK_SIZE - 1) / Q16_1Block::BLOCK_SIZE;
 
         Q16_1Block *blocks = mutable_q16_1_blocks();
-        const float *cache_data = dequant_cache_.data();
 
 #pragma omp parallel for if (n_blocks > 4)
         for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
@@ -804,17 +860,43 @@ namespace llaminar2
             const size_t count = std::min(static_cast<size_t>(Q16_1Block::BLOCK_SIZE), total_elements - offset);
 
             Q16_1Block &block = blocks[block_idx];
-            const float *src = cache_data + offset;
 
-            // Use SIMD helpers for quantization
-            if (count == Q16_1Block::BLOCK_SIZE)
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
             {
-                simd::quantize_fp32_to_q16_1_block(src, block);
+                max_abs = std::max(max_abs, std::abs(dequant_cache_[offset + i]));
+            }
+
+            const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
+            block.d = d; // FP32 scale, no conversion needed
+
+            int64_t sum_i64 = 0;
+            if (d > 1e-10f)
+            {
+                const float inv_d = 1.0f / d;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const float scaled = dequant_cache_[offset + i] * inv_d;
+                    const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
+                    const int16_t quantized = static_cast<int16_t>(std::round(clamped));
+                    block.qs[i] = quantized;
+                    sum_i64 += static_cast<int64_t>(quantized);
+                }
             }
             else
             {
-                simd::quantize_fp32_to_q16_1_block_partial(src, count, block);
+                for (size_t i = 0; i < count; ++i)
+                {
+                    block.qs[i] = 0;
+                }
             }
+
+            for (size_t i = count; i < Q16_1Block::BLOCK_SIZE; ++i)
+            {
+                block.qs[i] = 0;
+            }
+
+            block.sum_qs = static_cast<int32_t>(sum_i64);
         }
 
         cache_dirty_ = false;
@@ -1000,25 +1082,71 @@ namespace llaminar2
 
     void Q16_1Tensor::decodeBlockScalar(const Q16_1Block &block, float *output)
     {
-        simd::decode_q16_1_block_to_fp32_scalar(block, output);
+        const float scale = block.d; // FP32 scale, no conversion needed
+        for (size_t i = 0; i < Q16_1Block::BLOCK_SIZE; ++i)
+        {
+            output[i] = scale * static_cast<float>(block.qs[i]);
+        }
     }
 
     void Q16_1Tensor::decodeBlock(const Q16_1Block &block, float *output)
     {
-        simd::decode_q16_1_block_to_fp32(block, output);
+#if defined(__AVX512F__)
+        decodeBlockAVX512(block, output);
+#elif defined(__AVX2__)
+        decodeBlockAVX2(block, output);
+#else
+        decodeBlockScalar(block, output);
+#endif
     }
 
 #if defined(__AVX512F__)
     void Q16_1Tensor::decodeBlockAVX512(const Q16_1Block &block, float *output)
     {
-        simd::decode_q16_1_block_to_fp32_avx512(block, output);
+        const float scale = block.d; // FP32 scale, no conversion needed
+        const __m512 vscale = _mm512_set1_ps(scale);
+
+        // Process 16 int16 values at a time (2 iterations for 32 elements)
+        for (size_t i = 0; i < 2; ++i)
+        {
+            // Load 16 int16 values and convert to int32
+            __m256i vi16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&block.qs[i * 16]));
+            __m512i vi32 = _mm512_cvtepi16_epi32(vi16);
+
+            // Convert to float and scale
+            __m512 vf = _mm512_cvtepi32_ps(vi32);
+            vf = _mm512_mul_ps(vf, vscale);
+
+            // Store result
+            _mm512_storeu_ps(&output[i * 16], vf);
+        }
     }
 #endif
 
 #if defined(__AVX2__)
     void Q16_1Tensor::decodeBlockAVX2(const Q16_1Block &block, float *output)
     {
-        simd::decode_q16_1_block_to_fp32_avx2(block, output);
+        const float scale = block.d; // FP32 scale, no conversion needed
+        const __m256 vscale = _mm256_set1_ps(scale);
+
+        // Process 8 int16 values at a time (4 iterations for 32 elements)
+        for (size_t i = 0; i < 4; ++i)
+        {
+            // Load 8 int16 values
+            __m128i vi16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&block.qs[i * 8]));
+
+            // Sign-extend int16 → int32 (8 elements)
+            __m256i vi32 = _mm256_cvtepi16_epi32(vi16);
+
+            // Convert int32 → float
+            __m256 vf = _mm256_cvtepi32_ps(vi32);
+
+            // Multiply by scale
+            vf = _mm256_mul_ps(vf, vscale);
+
+            // Store result
+            _mm256_storeu_ps(&output[i * 8], vf);
+        }
     }
 #endif
 
@@ -1045,25 +1173,55 @@ namespace llaminar2
         std::vector<uint8_t> raw_data(total_bytes);
         Q16_1Block *blocks = reinterpret_cast<Q16_1Block *>(raw_data.data());
 
-        // Check if we have a partial final block
-        const bool has_partial_block = (total_elements % Q16_1Block::BLOCK_SIZE) != 0;
-        const size_t full_blocks = has_partial_block ? n_blocks - 1 : n_blocks;
-
 #pragma omp parallel for
-        for (size_t block_idx = 0; block_idx < full_blocks; ++block_idx)
+        for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
         {
             const size_t offset = block_idx * Q16_1Block::BLOCK_SIZE;
-            simd::quantize_fp32_to_q16_1_block(&src[offset], blocks[block_idx]);
-        }
+            const size_t count = std::min(static_cast<size_t>(Q16_1Block::BLOCK_SIZE), total_elements - offset);
 
-        // Handle partial final block with SIMD helper (handles zero-fill)
-        if (has_partial_block)
-        {
-            const size_t block_idx = n_blocks - 1;
-            const size_t offset = block_idx * Q16_1Block::BLOCK_SIZE;
-            const size_t count = total_elements - offset;
+            Q16_1Block &block = blocks[block_idx];
 
-            simd::quantize_fp32_to_q16_1_block_partial(&src[offset], count, blocks[block_idx]);
+            // Find max absolute value in block
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
+            {
+                max_abs = std::max(max_abs, std::abs(src[offset + i]));
+            }
+
+            // Compute scale factor (d = max_abs / 32767 for int16 range)
+            const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
+            block.d = d; // FP32 scale, no conversion needed
+
+            // Quantize AND compute sum simultaneously
+            int64_t sum_i64 = 0;
+            if (d > 1e-10f)
+            {
+                const float inv_d = 1.0f / d;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const float val = src[offset + i];
+                    const float scaled = val * inv_d;
+                    const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
+                    block.qs[i] = static_cast<int16_t>(std::round(clamped));
+                    sum_i64 += static_cast<int64_t>(block.qs[i]);
+                }
+            }
+            else
+            {
+                for (size_t i = 0; i < count; ++i)
+                {
+                    block.qs[i] = 0;
+                }
+            }
+
+            // Zero-fill partial block tail
+            for (size_t i = count; i < Q16_1Block::BLOCK_SIZE; ++i)
+            {
+                block.qs[i] = 0;
+            }
+
+            // Store pre-computed integer sum (INT32 for wider int16 value range)
+            block.sum_qs = static_cast<int32_t>(sum_i64);
         }
 
         return std::make_shared<Q16_1Tensor>(shape, raw_data);
@@ -1106,15 +1264,42 @@ namespace llaminar2
             // Source data is row-major: src_data[row * cols + col]
             const float *row_data = src_data + row_idx * elements_per_row + col_offset;
 
-            // Use SIMD helpers for quantization
-            if (count == Q16_1Block::BLOCK_SIZE)
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i)
             {
-                simd::quantize_fp32_to_q16_1_block(row_data, block);
+                max_abs = std::max(max_abs, std::abs(row_data[i]));
+            }
+
+            const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
+            block.d = d;
+
+            int64_t sum_i64 = 0;
+            if (d > 1e-10f)
+            {
+                const float inv_d = 1.0f / d;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const float scaled = row_data[i] * inv_d;
+                    const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
+                    const int16_t quantized = static_cast<int16_t>(std::round(clamped));
+                    block.qs[i] = quantized;
+                    sum_i64 += static_cast<int64_t>(quantized);
+                }
             }
             else
             {
-                simd::quantize_fp32_to_q16_1_block_partial(row_data, count, block);
+                for (size_t i = 0; i < count; ++i)
+                {
+                    block.qs[i] = 0;
+                }
             }
+
+            for (size_t i = count; i < Q16_1Block::BLOCK_SIZE; ++i)
+            {
+                block.qs[i] = 0;
+            }
+
+            block.sum_qs = static_cast<int32_t>(sum_i64);
         }
 
         dequant_cache_.clear();
@@ -1124,9 +1309,7 @@ namespace llaminar2
     namespace
     {
         /**
-         * @brief Templated quantization helper for variable Q16 block sizes (SIMD)
-         *
-         * Uses SIMD helpers that automatically dispatch to best implementation.
+         * @brief Templated quantization helper for variable Q16 block sizes
          */
         template <typename BlockType>
         void quantize_fp32_to_q16_blocks(const float *src_data, void *dst_blocks,
@@ -1142,17 +1325,44 @@ namespace llaminar2
                 const size_t count = std::min(BLOCK_SIZE, total_elements - offset);
 
                 BlockType &block = blocks[block_idx];
-                const float *src = src_data + offset;
 
-                // Use SIMD helpers for quantization
-                if (count == BLOCK_SIZE)
+                float max_abs = 0.0f;
+                for (size_t i = 0; i < count; ++i)
                 {
-                    simd::quantize_fp32_to_q16_block<BlockType>(src, block);
+                    max_abs = std::max(max_abs, std::abs(src_data[offset + i]));
+                }
+
+                const float d = (max_abs > 1e-10f) ? (max_abs / 32767.0f) : 0.0f;
+                block.d = d;
+
+                int64_t sum_i64 = 0;
+                if (d > 1e-10f)
+                {
+                    const float inv_d = 1.0f / d;
+                    for (size_t i = 0; i < count; ++i)
+                    {
+                        const float scaled = src_data[offset + i] * inv_d;
+                        const float clamped = std::max(-32767.0f, std::min(32767.0f, scaled));
+                        const int16_t quantized = static_cast<int16_t>(std::round(clamped));
+                        block.qs[i] = quantized;
+                        sum_i64 += static_cast<int64_t>(quantized);
+                    }
                 }
                 else
                 {
-                    simd::quantize_fp32_to_q16_block_partial<BlockType>(src, count, block);
+                    for (size_t i = 0; i < count; ++i)
+                    {
+                        block.qs[i] = 0;
+                    }
                 }
+
+                // Zero-fill any remaining elements in the block
+                for (size_t i = count; i < BLOCK_SIZE; ++i)
+                {
+                    block.qs[i] = 0;
+                }
+
+                block.sum_qs = static_cast<int32_t>(sum_i64);
             }
         }
     } // anonymous namespace
@@ -1197,12 +1407,10 @@ namespace llaminar2
     namespace
     {
         /**
-         * @brief Templated FIXED-SCALE quantization for VNNI-safe Q16 blocks (SIMD)
+         * @brief Templated FIXED-SCALE quantization for VNNI-safe Q16 blocks
          *
          * CRITICAL: Unlike adaptive quantization, this uses a FIXED scale and clips
          * INT16 values to prevent VNNI INT32 overflow during dot-product accumulation.
-         *
-         * Uses SIMD helpers that automatically dispatch to best implementation.
          *
          * @tparam BlockType Q16_1Block, Q16_1Block_64, or Q16_1Block_128
          * @param src_data Source FP32 data
@@ -1225,26 +1433,38 @@ namespace llaminar2
             const float d = kv_cache_scale / 32767.0f;
             const float inv_d = 32767.0f / kv_cache_scale;
 
-            // Check if we have a partial final block
-            const bool has_partial_block = (total_elements % BLOCK_SIZE) != 0;
-            const size_t full_blocks = has_partial_block ? n_blocks - 1 : n_blocks;
-
 #pragma omp parallel for if (n_blocks > 4)
-            for (size_t block_idx = 0; block_idx < full_blocks; ++block_idx)
+            for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
             {
                 const size_t offset = block_idx * BLOCK_SIZE;
-                simd::quantize_fp32_to_q16_block_fixed_scale<BlockType>(
-                    &src_data[offset], blocks[block_idx], d, inv_d, max_safe_int16);
-            }
+                const size_t count = std::min(BLOCK_SIZE, total_elements - offset);
 
-            // Handle partial final block
-            if (has_partial_block)
-            {
-                const size_t block_idx = n_blocks - 1;
-                const size_t offset = block_idx * BLOCK_SIZE;
-                const size_t count = total_elements - offset;
-                simd::quantize_fp32_to_q16_block_partial_fixed_scale<BlockType>(
-                    &src_data[offset], count, blocks[block_idx], d, inv_d, max_safe_int16);
+                BlockType &block = blocks[block_idx];
+
+                // Fixed scale for ALL blocks (not adaptive!)
+                block.d = d;
+
+                int64_t sum_i64 = 0;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    // Quantize with fixed scale
+                    const float scaled = src_data[offset + i] * inv_d;
+
+                    // CRITICAL: Clip to VNNI-safe range, NOT ±32767!
+                    const float clamped = std::max(static_cast<float>(-max_safe_int16),
+                                                   std::min(scaled, static_cast<float>(max_safe_int16)));
+                    const int16_t quantized = static_cast<int16_t>(std::round(clamped));
+                    block.qs[i] = quantized;
+                    sum_i64 += static_cast<int64_t>(quantized);
+                }
+
+                // Zero-fill any remaining elements in the block
+                for (size_t i = count; i < BLOCK_SIZE; ++i)
+                {
+                    block.qs[i] = 0;
+                }
+
+                block.sum_qs = static_cast<int32_t>(sum_i64);
             }
         }
 
