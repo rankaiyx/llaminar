@@ -3533,28 +3533,28 @@ add_v2_test(V2_Unit_IQ4_XSTensor
 #   e2e/parity/kernels/       - Individual kernel comparisons
 
 # -----------------------------------------------------------------------------
-# E2E Parity: MPI Tensor-Parallel vs Single-Rank
+# Integration Parity: MPI Tensor-Parallel vs Single-Rank
 # -----------------------------------------------------------------------------
 # Compares distributed execution against single-node to ensure TP correctness
 if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR CMAKE_BUILD_TYPE MATCHES "Integration" OR ENABLE_SNAPSHOTS)
-    add_executable(v2_e2e_parity_mpi_vs_single_rank 
+    add_executable(v2_integration_parity_mpi_vs_single_rank 
         e2e/parity/internal/mpi_vs_single_rank/Test__MPIPipeline_vs_SingleRank.cpp
         e2e/parity/gtest_mpi_main.cpp
     )
-    target_link_libraries(v2_e2e_parity_mpi_vs_single_rank llaminar2_core GTest::gtest MPI::MPI_CXX)
+    target_link_libraries(v2_integration_parity_mpi_vs_single_rank llaminar2_core GTest::gtest MPI::MPI_CXX)
 
-    add_v2_test(V2_E2E_Parity_MPIPipeline_vs_SingleRank
-        COMMAND $<TARGET_FILE:v2_e2e_parity_mpi_vs_single_rank>
-        LABELS "V2;E2E;Parity;Internal;MPI;TensorParallel"
+    add_v2_test(V2_Integration_Parity_MPIPipeline_vs_SingleRank
+        COMMAND $<TARGET_FILE:v2_integration_parity_mpi_vs_single_rank>
+        LABELS "V2;Integration;Parity;MPI;TensorParallel"
         MPI_PROCS 2
     )
 else()
-    message(STATUS "V2: E2E MPI parity test disabled (snapshots not available in Release build)")
-    message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
+    message(STATUS "V2: Integration MPI parity test disabled (snapshots not available in Release build)")
+    message(STATUS "     Use -DCMAKE_BUILD_TYPE=Integration or -DENABLE_SNAPSHOTS=ON to enable")
 endif()
 
 # -----------------------------------------------------------------------------
-# E2E Parity: Llaminar FP32 Pipeline vs PyTorch Reference
+# Integration Parity: Llaminar FP32 Pipeline vs PyTorch Reference
 # -----------------------------------------------------------------------------
 # Ground truth validation against PyTorch Qwen2 implementation
 find_package(ZLIB)
@@ -3562,50 +3562,53 @@ if(ZLIB_FOUND)
     get_filename_component(WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     
     if(CMAKE_BUILD_TYPE MATCHES "Debug" OR CMAKE_BUILD_TYPE MATCHES "E2ERelease" OR CMAKE_BUILD_TYPE MATCHES "Integration" OR ENABLE_SNAPSHOTS)
-        add_executable(v2_e2e_parity_fp32_vs_pytorch 
+        add_executable(v2_integration_parity_fp32_vs_pytorch 
             e2e/parity/pytorch/qwen2/Test__FP32Pipeline_vs_PyTorch.cpp
             ${WORKSPACE_ROOT}/external/cnpy/cnpy.cpp
         )
-        target_link_libraries(v2_e2e_parity_fp32_vs_pytorch 
+        target_link_libraries(v2_integration_parity_fp32_vs_pytorch 
             llaminar2_core 
             GTest::gtest 
             GTest::gtest_main
             ZLIB::ZLIB
         )
-        target_include_directories(v2_e2e_parity_fp32_vs_pytorch PRIVATE 
+        target_include_directories(v2_integration_parity_fp32_vs_pytorch PRIVATE 
             ${WORKSPACE_ROOT}/external/cnpy
         )
         
-        add_v2_test(V2_E2E_Parity_FP32Pipeline_vs_PyTorch
-            COMMAND $<TARGET_FILE:v2_e2e_parity_fp32_vs_pytorch>
-            LABELS "V2;E2E;Parity;PyTorch;FP32;Qwen2"
+        add_v2_test(V2_Integration_Parity_FP32Pipeline_vs_PyTorch
+            COMMAND $<TARGET_FILE:v2_integration_parity_fp32_vs_pytorch>
+            LABELS "V2;Integration;Parity;PyTorch;FP32;Qwen2"
             MPI_PROCS 1
         )
-        message(STATUS "V2: E2E FP32 vs PyTorch parity test enabled")
+        message(STATUS "V2: Integration FP32 vs PyTorch parity test enabled")
 
         # -----------------------------------------------------------------------------
-        # E2E Parity: Q8_1 Pipeline vs FP32 Pipeline (Layer-by-Layer)
+        # DISABLED: E2E Parity tests moved to Integration or deprecated
         # -----------------------------------------------------------------------------
-        # Identifies exactly where Q8_1 diverges from FP32 using snapshot comparison
-        add_executable(v2_e2e_parity_q8_1_vs_fp32_pipeline 
-            e2e/parity/internal/q8_1_vs_fp32/Test__Q8_1Pipeline_vs_FP32Pipeline_LayerByLayer.cpp
-        )
-        target_link_libraries(v2_e2e_parity_q8_1_vs_fp32_pipeline 
-            llaminar2_core 
-            GTest::gtest 
-        )
-        add_v2_test(V2_E2E_Parity_Q8_1Pipeline_vs_FP32Pipeline
-            COMMAND $<TARGET_FILE:v2_e2e_parity_q8_1_vs_fp32_pipeline>
-            LABELS "V2;E2E;Parity;Internal;Q8_1;FP32;LayerByLayer"
-            MPI_PROCS 1
-        )
-        message(STATUS "V2: E2E Q8_1 vs FP32 pipeline parity test enabled")
+        # The following tests are disabled as part of test suite cleanup.
+        # - Q8_1 vs FP32 Pipeline: Superseded by unit tests and integration stage tests
+        # - Hybrid Pipeline: Project on hold (ENABLE_HYBRIDQ16_TESTS)
+        # - Kernel-level attention parity: Covered by integration attention tests
+        # To re-enable, set ENABLE_DEPRECATED_E2E_TESTS=ON
+        if(ENABLE_DEPRECATED_E2E_TESTS)
+            # E2E Parity: Q8_1 Pipeline vs FP32 Pipeline (Layer-by-Layer)
+            add_executable(v2_e2e_parity_q8_1_vs_fp32_pipeline 
+                e2e/parity/internal/q8_1_vs_fp32/Test__Q8_1Pipeline_vs_FP32Pipeline_LayerByLayer.cpp
+            )
+            target_link_libraries(v2_e2e_parity_q8_1_vs_fp32_pipeline 
+                llaminar2_core 
+                GTest::gtest 
+            )
+            add_v2_test(V2_E2E_Parity_Q8_1Pipeline_vs_FP32Pipeline
+                COMMAND $<TARGET_FILE:v2_e2e_parity_q8_1_vs_fp32_pipeline>
+                LABELS "V2;E2E;Parity;Internal;Q8_1;FP32;LayerByLayer"
+                MPI_PROCS 1
+            )
+            message(STATUS "V2: E2E Q8_1 vs FP32 pipeline parity test enabled (deprecated)")
+        endif()
 
-        # -----------------------------------------------------------------------------
         # E2E Parity: Hybrid Pipeline vs FP32 and Q8_1 (Layer-by-Layer) [DISABLED - project on hold]
-        # -----------------------------------------------------------------------------
-        # Validates that Hybrid precision mode achieves ≥0.995 cosine similarity
-        # with FP32, measuring improvement over full Q8_1 mode
         if(ENABLE_HYBRIDQ16_TESTS)
             add_executable(v2_e2e_parity_hybrid_vs_fp32_q8_1_pipeline 
                 e2e/parity/internal/hybrid_vs_fp32_q8_1/Test__HybridPipeline_vs_FP32_Q8_1_LayerByLayer.cpp
@@ -3621,41 +3624,55 @@ if(ZLIB_FOUND)
             )
             message(STATUS "V2: E2E Hybrid vs FP32/Q8_1 pipeline parity test enabled")
         endif()
-
-        # -----------------------------------------------------------------------------
-        # (Moved to Integration tests - see V2_Integration_HybridQ16Pipeline_vs_FP32)
-        message(STATUS "V2: HybridQ16 vs FP32 parity test is now in integration tests")
     else()
-        message(STATUS "V2: E2E parity tests disabled (snapshots not available in Release build)")
-        message(STATUS "     Use -DCMAKE_BUILD_TYPE=E2ERelease or -DENABLE_SNAPSHOTS=ON to enable")
+        message(STATUS "V2: Integration parity tests disabled (snapshots not available in Release build)")
+        message(STATUS "     Use -DCMAKE_BUILD_TYPE=Integration or -DENABLE_SNAPSHOTS=ON to enable")
     endif()
 else()
     message(WARNING "ZLIB not found - PyTorch parity tests disabled (requires cnpy for .npz loading)")
 endif()
 
 # -----------------------------------------------------------------------------
-# E2E Parity: Kernel-Level Tests (Attention)
+# DISABLED: E2E Parity Kernel-Level Tests (Attention)
 # -----------------------------------------------------------------------------
-# Compare individual kernels against FP32 reference implementations
-# These run without model loading and test kernel correctness in isolation
+# These tests are disabled as part of test suite cleanup.
+# Kernel-level attention parity is now covered by integration tests:
+# - V2_Integration_Q8_1_FusedAttention
+# - V2_Integration_Q8_1_OnlineSoftmax
+# To re-enable, set ENABLE_DEPRECATED_E2E_TESTS=ON
 
-# JitFusedAttentionWo (FA2 Q8_1 kernel) vs FP32 Decomposed Attention
-add_executable(v2_e2e_parity_jit_fused_attention_vs_fp32 
-    e2e/parity/kernels/attention/Test__JitFusedAttentionWo_vs_FP32Attention.cpp
-)
-target_link_libraries(v2_e2e_parity_jit_fused_attention_vs_fp32 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_E2E_Parity_JitFusedAttentionWo_vs_FP32
-    COMMAND $<TARGET_FILE:v2_e2e_parity_jit_fused_attention_vs_fp32>
-    LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;FA2;JIT"
-    MPI_PROCS 1
-)
+if(ENABLE_DEPRECATED_E2E_TESTS)
+    # JitFusedAttentionWo (FA2 Q8_1 kernel) vs FP32 Decomposed Attention
+    add_executable(v2_e2e_parity_jit_fused_attention_vs_fp32 
+        e2e/parity/kernels/attention/Test__JitFusedAttentionWo_vs_FP32Attention.cpp
+    )
+    target_link_libraries(v2_e2e_parity_jit_fused_attention_vs_fp32 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_E2E_Parity_JitFusedAttentionWo_vs_FP32
+        COMMAND $<TARGET_FILE:v2_e2e_parity_jit_fused_attention_vs_fp32>
+        LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;FA2;JIT"
+        MPI_PROCS 1
+    )
+
+    # QuantisedAttentionJit_Q8_1_Fused (Simple Q8_1 kernel) vs FP32 Decomposed Attention  
+    add_executable(v2_e2e_parity_simple_attention_q8_1_vs_fp32 
+        e2e/parity/kernels/attention/Test__SimpleAttentionQ8_1_vs_FP32Attention.cpp
+    )
+    target_link_libraries(v2_e2e_parity_simple_attention_q8_1_vs_fp32 
+        llaminar2_core 
+        GTest::gtest
+    )
+    add_v2_test(V2_E2E_Parity_SimpleAttentionQ8_1_vs_FP32
+        COMMAND $<TARGET_FILE:v2_e2e_parity_simple_attention_q8_1_vs_fp32>
+        LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;Simple"
+        MPI_PROCS 1
+    )
+endif()
 
 # JitFusedAttentionWo with Q16_1 Fused Residual vs FP32 Reference [DISABLED - project on hold]
-# Tests Phase 5 of Q16_1 Typed Residual Stream: fused Attention + Wo + Residual Add
 if(ENABLE_HYBRIDQ16_TESTS)
     add_executable(v2_e2e_parity_jit_fused_attention_q16_1_vs_fp32 
         e2e/parity/kernels/attention/Test__JitFusedAttentionWo_Q16_1Fused_vs_FP32.cpp
@@ -3671,20 +3688,6 @@ if(ENABLE_HYBRIDQ16_TESTS)
         MPI_PROCS 1
     )
 endif()
-
-# QuantisedAttentionJit_Q8_1_Fused (Simple Q8_1 kernel) vs FP32 Decomposed Attention  
-add_executable(v2_e2e_parity_simple_attention_q8_1_vs_fp32 
-    e2e/parity/kernels/attention/Test__SimpleAttentionQ8_1_vs_FP32Attention.cpp
-)
-target_link_libraries(v2_e2e_parity_simple_attention_q8_1_vs_fp32 
-    llaminar2_core 
-    GTest::gtest
-)
-add_v2_test(V2_E2E_Parity_SimpleAttentionQ8_1_vs_FP32
-    COMMAND $<TARGET_FILE:v2_e2e_parity_simple_attention_q8_1_vs_fp32>
-    LABELS "V2;E2E;Parity;Kernels;Attention;Q8_1;Simple"
-    MPI_PROCS 1
-)
 
 # Performance Test: GEMM Tuning Sweep
 add_executable(v2_perf_gemm_tuning_sweep performance/kernels/cpu/gemm/Perf__GemmTuningSweep.cpp)
