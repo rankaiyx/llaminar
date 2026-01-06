@@ -99,11 +99,21 @@ namespace llaminar2
             return false;
         }
 
-        // Generate position_ids array [pos_offset, pos_offset+1, ..., pos_offset+seq_len-1]
-        std::vector<int> position_ids(seq_len);
-        for (int i = 0; i < seq_len; ++i)
+        // Use provided position_ids if available (for batched execution with per-token positions)
+        // Otherwise, generate contiguous position_ids from pos_offset
+        const int *position_ids_ptr = params_.position_ids;
+        std::vector<int> generated_position_ids;
+        
+        if (!position_ids_ptr)
         {
-            position_ids[i] = params_.pos_offset + i;
+            // Fallback: Generate contiguous position_ids [pos_offset, pos_offset+1, ..., pos_offset+seq_len-1]
+            // This path is used for single-sequence execution or when position_ids not provided
+            generated_position_ids.resize(seq_len);
+            for (int i = 0; i < seq_len; ++i)
+            {
+                generated_position_ids[i] = params_.pos_offset + i;
+            }
+            position_ids_ptr = generated_position_ids.data();
         }
 
         const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
@@ -116,7 +126,7 @@ namespace llaminar2
                 params_.K,
                 params_.Q_out,
                 params_.K_out,
-                position_ids.data(),
+                position_ids_ptr,
                 seq_len,
                 params_.n_heads,
                 n_kv_heads,
@@ -178,7 +188,7 @@ namespace llaminar2
                 params_.K_out,         // Q16_1 K output
                 params_.K_head_scales, // Output: per-head K scales [seq_len * n_kv_heads]
                 block_size,
-                position_ids.data(),
+                position_ids_ptr,
                 seq_len,
                 params_.n_heads,
                 n_kv_heads,
@@ -232,7 +242,7 @@ namespace llaminar2
                 params_.Q_out,
                 params_.K_out,
                 block_size, // Match attention kernel's block size for head_dim
-                position_ids.data(),
+                position_ids_ptr,
                 seq_len,
                 params_.n_heads,
                 n_kv_heads,
@@ -262,7 +272,7 @@ namespace llaminar2
         return kernel->apply_tensor(
             params_.Q,
             params_.K, // May be nullptr
-            position_ids.data(),
+            position_ids_ptr,
             seq_len,
             params_.n_heads,
             n_kv_heads,

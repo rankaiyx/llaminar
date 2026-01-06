@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
+#include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"  // Required for FusedAttentionWoStage test
 #include "utils/MPIContext.h"
 #include "../utils/TestTensorFactory.h"
 
@@ -666,6 +667,187 @@ TEST_F(StageDumpInfoTest, AttentionComputeStage_GetDumpInfo)
 
     // Check outputs
     EXPECT_TRUE(hasOutput(info, "output"));
+}
+
+// -----------------------------------------------------------------------------
+// AttentionComputeStage: getDumpInfo batch_size * seq_len dimension fix
+// -----------------------------------------------------------------------------
+
+TEST_F(StageDumpInfoTest, AttentionComputeStage_GetDumpInfo_BatchDimensions)
+{
+    // BUG FIXED: getDumpInfo() was using seq_len instead of batch_size * seq_len
+    // for output tensor rows. This caused dimension mismatches in snapshot capture
+    // when batch_size > 1.
+    //
+    // The fix ensures output shape is [batch_size * seq_len, n_heads * head_dim]
+
+    int batch_size = 2;
+    int seq_len = 4;
+    int kv_len = 8;
+    int n_heads = 4;
+    int n_kv_heads = 2;
+    int head_dim = 32;
+
+    size_t total_tokens = static_cast<size_t>(batch_size * seq_len);
+    size_t hidden_size = static_cast<size_t>(n_heads * head_dim);
+    size_t kv_hidden = static_cast<size_t>(n_kv_heads * head_dim);
+    size_t total_kv_tokens = static_cast<size_t>(batch_size * kv_len);
+
+    // Create tensors with batched dimensions
+    auto Q = TestTensorFactory::createFP32Random({total_tokens, hidden_size});
+    auto K = TestTensorFactory::createFP32Random({total_kv_tokens, kv_hidden});
+    auto V = TestTensorFactory::createFP32Random({total_kv_tokens, kv_hidden});
+    auto output = TestTensorFactory::createFP32({total_tokens, hidden_size});
+
+    AttentionComputeStage::Params params;
+    params.Q = Q.get();
+    params.K = K.get();
+    params.V = V.get();
+    params.output = output.get();
+    params.batch_size = batch_size;
+    params.seq_len = seq_len;
+    params.kv_len = kv_len;
+    params.n_heads = n_heads;
+    params.n_kv_heads = n_kv_heads;
+    params.head_dim = head_dim;
+    params.causal = true;
+
+    AttentionComputeStage stage(params);
+    StageDumpInfo info = stage.getDumpInfo();
+
+    // Check batch_size is captured
+    EXPECT_TRUE(hasScalar(info, "batch_size"));
+    EXPECT_EQ(getScalarInt(info, "batch_size"), batch_size);
+
+    // Find the output tensor info and verify dimensions
+    EXPECT_TRUE(hasOutput(info, "output"));
+
+    // Verify the output dimensions are batch_size * seq_len, not just seq_len
+    for (const auto &out : info.outputs)
+    {
+        if (std::string(out.name) == "output")
+        {
+            EXPECT_EQ(out.rows, total_tokens)
+                << "Output rows should be batch_size * seq_len = " << total_tokens
+                << ", not seq_len = " << seq_len;
+            EXPECT_EQ(out.cols, hidden_size)
+                << "Output cols should be n_heads * head_dim = " << hidden_size;
+        }
+    }
+}
+
+// =============================================================================
+// FusedAttentionWoStage Tests
+// =============================================================================
+
+TEST_F(StageDumpInfoTest, FusedAttentionWoStage_GetDumpInfo_BatchDimensions)
+{
+    // BUG FIXED: getDumpInfo() was using seq_len instead of batch_size * seq_len
+    // for snapshot tensor rows. This caused dimension mismatches in snapshot capture
+    // when batch_size > 1.
+    //
+    // The fix ensures all snapshot shapes are [batch_size * seq_len, feature_dim]
+
+    int batch_size = 2;
+    int seq_len = 4;
+    int kv_len = 8;
+    int n_heads = 4;
+    int n_kv_heads = 2;
+    int head_dim = 32;
+    int d_model = n_heads * head_dim;
+
+    size_t total_tokens = static_cast<size_t>(batch_size * seq_len);
+    size_t hidden_size = static_cast<size_t>(n_heads * head_dim);
+    size_t kv_hidden = static_cast<size_t>(n_kv_heads * head_dim);
+    size_t total_kv_tokens = static_cast<size_t>(batch_size * kv_len);
+
+    // Create tensors with batched dimensions
+    auto Q = TestTensorFactory::createFP32Random({total_tokens, hidden_size});
+    auto K = TestTensorFactory::createFP32Random({total_kv_tokens, kv_hidden});
+    auto V = TestTensorFactory::createFP32Random({total_kv_tokens, kv_hidden});
+    auto Wo = TestTensorFactory::createFP32Random({hidden_size, static_cast<size_t>(d_model)});
+    auto output = TestTensorFactory::createFP32({total_tokens, static_cast<size_t>(d_model)});
+
+    // Create snapshot buffers (what the bug affected)
+    auto context_snapshot = TestTensorFactory::createFP32({total_tokens, hidden_size});
+    auto attention_output_snapshot = TestTensorFactory::createFP32({total_tokens, static_cast<size_t>(d_model)});
+    auto attention_residual_snapshot = TestTensorFactory::createFP32({total_tokens, static_cast<size_t>(d_model)});
+
+    FusedAttentionWoStage::Params params;
+    params.Q = Q.get();
+    params.K = K.get();
+    params.V = V.get();
+    params.Wo = Wo.get();
+    params.output = output.get();
+    params.batch_size = batch_size;
+    params.seq_len = seq_len;
+    params.kv_len = kv_len;
+    params.n_heads = n_heads;
+    params.n_kv_heads = n_kv_heads;
+    params.head_dim = head_dim;
+    params.d_model = d_model;
+    params.causal = true;
+
+    // Set snapshot buffers
+    params.context_snapshot = context_snapshot.get();
+    params.attention_output_snapshot = attention_output_snapshot.get();
+    params.attention_residual_snapshot = attention_residual_snapshot.get();
+
+    FusedAttentionWoStage stage(params);
+    StageDumpInfo info = stage.getDumpInfo();
+
+    // Check batch_size is captured
+    EXPECT_TRUE(hasScalar(info, "batch_size"));
+    EXPECT_EQ(getScalarInt(info, "batch_size"), batch_size);
+
+    // Check Q input dimensions
+    for (const auto &inp : info.inputs)
+    {
+        if (std::string(inp.name) == "Q")
+        {
+            EXPECT_EQ(inp.rows, total_tokens)
+                << "Q rows should be batch_size * seq_len = " << total_tokens;
+            EXPECT_EQ(inp.cols, hidden_size)
+                << "Q cols should be n_heads * head_dim = " << hidden_size;
+        }
+        if (std::string(inp.name) == "K")
+        {
+            EXPECT_EQ(inp.rows, total_kv_tokens)
+                << "K rows should be batch_size * kv_len = " << total_kv_tokens;
+        }
+        if (std::string(inp.name) == "V")
+        {
+            EXPECT_EQ(inp.rows, total_kv_tokens)
+                << "V rows should be batch_size * kv_len = " << total_kv_tokens;
+        }
+    }
+
+    // Check context snapshot output dimensions (the key fix)
+    for (const auto &out : info.outputs)
+    {
+        if (std::string(out.name) == "context")
+        {
+            EXPECT_EQ(out.rows, total_tokens)
+                << "Context rows should be batch_size * seq_len = " << total_tokens
+                << ", not seq_len = " << seq_len;
+            EXPECT_EQ(out.cols, hidden_size)
+                << "Context cols should be n_heads * head_dim = " << hidden_size;
+        }
+        if (std::string(out.name) == "attention_output")
+        {
+            EXPECT_EQ(out.rows, total_tokens)
+                << "Attention output rows should be batch_size * seq_len = " << total_tokens;
+            EXPECT_EQ(out.cols, static_cast<size_t>(d_model))
+                << "Attention output cols should be d_model = " << d_model;
+        }
+        if (std::string(out.name) == "attention_residual")
+        {
+            EXPECT_EQ(out.rows, total_tokens)
+                << "Attention residual rows should be batch_size * seq_len = " << total_tokens;
+            EXPECT_EQ(out.cols, static_cast<size_t>(d_model))
+                << "Attention residual cols should be d_model = " << d_model;
+        }
+    }
 }
 
 // =============================================================================

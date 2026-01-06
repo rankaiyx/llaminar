@@ -833,19 +833,23 @@ namespace llaminar2
 
         // Context snapshot: pre-Wo attention output (for debugging/parity testing)
         // This is ATTENTION_CONTEXT in pipeline terminology
+        // Shape: [batch_size * seq_len, n_heads * head_dim] to match buffer allocation
         if (params_.context_snapshot)
         {
             const float *ctx_data = getSafeFp32Data(params_.context_snapshot);
+            const size_t total_tokens = static_cast<size_t>(params_.batch_size * params_.seq_len);
             LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] context_snapshot tensor type: "
                       << static_cast<int>(params_.context_snapshot->native_type())
                       << " ctx_data=" << (ctx_data ? "valid" : "NULL")
+                      << " batch_size=" << params_.batch_size
                       << " seq_len=" << params_.seq_len
+                      << " total_tokens=" << total_tokens
                       << " n_heads*head_dim=" << params_.n_heads * params_.head_dim);
             if (ctx_data)
             {
                 info.addOutput("context",
                                ctx_data,
-                               params_.seq_len,
+                               total_tokens,
                                params_.n_heads * params_.head_dim);
             }
         }
@@ -856,38 +860,46 @@ namespace llaminar2
 
         // Attention output snapshot: Wo projection result (before residual add)
         // This is ATTENTION_OUTPUT in pipeline terminology
+        // Shape: [batch_size * seq_len, d_model] to match buffer allocation
         if (params_.attention_output_snapshot)
         {
             const float *out_snap_data = getSafeFp32Data(params_.attention_output_snapshot);
+            const size_t total_tokens = static_cast<size_t>(params_.batch_size * params_.seq_len);
             LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] attention_output_snapshot tensor type: "
                       << static_cast<int>(params_.attention_output_snapshot->native_type())
                       << " data=" << (out_snap_data ? "valid" : "NULL")
+                      << " batch_size=" << params_.batch_size
                       << " seq_len=" << params_.seq_len
+                      << " total_tokens=" << total_tokens
                       << " d_model=" << params_.d_model);
             if (out_snap_data)
             {
                 info.addOutput("attention_output",
                                out_snap_data,
-                               params_.seq_len,
+                               total_tokens,
                                params_.d_model);
             }
         }
 
         // Attention residual snapshot: after residual add (final attention block output)
         // This is ATTENTION_RESIDUAL in pipeline terminology
+        // Shape: [batch_size * seq_len, d_model] to match buffer allocation
         if (params_.attention_residual_snapshot)
         {
             const float *res_snap_data = getSafeFp32Data(params_.attention_residual_snapshot);
+            const size_t total_tokens = static_cast<size_t>(params_.batch_size * params_.seq_len);
             LOG_DEBUG("[FusedAttentionWoStage::getDumpInfo] attention_residual_snapshot tensor type: "
                       << static_cast<int>(params_.attention_residual_snapshot->native_type())
                       << " data=" << (res_snap_data ? "valid" : "NULL")
+                      << " batch_size=" << params_.batch_size
                       << " seq_len=" << params_.seq_len
+                      << " total_tokens=" << total_tokens
                       << " d_model=" << params_.d_model);
             if (res_snap_data)
             {
                 info.addOutput("attention_residual",
                                res_snap_data,
-                               params_.seq_len,
+                               total_tokens,
                                params_.d_model);
             }
         }

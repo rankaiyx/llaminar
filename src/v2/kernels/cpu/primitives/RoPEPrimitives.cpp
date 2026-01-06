@@ -557,7 +557,10 @@ namespace llaminar2::primitives
         {
             // Prefill or no persistent state: use angle recurrence
             apply_rope_to_tensor_recurrence(q, seq_len, q_heads, head_dim, n_past, inv_freq);
-            apply_rope_to_tensor_recurrence(k, seq_len, k_heads, head_dim, n_past, inv_freq);
+            if (k)
+            {
+                apply_rope_to_tensor_recurrence(k, seq_len, k_heads, head_dim, n_past, inv_freq);
+            }
         }
     }
 

@@ -35,9 +35,14 @@ namespace llaminar2
             int n_heads = 0;             ///< Number of query heads
             int n_kv_heads = 0;          ///< Number of KV heads (for GQA)
             int head_dim = 0;            ///< Dimension per head
-            int pos_offset = 0;          ///< Position offset (for KV cache)
+            int pos_offset = 0;          ///< Position offset (for KV cache) - DEPRECATED: use position_ids
             float theta_base = 10000.0f; ///< RoPE theta base
             int seq_len = 0;             ///< Explicit sequence length (for pre-allocated buffers)
+
+            // Per-token position IDs for batched execution (optional, overrides pos_offset)
+            // When set, this array should have seq_len elements (total_tokens for batched)
+            // For batched mode with batch_size=2, seq_len=2: [pos0_t0, pos0_t1, pos1_t0, pos1_t1]
+            const int *position_ids = nullptr; ///< Per-token position IDs array [seq_len]
 
             // Fixed-scale quantization for HybridQ16 mode (used when Q_out is Q16_1)
             float kv_cache_scale = 256.0f; ///< Fixed scale for Q16 output (d = kv_cache_scale / 32767)

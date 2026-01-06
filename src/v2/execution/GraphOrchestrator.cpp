@@ -1228,11 +1228,11 @@ namespace llaminar2
         }
         padded_seq_len_ = max_len;
 
-        // Update sequence lengths
-        state_.sequence_lengths.resize(batch_size);
+        // Store actual lengths BEFORE calling forward (forward() will overwrite with padded len)
+        std::vector<int> actual_lengths(batch_size);
         for (int i = 0; i < batch_size; ++i)
         {
-            state_.sequence_lengths[i] = static_cast<int>(token_batches[i].size());
+            actual_lengths[i] = static_cast<int>(token_batches[i].size());
         }
 
         // Create flattened, padded token array [batch_size * padded_seq_len]
@@ -1247,7 +1247,20 @@ namespace llaminar2
         }
 
         // Call the 3-parameter forward() with padded tokens
+        // Note: forward() will set sequence_lengths[b] = padded_seq_len for all b
         const float *result = forward(flat_tokens.data(), padded_seq_len_, batch_size);
+        
+        // Restore actual sequence lengths (forward() set them to padded_seq_len)
+        // This is important for:
+        // 1. Proper logits extraction (only extract non-padded logits)
+        // 2. Snapshot comparison (shapes should match actual token count)
+        // 3. KV cache position tracking (only actual tokens contribute to cache)
+        state_.sequence_lengths.resize(batch_size);
+        for (int i = 0; i < batch_size; ++i)
+        {
+            state_.sequence_lengths[i] = actual_lengths[i];
+        }
+
         return result != nullptr;
     }
 

@@ -805,6 +805,9 @@ namespace llaminar2
         // Stage 3: RoPE on Q and K
         if (env.execution.exec_rope)
         {
+            // For batched execution, pass the full position_ids array
+            // This enables correct per-token position encoding for variable-length sequences
+            // Fallback pos_offset is still used for compatibility with single-sequence execution
             int pos_offset = position_ids ? position_ids[0] : 0;
 
             RoPEStage::Params rope_params;
@@ -814,6 +817,7 @@ namespace llaminar2
             rope_params.n_kv_heads = local_n_kv_heads; // Use local KV head count for TP
             rope_params.head_dim = config_.head_dim;
             rope_params.pos_offset = pos_offset;
+            rope_params.position_ids = position_ids; // Pass full array for batched execution
             rope_params.theta_base = config_.rope_theta;
             rope_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
 

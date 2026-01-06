@@ -309,6 +309,200 @@ TEST_F(ComputeStageTest, RoPEPositionOffset)
     EXPECT_TRUE(different);
 }
 
+// -----------------------------------------------------------------------------
+// RoPE with explicit position_ids (for batched execution parity)
+// -----------------------------------------------------------------------------
+
+TEST_F(ComputeStageTest, RoPEExplicitPositionIds_BatchedParity)
+{
+    // This test verifies that using explicit position_ids produces the same result
+    // as using pos_offset for the same token at the same position.
+    //
+    // Bug fixed: For batched execution with batch_size=2, seq_len=2, the positions
+    // should be [0, 1, 0, 1] (per-sequence positions) not [0, 1, 2, 3] (contiguous).
+    // The fix was to pass explicit position_ids to RoPEStage.
+    
+    const int total_tokens = 2;  // Simulating 2 tokens (could be 2 sequences of 1 token each)
+    const int n_heads = 1;
+    const int head_dim = 4;
+    
+    // Same input tensor data for both tests
+    std::vector<float> tensor_data = {1.0f, 0.0f, 1.0f, 0.0f,
+                                      1.0f, 0.0f, 1.0f, 0.0f};
+    
+    // Test 1: Using pos_offset=0 (generates contiguous positions [0, 1])
+    auto Q_contiguous = makeTensor(total_tokens, n_heads * head_dim, tensor_data);
+    RoPEStage::Params params_contiguous;
+    params_contiguous.Q = Q_contiguous.get();
+    params_contiguous.n_heads = n_heads;
+    params_contiguous.n_kv_heads = n_heads;
+    params_contiguous.head_dim = head_dim;
+    params_contiguous.pos_offset = 0;
+    params_contiguous.theta_base = 10000.0f;
+    params_contiguous.seq_len = total_tokens;
+    params_contiguous.position_ids = nullptr;  // Will generate [0, 1]
+    
+    // Test 2: Using explicit position_ids = [0, 0] (both tokens at position 0)
+    // This simulates two sequences each starting at position 0
+    std::vector<int> batch_positions = {0, 0};
+    auto Q_batched = makeTensor(total_tokens, n_heads * head_dim, tensor_data);
+    RoPEStage::Params params_batched;
+    params_batched.Q = Q_batched.get();
+    params_batched.n_heads = n_heads;
+    params_batched.n_kv_heads = n_heads;
+    params_batched.head_dim = head_dim;
+    params_batched.pos_offset = 0;  // Ignored when position_ids is set
+    params_batched.theta_base = 10000.0f;
+    params_batched.seq_len = total_tokens;
+    params_batched.position_ids = batch_positions.data();  // Explicit [0, 0]
+    
+    RoPEStage stage_contiguous(params_contiguous);
+    RoPEStage stage_batched(params_batched);
+    
+    bool success1 = false, success2 = false;
+    try
+    {
+        success1 = stage_contiguous.execute(ctx_.get());
+        success2 = stage_batched.execute(ctx_.get());
+    }
+    catch (const std::exception &e)
+    {
+        GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
+    }
+    
+    if (!success1 || !success2)
+    {
+        GTEST_SKIP() << "RoPE execution failed (missing kernel support)";
+    }
+    
+    const float *out_contiguous = Q_contiguous->data();
+    const float *out_batched = Q_batched->data();
+    
+    // With position_ids = [0, 0], both rows should have the same RoPE rotation (position 0)
+    // Row 0 should be the same in both (position 0)
+    for (int i = 0; i < head_dim; ++i)
+    {
+        EXPECT_NEAR(out_contiguous[i], out_batched[i], 1e-5f) 
+            << "Row 0 element " << i << " should match (both at position 0)";
+    }
+    
+    // Row 1 should be DIFFERENT in contiguous (position 1) vs batched (position 0)
+    // So batched row 1 should match contiguous row 0 (both at position 0)
+    bool row1_matches_row0 = true;
+    for (int i = 0; i < head_dim; ++i)
+    {
+        if (std::abs(out_batched[head_dim + i] - out_contiguous[i]) > 1e-5f)
+        {
+            row1_matches_row0 = false;
+            break;
+        }
+    }
+    EXPECT_TRUE(row1_matches_row0) << "Batched row 1 (position 0) should match contiguous row 0 (position 0)";
+    
+    // And contiguous row 1 should be different from batched row 1
+    bool row1_different = false;
+    for (int i = 0; i < head_dim; ++i)
+    {
+        if (std::abs(out_contiguous[head_dim + i] - out_batched[head_dim + i]) > 1e-5f)
+        {
+            row1_different = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(row1_different) << "Contiguous row 1 (position 1) should differ from batched row 1 (position 0)";
+}
+
+TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
+{
+    // Verify that when position_ids is provided, pos_offset is ignored
+    const int seq_len = 1;
+    const int n_heads = 1;
+    const int head_dim = 4;
+    
+    std::vector<float> tensor_data = {1.0f, 0.0f, 1.0f, 0.0f};
+    
+    // Test 1: pos_offset=5, no position_ids
+    auto Q1 = makeTensor(seq_len, n_heads * head_dim, tensor_data);
+    RoPEStage::Params params1;
+    params1.Q = Q1.get();
+    params1.n_heads = n_heads;
+    params1.n_kv_heads = n_heads;
+    params1.head_dim = head_dim;
+    params1.pos_offset = 5;
+    params1.theta_base = 10000.0f;
+    params1.seq_len = seq_len;
+    params1.position_ids = nullptr;  // Uses pos_offset=5
+    
+    // Test 2: pos_offset=5 but position_ids=[0] should override to position 0
+    std::vector<int> explicit_pos = {0};
+    auto Q2 = makeTensor(seq_len, n_heads * head_dim, tensor_data);
+    RoPEStage::Params params2;
+    params2.Q = Q2.get();
+    params2.n_heads = n_heads;
+    params2.n_kv_heads = n_heads;
+    params2.head_dim = head_dim;
+    params2.pos_offset = 5;  // Should be ignored
+    params2.theta_base = 10000.0f;
+    params2.seq_len = seq_len;
+    params2.position_ids = explicit_pos.data();  // Overrides to position 0
+    
+    // Test 3: pos_offset=0 for reference
+    auto Q3 = makeTensor(seq_len, n_heads * head_dim, tensor_data);
+    RoPEStage::Params params3;
+    params3.Q = Q3.get();
+    params3.n_heads = n_heads;
+    params3.n_kv_heads = n_heads;
+    params3.head_dim = head_dim;
+    params3.pos_offset = 0;
+    params3.theta_base = 10000.0f;
+    params3.seq_len = seq_len;
+    params3.position_ids = nullptr;
+    
+    RoPEStage stage1(params1);
+    RoPEStage stage2(params2);
+    RoPEStage stage3(params3);
+    
+    bool success1 = false, success2 = false, success3 = false;
+    try
+    {
+        success1 = stage1.execute(ctx_.get());
+        success2 = stage2.execute(ctx_.get());
+        success3 = stage3.execute(ctx_.get());
+    }
+    catch (const std::exception &e)
+    {
+        GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
+    }
+    
+    if (!success1 || !success2 || !success3)
+    {
+        GTEST_SKIP() << "RoPE execution failed (missing kernel support)";
+    }
+    
+    const float *out1 = Q1->data();  // pos_offset=5
+    const float *out2 = Q2->data();  // position_ids=[0] (should override)
+    const float *out3 = Q3->data();  // pos_offset=0
+    
+    // Q2 (with position_ids=[0]) should match Q3 (pos_offset=0), not Q1 (pos_offset=5)
+    for (int i = 0; i < head_dim; ++i)
+    {
+        EXPECT_NEAR(out2[i], out3[i], 1e-5f) 
+            << "position_ids=[0] should produce same result as pos_offset=0";
+    }
+    
+    // Q1 should be different from Q3 (different positions)
+    bool q1_differs = false;
+    for (int i = 0; i < head_dim; ++i)
+    {
+        if (std::abs(out1[i] - out3[i]) > 1e-5f)
+        {
+            q1_differs = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(q1_differs) << "pos_offset=5 should produce different result than pos_offset=0";
+}
+
 // =============================================================================
 // SwiGLUStage Tests
 // =============================================================================

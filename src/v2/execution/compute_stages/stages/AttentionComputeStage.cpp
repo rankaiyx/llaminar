@@ -249,16 +249,19 @@ namespace llaminar2
         if (params_.output)
         {
             const float *out_data = getSafeFp32Data(params_.output);
+            const size_t total_tokens = static_cast<size_t>(params_.batch_size * params_.seq_len);
             LOG_DEBUG("[AttentionComputeStage::getDumpInfo] output=" << (void *)params_.output
                                                                      << " type=" << params_.output->dtype_name()
                                                                      << " out_data=" << (void *)out_data
+                                                                     << " batch_size=" << params_.batch_size
                                                                      << " seq_len=" << params_.seq_len
+                                                                     << " total_tokens=" << total_tokens
                                                                      << " n_heads*head_dim=" << (params_.n_heads * params_.head_dim));
             if (out_data)
             {
                 info.addOutput("output",
                                out_data,
-                               params_.seq_len,
+                               total_tokens,
                                params_.n_heads * params_.head_dim);
             }
         }

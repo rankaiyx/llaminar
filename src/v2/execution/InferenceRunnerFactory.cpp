@@ -177,7 +177,7 @@ namespace llaminar2
         // =====================================================================
         // Phase 3: Tensor-Parallel Configuration for Column-Parallel QKV
         // =====================================================================
-        // When running with multiple MPI ranks, compute head distribution:
+        // When running with multiple MPI ranks AND weights are sharded, compute head distribution:
         // - Each rank handles local_n_heads = n_heads / world_size
         // - Each rank handles local_n_kv_heads = n_kv_heads / world_size (for GQA)
         // - head_start identifies which head range this rank owns
@@ -185,8 +185,14 @@ namespace llaminar2
         // Weight sharding in WeightManager uses COLUMN_PARALLEL for Q/K/V:
         // - Q: [n_heads * head_dim, d_model] → [local_n_heads * head_dim, d_model]
         // - K/V: [n_kv_heads * head_dim, d_model] → [local_n_kv_heads * head_dim, d_model]
+        //
+        // IMPORTANT: Only enable tensor parallelism if weights are actually sharded.
+        // If weights are REPLICATED, each rank has the full weight and should use
+        // the full head counts to avoid buffer/weight dimension mismatch.
         // =====================================================================
-        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        const bool weights_sharded = weight_mgr && 
+            (weight_mgr->strategy() == WeightDistributionStrategy::SHARDED);
+        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
         {
             // Compute local head distribution
             auto [q_head_start, local_n_q_heads] = mpi_ctx->get_local_slice(
@@ -207,22 +213,30 @@ namespace llaminar2
         }
         else
         {
-            // Single rank: use full head counts (no sharding)
+            // Single rank OR weights not sharded: use full head counts
             graph_config.head_start = 0;
             graph_config.local_n_heads = graph_config.n_heads;
             graph_config.local_n_kv_heads = graph_config.n_kv_heads;
             graph_config.qkv_column_parallel = false;
+            
+            if (mpi_ctx && mpi_ctx->world_size() > 1 && !weights_sharded)
+            {
+                LOG_WARN("[InferenceRunner] MPI world_size > 1 but weights are REPLICATED, "
+                         << "not SHARDED. Using full buffer sizes (no tensor parallelism). "
+                         << "Pass WeightDistributionStrategy::SHARDED to ModelContext::create() "
+                         << "to enable tensor parallelism.");
+            }
         }
 
         // =====================================================================
         // Phase 4: Tensor-Parallel Configuration for Column-Parallel FFN
         // =====================================================================
-        // When running with multiple MPI ranks, compute local FFN dimension:
+        // When running with multiple MPI ranks AND weights are sharded, compute local FFN dimension:
         // - Each rank handles d_ff_local = d_ff / world_size
         // - Gate/Up weights: [d_ff, d_model] → [d_ff_local, d_model]
         // - Down weight remains row-parallel: [d_model, d_ff_local] per rank
         // =====================================================================
-        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
         {
             int world_size = mpi_ctx->world_size();
             if (graph_config.d_ff % world_size != 0)
@@ -248,12 +262,12 @@ namespace llaminar2
         // =====================================================================
         // Phase 5: Tensor-Parallel Configuration for Column-Parallel LM Head
         // =====================================================================
-        // When running with multiple MPI ranks, compute local vocab dimension:
+        // When running with multiple MPI ranks AND weights are sharded, compute local vocab dimension:
         // - Each rank handles vocab_local = vocab_size / world_size
         // - LM head weight: [vocab_size, d_model] → [vocab_local, d_model]
         // - Output: [seq, vocab_local] per rank, then AllGather to [seq, vocab_size]
         // =====================================================================
-        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
         {
             int world_size = mpi_ctx->world_size();
             if (graph_config.vocab_size % world_size != 0)
