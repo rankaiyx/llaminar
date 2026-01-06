@@ -2560,6 +2560,76 @@ namespace llaminar2
     };
 
     /**
+     * @brief Residual Add kernel interface
+     *
+     * Element-wise addition of input and residual tensors.
+     * Supports FP32, BF16, FP16 with automatic type dispatch via apply_tensor().
+     */
+    class ITensorResidualAdd : public ITensorKernel
+    {
+    public:
+        /**
+         * @brief Apply element-wise addition: output = input + residual
+         *
+         * @param input Input tensor data
+         * @param residual Residual tensor data
+         * @param output Output tensor data
+         * @param num_elements Number of elements
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index (-1 for CPU)
+         * @return true on success
+         */
+        virtual bool apply(
+            const float *input, const float *residual, float *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) = 0;
+
+        virtual bool apply_bf16(
+            const uint16_t *input, const uint16_t *residual, uint16_t *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        virtual bool apply_fp16(
+            const uint16_t *input, const uint16_t *residual, uint16_t *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) { return false; }
+
+        /**
+         * @brief Apply residual add using tensor objects with automatic type dispatch
+         *
+         * Inspects input/residual/output tensor native_type() and dispatches to
+         * the appropriate typed method (apply, apply_bf16, apply_fp16).
+         *
+         * @param input Input tensor
+         * @param residual Residual tensor
+         * @param output Output tensor
+         * @param num_elements Number of elements to process
+         * @param mpi_ctx MPI context (optional)
+         * @param device_idx Device index
+         * @return true on success, false on failure or unsupported type
+         */
+        virtual bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *residual,
+            TensorBase *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1)
+        {
+            (void)input;
+            (void)residual;
+            (void)output;
+            (void)num_elements;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // Subclasses override with type-aware dispatch
+        }
+    };
+
+    /**
      * @brief Embedding lookup kernel
      *
      * Handles embedding table lookup with typed output:

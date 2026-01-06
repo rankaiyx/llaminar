@@ -78,7 +78,7 @@ namespace llaminar2
 
         std::vector<float> host_buffer(numel);
 
-        int device_id = tensor->device_index();
+        int device_id = tensor->home_dm_device_index();
 
         if (device_id < 0)
         {
@@ -117,7 +117,7 @@ namespace llaminar2
             throw std::invalid_argument("[MPIStager] toDevice: buffer size mismatch (host=" + std::to_string(host_buffer.size()) + ", tensor=" + std::to_string(numel) + ")");
         }
 
-        int device_id = tensor->device_index();
+        int device_id = tensor->home_dm_device_index();
 
         if (device_id < 0)
         {
@@ -138,7 +138,7 @@ namespace llaminar2
     {
         // Device index 0 = CPU (no staging needed)
         // Device index > 0 = GPU (staging required)
-        return tensor && tensor->device_index() > 0;
+        return tensor && tensor->home_dm_device_index() > 0;
     }
 
     void MPIStager::synchronizeDevice(int device_id)

@@ -73,10 +73,10 @@ TEST(Test__DeviceTransfer, NullSourceDetection)
 TEST(Test__DeviceTransfer, DeviceIndexTracking)
 {
     auto cpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4}, -1);
-    EXPECT_EQ(cpu_tensor->device_index(), -1) << "CPU tensor should have device_idx = -1";
+    EXPECT_EQ(cpu_tensor->home_dm_device_index(), -1) << "CPU tensor should have device_idx = -1";
 
     auto gpu_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4}, 0);
-    EXPECT_EQ(gpu_tensor->device_index(), 0) << "GPU tensor should have device_idx = 0";
+    EXPECT_EQ(gpu_tensor->home_dm_device_index(), 0) << "GPU tensor should have device_idx = 0";
 }
 
 /**

@@ -656,8 +656,12 @@ namespace llaminar2
         TensorBase(TensorBase &&) = delete;
         TensorBase &operator=(TensorBase &&) = delete;
 
-        // Generic cache for kernel state (e.g. packed weights)
+        // Generic cache for CPU kernel state (e.g. packed VNNI weights)
         mutable std::any cache_;
+
+        // Generic cache for CUDA kernel state (e.g. packed INT8 weights)
+        // Separate from cache_ to allow both CPU and CUDA paths to coexist
+        mutable std::any cuda_cache_;
 
         // Shape and type
         virtual const std::vector<size_t> &shape() const = 0;
@@ -732,15 +736,64 @@ namespace llaminar2
          */
         void *raw_mutable_data() override { return raw_host_data_ptr(); }
 
-        // Device affinity
-        virtual int device_index() const = 0;        // -1 = host, ≥0 = device index from DeviceManager
+        // ===== Device Affinity API =====
+        //
+        // Device indices are DeviceManager indices:
+        //   - NOT_ON_GPU (-1): Data is on host/CPU only, not on any GPU
+        //   - >= 0: DeviceManager device index (use dm.devices()[idx] to get details)
+        //
+        // Note: DeviceManager index 0 is typically CPU. GPU indices start at 1+.
+        // NOT_ON_GPU is distinct from "CPU device" - it means "no GPU copy exists".
+        //
+        // There are TWO device tracking concepts:
+        //   1. "Home DM device" (home_dm_device_index) - where tensor was CREATED
+        //   2. "Current DM device" (current_dm_device_index) - where GPU data currently RESIDES
+        //
+        // After ensureOnDevice(gpu_idx):
+        //   - home_dm_device_index() still returns original value (e.g., NOT_ON_GPU for CPU-created)
+        //   - current_dm_device_index() returns gpu_idx (where data now is)
+        //   - is_on_device(gpu_idx) returns true
+        //
+        // Use current_dm_device_index() when checking WHERE GPU data is.
+        // Use home_dm_device_index() when checking WHERE tensor was created/belongs.
+
+        /** @brief Sentinel value meaning "not resident on any GPU" */
+        static constexpr int NOT_ON_GPU = -1;
+
+        /**
+         * @brief Get "home" DeviceManager device index where tensor was created
+         *
+         * This is the CREATION device, NOT the current location of data.
+         * After ensureOnDevice(), this still returns the original value.
+         *
+         * @return NOT_ON_GPU (-1) for host/CPU, >=0 for DeviceManager device index
+         * @note To check where data currently IS, use current_dm_device_index()
+         * @see current_dm_device_index() for checking current GPU data location
+         */
+        virtual int home_dm_device_index() const = 0;
+
+        /**
+         * @brief Get the DeviceManager device index where tensor GPU data currently resides
+         *
+         * This reflects the CURRENT GPU location of tensor data:
+         * - After ensureOnDevice(gpu_idx): returns gpu_idx
+         * - After ensureOnHost(): returns NOT_ON_GPU
+         * - If never uploaded to GPU: returns NOT_ON_GPU
+         *
+         * For dual-residency (data on both CPU and GPU), returns GPU index.
+         *
+         * @return NOT_ON_GPU (-1) for host/CPU only, >=0 for DeviceManager GPU device index
+         * @note This is non-virtual - uses TensorBase's gpu_device_idx_ tracking
+         */
+        int current_dm_device_index() const { return gpu_device_idx_; }
+
         virtual bool set_device(int device_idx) = 0; // Upload to device
 
         /**
          * @brief Check if tensor currently has valid data on the specified device
          *
-         * @param device_idx Device index to check:
-         *        - device_idx <= 0: Check if tensor has valid host/CPU data
+         * @param device_idx DeviceManager device index to check:
+         *        - device_idx <= 0 (or NOT_ON_GPU): Check if tensor has valid host/CPU data
          *        - device_idx >= 1: Check if tensor is currently on that specific GPU
          * @return true if tensor has valid data on the specified device
          *
@@ -766,9 +819,9 @@ namespace llaminar2
          * @brief Ensure tensor data is available on target device
          *
          * Performs lazy upload: if data is already on target device, returns immediately.
-         * If data is on host (device_index() == -1), allocates GPU memory and uploads.
+         * If data is on host (home_dm_device_index() == NOT_ON_GPU), allocates GPU memory and uploads.
          *
-         * @param target_device GPU device index (0-based from DeviceManager)
+         * @param target_device DeviceManager GPU device index (typically 1+ for GPUs)
          * @return true if data is now available on target device, false on error
          *
          * **Thread Safety**: Caller must ensure no concurrent modifications to tensor data
@@ -797,7 +850,16 @@ namespace llaminar2
          * @brief Check if tensor data is currently resident on GPU
          * @return true if GPU buffer is allocated and contains valid data
          */
-        bool isOnGPU() const { return device_data_ptr_ != nullptr; }
+        bool isOnGPU() const { return gpu_data_ptr_ != nullptr; }
+
+        /**
+         * @brief Get the raw device (GPU) data pointer
+         * @return void* pointer to device memory, or nullptr if not on GPU
+         * @note Use this for CUDA/ROCm kernel dispatch - the pointer is device-side memory
+         * @note Virtual to allow tensor types with their own device management to override
+         */
+        virtual void *gpu_data_ptr() { return gpu_data_ptr_; }
+        virtual const void *gpu_data_ptr() const { return gpu_data_ptr_; }
 
         /**
          * @brief Check if tensor data is currently resident on host (CPU)
@@ -1290,9 +1352,9 @@ namespace llaminar2
         // ===== Lazy Transfer State (Phase 1 GPU Device-Aware Slicing) =====
         // Maintained by TensorBase::ensureOnDevice/ensureOnHost implementations.
 
-        void *device_data_ptr_ = nullptr; // GPU buffer pointer (nullptr = not on GPU)
+        void *gpu_data_ptr_ = nullptr;    // GPU buffer pointer (nullptr = not on GPU)
         bool host_invalid_ = false;       // true if GPU has newer data than host
-        int gpu_device_idx_ = -1;         // Which GPU device (-1 = not on GPU)
+        int gpu_device_idx_ = NOT_ON_GPU; // Which GPU device (NOT_ON_GPU = not on GPU)
 
         // ===== Abstract Accessors for Lazy Transfer =====
         // Each tensor type can override these for GPU support.
@@ -1429,7 +1491,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::FP32; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -1639,7 +1701,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::FP16; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
@@ -1853,7 +1915,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::BF16; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
@@ -2060,7 +2122,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::INT8; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
@@ -2212,7 +2274,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::INT32; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
@@ -2345,7 +2407,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ4_NL; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to temp buffer
@@ -2576,7 +2638,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q8_0; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -2836,7 +2898,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q8_1; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         /**
@@ -3312,7 +3374,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q16_1; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -3748,7 +3810,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q4_0; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -3947,7 +4009,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q4_1; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4144,7 +4206,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q5_0; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4332,7 +4394,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q5_1; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4516,7 +4578,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q6_K; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4663,7 +4725,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q2_K; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4818,7 +4880,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4962,7 +5024,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q3_K; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5109,7 +5171,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q4_K; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5260,7 +5322,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q8_K; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5404,7 +5466,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ4_XS; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5582,7 +5644,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ2_XXS; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5748,7 +5810,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ2_XS; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5914,7 +5976,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ3_XXS; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6084,7 +6146,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ2_S; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6250,7 +6312,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ3_S; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6420,7 +6482,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ1_S; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6586,7 +6648,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ1_M; }
 
-        int device_index() const override { return device_idx_; }
+        int home_dm_device_index() const override { return device_idx_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;

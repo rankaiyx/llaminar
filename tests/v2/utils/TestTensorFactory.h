@@ -340,6 +340,906 @@ namespace llaminar2::test
             return std::make_unique<Q4_0Tensor>(shape, raw_data);
         }
 
+        /**
+         * @brief Create IQ4_NL tensor with random quantized data
+         *
+         * Creates realistic IQ4_NL quantized weights by:
+         * 1. Generating random FP32 values from normal distribution
+         * 2. Quantizing to IQ4_NL format using non-linear codebook
+         *
+         * IQ4_NL uses kvalues_iq4nl[16] lookup table for non-linear quantization.
+         *
+         * @param shape Tensor dimensions [rows, cols]
+         * @param seed Random seed
+         */
+        static std::unique_ptr<IQ4_NLTensor> createIQ4_NLRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 32;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f); // Normal distribution typical for weights
+
+            // IQ4_NL block: 2 bytes FP16 scale + 16 bytes packed indices = 18 bytes
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ4_NLBlock));
+            auto *blocks = reinterpret_cast<IQ4_NLBlock *>(raw_data.data());
+
+            // Non-linear codebook from IQQuantTables.h
+            static constexpr float kvalues[16] = {
+                -127.0f, -104.0f, -83.0f, -65.0f,
+                -49.0f, -35.0f, -22.0f, -10.0f,
+                1.0f, 13.0f, 25.0f, 38.0f,
+                53.0f, 69.0f, 89.0f, 113.0f};
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                // Generate random values for this block
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                // Compute scale (map max_abs to ~113, the max positive in codebook)
+                float scale = max_abs / 113.0f;
+                if (scale < 1e-10f)
+                    scale = 1e-10f;
+                blocks[i].d = fp32_to_fp16(scale);
+
+                float inv_scale = 1.0f / scale;
+
+                // Quantize each value to nearest codebook index
+                for (size_t j = 0; j < BLOCK_SIZE / 2; ++j)
+                {
+                    // First element (stored in low nibble)
+                    float v0 = values[j] * inv_scale;
+                    int best_idx0 = 8; // Default to ~1.0
+                    float best_dist0 = std::abs(v0 - kvalues[8]);
+                    for (int k = 0; k < 16; ++k)
+                    {
+                        float d = std::abs(v0 - kvalues[k]);
+                        if (d < best_dist0)
+                        {
+                            best_dist0 = d;
+                            best_idx0 = k;
+                        }
+                    }
+
+                    // Second element (stored in high nibble, offset by 16 in block)
+                    float v1 = values[j + 16] * inv_scale;
+                    int best_idx1 = 8;
+                    float best_dist1 = std::abs(v1 - kvalues[8]);
+                    for (int k = 0; k < 16; ++k)
+                    {
+                        float d = std::abs(v1 - kvalues[k]);
+                        if (d < best_dist1)
+                        {
+                            best_dist1 = d;
+                            best_idx1 = k;
+                        }
+                    }
+
+                    // Pack: low nibble = first, high nibble = second
+                    blocks[i].qs[j] = static_cast<uint8_t>((best_idx1 << 4) | best_idx0);
+                }
+            }
+
+            return std::make_unique<IQ4_NLTensor>(shape, raw_data);
+        }
+
+        // =========================================================================
+        // Q4_1 Tensor Creation (4-bit with min value)
+        // =========================================================================
+
+        /**
+         * @brief Create Q4_1 tensor with random quantized data
+         */
+        static std::unique_ptr<Q4_1Tensor> createQ4_1Random(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 32;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q4_1Block));
+            auto *blocks = reinterpret_cast<Q4_1Block *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float min_val = std::numeric_limits<float>::max();
+                float max_val = std::numeric_limits<float>::lowest();
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    min_val = std::min(min_val, values[j]);
+                    max_val = std::max(max_val, values[j]);
+                }
+
+                float scale = (max_val - min_val) / 15.0f;
+                blocks[i].d = fp32_to_fp16(scale);
+                blocks[i].m = fp32_to_fp16(min_val);
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                for (size_t j = 0; j < BLOCK_SIZE / 2; ++j)
+                {
+                    int32_t q0 = static_cast<int32_t>(std::round((values[2 * j] - min_val) * inv_scale));
+                    int32_t q1 = static_cast<int32_t>(std::round((values[2 * j + 1] - min_val) * inv_scale));
+                    q0 = std::clamp(q0, 0, 15);
+                    q1 = std::clamp(q1, 0, 15);
+                    blocks[i].qs[j] = static_cast<uint8_t>((q1 << 4) | q0);
+                }
+            }
+
+            return std::make_unique<Q4_1Tensor>(shape, raw_data);
+        }
+
+        // =========================================================================
+        // Q5_0 Tensor Creation (5-bit quantization)
+        // =========================================================================
+
+        /**
+         * @brief Create Q5_0 tensor with random quantized data
+         */
+        static std::unique_ptr<Q5_0Tensor> createQ5_0Random(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 32;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q5_0Block));
+            auto *blocks = reinterpret_cast<Q5_0Block *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 15.0f; // Q5 symmetric range is [-16, 15]
+                blocks[i].d = fp32_to_fp16(scale);
+                memset(blocks[i].qh, 0, sizeof(blocks[i].qh));
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                for (size_t j = 0; j < BLOCK_SIZE / 2; ++j)
+                {
+                    int32_t q0 = static_cast<int32_t>(std::round(values[2 * j] * inv_scale)) + 16;
+                    int32_t q1 = static_cast<int32_t>(std::round(values[2 * j + 1] * inv_scale)) + 16;
+                    q0 = std::clamp(q0, 0, 31);
+                    q1 = std::clamp(q1, 0, 31);
+                    // Store lower 4 bits in qs, 5th bit in qh
+                    blocks[i].qs[j] = static_cast<uint8_t>(((q1 & 0x0F) << 4) | (q0 & 0x0F));
+                    // High bits stored in qh (4 bytes = 32 bits)
+                    if (q0 & 0x10)
+                        blocks[i].qh[j / 8] |= (1 << (j % 8));
+                    if (q1 & 0x10)
+                        blocks[i].qh[(j + 16) / 8] |= (1 << ((j + 16) % 8));
+                }
+            }
+
+            return std::make_unique<Q5_0Tensor>(shape, raw_data);
+        }
+
+        // =========================================================================
+        // Q5_1 Tensor Creation (5-bit with min value)
+        // =========================================================================
+
+        /**
+         * @brief Create Q5_1 tensor with random quantized data
+         */
+        static std::unique_ptr<Q5_1Tensor> createQ5_1Random(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 32;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q5_1Block));
+            auto *blocks = reinterpret_cast<Q5_1Block *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float min_val = std::numeric_limits<float>::max();
+                float max_val = std::numeric_limits<float>::lowest();
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    min_val = std::min(min_val, values[j]);
+                    max_val = std::max(max_val, values[j]);
+                }
+
+                float scale = (max_val - min_val) / 31.0f;
+                blocks[i].d = fp32_to_fp16(scale);
+                blocks[i].m = fp32_to_fp16(min_val);
+                memset(blocks[i].qh, 0, sizeof(blocks[i].qh));
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                for (size_t j = 0; j < BLOCK_SIZE / 2; ++j)
+                {
+                    int32_t q0 = static_cast<int32_t>(std::round((values[2 * j] - min_val) * inv_scale));
+                    int32_t q1 = static_cast<int32_t>(std::round((values[2 * j + 1] - min_val) * inv_scale));
+                    q0 = std::clamp(q0, 0, 31);
+                    q1 = std::clamp(q1, 0, 31);
+                    blocks[i].qs[j] = static_cast<uint8_t>(((q1 & 0x0F) << 4) | (q0 & 0x0F));
+                    if (q0 & 0x10)
+                        blocks[i].qh[j / 8] |= (1 << (j % 8));
+                    if (q1 & 0x10)
+                        blocks[i].qh[(j + 16) / 8] |= (1 << ((j + 16) % 8));
+                }
+            }
+
+            return std::make_unique<Q5_1Tensor>(shape, raw_data);
+        }
+
+        // =========================================================================
+        // K-Quant Tensor Factory Methods (256-element super-blocks)
+        // =========================================================================
+
+        /**
+         * @brief Create Q6_K tensor with random quantized data
+         * K-quant format with 256 elements per super-block
+         */
+        static std::unique_ptr<Q6_KTensor> createQ6_KRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q6_KBlock));
+            auto *blocks = reinterpret_cast<Q6_KBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 31.0f; // 6-bit has range [-32, 31]
+                blocks[i].d = fp32_to_fp16(scale);
+
+                // Initialize per-block scales to 1
+                for (int s = 0; s < 16; ++s)
+                {
+                    blocks[i].scales[s] = 32; // Neutral scale (centered)
+                }
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                // Simplified quantization - just store values directly
+                for (size_t j = 0; j < 128; ++j)
+                {
+                    int32_t q = static_cast<int32_t>(std::round(values[j * 2] * inv_scale)) + 32;
+                    q = std::clamp(q, 0, 63);
+                    blocks[i].ql[j] = static_cast<uint8_t>(q & 0x0F);
+                    blocks[i].qh[j / 2] |= static_cast<uint8_t>(((q >> 4) & 0x03) << ((j % 2) * 2));
+                }
+            }
+
+            return std::make_unique<Q6_KTensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create Q2_K tensor with random quantized data
+         */
+        static std::unique_ptr<Q2_KTensor> createQ2_KRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q2_KBlock));
+            auto *blocks = reinterpret_cast<Q2_KBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 1.5f; // Q2 range is small
+                blocks[i].d = fp32_to_fp16(scale);
+                blocks[i].dmin = fp32_to_fp16(0.0f);
+
+                memset(blocks[i].scales, 0x44, sizeof(blocks[i].scales)); // Neutral scales
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                for (size_t j = 0; j < 64; ++j)
+                {
+                    uint8_t packed = 0;
+                    for (size_t k = 0; k < 4; ++k)
+                    {
+                        int32_t q = static_cast<int32_t>(std::round(values[j * 4 + k] * inv_scale)) + 2;
+                        q = std::clamp(q, 0, 3);
+                        packed |= static_cast<uint8_t>(q << (k * 2));
+                    }
+                    blocks[i].qs[j] = packed;
+                }
+            }
+
+            return std::make_unique<Q2_KTensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create Q3_K tensor with random quantized data
+         */
+        static std::unique_ptr<Q3_KTensor> createQ3_KRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q3_KBlock));
+            auto *blocks = reinterpret_cast<Q3_KBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 3.5f; // Q3 range
+                blocks[i].d = fp32_to_fp16(scale);
+
+                memset(blocks[i].hmask, 0, sizeof(blocks[i].hmask));
+                memset(blocks[i].scales, 0x44, sizeof(blocks[i].scales)); // Neutral scales
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                for (size_t j = 0; j < 64; ++j)
+                {
+                    uint8_t packed = 0;
+                    for (size_t k = 0; k < 4; ++k)
+                    {
+                        int32_t q = static_cast<int32_t>(std::round(values[j * 4 + k] * inv_scale)) + 4;
+                        q = std::clamp(q, 0, 7);
+                        packed |= static_cast<uint8_t>((q & 0x03) << (k * 2));
+                        if (q & 0x04)
+                            blocks[i].hmask[j * 4 / 8 + k / 8] |= (1 << ((j * 4 + k) % 8));
+                    }
+                    blocks[i].qs[j] = packed;
+                }
+            }
+
+            return std::make_unique<Q3_KTensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create Q4_K tensor with random quantized data
+         */
+        static std::unique_ptr<Q4_KTensor> createQ4_KRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q4_KBlock));
+            auto *blocks = reinterpret_cast<Q4_KBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 7.0f;
+                blocks[i].d = fp32_to_fp16(scale);
+                blocks[i].dmin = fp32_to_fp16(0.0f);
+
+                memset(blocks[i].scales, 0x44, sizeof(blocks[i].scales));
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                for (size_t j = 0; j < 128; ++j)
+                {
+                    int32_t q0 = static_cast<int32_t>(std::round(values[j * 2] * inv_scale)) + 8;
+                    int32_t q1 = static_cast<int32_t>(std::round(values[j * 2 + 1] * inv_scale)) + 8;
+                    q0 = std::clamp(q0, 0, 15);
+                    q1 = std::clamp(q1, 0, 15);
+                    blocks[i].qs[j] = static_cast<uint8_t>((q1 << 4) | q0);
+                }
+            }
+
+            return std::make_unique<Q4_KTensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create Q5_K tensor with random quantized data
+         */
+        static std::unique_ptr<Q5_KTensor> createQ5_KRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(Q5_KBlock));
+            auto *blocks = reinterpret_cast<Q5_KBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 15.0f;
+                blocks[i].d = fp32_to_fp16(scale);
+                blocks[i].dmin = fp32_to_fp16(0.0f);
+
+                memset(blocks[i].scales, 0x44, sizeof(blocks[i].scales));
+                memset(blocks[i].qh, 0, sizeof(blocks[i].qh));
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                for (size_t j = 0; j < 128; ++j)
+                {
+                    int32_t q0 = static_cast<int32_t>(std::round(values[j * 2] * inv_scale)) + 16;
+                    int32_t q1 = static_cast<int32_t>(std::round(values[j * 2 + 1] * inv_scale)) + 16;
+                    q0 = std::clamp(q0, 0, 31);
+                    q1 = std::clamp(q1, 0, 31);
+                    blocks[i].qs[j] = static_cast<uint8_t>(((q1 & 0x0F) << 4) | (q0 & 0x0F));
+                    if (q0 & 0x10)
+                        blocks[i].qh[j / 4] |= (1 << ((j % 4) * 2));
+                    if (q1 & 0x10)
+                        blocks[i].qh[j / 4] |= (1 << ((j % 4) * 2 + 1));
+                }
+            }
+
+            return std::make_unique<Q5_KTensor>(shape, raw_data);
+        }
+
+        // =========================================================================
+        // IQ (Importance Quantization) Tensor Factory Methods
+        // =========================================================================
+
+        /**
+         * @brief Create IQ4_XS tensor with random quantized data
+         * 4-bit importance quantization with extra-small overhead
+         */
+        static std::unique_ptr<IQ4_XSTensor> createIQ4_XSRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ4_XSBlock));
+            auto *blocks = reinterpret_cast<IQ4_XSBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 7.0f;
+                blocks[i].d = fp32_to_fp16(scale);
+                blocks[i].scales_h = 0;
+                memset(blocks[i].scales_l, 0x44, sizeof(blocks[i].scales_l));
+
+                float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+                for (size_t j = 0; j < 128; ++j)
+                {
+                    int32_t q0 = static_cast<int32_t>(std::round(values[j * 2] * inv_scale)) + 8;
+                    int32_t q1 = static_cast<int32_t>(std::round(values[j * 2 + 1] * inv_scale)) + 8;
+                    q0 = std::clamp(q0, 0, 15);
+                    q1 = std::clamp(q1, 0, 15);
+                    blocks[i].qs[j] = static_cast<uint8_t>((q1 << 4) | q0);
+                }
+            }
+
+            return std::make_unique<IQ4_XSTensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create IQ2_XXS tensor with random quantized data
+         * 2-bit extra-extra-small importance quantization
+         */
+        static std::unique_ptr<IQ2_XXSTensor> createIQ2_XXSRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ2_XXSBlock));
+            auto *blocks = reinterpret_cast<IQ2_XXSBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 1.5f;
+                blocks[i].d = fp32_to_fp16(scale);
+
+                // Simplified: just fill with default grid indices
+                for (size_t j = 0; j < 32; ++j)
+                {
+                    blocks[i].qs[j] = static_cast<uint16_t>(rng() & 0xFFFF);
+                }
+            }
+
+            return std::make_unique<IQ2_XXSTensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create IQ2_XS tensor with random quantized data
+         */
+        static std::unique_ptr<IQ2_XSTensor> createIQ2_XSRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ2_XSBlock));
+            auto *blocks = reinterpret_cast<IQ2_XSBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 1.5f;
+                blocks[i].d = fp32_to_fp16(scale);
+                memset(blocks[i].scales, 0x44, sizeof(blocks[i].scales));
+
+                for (size_t j = 0; j < 32; ++j)
+                {
+                    blocks[i].qs[j] = static_cast<uint16_t>(rng() & 0xFFFF);
+                }
+            }
+
+            return std::make_unique<IQ2_XSTensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create IQ2_S tensor with random quantized data
+         */
+        static std::unique_ptr<IQ2_STensor> createIQ2_SRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ2_SBlock));
+            auto *blocks = reinterpret_cast<IQ2_SBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 1.5f;
+                blocks[i].d = fp32_to_fp16(scale);
+                memset(blocks[i].scales, 0x44, sizeof(blocks[i].scales));
+                memset(blocks[i].qh, 0, sizeof(blocks[i].qh));
+
+                for (size_t j = 0; j < 64; ++j)
+                {
+                    blocks[i].qs[j] = static_cast<uint8_t>(rng() & 0xFF);
+                }
+            }
+
+            return std::make_unique<IQ2_STensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create IQ3_XXS tensor with random quantized data
+         */
+        static std::unique_ptr<IQ3_XXSTensor> createIQ3_XXSRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ3_XXSBlock));
+            auto *blocks = reinterpret_cast<IQ3_XXSBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 3.5f;
+                blocks[i].d = fp32_to_fp16(scale);
+
+                for (size_t j = 0; j < 96; ++j)
+                {
+                    blocks[i].qs[j] = static_cast<uint8_t>(rng() & 0xFF);
+                }
+            }
+
+            return std::make_unique<IQ3_XXSTensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create IQ3_S tensor with random quantized data
+         */
+        static std::unique_ptr<IQ3_STensor> createIQ3_SRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ3_SBlock));
+            auto *blocks = reinterpret_cast<IQ3_SBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 3.5f;
+                blocks[i].d = fp32_to_fp16(scale);
+                memset(blocks[i].qh, 0, sizeof(blocks[i].qh));
+                memset(blocks[i].signs, 0, sizeof(blocks[i].signs));
+                memset(blocks[i].scales, 0x44, sizeof(blocks[i].scales));
+
+                for (size_t j = 0; j < 64; ++j)
+                {
+                    blocks[i].qs[j] = static_cast<uint8_t>(rng() & 0xFF);
+                }
+            }
+
+            return std::make_unique<IQ3_STensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create IQ1_S tensor with random quantized data
+         */
+        static std::unique_ptr<IQ1_STensor> createIQ1_SRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ1_SBlock));
+            auto *blocks = reinterpret_cast<IQ1_SBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float max_abs = 0.0f;
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
+                }
+
+                float scale = max_abs / 0.5f;
+                blocks[i].d = fp32_to_fp16(scale);
+
+                for (size_t j = 0; j < 32; ++j)
+                {
+                    blocks[i].qs[j] = static_cast<uint8_t>(rng() & 0xFF);
+                }
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    blocks[i].qh[j] = static_cast<uint16_t>(rng() & 0xFFFF);
+                }
+            }
+
+            return std::make_unique<IQ1_STensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create IQ1_M tensor with random quantized data
+         */
+        static std::unique_ptr<IQ1_MTensor> createIQ1_MRandom(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            constexpr size_t BLOCK_SIZE = 256;
+
+            size_t rows = shape[0];
+            size_t cols = shape[1];
+            size_t blocks_per_row = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            size_t total_blocks = rows * blocks_per_row;
+
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(IQ1_MBlock));
+            auto *blocks = reinterpret_cast<IQ1_MBlock *>(raw_data.data());
+
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                float values[BLOCK_SIZE];
+                for (size_t j = 0; j < BLOCK_SIZE; ++j)
+                {
+                    values[j] = dist(rng);
+                }
+
+                for (size_t j = 0; j < 32; ++j)
+                {
+                    blocks[i].qs[j] = static_cast<uint8_t>(rng() & 0xFF);
+                }
+                for (size_t j = 0; j < 16; ++j)
+                {
+                    blocks[i].qh[j] = static_cast<uint8_t>(rng() & 0xFF);
+                }
+                for (size_t j = 0; j < 8; ++j)
+                {
+                    blocks[i].scales[j] = static_cast<uint8_t>(rng() & 0xFF);
+                }
+            }
+
+            return std::make_unique<IQ1_MTensor>(shape, raw_data);
+        }
+
         // =========================================================================
         // Q16_1 Tensor Creation (for Q16 integer-domain attention)
         // =========================================================================

@@ -363,7 +363,7 @@ namespace llaminar2
             count *= dim;
         }
 
-        int src_device = src->device_index();
+        int src_device = src->home_dm_device_index();
         int dst_device = device_idx_;
 
         // Determine transfer type

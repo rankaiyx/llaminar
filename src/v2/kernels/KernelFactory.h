@@ -84,6 +84,7 @@ namespace llaminar2
     class ITensorSwiGLU;
     class ITensorSoftmax;
     class ITensorRMSNorm;
+    class ITensorResidualAdd;
     class ITensorAttention;
     class ITensorEmbedding;
     class IQ4_NLTensor;
@@ -118,6 +119,11 @@ namespace llaminar2
     {
         struct QuantisedPackedWeights;
     } // namespace gemm_v4
+
+    namespace cuda
+    {
+        struct CUDAPackedWeights; // Forward declare from CUDAQuantisedGemmKernel.h
+    } // namespace cuda
 } // namespace llaminar2
 
 namespace llaminar
@@ -583,6 +589,28 @@ namespace llaminar
                     const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type);
 
                 // ==========================================================================
+                // ResidualAdd Kernel Creation - Device-aware dispatch
+                // ==========================================================================
+
+                /**
+                 * @brief Create ResidualAdd kernel for FP32 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
+                    const llaminar2::FP32Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create ResidualAdd kernel for BF16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
+                    const llaminar2::BF16Tensor *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create ResidualAdd kernel for FP16 activation tensor
+                 */
+                static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
+                    const llaminar2::FP16Tensor *tensor, DeviceType dev_type);
+
+                // ==========================================================================
                 // Generic TensorBase* Factory Methods - Auto-dispatch by native_type()
                 // ==========================================================================
 
@@ -627,6 +655,20 @@ namespace llaminar
                  * @throws std::runtime_error if tensor type is unsupported
                  */
                 static std::unique_ptr<llaminar2::ITensorSwiGLU> createSwiGLU(
+                    const llaminar2::TensorBase *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create ResidualAdd kernel for any tensor type via dynamic dispatch
+                 *
+                 * Dispatches to the appropriate typed createResidualAdd overload based on
+                 * tensor->native_type().
+                 *
+                 * @param tensor Input tensor (FP32, BF16, or FP16)
+                 * @param dev_type Target device type
+                 * @return ITensorResidualAdd implementation appropriate for the tensor type
+                 * @throws std::runtime_error if tensor type is unsupported
+                 */
+                static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
                     const llaminar2::TensorBase *tensor, DeviceType dev_type);
 
                 /**
@@ -704,6 +746,26 @@ namespace llaminar
                  */
                 static const llaminar2::gemm_v4::QuantisedPackedWeights *
                 ensurePackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
+
+#ifdef HAVE_CUDA
+                /**
+                 * @brief Ensure tensor has CUDA INT8 packed weights in its cache and return pointer
+                 *
+                 * Similar to ensurePackedWeightsInTensorCache but for CUDA backend.
+                 * Converts any quantized tensor to INT8 + per-column scales for CUTLASS.
+                 *
+                 * The packed weights are stored in tensor->cuda_cache_ so they outlive
+                 * any individual kernel and can be shared across multiple kernel instances.
+                 *
+                 * Thread-safe: can be called from multiple threads.
+                 *
+                 * @param tensor Quantized tensor
+                 * @return Pointer to CUDA packed weights (stored in tensor's cuda_cache_)
+                 * @throws std::runtime_error if packing fails
+                 */
+                static llaminar2::cuda::CUDAPackedWeights *
+                ensureCUDAPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
+#endif
 
                 /**
                  * @brief Clear cached kernel for a specific tensor

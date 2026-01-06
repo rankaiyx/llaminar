@@ -68,7 +68,7 @@ TEST_F(MPIStaging, CPUTensorNoOp)
     auto tensor = tensor_factory_->createFP32(shape);
 
     // Verify it's a CPU tensor
-    EXPECT_EQ(tensor->device_index(), -1) << "Tensor should be on CPU (device -1)";
+    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "Tensor should be on CPU (device -1)";
 
     // Fill with test data
     float *data = tensor->mutable_data();
@@ -209,7 +209,7 @@ TEST_F(MPIStaging, RequiresStagingHelper)
         << "CPU tensor should not require staging";
 
     // Verify it's actually a CPU tensor
-    EXPECT_EQ(cpu_tensor->device_index(), -1)
+    EXPECT_EQ(cpu_tensor->home_dm_device_index(), -1)
         << "TensorFactory should create CPU tensors by default";
 
     // Null tensor should return false

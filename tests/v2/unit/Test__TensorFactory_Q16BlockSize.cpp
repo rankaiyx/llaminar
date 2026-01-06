@@ -75,7 +75,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, BlockSizeOverloadRespectsDeviceIdx)
     auto tensor = factory_->createQ16_1({4, 128}, Q16BlockSize::BLOCK_128, 0);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), 0);
+    EXPECT_EQ(tensor->home_dm_device_index(), 0);
     EXPECT_EQ(tensor->block_size(), 128);
 }
 
@@ -84,7 +84,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, BlockSizeOverloadDefaultDevice)
     auto tensor = factory_->createQ16_1({4, 128}, Q16BlockSize::BLOCK_128);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), -1); // Default device
+    EXPECT_EQ(tensor->home_dm_device_index(), -1); // Default device
     EXPECT_EQ(tensor->block_size(), 128);
 }
 

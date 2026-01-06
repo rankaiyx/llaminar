@@ -9,6 +9,8 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/SIMDHelpers.h"
+#include "../../../execution/DeviceContext.h"
+#include "../../../kernels/KernelFactory.h"
 
 namespace llaminar2
 {
@@ -151,6 +153,8 @@ namespace llaminar2
 
     bool ResidualAddStage::executeFP32(IDeviceContext *ctx, size_t num_elements)
     {
+        (void)ctx; // Now unused - KernelFactory handles device dispatch
+
         const float *input = params_.input->data();
         const float *residual = params_.residual->data();
         float *output = params_.output->mutable_data();
@@ -161,17 +165,27 @@ namespace llaminar2
                   << " residual[0:4]="
                   << residual[0] << "," << residual[1] << "," << residual[2] << "," << residual[3]);
 
-        ctx->runFor(0, n, [=](size_t i)
-                    { output[i] = input[i] + residual[i]; });
+        // Create kernel via KernelFactory with automatic device dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(params_.input, dev_type);
+        if (!kernel)
+        {
+            LOG_ERROR("[ResidualAddStage::FP32] Failed to create ResidualAdd kernel");
+            return false;
+        }
+
+        bool ok = kernel->apply(input, residual, output, n, params_.mpi_ctx, params_.device_idx);
 
         LOG_DEBUG("[ResidualAddStage::FP32] output[0:4]="
                   << output[0] << "," << output[1] << "," << output[2] << "," << output[3]);
 
-        return true;
+        return ok;
     }
 
     bool ResidualAddStage::executeBF16(IDeviceContext *ctx, size_t num_elements)
     {
+        (void)ctx; // Now unused - KernelFactory handles device dispatch
+
         const uint16_t *input = static_cast<const uint16_t *>(params_.input->raw_data());
         const uint16_t *residual = static_cast<const uint16_t *>(params_.residual->raw_data());
         uint16_t *output = static_cast<uint16_t *>(params_.output->raw_mutable_data());
@@ -179,17 +193,22 @@ namespace llaminar2
 
         LOG_DEBUG("[ResidualAddStage::BF16] Converting and adding " << n << " elements");
 
-        ctx->runFor(0, n, [=](size_t i)
-                    {
-            float in_f = simd::bf16_to_fp32(input[i]);
-            float res_f = simd::bf16_to_fp32(residual[i]);
-            output[i] = simd::fp32_to_bf16(in_f + res_f); });
+        // Create kernel via KernelFactory with automatic device dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(params_.input, dev_type);
+        if (!kernel)
+        {
+            LOG_ERROR("[ResidualAddStage::BF16] Failed to create ResidualAdd kernel");
+            return false;
+        }
 
-        return true;
+        return kernel->apply_bf16(input, residual, output, n, params_.mpi_ctx, params_.device_idx);
     }
 
     bool ResidualAddStage::executeFP16(IDeviceContext *ctx, size_t num_elements)
     {
+        (void)ctx; // Now unused - KernelFactory handles device dispatch
+
         const uint16_t *input = static_cast<const uint16_t *>(params_.input->raw_data());
         const uint16_t *residual = static_cast<const uint16_t *>(params_.residual->raw_data());
         uint16_t *output = static_cast<uint16_t *>(params_.output->raw_mutable_data());
@@ -197,13 +216,16 @@ namespace llaminar2
 
         LOG_DEBUG("[ResidualAddStage::FP16] Converting and adding " << n << " elements");
 
-        ctx->runFor(0, n, [=](size_t i)
-                    {
-            float in_f = simd::fp16_to_fp32(input[i]);
-            float res_f = simd::fp16_to_fp32(residual[i]);
-            output[i] = simd::fp32_to_fp16(in_f + res_f); });
+        // Create kernel via KernelFactory with automatic device dispatch
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createResidualAdd(params_.input, dev_type);
+        if (!kernel)
+        {
+            LOG_ERROR("[ResidualAddStage::FP16] Failed to create ResidualAdd kernel");
+            return false;
+        }
 
-        return true;
+        return kernel->apply_fp16(input, residual, output, n, params_.mpi_ctx, params_.device_idx);
     }
 
     bool ResidualAddStage::executeQ8_1(IDeviceContext *ctx, size_t num_elements)
@@ -501,8 +523,11 @@ namespace llaminar2
         switch (backend)
         {
         case ComputeBackendType::CPU:
-
             return true;
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
         default:
             return false;
         }

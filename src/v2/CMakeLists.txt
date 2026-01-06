@@ -193,7 +193,6 @@ if(HAVE_CUDA)
         # kernels/cuda/CudaGemmVariantsTensorCore.cu  # OBSOLETE: Unused CuTe-based Tensor Core kernels (replaced by JIT)
         kernels/cuda/CudaGemmJIT.cu                   # JIT compiler implementation (NVRTC)
         kernels/cuda/CudaGemmAutoTuner.cu
-        kernels/cuda/CudaGemmFactory.cu
         kernels/cuda/CudaGemmCuTeWrapper.cu           # CuTe Tensor Core wrapper (Phase 1)
         kernels/cuda/CudaGemmKernelPhase3.cu          # Phase 3 Part 1: Large tiles (128×128×64)
         kernels/cuda/CudaGemmKernelPhase3Pipelined.cu # Phase 3 Part 2: Pipelined (900-1,000 GFLOPS target)
@@ -201,7 +200,20 @@ if(HAVE_CUDA)
         kernels/cuda/CudaGemmKernelPhase5ASimple.cu   # Phase 5A: Streaming dequant (10.0 TFLOPS target)
         kernels/cuda/CudaGemmJITPhase5.cu             # Phase 5 JIT: Auto-tuning infrastructure
         kernels/cuda/CudaGemmKernelPhase7_CUTLASS.cu  # Phase 7: CUTLASS int8 GEMM (50-100+ TFLOPS target)
+        kernels/cuda/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
+        kernels/cuda/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM implementation
+        # Ops kernels (split from monolithic CUDAOpsKernels.cu)
+        kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
+        kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)
+        kernels/cuda/ops/CUDASwiGLUKernels.cu         # SwiGLU kernels (FP32, BF16, FP16)
+        kernels/cuda/ops/CUDARoPEKernels.cu           # RoPE kernels (FP32, BF16, FP16)
+        kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
+        kernels/cuda/CUDARingKVCache.cu               # Ring buffer KV cache with O(1) eviction
     )
+    
+    # NOTE: CUDA kernel ITensorGemm adapters (CUDAFloatingPointGemmKernel.cpp, CUDAQuantisedGemmKernel.cpp)
+    # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT nvcc)
+    # because they include MPI headers which nvcc cannot process
     
     # Add neural network if ONNX Runtime enabled
     if(USE_ONNX_HEURISTIC AND ONNXRUNTIME_INCLUDE_DIR)
@@ -221,10 +233,12 @@ if(HAVE_CUDA)
     # - cudart: CUDA Runtime API (for memory management, streams, etc.)
     # - nvrtc: NVRTC runtime compiler (for JIT kernel compilation)
     # - cuda: CUDA Driver API (for cuLaunchKernel, cuModuleLoad, etc.)
+    # - cublas: cuBLAS library for dense GEMM (FP32/FP16/BF16)
     target_link_libraries(cuda_backend PUBLIC 
         CUDA::cudart
         CUDA::nvrtc
         CUDA::cuda_driver
+        CUDA::cublas
     )
     
     # Link ONNX Runtime if enabled
@@ -749,6 +763,16 @@ endif()
 # =============================================================================
 if(HAVE_CUDA)
     target_link_libraries(llaminar2_core PUBLIC cuda_backend)
+    
+    # Add CUDA kernel C++ adapter files (compiled with C++ compiler, NOT nvcc)
+    # These implement ITensorGemm interface and can include MPI headers
+    target_sources(llaminar2_core PRIVATE
+        kernels/cuda/CUDAFloatingPointGemmKernel.cpp
+        kernels/cuda/CUDAQuantisedGemmKernel.cpp
+        kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE ITensor implementations
+        kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
+    )
+    
     message(STATUS "V2: Linked CUDA backend library")
 endif()
 

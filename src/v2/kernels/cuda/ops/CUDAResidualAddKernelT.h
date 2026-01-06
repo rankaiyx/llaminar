@@ -1,0 +1,222 @@
+/**
+ * @file CUDAResidualAddKernelT.h
+ * @brief CUDA implementation of residual add kernel
+ * @author David Sanftenberg
+ *
+ * Template-specialized implementations of ITensorResidualAdd for CUDA.
+ * Uses extern "C" wrappers to call CUDA kernels in CUDAResidualAddKernels.cu.
+ */
+
+#pragma once
+
+#include "../../../tensors/TensorKernels.h"
+#include "../../../tensors/Tensors.h"
+#include "../../../utils/Logger.h"
+
+// Forward declarations for CUDA kernels
+extern "C"
+{
+    bool cudaOps_residual_add_fp32(const float *input, const float *residual, float *output, int size, int device_idx);
+    bool cudaOps_residual_add_bf16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx);
+    bool cudaOps_residual_add_fp16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx);
+}
+
+namespace llaminar2::cuda
+{
+
+    // ==========================================================================
+    // FP32 Specialization
+    // ==========================================================================
+
+    template <ActivationPrecision Precision>
+    class CUDAResidualAddKernelT;
+
+    template <>
+    class CUDAResidualAddKernelT<ActivationPrecision::FP32> : public ITensorResidualAdd
+    {
+    public:
+        explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+        ~CUDAResidualAddKernelT() override = default;
+
+        bool supports_device(int device_idx) const override
+        {
+            return device_idx >= 0; // Supports any GPU device
+        }
+
+        bool apply(
+            const float *input, const float *residual, float *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            LOG_DEBUG("[CUDAResidualAddKernelT::FP32] Executing on device " << dev);
+            return cudaOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev);
+        }
+
+        bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *residual,
+            TensorBase *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            if (!input || !residual || !output)
+                return false;
+            if (input->native_type() != TensorType::FP32)
+                return false;
+
+            return apply(
+                input->data(),
+                residual->data(),
+                output->mutable_data(),
+                num_elements,
+                mpi_ctx,
+                device_idx);
+        }
+
+    private:
+        int device_idx_;
+    };
+
+    // ==========================================================================
+    // BF16 Specialization
+    // ==========================================================================
+
+    template <>
+    class CUDAResidualAddKernelT<ActivationPrecision::BF16> : public ITensorResidualAdd
+    {
+    public:
+        explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+        ~CUDAResidualAddKernelT() override = default;
+
+        bool supports_device(int device_idx) const override
+        {
+            return device_idx >= 0;
+        }
+
+        bool apply(
+            const float *input, const float *residual, float *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)residual;
+            (void)output;
+            (void)num_elements;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // BF16 kernel doesn't handle FP32
+        }
+
+        bool apply_bf16(
+            const uint16_t *input, const uint16_t *residual, uint16_t *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            LOG_DEBUG("[CUDAResidualAddKernelT::BF16] Executing on device " << dev);
+            return cudaOps_residual_add_bf16(input, residual, output, static_cast<int>(num_elements), dev);
+        }
+
+        bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *residual,
+            TensorBase *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            if (!input || !residual || !output)
+                return false;
+            if (input->native_type() != TensorType::BF16)
+                return false;
+
+            return apply_bf16(
+                static_cast<const uint16_t *>(input->raw_data()),
+                static_cast<const uint16_t *>(residual->raw_data()),
+                static_cast<uint16_t *>(output->raw_mutable_data()),
+                num_elements,
+                mpi_ctx,
+                device_idx);
+        }
+
+    private:
+        int device_idx_;
+    };
+
+    // ==========================================================================
+    // FP16 Specialization
+    // ==========================================================================
+
+    template <>
+    class CUDAResidualAddKernelT<ActivationPrecision::FP16> : public ITensorResidualAdd
+    {
+    public:
+        explicit CUDAResidualAddKernelT(int device_idx = 0) : device_idx_(device_idx) {}
+        ~CUDAResidualAddKernelT() override = default;
+
+        bool supports_device(int device_idx) const override
+        {
+            return device_idx >= 0;
+        }
+
+        bool apply(
+            const float *input, const float *residual, float *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)input;
+            (void)residual;
+            (void)output;
+            (void)num_elements;
+            (void)mpi_ctx;
+            (void)device_idx;
+            return false; // FP16 kernel doesn't handle FP32
+        }
+
+        bool apply_fp16(
+            const uint16_t *input, const uint16_t *residual, uint16_t *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            (void)mpi_ctx;
+            int dev = (device_idx >= 0) ? device_idx : device_idx_;
+            LOG_DEBUG("[CUDAResidualAddKernelT::FP16] Executing on device " << dev);
+            return cudaOps_residual_add_fp16(input, residual, output, static_cast<int>(num_elements), dev);
+        }
+
+        bool apply_tensor(
+            const TensorBase *input,
+            const TensorBase *residual,
+            TensorBase *output,
+            size_t num_elements,
+            const MPIContext *mpi_ctx = nullptr,
+            int device_idx = -1) override
+        {
+            if (!input || !residual || !output)
+                return false;
+            if (input->native_type() != TensorType::FP16)
+                return false;
+
+            return apply_fp16(
+                static_cast<const uint16_t *>(input->raw_data()),
+                static_cast<const uint16_t *>(residual->raw_data()),
+                static_cast<uint16_t *>(output->raw_mutable_data()),
+                num_elements,
+                mpi_ctx,
+                device_idx);
+        }
+
+    private:
+        int device_idx_;
+    };
+
+} // namespace llaminar2::cuda

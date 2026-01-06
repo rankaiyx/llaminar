@@ -116,10 +116,10 @@ namespace llaminar2
         virtual size_t size_bytes() const = 0;
 
         /**
-         * @brief Get the device index where this tensor resides
-         * @return -1 for CPU/host, >= 0 for GPU device index
+         * @brief Get the DeviceManager device index where this tensor was created
+         * @return TensorBase::NOT_ON_GPU (-1) for CPU/host, >= 0 for DeviceManager device index
          */
-        virtual int device_index() const = 0;
+        virtual int home_dm_device_index() const = 0;
 
         // =========================================================================
         // Raw Data Access (type-unsafe, use with caution)

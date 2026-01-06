@@ -97,7 +97,7 @@ namespace llaminar2
      * - Implement `const DataType* data_impl() const`
      * - Implement `DataType* mutable_data_impl()`
      * - Implement `static constexpr int static_type_id()`
-     * - Implement ITensor interface: shape(), numel(), size_bytes(), device_index()
+     * - Implement ITensor interface: shape(), numel(), size_bytes(), home_dm_device_index()
      */
     template <typename Derived, typename DataType>
     class TypedTensorBase : public virtual ITensor

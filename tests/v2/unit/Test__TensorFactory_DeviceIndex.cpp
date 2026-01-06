@@ -50,7 +50,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, Q8_1_ActivationHasCorrectDeviceIndex_Dev
     );
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), 0) << "Q8_1 tensor should have device_index=0 when created with device_idx=0";
+    EXPECT_EQ(tensor->home_dm_device_index(), 0) << "Q8_1 tensor should have device_index=0 when created with device_idx=0";
     EXPECT_EQ(tensor->native_type(), TensorType::Q8_1);
 }
 
@@ -65,7 +65,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, Q8_1_ActivationHasCorrectDeviceIndex_Dev
 
     ASSERT_NE(tensor, nullptr);
     // When device_idx is -1, we should NOT call set_device, so it stays at constructor default
-    EXPECT_EQ(tensor->device_index(), -1) << "Q8_1 tensor should have device_index=-1 when created with device_idx=-1";
+    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "Q8_1 tensor should have device_index=-1 when created with device_idx=-1";
 }
 
 TEST_F(Test__TensorFactory_DeviceIndex, Q8_1_ActivationHasCorrectDeviceIndex_Device1)
@@ -78,7 +78,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, Q8_1_ActivationHasCorrectDeviceIndex_Dev
     );
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), 1) << "Q8_1 tensor should have device_index=1 when created with device_idx=1";
+    EXPECT_EQ(tensor->home_dm_device_index(), 1) << "Q8_1 tensor should have device_index=1 when created with device_idx=1";
 }
 
 // =============================================================================
@@ -93,7 +93,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, BF16_ActivationHasCorrectDeviceIndex_Dev
         0);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), 0) << "BF16 tensor should have device_index=0 when created with device_idx=0";
+    EXPECT_EQ(tensor->home_dm_device_index(), 0) << "BF16 tensor should have device_index=0 when created with device_idx=0";
     EXPECT_EQ(tensor->native_type(), TensorType::BF16);
 }
 
@@ -105,7 +105,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, BF16_ActivationHasCorrectDeviceIndex_Dev
         -1);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), -1) << "BF16 tensor should have device_index=-1 when created with device_idx=-1";
+    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "BF16 tensor should have device_index=-1 when created with device_idx=-1";
 }
 
 // =============================================================================
@@ -120,7 +120,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP16_ActivationHasCorrectDeviceIndex_Dev
         0);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), 0) << "FP16 tensor should have device_index=0 when created with device_idx=0";
+    EXPECT_EQ(tensor->home_dm_device_index(), 0) << "FP16 tensor should have device_index=0 when created with device_idx=0";
     EXPECT_EQ(tensor->native_type(), TensorType::FP16);
 }
 
@@ -132,7 +132,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP16_ActivationHasCorrectDeviceIndex_Dev
         -1);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), -1) << "FP16 tensor should have device_index=-1 when created with device_idx=-1";
+    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "FP16 tensor should have device_index=-1 when created with device_idx=-1";
 }
 
 // =============================================================================
@@ -147,7 +147,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP32_ActivationHasCorrectDeviceIndex_Dev
         0);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), 0) << "FP32 tensor should have device_index=0 when created with device_idx=0";
+    EXPECT_EQ(tensor->home_dm_device_index(), 0) << "FP32 tensor should have device_index=0 when created with device_idx=0";
     EXPECT_EQ(tensor->native_type(), TensorType::FP32);
 }
 
@@ -159,7 +159,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP32_ActivationHasCorrectDeviceIndex_Dev
         -1);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->device_index(), -1) << "FP32 tensor should have device_index=-1 when created with device_idx=-1";
+    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "FP32 tensor should have device_index=-1 when created with device_idx=-1";
 }
 
 // =============================================================================
@@ -183,10 +183,10 @@ TEST_F(Test__TensorFactory_DeviceIndex, AllPrecisions_ConsistentDeviceIndex)
     ASSERT_NE(fp16, nullptr);
     ASSERT_NE(q8_1, nullptr);
 
-    EXPECT_EQ(fp32->device_index(), target_device);
-    EXPECT_EQ(bf16->device_index(), target_device);
-    EXPECT_EQ(fp16->device_index(), target_device);
-    EXPECT_EQ(q8_1->device_index(), target_device);
+    EXPECT_EQ(fp32->home_dm_device_index(), target_device);
+    EXPECT_EQ(bf16->home_dm_device_index(), target_device);
+    EXPECT_EQ(fp16->home_dm_device_index(), target_device);
+    EXPECT_EQ(q8_1->home_dm_device_index(), target_device);
 }
 
 // =============================================================================
@@ -212,7 +212,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, RegressionTest_Q8_1_NoSpuriousTransfer)
     ASSERT_NE(current_hidden, nullptr);
 
     // Simulate the check in prepareActivationForDevice
-    int current_device = current_hidden->device_index();
+    int current_device = current_hidden->home_dm_device_index();
     int target_device = pipeline_device;
 
     // With the fix, these should match - no transfer needed
@@ -236,7 +236,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, RegressionTest_MultipleAllocations_Consi
             target_device);
 
         ASSERT_NE(tensor, nullptr) << "Allocation " << i << " failed";
-        EXPECT_EQ(tensor->device_index(), target_device)
+        EXPECT_EQ(tensor->home_dm_device_index(), target_device)
             << "Allocation " << i << " has wrong device_index";
     }
 }

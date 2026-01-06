@@ -1046,6 +1046,19 @@ add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
     MPI_PROCS 1  # Cache invalidation tests, single rank
 )
 
+# Test: KernelFactory ops kernel creation (RMSNorm, SwiGLU, RoPE, Attention, Embedding, ResidualAdd)
+add_executable(v2_test_kernel_factory_ops unit/Test__KernelFactoryOps.cpp)
+target_link_libraries(v2_test_kernel_factory_ops
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_KernelFactoryOps
+    COMMAND $<TARGET_FILE:v2_test_kernel_factory_ops>
+    LABELS "V2;Unit;Kernels;KernelFactory;Ops;RMSNorm;SwiGLU;RoPE;Attention;Embedding;ResidualAdd"
+    MPI_PROCS 1  # Ops kernel factory tests, single rank
+)
+
 # Test: RMSNorm precision variants (FP32/BF16/FP16/INT32 scalar/AVX2/AVX512 parity)
 add_executable(v2_test_rmsnorm_precision unit/Test__RMSNormPrecision.cpp)
 target_link_libraries(v2_test_rmsnorm_precision 
@@ -2461,6 +2474,82 @@ add_v2_test(V2_Integration_MultiGPU_RealModel
     COMMAND $<TARGET_FILE:v2_test_multi_gpu_real_model>
     LABELS "V2;Integration;DeviceManagement;MultiGPU;CUDA;ROCm;ModelLoading;TensorTransfer;WeightManagement"
     MPI_PROCS 1  # Tests tensor transfers locally, no MPI needed
+)
+
+# =============================================================================
+# CUDA Kernel Infrastructure Tests (Phase 1)
+# =============================================================================
+# Test: CUDA Tensor Transfer (Phase 1 - GPU upload/download via TensorBase::ensureOnDevice)
+# Tests FP32, BF16, FP16 tensor upload/download, round-trip verification, edge cases
+add_executable(v2_test_cuda_tensor_transfer unit/Test__CUDATensorTransfer.cpp)
+target_link_libraries(v2_test_cuda_tensor_transfer llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CUDATensorTransfer
+    COMMAND $<TARGET_FILE:v2_test_cuda_tensor_transfer>
+    LABELS "V2;Unit;CUDA;TensorTransfer;FP32;BF16;FP16;GPUMemory;DeviceManagement"
+    MPI_PROCS 1  # Tests GPU transfers locally, no MPI needed
+)
+
+# Test: cuBLAS GEMM (Phase 1 - dense GEMM via cuBLAS for FP32/FP16/BF16)
+# Tests correctness against CPU reference, various matrix sizes, transpose variants
+add_executable(v2_test_cublas_gemm unit/Test__CuBLASGemm.cpp)
+target_link_libraries(v2_test_cublas_gemm llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CuBLASGemm
+    COMMAND $<TARGET_FILE:v2_test_cublas_gemm>
+    LABELS "V2;Unit;CUDA;cuBLAS;GEMM;FP32;FP16;BF16;DenseGEMM;KernelCorrectness"
+    MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
+)
+
+# Test: CUDA Basic Pipeline (Phase 1 - end-to-end KernelFactory + tensor transfer)
+# Tests KernelFactory dispatch to cuBLAS, tensor upload/download in GEMM context
+add_executable(v2_integration_cuda_basic_pipeline integration/Test__CUDABasicPipeline.cpp)
+target_link_libraries(v2_integration_cuda_basic_pipeline llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDABasicPipeline
+    COMMAND $<TARGET_FILE:v2_integration_cuda_basic_pipeline>
+    LABELS "V2;Integration;CUDA;Pipeline;KernelFactory;TensorTransfer;GEMM;FP32"
+    MPI_PROCS 1  # Tests GPU pipeline locally, no MPI needed
+)
+
+# Test: CUDA GEMM Parity (FP32 and IQ4_NL: CUDA vs CPU kernel comparison)
+# Tests CUDAFloatingPointGemmKernel and CUDAQuantisedGemmKernel through KernelFactory
+# with cosine similarity metrics against CPU reference kernels
+add_executable(v2_integration_cuda_gemm_parity integration/Test__CUDAGemmParity.cpp)
+target_link_libraries(v2_integration_cuda_gemm_parity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAGemmParity
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+    LABELS "V2;Integration;CUDA;GEMM;Parity;FP32;IQ4_NL;Quantized;KernelFactory;CosineSimilarity"
+    MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
+)
+
+# Test: CUDA Ops Parity (RMSNorm, SwiGLU, RoPE)
+# Tests CUDA kernel implementations of normalization and activation functions
+# against CPU reference kernels with cosine similarity metrics
+add_executable(v2_integration_cuda_ops_parity integration/Test__CUDAOpsParity.cpp)
+target_link_libraries(v2_integration_cuda_ops_parity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAOpsParity
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ops_parity>
+    LABELS "V2;Integration;CUDA;Parity;RMSNorm;SwiGLU;RoPE;FP32;BF16;FP16;CosineSimilarity"
+    MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
+)
+
+# Test: CUDA Flash Attention Parity
+# Tests Flash Attention 2 (prefill) and Flash Decoding (decode) CUDA kernels
+# against CPU attention reference with cosine similarity metrics
+add_executable(v2_integration_cuda_flash_attention_parity integration/Test__CUDAFlashAttentionParity.cpp)
+target_link_libraries(v2_integration_cuda_flash_attention_parity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAFlashAttentionParity
+    COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
+    LABELS "V2;Integration;CUDA;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity"
+    MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
+)
+
+# Test: CUDA Ring Buffer KV Cache Parity
+# Tests ring buffer KV cache with O(1) eviction, wrap-around, batched gather, FP32/FP16/BF16
+add_executable(v2_integration_cuda_ring_kv_cache_parity integration/Test__CUDARingKVCacheParity.cpp)
+target_link_libraries(v2_integration_cuda_ring_kv_cache_parity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDARingKVCacheParity
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_parity>
+    LABELS "V2;Integration;CUDA;Parity;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;BF16"
+    MPI_PROCS 1  # Tests GPU KV cache locally, no MPI needed
 )
 
 # Test: ComputeStage (device-agnostic kernel dispatch abstraction)
