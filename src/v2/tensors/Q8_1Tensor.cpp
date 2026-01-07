@@ -31,7 +31,7 @@ namespace llaminar2
 
     Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
         : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(-1), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr),
           is_mutable_(false), cache_dirty_(false)
     {
         LOG_TRACE("[Q8_1Tensor] Creating IMMUTABLE tensor from raw_data, shape=[" << shape[0] << "," << shape[1]
@@ -67,7 +67,7 @@ namespace llaminar2
     // Construct from Q8_1Block array (for testing and direct block construction)
     Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const Q8_1Block *blocks, size_t num_blocks, int device_idx)
         : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(device_idx), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::fromLegacyIndex(device_idx)), device_blocks_(nullptr),
           is_mutable_(true), cache_dirty_(false)
     {
         if (shape.empty())
@@ -103,7 +103,7 @@ namespace llaminar2
     // Copy constructor - deep copy of all data
     Q8_1Tensor::Q8_1Tensor(const Q8_1Tensor &other)
         : shape_(other.shape_), is_view_(false), raw_data_(other.raw_data_), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(other.device_idx_), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(other.device_), device_blocks_(nullptr),
           is_mutable_(other.is_mutable_), cache_dirty_(false)
     {
         // If the source is a view, we need to copy the actual viewed data
@@ -137,7 +137,7 @@ namespace llaminar2
     // Do NOT use mutable_data() - it throws for Q8_1 tensors.
     Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, int device_idx)
         : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(device_idx), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::fromLegacyIndex(device_idx)), device_blocks_(nullptr),
           is_mutable_(true), cache_dirty_(false)
     {
         if (shape.empty())
@@ -173,7 +173,7 @@ namespace llaminar2
                            size_t byte_offset,
                            std::shared_ptr<TensorBase> parent)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(parent_raw_data),
-          view_byte_offset_(byte_offset), parent_(parent), device_idx_(-1), device_blocks_(nullptr),
+          view_byte_offset_(byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr),
           is_mutable_(false), cache_dirty_(false)
     {
         // Check if parent is a mutable Q8_1Tensor - if so, inherit mutability
@@ -284,7 +284,7 @@ namespace llaminar2
     bool Q8_1Tensor::set_device(int device_idx)
     {
         // TODO: Implement device transfer
-        device_idx_ = device_idx;
+        device_ = DeviceId::fromLegacyIndex(device_idx);
         return true;
     }
 
@@ -428,49 +428,49 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> Q8_1Tensor::createGemm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::unique_ptr<ITensorRoPE> Q8_1Tensor::createRoPE()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createRoPE(this, dev_type);
     }
 
     std::unique_ptr<ITensorSwiGLU> Q8_1Tensor::createSwiGLU()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createSwiGLU(this, dev_type);
     }
 
     std::unique_ptr<ITensorSoftmax> Q8_1Tensor::createSoftmax()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createSoftmax(this, dev_type);
     }
 
     std::unique_ptr<ITensorRMSNorm> Q8_1Tensor::createRMSNorm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createRMSNorm(this, dev_type);
     }
 
     std::unique_ptr<ITensorAttention> Q8_1Tensor::createAttention()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createAttention(this, dev_type);
     }
 
     std::unique_ptr<ITensorEmbedding> Q8_1Tensor::createEmbedding()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createEmbedding(this, dev_type);
     }
 
@@ -1087,7 +1087,7 @@ namespace llaminar2
 
         // Create new Q8_1Tensor with sliced shape
         std::vector<size_t> new_shape = {rows, k_size};
-        auto result = std::make_shared<Q8_1Tensor>(new_shape, device_idx_);
+        auto result = std::make_shared<Q8_1Tensor>(new_shape, device_.toLegacyIndex());
 
         // Get source and destination block pointers
         const uint8_t *src_data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();

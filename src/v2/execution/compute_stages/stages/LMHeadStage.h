@@ -25,9 +25,9 @@ namespace llaminar2
         struct Params
         {
             // Input/output tensors
-            const TensorBase *hidden_states = nullptr;
-            const TensorBase *lm_head_weight = nullptr;
-            TensorBase *logits = nullptr;
+            const ITensor *hidden_states = nullptr;
+            const ITensor *lm_head_weight = nullptr;
+            ITensor *logits = nullptr;
 
             // Dimensions
             int seq_len = 0;

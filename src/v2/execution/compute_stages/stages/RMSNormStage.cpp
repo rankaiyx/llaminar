@@ -35,6 +35,16 @@ namespace llaminar2
             return false;
         }
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *input_base = requireTensorBase(params_.input, "input");
+        auto *gamma_base = requireTensorBase(params_.gamma, "gamma");
+        auto *output_base = requireTensorBase(params_.output, "output");
+        if (!input_base || !gamma_base || !output_base)
+        {
+            LOG_ERROR("[RMSNormStage] GPU tensors not yet supported");
+            return false;
+        }
+
         // === Stage Tracing (Task 3) ===
         traceInput("input", params_.input);
         traceInput("gamma", params_.gamma);
@@ -42,29 +52,29 @@ namespace llaminar2
         // Use explicit seq_len if provided, otherwise derive from tensor dimensions
         // CRITICAL: For pre-allocated buffers, params_.seq_len must be set to avoid
         // processing garbage data beyond the actual sequence
-        const int seq_len = params_.seq_len > 0 ? params_.seq_len : static_cast<int>(params_.input->rows());
-        const int hidden_dim = static_cast<int>(params_.input->cols());
+        const int seq_len = params_.seq_len > 0 ? params_.seq_len : static_cast<int>(input_base->rows());
+        const int hidden_dim = static_cast<int>(input_base->cols());
 
         LOG_DEBUG("[RMSNormStage] Execute: seq_len=" << seq_len
                                                      << " hidden_dim=" << hidden_dim
                                                      << " eps=" << params_.eps
-                                                     << " tensor_type=" << params_.input->dtype_name());
+                                                     << " tensor_type=" << input_base->dtype_name());
 
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
-        auto kernel = llaminar::v2::kernels::KernelFactory::createRMSNorm(params_.input, dev_type);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createRMSNorm(input_base, dev_type);
         if (!kernel)
         {
             LOG_ERROR("[RMSNormStage] Failed to create RMSNorm kernel for type "
-                      << params_.input->dtype_name());
+                      << input_base->dtype_name());
             return false;
         }
 
         // apply_tensor handles input != output cases internally
         bool success = kernel->apply_tensor(
-            params_.input,
-            params_.gamma,
-            params_.output,
+            input_base,
+            gamma_base,
+            output_base,
             seq_len,
             hidden_dim,
             params_.eps,
@@ -177,6 +187,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

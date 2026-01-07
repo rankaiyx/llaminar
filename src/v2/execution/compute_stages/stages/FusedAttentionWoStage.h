@@ -35,16 +35,16 @@ namespace llaminar2
     public:
         struct Params
         {
-            // Input tensors (Q8_1 format)
-            TensorBase *Q = nullptr;
-            TensorBase *K = nullptr;
-            TensorBase *V = nullptr;
+            // Input tensors (Q8_1 format) - ITensor for device-agnostic interface
+            ITensor *Q = nullptr;
+            ITensor *K = nullptr;
+            ITensor *V = nullptr;
 
             // Weight tensor
-            TensorBase *Wo = nullptr;
+            ITensor *Wo = nullptr;
 
             // Output tensor
-            TensorBase *output = nullptr;
+            ITensor *output = nullptr;
 
             // Dimensions
             int batch_size = 1;
@@ -71,15 +71,15 @@ namespace llaminar2
             int device_idx = -1;
 
             // Optional context snapshot buffer for debugging
-            TensorBase *context_snapshot = nullptr;
+            ITensor *context_snapshot = nullptr;
 
             // Optional attention output snapshot buffer (Wo projection result, before residual add)
             // Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_OUTPUT
-            TensorBase *attention_output_snapshot = nullptr;
+            ITensor *attention_output_snapshot = nullptr;
 
             // Optional attention residual snapshot buffer (after residual add)
             // Shape: [batch_size * seq_len, d_model] - corresponds to ATTENTION_RESIDUAL
-            TensorBase *attention_residual_snapshot = nullptr;
+            ITensor *attention_residual_snapshot = nullptr;
 
             // Hybrid mode: use streaming dequantization for Wo projection
             bool use_hybrid_wo = false;

@@ -321,15 +321,15 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_BatchedParity)
     // Bug fixed: For batched execution with batch_size=2, seq_len=2, the positions
     // should be [0, 1, 0, 1] (per-sequence positions) not [0, 1, 2, 3] (contiguous).
     // The fix was to pass explicit position_ids to RoPEStage.
-    
-    const int total_tokens = 2;  // Simulating 2 tokens (could be 2 sequences of 1 token each)
+
+    const int total_tokens = 2; // Simulating 2 tokens (could be 2 sequences of 1 token each)
     const int n_heads = 1;
     const int head_dim = 4;
-    
+
     // Same input tensor data for both tests
     std::vector<float> tensor_data = {1.0f, 0.0f, 1.0f, 0.0f,
                                       1.0f, 0.0f, 1.0f, 0.0f};
-    
+
     // Test 1: Using pos_offset=0 (generates contiguous positions [0, 1])
     auto Q_contiguous = makeTensor(total_tokens, n_heads * head_dim, tensor_data);
     RoPEStage::Params params_contiguous;
@@ -340,8 +340,8 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_BatchedParity)
     params_contiguous.pos_offset = 0;
     params_contiguous.theta_base = 10000.0f;
     params_contiguous.seq_len = total_tokens;
-    params_contiguous.position_ids = nullptr;  // Will generate [0, 1]
-    
+    params_contiguous.position_ids = nullptr; // Will generate [0, 1]
+
     // Test 2: Using explicit position_ids = [0, 0] (both tokens at position 0)
     // This simulates two sequences each starting at position 0
     std::vector<int> batch_positions = {0, 0};
@@ -351,14 +351,14 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_BatchedParity)
     params_batched.n_heads = n_heads;
     params_batched.n_kv_heads = n_heads;
     params_batched.head_dim = head_dim;
-    params_batched.pos_offset = 0;  // Ignored when position_ids is set
+    params_batched.pos_offset = 0; // Ignored when position_ids is set
     params_batched.theta_base = 10000.0f;
     params_batched.seq_len = total_tokens;
-    params_batched.position_ids = batch_positions.data();  // Explicit [0, 0]
-    
+    params_batched.position_ids = batch_positions.data(); // Explicit [0, 0]
+
     RoPEStage stage_contiguous(params_contiguous);
     RoPEStage stage_batched(params_batched);
-    
+
     bool success1 = false, success2 = false;
     try
     {
@@ -369,23 +369,23 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_BatchedParity)
     {
         GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
     }
-    
+
     if (!success1 || !success2)
     {
         GTEST_SKIP() << "RoPE execution failed (missing kernel support)";
     }
-    
+
     const float *out_contiguous = Q_contiguous->data();
     const float *out_batched = Q_batched->data();
-    
+
     // With position_ids = [0, 0], both rows should have the same RoPE rotation (position 0)
     // Row 0 should be the same in both (position 0)
     for (int i = 0; i < head_dim; ++i)
     {
-        EXPECT_NEAR(out_contiguous[i], out_batched[i], 1e-5f) 
+        EXPECT_NEAR(out_contiguous[i], out_batched[i], 1e-5f)
             << "Row 0 element " << i << " should match (both at position 0)";
     }
-    
+
     // Row 1 should be DIFFERENT in contiguous (position 1) vs batched (position 0)
     // So batched row 1 should match contiguous row 0 (both at position 0)
     bool row1_matches_row0 = true;
@@ -398,7 +398,7 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_BatchedParity)
         }
     }
     EXPECT_TRUE(row1_matches_row0) << "Batched row 1 (position 0) should match contiguous row 0 (position 0)";
-    
+
     // And contiguous row 1 should be different from batched row 1
     bool row1_different = false;
     for (int i = 0; i < head_dim; ++i)
@@ -418,9 +418,9 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
     const int seq_len = 1;
     const int n_heads = 1;
     const int head_dim = 4;
-    
+
     std::vector<float> tensor_data = {1.0f, 0.0f, 1.0f, 0.0f};
-    
+
     // Test 1: pos_offset=5, no position_ids
     auto Q1 = makeTensor(seq_len, n_heads * head_dim, tensor_data);
     RoPEStage::Params params1;
@@ -431,8 +431,8 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
     params1.pos_offset = 5;
     params1.theta_base = 10000.0f;
     params1.seq_len = seq_len;
-    params1.position_ids = nullptr;  // Uses pos_offset=5
-    
+    params1.position_ids = nullptr; // Uses pos_offset=5
+
     // Test 2: pos_offset=5 but position_ids=[0] should override to position 0
     std::vector<int> explicit_pos = {0};
     auto Q2 = makeTensor(seq_len, n_heads * head_dim, tensor_data);
@@ -441,11 +441,11 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
     params2.n_heads = n_heads;
     params2.n_kv_heads = n_heads;
     params2.head_dim = head_dim;
-    params2.pos_offset = 5;  // Should be ignored
+    params2.pos_offset = 5; // Should be ignored
     params2.theta_base = 10000.0f;
     params2.seq_len = seq_len;
-    params2.position_ids = explicit_pos.data();  // Overrides to position 0
-    
+    params2.position_ids = explicit_pos.data(); // Overrides to position 0
+
     // Test 3: pos_offset=0 for reference
     auto Q3 = makeTensor(seq_len, n_heads * head_dim, tensor_data);
     RoPEStage::Params params3;
@@ -457,11 +457,11 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
     params3.theta_base = 10000.0f;
     params3.seq_len = seq_len;
     params3.position_ids = nullptr;
-    
+
     RoPEStage stage1(params1);
     RoPEStage stage2(params2);
     RoPEStage stage3(params3);
-    
+
     bool success1 = false, success2 = false, success3 = false;
     try
     {
@@ -473,23 +473,23 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
     {
         GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
     }
-    
+
     if (!success1 || !success2 || !success3)
     {
         GTEST_SKIP() << "RoPE execution failed (missing kernel support)";
     }
-    
-    const float *out1 = Q1->data();  // pos_offset=5
-    const float *out2 = Q2->data();  // position_ids=[0] (should override)
-    const float *out3 = Q3->data();  // pos_offset=0
-    
+
+    const float *out1 = Q1->data(); // pos_offset=5
+    const float *out2 = Q2->data(); // position_ids=[0] (should override)
+    const float *out3 = Q3->data(); // pos_offset=0
+
     // Q2 (with position_ids=[0]) should match Q3 (pos_offset=0), not Q1 (pos_offset=5)
     for (int i = 0; i < head_dim; ++i)
     {
-        EXPECT_NEAR(out2[i], out3[i], 1e-5f) 
+        EXPECT_NEAR(out2[i], out3[i], 1e-5f)
             << "position_ids=[0] should produce same result as pos_offset=0";
     }
-    
+
     // Q1 should be different from Q3 (different positions)
     bool q1_differs = false;
     for (int i = 0; i < head_dim; ++i)
@@ -672,7 +672,7 @@ TEST_F(ComputeStageTest, MoERouterBasic)
     EXPECT_TRUE(stage.execute(ctx_.get()));
 
     // Get output data for verification
-    const float* output = router_logits->data();
+    const float *output = router_logits->data();
 
     // Token 0: [1,0,0,0] should have logit 1 for expert 0
     EXPECT_NEAR(output[0], 1.0f, 1e-5f); // Expert 0

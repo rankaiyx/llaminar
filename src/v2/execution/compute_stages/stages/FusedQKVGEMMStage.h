@@ -26,25 +26,25 @@ namespace llaminar2
         struct Params
         {
             // Type-safe tensor pointers (required)
-            const TensorBase *input = nullptr; ///< Input activation tensor [m, k]
+            const ITensor *input = nullptr; ///< Input activation tensor [m, k]
             int m = 0;                         ///< Batch size * seq_len
             int k = 0;                         ///< Input dimension (d_model)
 
             // Q projection
-            const TensorBase *wq = nullptr;
-            TensorBase *output_q = nullptr;
+            const ITensor *wq = nullptr;
+            ITensor *output_q = nullptr;
             int n_q = 0;
             const float *bias_q = nullptr;
 
             // K projection
-            const TensorBase *wk = nullptr;
-            TensorBase *output_k = nullptr;
+            const ITensor *wk = nullptr;
+            ITensor *output_k = nullptr;
             int n_k = 0;
             const float *bias_k = nullptr;
 
             // V projection
-            const TensorBase *wv = nullptr;
-            TensorBase *output_v = nullptr;
+            const ITensor *wv = nullptr;
+            ITensor *output_v = nullptr;
             int n_v = 0;
             const float *bias_v = nullptr;
         };

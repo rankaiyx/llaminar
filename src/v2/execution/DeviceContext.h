@@ -29,6 +29,7 @@
 #pragma once
 
 #include "../backends/ComputeBackend.h"
+#include "../backends/DeviceType.h" // Type-safe device type enum
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -37,21 +38,7 @@
 namespace llaminar2
 {
 
-    /**
-     * @brief Simplified device type for kernel dispatch
-     *
-     * This enum matches kernels::KernelFactory::DeviceType but is defined
-     * here to avoid circular includes. Stages can convert using
-     * KernelFactory::getDeviceType() when needed.
-     */
-    enum class DeviceType
-    {
-        CPU,    ///< Any CPU backend (OpenBLAS, MKL, etc.)
-        CUDA,   ///< NVIDIA CUDA
-        ROCm,   ///< AMD ROCm/HIP
-        Vulkan, ///< Vulkan compute shaders
-        Metal   ///< Apple Metal Performance Shaders
-    };
+    // DeviceType enum is defined in backends/DeviceType.h (included above)
 
     /**
      * @brief Abstract base class for device execution contexts

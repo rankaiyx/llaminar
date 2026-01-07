@@ -449,7 +449,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ4_NL GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -483,7 +483,7 @@ namespace llaminar
                 {
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return new llaminar2::cuda::CUDAQuantisedGemmKernel(packed, cuda_device_id);
                 }
 #endif
@@ -517,7 +517,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q4_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -552,7 +552,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q4_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -587,7 +587,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q5_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -622,7 +622,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q5_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -657,7 +657,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q6_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -692,7 +692,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q8_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -727,7 +727,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q8_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -762,7 +762,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q2_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -797,7 +797,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q3_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -832,7 +832,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q4_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -867,7 +867,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q5_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -902,7 +902,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] Q8_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -937,7 +937,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ1_M GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -972,7 +972,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ1_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1007,7 +1007,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ2_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1042,7 +1042,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ2_XS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1077,7 +1077,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ2_XXS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1112,7 +1112,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ3_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1147,7 +1147,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ3_XXS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1182,7 +1182,7 @@ namespace llaminar
                     LOG_DEBUG("[KernelFactory] IQ4_XS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
                     auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
                 }
 #endif
@@ -1213,7 +1213,7 @@ namespace llaminar
                 {
                     LOG_DEBUG("[KernelFactory] FP32 GEMM: Using CUDAFloatingPointGemmKernel");
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
                         tensor, cuda_device_id, llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP32);
                 }
@@ -1245,7 +1245,7 @@ namespace llaminar
                 {
                     LOG_DEBUG("[KernelFactory] FP16 GEMM: Using CUDAFloatingPointGemmKernel");
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
                         tensor, cuda_device_id, llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP16);
                 }
@@ -1277,7 +1277,7 @@ namespace llaminar
                 {
                     LOG_DEBUG("[KernelFactory] BF16 GEMM: Using CUDAFloatingPointGemmKernel");
                     const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = dm.devices()[tensor->home_dm_device_index()].device_id;
+                    int cuda_device_id = dm.devices()[tensor->current_dm_device_index()].device_id;
                     return std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
                         tensor, cuda_device_id, llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::BF16);
                 }
@@ -2371,7 +2371,7 @@ namespace llaminar
                     }
                 }
 
-                auto dev_type = getDeviceType(tensor->home_dm_device_index());
+                auto dev_type = getDeviceType(tensor->current_dm_device_index());
 
                 // Handle TensorSlice: delegate to inner tensor's kernel creation
                 // TensorSlice always implements IINT8Unpackable, but the inner tensor may not
@@ -2654,7 +2654,7 @@ namespace llaminar
                 LOG_DEBUG("[KernelFactory] Sliced GEMM cache MISS: creating kernel for tensor=" << tensor
                                                                                                 << " rows=[" << row_start << "," << row_end << ")");
 
-                auto dev_type = getDeviceType(tensor->home_dm_device_index());
+                auto dev_type = getDeviceType(tensor->current_dm_device_index());
 
                 if (dev_type != DeviceType::CPU)
                 {

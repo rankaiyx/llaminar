@@ -26,7 +26,7 @@ namespace llaminar2
     // ========== Constructors ==========
 
     BF16Tensor::BF16Tensor(const std::vector<size_t> &shape)
-        : shape_(shape), device_idx_(-1), device_data_(nullptr),
+        : shape_(shape), device_(DeviceId::cpu()), device_data_(nullptr),
           is_view_(false), parent_data_ptr_(nullptr), view_offset_(0), parent_(nullptr)
     {
         if (shape.empty())
@@ -44,7 +44,7 @@ namespace llaminar2
     }
 
     BF16Tensor::BF16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &bf16_data)
-        : shape_(shape), device_idx_(-1), device_data_(nullptr), host_bf16_data_(bf16_data.size()),
+        : shape_(shape), device_(DeviceId::cpu()), device_data_(nullptr), host_bf16_data_(bf16_data.size()),
           is_view_(false), parent_data_ptr_(nullptr), view_offset_(0), parent_(nullptr)
     {
         if (shape.empty())
@@ -73,7 +73,7 @@ namespace llaminar2
                            AlignedVector<uint16_t> *parent_data,
                            size_t data_offset,
                            std::shared_ptr<BF16Tensor> parent)
-        : shape_(shape), device_idx_(device_idx), device_data_(nullptr),
+        : shape_(shape), device_(DeviceId::fromLegacyIndex(device_idx)), device_data_(nullptr),
           is_view_(true), parent_data_ptr_(parent_data), view_offset_(data_offset),
           parent_(parent)
     {
@@ -90,7 +90,7 @@ namespace llaminar2
 
     bool BF16Tensor::set_device(int device_idx)
     {
-        device_idx_ = device_idx;
+        device_ = DeviceId::fromLegacyIndex(device_idx);
         // TODO: Upload to device when device support is added
         return true;
     }
@@ -187,49 +187,49 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> BF16Tensor::createGemm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::unique_ptr<ITensorRoPE> BF16Tensor::createRoPE()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createRoPE(this, dev_type);
     }
 
     std::unique_ptr<ITensorSwiGLU> BF16Tensor::createSwiGLU()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createSwiGLU(this, dev_type);
     }
 
     std::unique_ptr<ITensorSoftmax> BF16Tensor::createSoftmax()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createSoftmax(this, dev_type);
     }
 
     std::unique_ptr<ITensorRMSNorm> BF16Tensor::createRMSNorm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createRMSNorm(this, dev_type);
     }
 
     std::unique_ptr<ITensorAttention> BF16Tensor::createAttention()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createAttention(this, dev_type);
     }
 
     std::unique_ptr<ITensorEmbedding> BF16Tensor::createEmbedding()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createEmbedding(this, dev_type);
     }
 
@@ -378,7 +378,7 @@ namespace llaminar2
         // Create view using private constructor
         auto view_tensor = std::shared_ptr<BF16Tensor>(new BF16Tensor(
             new_shape,
-            device_idx_,
+            device_.toLegacyIndex(),
             root_data,
             root_offset,
             root_parent));

@@ -34,7 +34,7 @@ namespace llaminar2
 
     Q16_1Tensor::Q16_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
         : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(-1), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr),
           is_mutable_(false), cache_dirty_(false)
     {
         LOG_TRACE("[Q16_1Tensor] Creating IMMUTABLE tensor from raw_data, shape=[" << shape[0] << "," << shape[1]
@@ -66,7 +66,7 @@ namespace llaminar2
 
     Q16_1Tensor::Q16_1Tensor(const std::vector<size_t> &shape, const Q16_1Block *blocks, size_t num_blocks, int device_idx)
         : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(device_idx), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::fromLegacyIndex(device_idx)), device_blocks_(nullptr),
           is_mutable_(true), cache_dirty_(false)
     {
         if (shape.empty())
@@ -100,7 +100,7 @@ namespace llaminar2
 
     Q16_1Tensor::Q16_1Tensor(const Q16_1Tensor &other)
         : shape_(other.shape_), is_view_(false), raw_data_(other.raw_data_), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(other.device_idx_), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(other.device_), device_blocks_(nullptr),
           is_mutable_(other.is_mutable_), cache_dirty_(false)
     {
         if (other.is_view_)
@@ -126,7 +126,7 @@ namespace llaminar2
 
     Q16_1Tensor::Q16_1Tensor(const std::vector<size_t> &shape, int device_idx)
         : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(device_idx), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::fromLegacyIndex(device_idx)), device_blocks_(nullptr),
           is_mutable_(true), cache_dirty_(false)
     {
         if (shape.empty())
@@ -152,7 +152,7 @@ namespace llaminar2
 
     Q16_1Tensor::Q16_1Tensor(const std::vector<size_t> &shape, Q16BlockSize block_size, int device_idx)
         : shape_(shape), is_view_(false), raw_data_(), raw_data_ptr_(nullptr),
-          view_byte_offset_(0), parent_(nullptr), device_idx_(device_idx), device_blocks_(nullptr),
+          view_byte_offset_(0), parent_(nullptr), device_(DeviceId::fromLegacyIndex(device_idx)), device_blocks_(nullptr),
           is_mutable_(true), cache_dirty_(false), block_size_(block_size)
     {
         if (shape.empty())
@@ -198,7 +198,7 @@ namespace llaminar2
                              size_t byte_offset,
                              std::shared_ptr<TensorBase> parent)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(parent_raw_data),
-          view_byte_offset_(byte_offset), parent_(parent), device_idx_(-1), device_blocks_(nullptr),
+          view_byte_offset_(byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr),
           is_mutable_(false), cache_dirty_(false)
     {
         if (auto parent_q16_1 = std::dynamic_pointer_cast<Q16_1Tensor>(parent))
@@ -219,7 +219,7 @@ namespace llaminar2
 
     bool Q16_1Tensor::set_device(int device_idx)
     {
-        device_idx_ = device_idx;
+        device_ = DeviceId::fromLegacyIndex(device_idx);
         return true;
     }
 
@@ -1077,7 +1077,7 @@ namespace llaminar2
         const size_t n_blocks = (total_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
 
         // Allocate Q8_1 tensor
-        auto q8_1_tensor = std::make_shared<Q8_1Tensor>(shape_, device_idx_);
+        auto q8_1_tensor = std::make_shared<Q8_1Tensor>(shape_, device_.toLegacyIndex());
 
         // Dequantize Q16_1 to FP32
         std::vector<float> temp_fp32(total_elements);

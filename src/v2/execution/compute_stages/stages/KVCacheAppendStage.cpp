@@ -292,7 +292,13 @@ namespace llaminar2
             {
                 // K is already Q16_1 - pass through directly
                 // Assumption: K was quantized with the same fixed scale (e.g., from RoPE stage)
-                k_for_cache = params_.K;
+                // Cast ITensor* to TensorBase* (const)
+                k_for_cache = dynamic_cast<const TensorBase *>(params_.K);
+                if (!k_for_cache)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] K tensor is Q16_1 but not a TensorBase (GPU?)");
+                    return false;
+                }
                 LOG_TRACE("[KVCacheAppendStage] K is already Q16_1, passing through");
             }
             else if (k_is_fp32)
@@ -308,6 +314,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for K tensor");
                     return false;
+                    ;
                 }
 
                 // Use fixed-scale quantization with VNNI-safe clipping
@@ -484,9 +491,18 @@ namespace llaminar2
         }
 
         // Direct append path - tensors already match cache precision
+        // Cast ITensor* to TensorBase* for append_kv
+        auto *K_base = dynamic_cast<const TensorBase *>(params_.K);
+        auto *V_base = dynamic_cast<const TensorBase *>(params_.V);
+        if (!K_base || !V_base)
+        {
+            LOG_ERROR("[KVCacheAppendStage] K/V tensors must be CPU TensorBase (GPU not yet supported)");
+            return false;
+        }
+
         bool success = params_.kv_cache->append_kv(
             params_.layer_idx, params_.seq_idx,
-            params_.K, params_.V, total_tokens);
+            K_base, V_base, total_tokens);
 
         if (!success)
         {

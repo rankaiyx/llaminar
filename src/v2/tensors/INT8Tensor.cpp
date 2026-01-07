@@ -60,7 +60,7 @@ namespace llaminar2
                                              size_t rows, size_t cols);
 
     INT8Tensor::INT8Tensor(const std::vector<size_t> &shape)
-        : shape_(shape), device_idx_(-1), scale_(1.0f), device_data_(nullptr)
+        : shape_(shape), device_(DeviceId::cpu()), scale_(1.0f), device_data_(nullptr)
     {
         size_t total = 1;
         for (auto dim : shape)
@@ -71,7 +71,7 @@ namespace llaminar2
     INT8Tensor::INT8Tensor(const std::vector<size_t> &shape,
                            const std::vector<int8_t> &data,
                            float scale)
-        : shape_(shape), device_idx_(-1), scale_(scale), device_data_(nullptr)
+        : shape_(shape), device_(DeviceId::cpu()), scale_(scale), device_data_(nullptr)
     {
         size_t total = 1;
         for (auto dim : shape)
@@ -92,7 +92,7 @@ namespace llaminar2
 
     INT8Tensor::INT8Tensor(const std::vector<size_t> &shape,
                            const std::vector<float> &fp32_data)
-        : shape_(shape), device_idx_(-1), device_data_(nullptr)
+        : shape_(shape), device_(DeviceId::cpu()), device_data_(nullptr)
     {
         size_t total = 1;
         for (auto dim : shape)
@@ -129,7 +129,7 @@ namespace llaminar2
     {
         // TODO: Implement device upload for INT8
         LOG_WARN("[INT8Tensor] Device upload not yet implemented");
-        device_idx_ = device_idx;
+        device_ = DeviceId::fromLegacyIndex(device_idx);
         return false;
     }
 

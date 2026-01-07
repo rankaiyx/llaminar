@@ -33,7 +33,7 @@ public:
         return s;
     }
     TensorType native_type() const override { return TensorType::Q4_1; } // Pretend to be Q4_1
-    int home_dm_device_index() const override { return -1; }
+    DeviceId home_device() const override { return DeviceId::cpu(); }
     bool set_device(int) override { return false; }
     bool is_on_device(int) const override { return false; }
     const float *data() const override { return nullptr; } // Not needed for this test

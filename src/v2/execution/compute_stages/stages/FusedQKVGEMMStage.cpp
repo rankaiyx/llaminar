@@ -71,8 +71,13 @@ namespace llaminar2
         {
             LOG_DEBUG("[FusedQKVGEMMStage] Mixed-precision QKV detected: Q=Q8_1, K=Q16_1, V=Q8_1");
 
+            // Cast weights to TensorBase for FusedGEMM
+            auto *wq_base = requireTensorBase(params_.wq, "wq");
+            auto *wk_base = requireTensorBase(params_.wk, "wk");
+            auto *wv_base = requireTensorBase(params_.wv, "wv");
+
             // Create FusedGEMM kernel
-            FusedGEMM fused_gemm(params_.wq, params_.wk, params_.wv);
+            FusedGEMM fused_gemm(wq_base, wk_base, wv_base);
 
             // Determine Q16 block size from K output tensor
             // LIMITATION: JIT kernel only properly supports block_size=64 or 32.
@@ -209,8 +214,13 @@ namespace llaminar2
         {
             LOG_DEBUG("[FusedQKVGEMMStage] Q8_1 output detected, using Q8_1 execution path");
 
+            // Cast weights to TensorBase for FusedGEMM
+            auto *wq_base2 = requireTensorBase(params_.wq, "wq");
+            auto *wk_base2 = requireTensorBase(params_.wk, "wk");
+            auto *wv_base2 = requireTensorBase(params_.wv, "wv");
+
             // Create FusedGEMM kernel for Q8_1 output support
-            FusedGEMM fused_gemm(params_.wq, params_.wk, params_.wv);
+            FusedGEMM fused_gemm(wq_base2, wk_base2, wv_base2);
 
             // Check if input is also Q8_1 - use Q8_1→Q8_1 path to avoid double quantization
             auto *input_q8_1 = dynamic_cast<const Q8_1Tensor *>(params_.input);
@@ -291,10 +301,15 @@ namespace llaminar2
         LOG_DEBUG("[FusedQKVGEMMStage] input_type=" << params_.input->dtype_name()
                                                     << " output_type=" << params_.output_q->dtype_name());
 
+        // Cast weights to TensorBase for KernelFactory
+        auto *wq_base_fp32 = requireTensorBase(params_.wq, "wq");
+        auto *wk_base_fp32 = requireTensorBase(params_.wk, "wk");
+        auto *wv_base_fp32 = requireTensorBase(params_.wv, "wv");
+
         // Get cached kernels from KernelFactory (handles weight packing once)
-        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.wq);
-        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.wk);
-        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.wv);
+        auto *gemm_q = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wq_base_fp32);
+        auto *gemm_k = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wk_base_fp32);
+        auto *gemm_v = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(wv_base_fp32);
 
         if (!gemm_q || !gemm_k || !gemm_v)
         {

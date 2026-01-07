@@ -1,16 +1,15 @@
 /**
  * @file Test__TensorFactory_DeviceIndex.cpp
- * @brief Unit tests for TensorFactory activation tensor device index assignment
+ * @brief Unit tests for TensorFactory activation tensor device placement
  * @author David Sanftenberg
  *
- * Tests the fix for a bug where Q8_1, BF16, and FP16 activation tensors were
- * created with device_index=-1 regardless of the device_idx parameter passed
- * to createActivation(). This caused prepareActivationForDevice() to attempt
- * spurious device transfers even when source and target were both CPU device 0.
+ * Tests that TensorFactory correctly assigns device placement to activation tensors.
  *
- * Bug: https://github.com/llaminar/llaminar/issues/XXX (if applicable)
- * Fix: TensorFactory::createActivation now calls set_device(device_idx) after
- *      creating non-FP32 tensor types.
+ * With the DeviceId refactor:
+ * - Legacy device_idx values -1 and 0 both map to CPU (DeviceId::cpu())
+ * - device_idx >= 1 maps to GPU (DeviceId::cuda(device_idx - 1))
+ * - Tests now use is_on_cpu()/is_on_gpu() for CPU/GPU checks
+ * - Tests use home_device() for type-safe device identification
  */
 
 #include <gtest/gtest.h>
@@ -19,6 +18,7 @@
 #include "v2/tensors/Tensors.h"
 #include "v2/utils/MPIContext.h"
 #include "v2/execution/RuntimeConfig.h"
+#include "v2/backends/DeviceId.h"
 
 using namespace llaminar2;
 
@@ -37,26 +37,29 @@ protected:
 };
 
 // =============================================================================
-// Test: Q8_1 activation tensors respect device_idx parameter
+// Test: Q8_1 activation tensors respect device placement
 // =============================================================================
 
 TEST_F(Test__TensorFactory_DeviceIndex, Q8_1_ActivationHasCorrectDeviceIndex_Device0)
 {
     // Create Q8_1 activation tensor on device 0 (CPU)
+    // With DeviceId refactor: device_idx=0 maps to DeviceId::cpu()
     auto tensor = factory_->createActivation(
         {32, 896},
         ActivationPrecision::Q8_1,
-        0 // device_idx = 0
+        0 // device_idx = 0 -> CPU
     );
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), 0) << "Q8_1 tensor should have device_index=0 when created with device_idx=0";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "Q8_1 tensor should be on CPU when created with device_idx=0";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cpu()) << "Q8_1 tensor should have DeviceId::cpu()";
     EXPECT_EQ(tensor->native_type(), TensorType::Q8_1);
 }
 
 TEST_F(Test__TensorFactory_DeviceIndex, Q8_1_ActivationHasCorrectDeviceIndex_DeviceMinus1)
 {
     // Create Q8_1 activation tensor with default device (-1)
+    // With DeviceId refactor: device_idx=-1 maps to DeviceId::cpu()
     auto tensor = factory_->createActivation(
         {32, 896},
         ActivationPrecision::Q8_1,
@@ -64,25 +67,27 @@ TEST_F(Test__TensorFactory_DeviceIndex, Q8_1_ActivationHasCorrectDeviceIndex_Dev
     );
 
     ASSERT_NE(tensor, nullptr);
-    // When device_idx is -1, we should NOT call set_device, so it stays at constructor default
-    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "Q8_1 tensor should have device_index=-1 when created with device_idx=-1";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "Q8_1 tensor should be on CPU when created with device_idx=-1";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cpu());
 }
 
 TEST_F(Test__TensorFactory_DeviceIndex, Q8_1_ActivationHasCorrectDeviceIndex_Device1)
 {
-    // Create Q8_1 activation tensor on device 1 (hypothetical second CPU/GPU)
+    // Create Q8_1 activation tensor on device 1 (GPU:0)
+    // With DeviceId refactor: device_idx=1 maps to DeviceId::cuda(0)
     auto tensor = factory_->createActivation(
         {32, 896},
         ActivationPrecision::Q8_1,
-        1 // device_idx = 1
+        1 // device_idx = 1 -> GPU:0
     );
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), 1) << "Q8_1 tensor should have device_index=1 when created with device_idx=1";
+    EXPECT_TRUE(tensor->is_on_gpu()) << "Q8_1 tensor should be on GPU when created with device_idx=1";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cuda(0)) << "Q8_1 tensor should have DeviceId::cuda(0)";
 }
 
 // =============================================================================
-// Test: BF16 activation tensors respect device_idx parameter
+// Test: BF16 activation tensors respect device placement
 // =============================================================================
 
 TEST_F(Test__TensorFactory_DeviceIndex, BF16_ActivationHasCorrectDeviceIndex_Device0)
@@ -93,7 +98,8 @@ TEST_F(Test__TensorFactory_DeviceIndex, BF16_ActivationHasCorrectDeviceIndex_Dev
         0);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), 0) << "BF16 tensor should have device_index=0 when created with device_idx=0";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "BF16 tensor should be on CPU when created with device_idx=0";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cpu());
     EXPECT_EQ(tensor->native_type(), TensorType::BF16);
 }
 
@@ -105,11 +111,12 @@ TEST_F(Test__TensorFactory_DeviceIndex, BF16_ActivationHasCorrectDeviceIndex_Dev
         -1);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "BF16 tensor should have device_index=-1 when created with device_idx=-1";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "BF16 tensor should be on CPU when created with device_idx=-1";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cpu());
 }
 
 // =============================================================================
-// Test: FP16 activation tensors respect device_idx parameter
+// Test: FP16 activation tensors respect device placement
 // =============================================================================
 
 TEST_F(Test__TensorFactory_DeviceIndex, FP16_ActivationHasCorrectDeviceIndex_Device0)
@@ -120,7 +127,8 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP16_ActivationHasCorrectDeviceIndex_Dev
         0);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), 0) << "FP16 tensor should have device_index=0 when created with device_idx=0";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "FP16 tensor should be on CPU when created with device_idx=0";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cpu());
     EXPECT_EQ(tensor->native_type(), TensorType::FP16);
 }
 
@@ -132,11 +140,12 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP16_ActivationHasCorrectDeviceIndex_Dev
         -1);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "FP16 tensor should have device_index=-1 when created with device_idx=-1";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "FP16 tensor should be on CPU when created with device_idx=-1";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cpu());
 }
 
 // =============================================================================
-// Test: FP32 activation tensors (baseline - should already work)
+// Test: FP32 activation tensors (baseline)
 // =============================================================================
 
 TEST_F(Test__TensorFactory_DeviceIndex, FP32_ActivationHasCorrectDeviceIndex_Device0)
@@ -147,7 +156,8 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP32_ActivationHasCorrectDeviceIndex_Dev
         0);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), 0) << "FP32 tensor should have device_index=0 when created with device_idx=0";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "FP32 tensor should be on CPU when created with device_idx=0";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cpu());
     EXPECT_EQ(tensor->native_type(), TensorType::FP32);
 }
 
@@ -159,7 +169,8 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP32_ActivationHasCorrectDeviceIndex_Dev
         -1);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), -1) << "FP32 tensor should have device_index=-1 when created with device_idx=-1";
+    EXPECT_TRUE(tensor->is_on_cpu()) << "FP32 tensor should be on CPU when created with device_idx=-1";
+    EXPECT_EQ(tensor->home_device(), DeviceId::cpu());
 }
 
 // =============================================================================
@@ -168,75 +179,74 @@ TEST_F(Test__TensorFactory_DeviceIndex, FP32_ActivationHasCorrectDeviceIndex_Dev
 
 TEST_F(Test__TensorFactory_DeviceIndex, AllPrecisions_ConsistentDeviceIndex)
 {
-    // Verify all precision types get consistent device indices
+    // Verify all precision types get consistent device placement
     // This is critical for heterogeneous pipelines that route activations between devices
 
-    const int target_device = 0;
-
-    auto fp32 = factory_->createActivation({32, 896}, ActivationPrecision::FP32, target_device);
-    auto bf16 = factory_->createActivation({32, 896}, ActivationPrecision::BF16, target_device);
-    auto fp16 = factory_->createActivation({32, 896}, ActivationPrecision::FP16, target_device);
-    auto q8_1 = factory_->createActivation({32, 896}, ActivationPrecision::Q8_1, target_device);
+    auto fp32 = factory_->createActivation({32, 896}, ActivationPrecision::FP32, 0);
+    auto bf16 = factory_->createActivation({32, 896}, ActivationPrecision::BF16, 0);
+    auto fp16 = factory_->createActivation({32, 896}, ActivationPrecision::FP16, 0);
+    auto q8_1 = factory_->createActivation({32, 896}, ActivationPrecision::Q8_1, 0);
 
     ASSERT_NE(fp32, nullptr);
     ASSERT_NE(bf16, nullptr);
     ASSERT_NE(fp16, nullptr);
     ASSERT_NE(q8_1, nullptr);
 
-    EXPECT_EQ(fp32->home_dm_device_index(), target_device);
-    EXPECT_EQ(bf16->home_dm_device_index(), target_device);
-    EXPECT_EQ(fp16->home_dm_device_index(), target_device);
-    EXPECT_EQ(q8_1->home_dm_device_index(), target_device);
+    // All should be on CPU (device_idx=0 maps to DeviceId::cpu())
+    EXPECT_TRUE(fp32->is_on_cpu());
+    EXPECT_TRUE(bf16->is_on_cpu());
+    EXPECT_TRUE(fp16->is_on_cpu());
+    EXPECT_TRUE(q8_1->is_on_cpu());
+
+    // All should have identical DeviceId
+    EXPECT_EQ(fp32->home_device(), bf16->home_device());
+    EXPECT_EQ(bf16->home_device(), fp16->home_device());
+    EXPECT_EQ(fp16->home_device(), q8_1->home_device());
 }
 
 // =============================================================================
-// Test: Regression test for the original bug scenario
+// Test: Regression test - CPU tensors don't need device transfer
 // =============================================================================
 
 TEST_F(Test__TensorFactory_DeviceIndex, RegressionTest_Q8_1_NoSpuriousTransfer)
 {
     // This test captures the original bug scenario:
-    // 1. Pipeline creates Q8_1 activation with device_idx=0
-    // 2. prepareActivationForDevice checks if current_device != target_device
-    // 3. OLD BUG: Q8_1 tensor had device_index=-1, so -1 != 0 triggered transfer
-    // 4. FIX: Q8_1 tensor now has device_index=0, so 0 == 0, no transfer needed
+    // 1. Pipeline creates Q8_1 activation with device_idx=0 (CPU)
+    // 2. prepareActivationForDevice checks if tensors need transfer
+    // 3. With DeviceId: all CPU tensors have is_on_cpu()=true, no spurious transfers
 
-    const int pipeline_device = 0; // Simulates pipeline's device_idx_
-
-    // Create activation as pipeline would
     auto current_hidden = factory_->createActivation(
         {32, 896},
         ActivationPrecision::Q8_1,
-        pipeline_device);
+        0 // CPU
+    );
 
     ASSERT_NE(current_hidden, nullptr);
 
-    // Simulate the check in prepareActivationForDevice
-    int current_device = current_hidden->home_dm_device_index();
-    int target_device = pipeline_device;
+    // The key check: tensor should be on CPU
+    EXPECT_TRUE(current_hidden->is_on_cpu())
+        << "Q8_1 activation tensor should be on CPU when created with device_idx=0. "
+        << "This prevents spurious device transfers.";
 
-    // With the fix, these should match - no transfer needed
-    EXPECT_EQ(current_device, target_device)
-        << "Q8_1 activation tensor's device_index should match the device_idx it was created with. "
-        << "Mismatch would cause prepareActivationForDevice to attempt spurious transfer.";
+    // Using DeviceId for explicit comparison
+    EXPECT_EQ(current_hidden->home_device(), DeviceId::cpu());
 }
 
 TEST_F(Test__TensorFactory_DeviceIndex, RegressionTest_MultipleAllocations_ConsistentDevice)
 {
-    // Test that multiple allocations with the same device_idx are consistent
-    // This catches any potential state leakage or inconsistent behavior
-
-    const int target_device = 0;
+    // Test that multiple allocations are consistently on CPU
 
     for (int i = 0; i < 5; ++i)
     {
         auto tensor = factory_->createActivation(
             {static_cast<size_t>(32 + i * 10), 896},
             ActivationPrecision::Q8_1,
-            target_device);
+            0);
 
         ASSERT_NE(tensor, nullptr) << "Allocation " << i << " failed";
-        EXPECT_EQ(tensor->home_dm_device_index(), target_device)
-            << "Allocation " << i << " has wrong device_index";
+        EXPECT_TRUE(tensor->is_on_cpu())
+            << "Allocation " << i << " should be on CPU";
+        EXPECT_EQ(tensor->home_device(), DeviceId::cpu())
+            << "Allocation " << i << " has wrong device";
     }
 }

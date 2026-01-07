@@ -28,19 +28,19 @@ namespace llaminar2
         struct Params
         {
             // Type-safe tensor pointers (required)
-            const TensorBase *input = nullptr; ///< Input activation tensor [m, k]
+            const ITensor *input = nullptr; ///< Input activation tensor [m, k]
             int m = 0;                         ///< Batch size * seq_len
             int k = 0;                         ///< Input dimension (d_model)
 
             // Gate projection
-            const TensorBase *w_gate = nullptr;
-            TensorBase *output_gate = nullptr;
+            const ITensor *w_gate = nullptr;
+            ITensor *output_gate = nullptr;
             int n_gate = 0;
             const float *bias_gate = nullptr;
 
             // Up projection
-            const TensorBase *w_up = nullptr;
-            TensorBase *output_up = nullptr;
+            const ITensor *w_up = nullptr;
+            ITensor *output_up = nullptr;
             int n_up = 0;
             const float *bias_up = nullptr;
 

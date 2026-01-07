@@ -117,7 +117,7 @@ namespace llaminar2
     // =============================================================================
 
     INT32Tensor::INT32Tensor(const std::vector<size_t> &shape)
-        : shape_(shape), device_idx_(-1), scale_(1.0f), device_data_(nullptr)
+        : shape_(shape), device_(DeviceId::cpu()), scale_(1.0f), device_data_(nullptr)
     {
         size_t total_elements = 1;
         for (auto dim : shape)
@@ -129,7 +129,7 @@ namespace llaminar2
 
     INT32Tensor::INT32Tensor(const std::vector<size_t> &shape,
                              const std::vector<int32_t> &data)
-        : shape_(shape), device_idx_(-1), scale_(1.0f), device_data_(nullptr)
+        : shape_(shape), device_(DeviceId::cpu()), scale_(1.0f), device_data_(nullptr)
     {
         size_t total_elements = 1;
         for (auto dim : shape)
@@ -153,7 +153,7 @@ namespace llaminar2
     INT32Tensor::INT32Tensor(const std::vector<size_t> &shape,
                              const std::vector<float> &fp32_data,
                              float scale)
-        : shape_(shape), device_idx_(-1), scale_(scale), device_data_(nullptr)
+        : shape_(shape), device_(DeviceId::cpu()), scale_(scale), device_data_(nullptr)
     {
         size_t total_elements = 1;
         for (auto dim : shape)

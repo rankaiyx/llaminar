@@ -20,7 +20,7 @@ namespace llaminar2
     public:
         struct Params
         {
-            TensorBase *buffer = nullptr;        ///< Buffer to allreduce (in-place)
+            ITensor *buffer = nullptr;        ///< Buffer to allreduce (in-place)
             const MPIContext *mpi_ctx = nullptr; ///< MPI context (required)
             size_t count = 0;                    ///< Number of elements to reduce (0 = use buffer->numel())
         };

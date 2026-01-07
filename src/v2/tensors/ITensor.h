@@ -50,6 +50,8 @@
 #include <memory>
 #include <string>
 #include <stdexcept>
+#include "TensorType.h"           // For TensorType enum (CUDA-safe, no SIMD)
+#include "../backends/DeviceId.h" // Type-safe device identification
 
 namespace llaminar2
 {
@@ -97,10 +99,52 @@ namespace llaminar2
         virtual int native_type_id() const = 0;
 
         /**
+         * @brief Get the native storage type as TensorType enum
+         * @return TensorType enum indicating the tensor's data format
+         * @note Convenience method - derived from native_type_id()
+         */
+        TensorType native_type() const
+        {
+            return static_cast<TensorType>(native_type_id());
+        }
+
+        /**
+         * @brief Get human-readable dtype name
+         * @return String like "FP32", "Q8_0", "IQ4_NL", etc.
+         * @note Convenience method - uses tensorTypeName()
+         */
+        const char *dtype_name() const
+        {
+            return tensorTypeName(native_type());
+        }
+
+        /**
          * @brief Get the shape of this tensor
          * @return Reference to shape vector (dimensions)
          */
         virtual const std::vector<size_t> &shape() const = 0;
+
+        /**
+         * @brief Get number of rows (first dimension)
+         * @return shape()[0], or 1 if shape is empty
+         * @note Convenience method for 2D matrix access pattern
+         */
+        size_t rows() const
+        {
+            const auto &s = shape();
+            return s.empty() ? 1 : s[0];
+        }
+
+        /**
+         * @brief Get number of columns (second dimension)
+         * @return shape()[1], or 1 if shape has fewer than 2 dimensions
+         * @note Convenience method for 2D matrix access pattern
+         */
+        size_t cols() const
+        {
+            const auto &s = shape();
+            return s.size() < 2 ? 1 : s[1];
+        }
 
         /**
          * @brief Get total number of logical elements
@@ -115,11 +159,84 @@ namespace llaminar2
          */
         virtual size_t size_bytes() const = 0;
 
+        // =========================================================================
+        // Device Location API (Type-Safe)
+        // =========================================================================
+
+        /**
+         * @brief Get the device where this tensor's data resides
+         * @return DeviceId identifying CPU, CUDA, or ROCm device
+         * @note This is the PRIMARY device API - prefer over legacy home_dm_device_index()
+         */
+        virtual DeviceId home_device() const = 0;
+
         /**
          * @brief Get the DeviceManager device index where this tensor was created
          * @return TensorBase::NOT_ON_GPU (-1) for CPU/host, >= 0 for DeviceManager device index
+         * @deprecated Use home_device() instead for type-safe device identification
          */
-        virtual int home_dm_device_index() const = 0;
+        virtual int home_dm_device_index() const
+        {
+            return home_device().toLegacyIndex();
+        }
+
+        // =========================================================================
+        // Device Location Convenience Methods
+        // =========================================================================
+
+        /**
+         * @brief Check if tensor data is on CPU (host memory)
+         * @return true if tensor's primary data is on CPU
+         */
+        virtual bool is_on_cpu() const
+        {
+            return home_device().is_cpu();
+        }
+
+        /**
+         * @brief Check if tensor data is on GPU (device memory)
+         * @return true if tensor's primary data is on a GPU device
+         */
+        virtual bool is_on_gpu() const
+        {
+            return home_device().is_gpu();
+        }
+
+        // =========================================================================
+        // FP32 Data Access
+        // =========================================================================
+
+        /**
+         * @brief Get const pointer to FP32 data on host
+         * @return Const pointer to float data, or nullptr if not available
+         * @note For CPU tensors, returns host pointer directly
+         * @note For GPU tensors, may sync to host or return nullptr
+         * @note For non-FP32 tensors, may throw or return cached dequantized data
+         */
+        virtual const float *data() const = 0;
+
+        /**
+         * @brief Get mutable pointer to FP32 data on host
+         * @return Mutable pointer to float data, or nullptr if not supported
+         * @note For CPU activation tensors, returns mutable host pointer
+         * @note For GPU tensors or read-only weight tensors, may return nullptr or throw
+         */
+        virtual float *mutable_data() = 0;
+
+        /**
+         * @brief Explicit FP32 dequantization accessor
+         *
+         * For most tensor types, this is equivalent to data(). For quantized tensors
+         * like Q8_1Tensor, this performs explicit dequantization while data() may throw
+         * to prevent accidental implicit dequantization.
+         *
+         * Use this method when you INTENTIONALLY need FP32 data from a quantized tensor
+         * (e.g., for snapshot capture, debugging, or interop with FP32-only code).
+         *
+         * @return Const pointer to FP32 data (may be cached/lazily computed)
+         * @note Default implementation returns data() - overridden by quantized tensors
+         */
+        virtual const float *fp32_data() const { return data(); }
 
         // =========================================================================
         // Raw Data Access (type-unsafe, use with caution)

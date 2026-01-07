@@ -18,9 +18,9 @@ namespace llaminar2
     public:
         struct Params
         {
-            const TensorBase *hidden = nullptr;
-            const TensorBase *gate_weights = nullptr;
-            TensorBase *router_logits = nullptr;
+            const ITensor *hidden = nullptr;
+            const ITensor *gate_weights = nullptr;
+            ITensor *router_logits = nullptr;
             int seq_len = 0;
             int d_model = 0;
             int num_experts = 0;
@@ -51,11 +51,11 @@ namespace llaminar2
         struct Params
         {
             int expert_id = 0;
-            const TensorBase *input = nullptr;
-            TensorBase *output = nullptr;
-            const TensorBase *gate_w = nullptr;
-            const TensorBase *up_w = nullptr;
-            const TensorBase *down_w = nullptr;
+            const ITensor *input = nullptr;
+            ITensor *output = nullptr;
+            const ITensor *gate_w = nullptr;
+            const ITensor *up_w = nullptr;
+            const ITensor *down_w = nullptr;
             const std::vector<int> *token_indices = nullptr;
             int d_model = 0;
             int intermediate_dim = 0;
@@ -83,10 +83,10 @@ namespace llaminar2
     public:
         struct Params
         {
-            const std::vector<const TensorBase *> *expert_outputs = nullptr;
+            const std::vector<const ITensor *> *expert_outputs = nullptr;
             const std::vector<float> *expert_weights = nullptr;
             const std::vector<int> *token_expert_map = nullptr;
-            TensorBase *output = nullptr;
+            ITensor *output = nullptr;
             int seq_len = 0;
             int d_model = 0;
             int top_k = 0;

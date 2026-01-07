@@ -57,20 +57,28 @@ namespace llaminar2
             return false;
         }
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *Q_base = requireTensorBase(params_.Q, "Q");
+        if (!Q_base)
+        {
+            LOG_ERROR("[RoPEStage] GPU tensors not yet supported");
+            return false;
+        }
+
         // Get seq_len: use explicit param if set (for pre-allocated buffers), else from tensor
         // This is critical for decode where buffer is [max_seq_len, dim] but we only process 1 token
         const int seq_len = (params_.seq_len > 0)
                                 ? params_.seq_len
-                                : static_cast<int>(params_.Q->rows());
+                                : static_cast<int>(Q_base->rows());
 
         // Detect Hybrid mode: Q8_1 input with FP32 output buffers
         const bool hybrid_mode = (params_.Q_out != nullptr) &&
-                                 (params_.Q->native_type() == TensorType::Q8_1) &&
+                                 (Q_base->native_type() == TensorType::Q8_1) &&
                                  (params_.Q_out->native_type() == TensorType::FP32);
 
         // Detect HybridQ16 mode: Q8_1 Q input with Q16_1 Q output
         const bool hybrid_q16_mode = (params_.Q_out != nullptr) &&
-                                     (params_.Q->native_type() == TensorType::Q8_1) &&
+                                     (Q_base->native_type() == TensorType::Q8_1) &&
                                      (params_.Q_out->native_type() == TensorType::Q16_1);
 
         // Detect K precision fix mode: K input is Q16_1 (from GEMM, not Q8_1)
@@ -83,7 +91,7 @@ namespace llaminar2
                                                   << " n_kv_heads=" << params_.n_kv_heads
                                                   << " head_dim=" << params_.head_dim
                                                   << " pos_offset=" << params_.pos_offset
-                                                  << " Q_type=" << params_.Q->dtype_name()
+                                                  << " Q_type=" << Q_base->dtype_name()
                                                   << " K_type=" << (params_.K ? params_.K->dtype_name() : "nullptr")
                                                   << " hybrid_mode=" << (hybrid_mode ? "true" : "false")
                                                   << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false")
@@ -91,11 +99,11 @@ namespace llaminar2
 
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
-        auto kernel = llaminar::v2::kernels::KernelFactory::createRoPE(params_.Q, dev_type);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
         if (!kernel)
         {
             LOG_ERROR("[RoPEStage] Failed to create RoPE kernel for type "
-                      << params_.Q->dtype_name());
+                      << Q_base->dtype_name());
             return false;
         }
 
@@ -103,7 +111,7 @@ namespace llaminar2
         // Otherwise, generate contiguous position_ids from pos_offset
         const int *position_ids_ptr = params_.position_ids;
         std::vector<int> generated_position_ids;
-        
+
         if (!position_ids_ptr)
         {
             // Fallback: Generate contiguous position_ids [pos_offset, pos_offset+1, ..., pos_offset+seq_len-1]
@@ -118,14 +126,19 @@ namespace llaminar2
 
         const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
 
+        // Cast K and output tensors for kernel calls
+        auto *K_base = asTensorBase(params_.K, "K");
+        auto *Q_out_base = asTensorBase(params_.Q_out, "Q_out");
+        auto *K_out_base = asTensorBase(params_.K_out, "K_out");
+
         // Hybrid mode: use apply_q8_1_to_fp32() for Q8_1 → FP32 with no requantization
         if (hybrid_mode)
         {
             return kernel->apply_q8_1_to_fp32(
-                params_.Q,
-                params_.K,
-                params_.Q_out,
-                params_.K_out,
+                Q_base,
+                K_base,
+                Q_out_base,
+                K_out_base,
                 position_ids_ptr,
                 seq_len,
                 params_.n_heads,
@@ -146,7 +159,7 @@ namespace llaminar2
                                                 << " kv_cache_scale=" << params_.kv_cache_scale);
 
             // Debug: Check K_in state from GEMM (TRACE level)
-            auto *k16_in = dynamic_cast<Q16_1Tensor *>(params_.K);
+            auto *k16_in = dynamic_cast<Q16_1Tensor *>(K_base);
             if (k16_in)
             {
                 LOG_TRACE("[RoPEStage] K_in block_size=" << static_cast<int>(k16_in->block_size())
@@ -182,10 +195,10 @@ namespace llaminar2
             }
 
             bool success = kernel->apply_mixed_q8_k16_to_q16(
-                params_.Q,             // Q8_1 Q input
-                params_.K,             // Q16_1 K input (from GEMM!)
-                params_.Q_out,         // Q16_1 Q output
-                params_.K_out,         // Q16_1 K output
+                Q_base,                // Q8_1 Q input
+                K_base,                // Q16_1 K input (from GEMM!)
+                Q_out_base,            // Q16_1 Q output
+                K_out_base,            // Q16_1 K output
                 params_.K_head_scales, // Output: per-head K scales [seq_len * n_kv_heads]
                 block_size,
                 position_ids_ptr,
@@ -200,8 +213,8 @@ namespace llaminar2
 
             if (success)
             {
-                auto *q16_out = dynamic_cast<Q16_1Tensor *>(params_.Q_out);
-                auto *k16_out = dynamic_cast<Q16_1Tensor *>(params_.K_out);
+                auto *q16_out = dynamic_cast<Q16_1Tensor *>(Q_out_base);
+                auto *k16_out = dynamic_cast<Q16_1Tensor *>(K_out_base);
                 if (q16_out && q16_out->typed_data())
                 {
                     const auto &blk0 = q16_out->typed_data()[0];
@@ -227,7 +240,7 @@ namespace llaminar2
                       << ", block_size=" << static_cast<int>(block_size));
 
             // Debug: check INPUT Q8_1 data
-            auto *q8_in = dynamic_cast<Q8_1Tensor *>(params_.Q);
+            auto *q8_in = dynamic_cast<Q8_1Tensor *>(Q_base);
             if (q8_in && q8_in->typed_data())
             {
                 const auto &blk0 = q8_in->typed_data()[0];
@@ -237,10 +250,10 @@ namespace llaminar2
             }
 
             bool success = kernel->apply_q8_1_to_q16_fixed_scale(
-                params_.Q,
-                params_.K,
-                params_.Q_out,
-                params_.K_out,
+                Q_base,
+                K_base,
+                Q_out_base,
+                K_out_base,
                 block_size, // Match attention kernel's block size for head_dim
                 position_ids_ptr,
                 seq_len,
@@ -255,13 +268,13 @@ namespace llaminar2
             // Debug: verify RoPE Q16_1 output
             if (success)
             {
-                auto *q16_out = dynamic_cast<Q16_1Tensor *>(params_.Q_out);
+                auto *q16_out = dynamic_cast<Q16_1Tensor *>(Q_out_base);
                 if (q16_out && q16_out->typed_data())
                 {
                     const auto &blk0 = q16_out->typed_data()[0];
                     LOG_DEBUG("[RoPEStage] HybridQ16 Q_out[0].d=" << blk0.d
                                                                   << " qs[0]=" << blk0.qs[0]
-                                                                  << " Q_out ptr=" << static_cast<const void *>(params_.Q_out)
+                                                                  << " Q_out ptr=" << static_cast<const void *>(Q_out_base)
                                                                   << " typed_data ptr=" << static_cast<const void *>(q16_out->typed_data()));
                 }
             }
@@ -270,8 +283,8 @@ namespace llaminar2
 
         // Standard path: Apply RoPE via kernel's apply_tensor method (in-place)
         return kernel->apply_tensor(
-            params_.Q,
-            params_.K, // May be nullptr
+            Q_base,
+            K_base, // May be nullptr
             position_ids_ptr,
             seq_len,
             params_.n_heads,

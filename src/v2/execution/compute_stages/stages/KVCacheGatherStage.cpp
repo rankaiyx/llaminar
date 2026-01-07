@@ -42,12 +42,22 @@ namespace llaminar2
             return false;
         }
 
+        // Cast ITensor* to TensorBase* for CPU KV cache operations
+        // TODO: Update IUnifiedKVCache interface to use ITensor* for device-agnostic support
+        auto *out_K_base = dynamic_cast<TensorBase *>(params_.out_K);
+        auto *out_V_base = dynamic_cast<TensorBase *>(params_.out_V);
+        if (!out_K_base || !out_V_base)
+        {
+            LOG_ERROR("[KVCacheGatherStage] Output K/V tensors must be CPU TensorBase (GPU not yet supported)");
+            return false;
+        }
+
         // Call the unified gather method
         int max_kv_len = params_.kv_cache->gather_kv_batched(
             params_.layer_idx,
             params_.batch_size,
-            params_.out_K,
-            params_.out_V,
+            out_K_base,
+            out_V_base,
             last_per_seq_kv_lens_);
 
         if (max_kv_len < 0)
@@ -120,6 +130,5 @@ namespace llaminar2
 
         return info;
     }
-
 
 } // namespace llaminar2

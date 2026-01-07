@@ -39,9 +39,19 @@ namespace llaminar2
             return false;
         }
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *hidden_states = requireTensorBase(params_.hidden_states, "hidden_states");
+        auto *lm_head_weight = requireTensorBase(params_.lm_head_weight, "lm_head_weight");
+        auto *logits = requireTensorBase(params_.logits, "logits");
+        if (!hidden_states || !lm_head_weight || !logits)
+        {
+            LOG_ERROR("[LMHeadStage] GPU tensors not yet supported");
+            return false;
+        }
+
         // Debug: dump hidden states input at last position
         {
-            const float *hidden = params_.hidden_states->fp32_data();
+            const float *hidden = hidden_states->fp32_data();
             if (hidden && params_.seq_len > 0)
             {
                 size_t last_row_offset = (params_.seq_len - 1) * params_.d_model;
@@ -59,7 +69,7 @@ namespace llaminar2
 
         // Get or create GEMM kernel for LM head weight
         // The kernel handles quantized weights and typed activations
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.lm_head_weight);
+        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(lm_head_weight);
         if (!lm_gemm)
         {
             LOG_ERROR("[LMHeadStage] Failed to get/create LM head GEMM kernel");
@@ -70,8 +80,8 @@ namespace llaminar2
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
         // output: [seq_len, vocab_size]
         bool success = lm_gemm->multiply_tensor(
-            params_.hidden_states,
-            params_.logits,
+            hidden_states,
+            logits,
             params_.seq_len,
             params_.vocab_size,
             params_.d_model,
@@ -88,7 +98,7 @@ namespace llaminar2
 
         // Debug: dump local logits at last position
         {
-            const float *logits_data = params_.logits->fp32_data();
+            const float *logits_data = logits->fp32_data();
             if (logits_data && params_.seq_len > 0)
             {
                 // Get last row logits
@@ -108,7 +118,7 @@ namespace llaminar2
         // Apply bias if present
         if (params_.bias)
         {
-            float *logits_data = const_cast<float *>(params_.logits->fp32_data());
+            float *logits_data = logits->mutable_data();
             if (!logits_data)
             {
                 LOG_ERROR("[LMHeadStage] Failed to get logits data for bias add");

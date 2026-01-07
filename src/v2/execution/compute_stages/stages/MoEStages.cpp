@@ -33,9 +33,19 @@ namespace llaminar2
             return false;
         }
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        // TODO: Add GPU support with CUDA kernels
+        auto *hidden_base = dynamic_cast<const TensorBase *>(params_.hidden);
+        auto *gate_weights_base = dynamic_cast<const TensorBase *>(params_.gate_weights);
+        if (!hidden_base || !gate_weights_base)
+        {
+            LOG_ERROR("[MoERouterStage] Input tensors must be CPU TensorBase (GPU not yet supported)");
+            return false;
+        }
+
         // Get data pointers from tensors
-        const float *hidden = params_.hidden->data();
-        const float *gate_weights = params_.gate_weights->data();
+        const float *hidden = hidden_base->data();
+        const float *gate_weights = gate_weights_base->data();
 
         // Router logits is output, need mutable access
         auto *logits_tensor = dynamic_cast<FP32Tensor *>(params_.router_logits);
@@ -311,7 +321,7 @@ namespace llaminar2
         {
             for (size_t i = 0; i < params_.expert_outputs->size(); ++i)
             {
-                const TensorBase *expert_out = (*params_.expert_outputs)[i];
+                const ITensor *expert_out = (*params_.expert_outputs)[i];
                 if (expert_out)
                 {
                     BufferTensorType buf_type = toBufferTensorType(expert_out->native_type());
@@ -348,17 +358,27 @@ namespace llaminar2
         {
             for (size_t i = 0; i < params_.expert_outputs->size() && i < MAX_EXPERT_OUTPUTS; ++i)
             {
-                const TensorBase *expert_out = (*params_.expert_outputs)[i];
+                const ITensor *expert_out = (*params_.expert_outputs)[i];
                 if (expert_out)
                 {
-                    info.addInput(expert_names[i], expert_out, expert_out->rows(), expert_out->cols());
+                    // Cast to TensorBase for addInput (requires const TensorBase*)
+                    const TensorBase *expert_out_base = dynamic_cast<const TensorBase *>(expert_out);
+                    if (expert_out_base)
+                    {
+                        info.addInput(expert_names[i], expert_out_base, expert_out->rows(), expert_out->cols());
+                    }
                 }
             }
         }
 
         if (params_.output)
         {
-            info.addOutput("output", params_.output, params_.seq_len, params_.d_model);
+            // Cast to TensorBase for addOutput
+            const TensorBase *output_base = dynamic_cast<const TensorBase *>(params_.output);
+            if (output_base)
+            {
+                info.addOutput("output", output_base, params_.seq_len, params_.d_model);
+            }
         }
 
         info.addScalarInt("seq_len", params_.seq_len);
@@ -367,6 +387,5 @@ namespace llaminar2
 
         return info;
     }
-
 
 } // namespace llaminar2

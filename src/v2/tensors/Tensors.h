@@ -104,107 +104,8 @@ namespace llaminar2
     // All block structures are now defined in BlockStructures.h
     // This eliminates circular dependencies between Tensors.h and SIMDHelpers.h
 
-    /**
-     * @brief Tensor data type
-     */
-    enum class TensorType
-    {
-        FP32,    // 32-bit float
-        BF16,    // 16-bit bfloat
-        FP16,    // 16-bit float
-        INT8,    // 8-bit integer (dequantized for AVX512-VNNI/CUDA INT8 GEMM)
-        INT32,   // 32-bit integer accumulator (for INT8 GEMM results)
-        IQ4_NL,  // 4-bit quantized (non-linear)
-        IQ4_XS,  // 4-bit quantized (extra-small IQ)
-        Q8_0,    // 8-bit quantized (weights)
-        Q8_1,    // 8-bit quantized with pre-computed sum (intermediate activation format)
-        Q16_1,   // 16-bit quantized with pre-computed sum (high-precision residual format)
-        Q4_0,    // 4-bit quantized
-        Q4_1,    // 4-bit quantized with min
-        Q5_0,    // 5-bit quantized
-        Q5_1,    // 5-bit quantized with min
-        Q6_K,    // 6-bit K-quant
-        Q2_K,    // 2-bit K-quant
-        Q5_K,    // 5-bit K-quant
-        Q3_K,    // 3-bit K-quant
-        Q4_K,    // 4-bit K-quant
-        Q8_K,    // 8-bit K-quant
-        IQ2_XXS, // 2-bit extra-extra-small IQ
-        IQ2_XS,  // 2-bit extra-small IQ
-        IQ3_XXS, // 3-bit extra-extra-small IQ
-        IQ2_S,   // 2-bit small IQ
-        IQ3_S,   // 3-bit small IQ
-        IQ1_S,   // 1-bit small IQ
-        IQ1_M    // 1-bit medium IQ
-    };
-
-    /**
-     * @brief Get human-readable name for TensorType
-     * @param type The tensor type enum value
-     * @return Static string like "FP32", "Q8_0", "IQ4_NL", etc.
-     */
-    inline const char *tensorTypeName(TensorType type)
-    {
-        switch (type)
-        {
-        case TensorType::FP32:
-            return "FP32";
-        case TensorType::BF16:
-            return "BF16";
-        case TensorType::FP16:
-            return "FP16";
-        case TensorType::INT8:
-            return "INT8";
-        case TensorType::INT32:
-            return "INT32";
-        case TensorType::IQ4_NL:
-            return "IQ4_NL";
-        case TensorType::IQ4_XS:
-            return "IQ4_XS";
-        case TensorType::Q8_0:
-            return "Q8_0";
-        case TensorType::Q8_1:
-            return "Q8_1";
-        case TensorType::Q16_1:
-            return "Q16_1";
-        case TensorType::Q4_0:
-            return "Q4_0";
-        case TensorType::Q4_1:
-            return "Q4_1";
-        case TensorType::Q5_0:
-            return "Q5_0";
-        case TensorType::Q5_1:
-            return "Q5_1";
-        case TensorType::Q6_K:
-            return "Q6_K";
-        case TensorType::Q2_K:
-            return "Q2_K";
-        case TensorType::Q5_K:
-            return "Q5_K";
-        case TensorType::Q3_K:
-            return "Q3_K";
-        case TensorType::Q4_K:
-            return "Q4_K";
-        case TensorType::Q8_K:
-            return "Q8_K";
-        case TensorType::IQ2_XXS:
-            return "IQ2_XXS";
-        case TensorType::IQ2_XS:
-            return "IQ2_XS";
-        case TensorType::IQ3_XXS:
-            return "IQ3_XXS";
-        case TensorType::IQ2_S:
-            return "IQ2_S";
-        case TensorType::IQ3_S:
-            return "IQ3_S";
-        case TensorType::IQ1_S:
-            return "IQ1_S";
-        case TensorType::IQ1_M:
-            return "IQ1_M";
-        default:
-            return "UNKNOWN";
-        }
-    }
+    // TensorType enum and tensorTypeName() are now defined in TensorType.h
+    // (included transitively via ITensor.h)
 
     struct ActivationPack
     {
@@ -761,6 +662,13 @@ namespace llaminar2
         static constexpr int NOT_ON_GPU = -1;
 
         /**
+         * @brief Get the device where this tensor's data resides
+         * @return DeviceId identifying CPU, CUDA, or ROCm device
+         * @note Override in derived classes
+         */
+        virtual DeviceId home_device() const = 0;
+
+        /**
          * @brief Get "home" DeviceManager device index where tensor was created
          *
          * This is the CREATION device, NOT the current location of data.
@@ -769,8 +677,9 @@ namespace llaminar2
          * @return NOT_ON_GPU (-1) for host/CPU, >=0 for DeviceManager device index
          * @note To check where data currently IS, use current_dm_device_index()
          * @see current_dm_device_index() for checking current GPU data location
+         * @deprecated Use home_device() instead
          */
-        virtual int home_dm_device_index() const = 0;
+        int home_dm_device_index() const override { return home_device().toLegacyIndex(); }
 
         /**
          * @brief Get the DeviceManager device index where tensor GPU data currently resides
@@ -1484,14 +1393,24 @@ namespace llaminar2
         /// Called by TypedTensorBase::mutable_typed_data()
         float *mutable_data_impl() { return host_data_.data(); }
 
-        explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx = -1);
+        /// @brief Construct FP32Tensor on specified device
+        /// @param shape Tensor dimensions
+        /// @param device Device placement (default: CPU)
+        explicit FP32Tensor(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
+
+        /// @brief Construct FP32Tensor with legacy device index (deprecated)
+        /// @param shape Tensor dimensions
+        /// @param device_idx Legacy index (-1=CPU, 1+=GPU ordinal)
+        /// @deprecated Use DeviceId constructor instead
+        explicit FP32Tensor(const std::vector<size_t> &shape, int device_idx);
+
         ~FP32Tensor() override;
 
         // ===== TensorBase Interface =====
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::FP32; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -1630,12 +1549,12 @@ namespace llaminar2
     private:
         // Private constructor for creating views
         FP32Tensor(const std::vector<size_t> &shape,
-                   int device_idx,
+                   DeviceId device,
                    AlignedVector<float> *parent_data,
                    size_t data_offset,
                    std::shared_ptr<FP32Tensor> parent);
         std::vector<size_t> shape_;
-        int device_idx_; // -1 = host, ≥0 = device index
+        DeviceId device_; // Type-safe device identification
 
         // Ownership model:
         // - If is_view_ == false: owns host_data_ (64-byte aligned for SIMD)
@@ -1646,7 +1565,7 @@ namespace llaminar2
         size_t view_offset_;                    // Offset into parent data (only used when is_view_)
         std::shared_ptr<FP32Tensor> parent_;    // Keep parent alive (only used when is_view_)
                                                 // Always allocated
-        void *device_data_;                     // Allocated if device_idx ≥ 0
+        void *device_data_;                     // Allocated if device_.is_gpu()
 
         bool host_dirty_;   // Host modified, needs upload
         bool device_dirty_; // Device modified, needs download
@@ -1701,7 +1620,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::FP16; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
@@ -1850,7 +1769,7 @@ namespace llaminar2
                    std::shared_ptr<FP16Tensor> parent);
 
         std::vector<size_t> shape_;
-        int device_idx_;
+        DeviceId device_; // Type-safe device identification
 
         // Ownership model:
         // - If is_view_ == false: owns host_fp16_data_ (64-byte aligned for SIMD)
@@ -1915,7 +1834,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::BF16; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
@@ -2051,7 +1970,7 @@ namespace llaminar2
                    std::shared_ptr<BF16Tensor> parent);
 
         std::vector<size_t> shape_;
-        int device_idx_;
+        DeviceId device_; // Type-safe device identification
 
         // Ownership model:
         // - If is_view_ == false: owns host_bf16_data_ (64-byte aligned for SIMD)
@@ -2122,7 +2041,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::INT8; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
@@ -2211,7 +2130,7 @@ namespace llaminar2
 
     private:
         std::vector<size_t> shape_;
-        int device_idx_ = -1;
+        DeviceId device_ = DeviceId::cpu();
         AlignedVector<int8_t> host_int8_data_;        // 64-byte aligned for SIMD operations
         float scale_ = 1.0f;                          ///< Global scale factor (fallback if col_scales_ empty)
         std::vector<float> col_scales_;               ///< Per-column scales (for 2D weight matrices)
@@ -2274,7 +2193,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::INT32; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to cache
@@ -2352,7 +2271,7 @@ namespace llaminar2
 
     private:
         std::vector<size_t> shape_;
-        int device_idx_ = -1;
+        DeviceId device_ = DeviceId::cpu();
         AlignedVector<int32_t> host_int32_data_; // 64-byte aligned for SIMD operations
         float scale_ = 1.0f;                     ///< Global scale factor
         std::vector<float> row_scales_;          ///< Per-row scales (optional)
@@ -2407,7 +2326,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ4_NL; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override; // Dequantizes to temp buffer
@@ -2592,7 +2511,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_; // Quantized blocks on device (if uploaded)
 
         mutable std::vector<float> dequant_cache_; // Temporary for data() calls
@@ -2638,7 +2557,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q8_0; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -2804,7 +2723,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -2898,7 +2817,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q8_1; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         /**
@@ -3252,7 +3171,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false;   // Track if raw data was released after GEMM pack
@@ -3374,7 +3293,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q16_1; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -3707,7 +3626,7 @@ namespace llaminar2
         size_t view_byte_offset_;
         std::shared_ptr<TensorBase> parent_;
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false;
@@ -3810,7 +3729,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q4_0; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -3967,7 +3886,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -4009,7 +3928,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q4_1; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4164,7 +4083,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -4206,7 +4125,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q5_0; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4352,7 +4271,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -4394,7 +4313,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q5_1; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4540,7 +4459,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -4578,7 +4497,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q6_K; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4689,7 +4608,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -4725,7 +4644,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q2_K; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4835,7 +4754,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -4880,7 +4799,7 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -4986,7 +4905,7 @@ namespace llaminar2
 
         std::vector<size_t> shape_;
         std::vector<uint8_t> raw_data_; // Owned only by parent tensor
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -5024,7 +4943,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q3_K; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5135,7 +5054,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -5171,7 +5090,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q4_K; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5284,7 +5203,7 @@ namespace llaminar2
 
         std::vector<size_t> shape_;
         std::vector<uint8_t> raw_data_; // Owned only by parent tensor
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -5322,7 +5241,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::Q8_K; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5428,7 +5347,7 @@ namespace llaminar2
 
         std::vector<size_t> shape_;
         std::vector<uint8_t> raw_data_; // Owned only by parent tensor
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -5466,7 +5385,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ4_XS; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5614,7 +5533,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -5644,7 +5563,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ2_XXS; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5780,7 +5699,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -5810,7 +5729,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ2_XS; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -5946,7 +5865,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -5976,7 +5895,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ3_XXS; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6116,7 +6035,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -6146,7 +6065,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ2_S; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6282,7 +6201,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -6312,7 +6231,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ3_S; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6452,7 +6371,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -6482,7 +6401,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ1_S; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6618,7 +6537,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
@@ -6648,7 +6567,7 @@ namespace llaminar2
         const std::vector<size_t> &shape() const override { return shape_; }
         TensorType native_type() const override { return TensorType::IQ1_M; }
 
-        int home_dm_device_index() const override { return device_idx_; }
+        DeviceId home_device() const override { return device_; }
         bool set_device(int device_idx) override;
 
         const float *data() const override;
@@ -6784,7 +6703,7 @@ namespace llaminar2
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
 
-        int device_idx_;
+        DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack

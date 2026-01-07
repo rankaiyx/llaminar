@@ -33,7 +33,7 @@ namespace llaminar2
           raw_data_ptr_(nullptr),
           view_byte_offset_(0),
           parent_(nullptr),
-          device_idx_(-1),
+          device_(DeviceId::cpu()),
           device_blocks_(nullptr)
     {
         if (shape.empty())
@@ -67,7 +67,7 @@ namespace llaminar2
           raw_data_ptr_(parent_raw_data),
           view_byte_offset_(byte_offset),
           parent_(parent),
-          device_idx_(-1),
+          device_(DeviceId::cpu()),
           device_blocks_(nullptr)
     {
     }
@@ -138,7 +138,7 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> Q6_KTensor::createGemm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
@@ -281,7 +281,7 @@ namespace llaminar2
 
     bool Q6_KTensor::set_device(int device_idx)
     {
-        device_idx_ = device_idx;
+        device_ = DeviceId::fromLegacyIndex(device_idx);
         return true;
     }
 

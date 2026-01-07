@@ -67,7 +67,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, CreateBlock128)
 }
 
 // =============================================================================
-// Device Index Tests (ensure block_size overload respects device_idx)
+// Device Placement Tests (ensure block_size overload respects device placement)
 // =============================================================================
 
 TEST_F(Test__TensorFactory_Q16BlockSize, BlockSizeOverloadRespectsDeviceIdx)
@@ -75,7 +75,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, BlockSizeOverloadRespectsDeviceIdx)
     auto tensor = factory_->createQ16_1({4, 128}, Q16BlockSize::BLOCK_128, 0);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), 0);
+    EXPECT_TRUE(tensor->is_on_cpu()) << "Tensor should be on CPU with device_idx=0";
     EXPECT_EQ(tensor->block_size(), 128);
 }
 
@@ -84,7 +84,7 @@ TEST_F(Test__TensorFactory_Q16BlockSize, BlockSizeOverloadDefaultDevice)
     auto tensor = factory_->createQ16_1({4, 128}, Q16BlockSize::BLOCK_128);
 
     ASSERT_NE(tensor, nullptr);
-    EXPECT_EQ(tensor->home_dm_device_index(), -1); // Default device
+    EXPECT_TRUE(tensor->is_on_cpu()) << "Tensor should be on CPU with default device";
     EXPECT_EQ(tensor->block_size(), 128);
 }
 

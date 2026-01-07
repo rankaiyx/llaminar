@@ -24,12 +24,12 @@ namespace llaminar2
         struct Params
         {
             // Type-safe tensor pointers (required)
-            TensorBase *Q = nullptr; ///< Query tensor (IActivationTensor*, modified in-place)
-            TensorBase *K = nullptr; ///< Key tensor (IActivationTensor*, modified in-place, optional)
+            ITensor *Q = nullptr; ///< Query tensor (IActivationTensor*, modified in-place)
+            ITensor *K = nullptr; ///< Key tensor (IActivationTensor*, modified in-place, optional)
 
             // Hybrid mode output buffers (optional - when set, output goes here instead of in-place)
-            TensorBase *Q_out = nullptr; ///< FP32 output for Q after RoPE (Hybrid mode)
-            TensorBase *K_out = nullptr; ///< FP32 output for K after RoPE (Hybrid mode)
+            ITensor *Q_out = nullptr; ///< FP32 output for Q after RoPE (Hybrid mode)
+            ITensor *K_out = nullptr; ///< FP32 output for K after RoPE (Hybrid mode)
 
             // Configuration
             int n_heads = 0;             ///< Number of query heads

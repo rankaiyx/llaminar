@@ -25,9 +25,9 @@ namespace llaminar2
         struct Params
         {
             // Input/output tensors
-            const TensorBase *embed_table = nullptr;
+            const ITensor *embed_table = nullptr;
             const int *token_ids = nullptr;
-            TensorBase *output = nullptr;
+            ITensor *output = nullptr;
 
             // Dimensions
             int num_tokens = 0;
@@ -57,7 +57,7 @@ namespace llaminar2
         Params params_;
 
         bool executeQ16_1Output();
-        static void zero_output_row(TensorBase *output, int row_idx, int d_model);
+        static void zero_output_row(ITensor *output, int row_idx, int d_model);
     };
 
 } // namespace llaminar2

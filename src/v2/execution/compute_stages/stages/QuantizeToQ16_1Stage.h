@@ -24,8 +24,8 @@ namespace llaminar2
     public:
         struct Params
         {
-            const TensorBase *input = nullptr; ///< FP32 input [num_elements]
-            TensorBase *output = nullptr;      ///< Q16_1 output [num_elements]
+            const ITensor *input = nullptr; ///< FP32 input [num_elements]
+            ITensor *output = nullptr;      ///< Q16_1 output [num_elements]
             size_t num_elements = 0;           ///< Number of elements to quantize
         };
 

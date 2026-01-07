@@ -43,10 +43,10 @@ namespace llaminar2
         struct Params
         {
             // Input/output tensors (already projected)
-            TensorBase *Q = nullptr;
-            TensorBase *K = nullptr;
-            TensorBase *V = nullptr;
-            TensorBase *output = nullptr;
+            ITensor *Q = nullptr;
+            ITensor *K = nullptr;
+            ITensor *V = nullptr;
+            ITensor *output = nullptr;
 
             // KV cache integration
             IUnifiedKVCache *kv_cache = nullptr;
@@ -69,9 +69,9 @@ namespace llaminar2
             int mpi_strategy = 0;
 
             // Workspace buffers
-            TensorBase *workspace_scores = nullptr;
-            TensorBase *workspace_context = nullptr;
-            TensorBase *workspace_mask = nullptr;
+            ITensor *workspace_scores = nullptr;
+            ITensor *workspace_context = nullptr;
+            ITensor *workspace_mask = nullptr;
 
             // Per-sequence lengths for batched attention
             const std::vector<int> *sequence_lengths = nullptr;

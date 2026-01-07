@@ -35,34 +35,44 @@ namespace llaminar2
             return false;
         }
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *gate_base = requireTensorBase(params_.gate, "gate");
+        auto *up_base = requireTensorBase(params_.up, "up");
+        auto *output_base = requireTensorBase(params_.output, "output");
+        if (!gate_base || !up_base || !output_base)
+        {
+            LOG_ERROR("[SwiGLUStage] GPU tensors not yet supported");
+            return false;
+        }
+
         // Use explicit seq_len if provided, otherwise derive from tensor shape
         // This is critical for decode mode where buffers are pre-allocated for max_seq_len
         // but we're only processing 1 token.
         const int seq_len = (params_.seq_len > 0)
                                 ? params_.seq_len
-                                : static_cast<int>(params_.gate->rows());
-        const int intermediate_dim = static_cast<int>(params_.gate->cols());
+                                : static_cast<int>(gate_base->rows());
+        const int intermediate_dim = static_cast<int>(gate_base->cols());
 
         LOG_DEBUG("[SwiGLUStage] Execute: seq_len=" << seq_len
                                                     << " (params_.seq_len=" << params_.seq_len << ")"
                                                     << " intermediate_dim=" << intermediate_dim
-                                                    << " tensor_type=" << params_.gate->dtype_name());
+                                                    << " tensor_type=" << gate_base->dtype_name());
 
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_idx);
-        auto kernel = llaminar::v2::kernels::KernelFactory::createSwiGLU(params_.gate, dev_type);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createSwiGLU(gate_base, dev_type);
         if (!kernel)
         {
             LOG_ERROR("[SwiGLUStage] Failed to create SwiGLU kernel for type "
-                      << params_.gate->dtype_name());
+                      << gate_base->dtype_name());
             return false;
         }
 
         // Apply SwiGLU via kernel's apply_tensor method
         return kernel->apply_tensor(
-            params_.gate,
-            params_.up,
-            params_.output,
+            gate_base,
+            up_base,
+            output_base,
             seq_len,
             intermediate_dim,
             false, // add_residual
@@ -152,6 +162,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

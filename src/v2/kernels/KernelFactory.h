@@ -69,6 +69,7 @@
 
 #pragma once
 
+#include "../backends/DeviceType.h" // Shared DeviceType enum
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -132,20 +133,8 @@ namespace llaminar
     {
         namespace kernels
         {
-            /**
-             * @brief Simplified device type enum for kernel dispatch
-             *
-             * This is a simplified version of ComputeBackendType that groups
-             * CPU variants (OpenBLAS, MKL) together since they share kernel implementations.
-             */
-            enum class DeviceType
-            {
-                CPU,    ///< Any CPU backend (OpenBLAS, MKL, etc.)
-                CUDA,   ///< NVIDIA CUDA
-                ROCm,   ///< AMD ROCm/HIP
-                Vulkan, ///< Vulkan compute shaders
-                Metal   ///< Apple Metal Performance Shaders
-            };
+            // Use the shared DeviceType from backends/DeviceType.h
+            using ::llaminar2::DeviceType;
 
             /**
              * @brief Convert DeviceType to string for logging

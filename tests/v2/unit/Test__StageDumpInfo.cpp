@@ -32,7 +32,7 @@
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
-#include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"  // Required for FusedAttentionWoStage test
+#include "kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h" // Required for FusedAttentionWoStage test
 #include "utils/MPIContext.h"
 #include "../utils/TestTensorFactory.h"
 
@@ -520,7 +520,7 @@ TEST_F(StageDumpInfoTest, MoECombineStage_GetDumpInfo)
 
     // Create some expert outputs
     std::vector<std::unique_ptr<FP32Tensor>> expert_outputs_storage;
-    std::vector<const TensorBase *> expert_outputs;
+    std::vector<const ITensor *> expert_outputs;
     for (int i = 0; i < top_k; ++i)
     {
         auto expert_out = TestTensorFactory::createFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});

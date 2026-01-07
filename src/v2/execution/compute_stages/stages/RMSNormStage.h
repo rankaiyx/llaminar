@@ -25,9 +25,9 @@ namespace llaminar2
         struct Params
         {
             // Type-safe tensor pointers (required)
-            TensorBase *input = nullptr;       ///< Input activation tensor (IActivationTensor*)
-            TensorBase *output = nullptr;      ///< Output tensor (can be same as input for in-place)
-            const TensorBase *gamma = nullptr; ///< Gamma weights tensor
+            ITensor *input = nullptr;       ///< Input activation tensor (IActivationTensor*)
+            ITensor *output = nullptr;      ///< Output tensor (can be same as input for in-place)
+            const ITensor *gamma = nullptr; ///< Gamma weights tensor
 
             float eps = 1e-6f; ///< Epsilon for numerical stability
 

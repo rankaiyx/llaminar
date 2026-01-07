@@ -151,8 +151,8 @@ namespace llaminar2
             // This is necessary because:
             // - During prefill: params_.K/V are Q8_1 from QKV GEMM, but cache has Q16_1
             // - During decode: params_.K/V point to current token, cache has full context
-            TensorBase *k_tensor = params_.K;
-            TensorBase *v_tensor = params_.V;
+            TensorBase *k_tensor = asTensorBase(params_.K, "K");
+            TensorBase *v_tensor = asTensorBase(params_.V, "V");
             LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER checking KV cache: kv_cache="
                       << static_cast<const void *>(params_.kv_cache)
                       << " layer_idx=" << params_.layer_idx
@@ -593,8 +593,10 @@ namespace llaminar2
             // Check if Wo implements IINT8Unpackable (quantized formats)
             if (dynamic_cast<IINT8Unpackable *>(params_.Wo) != nullptr)
             {
+                // Cast to TensorBase for KernelFactory
+                auto *Wo_base = requireTensorBase(params_.Wo, "Wo");
                 // Get VNNI-packed weights from cache (or pack on first call)
-                auto *packed = llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(params_.Wo);
+                auto *packed = llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(Wo_base);
                 q16_params.Wo_packed = packed;
                 q16_params.Wo_fp32 = nullptr;
                 LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER: Using VNNI-packed Wo weights from "
@@ -728,17 +730,25 @@ namespace llaminar2
         else
         {
             // Q8_1 kernel (JIT/TILED/REFERENCE)
+            // Cast ITensor* to TensorBase* for kernel interface
+            auto *Q_base = requireTensorBase(params_.Q, "Q");
+            auto *K_base = requireTensorBase(params_.K, "K");
+            auto *V_base = requireTensorBase(params_.V, "V");
+            auto *Wo_base = requireTensorBase(params_.Wo, "Wo");
+            auto *output_base = asTensorBase(params_.output, "output");
+            auto *context_snapshot_base = asTensorBase(params_.context_snapshot, "context_snapshot");
+
             success = kernel_->compute(
-                params_.Q,
-                params_.K,
-                params_.V,
-                params_.Wo,
-                params_.output,
+                Q_base,
+                K_base,
+                V_base,
+                Wo_base,
+                output_base,
                 params_.seq_len,
                 effective_kv_len,
                 params_.causal,
                 position_offset,
-                params_.context_snapshot);
+                context_snapshot_base);
         }
 
         if (!success)

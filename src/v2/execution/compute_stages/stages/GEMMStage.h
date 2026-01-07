@@ -29,9 +29,9 @@ namespace llaminar2
         struct Params
         {
             // Type-safe tensor pointers (required)
-            const TensorBase *A = nullptr; ///< Input activation tensor [m, k]
-            const TensorBase *B = nullptr; ///< Weight tensor [k, n] (may be quantized)
-            TensorBase *C = nullptr;       ///< Output tensor [m, n]
+            const ITensor *A = nullptr; ///< Input activation tensor [m, k]
+            const ITensor *B = nullptr; ///< Weight tensor [k, n] (may be quantized)
+            ITensor *C = nullptr;       ///< Output tensor [m, n]
             int m = 0, n = 0, k = 0;       ///< Matrix dimensions
             float alpha = 1.0f;            ///< Scale factor for A*B
             float beta = 0.0f;             ///< Scale factor for existing C
@@ -50,7 +50,7 @@ namespace llaminar2
             /**
              * @brief Bias tensor (preferred interface)
              */
-            const TensorBase *bias_tensor = nullptr;
+            const ITensor *bias_tensor = nullptr;
 
             /**
              * @brief Whether bias is required for this operation
@@ -68,7 +68,7 @@ namespace llaminar2
             void validate(const std::string &stage_name = "GEMMStage") const;
 
             // SwiGLU fusion (extended fields)
-            const TensorBase *gate_input = nullptr;
+            const ITensor *gate_input = nullptr;
             bool do_swiglu = false;
 
             // MPI context for tensor-parallel execution (optional)

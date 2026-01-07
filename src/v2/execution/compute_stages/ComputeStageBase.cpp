@@ -158,7 +158,7 @@ namespace llaminar2
         return sum;
     }
 
-    void IComputeStage::traceInput(const std::string &tensor_name, const TensorBase *tensor) const
+    void IComputeStage::traceInput(const std::string &tensor_name, const ITensor *tensor) const
     {
         if (!shouldTrace() || !tensor)
             return;
@@ -236,7 +236,7 @@ namespace llaminar2
         LOG_INFO(oss.str());
     }
 
-    void IComputeStage::traceOutput(const std::string &tensor_name, const TensorBase *tensor) const
+    void IComputeStage::traceOutput(const std::string &tensor_name, const ITensor *tensor) const
     {
         if (!shouldTrace() || !tensor)
             return;
@@ -358,14 +358,14 @@ namespace llaminar2
         }
     }
 
-    void IComputeStage::validateShape(const std::string &tensor_name, const TensorBase *tensor,
+    void IComputeStage::validateShape(const std::string &tensor_name, const ITensor *tensor,
                                       const std::vector<size_t> &expected) const
     {
         validateShapes({{tensor_name, tensor, expected, false}});
     }
 
-    void IComputeStage::validateMatmulShapes(const std::string &a_name, const TensorBase *a,
-                                             const std::string &b_name, const TensorBase *b) const
+    void IComputeStage::validateMatmulShapes(const std::string &a_name, const ITensor *a,
+                                             const std::string &b_name, const ITensor *b) const
     {
         if (!a || !b)
         {
@@ -387,7 +387,6 @@ namespace llaminar2
                << b_name << " has " << b_shape.size() << "D";
             throw std::runtime_error(ss.str());
         }
-
         size_t a_k = a_shape[a_shape.size() - 1]; // Last dim of A
         size_t b_k = b_shape[b_shape.size() - 2]; // Second-to-last dim of B
 
@@ -442,7 +441,7 @@ namespace llaminar2
     // StageDumpInfo Implementation
     // =============================================================================
 
-    StageDumpInfo &StageDumpInfo::addWeight(const char *name, const TensorBase *tensor)
+    StageDumpInfo &StageDumpInfo::addWeight(const char *name, const ITensor *tensor)
     {
         if (tensor)
         {
@@ -453,7 +452,7 @@ namespace llaminar2
         return *this;
     }
 
-    StageDumpInfo &StageDumpInfo::addInput(const char *name, const TensorBase *tensor, size_t rows, size_t cols)
+    StageDumpInfo &StageDumpInfo::addInput(const char *name, const ITensor *tensor, size_t rows, size_t cols)
     {
         // Store raw tensor data in native format for accurate replay testing
         // This preserves quantized blocks (Q8_1, Q16_1, etc.) instead of dequantizing
@@ -494,7 +493,7 @@ namespace llaminar2
         return *this;
     }
 
-    StageDumpInfo &StageDumpInfo::addOutput(const char *name, const TensorBase *tensor, size_t rows, size_t cols)
+    StageDumpInfo &StageDumpInfo::addOutput(const char *name, const ITensor *tensor, size_t rows, size_t cols)
     {
         // Store raw tensor data in native format for accurate replay testing
         // This preserves quantized blocks (Q8_1, Q16_1, etc.) instead of dequantizing

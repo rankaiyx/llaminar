@@ -53,7 +53,17 @@ namespace llaminar2
         // Use the same approach as EmbeddingOp in Qwen2Pipeline:
         // Get the embedding kernel from the output tensor (IActivationTensor::createEmbedding)
         // This handles automatic type dispatch for FP32, Q8_1, etc.
-        auto *activation = dynamic_cast<IActivationTensor *>(params_.output);
+
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *embed_table_base = requireTensorBase(params_.embed_table, "embed_table");
+        auto *output_base = requireTensorBase(params_.output, "output");
+        if (!embed_table_base || !output_base)
+        {
+            LOG_ERROR("[EmbeddingStage] GPU tensors not yet supported");
+            return false;
+        }
+
+        auto *activation = dynamic_cast<IActivationTensor *>(output_base);
         if (!activation)
         {
             LOG_ERROR("[EmbeddingStage] Output tensor must implement IActivationTensor");
@@ -92,8 +102,8 @@ namespace llaminar2
             }
 
             // Delegate to kernel's apply_tensor - handles all type dispatch internally
-            if (!kernel->apply_tensor(params_.embed_table, flat_token_ids.data(), total_positions,
-                                      params_.d_model, params_.output, params_.mpi_ctx, params_.device_idx))
+            if (!kernel->apply_tensor(embed_table_base, flat_token_ids.data(), total_positions,
+                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_idx))
             {
                 LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed (batched)");
                 return false;
@@ -117,8 +127,8 @@ namespace llaminar2
         else
         {
             // Single sequence input: delegate directly to kernel
-            if (!kernel->apply_tensor(params_.embed_table, params_.token_ids, params_.num_tokens,
-                                      params_.d_model, params_.output, params_.mpi_ctx, params_.device_idx))
+            if (!kernel->apply_tensor(embed_table_base, params_.token_ids, params_.num_tokens,
+                                      params_.d_model, output_base, params_.mpi_ctx, params_.device_idx))
             {
                 LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed");
                 return false;
@@ -214,13 +224,21 @@ namespace llaminar2
      *
      * Handles FP32, Q8_1, and Q16_1 output formats.
      */
-    void EmbeddingStage::zero_output_row(TensorBase *output, int row_idx, int d_model)
+    void EmbeddingStage::zero_output_row(ITensor *output, int row_idx, int d_model)
     {
-        TensorType output_type = output->native_type();
+        // Cast to TensorBase for CPU operations
+        auto *output_base = dynamic_cast<TensorBase *>(output);
+        if (!output_base)
+        {
+            LOG_ERROR("[EmbeddingStage::zero_output_row] GPU tensors not yet supported");
+            return;
+        }
+
+        TensorType output_type = output_base->native_type();
 
         if (output_type == TensorType::FP32)
         {
-            float *data = const_cast<float *>(output->fp32_data());
+            float *data = const_cast<float *>(output_base->fp32_data());
             if (data)
             {
                 std::memset(data + row_idx * d_model, 0, d_model * sizeof(float));
@@ -229,7 +247,7 @@ namespace llaminar2
         else if (output_type == TensorType::Q8_1)
         {
             // For Q8_1, zero out the blocks for this row
-            auto *q8_1_output = dynamic_cast<Q8_1Tensor *>(output);
+            auto *q8_1_output = dynamic_cast<Q8_1Tensor *>(output_base);
             if (q8_1_output)
             {
                 // Q8_1 has 32 elements per block
@@ -251,7 +269,7 @@ namespace llaminar2
         else if (output_type == TensorType::Q16_1)
         {
             // For Q16_1, zero out the blocks for this row
-            auto *q16_1_output = dynamic_cast<Q16_1Tensor *>(output);
+            auto *q16_1_output = dynamic_cast<Q16_1Tensor *>(output_base);
             if (q16_1_output)
             {
                 // Q16_1 has 32 elements per block

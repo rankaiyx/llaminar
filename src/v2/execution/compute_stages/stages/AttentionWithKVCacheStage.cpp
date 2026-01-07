@@ -97,11 +97,22 @@ namespace llaminar2
         LOG_DEBUG("[AttentionWithKVCacheStage::executePrefill] layer=" << params_.layer_idx
                                                                        << " seq_len=" << params_.seq_len);
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *Q_base = requireTensorBase(params_.Q, "Q");
+        auto *K_base = requireTensorBase(params_.K, "K");
+        auto *V_base = requireTensorBase(params_.V, "V");
+        auto *output_base = requireTensorBase(params_.output, "output");
+        if (!Q_base || !K_base || !V_base || !output_base)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage::executePrefill] GPU tensors not yet supported");
+            return false;
+        }
+
         // Step 1: Append new K/V to cache (if cache provided)
         if (params_.kv_cache)
         {
             bool append_ok = params_.kv_cache->append_kv(
-                params_.layer_idx, 0, params_.K, params_.V, params_.seq_len);
+                params_.layer_idx, 0, K_base, V_base, params_.seq_len);
             if (!append_ok)
             {
                 LOG_ERROR("[AttentionWithKVCacheStage] Failed to append K/V to cache");
@@ -112,8 +123,8 @@ namespace llaminar2
         }
 
         // Step 2: Get full K/V from cache (includes just-appended tokens)
-        TensorBase *K_full = params_.K;
-        TensorBase *V_full = params_.V;
+        TensorBase *K_full = K_base;
+        TensorBase *V_full = V_base;
         int kv_len = params_.seq_len;
 
         if (params_.kv_cache)
@@ -131,10 +142,10 @@ namespace llaminar2
         int q_dim = params_.n_heads * params_.head_dim;
         int kv_dim = params_.n_kv_heads * params_.head_dim;
 
-        auto Q_view = params_.Q->create_view({static_cast<size_t>(params_.seq_len), static_cast<size_t>(q_dim)});
+        auto Q_view = Q_base->create_view({static_cast<size_t>(params_.seq_len), static_cast<size_t>(q_dim)});
         auto K_view = K_full->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
         auto V_view = V_full->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
-        auto out_view = params_.output->create_view({static_cast<size_t>(params_.seq_len), static_cast<size_t>(q_dim)});
+        auto out_view = output_base->create_view({static_cast<size_t>(params_.seq_len), static_cast<size_t>(q_dim)});
 
         if (!Q_view || !K_view || !V_view || !out_view)
         {
@@ -214,9 +225,20 @@ namespace llaminar2
             return false;
         }
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *Q_base = requireTensorBase(params_.Q, "Q");
+        auto *K_base = requireTensorBase(params_.K, "K");
+        auto *V_base = requireTensorBase(params_.V, "V");
+        auto *output_base = requireTensorBase(params_.output, "output");
+        if (!Q_base || !K_base || !V_base || !output_base)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage::executeDecode] GPU tensors not yet supported");
+            return false;
+        }
+
         // Step 1: Append single token K/V to cache
         bool append_ok = params_.kv_cache->append_kv(
-            params_.layer_idx, 0, params_.K, params_.V, 1);
+            params_.layer_idx, 0, K_base, V_base, 1);
         if (!append_ok)
         {
             LOG_ERROR("[AttentionWithKVCacheStage] Failed to append decode token to cache");
@@ -236,10 +258,10 @@ namespace llaminar2
         int kv_dim = params_.n_kv_heads * params_.head_dim;
         const int q_seq_len = 1; // Decode mode: single query token
 
-        auto Q_view = params_.Q->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(q_dim)});
+        auto Q_view = Q_base->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(q_dim)});
         auto K_view = K_cached->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
         auto V_view = V_cached->create_view({static_cast<size_t>(kv_len), static_cast<size_t>(kv_dim)});
-        auto out_view = params_.output->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(q_dim)});
+        auto out_view = output_base->create_view({static_cast<size_t>(q_seq_len), static_cast<size_t>(q_dim)});
 
         if (!Q_view || !K_view || !V_view || !out_view)
         {
@@ -314,6 +336,17 @@ namespace llaminar2
                                                                        << " sequence_lengths=" << (params_.sequence_lengths ? "valid" : "nullptr")
                                                                        << (params_.sequence_lengths ? " [0]=" + std::to_string((*params_.sequence_lengths)[0]) : ""));
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *Q_base = requireTensorBase(params_.Q, "Q");
+        auto *K_base = requireTensorBase(params_.K, "K");
+        auto *V_base = requireTensorBase(params_.V, "V");
+        auto *output_base = requireTensorBase(params_.output, "output");
+        if (!Q_base || !K_base || !V_base || !output_base)
+        {
+            LOG_ERROR("[AttentionWithKVCacheStage::executeBatched] GPU tensors not yet supported");
+            return false;
+        }
+
         // For batched mode with different sequence lengths, we need to:
         // 1. Append K/V per sequence to cache
         // 2. Build combined K/V tensors with padding
@@ -323,6 +356,7 @@ namespace llaminar2
         {
             // Append each sequence's K/V to cache
             const int d_kv = params_.n_kv_heads * params_.head_dim;
+            (void)d_kv; // TODO: use for proper batch slicing
             for (int b = 0; b < params_.batch_size; ++b)
             {
                 int actual_len = params_.sequence_lengths ? (*params_.sequence_lengths)[b] : params_.seq_len;
@@ -332,7 +366,7 @@ namespace llaminar2
                 // TODO: Implement proper batch slicing
 
                 bool append_ok = params_.kv_cache->append_kv(
-                    params_.layer_idx, b, params_.K, params_.V, actual_len);
+                    params_.layer_idx, b, K_base, V_base, actual_len);
                 if (!append_ok)
                 {
                     LOG_ERROR("[AttentionWithKVCacheStage::executeBatched] Failed to append batch " << b);
@@ -344,7 +378,7 @@ namespace llaminar2
         // Create attention kernel via KernelFactory (device-aware dispatch)
         const int device_idx = params_.device_idx;
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx);
-        auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
+        auto attention_kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_base, dev_type);
 
         if (!attention_kernel)
         {
@@ -392,7 +426,7 @@ namespace llaminar2
 
         // Dispatch via compute_tensor
         bool success = attention_kernel->compute_tensor(
-            params_.Q, params_.K, params_.V, params_.output,
+            Q_base, K_base, V_base, output_base,
             params_.batch_size,
             params_.seq_len, // Query sequence length
             params_.seq_len, // KV length (same for batched prefill)
@@ -550,6 +584,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

@@ -2,6 +2,7 @@
 
 **Branch**: `feature/cuda-kernels`  
 **Created**: January 6, 2026  
+**Updated**: January 7, 2026  
 **Goal**: Enable GPU inference in Llaminar V2 via CUDA kernels
 
 ---
@@ -9,6 +10,13 @@
 ## Executive Summary
 
 This project adds CUDA kernel support to Llaminar V2, enabling GPU-accelerated inference. The existing architecture has been designed with GPU support in mind—device detection, per-tensor device affinity, and graph-level device routing infrastructure already exist. This project implements the missing GPU execution components.
+
+**Key Architecture Decision (January 7, 2026)**: The codebase uses a **two-tier tensor abstraction**:
+- **`ITensor*`**: Device-agnostic interface used in all stage `Params` structs
+- **`TensorBase*`**: CPU-specific implementation (subclass of `ITensor`)
+- **`CUDATensorBase*`**: GPU-specific implementation (also subclass of `ITensor`)
+
+Stages must be updated to work with `ITensor*` directly (via polymorphism) rather than casting to `TensorBase*`.
 
 ---
 
@@ -21,6 +29,7 @@ This project adds CUDA kernel support to Llaminar V2, enabling GPU-accelerated i
 | Device enumeration (CUDA/ROCm) | ✅ Working | `src/v2/devices/CUDAEnumeration.cu` |
 | NUMA-aware GPU filtering | ✅ Working | `src/v2/utils/NUMATopology.cpp` |
 | `DeviceManager` singleton | ✅ Working | `src/v2/devices/DeviceManager.cpp` |
+| `DeviceId` type-safe device identification | ✅ Working | `src/v2/backends/DeviceId.h` |
 | `DeviceType` enum | ✅ Working | `src/v2/devices/DeviceContext.h` |
 | `IDeviceContext` interface | ✅ Working | `src/v2/devices/DeviceContext.h` |
 | `ComputeGraph` with `device_idx` | ✅ Working | `src/v2/execution/ComputeGraph.h` |
@@ -28,9 +37,10 @@ This project adds CUDA kernel support to Llaminar V2, enabling GPU-accelerated i
 | `KernelFactory` device routing | ✅ Working | `src/v2/kernels/KernelFactory.h` |
 | `LayerPlacement` per-layer devices | ✅ Exists | `src/v2/pipelines/qwen/PlacementPlan.h` |
 | `PlacementStrategy` interface | ✅ Exists | `src/v2/pipelines/qwen/PlacementStrategy.h` |
-| Tensor `device_index()` tracking | ✅ Exists | `src/v2/tensors/TensorBase.h` |
+| `ITensor` interface with `home_device()` | ✅ Working | `src/v2/tensors/ITensor.h` |
+| Stage Params structs use `ITensor*` | ✅ Done | All stage headers updated |
 
-### ✅ Completed Components (January 6, 2026)
+### ✅ Completed CUDA Kernels (January 6-7, 2026)
 
 | Component | Status | Location |
 |-----------|--------|----------|
@@ -41,17 +51,28 @@ This project adds CUDA kernel support to Llaminar V2, enabling GPU-accelerated i
 | CUDA RMSNorm | ✅ Done | `src/v2/kernels/cuda/ops/CUDARMSNormKernelT.h` |
 | CUDA RoPE | ✅ Done | `src/v2/kernels/cuda/ops/CUDARoPEKernelT.h` |
 | CUDA SwiGLU | ✅ Done | `src/v2/kernels/cuda/ops/CUDASwiGLUKernelT.h` |
+| CUDA ResidualAdd | ✅ Done | `src/v2/kernels/cuda/ops/CUDAResidualAddKernelT.h` |
 | CUDA Flash Attention | ✅ Done | `src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu` |
 | CUDA Ring Buffer KV Cache | ✅ Done | `src/v2/kernels/cuda/CUDARingKVCache.cu` |
 
+### ⚠️ Blocking Issues for End-to-End GPU Inference
+
+| Issue | Impact | Fix Required |
+|-------|--------|--------------|
+| Stage `.cpp` files use `requireTensorBase()` | ❌ Blocks GPU tensors | Update to dispatch via `ITensor*` |
+| `KernelFactory::createAttention()` takes `TensorBase*` | ❌ Blocks GPU attention | Add `ITensor*` overload |
+| `FusedAttentionWoStage` uses `TensorBase*` casts | ❌ Decode pipeline blocked | Use decomposed attention for GPU |
+| No decomposed attention CUDA path | ❌ GPU decode blocked | Wire `AttentionComputeStage` to GPU |
+
 ### ❌ Components Remaining
 
-| Component | Priority | Complexity |
-|-----------|----------|------------|
-| CUDA Residual Add (fused) | P2 | Trivial (stubbed) |
-| `GPUFirstStrategy` implementation | P2 | Medium |
-| Per-layer device routing in Qwen2Graph | P3 | Medium |
-| End-to-end GPU inference pipeline | P1 | High |
+| Component | Priority | Complexity | Blocker |
+|-----------|----------|------------|---------|
+| Update `AttentionComputeStage` for GPU | **P0** | Medium | GPU decode |
+| Update `KVCacheAppendStage` for GPU | **P0** | Medium | GPU decode |
+| Wire KernelFactory with `ITensor*` | **P1** | Low | All stages |
+| `GPUFirstStrategy` implementation | P2 | Medium | Multi-device |
+| Per-layer device routing in Qwen2Graph | P3 | Medium | Hybrid CPU/GPU |
 
 ---
 
@@ -126,34 +147,63 @@ std::unique_ptr<ITensorGemm> KernelFactory::createGemm(
 
 ---
 
-### Hook 3: ComputeStage Device Index
+### Hook 3: ComputeStage Device Index - ITensor* Scheme
 
-**File**: `src/v2/execution/compute_stages/stages/*.cpp`
+**File**: `src/v2/execution/compute_stages/stages/*.h`
 
-Each stage receives `device_idx` in its `Params` struct:
+All stage Params structs now use `ITensor*` (device-agnostic interface):
 
 ```cpp
-// Example: GEMMStage
-struct GEMMStage::Params {
-    TensorBase* weights;
-    TensorBase* input;
-    TensorBase* output;
-    int device_idx = -1;  // ← Device routing
+// Example: GEMMStage (UPDATED - uses ITensor*)
+struct GEMMStage::Params
+{
+    const ITensor *A = nullptr;       ///< Input activation tensor [m, k]
+    const ITensor *B = nullptr;       ///< Weight tensor [k, n] (may be quantized)
+    ITensor *C = nullptr;             ///< Output tensor [m, n]
+    int device_idx = -1;              ///< Device routing
+    const ITensor *bias_tensor = nullptr;
     // ...
 };
 
-void GEMMStage::execute(IDeviceContext* ctx) {
-    // Get or create kernel for this device
-    DeviceType dev_type = (params_.device_idx >= 0 && 
-                           DeviceManager::instance().isGPU(params_.device_idx))
-                          ? DeviceType::CUDA : DeviceType::CPU;
-    
-    auto* gemm = KernelFactory::getOrCreateGemm(params_.weights, dev_type);
-    gemm->multiply(...);
+// Example: AttentionComputeStage (UPDATED - uses ITensor*)
+struct AttentionComputeStage::Params
+{
+    ITensor *Q = nullptr;             ///< Query tensor [seq_len, n_heads*head_dim]
+    ITensor *K = nullptr;             ///< Key tensor [kv_len, n_kv_heads*head_dim]  
+    ITensor *V = nullptr;             ///< Value tensor [kv_len, n_kv_heads*head_dim]
+    ITensor *output = nullptr;        ///< Output tensor [seq_len, n_heads*head_dim]
+    int device_idx = -1;
+    // ...
+};
+```
+
+**Status**: ✅ Headers updated to `ITensor*` - implementations need GPU dispatch.
+
+**BLOCKING ISSUE**: Stage `.cpp` implementations still cast to `TensorBase*`:
+
+```cpp
+// AttentionComputeStage.cpp - CURRENT (blocks GPU)
+auto *Q_base = requireTensorBase(params_.Q, "Q");  // ❌ Fails for CUDATensorBase
+if (!Q_base) {
+    LOG_ERROR("[AttentionComputeStage] GPU tensors not yet supported");
+    return false;
 }
 ```
 
-**Status**: ✅ Infrastructure exists - stages pass `device_idx` to KernelFactory.
+**FIX REQUIRED**: Dispatch via `ITensor*` polymorphism:
+
+```cpp
+// AttentionComputeStage.cpp - FIXED (supports GPU)
+if (params_.Q->is_on_gpu()) {
+    // GPU path: use CUDAFlashAttentionKernelT directly
+    auto kernel = KernelFactory::createAttention(params_.Q, DeviceType::CUDA);
+    kernel->compute_tensor(params_.Q, params_.K, params_.V, params_.output, ...);
+} else {
+    // CPU path: existing TensorBase* logic
+    auto *Q_base = dynamic_cast<TensorBase*>(params_.Q);
+    // ...
+}
+```
 
 ---
 
@@ -1267,21 +1317,165 @@ CUDA format is slightly more compact than CPU VNNI format because it doesn't sto
 ### Phase 4: Integration (Week 7-8)
 **Goal**: End-to-end GPU inference
 
+**Status Update (January 7, 2026)**: Phase 4 is BLOCKED on stage implementation updates.
+
+#### 4.0 CRITICAL BLOCKER: Stage Implementations Use `requireTensorBase()` ⛔
+
+The root cause of GPU inference failure is that stage `.cpp` files cast `ITensor*` → `TensorBase*`:
+
+```cpp
+// ComputeStageUtils.h - the blocker
+inline TensorBase *requireTensorBase(ITensor *tensor, const char *name)
+{
+    auto *base = dynamic_cast<TensorBase *>(tensor);
+    LLAMINAR_ASSERTF(base, name << " must be a CPU TensorBase (GPU not yet supported)");
+    return base;
+}
+```
+
+**Stages with `requireTensorBase()` calls** (all block GPU execution):
+
+| Stage | Impact |
+|-------|--------|
+| `AttentionComputeStage` | Blocks GPU attention (Q, K, V, output) |
+| `GEMMStage` | Blocks GPU GEMM (A, B, C) |
+| `RoPEStage` | Blocks GPU RoPE (Q, K, Q_out, K_out) |
+| `RMSNormStage` | Blocks GPU normalization |
+| `SwiGLUStage` | Blocks GPU FFN activation |
+| `ResidualAddStage` | Blocks GPU residual connections |
+| `EmbeddingStage` | Blocks GPU embedding lookup |
+| `LMHeadStage` | Blocks GPU logit projection |
+| `FusedAttentionWoStage` | Blocks GPU fused attention |
+| `FusedGateUpGEMMStage` | Blocks GPU FFN projections |
+
+**Fix Strategy**:
+1. Add `ITensor*` overloads to KernelFactory (dispatch via `native_type()` + `is_on_gpu()`)
+2. Update each stage to check `ITensor::is_on_gpu()` and dispatch accordingly
+3. For GPU path: pass `ITensor*` directly to CUDA kernels (they work with device pointers)
+
 #### 4.1 Device Routing
 - [ ] Implement `GPUFirstStrategy` with memory-based layer assignment
 - [ ] Modify `Qwen2Graph` to query `PlacementPlan` per-layer
 - [ ] Add automatic fallback to CPU when GPU OOM
 
-#### 4.2 Tensor Transfers
+#### 4.2 Stage Implementation Updates (NEW - P0)
+- [ ] Add `KernelFactory::createAttention(ITensor*, DeviceType)` overload
+- [ ] Update `AttentionComputeStage` to dispatch via `ITensor::is_on_gpu()`
+- [ ] Update `KVCacheAppendStage` for GPU KV cache
+- [ ] Test decomposed attention path on GPU (prefill + decode)
+
+#### 4.3 Tensor Transfers
 - [ ] Automatic device migration at stage boundaries
 - [ ] Overlap compute with transfers using streams
 - [ ] Profile and optimize transfer overhead
 
-#### 4.3 Testing
-- [ ] Unit tests for each CUDA kernel
-- [ ] Numerical parity tests vs CPU kernels
-- [ ] Integration tests with real models
+#### 4.4 Testing
+- [x] Unit tests for each CUDA kernel (**27 tests passing**)
+- [x] Numerical parity tests vs CPU kernels
+- [ ] Integration tests with real models (prefill works, **decode blocked**)
 - [ ] Benchmark suite for GPU performance
+
+**Test Status** (`Test__CUDAFullModelInference.cpp`):
+
+| Test | Status | Notes |
+|------|--------|-------|
+| `CanCreateCPURunner` | ✅ Pass | |
+| `CanCreateGPURunner` | ✅ Pass | |
+| `SingleTokenPrediction_MatchesCPU` | ✅ Pass | Prefill only |
+| `LongerPrompt_MatchesCPU` | ✅ Pass | Prefill only |
+| `MultiTokenGeneration_MatchesCPU` | ⛔ **SKIP** | GPU decode blocked |
+| `GPUMemoryUsage` | ✅ Pass | |
+| `WeightsAreOnGPU` | ✅ Pass | |
+
+**Skip Reason**:
+```cpp
+GTEST_SKIP() << "GPU decode not yet supported - FusedAttentionWoStage requires TensorBase* "
+             << "but GPU KV cache returns CUDATensorBase*";
+```
+
+---
+
+## Path Forward: Enabling GPU Decode (January 7, 2026)
+
+The GPU prefill pipeline works, but **decode is blocked** because stages can't handle GPU tensors from the KV cache. Here's the recommended path to fix it:
+
+### Option A: Use Decomposed Attention for GPU (Recommended) ⭐
+
+**Rationale**: The decomposed attention path (`KVCacheAppendStage` + `AttentionComputeStage`) is designed for flexibility. Unlike `FusedAttentionWoStage`, it separates KV cache management from attention computation, making it easier to support heterogeneous tensor types.
+
+**Steps**:
+1. **Update `AttentionComputeStage` for GPU dispatch**
+   ```cpp
+   // In AttentionComputeStage::execute()
+   if (params_.Q->is_on_gpu()) {
+       // Use CUDAFlashAttentionKernelT
+       auto kernel = KernelFactory::createAttention(DeviceType::CUDA);
+       kernel->compute_tensor(
+           params_.Q->raw_data(),  // device pointer
+           params_.K->raw_data(),
+           params_.V->raw_data(),
+           params_.output->raw_mutable_data(),
+           ...);
+   } else {
+       // Existing CPU path
+   }
+   ```
+
+2. **Add `ITensor*` overload to KernelFactory**
+   ```cpp
+   std::unique_ptr<ITensorAttention> KernelFactory::createAttention(
+       const ITensor* tensor, DeviceType dev_type)
+   {
+       // Dispatch by tensor location
+       if (tensor->is_on_gpu()) {
+           return createCUDAAttention(tensor);
+       }
+       // Fall back to TensorBase path for CPU
+       return createAttention(requireTensorBase(tensor, "Q"), dev_type);
+   }
+   ```
+
+3. **Ensure `KVCacheAppendStage` works with GPU cache**
+   - The CUDA Ring KV Cache (`CUDARingKVCache`) already exists
+   - Need to wire it into the stage's execute path
+
+4. **Configure Qwen2Graph to use decomposed attention for GPU**
+   ```cpp
+   // In Qwen2Graph - when building for GPU inference
+   bool use_fused_attention = !config_.use_gpu;  // Disable fused for GPU
+   ```
+
+**Estimated Effort**: 1-2 days
+
+### Option B: Create CUDAFusedAttentionWoStage
+
+**Rationale**: Keep the fused stage architecture but create a GPU-native version.
+
+**Pros**: 
+- Potentially faster (fewer stage transitions)
+- Matches CPU architecture
+
+**Cons**:
+- More code to maintain
+- Duplicates logic between CPU and GPU
+
+**Estimated Effort**: 3-5 days
+
+### Recommended Next Steps
+
+1. **Immediate**: Enable decomposed attention for GPU (Option A)
+   - Lower risk, reuses existing CUDA Flash Attention kernel
+   - Unblocks GPU decode testing
+
+2. **Short-term**: Add `ITensor*` overloads to KernelFactory
+   - Makes all stages GPU-compatible
+   - Enables gradual migration
+
+3. **Medium-term**: Profile and optimize
+   - Benchmark decomposed vs fused attention
+   - Consider fused stage if perf gap is significant
+
+---
 
 ### Phase 5: Optimization (Week 9+)
 **Goal**: Production-ready performance

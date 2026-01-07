@@ -35,8 +35,8 @@ namespace llaminar2
     public:
         struct Params
         {
-            const TensorBase *K = nullptr; ///< Key to append
-            const TensorBase *V = nullptr; ///< Value to append
+            const ITensor *K = nullptr; ///< Key to append
+            const ITensor *V = nullptr; ///< Value to append
             IUnifiedKVCache *kv_cache = nullptr;
             int layer_idx = 0;
             int seq_idx = 0;
@@ -45,7 +45,7 @@ namespace llaminar2
             int seq_len = 0;
 
             /// [Hybrid mode] Optional output for dequantized V (FP32)
-            TensorBase *V_dequant_out = nullptr;
+            ITensor *V_dequant_out = nullptr;
 
             // =========================================================
             // VNNI-Safe Quantization Parameters (Q16_1 cache)

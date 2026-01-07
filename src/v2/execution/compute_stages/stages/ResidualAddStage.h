@@ -27,9 +27,9 @@ namespace llaminar2
         struct Params
         {
             // Type-safe tensor pointers (required)
-            const TensorBase *input = nullptr;    ///< Input tensor (projection output)
-            const TensorBase *residual = nullptr; ///< Residual tensor (previous hidden state)
-            TensorBase *output = nullptr;         ///< Output tensor (can be same as residual for in-place)
+            const ITensor *input = nullptr;    ///< Input tensor (projection output)
+            const ITensor *residual = nullptr; ///< Residual tensor (previous hidden state)
+            ITensor *output = nullptr;         ///< Output tensor (can be same as residual for in-place)
 
             // Number of elements to process (0 = use input->numel())
             // IMPORTANT: For decode mode with pre-allocated buffers, this must be set to

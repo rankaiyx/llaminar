@@ -26,10 +26,10 @@ namespace llaminar2
         struct Params
         {
             // Input/output tensors
-            TensorBase *Q = nullptr;
-            TensorBase *K = nullptr;
-            TensorBase *V = nullptr;
-            TensorBase *output = nullptr;
+            ITensor *Q = nullptr;
+            ITensor *K = nullptr;
+            ITensor *V = nullptr;
+            ITensor *output = nullptr;
 
             // Dimensions
             int batch_size = 1;
@@ -48,9 +48,9 @@ namespace llaminar2
             bool auto_detect_mode = true;
 
             // Workspace buffers
-            TensorBase *workspace_scores = nullptr;
-            TensorBase *workspace_context = nullptr;
-            TensorBase *workspace_mask = nullptr;
+            ITensor *workspace_scores = nullptr;
+            ITensor *workspace_context = nullptr;
+            ITensor *workspace_mask = nullptr;
 
             // KV cache for dynamic length query at execution time
             IUnifiedKVCache *kv_cache = nullptr;

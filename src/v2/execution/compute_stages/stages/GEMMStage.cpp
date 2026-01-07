@@ -23,17 +23,24 @@ namespace llaminar2
         // Prefer bias_tensor over raw bias pointer for TensorSlice compatibility
         if (bias_tensor)
         {
-            // Use unified data access interface - works for FP32Tensor and TensorSlice
-            if (bias_tensor->is_fp32_backed())
+            // Cast to TensorBase to access is_fp32_backed()
+            auto *bias_base = dynamic_cast<const TensorBase *>(bias_tensor);
+            if (!bias_base)
             {
-                return bias_tensor->data();
+                LOG_WARN("[GEMMStage::Params] bias_tensor is not TensorBase, ignoring.");
+                return nullptr;
+            }
+            // Use unified data access interface - works for FP32Tensor and TensorSlice
+            if (bias_base->is_fp32_backed())
+            {
+                return bias_base->data();
             }
             else
             {
                 // Non-FP32-backed bias tensor (e.g., quantized) - not supported
                 LOG_WARN("[GEMMStage::Params] bias_tensor is not FP32-backed, ignoring. "
                          "Type: "
-                         << bias_tensor->dtype_name());
+                         << bias_base->dtype_name());
                 return nullptr;
             }
         }
@@ -151,20 +158,23 @@ namespace llaminar2
             }
         }
 
+        // Cast weights to TensorBase for KernelFactory
+        auto *B_base = requireTensorBase(params_.B, "weight B");
+
         // Get kernel - either full or sliced
         llaminar2::ITensorGemm *gemm = nullptr;
         if (is_sliced)
         {
             // Use sliced kernel for tensor parallelism
             gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
-                params_.B, params_.output_range.start, params_.output_range.end);
+                B_base, params_.output_range.start, params_.output_range.end);
             LOG_DEBUG("[GEMMStage] Using sliced kernel for rows [" << params_.output_range.start
                                                                    << ", " << params_.output_range.end << ")");
         }
         else
         {
             // Use full kernel
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.B);
+            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(B_base);
         }
 
         if (!gemm)
@@ -208,11 +218,15 @@ namespace llaminar2
             // into a buffer EVERY CALL - this was causing 25x slowdown for down_proj.
             if (!gate_fp32)
             {
+                // Cast input/output to TensorBase for multiply_tensor
+                auto *A_base = requireTensorBase(params_.A, "input A");
+                auto *C_base = asTensorBase(params_.C, "output C");
+
                 LOG_DEBUG("[GEMMStage] Using multiply_tensor for type-aware dispatch: "
                           << "input_type=" << params_.A->dtype_name()
                           << " output_type=" << params_.C->dtype_name());
                 bool success = qgemm->multiply_tensor(
-                    params_.A, params_.C,
+                    A_base, C_base,
                     params_.m, effective_n, params_.k,
                     params_.transpose_B,
                     params_.alpha, params_.beta,
@@ -259,9 +273,13 @@ namespace llaminar2
             return success;
         }
 
+        // Cast A/C for FP32 GEMM fallback
+        auto *A_base_fallback = requireTensorBase(params_.A, "input A fallback");
+        auto *C_base_fallback = asTensorBase(params_.C, "output C fallback");
+
         // FP32 GEMM fallback (for non-quantized weights)
         // Use multiply_tensor if available for type-aware dispatch
-        if (gemm->multiply_tensor(params_.A, params_.C, params_.m, effective_n, params_.k,
+        if (gemm->multiply_tensor(A_base_fallback, C_base_fallback, params_.m, effective_n, params_.k,
                                   params_.transpose_B, params_.alpha, params_.beta,
                                   params_.mpi_ctx, params_.device_idx))
         {
@@ -419,6 +437,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

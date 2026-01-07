@@ -956,7 +956,7 @@ TEST_F(Test__StageBufferRequirements, MoECombineStage_DeclaresExpertInputsAndOut
 
     auto expert0_out = createFP32Tensor(SEQ_LEN, D_MODEL);
     auto expert1_out = createFP32Tensor(SEQ_LEN, D_MODEL);
-    std::vector<const TensorBase *> expert_outputs = {expert0_out.get(), expert1_out.get()};
+    std::vector<const ITensor *> expert_outputs = {expert0_out.get(), expert1_out.get()};
     auto output = createFP32Tensor(SEQ_LEN, D_MODEL);
 
     MoECombineStage::Params params{

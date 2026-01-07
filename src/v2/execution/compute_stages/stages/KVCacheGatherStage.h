@@ -26,8 +26,8 @@ namespace llaminar2
             int layer_idx = 0;
             int batch_size = 1;
 
-            TensorBase *out_K = nullptr;
-            TensorBase *out_V = nullptr;
+            ITensor *out_K = nullptr;
+            ITensor *out_V = nullptr;
 
             int *out_max_kv_len = nullptr;
             std::vector<int> *out_per_seq_kv_lens = nullptr;

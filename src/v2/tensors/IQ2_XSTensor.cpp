@@ -30,7 +30,7 @@ namespace llaminar2
 {
 
     IQ2_XSTensor::IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr), view_byte_offset_(0), parent_(nullptr), device_idx_(-1), device_blocks_(nullptr)
+        : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr), view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr)
     {
         if (shape.empty())
         {
@@ -56,7 +56,7 @@ namespace llaminar2
     IQ2_XSTensor::IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
                                size_t view_byte_offset, std::shared_ptr<TensorBase> parent)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(raw_data_ptr),
-          view_byte_offset_(view_byte_offset), parent_(parent), device_idx_(-1), device_blocks_(nullptr)
+          view_byte_offset_(view_byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr)
     {
     }
 
@@ -102,7 +102,7 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> IQ2_XSTensor::createGemm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
@@ -181,7 +181,7 @@ namespace llaminar2
 
     bool IQ2_XSTensor::set_device(int device_idx)
     {
-        device_idx_ = device_idx;
+        device_ = DeviceId::fromLegacyIndex(device_idx);
         return true;
     }
 

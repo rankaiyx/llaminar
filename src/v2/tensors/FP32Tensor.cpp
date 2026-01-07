@@ -68,8 +68,8 @@ namespace llaminar2
         return devices[device_idx].device_id;
     }
 
-    FP32Tensor::FP32Tensor(const std::vector<size_t> &shape, int device_idx)
-        : shape_(shape), device_idx_(device_idx), device_data_(nullptr),
+    FP32Tensor::FP32Tensor(const std::vector<size_t> &shape, DeviceId device)
+        : shape_(shape), device_(device), device_data_(nullptr),
           host_dirty_(false), device_dirty_(false),
           is_view_(false), parent_data_ptr_(nullptr), view_offset_(0), parent_(nullptr)
     {
@@ -80,18 +80,19 @@ namespace llaminar2
         }
         host_data_.resize(count, 0.0f);
 
-        // Phase 6: Allocate GPU memory if device_idx > 0 (GPU)
-        if (device_idx_ > 0)
+        // Phase 6: Allocate GPU memory if device is GPU
+        if (device_.is_gpu())
         {
-            IBackend *backend = getBackendForDeviceIdx(device_idx_);
+            int device_idx = device_.toLegacyIndex();
+            IBackend *backend = getBackendForDeviceIdx(device_idx);
             if (backend)
             {
-                int backend_device_id = getBackendDeviceId(device_idx_);
+                int backend_device_id = getBackendDeviceId(device_idx);
                 size_t bytes = count * sizeof(float);
                 device_data_ = backend->allocate(bytes, backend_device_id);
                 if (device_data_)
                 {
-                    LOG_DEBUG("[FP32Tensor] Allocated " << bytes << " bytes on device " << device_idx_
+                    LOG_DEBUG("[FP32Tensor] Allocated " << bytes << " bytes on device " << device_.to_string()
                                                         << " (backend device " << backend_device_id << ")");
                     // Initialize device memory from host
                     backend->hostToDevice(device_data_, host_data_.data(), bytes, backend_device_id);
@@ -100,22 +101,28 @@ namespace llaminar2
                 }
                 else
                 {
-                    LOG_ERROR("[FP32Tensor] GPU allocation failed for " << bytes << " bytes on device " << device_idx_);
+                    LOG_ERROR("[FP32Tensor] GPU allocation failed for " << bytes << " bytes on device " << device_.to_string());
                 }
             }
             else
             {
-                LOG_DEBUG("[FP32Tensor] No backend available for device " << device_idx_ << ", using CPU fallback");
+                LOG_DEBUG("[FP32Tensor] No backend available for device " << device_.to_string() << ", using CPU fallback");
             }
         }
     }
 
+    FP32Tensor::FP32Tensor(const std::vector<size_t> &shape, int device_idx)
+        : FP32Tensor(shape, DeviceId::fromLegacyIndex(device_idx))
+    {
+        // Legacy constructor - delegates to DeviceId constructor
+    }
+
     FP32Tensor::FP32Tensor(const std::vector<size_t> &shape,
-                           int device_idx,
+                           DeviceId device,
                            AlignedVector<float> *parent_data,
                            size_t data_offset,
                            std::shared_ptr<FP32Tensor> parent)
-        : shape_(shape), device_idx_(device_idx), device_data_(nullptr),
+        : shape_(shape), device_(device), device_data_(nullptr),
           host_dirty_(false), device_dirty_(false),
           is_view_(true), parent_data_ptr_(parent_data), view_offset_(data_offset),
           parent_(parent)
@@ -129,16 +136,17 @@ namespace llaminar2
         // Phase 6: Free device memory using appropriate backend
         if (device_data_)
         {
-            IBackend *backend = getBackendForDeviceIdx(device_idx_);
+            int device_idx = device_.toLegacyIndex();
+            IBackend *backend = getBackendForDeviceIdx(device_idx);
             if (backend)
             {
-                int backend_device_id = getBackendDeviceId(device_idx_);
+                int backend_device_id = getBackendDeviceId(device_idx);
                 backend->free(device_data_, backend_device_id);
-                LOG_DEBUG("[FP32Tensor] Freed device memory on device " << device_idx_);
+                LOG_DEBUG("[FP32Tensor] Freed device memory on device " << device_.to_string());
             }
             else
             {
-                LOG_ERROR("[FP32Tensor] Cannot free device data - backend unavailable for device " << device_idx_);
+                LOG_ERROR("[FP32Tensor] Cannot free device data - backend unavailable for device " << device_.to_string());
             }
             device_data_ = nullptr;
         }
@@ -146,21 +154,23 @@ namespace llaminar2
 
     bool FP32Tensor::set_device(int device_idx)
     {
-        if (device_idx == device_idx_)
+        DeviceId new_device = DeviceId::fromLegacyIndex(device_idx);
+        if (new_device == device_)
         {
             return true; // Already on target device
         }
 
         // Phase 6: Cross-device transfer
         size_t bytes = numel() * sizeof(float);
+        int old_device_idx = device_.toLegacyIndex();
 
         // Step 1: Sync current data to host if on GPU and dirty
         if (device_data_ && device_dirty_)
         {
-            IBackend *old_backend = getBackendForDeviceIdx(device_idx_);
+            IBackend *old_backend = getBackendForDeviceIdx(old_device_idx);
             if (old_backend)
             {
-                int old_backend_id = getBackendDeviceId(device_idx_);
+                int old_backend_id = getBackendDeviceId(old_device_idx);
                 old_backend->deviceToHost(host_data_.data(), device_data_, bytes, old_backend_id);
                 device_dirty_ = false;
             }
@@ -169,25 +179,25 @@ namespace llaminar2
         // Step 2: Free old device memory
         if (device_data_)
         {
-            IBackend *old_backend = getBackendForDeviceIdx(device_idx_);
+            IBackend *old_backend = getBackendForDeviceIdx(old_device_idx);
             if (old_backend)
             {
-                int old_backend_id = getBackendDeviceId(device_idx_);
+                int old_backend_id = getBackendDeviceId(old_device_idx);
                 old_backend->free(device_data_, old_backend_id);
             }
             device_data_ = nullptr;
         }
 
-        // Step 3: Update device index
-        device_idx_ = device_idx;
+        // Step 3: Update device
+        device_ = new_device;
 
         // Step 4: Allocate on new device if GPU
-        if (device_idx_ > 0)
+        if (device_.is_gpu())
         {
-            IBackend *new_backend = getBackendForDeviceIdx(device_idx_);
+            IBackend *new_backend = getBackendForDeviceIdx(device_idx);
             if (new_backend)
             {
-                int new_backend_id = getBackendDeviceId(device_idx_);
+                int new_backend_id = getBackendDeviceId(device_idx);
                 device_data_ = new_backend->allocate(bytes, new_backend_id);
                 if (device_data_)
                 {
@@ -195,11 +205,11 @@ namespace llaminar2
                     new_backend->hostToDevice(device_data_, host_data_.data(), bytes, new_backend_id);
                     device_dirty_ = false;
                     host_dirty_ = false;
-                    LOG_DEBUG("[FP32Tensor] Transferred " << bytes << " bytes to device " << device_idx_);
+                    LOG_DEBUG("[FP32Tensor] Transferred " << bytes << " bytes to device " << device_.to_string());
                 }
                 else
                 {
-                    LOG_ERROR("[FP32Tensor] set_device: allocation failed on device " << device_idx_);
+                    LOG_ERROR("[FP32Tensor] set_device: allocation failed on device " << device_.to_string());
                     return false;
                 }
             }
@@ -240,49 +250,49 @@ namespace llaminar2
     std::unique_ptr<ITensorGemm> FP32Tensor::createGemm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createGemm(this, dev_type);
     }
 
     std::unique_ptr<ITensorRoPE> FP32Tensor::createRoPE()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createRoPE(this, dev_type);
     }
 
     std::unique_ptr<ITensorSwiGLU> FP32Tensor::createSwiGLU()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createSwiGLU(this, dev_type);
     }
 
     std::unique_ptr<ITensorSoftmax> FP32Tensor::createSoftmax()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createSoftmax(this, dev_type);
     }
 
     std::unique_ptr<ITensorRMSNorm> FP32Tensor::createRMSNorm()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createRMSNorm(this, dev_type);
     }
 
     std::unique_ptr<ITensorAttention> FP32Tensor::createAttention()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createAttention(this, dev_type);
     }
 
     std::unique_ptr<ITensorEmbedding> FP32Tensor::createEmbedding()
     {
         // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_idx_);
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_.toLegacyIndex());
         return llaminar::v2::kernels::KernelFactory::createEmbedding(this, dev_type);
     }
 
@@ -364,7 +374,7 @@ namespace llaminar2
         }
 
         int src_device = src->home_dm_device_index();
-        int dst_device = device_idx_;
+        int dst_device = device_.toLegacyIndex();
 
         // Determine transfer type
         bool cpu_to_cpu = (src_device == -1 && dst_device == -1);
@@ -487,7 +497,7 @@ namespace llaminar2
         // Create view using private constructor
         auto view_tensor = std::shared_ptr<FP32Tensor>(new FP32Tensor(
             new_shape,
-            device_idx_,
+            device_,
             root_data,
             root_offset,
             root_parent));

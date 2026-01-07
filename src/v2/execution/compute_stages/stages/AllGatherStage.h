@@ -25,8 +25,8 @@ namespace llaminar2
     public:
         struct Params
         {
-            TensorBase *local_input = nullptr;
-            TensorBase *full_output = nullptr;
+            ITensor *local_input = nullptr;
+            ITensor *full_output = nullptr;
             const MPIContext *mpi_ctx = nullptr; ///< MPI context (required)
             size_t actual_seq_len = 0;
         };

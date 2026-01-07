@@ -39,6 +39,7 @@ namespace llaminar2
         struct LayoutExpectation;
     }
     using verification::LayoutExpectation;
+    class ITensor;
     class TensorBase;
     class IKVCache;
     class IUnifiedKVCache;
@@ -165,7 +166,7 @@ namespace llaminar2
         struct WeightBuffer
         {
             const char *name = nullptr;
-            const TensorBase *tensor = nullptr;
+            const ITensor *tensor = nullptr;
             const void *raw_data = nullptr;
             size_t raw_size = 0;
             size_t rows = 0;
@@ -193,7 +194,7 @@ namespace llaminar2
             return *this;
         }
 
-        StageDumpInfo &addInput(const char *name, const TensorBase *tensor, size_t rows, size_t cols);
+        StageDumpInfo &addInput(const char *name, const ITensor *tensor, size_t rows, size_t cols);
 
         StageDumpInfo &addInputQ8_1(const char *name, const void *data, size_t rows, size_t cols)
         {
@@ -207,16 +208,16 @@ namespace llaminar2
             return *this;
         }
 
-        StageDumpInfo &addOutput(const char *name, const TensorBase *tensor, size_t rows, size_t cols);
+        StageDumpInfo &addOutput(const char *name, const ITensor *tensor, size_t rows, size_t cols);
 
-        StageDumpInfo &addWeight(const char *name, const TensorBase *tensor,
+        StageDumpInfo &addWeight(const char *name, const ITensor *tensor,
                                  size_t rows, size_t cols, const char *dtype)
         {
             weights.push_back({name, tensor, nullptr, 0, rows, cols, dtype});
             return *this;
         }
 
-        StageDumpInfo &addWeight(const char *name, const TensorBase *tensor);
+        StageDumpInfo &addWeight(const char *name, const ITensor *tensor);
 
         StageDumpInfo &addScalar(const char *name, double value, const char *dtype = "float")
         {
@@ -481,7 +482,7 @@ namespace llaminar2
          * @param name Tensor name (e.g., "A", "hidden_states")
          * @param tensor Tensor to trace
          */
-        void traceInput(const std::string &name, const TensorBase *tensor) const;
+        void traceInput(const std::string &name, const ITensor *tensor) const;
 
         /**
          * @brief Trace output tensor values (only if tracing enabled).
@@ -489,7 +490,7 @@ namespace llaminar2
          * @param name Tensor name (e.g., "C", "output")
          * @param tensor Tensor to trace
          */
-        void traceOutput(const std::string &name, const TensorBase *tensor) const;
+        void traceOutput(const std::string &name, const ITensor *tensor) const;
 
         /**
          * @brief Trace intermediate float array values.
@@ -527,7 +528,7 @@ namespace llaminar2
         struct TensorShapeContract
         {
             std::string name;             ///< Tensor name for error messages
-            const TensorBase *tensor;     ///< Tensor to validate
+            const ITensor *tensor;        ///< Tensor to validate
             std::vector<size_t> expected; ///< Expected shape dimensions
             bool allow_broadcast = false; ///< If true, trailing dims of 1 are OK
         };
@@ -555,14 +556,14 @@ namespace llaminar2
          * @param tensor Tensor to validate
          * @param expected Expected shape
          */
-        void validateShape(const std::string &tensor_name, const TensorBase *tensor,
+        void validateShape(const std::string &tensor_name, const ITensor *tensor,
                            const std::vector<size_t> &expected) const;
 
         /**
          * @brief Validate that two tensors have compatible shapes for matrix multiply
          */
-        void validateMatmulShapes(const std::string &a_name, const TensorBase *a,
-                                  const std::string &b_name, const TensorBase *b) const;
+        void validateMatmulShapes(const std::string &a_name, const ITensor *a,
+                                  const std::string &b_name, const ITensor *b) const;
 
     private:
         static bool shapesMatch(const std::vector<size_t> &actual,

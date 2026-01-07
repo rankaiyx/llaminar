@@ -190,8 +190,8 @@ namespace llaminar2
         // If weights are REPLICATED, each rank has the full weight and should use
         // the full head counts to avoid buffer/weight dimension mismatch.
         // =====================================================================
-        const bool weights_sharded = weight_mgr && 
-            (weight_mgr->strategy() == WeightDistributionStrategy::SHARDED);
+        const bool weights_sharded = weight_mgr &&
+                                     (weight_mgr->strategy() == WeightDistributionStrategy::SHARDED);
         if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded)
         {
             // Compute local head distribution
@@ -218,7 +218,7 @@ namespace llaminar2
             graph_config.local_n_heads = graph_config.n_heads;
             graph_config.local_n_kv_heads = graph_config.n_kv_heads;
             graph_config.qkv_column_parallel = false;
-            
+
             if (mpi_ctx && mpi_ctx->world_size() > 1 && !weights_sharded)
             {
                 LOG_WARN("[InferenceRunner] MPI world_size > 1 but weights are REPLICATED, "

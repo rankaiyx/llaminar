@@ -1249,7 +1249,7 @@ namespace llaminar2
         // Call the 3-parameter forward() with padded tokens
         // Note: forward() will set sequence_lengths[b] = padded_seq_len for all b
         const float *result = forward(flat_tokens.data(), padded_seq_len_, batch_size);
-        
+
         // Restore actual sequence lengths (forward() set them to padded_seq_len)
         // This is important for:
         // 1. Proper logits extraction (only extract non-padded logits)

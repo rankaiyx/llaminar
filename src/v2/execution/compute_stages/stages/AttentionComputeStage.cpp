@@ -79,6 +79,17 @@ namespace llaminar2
             return false;
         }
 
+        // Cast ITensor* to TensorBase* for CPU operations
+        auto *Q_base = requireTensorBase(params_.Q, "Q");
+        auto *K_base = requireTensorBase(params_.K, "K");
+        auto *V_base = requireTensorBase(params_.V, "V");
+        auto *output_base = requireTensorBase(params_.output, "output");
+        if (!Q_base || !K_base || !V_base || !output_base)
+        {
+            LOG_ERROR("[AttentionComputeStage] GPU tensors not yet supported");
+            return false;
+        }
+
         // Determine device type from context
         using DeviceType = llaminar::v2::kernels::DeviceType;
         DeviceType dev_type = DeviceType::CPU;
@@ -97,11 +108,11 @@ namespace llaminar2
         }
 
         // Create attention kernel via KernelFactory
-        auto kernel = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
+        auto kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_base, dev_type);
         if (!kernel)
         {
             LOG_ERROR("[AttentionComputeStage] Failed to create attention kernel for tensor type "
-                      << params_.Q->dtype_name());
+                      << Q_base->dtype_name());
             return false;
         }
 
@@ -121,7 +132,7 @@ namespace llaminar2
         // so it should attend to ALL kv_len positions. The kernel's "n > m" check would
         // only allow attending to position 0, which is wrong.
         std::unique_ptr<FP32Tensor> decode_mask;
-        TensorBase *mask_to_use = params_.workspace_mask;
+        TensorBase *mask_to_use = asTensorBase(params_.workspace_mask, "workspace_mask");
 
         const bool is_decode_mode = (mode == AttentionMode::DECODE ||
                                      (params_.seq_len < effective_kv_len && params_.batch_size == 1));
@@ -162,8 +173,11 @@ namespace llaminar2
         // double-masking (kernel would apply "n > m" on top of our mask)
         const bool kernel_causal = params_.causal && !is_decode_mode;
 
+        // Cast workspace_scores to TensorBase* (can be null)
+        auto *workspace_scores_base = asTensorBase(params_.workspace_scores, "workspace_scores");
+
         bool success = kernel->compute_tensor(
-            params_.Q, params_.K, params_.V, params_.output,
+            Q_base, K_base, V_base, output_base,
             params_.batch_size,
             params_.seq_len,
             effective_kv_len,
@@ -172,7 +186,7 @@ namespace llaminar2
             params_.head_dim,
             kernel_causal, // Pass false for decode (we built the mask explicitly)
             params_.window_size,
-            params_.workspace_scores,
+            workspace_scores_base,
             mask_to_use, // Use our decode mask if we built one
             params_.mpi_ctx,
             device_idx);
@@ -345,6 +359,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

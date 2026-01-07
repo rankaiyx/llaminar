@@ -57,9 +57,18 @@ namespace llaminar2
                                                        << " output_gate_type=" << params_.output_gate->dtype_name()
                                                        << " output_up_type=" << params_.output_up->dtype_name());
 
+        // Cast ITensor* to TensorBase* for KernelFactory
+        auto *w_gate_base = requireTensorBase(params_.w_gate, "w_gate");
+        auto *w_up_base = requireTensorBase(params_.w_up, "w_up");
+        if (!w_gate_base || !w_up_base)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] GPU tensors not yet supported");
+            return false;
+        }
+
         // Get cached kernels from KernelFactory (handles weight packing once)
-        auto *gemm_gate = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.w_gate);
-        auto *gemm_up = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(params_.w_up);
+        auto *gemm_gate = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(w_gate_base);
+        auto *gemm_up = llaminar::v2::kernels::KernelFactory::getOrCreateGemm(w_up_base);
 
         if (!gemm_gate || !gemm_up)
         {
@@ -76,6 +85,11 @@ namespace llaminar2
         {
             LOG_DEBUG("[FusedGateUpGEMMStage] Using multiply_tensor for Q8_1 output type dispatch");
 
+            // Cast tensors for multiply_tensor
+            auto *input_base = requireTensorBase(params_.input, "input");
+            auto *output_gate_base = asTensorBase(params_.output_gate, "output_gate");
+            auto *output_up_base = asTensorBase(params_.output_up, "output_up");
+
             // For Q8_1 outputs, we need to use multiply_tensor which handles the type-aware dispatch
             // This means we lose the fusion optimization, but Q8_1 output is more important
             // TODO: Implement fused multiply_tensor_multi for Q8_1 outputs
@@ -87,7 +101,7 @@ namespace llaminar2
 
             // Gate projection
             bool gate_ok = gemm_gate->multiply_tensor(
-                params_.input, params_.output_gate,
+                input_base, output_gate_base,
                 params_.m, params_.n_gate, params_.k,
                 false,      // transpose_B
                 1.0f, 0.0f, // alpha, beta
@@ -101,7 +115,7 @@ namespace llaminar2
 
             // Up projection
             bool up_ok = gemm_up->multiply_tensor(
-                params_.input, params_.output_up,
+                input_base, output_up_base,
                 params_.m, params_.n_up, params_.k,
                 false,      // transpose_B
                 1.0f, 0.0f, // alpha, beta
@@ -252,6 +266,5 @@ namespace llaminar2
 
         return reqs;
     }
-
 
 } // namespace llaminar2

@@ -23,9 +23,9 @@ namespace llaminar2
         struct Params
         {
             // Type-safe tensor pointers (required)
-            const TensorBase *gate = nullptr; ///< Gate tensor [seq_len, intermediate_dim]
-            const TensorBase *up = nullptr;   ///< Up tensor [seq_len, intermediate_dim]
-            TensorBase *output = nullptr;     ///< Output tensor [seq_len, intermediate_dim]
+            const ITensor *gate = nullptr; ///< Gate tensor [seq_len, intermediate_dim]
+            const ITensor *up = nullptr;   ///< Up tensor [seq_len, intermediate_dim]
+            ITensor *output = nullptr;     ///< Output tensor [seq_len, intermediate_dim]
 
             // Explicit seq_len override (for pre-allocated buffers)
             // If 0, derives from tensor dimensions
