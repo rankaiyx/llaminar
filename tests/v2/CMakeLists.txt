@@ -1046,6 +1046,19 @@ add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
     MPI_PROCS 1  # Cache invalidation tests, single rank
 )
 
+# Test: NUMATopology NUMA detection (local node, GPU affinity) - INTEGRATION (requires real GPUs)
+add_executable(v2_integration_numa_topology integration/Test__NUMATopology.cpp)
+target_link_libraries(v2_integration_numa_topology
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_NUMATopology
+    COMMAND $<TARGET_FILE:v2_integration_numa_topology>
+    LABELS "V2;Integration;NUMA;Topology;DeviceManagement;GPU"
+    MPI_PROCS 1  # NUMA topology tests, single rank
+)
+
 # Test: KernelFactory ops kernel creation (RMSNorm, SwiGLU, RoPE, Attention, Embedding, ResidualAdd)
 add_executable(v2_test_kernel_factory_ops unit/Test__KernelFactoryOps.cpp)
 target_link_libraries(v2_test_kernel_factory_ops

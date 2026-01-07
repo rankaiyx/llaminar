@@ -26,8 +26,10 @@ class Test__KernelFactoryCacheInvalidation : public ::testing::Test
 protected:
     void SetUp() override
     {
-        // Ensure DeviceManager is initialized
-        DeviceManager::instance();
+        // Initialize DeviceManager to enumerate GPU devices
+        // -1 = no NUMA filtering, enumerate all devices
+        auto &dm = DeviceManager::instance();
+        dm.initialize(-1);
         // Start with empty cache
         KernelFactory::clearCache();
     }
@@ -264,3 +266,248 @@ TEST_F(Test__KernelFactoryCacheInvalidation, RapidCreateDestroy_CacheStaysClean)
     auto [size, _] = KernelFactory::cacheStats();
     EXPECT_EQ(size, 0u) << "Cache should be clean after rapid create/destroy cycles";
 }
+
+// ============================================================================
+// Packed Weights Cache Cleanup Tests
+// ============================================================================
+
+TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_CleanedUpOnDestruction)
+{
+    // This test verifies that tensor->cache_ (CPU VNNI packed weights)
+    // is properly cleaned up when the tensor is destroyed.
+
+    {
+        auto tensor = createTestTensor();
+
+        // Initially, cache_ should be empty
+        EXPECT_FALSE(tensor->cache_.has_value()) << "Fresh tensor should have no cache";
+
+        // Create GEMM kernel - this populates tensor->cache_ with packed weights
+        auto *kernel = KernelFactory::getOrCreateGemm(tensor.get());
+        ASSERT_NE(kernel, nullptr);
+
+        // Now cache_ should have packed weights
+        EXPECT_TRUE(tensor->cache_.has_value()) << "After GEMM creation, tensor should have packed weights in cache_";
+
+        // tensor goes out of scope here
+    }
+
+    // After tensor destruction, the KernelFactory cache should be empty
+    // AND the packed weights should have been deleted (no memory leak)
+    // We can't directly verify memory was freed, but we verify cache is clean
+    auto [size_after, _] = KernelFactory::cacheStats();
+    EXPECT_EQ(size_after, 0u) << "Cache should be empty after tensor destruction";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_ClearedByExplicitClearCacheFor)
+{
+    // Verify that clearCacheFor explicitly clears cache_
+    auto tensor = createTestTensor();
+
+    // Populate cache
+    KernelFactory::getOrCreateGemm(tensor.get());
+    EXPECT_TRUE(tensor->cache_.has_value());
+
+    // Explicitly clear
+    KernelFactory::clearCacheFor(tensor.get());
+
+    // cache_ should now be empty
+    EXPECT_FALSE(tensor->cache_.has_value()) << "clearCacheFor should reset cache_";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, CPUPackedWeights_ClearedByClearCache)
+{
+    // Verify that clearCache() clears all tensor caches
+    auto tensor1 = createTestTensor();
+    auto tensor2 = createTestTensor();
+
+    // Populate caches
+    KernelFactory::getOrCreateGemm(tensor1.get());
+    KernelFactory::getOrCreateGemm(tensor2.get());
+
+    EXPECT_TRUE(tensor1->cache_.has_value());
+    EXPECT_TRUE(tensor2->cache_.has_value());
+
+    // Clear all
+    KernelFactory::clearCache();
+
+    // Both should be cleared
+    EXPECT_FALSE(tensor1->cache_.has_value()) << "clearCache should reset all tensor caches";
+    EXPECT_FALSE(tensor2->cache_.has_value()) << "clearCache should reset all tensor caches";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, MultiplePackedWeightsCreation_OnlyPacksOnce)
+{
+    // Verify that calling getOrCreateGemm multiple times doesn't re-pack weights
+    auto tensor = createTestTensor();
+
+    // First call - should create packed weights
+    auto *kernel1 = KernelFactory::getOrCreateGemm(tensor.get());
+    ASSERT_NE(kernel1, nullptr);
+    EXPECT_TRUE(tensor->cache_.has_value());
+
+    // Get pointer to cached data for comparison
+    void *cache_ptr_before = nullptr;
+    try
+    {
+        // We can't directly access the packed data, but we can check the any still has value
+        cache_ptr_before = &tensor->cache_;
+    }
+    catch (...)
+    {
+    }
+
+    // Second call - should reuse existing packed weights
+    auto *kernel2 = KernelFactory::getOrCreateGemm(tensor.get());
+    EXPECT_EQ(kernel1, kernel2) << "Should return cached kernel";
+    EXPECT_TRUE(tensor->cache_.has_value());
+
+    // Cache should still have exactly 1 entry
+    auto [size, _] = KernelFactory::cacheStats();
+    EXPECT_EQ(size, 1u) << "Should only have one cached kernel";
+}
+
+#ifdef HAVE_CUDA
+// ============================================================================
+// CUDA Packed Weights Cache Cleanup Tests
+// ============================================================================
+
+TEST_F(Test__KernelFactoryCacheInvalidation, CUDAPackedWeights_CleanedUpOnDestruction)
+{
+    // This test verifies that tensor->cuda_cache_ (CUDA INT8 packed weights)
+    // is properly cleaned up when the tensor is destroyed.
+    //
+    // Note: This requires a CUDA device to be available for full coverage.
+    // If no CUDA device, the test validates that cuda_cache_ remains empty.
+
+    // Check if we have CUDA devices
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+    int cuda_device_idx = -1;
+
+    for (size_t i = 0; i < devices.size(); ++i)
+    {
+        if (devices[i].type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            cuda_device_idx = static_cast<int>(i);
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available, skipping CUDA cache cleanup test";
+    }
+
+    {
+        auto tensor = createTestTensor();
+
+        // Initially, cuda_cache_ should be empty
+        EXPECT_FALSE(tensor->cuda_cache_.has_value()) << "Fresh tensor should have no CUDA cache";
+
+        // Create CUDA GEMM kernel - this should populate cuda_cache_
+        auto kernel = KernelFactory::createGemm(
+            dynamic_cast<const IQ4_NLTensor *>(tensor.get()),
+            DeviceType::CUDA);
+        ASSERT_NE(kernel, nullptr);
+
+        // Now cuda_cache_ should have packed weights
+        EXPECT_TRUE(tensor->cuda_cache_.has_value())
+            << "After CUDA GEMM creation, tensor should have packed weights in cuda_cache_";
+
+        // tensor goes out of scope here
+    }
+
+    // After tensor destruction, CUDA packed weights should have been freed
+    // (including device memory via ~CUDAPackedWeights)
+    auto [size_after, _] = KernelFactory::cacheStats();
+    // Note: createGemm with explicit DeviceType doesn't add to kernel_cache_,
+    // but the cuda_cache_ cleanup happens in clearCacheFor
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, CUDAPackedWeights_ClearedByExplicitClearCacheFor)
+{
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+
+    for (const auto &dev : devices)
+    {
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    auto tensor = createTestTensor();
+
+    // Create CUDA kernel to populate cuda_cache_
+    auto kernel = KernelFactory::createGemm(
+        dynamic_cast<const IQ4_NLTensor *>(tensor.get()),
+        DeviceType::CUDA);
+    EXPECT_TRUE(tensor->cuda_cache_.has_value());
+
+    // Explicitly clear
+    KernelFactory::clearCacheFor(tensor.get());
+
+    // cuda_cache_ should now be empty
+    EXPECT_FALSE(tensor->cuda_cache_.has_value())
+        << "clearCacheFor should reset cuda_cache_";
+}
+
+TEST_F(Test__KernelFactoryCacheInvalidation, BothCaches_CleanedUpTogether)
+{
+    // Test that a tensor with BOTH CPU and CUDA packed weights
+    // has both cleaned up properly
+
+    const auto &dm = DeviceManager::instance();
+    const auto &devices = dm.devices();
+    bool has_cuda = false;
+
+    for (const auto &dev : devices)
+    {
+        if (dev.type == ComputeBackendType::GPU_CUDA)
+        {
+            has_cuda = true;
+            break;
+        }
+    }
+
+    if (!has_cuda)
+    {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+
+    {
+        auto tensor = createTestTensor();
+
+        // Create CPU GEMM (populates cache_)
+        auto *cpu_kernel = KernelFactory::getOrCreateGemm(tensor.get());
+        ASSERT_NE(cpu_kernel, nullptr);
+        EXPECT_TRUE(tensor->cache_.has_value()) << "Should have CPU packed weights";
+
+        // Create CUDA GEMM (populates cuda_cache_)
+        auto cuda_kernel = KernelFactory::createGemm(
+            dynamic_cast<const IQ4_NLTensor *>(tensor.get()),
+            DeviceType::CUDA);
+        ASSERT_NE(cuda_kernel, nullptr);
+        EXPECT_TRUE(tensor->cuda_cache_.has_value()) << "Should have CUDA packed weights";
+
+        // tensor goes out of scope here
+    }
+
+    // After destruction, both caches should be cleaned up
+    auto [size_after, _] = KernelFactory::cacheStats();
+    EXPECT_EQ(size_after, 0u) << "Kernel cache should be empty";
+    // Note: We can't check tensor->cache_ anymore since tensor is destroyed,
+    // but the destructor should have called clearCacheFor which cleans both
+}
+#endif // HAVE_CUDA

@@ -2733,7 +2733,7 @@ namespace llaminar
                     }
                 }
 
-                // Also clean up tensor's packed weights cache if present
+                // Also clean up tensor's packed weights cache if present (CPU VNNI)
                 if (tensor->cache_.has_value())
                 {
                     try
@@ -2750,31 +2750,75 @@ namespace llaminar
                         // cache_ contains something else - leave it alone
                     }
                 }
+
+#ifdef HAVE_CUDA
+                // Also clean up tensor's CUDA packed weights cache if present
+                if (tensor->cuda_cache_.has_value())
+                {
+                    try
+                    {
+                        auto *cuda_packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
+                        if (cuda_packed_cache)
+                        {
+                            delete cuda_packed_cache; // ~CUDAPackedWeights frees device memory
+                            tensor->cuda_cache_.reset();
+                        }
+                    }
+                    catch (const std::bad_any_cast &)
+                    {
+                        // cuda_cache_ contains something else - leave it alone
+                    }
+                }
+#endif
             }
 
             void KernelFactory::clearCache()
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
 
-                // Clean up all tensor packed weights caches
+                // Clean up all tensor packed weights caches (CPU VNNI and CUDA INT8)
                 for (auto &pair : kernel_cache_)
                 {
                     const auto *tensor = pair.first;
-                    if (tensor && tensor->cache_.has_value())
+                    if (tensor)
                     {
-                        try
+                        // Clean up CPU packed weights
+                        if (tensor->cache_.has_value())
                         {
-                            auto *packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
-                            if (packed_cache)
+                            try
                             {
-                                delete packed_cache;
-                                tensor->cache_.reset();
+                                auto *packed_cache = std::any_cast<TensorPackedWeightsCache *>(tensor->cache_);
+                                if (packed_cache)
+                                {
+                                    delete packed_cache;
+                                    tensor->cache_.reset();
+                                }
+                            }
+                            catch (const std::bad_any_cast &)
+                            {
+                                // cache_ contains something else - leave it alone
                             }
                         }
-                        catch (const std::bad_any_cast &)
+
+#ifdef HAVE_CUDA
+                        // Clean up CUDA packed weights
+                        if (tensor->cuda_cache_.has_value())
                         {
-                            // cache_ contains something else - leave it alone
+                            try
+                            {
+                                auto *cuda_packed_cache = std::any_cast<TensorCUDAPackedWeightsCache *>(tensor->cuda_cache_);
+                                if (cuda_packed_cache)
+                                {
+                                    delete cuda_packed_cache; // ~CUDAPackedWeights frees device memory
+                                    tensor->cuda_cache_.reset();
+                                }
+                            }
+                            catch (const std::bad_any_cast &)
+                            {
+                                // cuda_cache_ contains something else - leave it alone
+                            }
                         }
+#endif
                     }
                 }
 

@@ -28,8 +28,11 @@
 #include <hip/hip_runtime.h>
 #endif
 
-// When both are enabled, we only use sysfs-based detection (no direct GPU API calls)
-// This avoids header conflicts while still providing NUMA information
+// When both are enabled, we use GPUEnumeration.h declarations to access
+// NUMA detection functions implemented in separate compilation units
+#if defined(HAVE_ROCM)
+#include "../backends/GPUEnumeration.h"
+#endif
 
 namespace llaminar2
 {
@@ -476,9 +479,9 @@ namespace llaminar2
 
     int NUMATopology::detectGPUViaROCmSMI(int rocm_device_id)
     {
-        // TODO: Implement ROCm SMI detection when library is available
-        // For now, return -1 (detection not supported)
-        return -1;
+        // Use the sysfs-based detection from ROCm enumeration
+        // This reads /sys/bus/pci/devices/<pci_addr>/numa_node using HIP properties
+        return rocm_enumeration::get_rocm_device_numa_node(rocm_device_id);
     }
 #endif
 

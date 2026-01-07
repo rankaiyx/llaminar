@@ -199,11 +199,37 @@ LLAMINAR_PROFILE_KERNELS=1 ./build_v2_release/llaminar2 --benchmark -m model.ggu
 
 ### Running Tests
 
+**CRITICAL: Test-to-Build Mapping**
+
+| Test Type | Build Directory | CTest Filter |
+|-----------|-----------------|--------------|
+| Unit tests (`V2_Unit_*`) | `build_v2` | `-R "^V2_Unit_"` |
+| Integration tests (`V2_Integration_*`) | `build_v2_integration` | `-R "^V2_Integration_"` |
+| E2E tests (`V2_E2E_*`) | `build_v2_e2e_release` | `-R "^V2_E2E_"` |
+| Performance tests (`V2_Perf_*`) | `build_v2_release` | `-R "^V2_Perf_"` |
+
+**CRITICAL: Never Limit Parallelism**
+
+Agents must NEVER artificially limit build or test parallelism:
+
 ```bash
-# Unit tests
+# ❌ WRONG - Do NOT limit parallelism
+cmake --build build_v2 -j8
+cmake --build build_v2 --parallel 4
+ctest --test-dir build_v2 -j4
+
+# ✅ CORRECT - Use full parallelism
+cmake --build build_v2 --parallel
+ctest --test-dir build_v2 --parallel
+```
+
+**Example Commands**:
+
+```bash
+# Unit tests (Debug build)
 ctest --test-dir build_v2 -R "^V2_Unit_" --output-on-failure --parallel
 
-# Integration tests (uses real model data, use Integration build for snapshots + backtraces)
+# Integration tests (Integration build - has snapshots + debug symbols)
 ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure
 
 # E2E parity tests that test Llaminar vs Pytorch
