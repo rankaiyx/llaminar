@@ -87,8 +87,8 @@ namespace llaminar2
             ASSERT_NE(cache, nullptr);
 
             // K/V tensors should have shape [max_seq_len, kv_dim]
-            const TensorBase *k = cache->get_k_base(0, 0);
-            const TensorBase *v = cache->get_v_base(0, 0);
+            const ITensor *k = cache->get_k(0, 0);
+            const ITensor *v = cache->get_v(0, 0);
 
             ASSERT_NE(k, nullptr);
             ASSERT_NE(v, nullptr);
@@ -171,8 +171,8 @@ namespace llaminar2
             ASSERT_NE(cache, nullptr);
 
             // K/V tensors should have reduced shape [max_seq_len, local_kv_dim]
-            const TensorBase *k = cache->get_k_base(0, 0);
-            const TensorBase *v = cache->get_v_base(0, 0);
+            const ITensor *k = cache->get_k(0, 0);
+            const ITensor *v = cache->get_v(0, 0);
 
             ASSERT_NE(k, nullptr);
             ASSERT_NE(v, nullptr);
@@ -214,8 +214,8 @@ namespace llaminar2
                 kNKVHeads, kLocalKVHeads, 0, kHeadDim, -1);
 
             // Get actual tensor sizes
-            const TensorBase *full_k = full_cache->get_k_base(0, 0);
-            const TensorBase *sharded_k = sharded_cache->get_k_base(0, 0);
+            const ITensor *full_k = full_cache->get_k(0, 0);
+            const ITensor *sharded_k = sharded_cache->get_k(0, 0);
 
             EXPECT_EQ(sharded_k->numel(), full_k->numel() / kWorldSize);
         }

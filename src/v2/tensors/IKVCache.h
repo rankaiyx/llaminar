@@ -15,7 +15,8 @@
 
 namespace llaminar2
 {
-    class TensorBase;
+    class CPUTensorBase;
+    using TensorBase = CPUTensorBase; // Backward compatibility alias
 
     /**
      * @brief Unified interface for KV cache implementations
@@ -110,40 +111,6 @@ namespace llaminar2
             (void)seq_idx;
             return nullptr;
         }
-
-        // =================================================================
-        // TensorBase Access (legacy, prefer ITensor interface above)
-        // =================================================================
-
-        /**
-         * @brief Get K cache tensor for a layer/sequence
-         *
-         * @deprecated Use get_k() instead for unified CPU/GPU access
-         *
-         * For CPU caches: returns the K tensor (non-null)
-         * For GPU caches: may return nullptr if not supported
-         *
-         * @param layer Layer index
-         * @param seq_idx Sequence index (default 0)
-         * @return K tensor or nullptr if not supported
-         */
-        virtual TensorBase *get_k_base(int layer, int seq_idx = 0) { return nullptr; }
-        virtual const TensorBase *get_k_base(int layer, int seq_idx = 0) const { return nullptr; }
-
-        /**
-         * @brief Get V cache tensor for a layer/sequence
-         *
-         * @deprecated Use get_v() instead for unified CPU/GPU access
-         *
-         * For CPU caches: returns the V tensor (non-null)
-         * For GPU caches: may return nullptr if not supported
-         *
-         * @param layer Layer index
-         * @param seq_idx Sequence index (default 0)
-         * @return V tensor or nullptr if not supported
-         */
-        virtual TensorBase *get_v_base(int layer, int seq_idx = 0) { return nullptr; }
-        virtual const TensorBase *get_v_base(int layer, int seq_idx = 0) const { return nullptr; }
 
         // =================================================================
         // Append Operations

@@ -42,7 +42,8 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class TensorBase;
+    class CPUTensorBase;
+    using TensorBase = CPUTensorBase; // Backward compatibility alias
     class IUnifiedKVCache;
     class ComputeGraph;
 

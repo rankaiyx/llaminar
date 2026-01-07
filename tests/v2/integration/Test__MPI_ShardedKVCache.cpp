@@ -129,8 +129,8 @@ namespace llaminar2
             // Check K/V tensor shapes on each rank
             for (int layer = 0; layer < kNumLayers; ++layer)
             {
-                const TensorBase *k = cache->get_k_base(layer, 0);
-                const TensorBase *v = cache->get_v_base(layer, 0);
+                const ITensor *k = cache->get_k(layer, 0);
+                const ITensor *v = cache->get_v(layer, 0);
 
                 ASSERT_NE(k, nullptr) << "K tensor null at layer " << layer << " on rank " << rank_;
                 ASSERT_NE(v, nullptr) << "V tensor null at layer " << layer << " on rank " << rank_;
@@ -256,7 +256,7 @@ namespace llaminar2
                 kHeadDim,
                 -1);
 
-            const TensorBase *k = cache->get_k_base(0, 0);
+            const ITensor *k = cache->get_k(0, 0);
             EXPECT_EQ(k->numel(), static_cast<size_t>(kMaxSeqLen * local_kv_dim_));
 
             // Gather total memory usage across ranks (for logging)

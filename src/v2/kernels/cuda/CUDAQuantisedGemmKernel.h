@@ -41,7 +41,8 @@
 namespace llaminar2
 {
     // Forward declarations
-    class TensorBase;
+    class CPUTensorBase;
+    using TensorBase = CPUTensorBase; // Backward compatibility alias
     class Q8_1Tensor;
     class FP32Tensor;
 

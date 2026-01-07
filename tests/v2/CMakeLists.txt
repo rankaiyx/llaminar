@@ -2489,6 +2489,18 @@ add_v2_test(V2_Unit_CUDATensorTransfer
     MPI_PROCS 1  # Tests GPU transfers locally, no MPI needed
 )
 
+# Test: CUDA Flash Attention Decode KV Length Bug (Bug fix validation)
+# Bug discovered 2026-01-07: compute() hardcoded kv_len = seq_len. For decode mode
+# with seq_len=1 but kv_len=7, GPU only attended to 1 token instead of 7.
+# Fix: Use compute_decode() which takes separate seq_len and kv_len parameters.
+add_executable(v2_unit_cuda_flash_attention_decode_kvlen unit/kernels/cuda/Test__CUDAFlashAttention_DecodeKVLen.cpp)
+target_link_libraries(v2_unit_cuda_flash_attention_decode_kvlen llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CUDAFlashAttention_DecodeKVLen
+    COMMAND $<TARGET_FILE:v2_unit_cuda_flash_attention_decode_kvlen>
+    LABELS "V2;Unit;CUDA;Attention;FlashAttention;FlashDecode;DecodeMode;KVCache;BugFix"
+    MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
+)
+
 # Test: cuBLAS GEMM (Phase 1 - dense GEMM via cuBLAS for FP32/FP16/BF16)
 # Tests correctness against CPU reference, various matrix sizes, transpose variants
 add_executable(v2_test_cublas_gemm unit/Test__CuBLASGemm.cpp)
@@ -2550,6 +2562,17 @@ add_v2_test(V2_Integration_CUDARingKVCacheParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_parity>
     LABELS "V2;Integration;CUDA;Parity;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;BF16"
     MPI_PROCS 1  # Tests GPU KV cache locally, no MPI needed
+)
+
+# Test: CUDA Full Model Inference
+# End-to-end GPU inference: model loading, forward pass, token prediction
+# Tests GPU vs CPU parity for prefill and decode
+add_executable(v2_integration_cuda_full_model_inference integration/Test__CUDAFullModelInference.cpp)
+target_link_libraries(v2_integration_cuda_full_model_inference llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAFullModelInference
+    COMMAND $<TARGET_FILE:v2_integration_cuda_full_model_inference>
+    LABELS "V2;Integration;CUDA;Parity;FullModel;Pipeline;Prefill;Decode;E2E"
+    MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
 )
 
 # Test: ComputeStage (device-agnostic kernel dispatch abstraction)

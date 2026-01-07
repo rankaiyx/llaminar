@@ -121,8 +121,21 @@ protected:
         config.max_seq_len = 512;
         config.activation_precision = ActivationPrecision::FP32;
 
-        // Create runner
-        result.runner = createInferenceRunner(result.model_ctx, nullptr, device_id, config);
+        // Convert DeviceId to device index
+        // CPU: use DeviceManager::instance().cpuDeviceIndex() (returns 0)
+        // GPU: use ordinal + 1 (GPU 0 -> index 1, GPU 1 -> index 2, etc.)
+        int device_idx;
+        if (device_id.is_cpu())
+        {
+            device_idx = DeviceManager::instance().cpuDeviceIndex();
+        }
+        else
+        {
+            // GPU ordinal to device index: GPU 0 -> 1, GPU 1 -> 2, etc.
+            device_idx = device_id.ordinal + 1;
+        }
+
+        result.runner = createInferenceRunner(result.model_ctx, nullptr, device_idx, config);
         return result;
     }
 
@@ -245,32 +258,45 @@ protected:
         std::vector<int> generated;
         generated.reserve(n_tokens);
 
-        // Initial forward pass with prompt
-        std::vector<int> context = prompt;
+        // Clear cache before starting generation
+        runner->clear_cache();
 
-        for (int i = 0; i < n_tokens; ++i)
+        // Prefill: forward pass with full prompt
+        runner->forward(prompt.data(), static_cast<int>(prompt.size()));
+
+        // Get first token prediction
+        int vocab_sz = runner->vocab_size();
+        const float *logits_ptr = runner->logits();
+        if (!logits_ptr)
         {
-            // Forward pass
-            runner->forward(context.data(), static_cast<int>(context.size()));
+            LOG_ERROR("Failed to get logits during prefill");
+            return generated;
+        }
+
+        // Greedy: select argmax
+        int next_token = static_cast<int>(
+            std::max_element(logits_ptr, logits_ptr + vocab_sz) - logits_ptr);
+        generated.push_back(next_token);
+
+        // Decode: forward pass with single new token at a time
+        for (int i = 1; i < n_tokens; ++i)
+        {
+            // Incremental decode: pass only the new token (seq_len=1)
+            runner->forward(&next_token, 1);
 
             // Get logits and vocab size
-            int vocab_sz = runner->vocab_size();
-            const float *logits_ptr = runner->logits();
+            logits_ptr = runner->logits();
             if (!logits_ptr)
             {
-                LOG_ERROR("Failed to get logits during generation");
+                LOG_ERROR("Failed to get logits during decode step " << i);
                 break;
             }
 
             // Greedy: select argmax
-            int next_token = static_cast<int>(
+            next_token = static_cast<int>(
                 std::max_element(logits_ptr, logits_ptr + vocab_sz) - logits_ptr);
 
             generated.push_back(next_token);
-            context.push_back(next_token);
-
-            // Reset KV cache position for decode
-            // (runner handles this internally)
         }
 
         return generated;
@@ -429,17 +455,6 @@ TEST_F(Test__CUDAFullModelInference, LongerPrompt_MatchesCPU)
 
 TEST_F(Test__CUDAFullModelInference, MultiTokenGeneration_MatchesCPU)
 {
-    // KNOWN LIMITATION: GPU decode (multi-token generation) requires GPU-native attention stage
-    // Currently, FusedAttentionWoStage requires TensorBase* (CPU tensors) but GPU KV cache
-    // returns CUDATensorBase* (GPU tensors). The dynamic_cast<TensorBase*> fails for GPU tensors.
-    //
-    // To fix this, we need either:
-    // 1. A GPU-native attention stage (CUDAFusedAttentionWoStage) that uses CUDAFlashAttentionKernelT
-    // 2. Or modify the existing stage to handle both CPU and GPU tensors via ITensor interface
-    //
-    // For now, skip this test until GPU attention is properly implemented.
-    GTEST_SKIP() << "GPU decode not yet supported - FusedAttentionWoStage requires TensorBase* "
-                 << "but GPU KV cache returns CUDATensorBase*";
 
     // Test that multi-token generation produces identical sequences
     DeviceId cpu_id = DeviceId::cpu();

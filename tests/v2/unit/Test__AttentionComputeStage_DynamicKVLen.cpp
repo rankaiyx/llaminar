@@ -65,7 +65,7 @@ namespace llaminar2
                 return cached_tokens_[layer];
             }
 
-            TensorBase *get_k_base(int layer, int seq_idx = 0) override
+            ITensor *get_k(int layer, int seq_idx = 0) override
             {
                 (void)seq_idx;
                 if (layer < 0 || layer >= num_layers_)
@@ -73,7 +73,7 @@ namespace llaminar2
                 return k_tensors_[layer].get();
             }
 
-            const TensorBase *get_k_base(int layer, int seq_idx = 0) const override
+            const ITensor *get_k(int layer, int seq_idx = 0) const override
             {
                 (void)seq_idx;
                 if (layer < 0 || layer >= num_layers_)
@@ -81,7 +81,7 @@ namespace llaminar2
                 return k_tensors_[layer].get();
             }
 
-            TensorBase *get_v_base(int layer, int seq_idx = 0) override
+            ITensor *get_v(int layer, int seq_idx = 0) override
             {
                 (void)seq_idx;
                 if (layer < 0 || layer >= num_layers_)
@@ -89,26 +89,12 @@ namespace llaminar2
                 return v_tensors_[layer].get();
             }
 
-            const TensorBase *get_v_base(int layer, int seq_idx = 0) const override
+            const ITensor *get_v(int layer, int seq_idx = 0) const override
             {
                 (void)seq_idx;
                 if (layer < 0 || layer >= num_layers_)
                     return nullptr;
                 return v_tensors_[layer].get();
-            }
-
-            std::shared_ptr<TensorBase> get_k(int layer, int seq_idx = 0) const override
-            {
-                (void)seq_idx;
-                (void)layer;
-                return nullptr; // Not needed for tests
-            }
-
-            std::shared_ptr<TensorBase> get_v(int layer, int seq_idx = 0) const override
-            {
-                (void)seq_idx;
-                (void)layer;
-                return nullptr; // Not needed for tests
             }
 
             bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v) override
@@ -266,10 +252,10 @@ namespace llaminar2
             kv_cache_->setCachedTokens(layer_idx, actual_kv_len);
 
             // Initialize K/V in cache with some values
-            TensorBase *K = kv_cache_->get_k_base(layer_idx, 0);
-            TensorBase *V = kv_cache_->get_v_base(layer_idx, 0);
-            float *k_data = static_cast<FP32Tensor *>(K)->mutable_data();
-            float *v_data = static_cast<FP32Tensor *>(V)->mutable_data();
+            ITensor *K = kv_cache_->get_k(layer_idx, 0);
+            ITensor *V = kv_cache_->get_v(layer_idx, 0);
+            float *k_data = dynamic_cast<FP32Tensor *>(K)->mutable_data();
+            float *v_data = dynamic_cast<FP32Tensor *>(V)->mutable_data();
             for (int i = 0; i < actual_kv_len * kKVDim; ++i)
             {
                 k_data[i] = 0.05f * static_cast<float>(i % 20);
@@ -400,10 +386,10 @@ namespace llaminar2
             }
 
             // Get K/V from cache and initialize
-            TensorBase *K = kv_cache_->get_k_base(layer_idx, 0);
-            TensorBase *V = kv_cache_->get_v_base(layer_idx, 0);
-            float *k_data = static_cast<FP32Tensor *>(K)->mutable_data();
-            float *v_data = static_cast<FP32Tensor *>(V)->mutable_data();
+            ITensor *K = kv_cache_->get_k(layer_idx, 0);
+            ITensor *V = kv_cache_->get_v(layer_idx, 0);
+            float *k_data = dynamic_cast<FP32Tensor *>(K)->mutable_data();
+            float *v_data = dynamic_cast<FP32Tensor *>(V)->mutable_data();
             for (int i = 0; i < seq_len * kKVDim; ++i)
             {
                 k_data[i] = 0.05f * static_cast<float>(i % 20);
@@ -459,10 +445,10 @@ namespace llaminar2
             const int initial_tokens = 4; // After prefill
 
             // Initialize K/V in cache
-            TensorBase *K = kv_cache_->get_k_base(layer_idx, 0);
-            TensorBase *V = kv_cache_->get_v_base(layer_idx, 0);
-            float *k_data = static_cast<FP32Tensor *>(K)->mutable_data();
-            float *v_data = static_cast<FP32Tensor *>(V)->mutable_data();
+            ITensor *K = kv_cache_->get_k(layer_idx, 0);
+            ITensor *V = kv_cache_->get_v(layer_idx, 0);
+            float *k_data = dynamic_cast<FP32Tensor *>(K)->mutable_data();
+            float *v_data = dynamic_cast<FP32Tensor *>(V)->mutable_data();
             for (size_t i = 0; i < K->numel(); ++i)
             {
                 k_data[i] = 0.05f * static_cast<float>(i % 20);
@@ -589,13 +575,13 @@ namespace llaminar2
 
             kv_cache_->setCachedTokens(layer_idx, kv_len);
 
-            TensorBase *K = kv_cache_->get_k_base(layer_idx, 0);
-            TensorBase *V = kv_cache_->get_v_base(layer_idx, 0);
+            ITensor *K = kv_cache_->get_k(layer_idx, 0);
+            ITensor *V = kv_cache_->get_v(layer_idx, 0);
 
             // Initialize K with distinct values per position so we can verify
             // attention is over all positions
-            float *k_data = static_cast<FP32Tensor *>(K)->mutable_data();
-            float *v_data = static_cast<FP32Tensor *>(V)->mutable_data();
+            float *k_data = dynamic_cast<FP32Tensor *>(K)->mutable_data();
+            float *v_data = dynamic_cast<FP32Tensor *>(V)->mutable_data();
             for (int pos = 0; pos < kv_len; ++pos)
             {
                 for (int d = 0; d < kKVDim; ++d)

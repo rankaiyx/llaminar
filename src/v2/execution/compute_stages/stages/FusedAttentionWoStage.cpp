@@ -161,8 +161,8 @@ namespace llaminar2
             if (params_.kv_cache && params_.layer_idx >= 0)
             {
                 // Always use cache for Q16_INTEGER - cache has properly typed Q16_1 tensors
-                k_tensor = params_.kv_cache->get_k_base(params_.layer_idx, 0);
-                v_tensor = params_.kv_cache->get_v_base(params_.layer_idx, 0);
+                k_tensor = dynamic_cast<TensorBase *>(params_.kv_cache->get_k(params_.layer_idx, 0));
+                v_tensor = dynamic_cast<TensorBase *>(params_.kv_cache->get_v(params_.layer_idx, 0));
                 LOG_DEBUG("[FusedAttentionWoStage] Q16_INTEGER using KV cache: K="
                           << (k_tensor ? k_tensor->dtype_name() : "null")
                           << " V=" << (v_tensor ? v_tensor->dtype_name() : "null"));

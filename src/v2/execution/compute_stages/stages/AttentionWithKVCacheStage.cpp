@@ -130,8 +130,8 @@ namespace llaminar2
         if (params_.kv_cache)
         {
             // Use cached K/V (will include all tokens including just-appended)
-            K_full = params_.kv_cache->get_k_base(params_.layer_idx, 0);
-            V_full = params_.kv_cache->get_v_base(params_.layer_idx, 0);
+            K_full = dynamic_cast<TensorBase *>(params_.kv_cache->get_k(params_.layer_idx, 0));
+            V_full = dynamic_cast<TensorBase *>(params_.kv_cache->get_v(params_.layer_idx, 0));
             kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
             LOG_DEBUG("[AttentionWithKVCacheStage] Using cached K/V with " << kv_len << " tokens");
         }
@@ -246,8 +246,8 @@ namespace llaminar2
         }
 
         // Step 2: Get full cached K/V
-        TensorBase *K_cached = params_.kv_cache->get_k_base(params_.layer_idx, 0);
-        TensorBase *V_cached = params_.kv_cache->get_v_base(params_.layer_idx, 0);
+        TensorBase *K_cached = dynamic_cast<TensorBase *>(params_.kv_cache->get_k(params_.layer_idx, 0));
+        TensorBase *V_cached = dynamic_cast<TensorBase *>(params_.kv_cache->get_v(params_.layer_idx, 0));
         int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
 
         LOG_DEBUG("[AttentionWithKVCacheStage::executeDecode] Attending to " << kv_len << " cached tokens");

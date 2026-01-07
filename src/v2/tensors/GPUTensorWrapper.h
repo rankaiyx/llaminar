@@ -21,8 +21,9 @@
 
 namespace llaminar2
 {
-    // Forward declaration - full TensorBase from Tensors.h
-    class TensorBase;
+    // Forward declaration - full CPUTensorBase from cpu/CPUTensors.h
+    class CPUTensorBase;
+    using TensorBase = CPUTensorBase; // Backward compatibility alias
 
     /**
      * @brief Tensor type enum (copied here for CUDA compatibility)

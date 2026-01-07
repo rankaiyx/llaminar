@@ -175,7 +175,7 @@ TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_Q16_1)
     EXPECT_EQ(cache->kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
 
     // Verify tensor shape matches HEAD_MAJOR: [n_kv_heads * max_seq_len, head_dim]
-    auto k_base = cache->get_k_base(0);
+    auto k_base = cache->get_k(0);
     ASSERT_NE(k_base, nullptr);
     EXPECT_EQ(k_base->rows(), 2u * 16u);  // n_kv_heads * max_seq_len
     EXPECT_EQ(k_base->cols(), 64u);       // head_dim
@@ -195,7 +195,7 @@ TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_FP32)
     EXPECT_EQ(cache->kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
 
     // Verify tensor shape
-    auto k_base = cache->get_k_base(0);
+    auto k_base = cache->get_k(0);
     ASSERT_NE(k_base, nullptr);
     EXPECT_EQ(k_base->rows(), 4u * 16u);  // n_kv_heads * max_seq_len
     EXPECT_EQ(k_base->cols(), 32u);       // head_dim
@@ -254,7 +254,7 @@ TEST_F(Test__UnifiedKVCache, ShardedFactory_ExplicitHeadMajor_Q16_1)
     EXPECT_EQ(cache->kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
 
     // Verify tensor shape for sharded HEAD_MAJOR: [local_n_kv_heads * max_seq_len, head_dim]
-    auto k_base = cache->get_k_base(0);
+    auto k_base = cache->get_k(0);
     ASSERT_NE(k_base, nullptr);
     EXPECT_EQ(k_base->rows(), 2u * 64u);  // local_n_kv_heads * max_seq_len
     EXPECT_EQ(k_base->cols(), 64u);       // head_dim
@@ -764,8 +764,8 @@ TEST_F(Test__UnifiedKVCache, Q16_1_PolymorphicInterface)
     EXPECT_EQ(cache->get_cached_tokens(0), 4);
 
     // Verify we can get base pointers
-    auto k_base = cache->get_k_base(0);
-    auto v_base = cache->get_v_base(0);
+    auto k_base = cache->get_k(0);
+    auto v_base = cache->get_v(0);
     ASSERT_NE(k_base, nullptr);
     ASSERT_NE(v_base, nullptr);
     EXPECT_EQ(k_base->native_type(), TensorType::Q16_1);
@@ -959,8 +959,8 @@ TEST_F(Test__UnifiedKVCache, BackwardCompatSingleSequence)
     EXPECT_EQ(cache.get_cached_tokens(0), 4);          // layer only
     EXPECT_NE(cache.get_k(0), nullptr);                // layer only
     EXPECT_NE(cache.get_v(0), nullptr);                // layer only
-    EXPECT_NE(cache.get_k_base(0), nullptr);           // layer only
-    EXPECT_NE(cache.get_v_base(0), nullptr);           // layer only
+    EXPECT_NE(cache.get_k(0), nullptr);           // layer only
+    EXPECT_NE(cache.get_v(0), nullptr);           // layer only
 
     cache.clear();
     EXPECT_EQ(cache.get_cached_tokens(0), 0);
@@ -977,7 +977,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_AutoSelectBlockSize_HeadDim64)
     UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 2, 1, 16, n_kv_heads, head_dim, -1);
 
     // Get the K tensor for layer 0 and verify block size
-    auto k_base = cache.get_k_base(0);
+    auto k_base = cache.get_k(0);
     ASSERT_NE(k_base, nullptr);
     EXPECT_EQ(k_base->native_type(), TensorType::Q16_1);
 
@@ -994,7 +994,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_AutoSelectBlockSize_HeadDim128)
     int n_kv_heads = 4;
     UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 2, 1, 16, n_kv_heads, head_dim, -1);
 
-    auto k_base = cache.get_k_base(0);
+    auto k_base = cache.get_k(0);
     ASSERT_NE(k_base, nullptr);
 
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_base);
@@ -1077,7 +1077,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockEvict_HeadDim64)
     EXPECT_EQ(cache.get_cached_tokens(0), 7);
 
     // Verify tensor still has correct block size
-    auto k_base = cache.get_k_base(0);
+    auto k_base = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_base);
     ASSERT_NE(k_q16, nullptr);
     EXPECT_EQ(k_q16->block_size(), 64);
@@ -1091,7 +1091,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_OneBlockPerHead)
 
     UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 16, n_kv_heads, head_dim, -1);
 
-    auto k_base = cache.get_k_base(0);
+    auto k_base = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_base);
     ASSERT_NE(k_q16, nullptr);
 
@@ -1122,7 +1122,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_FP32)
     EXPECT_EQ(cache.kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
 
     // Verify tensor allocation shape: [n_kv_heads * max_seq_len, head_dim]
-    auto k_base = cache.get_k_base(0);
+    auto k_base = cache.get_k(0);
     ASSERT_NE(k_base, nullptr);
     EXPECT_EQ(k_base->rows(), static_cast<size_t>(n_kv_heads * max_seq_len));
     EXPECT_EQ(k_base->cols(), static_cast<size_t>(head_dim));
@@ -1144,7 +1144,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_Q16_1)
     EXPECT_EQ(cache.kv_layout(), TensorLayout::KV_HEAD_POS_DIM);
 
     // Verify tensor allocation shape: [n_kv_heads * max_seq_len, head_dim]
-    auto k_base = cache.get_k_base(0);
+    auto k_base = cache.get_k(0);
     ASSERT_NE(k_base, nullptr);
     EXPECT_EQ(k_base->rows(), static_cast<size_t>(n_kv_heads * max_seq_len));
     EXPECT_EQ(k_base->cols(), static_cast<size_t>(head_dim));
@@ -1372,7 +1372,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Q16_1_DataIntegrity)
     EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
 
     // Verify HEAD_MAJOR storage
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 
@@ -1407,7 +1407,7 @@ TEST_F(Test__UnifiedKVCache, PositionMajorLayout_Default)
     EXPECT_EQ(cache.kv_layout(), TensorLayout::KV_POS_HEAD_DIM);
 
     // Verify tensor shape: [max_seq_len, n_kv_heads * head_dim]
-    auto k_base = cache.get_k_base(0);
+    auto k_base = cache.get_k(0);
     ASSERT_NE(k_base, nullptr);
     EXPECT_EQ(k_base->rows(), 16u);          // max_seq_len
     EXPECT_EQ(k_base->cols(), 4u * 32u);     // n_kv_heads * head_dim
@@ -1494,7 +1494,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_AppendAndVerify)
     EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
 
     // Verify HEAD_MAJOR storage
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 
@@ -1573,7 +1573,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_IncrementalDecode)
     }
 
     // Verify all tokens
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 
@@ -1648,7 +1648,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_EvictionPreservesData)
     EXPECT_EQ(cache.get_cached_tokens(0), 4);
 
     // Verify remaining tokens are positions 2-5 (originally t=2,3,4,5)
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 
@@ -1773,7 +1773,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
     EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
 
     // Verify HEAD_MAJOR storage - check all blocks are in correct positions
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 
@@ -1865,7 +1865,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_EvictionMultiBlockPerHead)
     EXPECT_EQ(cache.get_cached_tokens(0), 3);
 
     // Verify remaining tokens (originally t=2,3,4) are correctly shifted
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 
@@ -1942,7 +1942,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_AppendMultiBlockPerHead
     EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
 
     // Verify POSITION_MAJOR storage: data should be contiguous by position
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 
@@ -2015,7 +2015,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_EvictionMultiBlockPerHe
     cache.evict_oldest(2);
     EXPECT_EQ(cache.get_cached_tokens(0), 3);
 
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 
@@ -2086,7 +2086,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_FourKVHeads)
 
     ASSERT_TRUE(cache.append_kv(0, k.get(), v.get()));
 
-    auto k_cached = cache.get_k_base(0);
+    auto k_cached = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_cached);
     ASSERT_NE(k_q16, nullptr);
 

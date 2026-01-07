@@ -35,6 +35,7 @@
 #include "RegisterAllocation.h"
 #include <bitset>
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -476,7 +477,7 @@ namespace llaminar2::jit
                 std::cerr << debug_string() << "\n";
                 std::cerr << "╚══════════════════════════════════════════════════════════════════╝\n";
                 std::cerr.flush();
-                assert(false && "Raw accessor used on borrowed register - see error above");
+                std::abort(); // Use abort() instead of assert() for Integration builds
             }
         }
 
@@ -502,7 +503,7 @@ namespace llaminar2::jit
                 std::cerr << debug_string() << "\n";
                 std::cerr << "╚══════════════════════════════════════════════════════════════════╝\n";
                 std::cerr.flush();
-                assert(false && "Raw accessor used on borrowed register - see error above");
+                std::abort(); // Use abort() instead of assert() for Integration builds
             }
         }
 
@@ -561,7 +562,7 @@ namespace llaminar2::jit
                 std::cerr << debug_string();
                 std::cerr << "╚══════════════════════════════════════════════════════════════════╝\n";
                 std::cerr.flush();
-                assert(false && "Register conflict detected - see error message above");
+                std::abort(); // Use abort() instead of assert() for Integration builds
             }
             borrowed_.set(physical_index);
             borrower_names_[physical_index] = name;

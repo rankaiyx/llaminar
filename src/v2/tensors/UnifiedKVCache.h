@@ -98,14 +98,11 @@ namespace llaminar2
         // Per-sequence token tracking
         virtual int get_cached_tokens(int layer, int seq_idx = 0) const = 0;
 
-        // Polymorphic tensor access (returns base type)
-        virtual TensorBase *get_k_base(int layer, int seq_idx = 0) = 0;
-        virtual const TensorBase *get_k_base(int layer, int seq_idx = 0) const = 0;
-        virtual TensorBase *get_v_base(int layer, int seq_idx = 0) = 0;
-        virtual const TensorBase *get_v_base(int layer, int seq_idx = 0) const = 0;
-
-        virtual std::shared_ptr<TensorBase> get_k(int layer, int seq_idx = 0) const = 0;
-        virtual std::shared_ptr<TensorBase> get_v(int layer, int seq_idx = 0) const = 0;
+        // Polymorphic tensor access (returns ITensor* for unified CPU/GPU access)
+        virtual ITensor *get_k(int layer, int seq_idx = 0) = 0;
+        virtual const ITensor *get_k(int layer, int seq_idx = 0) const = 0;
+        virtual ITensor *get_v(int layer, int seq_idx = 0) = 0;
+        virtual const ITensor *get_v(int layer, int seq_idx = 0) const = 0;
 
         /**
          * @brief Append K/V to cache for a sequence
@@ -339,17 +336,13 @@ namespace llaminar2
 
         int get_cached_tokens(int layer, int seq_idx = 0) const override;
 
-        TensorBase *get_k_base(int layer, int seq_idx = 0) override;
-        const TensorBase *get_k_base(int layer, int seq_idx = 0) const override;
-        TensorBase *get_v_base(int layer, int seq_idx = 0) override;
-        const TensorBase *get_v_base(int layer, int seq_idx = 0) const override;
-
-        std::shared_ptr<TensorBase> get_k(int layer, int seq_idx = 0) const override;
-        std::shared_ptr<TensorBase> get_v(int layer, int seq_idx = 0) const override;
+        ITensor *get_k(int layer, int seq_idx = 0) override;
+        const ITensor *get_k(int layer, int seq_idx = 0) const override;
+        ITensor *get_v(int layer, int seq_idx = 0) override;
+        const ITensor *get_v(int layer, int seq_idx = 0) const override;
 
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v) override;
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens) override;
-
 
         // Bring in convenience methods from interface (would be hidden by overrides otherwise)
         using IUnifiedKVCache::append_kv;

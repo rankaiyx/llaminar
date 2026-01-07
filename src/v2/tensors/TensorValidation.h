@@ -37,7 +37,9 @@
 namespace llaminar2
 {
 
-#ifndef NDEBUG
+// Use LLAMINAR_ENABLE_ASSERTIONS to be consistent with Integration builds
+// which define NDEBUG but still want assertions active
+#if !defined(NDEBUG) || defined(LLAMINAR_ENABLE_ASSERTIONS)
 
     /**
      * @brief Check if a tensor appears to be uninitialized (all zeros)
@@ -190,7 +192,7 @@ namespace llaminar2
         }
     }
 
-#else // NDEBUG - Release mode: compile out validation
+#else // Release mode without LLAMINAR_ENABLE_ASSERTIONS: compile out validation
 
     inline bool tensorAppearsZero(const TensorBase *, size_t = 1000) { return false; }
     inline bool tensorHasNaNOrInf(const TensorBase *, size_t = 1000) { return false; }
@@ -199,6 +201,6 @@ namespace llaminar2
     inline void assertTensorValid(const TensorBase *, const std::string &,
                                   const std::string &) {}
 
-#endif // NDEBUG
+#endif // !defined(NDEBUG) || defined(LLAMINAR_ENABLE_ASSERTIONS)
 
 } // namespace llaminar2

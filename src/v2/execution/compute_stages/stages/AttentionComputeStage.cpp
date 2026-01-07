@@ -79,22 +79,20 @@ namespace llaminar2
             return false;
         }
 
-        // Cast ITensor* to TensorBase* for CPU operations
-        auto *Q_base = requireTensorBase(params_.Q, "Q");
-        auto *K_base = requireTensorBase(params_.K, "K");
-        auto *V_base = requireTensorBase(params_.V, "V");
-        auto *output_base = requireTensorBase(params_.output, "output");
-        if (!Q_base || !K_base || !V_base || !output_base)
-        {
-            LOG_ERROR("[AttentionComputeStage] GPU tensors not yet supported");
-            return false;
-        }
-
-        // Determine device type from context
+        // Determine device type: check tensor location FIRST, then fall back to context
         using DeviceType = llaminar::v2::kernels::DeviceType;
         DeviceType dev_type = DeviceType::CPU;
+        const bool is_gpu_tensor = params_.Q->is_on_gpu();
 
-        if (ctx)
+        if (is_gpu_tensor)
+        {
+#if defined(HAVE_CUDA)
+            dev_type = DeviceType::CUDA;
+#elif defined(HAVE_ROCM)
+            dev_type = DeviceType::ROCm;
+#endif
+        }
+        else if (ctx)
         {
             auto *gpu_ctx = dynamic_cast<IGPUDeviceContext *>(ctx);
             if (gpu_ctx)
@@ -107,12 +105,12 @@ namespace llaminar2
             }
         }
 
-        // Create attention kernel via KernelFactory
-        auto kernel = llaminar::v2::kernels::KernelFactory::createAttention(Q_base, dev_type);
+        // Create attention kernel via KernelFactory using ITensor* overload (supports both CPU and GPU)
+        auto kernel = llaminar::v2::kernels::KernelFactory::createAttention(params_.Q, dev_type);
         if (!kernel)
         {
             LOG_ERROR("[AttentionComputeStage] Failed to create attention kernel for tensor type "
-                      << Q_base->dtype_name());
+                      << params_.Q->dtype_name());
             return false;
         }
 
@@ -168,28 +166,90 @@ namespace llaminar2
                                                                                     << " seq_len=" << params_.seq_len << " kv_len=" << effective_kv_len);
         }
 
-        // Dispatch to kernel's compute_tensor() method with detected mode
+        // Dispatch to kernel's compute method
         // IMPORTANT: For decode with explicit mask, we pass causal=false to avoid
         // double-masking (kernel would apply "n > m" on top of our mask)
         const bool kernel_causal = params_.causal && !is_decode_mode;
 
-        // Cast workspace_scores to TensorBase* (can be null)
-        auto *workspace_scores_base = asTensorBase(params_.workspace_scores, "workspace_scores");
+        bool success = false;
 
-        bool success = kernel->compute_tensor(
-            Q_base, K_base, V_base, output_base,
-            params_.batch_size,
-            params_.seq_len,
-            effective_kv_len,
-            params_.n_heads,
-            params_.n_kv_heads,
-            params_.head_dim,
-            kernel_causal, // Pass false for decode (we built the mask explicitly)
-            params_.window_size,
-            workspace_scores_base,
-            mask_to_use, // Use our decode mask if we built one
-            params_.mpi_ctx,
-            device_idx);
+        if (is_gpu_tensor)
+        {
+            // GPU path: use raw pointers via ITensor interface
+            const float *Q_ptr = static_cast<const float *>(params_.Q->raw_data());
+            const float *K_ptr = static_cast<const float *>(params_.K->raw_data());
+            const float *V_ptr = static_cast<const float *>(params_.V->raw_data());
+            float *output_ptr = static_cast<float *>(params_.output->raw_mutable_data());
+
+            LOG_DEBUG("[AttentionComputeStage] GPU path: Q=" << (void *)Q_ptr
+                                                             << " K=" << (void *)K_ptr
+                                                             << " V=" << (void *)V_ptr
+                                                             << " output=" << (void *)output_ptr);
+
+            // For decode mode (seq_len != kv_len), use compute_decode()
+            // For prefill mode (seq_len == kv_len), use compute()
+            if (is_decode_mode)
+            {
+                // Use compute_decode() which properly handles different seq_len and kv_len
+                success = kernel->compute_decode(
+                    Q_ptr, K_ptr, V_ptr, output_ptr,
+                    params_.seq_len,
+                    effective_kv_len,
+                    params_.n_heads,
+                    params_.n_kv_heads,
+                    params_.head_dim,
+                    kernel_causal,
+                    params_.position_offset);
+            }
+            else
+            {
+                // Prefill: seq_len == kv_len, use standard compute()
+                success = kernel->compute(
+                    Q_ptr, K_ptr, V_ptr, output_ptr,
+                    params_.seq_len,
+                    params_.n_heads,
+                    params_.n_kv_heads,
+                    params_.head_dim,
+                    kernel_causal,
+                    params_.window_size,
+                    nullptr, nullptr, nullptr, nullptr, // workspaces not used for GPU flash attention
+                    false,
+                    params_.mpi_ctx,
+                    device_idx);
+            }
+        }
+        else
+        {
+            // CPU path: use TensorBase* via compute_tensor()
+            auto *Q_base = asTensorBase(params_.Q, "Q");
+            auto *K_base = asTensorBase(params_.K, "K");
+            auto *V_base = asTensorBase(params_.V, "V");
+            auto *output_base = asTensorBase(params_.output, "output");
+
+            if (!Q_base || !K_base || !V_base || !output_base)
+            {
+                LOG_ERROR("[AttentionComputeStage] CPU path requires TensorBase tensors");
+                return false;
+            }
+
+            // Cast workspace_scores to TensorBase* (can be null)
+            auto *workspace_scores_base = asTensorBase(params_.workspace_scores, "workspace_scores");
+
+            success = kernel->compute_tensor(
+                Q_base, K_base, V_base, output_base,
+                params_.batch_size,
+                params_.seq_len,
+                effective_kv_len,
+                params_.n_heads,
+                params_.n_kv_heads,
+                params_.head_dim,
+                kernel_causal, // Pass false for decode (we built the mask explicitly)
+                params_.window_size,
+                workspace_scores_base,
+                mask_to_use, // Use our decode mask if we built one
+                params_.mpi_ctx,
+                device_idx);
+        }
 
         if (!success)
         {

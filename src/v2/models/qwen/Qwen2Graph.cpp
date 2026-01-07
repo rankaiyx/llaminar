@@ -927,8 +927,8 @@ namespace llaminar2
             //
             // Note: Hybrid mode's main accuracy gain is from FP32 Q (via Q_rope) and
             // FP32 streaming dequant for Wo projection, not from FP32 K/V.
-            TensorBase *K_for_attn = buffers.K; // Default to Q8_1
-            TensorBase *V_for_attn = buffers.V; // Default to Q8_1
+            ITensor *K_for_attn = buffers.K; // Default to Q8_1
+            ITensor *V_for_attn = buffers.V; // Default to Q8_1
 
             // For decomposed attention path (FP32 or Hybrid without fused), use FP32 K/V if available
             // The fused attention path check below will override this for fused attention
@@ -956,8 +956,9 @@ namespace llaminar2
                 if (cached_tokens > 0 && batch_size == 1)
                 {
                     // Single-sequence decode: read K/V from cache
-                    K_for_attn = kv_cache->get_k_base(layer_idx, 0);
-                    V_for_attn = kv_cache->get_v_base(layer_idx, 0);
+                    // Use ITensor* directly (works for both CPU and GPU caches)
+                    K_for_attn = kv_cache->get_k(layer_idx, 0);
+                    V_for_attn = kv_cache->get_v(layer_idx, 0);
                     kv_len = cached_tokens;
                     LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using cached K/V (decode mode)");
                 }
@@ -1042,8 +1043,8 @@ namespace llaminar2
                 // FusedAttentionWoKernel only supports Q8_1 K/V currently
                 // For Hybrid mode, we use Q8_1 K/V for attention but store FP32 to cache
                 // Reset to Q8_1 K/V for fused attention path (overriding FP32 K/V if set above)
-                TensorBase *K_for_fused = buffers.K;
-                TensorBase *V_for_fused = buffers.V;
+                ITensor *K_for_fused = buffers.K;
+                ITensor *V_for_fused = buffers.V;
 
                 // HybridQ16 K precision fix: Use K_rope (post-RoPE Q16_1 with dynamic scale)
                 // instead of K (pre-RoPE Q16_1 from GEMM) for prefill
@@ -1065,8 +1066,9 @@ namespace llaminar2
                         // Note: In Hybrid mode, KV cache stores FP32 but fused kernel needs Q8_1
                         // This is a known limitation - Hybrid decode will fail until we add
                         // FP32 K/V support to FusedAttentionWoKernel
-                        K_for_fused = kv_cache->get_k_base(layer_idx, 0);
-                        V_for_fused = kv_cache->get_v_base(layer_idx, 0);
+                        // Use ITensor* directly (works for both CPU and GPU caches)
+                        K_for_fused = kv_cache->get_k(layer_idx, 0);
+                        V_for_fused = kv_cache->get_v(layer_idx, 0);
                     }
                 }
 

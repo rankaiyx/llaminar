@@ -119,6 +119,7 @@
 #include "../../../jit/RegisterEnforcement.h" // Enforce typed registers
 #include "../../../jit/RegisterGuard.h"       // Enforce guarded registers
 #include "v2/utils/CPUFeatures.h"             // Cache-aware batch size calculation
+#include "v2/tensors/TensorKernels.h"         // AttentionMode enum
 
 #include <memory>
 #include <cstdint>
@@ -132,26 +133,9 @@ namespace llaminar::v2::kernels::jit
     // Import typed register aliases for FA2 tile processing
     using namespace llaminar2::jit;
 
-    /**
-     * @brief Attention computation mode
-     *
-     * DECODE: Optimized for single-token generation (seq_len_q = 1)
-     *   - Loop order: Q → H → KV (current implementation)
-     *   - K/V cache loaded once per head per query
-     *   - Minimal memory overhead
-     *
-     * PREFILL: Optimized for multi-token processing (seq_len_q > 1)
-     *   - Loop order: Q_tile → H → KV → Q_inner (K/V cache reuse within tile)
-     *   - K/V cache loaded once per head per KV position, reused across queries in tile
-     *   - Higher memory overhead for per-query softmax state and context
-     *   - Better throughput for prefill workloads
-     */
-    enum class AttentionMode
-    {
-        DECODE,  // seq_len_q == 1, optimize for latency
-        PREFILL, // seq_len_q > 1, optimize for K/V cache reuse
-        AUTO     // Automatically select based on batch_size
-    };
+    // Use the unified AttentionMode from llaminar2 (TensorKernels.h)
+    // This provides: PREFILL, DECODE, BATCHED_DECODE, CHUNKED_PREFILL
+    using llaminar2::AttentionMode;
 
     /**
      * @brief Coarse work-size bucket for JIT specialization.
@@ -171,16 +155,16 @@ namespace llaminar::v2::kernels::jit
      */
     struct JitAttentionConfig
     {
-        int head_dim = 0;                         // Dimension per head (e.g., 64)
-        int num_heads = 0;                        // Number of Q heads (LOCAL heads for TP)
-        int num_kv_heads = 0;                     // Number of KV heads (GQA support)
-        int batch_size = 0;                       // Batch size (1 for decode, >1 for prefill)
-        int d_model = 0;                          // Output dimension for Wo (0 = auto from num_heads * head_dim)
-                                                  // For tensor parallelism: full model dim, not local
-        WoFormat wo_format = WoFormat::Q8_1;      // Output projection weight format
-        bool causal = true;                       // Whether to apply causal masking
-        AttentionMode mode = AttentionMode::AUTO; // Kernel mode selection
-        bool use_fa2_tiling = true;               // Enable FA2-style KV tile processing (4x batched)
+        int head_dim = 0;                           // Dimension per head (e.g., 64)
+        int num_heads = 0;                          // Number of Q heads (LOCAL heads for TP)
+        int num_kv_heads = 0;                       // Number of KV heads (GQA support)
+        int batch_size = 0;                         // Batch size (1 for decode, >1 for prefill)
+        int d_model = 0;                            // Output dimension for Wo (0 = auto from num_heads * head_dim)
+                                                    // For tensor parallelism: full model dim, not local
+        WoFormat wo_format = WoFormat::Q8_1;        // Output projection weight format
+        bool causal = true;                         // Whether to apply causal masking
+        AttentionMode mode = AttentionMode::DECODE; // Kernel mode selection (caller should set based on seq_len)
+        bool use_fa2_tiling = true;                 // Enable FA2-style KV tile processing (4x batched)
         enum class Fa2TileWidth : uint8_t
         {
             KV4 = 4,
@@ -330,16 +314,23 @@ namespace llaminar::v2::kernels::jit
         }
 
         /**
-         * @brief Get the effective mode based on batch_size
-         * @return DECODE if batch_size == 1, PREFILL otherwise
+         * @brief Get the effective mode
+         * @return The configured mode (DECODE or PREFILL)
+         * @note BATCHED_DECODE maps to DECODE, CHUNKED_PREFILL maps to PREFILL for JIT dispatch
          */
         AttentionMode effectiveMode() const
         {
-            if (mode == AttentionMode::AUTO)
+            // Map extended modes to basic DECODE/PREFILL for JIT kernel dispatch
+            switch (mode)
             {
-                return (batch_size <= 1) ? AttentionMode::DECODE : AttentionMode::PREFILL;
+            case AttentionMode::DECODE:
+            case AttentionMode::BATCHED_DECODE:
+                return AttentionMode::DECODE;
+            case AttentionMode::PREFILL:
+            case AttentionMode::CHUNKED_PREFILL:
+            default:
+                return AttentionMode::PREFILL;
             }
-            return mode;
         }
 
         bool operator==(const JitAttentionConfig &other) const

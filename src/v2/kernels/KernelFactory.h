@@ -79,7 +79,9 @@
 // Forward declarations
 namespace llaminar2
 {
-    class TensorBase;
+    class ITensor;
+    class CPUTensorBase;
+    using TensorBase = CPUTensorBase; // Backward compatibility alias
     class ITensorGemm;
     class ITensorRoPE;
     class ITensorSwiGLU;
@@ -673,6 +675,20 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
                     const llaminar2::TensorBase *tensor, DeviceType dev_type);
+
+                /**
+                 * @brief Create Attention kernel for any ITensor via device-aware dispatch
+                 *
+                 * For GPU tensors (is_on_gpu() == true), creates CUDAFlashAttentionKernelT.
+                 * For CPU tensors, delegates to the TensorBase* overload.
+                 *
+                 * @param tensor Input tensor (ITensor* - works with both CPU and GPU tensors)
+                 * @param dev_type Target device type
+                 * @return ITensorAttention implementation appropriate for the tensor type and device
+                 * @throws std::runtime_error if tensor type is unsupported
+                 */
+                static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
+                    const llaminar2::ITensor *tensor, DeviceType dev_type);
 
                 // ==========================================================================
                 // Cached GEMM Kernel API - Pack Once, Use Many

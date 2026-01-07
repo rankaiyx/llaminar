@@ -174,8 +174,8 @@ namespace llaminar2
                                       n_kv_heads, head_dim, -1);
 
             // Get the K and V tensors via the polymorphic interface (layer 0, seq 0)
-            const TensorBase *k_base = cache.get_k_base(0, 0);
-            const TensorBase *v_base = cache.get_v_base(0, 0);
+            const ITensor *k_base = cache.get_k(0, 0);
+            const ITensor *v_base = cache.get_v(0, 0);
             auto *k_tensor = dynamic_cast<const Q16_1Tensor *>(k_base);
             auto *v_tensor = dynamic_cast<const Q16_1Tensor *>(v_base);
 

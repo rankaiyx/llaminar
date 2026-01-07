@@ -1959,6 +1959,46 @@ namespace llaminar
                 }
             }
 
+            std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
+                const llaminar2::ITensor *tensor, DeviceType dev_type)
+            {
+                if (!tensor)
+                {
+                    throw std::runtime_error("KernelFactory::createAttention: null tensor");
+                }
+
+                // For GPU tensors, dispatch to CUDA Flash Attention directly
+                if (tensor->is_on_gpu())
+                {
+#ifdef HAVE_CUDA
+                    // GPU tensors use CUDAFlashAttentionKernelT based on native_type
+                    switch (tensor->native_type())
+                    {
+                    case llaminar2::TensorType::FP32:
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP32>>();
+                    case llaminar2::TensorType::FP16:
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::FP16>>();
+                    case llaminar2::TensorType::BF16:
+                        return std::make_unique<llaminar2::cuda::CUDAFlashAttentionKernelT<llaminar2::ActivationPrecision::BF16>>();
+                    default:
+                        throw std::runtime_error(
+                            "KernelFactory::createAttention: unsupported GPU tensor type " +
+                            std::string(tensor->dtype_name()));
+                    }
+#else
+                    throw std::runtime_error("KernelFactory::createAttention: GPU tensor but CUDA not available");
+#endif
+                }
+
+                // For CPU tensors, use existing TensorBase* dispatch
+                auto *cpu_tensor = dynamic_cast<const llaminar2::TensorBase *>(tensor);
+                if (!cpu_tensor)
+                {
+                    throw std::runtime_error("KernelFactory::createAttention: non-GPU ITensor must be TensorBase");
+                }
+                return createAttention(cpu_tensor, dev_type);
+            }
+
             // ==========================================================================
             // Attention Kernel Creation - Device-aware dispatch (typed overloads)
             // CPU fallback for GPU requests since GPU Attention kernels not yet implemented

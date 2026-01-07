@@ -506,12 +506,12 @@ namespace llaminar2
             // Explicitly specialize by mode (decode vs prefill) independent of batch_size.
             // In this pipeline kernel, batch_size is typically 1 for both decode and prefill.
             jit_config.mode = (params.seq_len <= 1)
-                                  ? llaminar::v2::kernels::jit::AttentionMode::DECODE
-                                  : llaminar::v2::kernels::jit::AttentionMode::PREFILL;
+                                  ? AttentionMode::DECODE
+                                  : AttentionMode::PREFILL;
 
             // Work-size bucketing: compile decode kernels for SMALL/LARGE/XL and swap.
             // Prefill currently uses a single generic bucket.
-            if (jit_config.mode == llaminar::v2::kernels::jit::AttentionMode::DECODE)
+            if (jit_config.mode == AttentionMode::DECODE)
             {
                 // ═══════════════════════════════════════════════════════════════════
                 // CACHE-AWARE WORK SIZE SELECTION
@@ -566,7 +566,7 @@ namespace llaminar2
             // so we don't pay the global cache mutex on every token.
             auto &slots = jit_slots_[static_cast<int>(wo_format)];
             std::unique_ptr<JitFusedAttentionWo> *slot_ptr = nullptr;
-            if (jit_config.mode == llaminar::v2::kernels::jit::AttentionMode::PREFILL)
+            if (jit_config.mode == AttentionMode::PREFILL)
             {
                 slot_ptr = &slots.prefill;
             }

@@ -36,7 +36,8 @@ namespace llaminar2
 
     // Forward declarations
     class MPIContext;
-    class TensorBase;
+    class CPUTensorBase;
+    using TensorBase = CPUTensorBase; // Backward compatibility alias
 
     // =========================================================================
     // Precision Metadata Traits (same pattern as CPUSoftmaxKernelT)

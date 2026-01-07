@@ -19,8 +19,9 @@
 namespace llaminar2
 {
     // Forward declarations
-    class TensorBase;
-    struct Q8_1Block; // For apply_q8_1() interface
+    class CPUTensorBase;
+    using TensorBase = CPUTensorBase; // Backward compatibility alias
+    struct Q8_1Block;                 // For apply_q8_1() interface
 
     // =============================================================================
     // Fused Operation Configuration
@@ -1357,7 +1358,7 @@ namespace llaminar2
         virtual int get_k() const { return 0; }
     };
 
-    class TensorBase;
+    // Note: TensorBase alias already declared at top of file
 
     // ==========================================================================
     // Attention Mode Detection
@@ -1519,6 +1520,37 @@ namespace llaminar2
             bool use_bf16 = false,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
+
+        /**
+         * @brief Compute decode attention with separate seq_len and kv_len
+         *
+         * Optimized for autoregressive decode (single new token attending to KV cache).
+         *
+         * @param Q Query tensor [seq_len, n_heads * head_dim] (typically seq_len=1)
+         * @param K Key tensor [kv_len, n_kv_heads * head_dim]
+         * @param V Value tensor [kv_len, n_kv_heads * head_dim]
+         * @param output Output tensor [seq_len, n_heads * head_dim]
+         * @param seq_len Query sequence length (typically 1 for decode)
+         * @param kv_len Key/value sequence length (accumulated from KV cache)
+         * @param n_heads Number of query heads
+         * @param n_kv_heads Number of key/value heads
+         * @param head_dim Dimension per head
+         * @param causal Apply causal masking
+         * @param position_offset Position offset for causal masking
+         * @return true on success
+         */
+        virtual bool compute_decode(
+            const float *Q, const float *K, const float *V, float *output,
+            int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
+            bool causal = true,
+            int position_offset = 0)
+        {
+            // Default implementation: fall back to compute() - will fail if kv_len != seq_len
+            (void)kv_len;
+            (void)position_offset;
+            return compute(Q, K, V, output, seq_len, n_heads, n_kv_heads, head_dim,
+                           causal, -1, nullptr, nullptr, nullptr, nullptr, false, nullptr, -1);
+        }
 
         /**
          * @brief Compute single-sequence Q8_1 native attention

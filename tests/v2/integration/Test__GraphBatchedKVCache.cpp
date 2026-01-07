@@ -183,8 +183,8 @@ protected:
             << test_name << ": Wrong cached_tokens for layer " << layer_idx
             << " seq " << seq_idx;
 
-        const float *k_base = cache->get_k_base(layer_idx, seq_idx)->data();
-        const float *v_base = cache->get_v_base(layer_idx, seq_idx)->data();
+        const float *k_base = cache->get_k(layer_idx, seq_idx)->data();
+        const float *v_base = cache->get_v(layer_idx, seq_idx)->data();
 
         // Verify each position's pattern
         for (int t = 0; t < expected_seq_len; ++t)
@@ -407,10 +407,10 @@ TEST_F(GraphBatchedKVCacheTest, BatchedPrefill_SequenceIsolation)
     ASSERT_TRUE(executeStage(stage.get()));
 
     // Verify isolation: seq 0 should have 1.0/2.0, seq 1 should have 100.0/200.0
-    const float *k0 = cache->get_k_base(0, 0)->data();
-    const float *v0 = cache->get_v_base(0, 0)->data();
-    const float *k1 = cache->get_k_base(0, 1)->data();
-    const float *v1 = cache->get_v_base(0, 1)->data();
+    const float *k0 = cache->get_k(0, 0)->data();
+    const float *v0 = cache->get_v(0, 0)->data();
+    const float *k1 = cache->get_k(0, 1)->data();
+    const float *v1 = cache->get_v(0, 1)->data();
 
     for (int t = 0; t < seq_len; ++t)
     {
@@ -544,10 +544,10 @@ TEST_F(GraphBatchedKVCacheTest, Sequential_vs_Batched_CacheParity)
 
     // --- Compare Results ---
     // Sequence 0 comparison
-    const float *seq_k0 = seq_cache->get_k_base(test_layer, 0)->data();
-    const float *seq_v0 = seq_cache->get_v_base(test_layer, 0)->data();
-    const float *batch_k0 = batch_cache->get_k_base(test_layer, 0)->data();
-    const float *batch_v0 = batch_cache->get_v_base(test_layer, 0)->data();
+    const float *seq_k0 = seq_cache->get_k(test_layer, 0)->data();
+    const float *seq_v0 = seq_cache->get_v(test_layer, 0)->data();
+    const float *batch_k0 = batch_cache->get_k(test_layer, 0)->data();
+    const float *batch_v0 = batch_cache->get_v(test_layer, 0)->data();
 
     int seq0_k_mismatches = 0, seq0_v_mismatches = 0;
     for (int t = 0; t < seq_len; ++t)
@@ -568,10 +568,10 @@ TEST_F(GraphBatchedKVCacheTest, Sequential_vs_Batched_CacheParity)
         << "Sequential vs Batched: Seq 0 V has " << seq0_v_mismatches << " mismatches";
 
     // Sequence 1 comparison
-    const float *seq_k1 = seq_cache->get_k_base(test_layer, 1)->data();
-    const float *seq_v1 = seq_cache->get_v_base(test_layer, 1)->data();
-    const float *batch_k1 = batch_cache->get_k_base(test_layer, 1)->data();
-    const float *batch_v1 = batch_cache->get_v_base(test_layer, 1)->data();
+    const float *seq_k1 = seq_cache->get_k(test_layer, 1)->data();
+    const float *seq_v1 = seq_cache->get_v(test_layer, 1)->data();
+    const float *batch_k1 = batch_cache->get_k(test_layer, 1)->data();
+    const float *batch_v1 = batch_cache->get_v(test_layer, 1)->data();
 
     int seq1_k_mismatches = 0, seq1_v_mismatches = 0;
     for (int t = 0; t < seq_len; ++t)
@@ -656,8 +656,8 @@ TEST_F(GraphBatchedKVCacheTest, KVCacheAppendStage_IncrementalDecodeAppend)
         << "Seq 1 should have " << num_decode_steps << " cached tokens";
 
     // Verify last appended data is correct for each sequence
-    const float *k0 = cache->get_k_base(test_layer, 0)->data();
-    const float *k1 = cache->get_k_base(test_layer, 1)->data();
+    const float *k0 = cache->get_k(test_layer, 0)->data();
+    const float *k1 = cache->get_k(test_layer, 1)->data();
 
     // Check last position (step = num_decode_steps - 1)
     int last_step = num_decode_steps - 1;

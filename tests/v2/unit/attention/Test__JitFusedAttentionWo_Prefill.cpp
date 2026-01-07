@@ -8,7 +8,7 @@
  * for K/V cache reuse optimization. Validates that:
  *
  * 1. Prefill kernel produces same output as decode kernel (functional parity)
- * 2. AttentionMode::AUTO correctly selects prefill for batch_size > 1
+ * 2. AttentionMode maps correctly (DECODE→DECODE, PREFILL→PREFILL, BATCHED_DECODE→DECODE, CHUNKED_PREFILL→PREFILL)
  * 3. Causal masking works correctly in prefill mode
  * 4. Various tile sizes work correctly (Q_TILE_SIZE boundary conditions)
  *
@@ -354,31 +354,31 @@ namespace llaminar::v2::kernels::jit::test
     // AttentionMode Selection Tests
     // ============================================================================
 
-    TEST_F(Test__JitFusedAttentionWo_Prefill, ModeSelection_AutoDecodeForBatch1)
+    TEST_F(Test__JitFusedAttentionWo_Prefill, ModeSelection_DecodeMapsToDecode)
     {
         JitAttentionConfig config;
         config.head_dim = 64;
         config.num_heads = 14;
         config.num_kv_heads = 2;
         config.batch_size = 1;
-        config.mode = AttentionMode::AUTO;
+        config.mode = AttentionMode::DECODE;
 
         EXPECT_EQ(config.effectiveMode(), AttentionMode::DECODE);
     }
 
-    TEST_F(Test__JitFusedAttentionWo_Prefill, ModeSelection_AutoPrefillForBatch8)
+    TEST_F(Test__JitFusedAttentionWo_Prefill, ModeSelection_PrefillMapsToPrefill)
     {
         JitAttentionConfig config;
         config.head_dim = 64;
         config.num_heads = 14;
         config.num_kv_heads = 2;
         config.batch_size = 8;
-        config.mode = AttentionMode::AUTO;
+        config.mode = AttentionMode::PREFILL;
 
         EXPECT_EQ(config.effectiveMode(), AttentionMode::PREFILL);
     }
 
-    TEST_F(Test__JitFusedAttentionWo_Prefill, ModeSelection_ExplicitOverridesAuto)
+    TEST_F(Test__JitFusedAttentionWo_Prefill, ModeSelection_ExplicitPrefillForBatch1)
     {
         JitAttentionConfig config;
         config.head_dim = 64;
