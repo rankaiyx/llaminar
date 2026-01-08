@@ -58,7 +58,7 @@ namespace llaminar2
     class ComputeGraph;
     class CPUTensorBase;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
-    class IUnifiedKVCache;
+    class ICPUKVCache;
     class MPIContext;
 
     /**
@@ -140,7 +140,7 @@ namespace llaminar2
         int position_offset = 0;     ///< Offset for decode mode (current position)
 
         // KV cache state
-        IUnifiedKVCache *kv_cache = nullptr; ///< KV cache (nullptr = no caching)
+        ICPUKVCache *kv_cache = nullptr; ///< KV cache (nullptr = no caching)
 
         // Device placement
         int device_idx = -1; ///< Target device (-1 = CPU)
@@ -244,7 +244,7 @@ namespace llaminar2
          */
         virtual ComputeGraph buildTransformerLayersGraph(
             TensorBase *input_hidden,
-            IUnifiedKVCache *kv_cache,
+            ICPUKVCache *kv_cache,
             const int *position_ids,
             int device_idx) = 0;
 
@@ -263,7 +263,7 @@ namespace llaminar2
         virtual ComputeGraph buildLayerGraph(
             int layer_idx,
             TensorBase *input_hidden,
-            IUnifiedKVCache *kv_cache,
+            ICPUKVCache *kv_cache,
             const int *position_ids,
             int device_idx) = 0;
 

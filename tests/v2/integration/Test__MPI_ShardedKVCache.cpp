@@ -18,7 +18,7 @@
 #include <vector>
 #include <iostream>
 
-#include "tensors/UnifiedKVCache.h"
+#include "tensors/CPUKVCache.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 
@@ -78,7 +78,7 @@ namespace llaminar2
         TEST_F(Test__MPI_ShardedKVCache, EachRankCreatesLocalShardedCache)
         {
             // Each rank creates its own sharded cache
-            auto cache = createShardedKVCache(
+            auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32,
                 *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
@@ -116,7 +116,7 @@ namespace llaminar2
 
         TEST_F(Test__MPI_ShardedKVCache, TensorShapesAreLocalOnEachRank)
         {
-            auto cache = createShardedKVCache(
+            auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32,
                 *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
@@ -156,7 +156,7 @@ namespace llaminar2
 
         TEST_F(Test__MPI_ShardedKVCache, AppendWorksIndependentlyOnEachRank)
         {
-            auto cache = createShardedKVCache(
+            auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32,
                 *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
@@ -205,7 +205,7 @@ namespace llaminar2
 
         TEST_F(Test__MPI_ShardedKVCache, ClearWorksIndependentlyOnEachRank)
         {
-            auto cache = createShardedKVCache(
+            auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32,
                 *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
@@ -248,7 +248,7 @@ namespace llaminar2
             EXPECT_EQ(sharded_memory_per_rank, full_memory_per_rank / world_size_);
 
             // Create sharded cache and verify tensor sizes
-            auto cache = createShardedKVCache(
+            auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32,
                 *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,
@@ -285,7 +285,7 @@ namespace llaminar2
 
             for (auto precision : precisions)
             {
-                auto cache = createShardedKVCache(
+                auto cache = createShardedCPUKVCache(
                     precision,
                     *mpi_ctx_,
                     kNumLayers, kBatchSize, kMaxSeqLen,
@@ -309,7 +309,7 @@ namespace llaminar2
 
         TEST_F(Test__MPI_ShardedKVCache, SequentialDecodeSimulation)
         {
-            auto cache = createShardedKVCache(
+            auto cache = createShardedCPUKVCache(
                 ActivationPrecision::FP32,
                 *mpi_ctx_,
                 kNumLayers, kBatchSize, kMaxSeqLen,

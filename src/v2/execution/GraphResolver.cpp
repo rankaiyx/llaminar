@@ -19,7 +19,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../tensors/Tensors.h"
-#include "../tensors/UnifiedKVCache.h"
+#include "../tensors/CPUKVCache.h"
 #include <stdexcept>
 #include <algorithm>
 
@@ -689,7 +689,7 @@ namespace llaminar2
             // KV cache is passed via opaque_params
             if (stage.opaque_params.count("kv_cache"))
             {
-                params.kv_cache = static_cast<IUnifiedKVCache *>(stage.opaque_params.at("kv_cache"));
+                params.kv_cache = static_cast<ICPUKVCache *>(stage.opaque_params.at("kv_cache"));
             }
             params.layer_idx = stage.int_params.count("layer_idx") ? stage.int_params.at("layer_idx") : 0;
             params.seq_idx = 0;

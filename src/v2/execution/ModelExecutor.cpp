@@ -152,7 +152,7 @@ namespace llaminar2
 
     bool ModelExecutor::executeTransformerLayers(
         TensorBase *hidden,
-        IUnifiedKVCache *kv_cache,
+        ICPUKVCache *kv_cache,
         const int *position_ids,
         int device_idx)
     {

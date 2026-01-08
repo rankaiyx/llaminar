@@ -1,11 +1,11 @@
 /**
- * @file UnifiedKVCache.cpp
+ * @file CPUKVCache.cpp
  * @brief Unified KV cache implementation
  * @author David Sanftenberg
  * @date December 2025
  */
 
-#include "../UnifiedKVCache.h"
+#include "../CPUKVCache.h"
 #include "../../utils/Logger.h"
 #include "../SIMDHelpers.h"
 #include <cstring>
@@ -20,7 +20,7 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    std::shared_ptr<FP32Tensor> UnifiedKVCache<ActivationPrecision::FP32>::allocate_tensor(
+    std::shared_ptr<FP32Tensor> CPUKVCache<ActivationPrecision::FP32>::allocate_tensor(
         size_t rows, size_t cols, int device_idx)
     {
         (void)device_idx;
@@ -28,28 +28,28 @@ namespace llaminar2
     }
 
     template <>
-    std::shared_ptr<BF16Tensor> UnifiedKVCache<ActivationPrecision::BF16>::allocate_tensor(
+    std::shared_ptr<BF16Tensor> CPUKVCache<ActivationPrecision::BF16>::allocate_tensor(
         size_t rows, size_t cols, int /* device_idx */)
     {
         return tensor_factory_->createBF16({rows, cols});
     }
 
     template <>
-    std::shared_ptr<FP16Tensor> UnifiedKVCache<ActivationPrecision::FP16>::allocate_tensor(
+    std::shared_ptr<FP16Tensor> CPUKVCache<ActivationPrecision::FP16>::allocate_tensor(
         size_t rows, size_t cols, int /* device_idx */)
     {
         return tensor_factory_->createFP16({rows, cols});
     }
 
     template <>
-    std::shared_ptr<Q8_1Tensor> UnifiedKVCache<ActivationPrecision::Q8_1>::allocate_tensor(
+    std::shared_ptr<Q8_1Tensor> CPUKVCache<ActivationPrecision::Q8_1>::allocate_tensor(
         size_t rows, size_t cols, int /* device_idx */)
     {
         return tensor_factory_->createQ8_1({rows, cols});
     }
 
     template <>
-    std::shared_ptr<Q16_1Tensor> UnifiedKVCache<ActivationPrecision::Q16_1>::allocate_tensor(
+    std::shared_ptr<Q16_1Tensor> CPUKVCache<ActivationPrecision::Q16_1>::allocate_tensor(
         size_t rows, size_t cols, int device_idx)
     {
         // Auto-select optimal Q16 block size based on head dimension for 1-block-per-head
@@ -63,7 +63,7 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::FP32>::copy_append_data(
+    void CPUKVCache<ActivationPrecision::FP32>::copy_append_data(
         FP32Tensor *dst, const FP32Tensor *src, int offset_tokens, int new_tokens)
     {
         float *dst_data = dst->mutable_data();
@@ -94,7 +94,7 @@ namespace llaminar2
     }
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::BF16>::copy_append_data(
+    void CPUKVCache<ActivationPrecision::BF16>::copy_append_data(
         BF16Tensor *dst, const BF16Tensor *src, int offset_tokens, int new_tokens)
     {
         uint16_t *dst_data = dst->mutable_typed_data();
@@ -123,7 +123,7 @@ namespace llaminar2
     }
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::FP16>::copy_append_data(
+    void CPUKVCache<ActivationPrecision::FP16>::copy_append_data(
         FP16Tensor *dst, const FP16Tensor *src, int offset_tokens, int new_tokens)
     {
         uint16_t *dst_data = dst->mutable_typed_data();
@@ -152,7 +152,7 @@ namespace llaminar2
     }
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::Q8_1>::copy_append_data(
+    void CPUKVCache<ActivationPrecision::Q8_1>::copy_append_data(
         Q8_1Tensor *dst, const Q8_1Tensor *src, int offset_tokens, int new_tokens)
     {
         Q8_1Block *dst_blocks = dst->mutable_typed_data();
@@ -189,7 +189,7 @@ namespace llaminar2
     }
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::Q16_1>::copy_append_data(
+    void CPUKVCache<ActivationPrecision::Q16_1>::copy_append_data(
         Q16_1Tensor *dst, const Q16_1Tensor *src, int offset_tokens, int new_tokens)
     {
         // Use tensor's actual block size for variable-size Q16 blocks
@@ -236,7 +236,7 @@ namespace llaminar2
     // =========================================================================
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::FP32>::shift_evict_data(
+    void CPUKVCache<ActivationPrecision::FP32>::shift_evict_data(
         FP32Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         float *data = tensor->mutable_data();
@@ -264,7 +264,7 @@ namespace llaminar2
     }
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::BF16>::shift_evict_data(
+    void CPUKVCache<ActivationPrecision::BF16>::shift_evict_data(
         BF16Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         uint16_t *data = tensor->mutable_typed_data();
@@ -290,7 +290,7 @@ namespace llaminar2
     }
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::FP16>::shift_evict_data(
+    void CPUKVCache<ActivationPrecision::FP16>::shift_evict_data(
         FP16Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         uint16_t *data = tensor->mutable_typed_data();
@@ -316,7 +316,7 @@ namespace llaminar2
     }
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::Q8_1>::shift_evict_data(
+    void CPUKVCache<ActivationPrecision::Q8_1>::shift_evict_data(
         Q8_1Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         Q8_1Block *blocks = tensor->mutable_typed_data();
@@ -346,7 +346,7 @@ namespace llaminar2
     }
 
     template <>
-    void UnifiedKVCache<ActivationPrecision::Q16_1>::shift_evict_data(
+    void CPUKVCache<ActivationPrecision::Q16_1>::shift_evict_data(
         Q16_1Tensor *tensor, int tokens_to_evict, int tokens_to_keep)
     {
         // Use tensor's actual block size for variable-size Q16 blocks
@@ -385,7 +385,7 @@ namespace llaminar2
     // =========================================================================
 
     template <ActivationPrecision Precision>
-    UnifiedKVCache<Precision>::UnifiedKVCache(
+    CPUKVCache<Precision>::CPUKVCache(
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, int device_idx, KVCacheLayoutMode layout_mode)
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
@@ -405,14 +405,14 @@ namespace llaminar2
             initialize_layer(layer, device_idx);
         }
 
-        LOG_DEBUG("UnifiedKVCache: n_layers=" << n_layers_ << ", batch_size=" << batch_size_
+        LOG_DEBUG("CPUKVCache: n_layers=" << n_layers_ << ", batch_size=" << batch_size_
                                               << ", max_seq_len=" << max_seq_len_ << ", kv_dim=" << kv_dim_
                                               << ", precision=" << static_cast<int>(Precision)
                                               << ", layout_mode=" << (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR"));
     }
 
     template <ActivationPrecision Precision>
-    UnifiedKVCache<Precision>::UnifiedKVCache(
+    CPUKVCache<Precision>::CPUKVCache(
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
         KVCacheLayoutMode layout_mode)
@@ -432,7 +432,7 @@ namespace llaminar2
         else
         {
             layer_devices_.resize(n_layers_, -1);
-            LOG_WARN("UnifiedKVCache: attention_devices size mismatch, defaulting all layers to CPU");
+            LOG_WARN("CPUKVCache: attention_devices size mismatch, defaulting all layers to CPU");
         }
 
         entries_.resize(n_layers_);
@@ -444,7 +444,7 @@ namespace llaminar2
             initialize_layer(layer, layer_devices_[layer]);
         }
 
-        LOG_DEBUG("UnifiedKVCache: n_layers=" << n_layers_ << ", batch_size=" << batch_size_
+        LOG_DEBUG("CPUKVCache: n_layers=" << n_layers_ << ", batch_size=" << batch_size_
                                               << ", max_seq_len=" << max_seq_len_ << ", kv_dim=" << kv_dim_
                                               << ", precision=" << static_cast<int>(Precision)
                                               << ", layout_mode=" << (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR")
@@ -456,7 +456,7 @@ namespace llaminar2
     // =========================================================================
 
     template <ActivationPrecision Precision>
-    UnifiedKVCache<Precision>::UnifiedKVCache(
+    CPUKVCache<Precision>::CPUKVCache(
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, int device_idx, KVCacheLayoutMode layout_mode)
@@ -477,7 +477,7 @@ namespace llaminar2
             initialize_layer(layer, device_idx);
         }
 
-        LOG_DEBUG("UnifiedKVCache (sharded): n_layers=" << n_layers_ << ", batch_size=" << batch_size_
+        LOG_DEBUG("CPUKVCache (sharded): n_layers=" << n_layers_ << ", batch_size=" << batch_size_
                                                         << ", max_seq_len=" << max_seq_len_
                                                         << ", n_kv_heads=" << n_kv_heads_
                                                         << ", local_n_kv_heads=" << local_n_kv_heads_
@@ -488,7 +488,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    UnifiedKVCache<Precision>::UnifiedKVCache(
+    CPUKVCache<Precision>::CPUKVCache(
         const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, const std::vector<int> &attention_devices,
@@ -509,7 +509,7 @@ namespace llaminar2
         else
         {
             layer_devices_.resize(n_layers_, -1);
-            LOG_WARN("UnifiedKVCache (sharded): attention_devices size mismatch, defaulting all layers to CPU");
+            LOG_WARN("CPUKVCache (sharded): attention_devices size mismatch, defaulting all layers to CPU");
         }
 
 
@@ -522,7 +522,7 @@ namespace llaminar2
             initialize_layer(layer, layer_devices_[layer]);
         }
 
-        LOG_DEBUG("UnifiedKVCache (sharded): n_layers=" << n_layers_ << ", batch_size=" << batch_size_
+        LOG_DEBUG("CPUKVCache (sharded): n_layers=" << n_layers_ << ", batch_size=" << batch_size_
                                                         << ", max_seq_len=" << max_seq_len_
                                                         << ", n_kv_heads=" << n_kv_heads_
                                                         << ", local_n_kv_heads=" << local_n_kv_heads_
@@ -534,7 +534,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    void UnifiedKVCache<Precision>::initialize_layer(int layer, int device_idx)
+    void CPUKVCache<Precision>::initialize_layer(int layer, int device_idx)
     {
         entries_[layer].resize(batch_size_);
 
@@ -568,7 +568,7 @@ namespace llaminar2
 
 
     template <ActivationPrecision Precision>
-    int UnifiedKVCache<Precision>::get_cached_tokens(int layer, int seq_idx) const
+    int CPUKVCache<Precision>::get_cached_tokens(int layer, int seq_idx) const
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -578,7 +578,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    ITensor *UnifiedKVCache<Precision>::get_k(int layer, int seq_idx)
+    ITensor *CPUKVCache<Precision>::get_k(int layer, int seq_idx)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -588,7 +588,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    const ITensor *UnifiedKVCache<Precision>::get_k(int layer, int seq_idx) const
+    const ITensor *CPUKVCache<Precision>::get_k(int layer, int seq_idx) const
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -598,7 +598,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    ITensor *UnifiedKVCache<Precision>::get_v(int layer, int seq_idx)
+    ITensor *CPUKVCache<Precision>::get_v(int layer, int seq_idx)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -608,7 +608,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    const ITensor *UnifiedKVCache<Precision>::get_v(int layer, int seq_idx) const
+    const ITensor *CPUKVCache<Precision>::get_v(int layer, int seq_idx) const
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -618,8 +618,8 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    std::shared_ptr<typename UnifiedKVCache<Precision>::TensorT>
-    UnifiedKVCache<Precision>::get_k_typed(int layer, int seq_idx) const
+    std::shared_ptr<typename CPUKVCache<Precision>::TensorT>
+    CPUKVCache<Precision>::get_k_typed(int layer, int seq_idx) const
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -634,8 +634,8 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    std::shared_ptr<typename UnifiedKVCache<Precision>::TensorT>
-    UnifiedKVCache<Precision>::get_v_typed(int layer, int seq_idx) const
+    std::shared_ptr<typename CPUKVCache<Precision>::TensorT>
+    CPUKVCache<Precision>::get_v_typed(int layer, int seq_idx) const
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -650,7 +650,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    int UnifiedKVCache<Precision>::get_layer_device(int layer) const
+    int CPUKVCache<Precision>::get_layer_device(int layer) const
     {
         if (layer < 0 || layer >= n_layers_)
         {
@@ -664,7 +664,7 @@ namespace llaminar2
     // =========================================================================
 
     template <ActivationPrecision Precision>
-    bool UnifiedKVCache<Precision>::append_kv(int layer, int seq_idx, const CPUTensorBase *new_k, const CPUTensorBase *new_v)
+    bool CPUKVCache<Precision>::append_kv(int layer, int seq_idx, const CPUTensorBase *new_k, const CPUTensorBase *new_v)
     {
         // Use tensor shape to determine token count
         if (!new_k || !new_v)
@@ -676,11 +676,11 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    bool UnifiedKVCache<Precision>::append_kv(int layer, int seq_idx, const CPUTensorBase *new_k, const CPUTensorBase *new_v, int num_tokens)
+    bool CPUKVCache<Precision>::append_kv(int layer, int seq_idx, const CPUTensorBase *new_k, const CPUTensorBase *new_v, int num_tokens)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
-            LOG_ERROR("UnifiedKVCache::append_kv: invalid layer=" << layer << " or seq_idx=" << seq_idx);
+            LOG_ERROR("CPUKVCache::append_kv: invalid layer=" << layer << " or seq_idx=" << seq_idx);
             return false;
         }
 
@@ -690,7 +690,7 @@ namespace llaminar2
 
         if (!typed_k || !typed_v)
         {
-            LOG_ERROR("UnifiedKVCache::append_kv: tensor type mismatch for layer " << layer);
+            LOG_ERROR("CPUKVCache::append_kv: tensor type mismatch for layer " << layer);
             return false;
         }
 
@@ -698,7 +698,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    bool UnifiedKVCache<Precision>::append_kv_typed(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v)
+    bool CPUKVCache<Precision>::append_kv_typed(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v)
     {
         if (!new_k || !new_v)
         {
@@ -709,13 +709,13 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    bool UnifiedKVCache<Precision>::append_kv_typed(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v, int num_tokens)
+    bool CPUKVCache<Precision>::append_kv_typed(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v, int num_tokens)
     {
         return append_kv_impl(layer, seq_idx, new_k, new_v, num_tokens);
     }
 
     template <ActivationPrecision Precision>
-    bool UnifiedKVCache<Precision>::append_kv_impl(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v, int num_tokens)
+    bool CPUKVCache<Precision>::append_kv_impl(int layer, int seq_idx, const TensorT *new_k, const TensorT *new_v, int num_tokens)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -728,7 +728,7 @@ namespace llaminar2
         // Check capacity
         if (current_tokens + num_tokens > max_seq_len_)
         {
-            LOG_ERROR("UnifiedKVCache: capacity exceeded for layer " << layer << " seq " << seq_idx
+            LOG_ERROR("CPUKVCache: capacity exceeded for layer " << layer << " seq " << seq_idx
                                                                      << " (current=" << current_tokens << " + new=" << num_tokens
                                                                      << " > max=" << max_seq_len_ << ")");
             return false;
@@ -740,7 +740,7 @@ namespace llaminar2
 
         entry.cached_tokens = current_tokens + num_tokens;
 
-        LOG_TRACE("UnifiedKVCache: layer " << layer << " seq " << seq_idx
+        LOG_TRACE("CPUKVCache: layer " << layer << " seq " << seq_idx
                                            << " appended " << num_tokens << " tokens (total=" << entry.cached_tokens << ")");
 
         return true;
@@ -751,7 +751,7 @@ namespace llaminar2
     // =========================================================================
 
     template <ActivationPrecision Precision>
-    void UnifiedKVCache<Precision>::clear()
+    void CPUKVCache<Precision>::clear()
     {
 // Parallelize clear across layers - simple scalar writes to independent locations
 #pragma omp parallel for schedule(static) if (n_layers_ >= 4)
@@ -762,11 +762,11 @@ namespace llaminar2
                 entries_[layer][seq_idx].cached_tokens = 0;
             }
         }
-        LOG_DEBUG("UnifiedKVCache: cleared all layers and sequences");
+        LOG_DEBUG("CPUKVCache: cleared all layers and sequences");
     }
 
     template <ActivationPrecision Precision>
-    void UnifiedKVCache<Precision>::clear_sequence(int seq_idx)
+    void CPUKVCache<Precision>::clear_sequence(int seq_idx)
     {
         if (seq_idx < 0 || seq_idx >= batch_size_)
         {
@@ -779,11 +779,11 @@ namespace llaminar2
         {
             entries_[layer][seq_idx].cached_tokens = 0;
         }
-        LOG_DEBUG("UnifiedKVCache: cleared sequence " << seq_idx);
+        LOG_DEBUG("CPUKVCache: cleared sequence " << seq_idx);
     }
 
     template <ActivationPrecision Precision>
-    void UnifiedKVCache<Precision>::clear_layer(int layer)
+    void CPUKVCache<Precision>::clear_layer(int layer)
     {
         if (layer < 0 || layer >= n_layers_)
         {
@@ -794,7 +794,7 @@ namespace llaminar2
         {
             entries_[layer][seq_idx].cached_tokens = 0;
         }
-        LOG_DEBUG("UnifiedKVCache: cleared layer " << layer);
+        LOG_DEBUG("CPUKVCache: cleared layer " << layer);
     }
 
     // =========================================================================
@@ -802,7 +802,7 @@ namespace llaminar2
     // =========================================================================
 
     template <ActivationPrecision Precision>
-    void UnifiedKVCache<Precision>::evict_oldest(int tokens_to_evict)
+    void CPUKVCache<Precision>::evict_oldest(int tokens_to_evict)
     {
 // Parallelize eviction across sequences for batched inference
 #pragma omp parallel for schedule(static) if (batch_size_ >= 4)
@@ -813,7 +813,7 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
-    void UnifiedKVCache<Precision>::evict_oldest_from_sequence(int seq_idx, int tokens_to_evict)
+    void CPUKVCache<Precision>::evict_oldest_from_sequence(int seq_idx, int tokens_to_evict)
     {
         if (seq_idx < 0 || seq_idx >= batch_size_ || tokens_to_evict <= 0)
         {
@@ -847,7 +847,7 @@ namespace llaminar2
 
         total_evicted_ += total_evicted_local;
 
-        LOG_DEBUG("UnifiedKVCache: evicted " << tokens_to_evict << " tokens from sequence " << seq_idx);
+        LOG_DEBUG("CPUKVCache: evicted " << tokens_to_evict << " tokens from sequence " << seq_idx);
     }
 
     // =========================================================================
@@ -855,19 +855,19 @@ namespace llaminar2
     // =========================================================================
 
     template <ActivationPrecision Precision>
-    int UnifiedKVCache<Precision>::gather_kv_batched(
+    int CPUKVCache<Precision>::gather_kv_batched(
         int layer, int num_sequences, CPUTensorBase *out_k, CPUTensorBase *out_v,
         std::vector<int> &out_kv_lens)
     {
         if (layer < 0 || layer >= n_layers_)
         {
-            LOG_ERROR("UnifiedKVCache::gather_kv_batched: invalid layer=" << layer);
+            LOG_ERROR("CPUKVCache::gather_kv_batched: invalid layer=" << layer);
             return -1;
         }
 
         if (num_sequences > batch_size_)
         {
-            LOG_ERROR("UnifiedKVCache::gather_kv_batched: num_sequences=" << num_sequences
+            LOG_ERROR("CPUKVCache::gather_kv_batched: num_sequences=" << num_sequences
                                                                           << " > batch_size=" << batch_size_);
             return -1;
         }
@@ -877,7 +877,7 @@ namespace llaminar2
         TensorT *typed_v = dynamic_cast<TensorT *>(out_v);
         if (!typed_k || !typed_v)
         {
-            LOG_ERROR("UnifiedKVCache::gather_kv_batched: output tensor type mismatch");
+            LOG_ERROR("CPUKVCache::gather_kv_batched: output tensor type mismatch");
             return -1;
         }
 
@@ -895,7 +895,7 @@ namespace llaminar2
 
         if (max_kv_len == 0)
         {
-            LOG_DEBUG("UnifiedKVCache::gather_kv_batched: all sequences have 0 cached tokens");
+            LOG_DEBUG("CPUKVCache::gather_kv_batched: all sequences have 0 cached tokens");
             return 0;
         }
 
@@ -904,14 +904,14 @@ namespace llaminar2
         size_t expected_cols = kv_dim_;
         if (typed_k->shape()[0] < expected_rows || typed_k->shape()[1] != expected_cols)
         {
-            LOG_ERROR("UnifiedKVCache::gather_kv_batched: out_k shape mismatch. Expected at least ["
+            LOG_ERROR("CPUKVCache::gather_kv_batched: out_k shape mismatch. Expected at least ["
                       << expected_rows << ", " << expected_cols << "], got ["
                       << typed_k->shape()[0] << ", " << typed_k->shape()[1] << "]");
             return -1;
         }
         if (typed_v->shape()[0] < expected_rows || typed_v->shape()[1] != expected_cols)
         {
-            LOG_ERROR("UnifiedKVCache::gather_kv_batched: out_v shape mismatch");
+            LOG_ERROR("CPUKVCache::gather_kv_batched: out_v shape mismatch");
             return -1;
         }
 
@@ -1022,7 +1022,7 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("UnifiedKVCache::gather_kv_batched: layer " << layer
+        LOG_DEBUG("CPUKVCache::gather_kv_batched: layer " << layer
                                                               << ", gathered " << num_sequences << " sequences, max_kv_len=" << max_kv_len);
 
         return max_kv_len;
@@ -1032,17 +1032,17 @@ namespace llaminar2
     // Explicit Template Instantiations
     // =========================================================================
 
-    template class UnifiedKVCache<ActivationPrecision::FP32>;
-    template class UnifiedKVCache<ActivationPrecision::BF16>;
-    template class UnifiedKVCache<ActivationPrecision::FP16>;
-    template class UnifiedKVCache<ActivationPrecision::Q8_1>;
-    template class UnifiedKVCache<ActivationPrecision::Q16_1>;
+    template class CPUKVCache<ActivationPrecision::FP32>;
+    template class CPUKVCache<ActivationPrecision::BF16>;
+    template class CPUKVCache<ActivationPrecision::FP16>;
+    template class CPUKVCache<ActivationPrecision::Q8_1>;
+    template class CPUKVCache<ActivationPrecision::Q16_1>;
 
     // =========================================================================
     // Factory Functions
     // =========================================================================
 
-    std::unique_ptr<IUnifiedKVCache> createUnifiedKVCache(
+    std::unique_ptr<ICPUKVCache> createCPUKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
@@ -1052,22 +1052,22 @@ namespace llaminar2
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
+            return std::make_unique<CPUKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         case ActivationPrecision::BF16:
-            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
+            return std::make_unique<CPUKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         case ActivationPrecision::FP16:
-            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
+            return std::make_unique<CPUKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         case ActivationPrecision::Q8_1:
-            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
+            return std::make_unique<CPUKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         case ActivationPrecision::Q16_1:
-            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
+            return std::make_unique<CPUKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_idx, layout_mode);
         default:
-            LOG_ERROR("createUnifiedKVCache: unsupported precision " << static_cast<int>(precision));
+            LOG_ERROR("createCPUKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
         }
     }
 
-    std::unique_ptr<IUnifiedKVCache> createUnifiedKVCache(
+    std::unique_ptr<ICPUKVCache> createCPUKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
@@ -1077,17 +1077,17 @@ namespace llaminar2
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPUKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::BF16:
-            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPUKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::FP16:
-            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPUKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q8_1:
-            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPUKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q16_1:
-            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPUKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         default:
-            LOG_ERROR("createUnifiedKVCache: unsupported precision " << static_cast<int>(precision));
+            LOG_ERROR("createCPUKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
         }
     }
@@ -1096,7 +1096,7 @@ namespace llaminar2
     // Sharded Factory Functions (for Tensor Parallelism)
     // =========================================================================
 
-    std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+    std::unique_ptr<ICPUKVCache> createShardedCPUKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
@@ -1106,27 +1106,27 @@ namespace llaminar2
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         case ActivationPrecision::BF16:
-            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         case ActivationPrecision::FP16:
-            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         case ActivationPrecision::Q8_1:
-            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         case ActivationPrecision::Q16_1:
-            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                          n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device_idx, layout_mode);
         default:
-            LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
+            LOG_ERROR("createShardedCPUKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
         }
     }
 
-    std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+    std::unique_ptr<ICPUKVCache> createShardedCPUKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
@@ -1137,22 +1137,22 @@ namespace llaminar2
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            return std::make_unique<UnifiedKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::BF16:
-            return std::make_unique<UnifiedKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::FP16:
-            return std::make_unique<UnifiedKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q8_1:
-            return std::make_unique<UnifiedKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q16_1:
-            return std::make_unique<UnifiedKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
+            return std::make_unique<CPUKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                          n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         default:
-            LOG_ERROR("createShardedKVCache: unsupported precision " << static_cast<int>(precision));
+            LOG_ERROR("createShardedCPUKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
         }
     }

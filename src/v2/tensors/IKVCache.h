@@ -2,7 +2,7 @@
  * @file IKVCache.h
  * @brief Unified KV cache interface for CPU and GPU implementations
  *
- * This interface abstracts the common operations between CPU (UnifiedKVCache)
+ * This interface abstracts the common operations between CPU (CPUKVCache)
  * and GPU (CUDARingKVCache) implementations, allowing stages to work with
  * either cache type through a single pointer.
  */
@@ -21,7 +21,7 @@ namespace llaminar2
     /**
      * @brief Unified interface for KV cache implementations
      *
-     * Both CPU (IUnifiedKVCache) and GPU (ICUDARingKVCache) caches inherit
+     * Both CPU (ICPUKVCache) and GPU (ICUDARingKVCache) caches inherit
      * from this interface. Stages that only need to query cache state or
      * append data can use IKVCache* without knowing the underlying implementation.
      */

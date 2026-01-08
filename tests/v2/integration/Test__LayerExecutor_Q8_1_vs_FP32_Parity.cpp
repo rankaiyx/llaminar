@@ -30,7 +30,7 @@
 #include "v2/execution/GraphOrchestrator.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
-#include "v2/tensors/UnifiedKVCache.h"
+#include "v2/tensors/CPUKVCache.h"
 #include "v2/tensors/SIMDHelpers.h"
 #include "v2/backends/ComputeBackend.h"
 #include "v2/loaders/ModelLoader.h"
@@ -522,7 +522,7 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FullLayerParity)
 
     // Create KV caches for both precision modes
     // KV cache is always FP32 for attention computation
-    auto fp32_kv_cache = std::make_unique<UnifiedKVCache<ActivationPrecision::FP32>>(
+    auto fp32_kv_cache = std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
         *mpi_ctx_,   // MPI context
         1,           // num_layers (testing single layer)
         1,           // batch_size
@@ -532,7 +532,7 @@ TEST_F(Test__LayerExecutor_Q8_1_vs_FP32_Parity, FullLayerParity)
         device_idx_  // device_idx
     );
 
-    auto q8_1_kv_cache = std::make_unique<UnifiedKVCache<ActivationPrecision::FP32>>(
+    auto q8_1_kv_cache = std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
         *mpi_ctx_,   // MPI context
         1,           // num_layers (testing single layer)
         1,           // batch_size

@@ -9,7 +9,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorVerification.h"
-#include "../../../tensors/UnifiedKVCache.h"
+#include "../../../tensors/CPUKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/cpu/attention/q8_1/FusedAttentionWoKernel.h"

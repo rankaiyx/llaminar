@@ -50,7 +50,7 @@
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "tensors/TensorFactory.h"
-#include "tensors/UnifiedKVCache.h"
+#include "tensors/CPUKVCache.h"
 
 using namespace llaminar2;
 

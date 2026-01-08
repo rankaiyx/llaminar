@@ -44,7 +44,7 @@ namespace llaminar2
     // Forward declarations
     class CPUTensorBase;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
-    class IUnifiedKVCache;
+    class ICPUKVCache;
     class ComputeGraph;
 
     // =========================================================================
@@ -179,7 +179,7 @@ namespace llaminar2
         std::unordered_map<std::string, TensorBase *> buffers;
 
         /// KV cache (optional)
-        IUnifiedKVCache *kv_cache = nullptr;
+        ICPUKVCache *kv_cache = nullptr;
 
         /// Position IDs pointer
         const int *position_ids = nullptr;

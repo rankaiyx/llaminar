@@ -24,7 +24,7 @@ namespace llaminar2
     // Forward declarations
     class CPUTensorBase;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
-    class IUnifiedKVCache;
+    class ICPUKVCache;
     struct Qwen2LayerWeights;
     struct Qwen2ActivationBuffers;
 
@@ -46,7 +46,7 @@ namespace llaminar2
         int seq_len = 0;                     ///< Sequence length per batch
         int position_offset = 0;             ///< KV cache position offset (legacy fallback)
         int device_idx = 0;                  ///< Target device index
-        IUnifiedKVCache *kv_cache = nullptr; ///< KV cache (optional)
+        ICPUKVCache *kv_cache = nullptr; ///< KV cache (optional)
 
         virtual ~ForwardInput() = default;
     };
@@ -72,7 +72,7 @@ namespace llaminar2
         int batch_size = 1;                  ///< Batch size (number of sequences)
         int device_idx = 0;                  ///< Target device
         const int *position_ids = nullptr;   ///< Position IDs for RoPE
-        IUnifiedKVCache *kv_cache = nullptr; ///< KV cache
+        ICPUKVCache *kv_cache = nullptr; ///< KV cache
         /// Sequence lengths for variable-length batching (nullptr = all equal)
         const std::vector<int> *sequence_lengths = nullptr;
     };

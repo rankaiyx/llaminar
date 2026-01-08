@@ -15,10 +15,6 @@
 #include <numaif.h>
 #endif
 
-#ifdef HAVE_CUDA
-#include "cuda/CUDATypedTensor.h"
-#endif
-
 namespace llaminar2
 {
     TensorFactory::TensorFactory(const MPIContext &mpi_ctx)
@@ -34,36 +30,19 @@ namespace llaminar2
         }
     }
 
-    std::unique_ptr<FP32Tensor> TensorFactory::createFP32(const std::vector<size_t> &shape, DeviceId device)
+    std::unique_ptr<FP32Tensor> TensorFactory::createFP32(const std::vector<size_t> &shape, int device_idx)
     {
-        if (device.is_gpu())
-        {
-            // NOTE: createFP32 returns unique_ptr<FP32Tensor> (CPU-specific).
-            // For GPU tensors, use create(TensorType::FP32, shape, device) which returns unique_ptr<ITensor>
-            // and can create CUDAFp32Tensor. However, callers using shared_ptr<TensorBase> (like GraphOrchestrator)
-            // need refactoring to use shared_ptr<ITensor> before GPU tensors can be used.
-            LOG_ERROR("TensorFactory::createFP32: Returns CPU tensor type. For GPU, use create(TensorType::FP32, ...) -> ITensor");
-            throw std::runtime_error("createFP32() returns CPU-specific FP32Tensor. Use create(TensorType::FP32, device) for GPU.");
-        }
-
-        // Ensure we're on the correct NUMA node for CPU tensors
+        // Ensure we're on the correct NUMA node
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
         }
 
-        // CPU tensor: use legacy device_idx for now (will be updated when CPUTensorBase migrates to DeviceId)
-        return std::make_unique<FP32Tensor>(shape, device.toLegacyIndex());
+        return std::make_unique<FP32Tensor>(shape, device_idx);
     }
 
-    std::unique_ptr<FP16Tensor> TensorFactory::createFP16(const std::vector<size_t> &shape, DeviceId device)
+    std::unique_ptr<FP16Tensor> TensorFactory::createFP16(const std::vector<size_t> &shape)
     {
-        if (device.is_gpu())
-        {
-            LOG_ERROR("TensorFactory::createFP16: GPU tensor creation not yet implemented for device " << device.to_string());
-            throw std::runtime_error("GPU tensor creation not yet implemented");
-        }
-
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
@@ -83,14 +62,8 @@ namespace llaminar2
         return std::make_unique<FP16Tensor>(shape, fp16_data);
     }
 
-    std::unique_ptr<BF16Tensor> TensorFactory::createBF16(const std::vector<size_t> &shape, DeviceId device)
+    std::unique_ptr<BF16Tensor> TensorFactory::createBF16(const std::vector<size_t> &shape)
     {
-        if (device.is_gpu())
-        {
-            LOG_ERROR("TensorFactory::createBF16: GPU tensor creation not yet implemented for device " << device.to_string());
-            throw std::runtime_error("GPU tensor creation not yet implemented");
-        }
-
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
@@ -110,14 +83,8 @@ namespace llaminar2
         return std::make_unique<BF16Tensor>(shape, bf16_data);
     }
 
-    std::unique_ptr<INT32Tensor> TensorFactory::createINT32(const std::vector<size_t> &shape, DeviceId device)
+    std::unique_ptr<INT32Tensor> TensorFactory::createINT32(const std::vector<size_t> &shape)
     {
-        if (device.is_gpu())
-        {
-            LOG_ERROR("TensorFactory::createINT32: GPU tensor creation not yet implemented for device " << device.to_string());
-            throw std::runtime_error("GPU tensor creation not yet implemented");
-        }
-
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
@@ -126,14 +93,8 @@ namespace llaminar2
         return std::make_unique<INT32Tensor>(shape);
     }
 
-    std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape, DeviceId device)
+    std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape, int device_idx)
     {
-        if (device.is_gpu())
-        {
-            LOG_ERROR("TensorFactory::createQ8_1: GPU tensor creation not yet implemented for device " << device.to_string());
-            throw std::runtime_error("GPU tensor creation not yet implemented");
-        }
-
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
@@ -141,7 +102,7 @@ namespace llaminar2
 
         // Use the mutable activation buffer constructor (no raw_data, allocates internally)
         // This creates a Q8_1Tensor that supports mutable_data() and quantize_from_cache()
-        return std::make_unique<Q8_1Tensor>(shape, device.toLegacyIndex());
+        return std::make_unique<Q8_1Tensor>(shape, device_idx);
     }
 
     std::unique_ptr<Q8_1Tensor> TensorFactory::createQ8_1(const std::vector<size_t> &shape,
@@ -156,14 +117,8 @@ namespace llaminar2
     }
 
     std::unique_ptr<Q16_1Tensor> TensorFactory::createQ16_1(const std::vector<size_t> &shape,
-                                                            DeviceId device)
+                                                            int device_idx)
     {
-        if (device.is_gpu())
-        {
-            LOG_ERROR("TensorFactory::createQ16_1: GPU tensor creation not yet implemented for device " << device.to_string());
-            throw std::runtime_error("GPU tensor creation not yet implemented");
-        }
-
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
@@ -171,135 +126,82 @@ namespace llaminar2
 
         // Use the mutable activation buffer constructor
         // Q16_1Tensor(shape, device_idx) creates an empty tensor for residual accumulation
-        return std::make_unique<Q16_1Tensor>(shape, device.toLegacyIndex());
+        return std::make_unique<Q16_1Tensor>(shape, device_idx);
     }
 
     std::unique_ptr<Q16_1Tensor> TensorFactory::createQ16_1(const std::vector<size_t> &shape,
                                                             Q16BlockSize block_size,
-                                                            DeviceId device)
+                                                            int device_idx)
     {
-        if (device.is_gpu())
-        {
-            LOG_ERROR("TensorFactory::createQ16_1: GPU tensor creation not yet implemented for device " << device.to_string());
-            throw std::runtime_error("GPU tensor creation not yet implemented");
-        }
-
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
         }
 
         // Use the mutable activation buffer constructor with custom block size
-        return std::make_unique<Q16_1Tensor>(shape, block_size, device.toLegacyIndex());
+        return std::make_unique<Q16_1Tensor>(shape, block_size, device_idx);
     }
 
-    std::unique_ptr<ITensor> TensorFactory::create(TensorType type,
-                                                   const std::vector<size_t> &shape,
-                                                   DeviceId device)
+    std::unique_ptr<CPUTensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
+                                                                   ActivationPrecision precision,
+                                                                   int device_idx)
     {
-#ifdef HAVE_CUDA
-        if (device.is_cuda())
-        {
-            // Create CUDA tensor based on type
-            switch (type)
-            {
-            case TensorType::FP32:
-                return std::make_unique<CUDAFp32Tensor>(shape, device.ordinal);
-            case TensorType::FP16:
-                return std::make_unique<CUDAFP16Tensor>(shape, device.ordinal);
-            case TensorType::BF16:
-                return std::make_unique<CUDABF16Tensor>(shape, device.ordinal);
-            case TensorType::INT8:
-                return std::make_unique<CUDAINT8Tensor>(shape, device.ordinal);
-            case TensorType::INT32:
-                return std::make_unique<CUDAINT32Tensor>(shape, device.ordinal);
-            case TensorType::Q8_1:
-                return std::make_unique<CUDAQ8_1Tensor>(shape, device.ordinal);
-            case TensorType::Q16_1:
-                // Default Q16_1 uses 32-element blocks
-                return std::make_unique<CUDAQ16_1Tensor>(shape, device.ordinal);
-            default:
-                LOG_ERROR("TensorFactory::create: CUDA tensor type "
-                          << static_cast<int>(type) << " not yet supported");
-                throw std::runtime_error("CUDA tensor type not yet supported");
-            }
-        }
-#endif
-
-        if (device.is_gpu())
-        {
-            // ROCm or other GPU backend - not yet implemented
-            LOG_ERROR("TensorFactory::create: GPU tensor creation not yet implemented for device " << device.to_string());
-            throw std::runtime_error("GPU tensor creation not yet implemented");
-        }
-
         if (numa_node_ >= 0)
         {
             bindToNumaNode();
         }
 
-        switch (type)
-        {
-        case TensorType::FP32:
-            return createFP32(shape, device);
-        case TensorType::FP16:
-            return createFP16(shape, device);
-        case TensorType::BF16:
-            return createBF16(shape, device);
-        case TensorType::INT32:
-            return createINT32(shape, device);
-        case TensorType::Q8_1:
-            return createQ8_1(shape, device);
-        case TensorType::Q16_1:
-            return createQ16_1(shape, device);
-        default:
-            LOG_ERROR("TensorFactory::create: unsupported type " << static_cast<int>(type));
-            std::ostringstream oss;
-            oss << "TensorFactory::create: unsupported type " << static_cast<int>(type)
-                << " - use createQuantized for weight tensors";
-            throw std::runtime_error(oss.str());
-        }
-    }
+        std::unique_ptr<CPUTensorBase> tensor;
 
-    std::unique_ptr<ITensor> TensorFactory::createActivation(const std::vector<size_t> &shape,
-                                                             ActivationPrecision precision,
-                                                             DeviceId device)
-    {
-        // Map ActivationPrecision to TensorType for device-agnostic creation
-        TensorType type;
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            type = TensorType::FP32;
-            break;
+            // FP32 createFP32 already accepts device_idx
+            return createFP32(shape, device_idx);
+
         case ActivationPrecision::BF16:
-            type = TensorType::BF16;
+            tensor = createBF16(shape);
             break;
+
         case ActivationPrecision::FP16:
-            type = TensorType::FP16;
+            tensor = createFP16(shape);
             break;
+
         case ActivationPrecision::Q8_1:
-            type = TensorType::Q8_1;
+            tensor = createQ8_1(shape);
             break;
+
         case ActivationPrecision::Q16_1:
+            // Q16_1: High-precision quantized format for residual stream
+            return createQ16_1(shape, device_idx);
+
         case ActivationPrecision::HybridQ16:
-            // Q16_1/HybridQ16 default block size - use head_dim overload for explicit size
-            type = TensorType::Q16_1;
-            break;
+            // For HybridQ16 mode, createActivation returns Q16_1 for residual buffers
+            // Buffer allocation logic in GraphOrchestrator handles specific buffer types
+            return createQ16_1(shape, device_idx);
+
         default:
             LOG_ERROR("TensorFactory::createActivation: unknown precision, defaulting to FP32");
-            type = TensorType::FP32;
-            break;
+            return createFP32(shape, device_idx);
         }
 
-        // Delegate to device-agnostic create() method
-        return create(type, shape, device);
+        // Set device_idx on the created tensor to ensure consistent device tracking
+        // This is critical for pipelines that use placement maps to route tensors
+        // between devices. Without this, Q8_1/BF16/FP16 tensors would have device_idx=-1
+        // even when they should be associated with device 0 (CPU), causing spurious
+        // "device transfer" attempts in prepareActivationForDevice().
+        if (tensor && device_idx >= 0)
+        {
+            tensor->set_device(device_idx);
+        }
+
+        return tensor;
     }
 
-    std::unique_ptr<ITensor> TensorFactory::createActivation(const std::vector<size_t> &shape,
-                                                             ActivationPrecision precision,
-                                                             int head_dim,
-                                                             DeviceId device)
+    std::unique_ptr<CPUTensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
+                                                                   ActivationPrecision precision,
+                                                                   int head_dim,
+                                                                   int device_idx)
     {
         // For Q16_1 and HybridQ16, use optimal block size based on head_dim
         if (precision == ActivationPrecision::Q16_1 ||
@@ -308,36 +210,11 @@ namespace llaminar2
             Q16BlockSize block_size = optimal_q16_block_size(head_dim);
             LOG_DEBUG("TensorFactory::createActivation: Q16 with head_dim=" << head_dim
                                                                             << " -> block_size=" << static_cast<int>(block_size));
-
-#ifdef HAVE_CUDA
-            if (device.is_cuda())
-            {
-                // Create CUDA Q16_1 tensor with appropriate block size
-                switch (block_size)
-                {
-                case Q16BlockSize::BLOCK_32:
-                    return std::make_unique<CUDAQ16_1Tensor>(shape, device.ordinal);
-                case Q16BlockSize::BLOCK_64:
-                    return std::make_unique<CUDAQ16_1_64Tensor>(shape, device.ordinal);
-                case Q16BlockSize::BLOCK_128:
-                    return std::make_unique<CUDAQ16_1_128Tensor>(shape, device.ordinal);
-                default:
-                    LOG_ERROR("TensorFactory::createActivation: Unsupported Q16 block size "
-                              << static_cast<int>(block_size) << " on CUDA");
-                    throw std::runtime_error("Unsupported Q16 block size on CUDA");
-                }
-            }
-#endif
-            if (device.is_gpu())
-            {
-                LOG_ERROR("TensorFactory::createActivation: Q16_1 with head_dim not supported on non-CUDA GPU");
-                throw std::runtime_error("Q16_1 with head_dim not supported on non-CUDA GPU");
-            }
-            return createQ16_1(shape, block_size, device);
+            return createQ16_1(shape, block_size, device_idx);
         }
 
         // All other precisions: delegate to base overload
-        return createActivation(shape, precision, device);
+        return createActivation(shape, precision, device_idx);
     }
 
     std::unique_ptr<CPUTensorBase> TensorFactory::createQuantized(TensorType type,
@@ -458,22 +335,5 @@ namespace llaminar2
         return -1;
 #endif
     }
-
-#ifdef HAVE_CUDA
-    std::unique_ptr<ITensor> TensorFactory::createCUDATensor(TensorType type,
-                                                             const std::vector<size_t> &shape,
-                                                             int cuda_ordinal)
-    {
-        switch (type)
-        {
-        case TensorType::FP32:
-            return std::make_unique<CUDAFp32Tensor>(shape, cuda_ordinal);
-        default:
-            LOG_ERROR("TensorFactory::createCUDATensor: unsupported CUDA tensor type "
-                      << static_cast<int>(type));
-            throw std::runtime_error("Unsupported CUDA tensor type");
-        }
-    }
-#endif
 
 } // namespace llaminar2

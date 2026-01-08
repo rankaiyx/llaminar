@@ -49,7 +49,7 @@ namespace llaminar2
             ITensor *output = nullptr;
 
             // KV cache integration
-            IUnifiedKVCache *kv_cache = nullptr;
+            ICPUKVCache *kv_cache = nullptr;
             int layer_idx = 0;
 
             // Execution mode (legacy - prefer attention_mode)

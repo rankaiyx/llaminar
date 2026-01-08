@@ -539,7 +539,7 @@ namespace llaminar2
 
     ComputeGraph Qwen2Graph::buildTransformerLayersGraph(
         TensorBase *input_hidden,
-        IUnifiedKVCache *kv_cache,
+        ICPUKVCache *kv_cache,
         const int *position_ids,
         int device_idx)
     {
@@ -571,7 +571,7 @@ namespace llaminar2
     ComputeGraph Qwen2Graph::buildLayerGraph(
         int layer_idx,
         TensorBase *input_hidden,
-        IUnifiedKVCache *kv_cache,
+        ICPUKVCache *kv_cache,
         const int *position_ids,
         int device_idx)
     {
@@ -677,7 +677,7 @@ namespace llaminar2
         int layer_idx,
         int seq_len,
         int batch_size,
-        IUnifiedKVCache *kv_cache,
+        ICPUKVCache *kv_cache,
         const int *position_ids,
         int device_idx,
         const std::vector<int> *sequence_lengths)

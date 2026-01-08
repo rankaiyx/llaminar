@@ -15,7 +15,7 @@
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
-#include "tensors/UnifiedKVCache.h"
+#include "tensors/CPUKVCache.h"
 
 namespace llaminar2
 {
@@ -28,7 +28,7 @@ namespace llaminar2
          * This mock allows us to control what get_cached_tokens() returns
          * to verify AttentionComputeStage queries it at execution time.
          */
-        class MockKVCache : public IUnifiedKVCache
+        class MockKVCache : public ICPUKVCache
         {
         public:
             MockKVCache(int num_layers, int max_seq_len, int kv_dim)
@@ -47,7 +47,7 @@ namespace llaminar2
                 }
             }
 
-            // IUnifiedKVCache interface
+            // ICPUKVCache interface
             ActivationPrecision precision() const override { return ActivationPrecision::FP32; }
             int num_layers() const override { return num_layers_; }
             int batch_size() const override { return 1; }

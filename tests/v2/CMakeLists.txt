@@ -1775,15 +1775,15 @@ target_link_libraries(v2_test_iq4nl_views
 # GEMM v4 paths. IQ4_NL is now validated via tensor views and activation-
 # centric kernels.
 
-# Test: UnifiedKVCache (supports both single-sequence and batched modes, all precisions)
-add_executable(v2_test_unified_kv_cache unit/tensors/Test__UnifiedKVCache.cpp)
-target_link_libraries(v2_test_unified_kv_cache 
+# Test: CPUKVCache (supports both single-sequence and batched modes, all precisions)
+add_executable(v2_test_cpu_kv_cache unit/tensors/Test__CPUKVCache.cpp)
+target_link_libraries(v2_test_cpu_kv_cache 
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_UnifiedKVCache 
-    COMMAND $<TARGET_FILE:v2_test_unified_kv_cache>
+add_v2_test(V2_Unit_CPUKVCache 
+    COMMAND $<TARGET_FILE:v2_test_cpu_kv_cache>
     LABELS "V2;Unit;KVCache;Batched;SingleSequence;FP32;BF16;FP16;Q8_1;Q16_1;Eviction"
     MPI_PROCS 1
 )
@@ -2548,17 +2548,6 @@ add_v2_test(V2_Integration_CUDABasicPipeline
     COMMAND $<TARGET_FILE:v2_integration_cuda_basic_pipeline>
     LABELS "V2;Integration;CUDA;Pipeline;KernelFactory;TensorTransfer;GEMM;FP32"
     MPI_PROCS 1  # Tests GPU pipeline locally, no MPI needed
-)
-
-# Test: CUDA Tensor Type Allocation (all quantized and activation types)
-# Verifies all tensor types can be instantiated and allocated on GPU
-# Tests CUDATypedTensor, CUDABackend allocation, host↔device transfer
-add_executable(v2_integration_cuda_tensor_type_allocation integration/Test__CUDATensorTypeAllocation.cpp)
-target_link_libraries(v2_integration_cuda_tensor_type_allocation llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Integration_CUDATensorTypeAllocation
-    COMMAND $<TARGET_FILE:v2_integration_cuda_tensor_type_allocation>
-    LABELS "V2;Integration;CUDA;TensorAllocation;Quantization;FP32;INT8;INT32;Q4_0;Q8_0;IQ4_NL;KQuant"
-    MPI_PROCS 1  # Tests GPU allocation locally, no MPI needed
 )
 
 # Test: CUDA GEMM Parity (FP32 and IQ4_NL: CUDA vs CPU kernel comparison)

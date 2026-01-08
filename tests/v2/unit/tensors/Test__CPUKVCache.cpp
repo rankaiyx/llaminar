@@ -1,5 +1,5 @@
 /**
- * @file Test__UnifiedKVCache.cpp
+ * @file Test__CPUKVCache.cpp
  * @brief Unit tests for unified KV cache
  * @author David Sanftenberg
  * @date December 2025
@@ -8,7 +8,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/v2/tensors/UnifiedKVCache.h"
+#include "../../../../src/v2/tensors/CPUKVCache.h"
 #include "../../../../src/v2/tensors/Tensors.h"
 #include "../../../../src/v2/utils/MPIContext.h"
 #include <vector>
@@ -23,7 +23,7 @@ static MPIContext getTestMPIContext()
     return MPIContext(0, 1, MPI_COMM_WORLD);
 }
 
-class Test__UnifiedKVCache : public ::testing::Test
+class Test__CPUKVCache : public ::testing::Test
 {
 protected:
     void SetUp() override {}
@@ -34,7 +34,7 @@ protected:
 // Test: Basic Construction - FP32
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, ConstructionFP32_SingleSequence)
+TEST_F(Test__CPUKVCache, ConstructionFP32_SingleSequence)
 {
     int n_layers = 24;
     int batch_size = 1; // Single sequence
@@ -42,7 +42,7 @@ TEST_F(Test__UnifiedKVCache, ConstructionFP32_SingleSequence)
     int n_kv_heads = 2;
     int head_dim = 64;
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     EXPECT_EQ(cache.num_layers(), n_layers);
     EXPECT_EQ(cache.batch_size(), batch_size);
@@ -56,7 +56,7 @@ TEST_F(Test__UnifiedKVCache, ConstructionFP32_SingleSequence)
     }
 }
 
-TEST_F(Test__UnifiedKVCache, ConstructionFP32_Batched)
+TEST_F(Test__CPUKVCache, ConstructionFP32_Batched)
 {
     int n_layers = 4;
     int batch_size = 4;
@@ -64,7 +64,7 @@ TEST_F(Test__UnifiedKVCache, ConstructionFP32_Batched)
     int n_kv_heads = 2;
     int head_dim = 32;
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     EXPECT_EQ(cache.batch_size(), batch_size);
 
@@ -82,27 +82,27 @@ TEST_F(Test__UnifiedKVCache, ConstructionFP32_Batched)
 // Test: Multi-Precision Construction
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, ConstructionBF16)
+TEST_F(Test__CPUKVCache, ConstructionBF16)
 {
-    UnifiedKVCacheBF16 cache(getTestMPIContext(), 4, 2, 64, 2, 32, -1);
+    CPUKVCacheBF16 cache(getTestMPIContext(), 4, 2, 64, 2, 32, -1);
     EXPECT_EQ(cache.precision(), ActivationPrecision::BF16);
 }
 
-TEST_F(Test__UnifiedKVCache, ConstructionFP16)
+TEST_F(Test__CPUKVCache, ConstructionFP16)
 {
-    UnifiedKVCacheFP16 cache(getTestMPIContext(), 4, 2, 64, 2, 32, -1);
+    CPUKVCacheFP16 cache(getTestMPIContext(), 4, 2, 64, 2, 32, -1);
     EXPECT_EQ(cache.precision(), ActivationPrecision::FP16);
 }
 
-TEST_F(Test__UnifiedKVCache, ConstructionQ8_1)
+TEST_F(Test__CPUKVCache, ConstructionQ8_1)
 {
-    UnifiedKVCacheQ8_1 cache(getTestMPIContext(), 4, 2, 64, 2, 32, -1);
+    CPUKVCacheQ8_1 cache(getTestMPIContext(), 4, 2, 64, 2, 32, -1);
     EXPECT_EQ(cache.precision(), ActivationPrecision::Q8_1);
 }
 
-TEST_F(Test__UnifiedKVCache, ConstructionQ16_1)
+TEST_F(Test__CPUKVCache, ConstructionQ16_1)
 {
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 4, 2, 64, 2, 32, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 4, 2, 64, 2, 32, -1);
     EXPECT_EQ(cache.precision(), ActivationPrecision::Q16_1);
 }
 
@@ -110,23 +110,23 @@ TEST_F(Test__UnifiedKVCache, ConstructionQ16_1)
 // Test: Factory Function
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, FactoryFP32)
+TEST_F(Test__CPUKVCache, FactoryFP32)
 {
-    auto cache = createUnifiedKVCache(ActivationPrecision::FP32, getTestMPIContext(), 4, 2, 64, 2, 32, -1);
+    auto cache = createCPUKVCache(ActivationPrecision::FP32, getTestMPIContext(), 4, 2, 64, 2, 32, -1);
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::FP32);
 }
 
-TEST_F(Test__UnifiedKVCache, FactoryQ8_1)
+TEST_F(Test__CPUKVCache, FactoryQ8_1)
 {
-    auto cache = createUnifiedKVCache(ActivationPrecision::Q8_1, getTestMPIContext(), 4, 2, 64, 2, 32, -1);
+    auto cache = createCPUKVCache(ActivationPrecision::Q8_1, getTestMPIContext(), 4, 2, 64, 2, 32, -1);
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::Q8_1);
 }
 
-TEST_F(Test__UnifiedKVCache, FactoryQ16_1)
+TEST_F(Test__CPUKVCache, FactoryQ16_1)
 {
-    auto cache = createUnifiedKVCache(ActivationPrecision::Q16_1, getTestMPIContext(), 4, 2, 64, 2, 32, -1);
+    auto cache = createCPUKVCache(ActivationPrecision::Q16_1, getTestMPIContext(), 4, 2, 64, 2, 32, -1);
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::Q16_1);
 }
@@ -135,36 +135,36 @@ TEST_F(Test__UnifiedKVCache, FactoryQ16_1)
 // Test: Factory Layout Mode Selection
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, Factory_DefaultLayoutMode_IsPositionMajor)
+TEST_F(Test__CPUKVCache, Factory_DefaultLayoutMode_IsPositionMajor)
 {
     // All precisions should default to POSITION_MAJOR when layout_mode not specified
-    auto fp32_cache = createUnifiedKVCache(ActivationPrecision::FP32, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    auto fp32_cache = createCPUKVCache(ActivationPrecision::FP32, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
     ASSERT_NE(fp32_cache, nullptr);
     EXPECT_EQ(fp32_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
     EXPECT_EQ(fp32_cache->kv_layout(), TensorLayout::KV_POS_HEAD_DIM);
 
-    auto bf16_cache = createUnifiedKVCache(ActivationPrecision::BF16, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    auto bf16_cache = createCPUKVCache(ActivationPrecision::BF16, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
     ASSERT_NE(bf16_cache, nullptr);
     EXPECT_EQ(bf16_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 
-    auto fp16_cache = createUnifiedKVCache(ActivationPrecision::FP16, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    auto fp16_cache = createCPUKVCache(ActivationPrecision::FP16, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
     ASSERT_NE(fp16_cache, nullptr);
     EXPECT_EQ(fp16_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 
-    auto q8_1_cache = createUnifiedKVCache(ActivationPrecision::Q8_1, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    auto q8_1_cache = createCPUKVCache(ActivationPrecision::Q8_1, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
     ASSERT_NE(q8_1_cache, nullptr);
     EXPECT_EQ(q8_1_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 
-    auto q16_1_cache = createUnifiedKVCache(ActivationPrecision::Q16_1, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    auto q16_1_cache = createCPUKVCache(ActivationPrecision::Q16_1, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
     ASSERT_NE(q16_1_cache, nullptr);
     EXPECT_EQ(q16_1_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }
 
-TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_Q16_1)
+TEST_F(Test__CPUKVCache, Factory_ExplicitHeadMajor_Q16_1)
 {
     // Q16_1 with explicit HEAD_MAJOR should use HEAD_MAJOR layout
     // This is required for Q16IntegerAttention kernel compatibility
-    auto cache = createUnifiedKVCache(
+    auto cache = createCPUKVCache(
         ActivationPrecision::Q16_1, getTestMPIContext(),
         2, 1, 16, 2, 64, -1,
         KVCacheLayoutMode::HEAD_MAJOR);
@@ -181,10 +181,10 @@ TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_Q16_1)
     EXPECT_EQ(k_base->cols(), 64u);      // head_dim
 }
 
-TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_FP32)
+TEST_F(Test__CPUKVCache, Factory_ExplicitHeadMajor_FP32)
 {
     // FP32 with explicit HEAD_MAJOR should also work
-    auto cache = createUnifiedKVCache(
+    auto cache = createCPUKVCache(
         ActivationPrecision::FP32, getTestMPIContext(),
         2, 1, 16, 4, 32, -1,
         KVCacheLayoutMode::HEAD_MAJOR);
@@ -201,7 +201,7 @@ TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_FP32)
     EXPECT_EQ(k_base->cols(), 32u);      // head_dim
 }
 
-TEST_F(Test__UnifiedKVCache, ShardedFactoryQ16_1)
+TEST_F(Test__CPUKVCache, ShardedFactoryQ16_1)
 {
     // Test sharded factory for tensor parallelism
     int n_layers = 4;
@@ -212,7 +212,7 @@ TEST_F(Test__UnifiedKVCache, ShardedFactoryQ16_1)
     int kv_head_start = 0;    // Starting head index
     int head_dim = 32;
 
-    auto cache = createShardedKVCache(
+    auto cache = createShardedCPUKVCache(
         ActivationPrecision::Q16_1, getTestMPIContext(),
         n_layers, batch_size, max_seq_len,
         n_kv_heads, local_n_kv_heads, kv_head_start,
@@ -228,7 +228,7 @@ TEST_F(Test__UnifiedKVCache, ShardedFactoryQ16_1)
     EXPECT_EQ(cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }
 
-TEST_F(Test__UnifiedKVCache, ShardedFactory_ExplicitHeadMajor_Q16_1)
+TEST_F(Test__CPUKVCache, ShardedFactory_ExplicitHeadMajor_Q16_1)
 {
     // Test sharded factory with explicit HEAD_MAJOR layout
     // This is what GraphOrchestrator should use for HybridQ16 mode
@@ -240,7 +240,7 @@ TEST_F(Test__UnifiedKVCache, ShardedFactory_ExplicitHeadMajor_Q16_1)
     int kv_head_start = 0;    // Starting head index
     int head_dim = 64;        // 1 block per head with BLOCK_64
 
-    auto cache = createShardedKVCache(
+    auto cache = createShardedCPUKVCache(
         ActivationPrecision::Q16_1, getTestMPIContext(),
         n_layers, batch_size, max_seq_len,
         n_kv_heads, local_n_kv_heads, kv_head_start,
@@ -264,7 +264,7 @@ TEST_F(Test__UnifiedKVCache, ShardedFactory_ExplicitHeadMajor_Q16_1)
 // Test: Single-Sequence Append (batch_size=1)
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, AppendSingleSequence_FP32)
+TEST_F(Test__CPUKVCache, AppendSingleSequence_FP32)
 {
     int n_layers = 2;
     int batch_size = 1;
@@ -273,7 +273,7 @@ TEST_F(Test__UnifiedKVCache, AppendSingleSequence_FP32)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -320,7 +320,7 @@ TEST_F(Test__UnifiedKVCache, AppendSingleSequence_FP32)
 // Test: Batched Append
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, AppendBatched_FP32)
+TEST_F(Test__CPUKVCache, AppendBatched_FP32)
 {
     int n_layers = 2;
     int batch_size = 3;
@@ -329,7 +329,7 @@ TEST_F(Test__UnifiedKVCache, AppendBatched_FP32)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -374,7 +374,7 @@ TEST_F(Test__UnifiedKVCache, AppendBatched_FP32)
 // Test: Q8_1 Precision
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, AppendQ8_1)
+TEST_F(Test__CPUKVCache, AppendQ8_1)
 {
     int n_layers = 2;
     int batch_size = 1;
@@ -383,7 +383,7 @@ TEST_F(Test__UnifiedKVCache, AppendQ8_1)
     int head_dim = 32; // Must be multiple of 32 for Q8_1 blocks
     int kv_dim = n_kv_heads * head_dim;
 
-    UnifiedKVCacheQ8_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ8_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -426,7 +426,7 @@ TEST_F(Test__UnifiedKVCache, AppendQ8_1)
 // Test: Q16_1 Precision
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, AppendQ16_1_SingleSequence)
+TEST_F(Test__CPUKVCache, AppendQ16_1_SingleSequence)
 {
     int n_layers = 2;
     int batch_size = 1;
@@ -435,7 +435,7 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_SingleSequence)
     int head_dim = 64;                  // Use 64 so optimal_q16_block_size returns BLOCK_64
     int kv_dim = n_kv_heads * head_dim; // 128
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -491,7 +491,7 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_SingleSequence)
     EXPECT_EQ(v_blocks[0].qs[1], -1); // Row 0, element 1
 }
 
-TEST_F(Test__UnifiedKVCache, AppendQ16_1_MultipleAppends)
+TEST_F(Test__CPUKVCache, AppendQ16_1_MultipleAppends)
 {
     int n_layers = 1;
     int batch_size = 1;
@@ -500,7 +500,7 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_MultipleAppends)
     int head_dim = 64;                  // Use head_dim=64 so cache auto-selects BLOCK_64
     int kv_dim = n_kv_heads * head_dim; // 128
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -563,7 +563,7 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_MultipleAppends)
     EXPECT_EQ(cached_blocks[7 * blocks_per_row].qs[0], 102);
 }
 
-TEST_F(Test__UnifiedKVCache, AppendQ16_1_Batched)
+TEST_F(Test__CPUKVCache, AppendQ16_1_Batched)
 {
     int n_layers = 2;
     int batch_size = 3;
@@ -572,7 +572,7 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_Batched)
     int head_dim = 64;                  // Use 64 so optimal_q16_block_size returns BLOCK_64
     int kv_dim = n_kv_heads * head_dim; // 128
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
     const size_t block_elements = 64;
@@ -630,7 +630,7 @@ TEST_F(Test__UnifiedKVCache, AppendQ16_1_Batched)
     EXPECT_EQ(k2_blocks[0].qs[0], 2000);
 }
 
-TEST_F(Test__UnifiedKVCache, EvictQ16_1)
+TEST_F(Test__CPUKVCache, EvictQ16_1)
 {
     int n_layers = 1;
     int batch_size = 1;
@@ -639,7 +639,7 @@ TEST_F(Test__UnifiedKVCache, EvictQ16_1)
     int head_dim = 64;                  // Use head_dim=64 so cache auto-selects BLOCK_64
     int kv_dim = n_kv_heads * head_dim; // 128
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -682,10 +682,10 @@ TEST_F(Test__UnifiedKVCache, EvictQ16_1)
     EXPECT_EQ(cached_blocks[5 * blocks_per_row].qs[0], 900);
 }
 
-TEST_F(Test__UnifiedKVCache, ClearQ16_1)
+TEST_F(Test__CPUKVCache, ClearQ16_1)
 {
     int kv_dim = 64;
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 2, 2, 16, 2, 32, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 2, 2, 16, 2, 32, -1);
 
     TensorFactory factory(getTestMPIContext());
     auto k = factory.createQ16_1({4, static_cast<size_t>(kv_dim)});
@@ -718,14 +718,14 @@ TEST_F(Test__UnifiedKVCache, ClearQ16_1)
     }
 }
 
-TEST_F(Test__UnifiedKVCache, Q16_1_CapacityExceeded)
+TEST_F(Test__CPUKVCache, Q16_1_CapacityExceeded)
 {
     int n_kv_heads = 2;
     int head_dim = 32;
     int kv_dim = n_kv_heads * head_dim;
     int max_seq_len = 8;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, max_seq_len, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, max_seq_len, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -744,9 +744,9 @@ TEST_F(Test__UnifiedKVCache, Q16_1_CapacityExceeded)
     EXPECT_EQ(cache.get_cached_tokens(0), 6);
 }
 
-TEST_F(Test__UnifiedKVCache, Q16_1_PolymorphicInterface)
+TEST_F(Test__CPUKVCache, Q16_1_PolymorphicInterface)
 {
-    auto cache = createUnifiedKVCache(ActivationPrecision::Q16_1, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
+    auto cache = createCPUKVCache(ActivationPrecision::Q16_1, getTestMPIContext(), 2, 1, 16, 2, 32, -1);
 
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::Q16_1);
@@ -779,9 +779,9 @@ TEST_F(Test__UnifiedKVCache, Q16_1_PolymorphicInterface)
 // Test: Clear Operations
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, ClearAll)
+TEST_F(Test__CPUKVCache, ClearAll)
 {
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), 2, 3, 10, 2, 4, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), 2, 3, 10, 2, 4, -1);
 
     TensorFactory factory(getTestMPIContext());
     auto k = factory.createFP32({4, 8}, -1);
@@ -803,9 +803,9 @@ TEST_F(Test__UnifiedKVCache, ClearAll)
     EXPECT_EQ(cache.get_cached_tokens(1, 0), 0);
 }
 
-TEST_F(Test__UnifiedKVCache, ClearSequence)
+TEST_F(Test__CPUKVCache, ClearSequence)
 {
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), 2, 3, 10, 2, 4, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), 2, 3, 10, 2, 4, -1);
 
     TensorFactory factory(getTestMPIContext());
     auto k = factory.createFP32({4, 8}, -1);
@@ -835,10 +835,10 @@ TEST_F(Test__UnifiedKVCache, ClearSequence)
 // Test: Eviction
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, EvictOldest)
+TEST_F(Test__CPUKVCache, EvictOldest)
 {
     int kv_dim = 8;
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), 1, 2, 20, 2, 4, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), 1, 2, 20, 2, 4, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -875,11 +875,11 @@ TEST_F(Test__UnifiedKVCache, EvictOldest)
 // Test: Per-Layer Device Placement
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, PerLayerDevicePlacement)
+TEST_F(Test__CPUKVCache, PerLayerDevicePlacement)
 {
     std::vector<int> devices = {-1, -1, 0, 0}; // Layers 0-1 CPU, 2-3 GPU
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), 4, 1, 64, 2, 32, devices);
+    CPUKVCacheFP32 cache(getTestMPIContext(), 4, 1, 64, 2, 32, devices);
 
     EXPECT_EQ(cache.get_layer_device(0), -1);
     EXPECT_EQ(cache.get_layer_device(1), -1);
@@ -891,12 +891,12 @@ TEST_F(Test__UnifiedKVCache, PerLayerDevicePlacement)
 // Test: Capacity Exceeded
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, CapacityExceeded)
+TEST_F(Test__CPUKVCache, CapacityExceeded)
 {
     int kv_dim = 8;
     int max_seq_len = 10;
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), 1, 1, max_seq_len, 2, 4, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), 1, 1, max_seq_len, 2, 4, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -916,12 +916,12 @@ TEST_F(Test__UnifiedKVCache, CapacityExceeded)
 }
 
 // =============================================================================
-// Test: IUnifiedKVCache Interface
+// Test: ICPUKVCache Interface
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, PolymorphicInterface)
+TEST_F(Test__CPUKVCache, PolymorphicInterface)
 {
-    auto cache = createUnifiedKVCache(ActivationPrecision::FP32, getTestMPIContext(), 2, 1, 16, 2, 4, -1);
+    auto cache = createCPUKVCache(ActivationPrecision::FP32, getTestMPIContext(), 2, 1, 16, 2, 4, -1);
 
     ASSERT_NE(cache, nullptr);
     EXPECT_EQ(cache->precision(), ActivationPrecision::FP32);
@@ -945,10 +945,10 @@ TEST_F(Test__UnifiedKVCache, PolymorphicInterface)
 // Test: Backward Compatibility API (batch_size=1)
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, BackwardCompatSingleSequence)
+TEST_F(Test__CPUKVCache, BackwardCompatSingleSequence)
 {
     // Test that batch_size=1 works identically to the old KVCache API
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), 2, 1, 16, 2, 4, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), 2, 1, 16, 2, 4, -1);
 
     TensorFactory factory(getTestMPIContext());
     auto k = factory.createFP32({4, 8}, -1);
@@ -969,12 +969,12 @@ TEST_F(Test__UnifiedKVCache, BackwardCompatSingleSequence)
 // Test: Q16_1 Variable Block Size Support (Phase 3)
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, Q16_1_AutoSelectBlockSize_HeadDim64)
+TEST_F(Test__CPUKVCache, Q16_1_AutoSelectBlockSize_HeadDim64)
 {
     // Qwen2.5-0.5B: head_dim=64 should auto-select BLOCK_64
     int head_dim = 64;
     int n_kv_heads = 4;
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 2, 1, 16, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 2, 1, 16, n_kv_heads, head_dim, -1);
 
     // Get the K tensor for layer 0 and verify block size
     auto k_base = cache.get_k(0);
@@ -987,12 +987,12 @@ TEST_F(Test__UnifiedKVCache, Q16_1_AutoSelectBlockSize_HeadDim64)
     EXPECT_EQ(k_q16->q16_block_size(), Q16BlockSize::BLOCK_64);
 }
 
-TEST_F(Test__UnifiedKVCache, Q16_1_AutoSelectBlockSize_HeadDim128)
+TEST_F(Test__CPUKVCache, Q16_1_AutoSelectBlockSize_HeadDim128)
 {
     // Llama3: head_dim=128 should auto-select BLOCK_128
     int head_dim = 128;
     int n_kv_heads = 4;
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 2, 1, 16, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 2, 1, 16, n_kv_heads, head_dim, -1);
 
     auto k_base = cache.get_k(0);
     ASSERT_NE(k_base, nullptr);
@@ -1006,7 +1006,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_AutoSelectBlockSize_HeadDim128)
 // Note: DeepSeek V3 MLA uses separate NOPE (128-dim) + ROPE (64-dim) tensors
 // with independent scales, not a combined 192-dim block.
 
-TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockAppend_HeadDim64)
+TEST_F(Test__CPUKVCache, Q16_1_VariableBlockAppend_HeadDim64)
 {
     // Test append with BLOCK_64 tensors
     int head_dim = 64;
@@ -1014,7 +1014,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockAppend_HeadDim64)
     int kv_dim = n_kv_heads * head_dim; // 128
     int seq_len = 8;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 32, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 32, n_kv_heads, head_dim, -1);
 
     // Create Q16_1 tensors with matching block size
     TensorFactory factory(getTestMPIContext());
@@ -1031,7 +1031,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockAppend_HeadDim64)
     EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
 }
 
-TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockAppend_HeadDim128)
+TEST_F(Test__CPUKVCache, Q16_1_VariableBlockAppend_HeadDim128)
 {
     // Test append with BLOCK_128 tensors
     int head_dim = 128;
@@ -1039,7 +1039,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockAppend_HeadDim128)
     int kv_dim = n_kv_heads * head_dim; // 256
     int seq_len = 8;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 32, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 32, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
     auto k = factory.createQ16_1({static_cast<size_t>(seq_len), static_cast<size_t>(kv_dim)},
@@ -1054,14 +1054,14 @@ TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockAppend_HeadDim128)
     EXPECT_EQ(cache.get_cached_tokens(0), seq_len);
 }
 
-TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockEvict_HeadDim64)
+TEST_F(Test__CPUKVCache, Q16_1_VariableBlockEvict_HeadDim64)
 {
     // Test eviction with BLOCK_64 preserves data integrity
     int head_dim = 64;
     int n_kv_heads = 2;
     int kv_dim = n_kv_heads * head_dim;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 20, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 20, n_kv_heads, head_dim, -1);
 
     TensorFactory factory(getTestMPIContext());
 
@@ -1083,13 +1083,13 @@ TEST_F(Test__UnifiedKVCache, Q16_1_VariableBlockEvict_HeadDim64)
     EXPECT_EQ(k_q16->block_size(), 64);
 }
 
-TEST_F(Test__UnifiedKVCache, Q16_1_OneBlockPerHead)
+TEST_F(Test__CPUKVCache, Q16_1_OneBlockPerHead)
 {
     // Verify 1-block-per-head optimization: each head dimension = 1 Q16 block
     int head_dim = 128;
     int n_kv_heads = 4;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 16, n_kv_heads, head_dim, -1);
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), 1, 1, 16, n_kv_heads, head_dim, -1);
 
     auto k_base = cache.get_k(0);
     auto *k_q16 = dynamic_cast<Q16_1Tensor *>(k_base);
@@ -1106,7 +1106,7 @@ TEST_F(Test__UnifiedKVCache, Q16_1_OneBlockPerHead)
 // Test: HEAD_MAJOR Layout Mode
 // =============================================================================
 
-TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_FP32)
+TEST_F(Test__CPUKVCache, HeadMajorLayout_Construction_FP32)
 {
     int n_layers = 2;
     int batch_size = 1;
@@ -1115,7 +1115,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_FP32)
     int head_dim = 32;
 
     // Create cache with HEAD_MAJOR layout
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
@@ -1128,7 +1128,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_FP32)
     EXPECT_EQ(k_base->cols(), static_cast<size_t>(head_dim));
 }
 
-TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_Q16_1)
+TEST_F(Test__CPUKVCache, HeadMajorLayout_Construction_Q16_1)
 {
     int n_layers = 2;
     int batch_size = 1;
@@ -1137,7 +1137,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_Q16_1)
     int head_dim = 64;
 
     // Create cache with HEAD_MAJOR layout for Q16 (optimal for Q16IntegerAttention)
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
@@ -1150,7 +1150,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Construction_Q16_1)
     EXPECT_EQ(k_base->cols(), static_cast<size_t>(head_dim));
 }
 
-TEST_F(Test__UnifiedKVCache, HeadMajorLayout_AppendScatterCopy_FP32)
+TEST_F(Test__CPUKVCache, HeadMajorLayout_AppendScatterCopy_FP32)
 {
     // Test that HEAD_MAJOR scatter-copies input from POSITION_MAJOR to HEAD_MAJOR storage
     int n_layers = 1;
@@ -1160,7 +1160,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_AppendScatterCopy_FP32)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -1221,7 +1221,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_AppendScatterCopy_FP32)
     }
 }
 
-TEST_F(Test__UnifiedKVCache, HeadMajorLayout_IncrementalAppend_FP32)
+TEST_F(Test__CPUKVCache, HeadMajorLayout_IncrementalAppend_FP32)
 {
     // Test incremental append (decode-style, 1 token at a time)
     int n_layers = 1;
@@ -1231,7 +1231,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_IncrementalAppend_FP32)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -1273,7 +1273,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_IncrementalAppend_FP32)
     }
 }
 
-TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Eviction_FP32)
+TEST_F(Test__CPUKVCache, HeadMajorLayout_Eviction_FP32)
 {
     // Test that eviction shifts data correctly in HEAD_MAJOR layout
     int n_layers = 1;
@@ -1283,7 +1283,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Eviction_FP32)
     int head_dim = 4;
     int kv_dim = n_kv_heads * head_dim;
 
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheFP32 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                              n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -1329,7 +1329,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Eviction_FP32)
     }
 }
 
-TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Q16_1_DataIntegrity)
+TEST_F(Test__CPUKVCache, HeadMajorLayout_Q16_1_DataIntegrity)
 {
     // Test HEAD_MAJOR with Q16_1 quantized data
     int n_layers = 1;
@@ -1339,7 +1339,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Q16_1_DataIntegrity)
     int head_dim = 64; // 1 block per head with BLOCK_64
     int kv_dim = n_kv_heads * head_dim;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -1398,10 +1398,10 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Q16_1_DataIntegrity)
     }
 }
 
-TEST_F(Test__UnifiedKVCache, PositionMajorLayout_Default)
+TEST_F(Test__CPUKVCache, PositionMajorLayout_Default)
 {
     // Verify default layout is POSITION_MAJOR
-    UnifiedKVCacheFP32 cache(getTestMPIContext(), 2, 1, 16, 4, 32, -1);
+    CPUKVCacheFP32 cache(getTestMPIContext(), 2, 1, 16, 4, 32, -1);
 
     EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
     EXPECT_EQ(cache.kv_layout(), TensorLayout::KV_POS_HEAD_DIM);
@@ -1424,7 +1424,7 @@ struct Q16BlockSizeTestParams
     std::string name;
 };
 
-class Test__UnifiedKVCache_Q16BlockSizes : public ::testing::TestWithParam<Q16BlockSizeTestParams>
+class Test__CPUKVCache_Q16BlockSizes : public ::testing::TestWithParam<Q16BlockSizeTestParams>
 {
 protected:
     MPIContext getTestMPIContext()
@@ -1433,7 +1433,7 @@ protected:
     }
 };
 
-TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_AppendAndVerify)
+TEST_P(Test__CPUKVCache_Q16BlockSizes, HeadMajor_AppendAndVerify)
 {
     const auto &params = GetParam();
     int n_layers = 1;
@@ -1447,7 +1447,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_AppendAndVerify)
     int block_elements = static_cast<int>(params.block_size);
     int blocks_per_head = head_dim / block_elements;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::HEAD_MAJOR);
@@ -1528,7 +1528,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_AppendAndVerify)
     }
 }
 
-TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_IncrementalDecode)
+TEST_P(Test__CPUKVCache_Q16BlockSizes, HeadMajor_IncrementalDecode)
 {
     const auto &params = GetParam();
     int n_layers = 1;
@@ -1541,7 +1541,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_IncrementalDecode)
     int block_elements = static_cast<int>(params.block_size);
     int blocks_per_head = head_dim / block_elements;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -1596,7 +1596,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_IncrementalDecode)
     }
 }
 
-TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_EvictionPreservesData)
+TEST_P(Test__CPUKVCache_Q16BlockSizes, HeadMajor_EvictionPreservesData)
 {
     const auto &params = GetParam();
     int n_layers = 1;
@@ -1609,7 +1609,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_EvictionPreservesData)
     int block_elements = static_cast<int>(params.block_size);
     int blocks_per_head = head_dim / block_elements;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -1674,7 +1674,7 @@ TEST_P(Test__UnifiedKVCache_Q16BlockSizes, HeadMajor_EvictionPreservesData)
 
 INSTANTIATE_TEST_SUITE_P(
     Q16BlockSizeVariants,
-    Test__UnifiedKVCache_Q16BlockSizes,
+    Test__CPUKVCache_Q16BlockSizes,
     ::testing::Values(
         Q16BlockSizeTestParams{Q16BlockSize::BLOCK_32, 32, "BLOCK_32_head32"},
         Q16BlockSizeTestParams{Q16BlockSize::BLOCK_64, 64, "BLOCK_64_head64"},
@@ -1698,7 +1698,7 @@ struct Q16MultiBlockTestParams
     std::string name;
 };
 
-class Test__UnifiedKVCache_Q16MultiBlock : public ::testing::TestWithParam<Q16MultiBlockTestParams>
+class Test__CPUKVCache_Q16MultiBlock : public ::testing::TestWithParam<Q16MultiBlockTestParams>
 {
 protected:
     MPIContext getTestMPIContext()
@@ -1707,7 +1707,7 @@ protected:
     }
 };
 
-TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
+TEST_P(Test__CPUKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
 {
     const auto &params = GetParam();
     int n_layers = 1;
@@ -1721,7 +1721,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
     int blocks_per_head = params.expected_blocks_per_head;
     ASSERT_EQ(head_dim / block_elements, blocks_per_head) << "Test param mismatch";
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -1814,7 +1814,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
     }
 }
 
-TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_EvictionMultiBlockPerHead)
+TEST_P(Test__CPUKVCache_Q16MultiBlock, HeadMajor_EvictionMultiBlockPerHead)
 {
     const auto &params = GetParam();
     int n_layers = 1;
@@ -1827,7 +1827,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_EvictionMultiBlockPerHead)
     int block_elements = static_cast<int>(params.block_size);
     int blocks_per_head = params.expected_blocks_per_head;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -1892,7 +1892,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_EvictionMultiBlockPerHead)
     }
 }
 
-TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_AppendMultiBlockPerHead)
+TEST_P(Test__CPUKVCache_Q16MultiBlock, PositionMajor_AppendMultiBlockPerHead)
 {
     const auto &params = GetParam();
     int n_layers = 1;
@@ -1907,7 +1907,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_AppendMultiBlockPerHead
     size_t blocks_per_row = n_kv_heads * blocks_per_head;
 
     // Use POSITION_MAJOR layout
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::POSITION_MAJOR);
 
     EXPECT_EQ(cache.layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
@@ -1969,7 +1969,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_AppendMultiBlockPerHead
     }
 }
 
-TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_EvictionMultiBlockPerHead)
+TEST_P(Test__CPUKVCache_Q16MultiBlock, PositionMajor_EvictionMultiBlockPerHead)
 {
     const auto &params = GetParam();
     int n_layers = 1;
@@ -1983,7 +1983,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_EvictionMultiBlockPerHe
     int blocks_per_head = params.expected_blocks_per_head;
     size_t blocks_per_row = n_kv_heads * blocks_per_head;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::POSITION_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -2043,7 +2043,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, PositionMajor_EvictionMultiBlockPerHe
 }
 
 // Test with 4 KV heads to exercise more complex scatter patterns
-TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_FourKVHeads)
+TEST_P(Test__CPUKVCache_Q16MultiBlock, HeadMajor_FourKVHeads)
 {
     const auto &params = GetParam();
     int n_layers = 1;
@@ -2056,7 +2056,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_FourKVHeads)
     int blocks_per_head = params.expected_blocks_per_head;
     size_t blocks_per_row = n_kv_heads * blocks_per_head;
 
-    UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+    CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                               n_kv_heads, head_dim, -1, KVCacheLayoutMode::HEAD_MAJOR);
 
     TensorFactory factory(getTestMPIContext());
@@ -2114,7 +2114,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_FourKVHeads)
 
 INSTANTIATE_TEST_SUITE_P(
     Q16MultiBlockVariants,
-    Test__UnifiedKVCache_Q16MultiBlock,
+    Test__CPUKVCache_Q16MultiBlock,
     ::testing::Values(
         // Multi-block scenarios using head_dim values where optimal_q16_block_size
         // returns a smaller block, naturally creating multiple blocks per head.

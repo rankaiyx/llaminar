@@ -43,7 +43,7 @@ namespace llaminar2
     class CPUTensorBase;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
     class IKVCache;
-    class IUnifiedKVCache;
+    class ICPUKVCache;
     class MPIContext;
     class FusedAttentionWoKernel;
 

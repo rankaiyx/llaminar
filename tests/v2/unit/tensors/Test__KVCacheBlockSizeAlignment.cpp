@@ -26,7 +26,7 @@
 
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "tensors/UnifiedKVCache.h"
+#include "tensors/CPUKVCache.h"
 #include "tensors/BlockStructures.h"
 #include "utils/MPIContext.h"
 #include <cstring>
@@ -162,7 +162,7 @@ namespace llaminar2
 
         TEST_F(Test__KVCacheBlockSizeAlignment, KVCache_AllocatesWithOptimalBlockSize)
         {
-            // This test verifies that UnifiedKVCache allocates tensors with optimal block size
+            // This test verifies that CPUKVCache allocates tensors with optimal block size
             const int n_layers = 1;
             const int batch_size = 1;
             const int n_kv_heads = 2;
@@ -170,7 +170,7 @@ namespace llaminar2
             const int max_seq_len = 128;
 
             // Use the type alias for Q16_1 cache
-            UnifiedKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
+            CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
                                       n_kv_heads, head_dim, -1);
 
             // Get the K and V tensors via the polymorphic interface (layer 0, seq 0)

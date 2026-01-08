@@ -14,7 +14,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/TensorFactory.h"
-#include "../tensors/UnifiedKVCache.h"
+#include "../tensors/CPUKVCache.h"
 #include <chrono>
 
 namespace llaminar2
@@ -428,7 +428,7 @@ namespace llaminar2
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
-        IUnifiedKVCache *kv_cache,
+        ICPUKVCache *kv_cache,
         const int *position_ids,
         int device_idx)
     {
@@ -622,7 +622,7 @@ namespace llaminar2
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
-        IUnifiedKVCache *kv_cache,
+        ICPUKVCache *kv_cache,
         const int *position_ids,
         int device_idx)
     {
@@ -1013,7 +1013,7 @@ namespace llaminar2
                       << config.local_n_kv_heads << " local KV heads (start=" << kv_head_start << ")"
                       << " precision=" << activationPrecisionToString(kv_cache_prec));
 
-            state_.kv_cache = createShardedKVCache(
+            state_.kv_cache = createShardedCPUKVCache(
                 kv_cache_prec,
                 *local_mpi_ctx,
                 n_layers,
@@ -1029,7 +1029,7 @@ namespace llaminar2
         else
         {
             // Non-sharded (replicated) KV cache for single-rank or non-tensor-parallel
-            state_.kv_cache = createUnifiedKVCache(
+            state_.kv_cache = createCPUKVCache(
                 kv_cache_prec,
                 *local_mpi_ctx,
                 n_layers,

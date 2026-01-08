@@ -11,7 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "tensors/UnifiedKVCache.h"
+#include "tensors/CPUKVCache.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
@@ -24,7 +24,7 @@
 using namespace llaminar2;
 
 // Alias for backward compatibility with tests
-using KVCache = UnifiedKVCache<ActivationPrecision::FP32>;
+using KVCache = CPUKVCache<ActivationPrecision::FP32>;
 
 // Single-rank MPI context for performance tests
 static MPIContext getTestMPIContext()

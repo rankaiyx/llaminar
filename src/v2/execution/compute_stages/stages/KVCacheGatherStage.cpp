@@ -8,7 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../tensors/UnifiedKVCache.h"
+#include "../../../tensors/CPUKVCache.h"
 
 namespace llaminar2
 {
@@ -43,7 +43,7 @@ namespace llaminar2
         }
 
         // Cast ITensor* to TensorBase* for CPU KV cache operations
-        // TODO: Update IUnifiedKVCache interface to use ITensor* for device-agnostic support
+        // TODO: Update ICPUKVCache interface to use ITensor* for device-agnostic support
         auto *out_K_base = dynamic_cast<TensorBase *>(params_.out_K);
         auto *out_V_base = dynamic_cast<TensorBase *>(params_.out_V);
         if (!out_K_base || !out_V_base)

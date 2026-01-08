@@ -18,7 +18,7 @@
 #include <cmath>
 #include <numeric>
 
-#include "v2/tensors/UnifiedKVCache.h"
+#include "v2/tensors/CPUKVCache.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/models/qwen/Qwen2Graph.h"
 #include "execution/compute_stages/ComputeStages.h"
@@ -101,10 +101,10 @@ protected:
     /**
      * @brief Create an FP32 KV cache for testing
      */
-    std::unique_ptr<UnifiedKVCache<ActivationPrecision::FP32>> createTestKVCache(
+    std::unique_ptr<CPUKVCache<ActivationPrecision::FP32>> createTestKVCache(
         int max_seq_len, int batch_size)
     {
-        return std::make_unique<UnifiedKVCache<ActivationPrecision::FP32>>(
+        return std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
             *mpi_ctx_,
             n_layers_,
             batch_size,
@@ -171,7 +171,7 @@ protected:
      * @brief Verify cache contents match expected pattern for a specific sequence
      */
     void verifyCacheSequence(
-        UnifiedKVCache<ActivationPrecision::FP32> *cache,
+        CPUKVCache<ActivationPrecision::FP32> *cache,
         int layer_idx,
         int seq_idx,
         int expected_batch_idx,

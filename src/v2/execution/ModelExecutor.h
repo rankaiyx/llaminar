@@ -91,14 +91,14 @@ namespace llaminar2
 
         ComputeGraph buildTransformerLayersGraph(
             TensorBase *input_hidden,
-            IUnifiedKVCache *kv_cache,
+            ICPUKVCache *kv_cache,
             const int *position_ids,
             int device_idx) override = 0;
 
         ComputeGraph buildLayerGraph(
             int layer_idx,
             TensorBase *input_hidden,
-            IUnifiedKVCache *kv_cache,
+            ICPUKVCache *kv_cache,
             const int *position_ids,
             int device_idx) override = 0;
 
@@ -170,7 +170,7 @@ namespace llaminar2
          */
         bool executeTransformerLayers(
             TensorBase *hidden,
-            IUnifiedKVCache *kv_cache,
+            ICPUKVCache *kv_cache,
             const int *position_ids,
             int device_idx);
 

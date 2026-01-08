@@ -51,7 +51,7 @@ namespace llaminar2
 
         /// K/V: [position][n_kv_heads][head_dim] - position-major
         /// Natural for KV cache append (new positions go at end)
-        /// Used by: UnifiedKVCache default storage
+        /// Used by: CPUKVCache default storage
         KV_POS_HEAD_DIM,
 
         /// K/V: [n_kv_heads][position][head_dim] - head-major

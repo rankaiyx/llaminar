@@ -1,5 +1,5 @@
 /**
- * @file UnifiedKVCache.h
+ * @file CPUKVCache.h
  * @brief Unified Key-Value cache supporting both single-sequence and batched modes
  * @author David Sanftenberg
  * @date December 2025
@@ -64,7 +64,7 @@ namespace llaminar2
     };
 
     // =========================================================================
-    // IUnifiedKVCache Interface
+    // ICPUKVCache Interface
     // =========================================================================
 
     /**
@@ -73,10 +73,10 @@ namespace llaminar2
      * Enables polymorphic use when precision is determined at runtime.
      * Supports both single-sequence (batch_size=1) and batched modes.
      */
-    class IUnifiedKVCache
+    class ICPUKVCache
     {
     public:
-        virtual ~IUnifiedKVCache() = default;
+        virtual ~ICPUKVCache() = default;
 
         // Metadata
         virtual ActivationPrecision precision() const = 0;
@@ -185,50 +185,50 @@ namespace llaminar2
          * @brief Map ActivationPrecision to tensor type for KV cache
          */
         template <ActivationPrecision P>
-        struct UnifiedKVCacheTensor;
+        struct CPUKVCacheTensor;
 
         template <>
-        struct UnifiedKVCacheTensor<ActivationPrecision::FP32>
+        struct CPUKVCacheTensor<ActivationPrecision::FP32>
         {
             using Type = FP32Tensor;
         };
 
         template <>
-        struct UnifiedKVCacheTensor<ActivationPrecision::BF16>
+        struct CPUKVCacheTensor<ActivationPrecision::BF16>
         {
             using Type = BF16Tensor;
         };
 
         template <>
-        struct UnifiedKVCacheTensor<ActivationPrecision::FP16>
+        struct CPUKVCacheTensor<ActivationPrecision::FP16>
         {
             using Type = FP16Tensor;
         };
 
         template <>
-        struct UnifiedKVCacheTensor<ActivationPrecision::Q8_1>
+        struct CPUKVCacheTensor<ActivationPrecision::Q8_1>
         {
             using Type = Q8_1Tensor;
         };
 
         template <>
-        struct UnifiedKVCacheTensor<ActivationPrecision::Q16_1>
+        struct CPUKVCacheTensor<ActivationPrecision::Q16_1>
         {
             using Type = Q16_1Tensor;
         };
     } // namespace detail
 
     // =========================================================================
-    // UnifiedKVCacheEntry
+    // CPUKVCacheEntry
     // =========================================================================
 
     /**
      * @brief Per-layer, per-sequence KV cache entry with typed tensors
      */
     template <ActivationPrecision Precision>
-    struct UnifiedKVCacheEntry
+    struct CPUKVCacheEntry
     {
-        using TensorT = typename detail::UnifiedKVCacheTensor<Precision>::Type;
+        using TensorT = typename detail::CPUKVCacheTensor<Precision>::Type;
 
         std::shared_ptr<TensorT> K; // [max_seq_len, n_kv_heads * head_dim] pre-allocated
         std::shared_ptr<TensorT> V; // [max_seq_len, n_kv_heads * head_dim] pre-allocated
@@ -236,7 +236,7 @@ namespace llaminar2
     };
 
     // =========================================================================
-    // UnifiedKVCache Template Class
+    // CPUKVCache Template Class
     // =========================================================================
 
     /**
@@ -260,11 +260,11 @@ namespace llaminar2
      * - Configurable layout mode (POSITION_MAJOR or HEAD_MAJOR)
      */
     template <ActivationPrecision Precision = ActivationPrecision::FP32>
-    class UnifiedKVCache : public IUnifiedKVCache
+    class CPUKVCache : public ICPUKVCache
     {
     public:
-        using TensorT = typename detail::UnifiedKVCacheTensor<Precision>::Type;
-        using EntryT = UnifiedKVCacheEntry<Precision>;
+        using TensorT = typename detail::CPUKVCacheTensor<Precision>::Type;
+        using EntryT = CPUKVCacheEntry<Precision>;
 
         /**
          * @brief Construct unified KV cache
@@ -278,14 +278,14 @@ namespace llaminar2
          * @param device_idx Default device for all layers (-1 = CPU)
          * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
          */
-        UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        CPUKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim, int device_idx = -1,
                        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
         /**
          * @brief Construct unified KV cache with per-layer device placement
          */
-        UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        CPUKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
                        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
@@ -306,7 +306,7 @@ namespace llaminar2
          * @param device_idx Default device for all layers (-1 = CPU)
          * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
          */
-        UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        CPUKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                        int head_dim, int device_idx = -1,
                        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
@@ -314,12 +314,12 @@ namespace llaminar2
         /**
          * @brief Construct unified KV cache with sharded KV heads and per-layer device placement
          */
-        UnifiedKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        CPUKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                        int head_dim, const std::vector<int> &attention_devices,
                        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
-        // IUnifiedKVCache interface implementation
+        // ICPUKVCache interface implementation
         ActivationPrecision precision() const override { return Precision; }
         int num_layers() const override { return n_layers_; }
         int batch_size() const override { return batch_size_; }
@@ -345,7 +345,7 @@ namespace llaminar2
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens) override;
 
         // Bring in convenience methods from interface (would be hidden by overrides otherwise)
-        using IUnifiedKVCache::append_kv;
+        using ICPUKVCache::append_kv;
 
         int gather_kv_batched(int layer, int num_sequences, TensorBase *out_k, TensorBase *out_v,
                               std::vector<int> &out_kv_lens) override;
@@ -445,11 +445,11 @@ namespace llaminar2
     // Type Aliases
     // =========================================================================
 
-    using UnifiedKVCacheFP32 = UnifiedKVCache<ActivationPrecision::FP32>;
-    using UnifiedKVCacheBF16 = UnifiedKVCache<ActivationPrecision::BF16>;
-    using UnifiedKVCacheFP16 = UnifiedKVCache<ActivationPrecision::FP16>;
-    using UnifiedKVCacheQ8_1 = UnifiedKVCache<ActivationPrecision::Q8_1>;
-    using UnifiedKVCacheQ16_1 = UnifiedKVCache<ActivationPrecision::Q16_1>;
+    using CPUKVCacheFP32 = CPUKVCache<ActivationPrecision::FP32>;
+    using CPUKVCacheBF16 = CPUKVCache<ActivationPrecision::BF16>;
+    using CPUKVCacheFP16 = CPUKVCache<ActivationPrecision::FP16>;
+    using CPUKVCacheQ8_1 = CPUKVCache<ActivationPrecision::Q8_1>;
+    using CPUKVCacheQ16_1 = CPUKVCache<ActivationPrecision::Q16_1>;
 
     // =========================================================================
     // Factory Functions
@@ -468,7 +468,7 @@ namespace llaminar2
      * @param device_idx Device index for all layers (-1 for CPU)
      * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
      */
-    std::unique_ptr<IUnifiedKVCache> createUnifiedKVCache(
+    std::unique_ptr<ICPUKVCache> createCPUKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
@@ -479,7 +479,7 @@ namespace llaminar2
     /**
      * @brief Create unified KV cache with per-layer device placement
      */
-    std::unique_ptr<IUnifiedKVCache> createUnifiedKVCache(
+    std::unique_ptr<ICPUKVCache> createCPUKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
@@ -509,7 +509,7 @@ namespace llaminar2
      * @param device_idx Device index for all layers (-1 for CPU)
      * @param layout_mode Memory layout mode (POSITION_MAJOR or HEAD_MAJOR)
      */
-    std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+    std::unique_ptr<ICPUKVCache> createShardedCPUKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
@@ -520,7 +520,7 @@ namespace llaminar2
     /**
      * @brief Create sharded unified KV cache with per-layer device placement
      */
-    std::unique_ptr<IUnifiedKVCache> createShardedKVCache(
+    std::unique_ptr<ICPUKVCache> createShardedCPUKVCache(
         ActivationPrecision precision,
         const MPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,

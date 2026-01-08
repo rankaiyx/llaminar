@@ -53,7 +53,7 @@ namespace llaminar2
             ITensor *workspace_mask = nullptr;
 
             // KV cache for dynamic length query at execution time
-            IUnifiedKVCache *kv_cache = nullptr;
+            ICPUKVCache *kv_cache = nullptr;
             int layer_idx = -1;
 
             // Position offset for decode mode causal masking

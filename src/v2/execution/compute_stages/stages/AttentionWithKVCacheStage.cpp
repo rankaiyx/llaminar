@@ -9,7 +9,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include "../../../tensors/UnifiedKVCache.h"
+#include "../../../tensors/CPUKVCache.h"
 #include <limits>
 
 namespace llaminar2

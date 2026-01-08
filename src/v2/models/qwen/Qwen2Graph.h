@@ -33,7 +33,7 @@
 #include "../../execution/GraphResolver.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorFactory.h"
-#include "../../tensors/UnifiedKVCache.h"
+#include "../../tensors/CPUKVCache.h"
 #include "../../loaders/ModelContext.h"
 #include "../../utils/MPIContext.h"
 #include "Qwen2Schema.h"
@@ -304,7 +304,7 @@ namespace llaminar2
         int seq_len = 0;                     ///< Sequence length
         int position_offset = 0;             ///< KV cache position offset (legacy, used if position_ids == nullptr)
         int device_idx = 0;                  ///< Target device
-        IUnifiedKVCache *kv_cache = nullptr; ///< KV cache for attention (optional)
+        ICPUKVCache *kv_cache = nullptr; ///< KV cache for attention (optional)
 
         /// Sequence lengths for variable-length batching (nullptr = all equal to seq_len)
         /// When set, this enables proper batch-separating attention masks that
@@ -534,7 +534,7 @@ namespace llaminar2
          */
         ComputeGraph buildTransformerLayersGraph(
             TensorBase *input_hidden,
-            IUnifiedKVCache *kv_cache,
+            ICPUKVCache *kv_cache,
             const int *position_ids,
             int device_idx);
 
@@ -544,7 +544,7 @@ namespace llaminar2
         ComputeGraph buildLayerGraph(
             int layer_idx,
             TensorBase *input_hidden,
-            IUnifiedKVCache *kv_cache,
+            ICPUKVCache *kv_cache,
             const int *position_ids,
             int device_idx);
 
@@ -582,7 +582,7 @@ namespace llaminar2
             int layer_idx,
             int seq_len,
             int batch_size,
-            IUnifiedKVCache *kv_cache,
+            ICPUKVCache *kv_cache,
             const int *position_ids,
             int device_idx,
             const std::vector<int> *sequence_lengths = nullptr);

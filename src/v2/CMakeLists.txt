@@ -604,7 +604,7 @@ add_library(llaminar2_core STATIC
     tensors/cpu/BF16Tensor.cpp
     tensors/cpu/INT32Tensor.cpp
     tensors/cpu/INT8Tensor.cpp
-    tensors/cpu/TensorFactory.cpp
+    tensors/TensorFactory.cpp
     tensors/cpu/IQ4_NLTensor.cpp
     # Simple quantization formats (Q8_0, Q8_1, Q16_1, Q4_0, Q4_1, Q5_0, Q5_1)
     tensors/cpu/Q8_0Tensor.cpp
@@ -630,7 +630,7 @@ add_library(llaminar2_core STATIC
     tensors/cpu/IQ3_STensor.cpp
     tensors/cpu/IQ1_STensor.cpp
     tensors/cpu/IQ1_MTensor.cpp
-    tensors/cpu/UnifiedKVCache.cpp
+    tensors/cpu/CPUKVCache.cpp
     # Vectorized primitives (ported from V1)
     kernels/cpu/primitives/RoPEPrimitives.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp

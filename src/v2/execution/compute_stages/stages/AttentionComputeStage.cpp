@@ -7,7 +7,7 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
-#include "../../../tensors/UnifiedKVCache.h"
+#include "../../../tensors/CPUKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include <limits>
