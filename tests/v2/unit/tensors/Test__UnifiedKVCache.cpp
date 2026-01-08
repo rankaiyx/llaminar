@@ -177,8 +177,8 @@ TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_Q16_1)
     // Verify tensor shape matches HEAD_MAJOR: [n_kv_heads * max_seq_len, head_dim]
     auto k_base = cache->get_k(0);
     ASSERT_NE(k_base, nullptr);
-    EXPECT_EQ(k_base->rows(), 2u * 16u);  // n_kv_heads * max_seq_len
-    EXPECT_EQ(k_base->cols(), 64u);       // head_dim
+    EXPECT_EQ(k_base->rows(), 2u * 16u); // n_kv_heads * max_seq_len
+    EXPECT_EQ(k_base->cols(), 64u);      // head_dim
 }
 
 TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_FP32)
@@ -197,8 +197,8 @@ TEST_F(Test__UnifiedKVCache, Factory_ExplicitHeadMajor_FP32)
     // Verify tensor shape
     auto k_base = cache->get_k(0);
     ASSERT_NE(k_base, nullptr);
-    EXPECT_EQ(k_base->rows(), 4u * 16u);  // n_kv_heads * max_seq_len
-    EXPECT_EQ(k_base->cols(), 32u);       // head_dim
+    EXPECT_EQ(k_base->rows(), 4u * 16u); // n_kv_heads * max_seq_len
+    EXPECT_EQ(k_base->cols(), 32u);      // head_dim
 }
 
 TEST_F(Test__UnifiedKVCache, ShardedFactoryQ16_1)
@@ -256,8 +256,8 @@ TEST_F(Test__UnifiedKVCache, ShardedFactory_ExplicitHeadMajor_Q16_1)
     // Verify tensor shape for sharded HEAD_MAJOR: [local_n_kv_heads * max_seq_len, head_dim]
     auto k_base = cache->get_k(0);
     ASSERT_NE(k_base, nullptr);
-    EXPECT_EQ(k_base->rows(), 2u * 64u);  // local_n_kv_heads * max_seq_len
-    EXPECT_EQ(k_base->cols(), 64u);       // head_dim
+    EXPECT_EQ(k_base->rows(), 2u * 64u); // local_n_kv_heads * max_seq_len
+    EXPECT_EQ(k_base->cols(), 64u);      // head_dim
 }
 
 // =============================================================================
@@ -959,8 +959,8 @@ TEST_F(Test__UnifiedKVCache, BackwardCompatSingleSequence)
     EXPECT_EQ(cache.get_cached_tokens(0), 4);          // layer only
     EXPECT_NE(cache.get_k(0), nullptr);                // layer only
     EXPECT_NE(cache.get_v(0), nullptr);                // layer only
-    EXPECT_NE(cache.get_k(0), nullptr);           // layer only
-    EXPECT_NE(cache.get_v(0), nullptr);           // layer only
+    EXPECT_NE(cache.get_k(0), nullptr);                // layer only
+    EXPECT_NE(cache.get_v(0), nullptr);                // layer only
 
     cache.clear();
     EXPECT_EQ(cache.get_cached_tokens(0), 0);
@@ -1361,7 +1361,7 @@ TEST_F(Test__UnifiedKVCache, HeadMajorLayout_Q16_1_DataIntegrity)
             auto *k_block = reinterpret_cast<Q16_1Block_64 *>(k->raw_mutable_data()) + block_idx;
             auto *v_block = reinterpret_cast<Q16_1Block_64 *>(v->raw_mutable_data()) + block_idx;
 
-            k_block->d = 0.01f * (t + 1);     // Different scale per position
+            k_block->d = 0.01f * (t + 1); // Different scale per position
             v_block->d = 0.01f * (t + 1);
             k_block->qs[0] = static_cast<int16_t>(t * 100 + h * 10); // Identifiable pattern
             v_block->qs[0] = static_cast<int16_t>(t * 100 + h * 10 + 1000);
@@ -1409,8 +1409,8 @@ TEST_F(Test__UnifiedKVCache, PositionMajorLayout_Default)
     // Verify tensor shape: [max_seq_len, n_kv_heads * head_dim]
     auto k_base = cache.get_k(0);
     ASSERT_NE(k_base, nullptr);
-    EXPECT_EQ(k_base->rows(), 16u);          // max_seq_len
-    EXPECT_EQ(k_base->cols(), 4u * 32u);     // n_kv_heads * head_dim
+    EXPECT_EQ(k_base->rows(), 16u);      // max_seq_len
+    EXPECT_EQ(k_base->cols(), 4u * 32u); // n_kv_heads * head_dim
 }
 
 // =============================================================================
@@ -1426,7 +1426,7 @@ struct Q16BlockSizeTestParams
 
 class Test__UnifiedKVCache_Q16BlockSizes : public ::testing::TestWithParam<Q16BlockSizeTestParams>
 {
-  protected:
+protected:
     MPIContext getTestMPIContext()
     {
         return MPIContext(0, 1, MPI_COMM_WORLD);
@@ -1700,7 +1700,7 @@ struct Q16MultiBlockTestParams
 
 class Test__UnifiedKVCache_Q16MultiBlock : public ::testing::TestWithParam<Q16MultiBlockTestParams>
 {
-  protected:
+protected:
     MPIContext getTestMPIContext()
     {
         return MPIContext(0, 1, MPI_COMM_WORLD);
@@ -1750,7 +1750,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
                 // Use distinctive values to detect any reordering issues
                 float scale_k = 0.001f * (t * 100 + h * 10 + b);
                 float scale_v = 0.002f * (t * 100 + h * 10 + b);
-                
+
                 // Pattern encodes position: t*1000 + h*100 + b*10 + element_offset
                 int16_t qs_k_0 = static_cast<int16_t>(t * 1000 + h * 100 + b * 10);
                 int16_t qs_k_1 = static_cast<int16_t>(t * 1000 + h * 100 + b * 10 + 1);
@@ -1758,7 +1758,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
 
                 std::memcpy(k_raw + src_block_idx * block_bytes, &scale_k, sizeof(float));
                 std::memcpy(v_raw + src_block_idx * block_bytes, &scale_v, sizeof(float));
-                
+
                 // Write first two int16 elements (after scale and sum_qs fields)
                 // Block layout: float d (4) + int32_t sum_qs (4) + int16_t qs[N]
                 size_t qs_offset = 8; // 4 bytes scale + 4 bytes sum_qs
@@ -1790,7 +1790,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_AppendMultiBlockPerHead)
 
                 float cached_scale;
                 int16_t cached_qs_0, cached_qs_1;
-                
+
                 std::memcpy(&cached_scale, k_cache_raw + cache_block_idx * block_bytes, sizeof(float));
                 size_t qs_offset = 8;
                 std::memcpy(&cached_qs_0, k_cache_raw + cache_block_idx * block_bytes + qs_offset, sizeof(int16_t));
@@ -1873,7 +1873,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_EvictionMultiBlockPerHead)
 
     for (int h = 0; h < n_kv_heads; ++h)
     {
-        for (int t = 0; t < 3; ++t)  // 3 remaining tokens
+        for (int t = 0; t < 3; ++t) // 3 remaining tokens
         {
             for (int b = 0; b < blocks_per_head; ++b)
             {
@@ -2049,7 +2049,7 @@ TEST_P(Test__UnifiedKVCache_Q16MultiBlock, HeadMajor_FourKVHeads)
     int n_layers = 1;
     int batch_size = 1;
     int max_seq_len = 8;
-    int n_kv_heads = 4;  // More heads
+    int n_kv_heads = 4; // More heads
     int head_dim = params.head_dim;
     int kv_dim = n_kv_heads * head_dim;
 

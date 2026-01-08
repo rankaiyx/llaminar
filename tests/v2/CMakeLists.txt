@@ -1046,6 +1046,22 @@ add_v2_test(V2_Unit_KernelFactoryCacheInvalidation
     MPI_PROCS 1  # Cache invalidation tests, single rank
 )
 
+# Test: KernelFactory TensorSlice unwrapping in CUDA dispatch path
+# Regression test for: "unsupported tensor type 10 for device CUDA:0"
+# Root cause: dynamic_cast<Q4_0Tensor*>(TensorSlice*) returns nullptr
+# Solution: Unwrap TensorSlice via slice->inner() before type dispatch
+add_executable(v2_test_kernel_factory_tensorslice_cuda unit/Test__KernelFactoryTensorSliceCUDA.cpp)
+target_link_libraries(v2_test_kernel_factory_tensorslice_cuda
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_KernelFactoryTensorSliceCUDA
+    COMMAND $<TARGET_FILE:v2_test_kernel_factory_tensorslice_cuda>
+    LABELS "V2;Unit;Kernels;KernelFactory;TensorSlice;CUDA;TensorParallelism;Regression"
+    MPI_PROCS 1  # TensorSlice tests, single rank
+)
+
 # Test: NUMATopology NUMA detection (local node, GPU affinity) - INTEGRATION (requires real GPUs)
 add_executable(v2_integration_numa_topology integration/Test__NUMATopology.cpp)
 target_link_libraries(v2_integration_numa_topology
@@ -2532,6 +2548,17 @@ add_v2_test(V2_Integration_CUDABasicPipeline
     COMMAND $<TARGET_FILE:v2_integration_cuda_basic_pipeline>
     LABELS "V2;Integration;CUDA;Pipeline;KernelFactory;TensorTransfer;GEMM;FP32"
     MPI_PROCS 1  # Tests GPU pipeline locally, no MPI needed
+)
+
+# Test: CUDA Tensor Type Allocation (all quantized and activation types)
+# Verifies all tensor types can be instantiated and allocated on GPU
+# Tests CUDATypedTensor, CUDABackend allocation, host↔device transfer
+add_executable(v2_integration_cuda_tensor_type_allocation integration/Test__CUDATensorTypeAllocation.cpp)
+target_link_libraries(v2_integration_cuda_tensor_type_allocation llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDATensorTypeAllocation
+    COMMAND $<TARGET_FILE:v2_integration_cuda_tensor_type_allocation>
+    LABELS "V2;Integration;CUDA;TensorAllocation;Quantization;FP32;INT8;INT32;Q4_0;Q8_0;IQ4_NL;KQuant"
+    MPI_PROCS 1  # Tests GPU allocation locally, no MPI needed
 )
 
 # Test: CUDA GEMM Parity (FP32 and IQ4_NL: CUDA vs CPU kernel comparison)

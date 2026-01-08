@@ -2548,88 +2548,98 @@ namespace llaminar
                 // GPU backends for quantized types (CUDA uses different packing)
                 else if (dev_type != DeviceType::CPU)
                 {
+                    // Handle TensorSlice: unwrap to get inner tensor type for dispatch
+                    // This occurs when weights are sharded across MPI ranks
+                    const llaminar2::TensorBase *dispatch_tensor = tensor;
+                    if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
+                    {
+                        dispatch_tensor = slice->inner();
+                        LOG_DEBUG("[KernelFactory] CUDA: Unwrapping TensorSlice -> inner type "
+                                  << static_cast<int>(dispatch_tensor->native_type()));
+                    }
+
                     // Type-based dispatch for GPU backends
-                    if (auto *t = dynamic_cast<const llaminar2::IQ4_NLTensor *>(tensor))
+                    if (auto *t = dynamic_cast<const llaminar2::IQ4_NLTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q4_0Tensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q4_0Tensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q4_1Tensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q4_1Tensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q5_0Tensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q5_0Tensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q5_1Tensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q5_1Tensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q6_KTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q6_KTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_0Tensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q8_0Tensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_1Tensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q8_1Tensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q2_KTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q2_KTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q3_KTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q3_KTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q4_KTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q4_KTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q5_KTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q5_KTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::Q8_KTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::Q8_KTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ1_MTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ1_MTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ1_STensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ1_STensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_STensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_STensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_XSTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_XSTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_XXSTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ2_XXSTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ3_STensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ3_STensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ3_XXSTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ3_XXSTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
-                    else if (auto *t = dynamic_cast<const llaminar2::IQ4_XSTensor *>(tensor))
+                    else if (auto *t = dynamic_cast<const llaminar2::IQ4_XSTensor *>(dispatch_tensor))
                     {
                         kernel = createGemm(t, dev_type);
                     }
