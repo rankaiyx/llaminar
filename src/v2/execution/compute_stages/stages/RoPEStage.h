@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 #include <vector>
 
 namespace llaminar2
@@ -24,6 +24,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Type-safe tensor pointers (required)
             ITensor *Q = nullptr; ///< Query tensor (IActivationTensor*, modified in-place)
             ITensor *K = nullptr; ///< Key tensor (IActivationTensor*, modified in-place, optional)
@@ -51,10 +53,6 @@ namespace llaminar2
             // Dynamic-scale K output (for HybridQ16 K precision fix)
             // When K is Q16_1 from GEMM, RoPE outputs per-head scales for attention
             float *K_head_scales = nullptr; ///< Output: per-head K scales [seq_len * n_kv_heads]
-
-            // Optional MPI context for distributed execution
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit RoPEStage(Params params);

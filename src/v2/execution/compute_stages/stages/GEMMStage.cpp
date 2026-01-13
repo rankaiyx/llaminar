@@ -94,7 +94,11 @@ namespace llaminar2
     // GEMMStage Implementation
     // =============================================================================
 
-    GEMMStage::GEMMStage(Params params) : params_(std::move(params)) {}
+    GEMMStage::GEMMStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool GEMMStage::execute(IDeviceContext *ctx)
     {

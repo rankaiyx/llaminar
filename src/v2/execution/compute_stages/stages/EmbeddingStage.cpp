@@ -17,7 +17,11 @@ namespace llaminar2
     // EmbeddingStage Implementation
     // =============================================================================
 
-    EmbeddingStage::EmbeddingStage(Params params) : params_(std::move(params)) {}
+    EmbeddingStage::EmbeddingStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool EmbeddingStage::execute(IDeviceContext *ctx)
     {

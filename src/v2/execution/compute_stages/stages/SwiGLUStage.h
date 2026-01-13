@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -23,6 +23,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Type-safe tensor pointers (required)
             const ITensor *gate = nullptr; ///< Gate tensor [seq_len, intermediate_dim]
             const ITensor *up = nullptr;   ///< Up tensor [seq_len, intermediate_dim]
@@ -31,10 +33,6 @@ namespace llaminar2
             // Explicit seq_len override (for pre-allocated buffers)
             // If 0, derives from tensor dimensions
             int seq_len = 0;
-
-            // Optional MPI context for distributed execution
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit SwiGLUStage(Params params);
@@ -48,7 +46,7 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
 
         /// Target device for coherence management
-        DeviceId preferredDevice() const override { return params_.device_id; }
+
 
     private:
         Params params_;

@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include "../../../src/v2/execution/GraphBufferManager.h"
 #include "../../../src/v2/execution/GraphExecutor.h"
+#include "../../../src/v2/execution/CollectiveContext.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "../../../src/v2/tensors/TensorFactory.h"
 #include "../../../src/v2/utils/MPIContext.h"
@@ -57,8 +58,8 @@ protected:
 class MockStageWithRequirements : public IComputeStage
 {
 public:
-    MockStageWithRequirements(StageBufferRequirements reqs)
-        : requirements_(std::move(reqs)) {}
+    MockStageWithRequirements(StageBufferRequirements reqs, DeviceId device = DeviceId::cpu())
+        : IComputeStage(device), requirements_(std::move(reqs)) {}
 
     bool execute(IDeviceContext *) override { return true; }
     ComputeStageType type() const override { return ComputeStageType::COPY; }
@@ -81,6 +82,9 @@ private:
 class MockStageNoRequirements : public IComputeStage
 {
 public:
+    explicit MockStageNoRequirements(DeviceId device = DeviceId::cpu())
+        : IComputeStage(device) {}
+
     bool execute(IDeviceContext *) override { return true; }
     ComputeStageType type() const override { return ComputeStageType::COPY; }
     bool supportsBackend(ComputeBackendType) const override { return true; }
@@ -790,4 +794,119 @@ TEST_F(GraphBufferManagerTest, AllocateWithAliasingOverlappingLifetimes)
     // Actually stage2::long_lived and stage2::scratch_c start at same index...
     // Let's just verify the allocation succeeds
     EXPECT_GE(manager_->aliasingGroupCount(), 1u);
+}
+
+// =============================================================================
+// Collective Context Integration Tests (Phase 3)
+// =============================================================================
+
+TEST_F(GraphBufferManagerTest, SetCollectiveContext_Null)
+{
+    EXPECT_EQ(manager_->collectiveContext(), nullptr);
+
+    manager_->setCollectiveContext(nullptr);
+    EXPECT_EQ(manager_->collectiveContext(), nullptr);
+}
+
+TEST_F(GraphBufferManagerTest, SetCollectiveContext_Valid)
+{
+    // Create a simple collective context (no router)
+    auto ctx = std::shared_ptr<CollectiveContext>(CollectiveContextFactory::createSingleDevice().release());
+    ASSERT_NE(ctx, nullptr);
+
+    manager_->setCollectiveContext(ctx);
+    EXPECT_EQ(manager_->collectiveContext(), ctx);
+
+    // Clear it
+    manager_->setCollectiveContext(nullptr);
+    EXPECT_EQ(manager_->collectiveContext(), nullptr);
+}
+
+TEST_F(GraphBufferManagerTest, BufferDescriptor_ForCollective)
+{
+    // Test the fluent builder for collective buffers
+    BufferDescriptor desc = BufferDescriptor::output("attn_out", {32, 64}, BufferTensorType::FP32)
+                                .forCollective("layer0_attn_allreduce");
+
+    EXPECT_TRUE(desc.participates_in_collective);
+    EXPECT_EQ(desc.collective_id, "layer0_attn_allreduce");
+    EXPECT_TRUE(desc.isCollectiveBuffer());
+}
+
+TEST_F(GraphBufferManagerTest, BufferDescriptor_NotCollective)
+{
+    // Standard buffer without collective participation
+    BufferDescriptor desc = BufferDescriptor::output("regular_out", {32, 64}, BufferTensorType::FP32);
+
+    EXPECT_FALSE(desc.participates_in_collective);
+    EXPECT_TRUE(desc.collective_id.empty());
+    EXPECT_FALSE(desc.isCollectiveBuffer());
+}
+
+TEST_F(GraphBufferManagerTest, AllocateCollectiveBuffer_NoContext)
+{
+    // Allocate a collective buffer without a collective context
+    // Should use standard allocation path
+    BufferDescriptor desc = BufferDescriptor::output("collective_out", {32, 64}, BufferTensorType::FP32)
+                                .forCollective("test_allreduce");
+
+    // No collective context set - should still allocate successfully
+    EXPECT_TRUE(manager_->allocateBuffer("node", desc));
+    EXPECT_TRUE(manager_->hasBuffer("node", "collective_out"));
+
+    auto *buffer = manager_->getBuffer("node", "collective_out");
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(buffer->numel(), 32u * 64u);
+}
+
+TEST_F(GraphBufferManagerTest, AllocateCollectiveBuffer_CPUDevice)
+{
+    // Collective buffer on CPU - should not use BAR allocation
+    // (BAR is only for ROCm devices)
+    auto ctx = std::shared_ptr<CollectiveContext>(CollectiveContextFactory::createSingleDevice().release());
+    manager_->setCollectiveContext(ctx);
+
+    BufferDescriptor desc = BufferDescriptor::output("collective_out", {32, 64}, BufferTensorType::FP32)
+                                .forCollective("test_allreduce");
+    desc.device = DeviceId::cpu(); // CPU device
+
+    EXPECT_TRUE(manager_->allocateBuffer("node", desc));
+    EXPECT_TRUE(manager_->hasBuffer("node", "collective_out"));
+}
+
+TEST_F(GraphBufferManagerTest, ShouldUseBarAllocation_NoContext)
+{
+    // Without collective context, shouldUseBarAllocation should return false
+    BufferDescriptor desc = BufferDescriptor::output("out", {32, 64}, BufferTensorType::FP32)
+                                .forCollective("test_collective");
+    desc.device = DeviceId::rocm(0);
+
+    // Can't directly test private method, but we can verify the allocation succeeds
+    // without BAR allocation (uses standard path)
+    EXPECT_TRUE(manager_->allocateBuffer("node", desc));
+}
+
+TEST_F(GraphBufferManagerTest, AllocateGraphWithCollectiveBuffers)
+{
+    // Create a graph with both regular and collective buffers
+    StageBufferRequirements reqs;
+    reqs.addOutput("regular_output", {32, 64}, BufferTensorType::FP32);
+
+    // Add a collective buffer using manual configuration
+    BufferDescriptor collective_desc = BufferDescriptor::output("collective_output", {32, 64}, BufferTensorType::FP32);
+    collective_desc.forCollective("layer0_attn_allreduce");
+    reqs.add(collective_desc);
+
+    reqs.addScratch("workspace", {256}, BufferTensorType::FP32);
+
+    ComputeGraph graph;
+    graph.addNode("test_stage", std::make_unique<MockStageWithRequirements>(reqs));
+
+    // Without collective context - should still allocate everything
+    EXPECT_TRUE(manager_->allocateForGraph(graph));
+
+    EXPECT_EQ(manager_->bufferCount(), 3u);
+    EXPECT_TRUE(manager_->hasBuffer("test_stage", "regular_output"));
+    EXPECT_TRUE(manager_->hasBuffer("test_stage", "collective_output"));
+    EXPECT_TRUE(manager_->hasBuffer("test_stage", "workspace"));
 }

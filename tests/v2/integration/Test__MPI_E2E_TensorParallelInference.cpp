@@ -176,11 +176,11 @@ protected:
         model_ctx_->weightManager()->setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
         // Validate model dimensions match expected
-        const auto &model = model_ctx_->loader().getModel();
-        ASSERT_EQ(model.head_count, n_heads_);
-        ASSERT_EQ(model.head_count_kv, n_kv_heads_);
-        ASSERT_EQ(model.embedding_length / model.head_count, head_dim_);
-        ASSERT_EQ(model.embedding_length, d_model_);
+        auto loader = model_ctx_->loader();
+        ASSERT_EQ(loader->headCount(), n_heads_);
+        ASSERT_EQ(loader->headCountKV(), n_kv_heads_);
+        ASSERT_EQ(loader->embeddingLength() / loader->headCount(), head_dim_);
+        ASSERT_EQ(loader->embeddingLength(), d_model_);
 
         LOG_INFO("[Rank " << rank_ << "] Test setup complete, world_size=" << world_size_);
     }

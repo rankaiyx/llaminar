@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -25,6 +25,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Input/output tensors
             const ITensor *hidden_states = nullptr;
             const ITensor *lm_head_weight = nullptr;
@@ -37,10 +39,6 @@ namespace llaminar2
 
             // Optional bias
             const float *bias = nullptr;
-
-            // Device placement
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit LMHeadStage(Params params);

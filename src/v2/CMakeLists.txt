@@ -26,6 +26,14 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease;Integration" CACHE STRIN
 # The build type flags are picked up by the compiler setup during project()
 project(llaminar2 LANGUAGES C CXX)
 
+# =============================================================================
+# Automatic Linux Capability Assignment (PCIe BAR P2P support)
+# =============================================================================
+# This MUST be included early, before any add_executable() calls, because it
+# overrides add_executable to automatically set CAP_SYS_ADMIN on all executables.
+# This enables PCIe BAR direct P2P transfers between CUDA and ROCm GPUs.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AutoSetCapabilities.cmake)
+
 # Enable ccache if available
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
@@ -208,6 +216,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDASwiGLUKernels.cu         # SwiGLU kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDARoPEKernels.cu           # RoPE kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
+        kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
         kernels/cuda/CUDARingKVCache.cu               # Ring buffer KV cache with O(1) eviction
     )
@@ -308,10 +317,16 @@ endif()
 
 # ROCm backend (separate .cpp compilation unit with HIP)
 if(HAVE_ROCM)
-    # ROCm enumeration must be compiled with hipcc to use HIP runtime
+    # ROCm kernels compiled with hipcc
+    set(ROCM_KERNEL_SOURCES
+        kernels/rocm/HipBLASGemmKernel.cpp      # hipBLAS wrapper for FP32/FP16 dense GEMM
+    )
+    
+    # ROCm enumeration and backend must be compiled with hipcc to use HIP runtime
     add_library(rocm_backend STATIC 
         backends/rocm/ROCmBackend.cpp
         backends/ROCmEnumeration.cpp
+        ${ROCM_KERNEL_SOURCES}
     )
     target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(rocm_backend PUBLIC hip::host roc::hipblas)
@@ -320,14 +335,93 @@ if(HAVE_ROCM)
     set_source_files_properties(
         backends/rocm/ROCmBackend.cpp
         backends/ROCmEnumeration.cpp
+        ${ROCM_KERNEL_SOURCES}
         PROPERTIES LANGUAGE HIP
     )
+    
+    # NOTE: ROCm kernel ITensorGemm adapters (ROCmFloatingPointGemmKernel.cpp)
+    # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT hipcc)
+    # because they include MPI headers which hipcc cannot process
     
     # Define HAVE_ROCM for MPIStager and other consumers
     add_compile_definitions(HAVE_ROCM)
     
-    message(STATUS "V2: ROCm backend library configured")
+    message(STATUS "V2: ROCm backend library configured with hipBLAS GEMM kernels")
 endif()
+
+# =============================================================================
+# Device Benchmarks (CPU + CUDA + ROCm)
+# =============================================================================
+# Lightweight benchmarks for measuring actual device capabilities:
+# - Memory bandwidth (GB/s)
+# - Compute throughput (GFLOPS/GOPS)
+# - Host-device transfer rates
+# - Peer-to-peer transfer rates (multi-GPU)
+#
+# Results are used by PlacementStrategy to make informed placement decisions
+# based on measured values rather than heuristic estimates.
+
+set(BENCHMARK_SOURCES
+    backends/benchmarks/DeviceBenchmark.cpp
+    backends/benchmarks/CPUBenchmark.cpp
+)
+
+# Add CUDA benchmark if CUDA backend enabled
+if(HAVE_CUDA)
+    list(APPEND BENCHMARK_SOURCES backends/benchmarks/CUDABenchmark.cu)
+endif()
+
+# Add ROCm benchmark if ROCm backend enabled
+if(HAVE_ROCM)
+    list(APPEND BENCHMARK_SOURCES backends/benchmarks/ROCmBenchmark.cpp)
+endif()
+
+# Add cross-vendor P2P if both CUDA and ROCm enabled
+if(HAVE_CUDA AND HAVE_ROCM)
+    list(APPEND BENCHMARK_SOURCES
+        backends/benchmarks/CrossVendorP2P.cpp
+        backends/benchmarks/CrossVendorP2P_CUDA.cu
+        backends/benchmarks/CrossVendorP2P_ROCm.cpp
+        # EXPERIMENTAL: Direct P2P via Linux DMA-BUF
+        backends/benchmarks/DirectP2P.cpp
+        backends/benchmarks/DirectP2P_CUDA.cu
+        backends/benchmarks/DirectP2P_ROCm.cpp
+        # HostBackend runtime-specific helpers (must be in separate compilation units)
+        collective/backends/HostBackendCUDA.cu
+        collective/backends/HostBackendROCm.cpp
+        # PCIe BAR collective backend for CUDA↔ROCm direct P2P
+        collective/backends/PCIeBARBackend.cpp
+    )
+endif()
+
+add_library(device_benchmarks STATIC ${BENCHMARK_SOURCES})
+target_include_directories(device_benchmarks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(device_benchmarks PRIVATE OpenMP::OpenMP_CXX)
+
+if(HAVE_CUDA)
+    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart CUDA::cuda_driver)
+    target_compile_definitions(device_benchmarks PRIVATE HAVE_CUDA=1)
+endif()
+
+if(HAVE_ROCM)
+    target_link_libraries(device_benchmarks PRIVATE hip::host)
+    target_compile_definitions(device_benchmarks PRIVATE HAVE_ROCM=1)
+    # ROCm files need HIP compilation
+    set_source_files_properties(
+        backends/benchmarks/ROCmBenchmark.cpp
+        PROPERTIES LANGUAGE HIP
+    )
+    if(HAVE_CUDA)
+        set_source_files_properties(
+            backends/benchmarks/CrossVendorP2P_ROCm.cpp
+            backends/benchmarks/DirectP2P_ROCm.cpp
+            collective/backends/HostBackendROCm.cpp
+            PROPERTIES LANGUAGE HIP
+        )
+    endif()
+endif()
+
+message(STATUS "V2: Device benchmarks library configured")
 
 # =============================================================================
 # OneDNN Configuration for INT8/BF16 GEMM Acceleration
@@ -553,6 +647,8 @@ enforce_typed_register_usage(${CMAKE_CURRENT_SOURCE_DIR})
 
 # V2 Core Library
 add_library(llaminar2_core STATIC
+    # Interfaces
+    interfaces/IMPIContext.cpp
     backends/ComputeBackend.cpp
     backends/BackendManager.cpp
     # Execution framework (hierarchical work distribution)
@@ -600,6 +696,8 @@ add_library(llaminar2_core STATIC
     loaders/WeightPlacementMap.cpp
     loaders/WeightPreloader.cpp
     loaders/DeviceOrchestrator.cpp
+    loaders/LayerWeightStreamer.cpp
+    loaders/WeightStreamerFactory.cpp
     models/qwen/Qwen2Graph.cpp
     tensors/cpu/CPUTensorBase.cpp
     tensors/cpu/FP32Tensor.cpp
@@ -687,6 +785,14 @@ add_library(llaminar2_core STATIC
     utils/ChatTemplate.cpp
     utils/ChatUI.cpp
     utils/BenchmarkRunner.cpp
+    # Collective communication infrastructure
+    collective/DeviceGroup.cpp
+    collective/BackendRouter.cpp
+    collective/backends/HostBackend.cpp
+    collective/backends/MPIBackend.cpp
+    collective/backends/NCCLBackend.cpp
+    collective/backends/RCCLBackend.cpp
+    execution/CollectiveContext.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
 )
@@ -783,8 +889,20 @@ endif()
 
 if(HAVE_ROCM)
     target_link_libraries(llaminar2_core PUBLIC rocm_backend)
-    message(STATUS "V2: Linked ROCm backend library")
+    
+    # Add ROCm kernel C++ adapter files (compiled with C++ compiler, NOT hipcc)
+    # These implement ITensorGemm interface and can include MPI headers
+    target_sources(llaminar2_core PRIVATE
+        kernels/rocm/ROCmFloatingPointGemmKernel.cpp
+    )
+    
+    message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")
 endif()
+
+# Link device benchmarks library
+target_link_libraries(llaminar2_core PUBLIC device_benchmarks)
+message(STATUS "V2: Linked device benchmarks library")
+
 if(HAVE_CUDA)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_CUDA)
     target_include_directories(llaminar2_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})

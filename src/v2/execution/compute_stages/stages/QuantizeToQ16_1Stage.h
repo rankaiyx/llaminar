@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -24,6 +25,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             const ITensor *input = nullptr; ///< FP32 input [num_elements]
             ITensor *output = nullptr;      ///< Q16_1 output [num_elements]
             size_t num_elements = 0;           ///< Number of elements to quantize

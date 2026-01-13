@@ -936,8 +936,8 @@ TEST_F(ComputeStagesTest, Stages_LargeSize)
 TEST_F(ComputeStagesTest, AllreduceStage_TypeAndBackend)
 {
     AllreduceStage::Params params{
-        .buffer = nullptr,
-        .mpi_ctx = nullptr};
+        .mpi_ctx = nullptr,
+        .buffer = nullptr};
 
     AllreduceStage stage(params);
 

@@ -586,4 +586,241 @@ namespace llaminar2
         return getReplicatedWeight(name, device);
     }
 
+    // =========================================================================
+    // Decode Weight Shard Support (CPU Decode Participation - Option A)
+    // =========================================================================
+
+    std::shared_ptr<TensorBase> WeightManager::getDecodeWeight(
+        const std::string &name,
+        DeviceId decode_device,
+        float fraction,
+        int layer_idx)
+    {
+        // Validate fraction
+        if (fraction <= 0.0f || fraction > 1.0f)
+        {
+            LOG_ERROR("[WeightManager] Invalid decode fraction: " << fraction
+                                                                  << " (must be 0 < fraction <= 1)");
+            return nullptr;
+        }
+
+        // Generate cache key (includes fraction to allow different shard sizes)
+        std::string cache_key = name + "@decode_" + std::to_string(fraction);
+
+        // Check decode cache first
+        auto it = decode_cache_.find(cache_key);
+        if (it != decode_cache_.end())
+        {
+            return it->second;
+        }
+
+        // Get the full weight tensor (from prefill cache or load fresh)
+        // We need to load to CPU first for slicing, even if decode_device differs
+        auto full_tensor = getWeight(name, DeviceId::cpu(), layer_idx);
+        if (!full_tensor)
+        {
+            LOG_ERROR("[WeightManager] Failed to load full weight for decode shard: " << name);
+            return nullptr;
+        }
+
+        // Determine sharding mode for this weight
+        ShardingMode mode = ShardingMode::REPLICATE;
+        if (has_sharding_config_)
+        {
+            mode = getShardingMode(name);
+        }
+
+        std::shared_ptr<TensorBase> decode_shard;
+
+        switch (mode)
+        {
+        case ShardingMode::REPLICATE:
+        {
+            // Replicated weights (norms, biases) - return full copy
+            // These are small, so no need to slice
+            if (fraction >= 1.0f)
+            {
+                // Full copy requested - just return the tensor
+                decode_shard = full_tensor;
+            }
+            else
+            {
+                // Still return full tensor for replicated weights
+                // Slicing doesn't make sense for norms/biases
+                LOG_DEBUG("[WeightManager] Decode shard for REPLICATE weight " << name
+                                                                               << " - returning full copy (fraction ignored)");
+                decode_shard = full_tensor;
+            }
+            break;
+        }
+
+        case ShardingMode::COLUMN_PARALLEL:
+        {
+            // Column-parallel weights (Q, K, V, Gate, Up) - slice tail rows
+            // These weights have shape [out_dim, in_dim]
+            // We slice the output dimension (rows) for decode
+            decode_shard = sliceTailRows(full_tensor, fraction);
+            if (!decode_shard)
+            {
+                LOG_ERROR("[WeightManager] Failed to slice tail rows for decode: " << name);
+                return nullptr;
+            }
+            LOG_DEBUG("[WeightManager] Decode shard for COLUMN_PARALLEL " << name
+                                                                          << ": tail " << (fraction * 100) << "% rows -> ["
+                                                                          << decode_shard->shape()[0] << ", "
+                                                                          << decode_shard->shape()[1] << "]");
+            break;
+        }
+
+        case ShardingMode::ROW_PARALLEL:
+        case ShardingMode::INPUT_PARALLEL:
+        {
+            // Row/Input-parallel weights (Wo, Down) - slice tail columns
+            // These weights have shape [out_dim, in_dim]
+            // We slice the input dimension (columns) for decode
+            decode_shard = sliceTailColumns(full_tensor, fraction);
+            if (!decode_shard)
+            {
+                LOG_ERROR("[WeightManager] Failed to slice tail columns for decode: " << name);
+                return nullptr;
+            }
+            LOG_DEBUG("[WeightManager] Decode shard for " << (mode == ShardingMode::ROW_PARALLEL ? "ROW_PARALLEL" : "INPUT_PARALLEL")
+                                                          << " " << name
+                                                          << ": tail " << (fraction * 100) << "% cols -> ["
+                                                          << decode_shard->shape()[0] << ", "
+                                                          << decode_shard->shape()[1] << "]");
+            break;
+        }
+
+        default:
+            LOG_ERROR("[WeightManager] Unknown sharding mode for decode weight: " << name);
+            return nullptr;
+        }
+
+        // Cache the decode shard
+        if (decode_shard)
+        {
+            decode_cache_[cache_key] = decode_shard;
+        }
+
+        return decode_shard;
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::sliceTailRows(
+        const std::shared_ptr<TensorBase> &full_tensor,
+        float fraction)
+    {
+        // For weight matrix [out_dim, in_dim], extract tail rows
+        // Result: [out_local, in_dim] where out_local = out_dim * fraction
+
+        const auto &shape = full_tensor->shape();
+        if (shape.size() != 2)
+        {
+            LOG_ERROR("[WeightManager] Tail row slicing requires 2D tensor, got " << shape.size() << "D");
+            return nullptr;
+        }
+
+        size_t out_dim = shape[0];
+        size_t in_dim = shape[1];
+
+        // Calculate slice dimensions
+        size_t out_local = static_cast<size_t>(std::ceil(out_dim * fraction));
+        if (out_local == 0)
+        {
+            out_local = 1; // At least one row
+        }
+        if (out_local > out_dim)
+        {
+            out_local = out_dim;
+        }
+
+        size_t out_start = out_dim - out_local; // Tail portion
+
+        LOG_TRACE("[WeightManager] Tail row slicing: [" << out_dim << ", " << in_dim
+                                                        << "] -> rows [" << out_start << ", " << out_dim
+                                                        << ") = [" << out_local << ", " << in_dim << "]");
+
+        // Currently only FP32 slicing is supported
+        auto *fp32_tensor = dynamic_cast<FP32Tensor *>(full_tensor.get());
+        if (!fp32_tensor)
+        {
+            LOG_ERROR("[WeightManager] Tail row slicing currently requires FP32 tensor. "
+                      "Use CONVERT_TO_FP32 weight precision for decode shards.");
+            return nullptr;
+        }
+
+        // Create sliced tensor
+        std::vector<size_t> slice_shape = {out_local, in_dim};
+        auto sliced = std::make_shared<FP32Tensor>(slice_shape);
+
+        // Copy tail rows
+        const float *src = fp32_tensor->data() + out_start * in_dim;
+        float *dst = sliced->mutable_data();
+        std::memcpy(dst, src, out_local * in_dim * sizeof(float));
+
+        return sliced;
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::sliceTailColumns(
+        const std::shared_ptr<TensorBase> &full_tensor,
+        float fraction)
+    {
+        // For weight matrix [out_dim, in_dim], extract tail columns
+        // Result: [out_dim, in_local] where in_local = in_dim * fraction
+
+        const auto &shape = full_tensor->shape();
+        if (shape.size() != 2)
+        {
+            LOG_ERROR("[WeightManager] Tail column slicing requires 2D tensor, got " << shape.size() << "D");
+            return nullptr;
+        }
+
+        size_t out_dim = shape[0];
+        size_t in_dim = shape[1];
+
+        // Calculate slice dimensions
+        size_t in_local = static_cast<size_t>(std::ceil(in_dim * fraction));
+        if (in_local == 0)
+        {
+            in_local = 1; // At least one column
+        }
+        if (in_local > in_dim)
+        {
+            in_local = in_dim;
+        }
+
+        size_t in_start = in_dim - in_local; // Tail portion
+
+        LOG_TRACE("[WeightManager] Tail column slicing: [" << out_dim << ", " << in_dim
+                                                           << "] -> cols [" << in_start << ", " << in_dim
+                                                           << ") = [" << out_dim << ", " << in_local << "]");
+
+        // Currently only FP32 slicing is supported
+        auto *fp32_tensor = dynamic_cast<FP32Tensor *>(full_tensor.get());
+        if (!fp32_tensor)
+        {
+            LOG_ERROR("[WeightManager] Tail column slicing currently requires FP32 tensor. "
+                      "Use CONVERT_TO_FP32 weight precision for decode shards.");
+            return nullptr;
+        }
+
+        // Create sliced tensor
+        std::vector<size_t> slice_shape = {out_dim, in_local};
+        auto sliced = std::make_shared<FP32Tensor>(slice_shape);
+
+        // Copy tail columns (non-contiguous in memory)
+        const float *src = fp32_tensor->data();
+        float *dst = sliced->mutable_data();
+
+#pragma omp parallel for
+        for (size_t row = 0; row < out_dim; ++row)
+        {
+            const float *src_row = src + row * in_dim + in_start;
+            float *dst_row = dst + row * in_local;
+            std::memcpy(dst_row, src_row, in_local * sizeof(float));
+        }
+
+        return sliced;
+    }
+
 } // namespace llaminar2

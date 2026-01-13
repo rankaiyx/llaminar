@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -28,6 +28,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Type-safe tensor pointers (required)
             const ITensor *input = nullptr; ///< Input activation tensor [m, k]
             int m = 0;                      ///< Batch size * seq_len
@@ -44,10 +46,6 @@ namespace llaminar2
             ITensor *output_up = nullptr;
             int n_up = 0;
             const TensorBase *bias_up = nullptr;
-
-            // Optional MPI context
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit FusedGateUpGEMMStage(Params params);

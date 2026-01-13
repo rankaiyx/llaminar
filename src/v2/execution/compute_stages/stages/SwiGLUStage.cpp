@@ -17,7 +17,11 @@ namespace llaminar2
     // SwiGLUStage Implementation (Type-Safe via TensorBase)
     // =============================================================================
 
-    SwiGLUStage::SwiGLUStage(Params params) : params_(std::move(params)) {}
+    SwiGLUStage::SwiGLUStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool SwiGLUStage::execute(IDeviceContext *ctx)
     {

@@ -22,7 +22,11 @@ namespace llaminar2
     // FusedQKVGEMMStage Implementation
     // =============================================================================
 
-    FusedQKVGEMMStage::FusedQKVGEMMStage(Params params) : params_(std::move(params)) {}
+    FusedQKVGEMMStage::FusedQKVGEMMStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool FusedQKVGEMMStage::execute(IDeviceContext *ctx)
     {

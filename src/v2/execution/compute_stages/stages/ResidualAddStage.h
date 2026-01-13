@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -27,6 +27,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Type-safe tensor pointers (required)
             const ITensor *input = nullptr;    ///< Input tensor (projection output)
             const ITensor *residual = nullptr; ///< Residual tensor (previous hidden state)
@@ -36,10 +38,6 @@ namespace llaminar2
             // IMPORTANT: For decode mode with pre-allocated buffers, this must be set to
             // seq_len * hidden_dim to avoid processing garbage data beyond the actual sequence.
             size_t num_elements = 0;
-
-            // Optional MPI context for distributed execution
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit ResidualAddStage(Params params);

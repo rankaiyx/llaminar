@@ -77,6 +77,12 @@ protected:
     }
 
     // Hash a PlacementPlan for comparison
+    // Hash a PlacementDevice into an integer for comparison
+    static uint64_t hashDevice(const PlacementDevice& device)
+    {
+        return (static_cast<uint64_t>(device.type) << 8) | static_cast<uint64_t>(device.gpu_index);
+    }
+
     uint64_t hashPlan(const PlacementPlan &plan)
     {
         uint64_t hash = 0;
@@ -88,7 +94,7 @@ protected:
         {
             hash ^= std::hash<int>()(layer.layer_idx) << 3;
             hash ^= std::hash<int>()(layer.owner_rank) << 4;
-            hash ^= std::hash<int>()(static_cast<int>(layer.device)) << 5;
+            hash ^= std::hash<uint64_t>()(hashDevice(layer.device)) << 5;
         }
 
         return hash;
@@ -173,7 +179,7 @@ TEST_F(Test__PlacementStrategy_MPI_Integration, ComputePlacementViaTopologyIsDet
     {
         layers_hash ^= (static_cast<uint64_t>(plan.layers[i].layer_idx) << (i % 64));
         layers_hash ^= (static_cast<uint64_t>(plan.layers[i].owner_rank) << ((i + 1) % 64));
-        layers_hash ^= (static_cast<uint64_t>(plan.layers[i].device) << ((i + 2) % 64));
+        layers_hash ^= (hashDevice(plan.layers[i].device) << ((i + 2) % 64));
     }
 
     PlanDetails my_details{
@@ -227,13 +233,14 @@ TEST_F(Test__PlacementStrategy_MPI_Integration, AllLayersHaveValidPlacement)
         EXPECT_EQ(layer.layer_idx, i) << "Layer " << i << " has wrong index";
         EXPECT_GE(layer.owner_rank, 0) << "Layer " << i << " has invalid owner_rank";
         EXPECT_LT(layer.owner_rank, world_size_) << "Layer " << i << " owner_rank out of range";
-        // Device should be valid enum value
-        EXPECT_TRUE(layer.device == PlacementDevice::CPU ||
-                    layer.device == PlacementDevice::GPU_0 ||
-                    layer.device == PlacementDevice::GPU_1 ||
-                    layer.device == PlacementDevice::GPU_2 ||
-                    layer.device == PlacementDevice::GPU_3)
-            << "Layer " << i << " has invalid device";
+        // Device should be either CPU or GPU with valid index
+        EXPECT_TRUE(layer.device.isCPU() || layer.device.isGPU())
+            << "Layer " << i << " has invalid device type";
+        if (layer.device.isGPU())
+        {
+            EXPECT_GE(layer.device.gpu_index, 0) << "Layer " << i << " has negative GPU index";
+            EXPECT_LT(layer.device.gpu_index, 32) << "Layer " << i << " has GPU index >= 32";
+        }
     }
 }
 

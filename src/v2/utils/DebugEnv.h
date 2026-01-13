@@ -522,6 +522,13 @@ namespace llaminar2
      *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use GraphBufferManager for buffers (default: 1 - ON)
      *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
      *
+     * Device Placement / Heterogeneous Execution:
+     *   LLAMINAR_CPU_PREFILL_PARTICIPATE   - Enable CPU participation in PREFILL phase (default: 0 - OFF)
+     *                                        When OFF (default), CPU only participates in DECODE phase
+     *                                        (Option A: Selective Duplication - GPU prefill, CPU decode).
+     *                                        When ON, CPU participates in BOTH prefill and decode
+     *                                        (Option C: Full CPU Participation - for memory-constrained systems).
+     *
      * Per-Operation Flags (all default to 1 - ON):
      *   These flags exist for debugging only - to selectively DISABLE operations.
      *   Set to 0 to disable the corresponding ComputeStage:
@@ -550,6 +557,29 @@ namespace llaminar2
         bool auto_weight_transfer = true;          ///< Auto-transfer weights to device
         bool use_graph_buffer_management = true;   ///< Use GraphBufferManager for buffer allocation (default: ON)
         bool exec_full_forward = true;             ///< Use orchestrator->executeForward() for complete inference (default: ON)
+
+        // =================================================================
+        // Device Placement / Heterogeneous Execution
+        // =================================================================
+
+        /**
+         * @brief Enable CPU participation in PREFILL phase (LLAMINAR_CPU_PREFILL_PARTICIPATE)
+         *
+         * By default (false), CPU only participates in DECODE phase:
+         *   - PREFILL: GPU only (compute-bound, benefits from GPU parallelism)
+         *   - DECODE: CPU + GPU (memory-bound, CPU can help with bandwidth)
+         *   This is "Option A: Selective Duplication" - optimal for most systems.
+         *
+         * When enabled (true), CPU participates in BOTH prefill and decode:
+         *   - PREFILL: CPU + GPU (slower but uses less GPU memory)
+         *   - DECODE: CPU + GPU
+         *   This is "Option C: Full CPU Participation" - for memory-constrained systems
+         *   where GPU cannot hold 100% of weights.
+         *
+         * @note This is an escape hatch for memory-constrained systems.
+         *       The default (false) provides better prefill performance.
+         */
+        bool cpu_prefill_participate = false;
 
         // =================================================================
         // Stage Tracing Configuration (Task 3: Debugging Infrastructure)
@@ -683,6 +713,14 @@ namespace llaminar2
             const char *residual_env = std::getenv("LLAMINAR_EXEC_RESIDUAL");
             if (residual_env)
                 exec_residual = (std::atoi(residual_env) != 0);
+
+            // Device placement configuration
+            const char *cpu_prefill_env = std::getenv("LLAMINAR_CPU_PREFILL_PARTICIPATE");
+            if (cpu_prefill_env)
+            {
+                std::string val(cpu_prefill_env);
+                cpu_prefill_participate = (val == "1" || val == "true");
+            }
 
             // Stage tracing configuration
             const char *trace_stages_env = std::getenv("LLAMINAR_TRACE_STAGES");
@@ -1514,6 +1552,103 @@ namespace llaminar2
     };
 
     /**
+     * @brief Weight streaming configuration (Option B)
+     *
+     * Controls the weight streaming subsystem for running models that exceed
+     * GPU memory capacity. When enabled, layer weights are streamed on-demand
+     * from host memory with configurable prefetching and eviction policies.
+     *
+     * **Environment Variables**:
+     * - `LLAMINAR_WEIGHT_STREAMING`: Enable weight streaming mode (0/1, default: 0)
+     * - `LLAMINAR_STREAM_MEMORY_MB`: GPU memory budget for weights in MB (0 = auto)
+     * - `LLAMINAR_STREAM_PREFETCH_DEPTH`: Number of layers to prefetch ahead (default: 1)
+     * - `LLAMINAR_STREAM_EVICTION_POLICY`: Eviction policy: "lru", "fifo", "none" (default: "lru")
+     * - `LLAMINAR_STREAM_VERBOSE`: Enable verbose streaming logs (0/1, default: 0)
+     *
+     * **Usage**:
+     * @code
+     *   # Enable weight streaming with 4GB GPU budget
+     *   LLAMINAR_WEIGHT_STREAMING=1 LLAMINAR_STREAM_MEMORY_MB=4096 \
+     *   ./build_v2_release/llaminar2 -m large_model.gguf -p "Hello"
+     *
+     *   # Enable with aggressive prefetching
+     *   LLAMINAR_WEIGHT_STREAMING=1 LLAMINAR_STREAM_PREFETCH_DEPTH=2 \
+     *   ./build_v2_release/llaminar2 -m large_model.gguf -p "Hello"
+     *
+     *   # Debug streaming with verbose logs
+     *   LLAMINAR_WEIGHT_STREAMING=1 LLAMINAR_STREAM_VERBOSE=1 \
+     *   ./build_v2/llaminar2 -m model.gguf -p "test"
+     * @endcode
+     *
+     * @see IWeightStreamer.h for the streaming interface
+     * @see LayerWeightStreamer.h for the implementation
+     * @see docs/v2/OPTION_B_WEIGHT_STREAMING_DESIGN.md for design details
+     */
+    struct StreamingEnv
+    {
+        bool enabled = false;                ///< Enable weight streaming (LLAMINAR_WEIGHT_STREAMING)
+        size_t memory_budget_mb = 0;         ///< GPU memory budget in MB (0 = auto-detect)
+        int prefetch_depth = 1;              ///< Layers to prefetch ahead (default: 1)
+        std::string eviction_policy = "lru"; ///< Eviction policy: lru, fifo, none
+        bool verbose = false;                ///< Enable verbose streaming logs
+
+        StreamingEnv()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            // Reset to defaults first (enables proper re-reading when env vars are unset)
+            enabled = false;
+            memory_budget_mb = 0;
+            prefetch_depth = 1;
+            eviction_policy = "lru";
+            verbose = false;
+
+            const char *enabled_env = std::getenv("LLAMINAR_WEIGHT_STREAMING");
+            if (enabled_env)
+            {
+                enabled = (std::atoi(enabled_env) != 0);
+            }
+
+            const char *memory_env = std::getenv("LLAMINAR_STREAM_MEMORY_MB");
+            if (memory_env)
+            {
+                memory_budget_mb = static_cast<size_t>(std::atol(memory_env));
+            }
+
+            const char *prefetch_env = std::getenv("LLAMINAR_STREAM_PREFETCH_DEPTH");
+            if (prefetch_env)
+            {
+                prefetch_depth = std::atoi(prefetch_env);
+                if (prefetch_depth < 0)
+                    prefetch_depth = 0;
+            }
+
+            const char *policy_env = std::getenv("LLAMINAR_STREAM_EVICTION_POLICY");
+            if (policy_env)
+            {
+                std::string policy(policy_env);
+                // Normalize to lowercase
+                std::transform(policy.begin(), policy.end(), policy.begin(), ::tolower);
+                // Validate policy
+                if (policy == "lru" || policy == "fifo" || policy == "none")
+                {
+                    eviction_policy = policy;
+                }
+                // Invalid values keep the default "lru"
+            }
+
+            const char *verbose_env = std::getenv("LLAMINAR_STREAM_VERBOSE");
+            if (verbose_env)
+            {
+                verbose = (std::atoi(verbose_env) != 0);
+            }
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
@@ -1530,6 +1665,7 @@ namespace llaminar2
         MPILoggingConfig mpi_logging;              ///< MPI collective operation logging
         StageOutputPrintConfig stage_output_print; ///< Stage output debug printing
         ValidationConfig validation;               ///< Buffer validation configuration
+        StreamingEnv streaming;                    ///< Weight streaming configuration (Option B)
 
         DebugEnv() = default;
 
@@ -1546,6 +1682,7 @@ namespace llaminar2
             mpi_logging.reload();
             stage_output_print.reload();
             validation.reload();
+            streaming.reload();
         }
     };
 

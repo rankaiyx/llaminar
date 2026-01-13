@@ -196,6 +196,9 @@ TEST_F(StageOutputManifestTest, DeclaredOutputs_SubsetOfBufferRequirements)
 class MockStageWithDefaults : public IComputeStage
 {
 public:
+    explicit MockStageWithDefaults(DeviceId device = DeviceId::cpu())
+        : IComputeStage(device) {}
+
     bool execute(IDeviceContext *) override { return true; }
     ComputeStageType type() const override { return ComputeStageType::COPY; }
     bool supportsBackend(ComputeBackendType) const override { return true; }

@@ -234,13 +234,26 @@ namespace llaminar2
     {
         placement_.devices.clear();
 
-        // Always add CPU as a device
+        // Detect CPU memory bandwidth first (for phase-aware decode placement)
+        auto cpu_bw_info = NUMATopology::estimateCPUBandwidth();
+
+        // Always add CPU as a device - CPU is a FIRST-CLASS decode participant!
         DeviceCapability cpu_dev;
         cpu_dev.type = DeviceCapability::Type::CPU;
         cpu_dev.device_id = 0;
-        cpu_dev.relative_compute = 1.0f; // Baseline
+        cpu_dev.relative_compute = 1.0f; // Baseline (for prefill compute weight)
         cpu_dev.memory_bytes = 0;        // TODO: Detect system memory
         cpu_dev.name = "CPU (socket " + std::to_string(placement_.socket_id) + ")";
+
+        // Set CPU memory bandwidth - critical for decode phase placement!
+        // This determines CPU's share of decode work (bandwidth-proportional sharding)
+        // Per-socket bandwidth (divide by num_sockets since this is per-rank)
+        if (cpu_bw_info.num_sockets > 0) {
+            cpu_dev.compute_units = cpu_bw_info.memory_channels;  // Channels as "units"
+            // Note: For multi-rank-per-node, bandwidth is shared among local ranks
+            // TODO: Better handling of intra-node bandwidth sharing
+        }
+
         placement_.devices.push_back(cpu_dev);
 
         // Check environment for CUDA devices
@@ -656,4 +669,74 @@ namespace llaminar2
         return plan;
     }
 
+    // =========================================================================
+    // ClusterInventory (IMPITopology interface)
+    // =========================================================================
+
+    const ClusterInventory& MPITopology::clusterInventory() const
+    {
+        if (!cluster_inventory_built_)
+        {
+            buildClusterInventory();
+        }
+        return cluster_inventory_;
+    }
+
+    void MPITopology::buildClusterInventory() const
+    {
+        cluster_inventory_.world_size = world_size_;
+        cluster_inventory_.node_count = node_count_;
+        cluster_inventory_.ranks.resize(world_size_);
+
+        // Convert RankPlacement to RankInventory
+        for (int r = 0; r < world_size_; ++r)
+        {
+            const auto &rp = (r < static_cast<int>(all_placements_.size()))
+                                 ? all_placements_[r]
+                                 : placement_;
+
+            auto &ri = cluster_inventory_.ranks[r];
+            ri.rank = rp.rank;
+            ri.node_id = rp.node_id;
+            ri.local_rank = rp.local_rank;
+            ri.hostname = rp.hostname;
+            ri.numa_nodes = 1;  // Simplified from RankPlacement
+
+            // Convert DeviceCapability to DeviceInfo
+            for (const auto &dev : rp.devices)
+            {
+                if (dev.type == DeviceCapability::Type::CPU)
+                {
+                    ri.cpu.type = DeviceType::CPU;
+                    ri.cpu.local_device_id = dev.device_id;
+                    ri.cpu.memory_bytes = dev.memory_bytes;
+                    ri.cpu.compute_units = static_cast<int>(dev.compute_units);
+                    ri.cpu.name = dev.name;
+                }
+                else
+                {
+                    DeviceInfo gpu;
+                    if (dev.type == DeviceCapability::Type::CUDA)
+                    {
+                        gpu.type = DeviceType::CUDA;
+                    }
+                    else if (dev.type == DeviceCapability::Type::ROCm)
+                    {
+                        gpu.type = DeviceType::ROCm;
+                    }
+                    gpu.local_device_id = dev.device_id;
+                    gpu.memory_bytes = dev.memory_bytes;
+                    gpu.compute_units = static_cast<int>(dev.compute_units);
+                    gpu.name = dev.name;
+                    ri.gpus.push_back(gpu);
+                }
+            }
+        }
+
+        // Build node aggregations
+        cluster_inventory_.buildNodeAggregations();
+        cluster_inventory_built_ = true;
+    }
+
 } // namespace llaminar2
+

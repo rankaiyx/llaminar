@@ -19,7 +19,11 @@ namespace llaminar2
     // ResidualAddStage Implementation (Type-Safe via TensorBase)
     // =============================================================================
 
-    ResidualAddStage::ResidualAddStage(Params params) : params_(std::move(params)) {}
+    ResidualAddStage::ResidualAddStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool ResidualAddStage::execute(IDeviceContext *ctx)
     {

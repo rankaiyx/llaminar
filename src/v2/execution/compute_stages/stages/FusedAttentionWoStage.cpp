@@ -27,7 +27,8 @@ namespace llaminar2
     // =============================================================================
 
     FusedAttentionWoStage::FusedAttentionWoStage(Params params)
-        : params_(std::move(params))
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
     {
         if (params_.backend == FusedAttentionBackend::Q16_INTEGER)
         {

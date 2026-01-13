@@ -20,7 +20,10 @@ namespace llaminar2
     // =============================================================================
 
     AttentionWithKVCacheStage::AttentionWithKVCacheStage(Params params)
-        : params_(std::move(params)) {}
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     AttentionWithKVCacheStage::Mode AttentionWithKVCacheStage::effectiveMode() const
     {
@@ -195,7 +198,7 @@ namespace llaminar2
             params_.window_size,
             &scores_workspace,
             mask_tensor.get(),
-            params_.mpi_ctx.get(),
+            params_.mpi_ctx_shared.get(),
             params_.device_id.toKernelDeviceIndex(),
             params_.head_start,
             params_.local_n_heads,
@@ -312,7 +315,7 @@ namespace llaminar2
             -1,   // window_size (disabled)
             &scores_workspace,
             &mask_tensor,
-            params_.mpi_ctx.get(),
+            params_.mpi_ctx_shared.get(),
             params_.device_id.toKernelDeviceIndex());
 
         if (!success)
@@ -434,7 +437,7 @@ namespace llaminar2
             params_.window_size,
             &scores_workspace,
             mask_tensor.get(),
-            params_.mpi_ctx.get(),
+            params_.mpi_ctx_shared.get(),
             params_.device_id.toKernelDeviceIndex(),
             params_.head_start,
             params_.local_n_heads,

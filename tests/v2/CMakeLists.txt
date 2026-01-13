@@ -282,6 +282,323 @@ add_v2_test(V2_Unit_StageDumpConfig
     MPI_PROCS 1
 )
 
+# Test: DeviceGroup - Device group construction and predicates for collective operations
+add_executable(v2_unit_device_group unit/Test__DeviceGroup.cpp)
+target_link_libraries(v2_unit_device_group 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceGroup 
+    COMMAND $<TARGET_FILE:v2_unit_device_group>
+    LABELS "V2;Unit;Collective;DeviceGroup;Topology"
+    MPI_PROCS 1
+)
+
+# Test: DeviceBenchmark - Lightweight device benchmarking infrastructure
+add_executable(v2_unit_device_benchmark unit/Test__DeviceBenchmark.cpp)
+target_link_libraries(v2_unit_device_benchmark 
+    llaminar2_core 
+    device_benchmarks
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceBenchmark 
+    COMMAND $<TARGET_FILE:v2_unit_device_benchmark>
+    LABELS "V2;Unit;DeviceManagement;Benchmark;Performance"
+    MPI_PROCS 1
+)
+
+# Test: DirectP2P - EXPERIMENTAL direct cross-vendor P2P via Linux DMA-BUF
+# Requires both CUDA and ROCm - tests zero-copy memory sharing between vendors
+if(HAVE_CUDA AND HAVE_ROCM)
+    add_executable(v2_integration_direct_p2p integration/Test__DirectP2P.cpp)
+    target_link_libraries(v2_integration_direct_p2p 
+        llaminar2_core 
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_DirectP2P 
+        COMMAND $<TARGET_FILE:v2_integration_direct_p2p>
+        LABELS "V2;Integration;DeviceManagement;P2P;DMA-BUF;CUDA;ROCm;CrossVendor"
+        MPI_PROCS 1
+    )
+
+    # Test: CrossVendorTensorParallel - Real tensor parallel inference across NVIDIA+AMD
+    # Tests FP32/Q8_1 tensor transfers, column/row parallel GEMM, AllReduce semantics
+    add_executable(v2_integration_cross_vendor_tp integration/Test__CrossVendorTensorParallel.cpp)
+    target_link_libraries(v2_integration_cross_vendor_tp 
+        llaminar2_core 
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    target_include_directories(v2_integration_cross_vendor_tp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Integration_CrossVendorTensorParallel 
+        COMMAND $<TARGET_FILE:v2_integration_cross_vendor_tp>
+        LABELS "V2;Integration;TensorParallel;P2P;CUDA;ROCm;CrossVendor;GEMM;AllReduce"
+        MPI_PROCS 1
+    )
+
+    # Test: PCIeBARBackend Integration - End-to-end collective operations via PCIe BAR P2P
+    add_executable(v2_integration_pcie_bar_backend integration/Test__PCIeBARBackendIntegration.cpp)
+    target_link_libraries(v2_integration_pcie_bar_backend 
+        llaminar2_core 
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    target_include_directories(v2_integration_pcie_bar_backend PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Integration_PCIeBARBackend 
+        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend>
+        LABELS "V2;Integration;Collective;PCIeBARBackend;P2P;CUDA;ROCm;CrossVendor;TensorParallel;AllReduce"
+        MPI_PROCS 1
+    )
+
+    # Test: CUDA Vector Add Kernels - Accuracy tests for FP32/FP16/BF16/INT8/INT32 reduction kernels
+    add_executable(v2_integration_cuda_vector_add_kernels integration/Test__CUDAVectorAddKernels.cpp)
+    target_link_libraries(v2_integration_cuda_vector_add_kernels 
+        llaminar2_core 
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_CUDAVectorAddKernels 
+        COMMAND $<TARGET_FILE:v2_integration_cuda_vector_add_kernels>
+        LABELS "V2;Integration;CUDA;Kernels;VectorAdd;FP16;BF16;INT8"
+        MPI_PROCS 1
+    )
+endif()
+
+# Test: BackendRouter - Backend selection and routing for collective operations
+add_executable(v2_unit_backend_router unit/Test__BackendRouter.cpp)
+target_link_libraries(v2_unit_backend_router 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BackendRouter 
+    COMMAND $<TARGET_FILE:v2_unit_backend_router>
+    LABELS "V2;Unit;Collective;BackendRouter;Routing"
+    MPI_PROCS 1
+)
+
+# Test: IBufferRegistration - Buffer registration interface for collective backends
+add_executable(v2_unit_buffer_registration unit/Test__IBufferRegistration.cpp)
+target_link_libraries(v2_unit_buffer_registration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BufferRegistration 
+    COMMAND $<TARGET_FILE:v2_unit_buffer_registration>
+    LABELS "V2;Unit;Collective;BufferRegistration;Interface"
+    MPI_PROCS 1
+)
+
+# Test: HostBackend - CPU-based fallback collective backend
+add_executable(v2_unit_host_backend unit/Test__HostBackend.cpp)
+target_link_libraries(v2_unit_host_backend 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_HostBackend 
+    COMMAND $<TARGET_FILE:v2_unit_host_backend>
+    LABELS "V2;Unit;Collective;HostBackend;CPU"
+    MPI_PROCS 1
+)
+
+# Test: MPIBackend - MPI-based collective backend for inter-node communication
+add_executable(v2_unit_mpi_backend unit/Test__MPIBackend.cpp)
+target_link_libraries(v2_unit_mpi_backend 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MPIBackend 
+    COMMAND $<TARGET_FILE:v2_unit_mpi_backend>
+    LABELS "V2;Unit;Collective;MPIBackend;MPI"
+    MPI_PROCS 1
+)
+
+# Test: PCIeBARBackend - PCIe BAR direct P2P collective backend (CUDA + ROCm)
+if(HAVE_CUDA AND HAVE_ROCM)
+    add_executable(v2_unit_pcie_bar_backend unit/Test__PCIeBARBackend.cpp)
+    target_link_libraries(v2_unit_pcie_bar_backend 
+        llaminar2_core 
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Unit_PCIeBARBackend 
+        COMMAND $<TARGET_FILE:v2_unit_pcie_bar_backend>
+        LABELS "V2;Unit;Collective;PCIeBARBackend;P2P;CUDA;ROCm;CrossVendor"
+        MPI_PROCS 1
+    )
+endif()
+
+# Test: CollectiveContext - Runtime context for collective operations
+add_executable(v2_unit_collective_context unit/Test__CollectiveContext.cpp)
+target_link_libraries(v2_unit_collective_context 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CollectiveContext 
+    COMMAND $<TARGET_FILE:v2_unit_collective_context>
+    LABELS "V2;Unit;Collective;CollectiveContext;Execution"
+    MPI_PROCS 1
+)
+
+# Test: MockMPIContext - Mock MPI context for unit testing distributed logic
+add_executable(v2_unit_mock_mpi_context unit/mocks/Test__MockMPIContext.cpp)
+target_include_directories(v2_unit_mock_mpi_context PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_mpi_context 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockMPIContext 
+    COMMAND $<TARGET_FILE:v2_unit_mock_mpi_context>
+    LABELS "V2;Unit;Mock;MPI;Testing"
+    MPI_PROCS 1
+)
+
+# Test: MockMPITopology - Mock MPI topology for unit testing distributed logic
+add_executable(v2_unit_mock_mpi_topology unit/mocks/Test__MockMPITopology.cpp)
+target_include_directories(v2_unit_mock_mpi_topology PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_mpi_topology 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockMPITopology 
+    COMMAND $<TARGET_FILE:v2_unit_mock_mpi_topology>
+    LABELS "V2;Unit;Mock;MPI;Topology;Testing"
+    MPI_PROCS 1
+)
+
+# Test: MockModelLoader - Mock model loader for unit testing without GGUF files
+add_executable(v2_unit_mock_model_loader unit/mocks/Test__MockModelLoader.cpp)
+target_include_directories(v2_unit_mock_model_loader PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_model_loader 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockModelLoader 
+    COMMAND $<TARGET_FILE:v2_unit_mock_model_loader>
+    LABELS "V2;Unit;Mock;ModelLoader;Testing"
+    MPI_PROCS 1
+)
+
+# Test: MockWeightManager - Mock weight manager for unit testing without GGUF files
+add_executable(v2_unit_mock_weight_manager unit/mocks/Test__MockWeightManager.cpp)
+target_include_directories(v2_unit_mock_weight_manager PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_weight_manager 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockWeightManager 
+    COMMAND $<TARGET_FILE:v2_unit_mock_weight_manager>
+    LABELS "V2;Unit;Mock;WeightManager;Testing"
+    MPI_PROCS 1
+)
+
+# Test: MockModelContext - Mock model context composing loader and weight manager
+add_executable(v2_unit_mock_model_context unit/mocks/Test__MockModelContext.cpp)
+target_include_directories(v2_unit_mock_model_context PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_model_context 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockModelContext 
+    COMMAND $<TARGET_FILE:v2_unit_mock_model_context>
+    LABELS "V2;Unit;Mock;ModelContext;Testing"
+    MPI_PROCS 1
+)
+
+# Test: MockCollectiveContext - Mock collective context for unit testing without MPI/NCCL
+add_executable(v2_unit_mock_collective_context unit/mocks/Test__MockCollectiveContext.cpp)
+target_include_directories(v2_unit_mock_collective_context PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_collective_context 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockCollectiveContext 
+    COMMAND $<TARGET_FILE:v2_unit_mock_collective_context>
+    LABELS "V2;Unit;Mock;CollectiveContext;Testing"
+    MPI_PROCS 1
+)
+
+# Test: MockWorkDistributor - Mock work distributor for unit testing work distribution
+add_executable(v2_unit_mock_work_distributor unit/mocks/Test__MockWorkDistributor.cpp)
+target_include_directories(v2_unit_mock_work_distributor PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_work_distributor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockWorkDistributor 
+    COMMAND $<TARGET_FILE:v2_unit_mock_work_distributor>
+    LABELS "V2;Unit;Mock;WorkDistributor;Testing"
+    MPI_PROCS 1
+)
+
+# Test: MockGraphBufferManager - Mock graph buffer manager for unit testing without tensor allocation
+add_executable(v2_unit_mock_graph_buffer_manager unit/mocks/Test__MockGraphBufferManager.cpp)
+target_include_directories(v2_unit_mock_graph_buffer_manager PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_graph_buffer_manager 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockGraphBufferManager 
+    COMMAND $<TARGET_FILE:v2_unit_mock_graph_buffer_manager>
+    LABELS "V2;Unit;Mock;GraphBufferManager;Testing"
+    MPI_PROCS 1
+)
+
+# Test: MockWeightPlacementMap - Mock weight placement map for unit testing without real device placement
+add_executable(v2_unit_mock_weight_placement_map unit/mocks/Test__MockWeightPlacementMap.cpp)
+target_include_directories(v2_unit_mock_weight_placement_map PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_mock_weight_placement_map 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MockWeightPlacementMap 
+    COMMAND $<TARGET_FILE:v2_unit_mock_weight_placement_map>
+    LABELS "V2;Unit;Mock;WeightPlacementMap;Testing"
+    MPI_PROCS 1
+)
+
 # Test: JIT Register Allocation Framework
 # Compile-time safe register allocation for JIT code generation
 add_executable(v2_test_register_allocation unit/Test__RegisterAllocation.cpp)
@@ -2472,6 +2789,42 @@ add_v2_test(V2_Unit_WeightManagerSharding
     LABELS "V2;Unit;TensorParallelism;WeightSharding;RowParallel"
 )
 
+# Test: WeightManager Decode Shards
+# Tests decode weight shard slicing for CPU decode participation (Option A: Selective Duplication)
+add_executable(v2_test_weight_manager_decode_shards unit/loaders/Test__WeightManagerDecodeShards.cpp)
+target_link_libraries(v2_test_weight_manager_decode_shards llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightManagerDecodeShards
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_decode_shards>
+    LABELS "V2;Unit;TensorParallelism;WeightSharding;DecodeShards;CPUDecode"
+)
+
+# Test: NullWeightStreamer
+# No-op weight streamer for RESIDENT mode (Option B - weights fit in GPU VRAM)
+add_executable(v2_test_null_weight_streamer unit/loaders/Test__NullWeightStreamer.cpp)
+target_link_libraries(v2_test_null_weight_streamer llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_NullWeightStreamer
+    COMMAND $<TARGET_FILE:v2_test_null_weight_streamer>
+    LABELS "V2;Unit;WeightStreaming;OptionB;RESIDENT"
+)
+
+# Test: LayerWeightStreamer
+# Weight streaming implementation for STREAMING mode (Option B - weights exceed GPU VRAM)
+add_executable(v2_test_layer_weight_streamer unit/loaders/Test__LayerWeightStreamer.cpp)
+target_link_libraries(v2_test_layer_weight_streamer llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_LayerWeightStreamer
+    COMMAND $<TARGET_FILE:v2_test_layer_weight_streamer>
+    LABELS "V2;Unit;WeightStreaming;OptionB;STREAMING;LRU;Cache"
+)
+
+# Test: WeightStreamerFactory
+# Factory for creating IWeightStreamer implementations based on config/env/auto-detection
+add_executable(v2_test_weight_streamer_factory unit/loaders/Test__WeightStreamerFactory.cpp)
+target_link_libraries(v2_test_weight_streamer_factory llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightStreamerFactory
+    COMMAND $<TARGET_FILE:v2_test_weight_streamer_factory>
+    LABELS "V2;Unit;WeightStreaming;OptionB;Factory;AutoDetection"
+)
+
 # =============================================================================
 # Execution Framework Tests (WorkDistributor, DeviceContext)
 # =============================================================================
@@ -2551,6 +2904,28 @@ add_v2_test(V2_Unit_CuBLASGemm
     COMMAND $<TARGET_FILE:v2_test_cublas_gemm>
     LABELS "V2;Unit;CUDA;cuBLAS;GEMM;FP32;FP16;BF16;DenseGEMM;KernelCorrectness"
     MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
+)
+
+# Test: hipBLAS GEMM (ROCm - dense GEMM via hipBLAS for FP32/FP16)
+# Tests ROCmFloatingPointGemmKernel correctness against CPU reference, various matrix sizes
+# MI50: 13.4 TFLOPS FP32, 26.5 TFLOPS FP16 (no native BF16)
+add_executable(v2_test_hipblas_gemm unit/kernels/rocm/Test__ROCmFloatingPointGemmKernel.cpp)
+target_link_libraries(v2_test_hipblas_gemm llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_HipBLASGemm
+    COMMAND $<TARGET_FILE:v2_test_hipblas_gemm>
+    LABELS "V2;Unit;ROCm;hipBLAS;GEMM;FP32;FP16;DenseGEMM;KernelCorrectness;MI50"
+    MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
+)
+
+# Test: ROCm Intra-Vendor P2P Transfer (MI50↔MI50 via host staging)
+# Tests CrossVendorP2PEngine's same_vendor_allowed mode for ROCm-to-ROCm transfers
+# across PCIe bus using double-buffered pipelining through pinned host memory
+add_executable(v2_test_rocm_intra_vendor_p2p unit/backends/benchmarks/Test__ROCmIntraVendorP2P.cpp)
+target_link_libraries(v2_test_rocm_intra_vendor_p2p llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ROCmIntraVendorP2P
+    COMMAND $<TARGET_FILE:v2_test_rocm_intra_vendor_p2p>
+    LABELS "V2;Unit;ROCm;P2P;Benchmark;MultiGPU;MI50;PCIe;HostStaging;TensorParallel"
+    MPI_PROCS 1  # Tests multi-GPU P2P locally, no MPI needed
 )
 
 # Test: CUDA Basic Pipeline (Phase 1 - end-to-end KernelFactory + tensor transfer)
@@ -2854,6 +3229,17 @@ add_v2_test(V2_Unit_GraphBufferManager
     MPI_PROCS 1
 )
 
+# Test: CollectiveBufferAllocation (Phase 3 Buffer Registration API)
+# Tests integration of BAR-region allocator with buffer management
+# for collective operations (AllReduce, AllGather)
+add_executable(v2_test_collective_buffer_allocation unit/Test__CollectiveBufferAllocation.cpp)
+target_link_libraries(v2_test_collective_buffer_allocation llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CollectiveBufferAllocation
+    COMMAND $<TARGET_FILE:v2_test_collective_buffer_allocation>
+    LABELS "V2;Unit;Execution;Collective;BufferRegistration;PCIeBAR;CrossVendor"
+    MPI_PROCS 1
+)
+
 # Test: ComputeGraphMerge (graph merging, root/leaf detection)
 # Tests merge(), getRootNodes(), getLeafNodes() for combining subgraphs
 # Part of Phase 3: Declarative Qwen2Graph refactoring
@@ -2953,6 +3339,18 @@ add_v2_test(V2_Unit_ValidationConfig
     MPI_PROCS 1
 )
 
+# Test: StreamingEnv (weight streaming environment variables and configuration)
+# Tests LLAMINAR_WEIGHT_STREAMING, LLAMINAR_STREAM_MEMORY_MB, LLAMINAR_STREAM_PREFETCH_DEPTH,
+# LLAMINAR_STREAM_EVICTION_POLICY, LLAMINAR_STREAM_VERBOSE.
+# Part of Option B: Weight Streaming infrastructure
+add_executable(v2_test_streaming_env unit/Test__StreamingEnv.cpp)
+target_link_libraries(v2_test_streaming_env llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StreamingEnv
+    COMMAND $<TARGET_FILE:v2_test_streaming_env>
+    LABELS "V2;Unit;WeightStreaming;DebugEnv;Configuration"
+    MPI_PROCS 1
+)
+
 # Test: StageCoherence (automatic device coherence at stage boundaries)
 # Tests CoherencePolicy enum, cohereInputs/markOutputsDirty, buffer extraction,
 # and stage coherence policy reporting.
@@ -2999,6 +3397,33 @@ target_link_libraries(v2_test_graph_orchestrator llaminar2_core GTest::gtest GTe
 add_v2_test(V2_Unit_GraphOrchestrator
     COMMAND $<TARGET_FILE:v2_test_graph_orchestrator>
     LABELS "V2;Unit;Qwen2;GraphOrchestrator;GraphExecution;DeclarativeDesign"
+    MPI_PROCS 1
+)
+
+# Test: GraphOrchestrator Phase-Aware Weights (Gap 3 - CPU Decode Participation)
+# Tests the phase-aware weight selection mechanism for "Option A: Selective Duplication":
+# - Phase tracking (PREFILL vs DECODE)
+# - WeightManager and PlacementMap integration
+# - Phase-aware weight selection logic
+# - CPU decode participation checks
+add_executable(v2_test_graph_orchestrator_phase_aware_weights unit/Test__GraphOrchestratorPhaseAwareWeights.cpp)
+target_link_libraries(v2_test_graph_orchestrator_phase_aware_weights llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphOrchestrator_PhaseAwareWeights
+    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_phase_aware_weights>
+    LABELS "V2;Unit;GraphOrchestrator;PhaseAwareWeights;CPUDecodeParticipation;Gap3"
+    MPI_PROCS 1
+)
+
+# Test: GraphOrchestrator Weight Streaming (Option B - On-Demand Weight Transfer)
+# Tests the IWeightStreamer integration with GraphOrchestrator:
+# - Phase transition notifications to streamer
+# - Weight streaming hooks (ensure/prefetch/release) during layer execution
+# - Streaming is optional (works without streamer set)
+add_executable(v2_test_graph_orchestrator_weight_streaming unit/Test__GraphOrchestratorWeightStreaming.cpp)
+target_link_libraries(v2_test_graph_orchestrator_weight_streaming llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_v2_test(V2_Unit_GraphOrchestrator_WeightStreaming
+    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_weight_streaming>
+    LABELS "V2;Unit;GraphOrchestrator;WeightStreaming;OptionB;IWeightStreamer"
     MPI_PROCS 1
 )
 
@@ -3064,6 +3489,18 @@ add_v2_test(V2_Unit_LayerExecutorInterface
     MPI_PROCS 1
 )
 
+# Test: StageParamsBase (device_id propagation via STAGE_PARAMS_COMMON_FIELDS macro)
+# Validates that all stage Params satisfy StageParamsRequired concept, device_id defaults
+# to CPU, and device() returns correct device from params - prevents bug where
+# stages accidentally run on CPU when intended for GPU.
+add_executable(v2_test_stage_params_base unit/Test__StageParamsBase.cpp)
+target_link_libraries(v2_test_stage_params_base llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StageParamsBase
+    COMMAND $<TARGET_FILE:v2_test_stage_params_base>
+    LABELS "V2;Unit;ComputeStage;StageParams;DeviceId;Safety"
+    MPI_PROCS 1
+)
+
 # Test: ComputeStages (individual compute stage unit tests)
 # Tests GEMMStage, RMSNormStage, RoPEStage, SwiGLUStage, ResidualAddStage, etc.
 # Verifies correctness, precision preservation, FLOP estimation, and backend compatibility
@@ -3115,6 +3552,137 @@ target_link_libraries(v2_test_allgather_stage llaminar2_core GTest::gtest GTest:
 add_v2_test(V2_Unit_AllGatherStage
     COMMAND $<TARGET_FILE:v2_test_allgather_stage>
     LABELS "V2;Unit;ComputeStage;AllGather;MPI;TensorParallel;LMHead"
+    MPI_PROCS 1
+)
+
+# Test: CollectiveStageIntegration (AllreduceStage and AllGatherStage with CollectiveContext)
+# Unit test for collective stages using the new collective infrastructure with mocks
+add_executable(v2_unit_collective_stage_integration integration/Test__CollectiveStageIntegration.cpp)
+target_link_libraries(v2_unit_collective_stage_integration 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CollectiveStageIntegration
+    COMMAND $<TARGET_FILE:v2_unit_collective_stage_integration>
+    LABELS "V2;Unit;ComputeStage;Collective;Allreduce;AllGather;MPI;TensorParallel"
+    MPI_PROCS 1
+)
+
+# Test: HeterogeneousExecution - Unit test for mixed CPU/GPU execution across ranks
+# Phase 5a testability refactoring: validates heterogeneous topology handling via mocks
+# Note: Uses mock infrastructure, no real MPI/GPU required - runs as unit test
+add_executable(v2_unit_heterogeneous_execution integration/Test__HeterogeneousExecution.cpp)
+target_include_directories(v2_unit_heterogeneous_execution PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_heterogeneous_execution 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_HeterogeneousExecution 
+    COMMAND $<TARGET_FILE:v2_unit_heterogeneous_execution>
+    LABELS "V2;Unit;HeterogeneousExecution;Mock;MPI;Topology;DevicePlacement;CPU;GPU"
+    MPI_PROCS 1
+)
+
+# Test: WorkDistribution - Integration test for work distribution across ranks
+# Phase 5b testability refactoring: validates tensor-parallel work distribution via mocks
+# Note: Uses mock infrastructure, no real MPI required - runs as unit test
+add_executable(v2_integration_work_distribution integration/Test__WorkDistribution.cpp)
+target_include_directories(v2_integration_work_distribution PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_integration_work_distribution 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_WorkDistribution 
+    COMMAND $<TARGET_FILE:v2_integration_work_distribution>
+    LABELS "V2;Unit;WorkDistribution;TensorParallel;Mock;MPI;GEMM;Attention"
+    MPI_PROCS 1
+)
+
+# Test: WeightStreaming - Unit test for weight streaming with prefetch/eviction
+# Phase 5c testability refactoring: validates weight streaming via mocks
+# Note: Uses mock infrastructure, no real GPU memory management - runs as unit test
+add_executable(v2_integration_weight_streaming integration/Test__WeightStreaming.cpp)
+target_include_directories(v2_integration_weight_streaming PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_integration_weight_streaming 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_WeightStreaming 
+    COMMAND $<TARGET_FILE:v2_integration_weight_streaming>
+    LABELS "V2;Unit;WeightStreaming;Prefetch;Eviction;LRU;FIFO;Mock"
+    MPI_PROCS 1
+)
+
+# Test: PhaseAwareExecution - Integration test for prefill vs decode device selection
+# Phase 5d testability refactoring: validates phase-aware device selection via mocks
+# Note: Uses mock infrastructure, no real MPI/GPU required - runs as unit test
+add_executable(v2_integration_phase_aware_execution integration/Test__PhaseAwareExecution.cpp)
+target_include_directories(v2_integration_phase_aware_execution PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_integration_phase_aware_execution 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PhaseAwareExecution 
+    COMMAND $<TARGET_FILE:v2_integration_phase_aware_execution>
+    LABELS "V2;Unit;PhaseAware;Prefill;Decode;DeviceSelection;Mock;MPI;Topology;CPU;GPU"
+    MPI_PROCS 1
+)
+
+# =============================================================================
+# Orchestration Scenario Tests (Declarative, Base Class Pattern)
+# =============================================================================
+# These tests follow the parity test pattern with OrchestrationTestBase
+# providing common infrastructure and scenario files being declarative.
+# See: tests/v2/integration/orchestration/README.md
+
+# Test: Scenario 1 - Heterogeneous Single Machine (2 ranks, 1 machine, mixed CUDA/ROCm)
+add_executable(v2_orchestration_scenario1
+    integration/orchestration/scenarios/Test__Scenario1_HeterogeneousSingleMachine.cpp
+)
+target_include_directories(v2_orchestration_scenario1 PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}           # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/integration/orchestration  # For OrchestrationTestBase.h
+)
+target_link_libraries(v2_orchestration_scenario1 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Orchestration_Scenario1_HeterogeneousSingleMachine 
+    COMMAND $<TARGET_FILE:v2_orchestration_scenario1>
+    LABELS "V2;Unit;Orchestration;Scenario;Heterogeneous;Placement;PlacementStrategy;Mock;MPI;Topology;CUDA;ROCm;CPU;GPU;Qwen2;7B;72B;235B"
+    MPI_PROCS 1
+)
+
+# Test: Scenario 2 - Multi-Node Cluster (12 ranks, 6 machines, Infiniband, mixed CUDA/ROCm)
+add_executable(v2_orchestration_scenario2
+    integration/orchestration/scenarios/Test__Scenario2_MultiNodeCluster.cpp
+)
+target_include_directories(v2_orchestration_scenario2 PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}           # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/integration/orchestration  # For OrchestrationTestBase.h
+)
+target_link_libraries(v2_orchestration_scenario2 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Orchestration_Scenario2_MultiNodeCluster 
+    COMMAND $<TARGET_FILE:v2_orchestration_scenario2>
+    LABELS "V2;Unit;Orchestration;Scenario;MultiNode;Cluster;Placement;PlacementStrategy;Mock;MPI;Topology;CUDA;ROCm;CPU;GPU;Infiniband;NVLink;xGMI;Qwen;7B;72B;235B;571B;1142B"
     MPI_PROCS 1
 )
 

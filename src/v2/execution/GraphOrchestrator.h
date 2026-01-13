@@ -35,9 +35,14 @@
 #include "GraphExecutor.h"
 #include "GraphBufferManager.h"
 #include "DeviceContext.h"
+#include "PlacementStrategy.h"            // For InferencePhase
 #include "compute_stages/ComputeStages.h" // For StageDumpInfo
 #include "../tensors/FP16Utils.h"         // For fp16_to_fp32, bf16_to_fp32
 #include "../tensors/BlockStructures.h"   // For Q8_1Block, Q16_1Block
+#include "../loaders/IWeightStreamer.h"   // For weight streaming (Option B)
+#include "../interfaces/IModelContext.h"  // For interface-based construction
+#include "../interfaces/IMPITopology.h"   // For interface-based construction
+#include "../interfaces/ICollectiveContext.h" // For interface-based construction
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -50,6 +55,8 @@ namespace llaminar2
     // Forward declarations
     class MPIContext;
     class IKVCache;
+    class WeightManager;
+    class WeightPlacementMap;
 
     /**
      * @brief Configuration for graph caching behavior
@@ -205,6 +212,59 @@ namespace llaminar2
     class GraphOrchestrator : public IInferenceRunner
     {
     public:
+        // =========================================================================
+        // Dependencies Struct for Interface-Based Construction (Testing Support)
+        // =========================================================================
+
+        /**
+         * @brief Dependency injection container for testable construction
+         *
+         * Allows injection of interface implementations for unit testing:
+         * - IModelContext: Provides model metadata and weights
+         * - IMPITopology: Provides MPI topology information (optional)
+         * - ICollectiveContext: Provides collective operations (optional)
+         *
+         * Usage:
+         * @code
+         * // In tests with mock dependencies
+         * GraphOrchestrator::Dependencies deps;
+         * deps.model_ctx = std::make_shared<MockModelContext>(config);
+         * deps.topology = std::make_shared<MockMPITopology>(rank, world_size);
+         * auto orchestrator = GraphOrchestrator(std::move(deps), graph_config);
+         * @endcode
+         */
+        struct Dependencies {
+            /// Model context providing weights and metadata (required)
+            std::shared_ptr<IModelContext> model_ctx;
+            
+            /// MPI topology for work distribution (optional - nullptr for single-rank)
+            std::shared_ptr<IMPITopology> topology = nullptr;
+            
+            /// Collective context for MPI operations (optional - nullptr for single-rank)
+            std::shared_ptr<ICollectiveContext> collective_ctx = nullptr;
+        };
+
+        // =========================================================================
+        // Constructors
+        // =========================================================================
+
+        /**
+         * @brief Construct orchestrator with injected dependencies (preferred for testing)
+         *
+         * This constructor allows full dependency injection for unit testing:
+         * - Mock model context provides weights and metadata without GGUF files
+         * - Mock topology enables testing distributed logic without MPI
+         * - Mock collective context enables testing sync stages in isolation
+         *
+         * @param deps Dependency injection container
+         * @param graph_config Configuration for Qwen2Graph
+         * @param cache_config Graph caching configuration
+         */
+        GraphOrchestrator(
+            Dependencies deps,
+            const Qwen2GraphConfig &graph_config,
+            const GraphCacheConfig &cache_config = {});
+
         /**
          * @brief Construct orchestrator with graph builder
          *
@@ -420,6 +480,157 @@ namespace llaminar2
          * @brief Check if weights are configured for full forward
          */
         bool hasGlobalWeights() const;
+
+        // =========================================================================
+        // Weight Manager and Phase-Aware Weight Access (Gap 3)
+        // =========================================================================
+
+        // =========================================================================
+        // Weight Streaming (Option B)
+        // =========================================================================
+
+        /**
+         * @brief Set weight streamer for on-demand layer weight transfer
+         *
+         * When set, the orchestrator will call streaming hooks during layer
+         * execution to ensure weights are on-device and to prefetch upcoming layers.
+         *
+         * @param streamer Shared pointer to IWeightStreamer (nullptr to disable streaming)
+         */
+        void setWeightStreamer(std::shared_ptr<IWeightStreamer> streamer);
+
+        /**
+         * @brief Get weight streamer
+         * @return Shared pointer to IWeightStreamer (may be nullptr)
+         */
+        std::shared_ptr<IWeightStreamer> weightStreamer() const { return weight_streamer_; }
+
+        /**
+         * @brief Check if weight streaming is active
+         *
+         * Returns true if a weight streamer is set and the current residency
+         * mode is STREAMING (not RESIDENT or UNIFIED).
+         *
+         * @return true if streaming hooks are active
+         */
+        bool isWeightStreamingEnabled() const;
+
+        // =========================================================================
+        // Weight Manager and Phase-Aware Weight Access (Gap 3)
+        // =========================================================================
+
+        /**
+         * @brief Set weight manager for phase-aware weight access
+         *
+         * The weight manager provides access to both full weights (prefill)
+         * and decode shards (decode) for CPU decode participation.
+         *
+         * @param weight_manager Shared pointer to WeightManager
+         */
+        void setWeightManager(std::shared_ptr<WeightManager> weight_manager);
+
+        /**
+         * @brief Get weight manager
+         * @return Shared pointer to WeightManager (may be nullptr)
+         */
+        std::shared_ptr<WeightManager> weightManager() const { return weight_manager_; }
+
+        /**
+         * @brief Set weight placement map for decode device selection
+         *
+         * The placement map provides device info for phase-aware weight selection.
+         *
+         * @param placement_map Shared pointer to WeightPlacementMap
+         */
+        void setWeightPlacementMap(std::shared_ptr<WeightPlacementMap> placement_map);
+
+        /**
+         * @brief Get weight placement map
+         * @return Shared pointer to WeightPlacementMap (may be nullptr)
+         */
+        std::shared_ptr<WeightPlacementMap> weightPlacementMap() const { return weight_placement_map_; }
+
+        /**
+         * @brief Set current inference phase (low-level, no logging)
+         *
+         * Changes the inference phase which affects weight selection:
+         * - PREFILL: Uses full weights from GPU (compute-bound)
+         * - DECODE: May use CPU decode shards if participation enabled
+         *
+         * Prefer using transitionToPhase() for explicit transitions with logging.
+         *
+         * @param phase The inference phase to set
+         */
+        void setPhase(InferencePhase phase) { current_phase_ = phase; }
+
+        /**
+         * @brief Transition to a new inference phase with logging
+         *
+         * Use this method for explicit phase transitions (e.g., from tests or
+         * when manually controlling prefill/decode phases). Logs the transition
+         * at DEBUG level if the phase actually changes.
+         *
+         * The phase affects weight selection via getPhaseAwareWeight():
+         * - PREFILL: Uses full weights from GPU (compute-bound)
+         * - DECODE: May use CPU decode shards if participation enabled
+         *
+         * @param phase The new inference phase
+         */
+        void transitionToPhase(InferencePhase phase);
+
+        /**
+         * @brief Get current inference phase
+         */
+        InferencePhase getPhase() const { return current_phase_; }
+
+        /**
+         * @brief Get weight tensor appropriate for current inference phase
+         *
+         * For PREFILL: Returns full weight from GPU (compute-bound - needs all weights)
+         * For DECODE: Returns decode shard if CPU is participating, else full weight
+         *
+         * This enables "Option A: Selective Duplication" where CPU only participates
+         * in decode phase with a subset of weights.
+         *
+         * @param name Weight tensor name (e.g., "blk.0.attn_q.weight")
+         * @param layer_idx Layer index for placement lookup
+         * @param phase Inference phase (overrides current_phase_ if provided)
+         * @return Shared pointer to weight tensor, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> getPhaseAwareWeight(
+            const std::string &name,
+            int layer_idx,
+            InferencePhase phase) const;
+
+        /**
+         * @brief Get weight for current phase (uses current_phase_)
+         *
+         * Convenience overload that uses the orchestrator's current phase.
+         *
+         * @param name Weight tensor name
+         * @param layer_idx Layer index for placement lookup
+         * @return Shared pointer to weight tensor, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> getPhaseAwareWeight(
+            const std::string &name,
+            int layer_idx) const
+        {
+            return getPhaseAwareWeight(name, layer_idx, current_phase_);
+        }
+
+        /**
+         * @brief Check if this rank should participate in CPU decode
+         *
+         * Returns true if:
+         * - Phase is DECODE
+         * - WeightPlacementMap indicates CPU decode participation
+         * - This MPI rank is the designated CPU decode participant
+         *
+         * @param name Weight tensor name
+         * @param layer_idx Layer index
+         * @return true if this rank handles CPU decode shard for this weight
+         */
+        bool shouldUseCPUDecodeWeight(const std::string &name, int layer_idx) const;
 
         // =========================================================================
         // Graph Buffer Management (Phase 3 - moved from Qwen2Graph)
@@ -1200,6 +1411,39 @@ namespace llaminar2
          * @param seq_len Sequence length for buffer sizing
          */
         void bindGraphManagedBuffers(int seq_len);
+
+        // =========================================================================
+        // Phase-Aware Weight Access Members (Gap 3 - CPU Decode Participation)
+        // =========================================================================
+
+        /// Weight manager for full weights and decode shards
+        std::shared_ptr<WeightManager> weight_manager_;
+
+        /// Weight placement map for decode device selection
+        std::shared_ptr<WeightPlacementMap> weight_placement_map_;
+
+        /// Current inference phase (PREFILL or DECODE)
+        InferencePhase current_phase_ = InferencePhase::PREFILL;
+
+        // =========================================================================
+        // Weight Streaming Members (Option B)
+        // =========================================================================
+
+        /// Weight streamer for on-demand layer transfer (nullptr = disabled)
+        std::shared_ptr<IWeightStreamer> weight_streamer_;
+
+        // =========================================================================
+        // Injected Dependencies (for testing - Phase 4)
+        // =========================================================================
+
+        /// Injected model context interface (nullptr if using concrete types)
+        std::shared_ptr<IModelContext> injected_model_ctx_;
+
+        /// Injected topology interface (nullptr if using MPIContext directly)
+        std::shared_ptr<IMPITopology> injected_topology_;
+
+        /// Injected collective context (nullptr if using default)
+        std::shared_ptr<ICollectiveContext> injected_collective_ctx_;
     };
 
 } // namespace llaminar2

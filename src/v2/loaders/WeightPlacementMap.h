@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include "../backends/DeviceId.h"
+#include "../interfaces/IWeightPlacementMap.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -16,8 +16,7 @@
 namespace llaminar2
 {
 
-    // Forward declaration
-    struct PlacementPlan;
+    // Note: WeightDeviceInfo is now defined in IWeightPlacementMap.h
 
     /**
      * @brief Encodes fine-grained decisions about which device should hold each weight tensor.
@@ -35,8 +34,10 @@ namespace llaminar2
      * - Offloading: First N layers GPU, rest CPU
      * - Multi-GPU: Layer-wise partitioning across GPUs
      * - Memory-aware: Fit what you can on GPU, rest on CPU
+     *
+     * Implements IWeightPlacementMap interface for testability.
      */
-    class WeightPlacementMap
+    class WeightPlacementMap : public IWeightPlacementMap
     {
     public:
         /**
@@ -58,21 +59,35 @@ namespace llaminar2
          * @param layer_idx Optional layer index for layer-based lookup (-1 = not a layer weight)
          * @return DeviceId where this tensor should be allocated
          */
-        DeviceId getDeviceForWeight(const std::string &tensor_name, int layer_idx = -1) const;
+        DeviceId getDeviceForWeight(const std::string &tensor_name, int layer_idx = -1) const override;
+
+        /**
+         * @brief Get extended device info for phase-aware weight placement
+         *
+         * Returns full device info including decode participation.
+         * For prefill-only code, use getDeviceForWeight() instead.
+         *
+         * Lookup priority is same as getDeviceForWeight().
+         *
+         * @param tensor_name Full tensor name (e.g., "blk.0.attn_q.weight")
+         * @param layer_idx Optional layer index for layer-based lookup (-1 = not a layer weight)
+         * @return WeightDeviceInfo with prefill device and decode participation info
+         */
+        WeightDeviceInfo getDeviceInfoForWeight(const std::string &tensor_name, int layer_idx = -1) const override;
 
         /**
          * @brief Explicitly map a specific tensor to a device
          * @param tensor_name Exact tensor name
          * @param device Target device
          */
-        void setTensorDevice(const std::string &tensor_name, DeviceId device);
+        void setTensorDevice(const std::string &tensor_name, DeviceId device) override;
 
         /**
          * @brief Map an entire layer to a device (bulk assignment)
          * @param layer_idx Layer index (0-based)
          * @param device Target device
          */
-        void setLayerDevice(int layer_idx, DeviceId device);
+        void setLayerDevice(int layer_idx, DeviceId device) override;
 
         /**
          * @brief Map a range of layers to a device
@@ -80,29 +95,29 @@ namespace llaminar2
          * @param end_layer Last layer (inclusive)
          * @param device Target device
          */
-        void setLayerRange(int start_layer, int end_layer, DeviceId device);
+        void setLayerRange(int start_layer, int end_layer, DeviceId device) override;
 
         /**
          * @brief Set a pattern-based rule (e.g., all "embed.*" → device 0)
          * @param pattern Regex or simple glob pattern
          * @param device Target device
          */
-        void setPatternDevice(const std::string &pattern, DeviceId device);
+        void setPatternDevice(const std::string &pattern, DeviceId device) override;
 
         /**
          * @brief Get the default device for unmapped weights
          */
-        DeviceId defaultDevice() const { return default_device_; }
+        DeviceId defaultDevice() const override { return default_device_; }
 
         /**
          * @brief Get total number of explicit tensor mappings
          */
-        size_t tensorMappingCount() const { return tensor_to_device_.size(); }
+        size_t tensorMappingCount() const override { return tensor_to_device_.size(); }
 
         /**
          * @brief Get total number of layer mappings
          */
-        size_t layerMappingCount() const { return layer_to_device_.size(); }
+        size_t layerMappingCount() const override { return layer_to_device_.size(); }
 
         // ========== Block-Level Convenience Methods (Phase 2) ==========
 
@@ -119,7 +134,7 @@ namespace llaminar2
          * @param layer_idx Layer index
          * @param device Target device
          */
-        void setAttentionDevice(int layer_idx, DeviceId device);
+        void setAttentionDevice(int layer_idx, DeviceId device) override;
 
         /**
          * @brief Get device for attention block in a layer
@@ -129,7 +144,7 @@ namespace llaminar2
          * @param layer_idx Layer index
          * @return DeviceId where attention tensors reside
          */
-        DeviceId getAttentionDevice(int layer_idx) const;
+        DeviceId getAttentionDevice(int layer_idx) const override;
 
         /**
          * @brief Set device for all FFN tensors in a layer
@@ -143,7 +158,7 @@ namespace llaminar2
          * @param layer_idx Layer index
          * @param device Target device
          */
-        void setFFNDevice(int layer_idx, DeviceId device);
+        void setFFNDevice(int layer_idx, DeviceId device) override;
 
         /**
          * @brief Get device for FFN block in a layer
@@ -153,7 +168,7 @@ namespace llaminar2
          * @param layer_idx Layer index
          * @return DeviceId where FFN tensors reside
          */
-        DeviceId getFFNDevice(int layer_idx) const;
+        DeviceId getFFNDevice(int layer_idx) const override;
 
         // ========== MoE-Specific Methods (Phase 2) ==========
 
@@ -166,7 +181,7 @@ namespace llaminar2
          * @param expert_idx Expert index
          * @param device Target device
          */
-        void setSharedExpertDevice(int expert_idx, DeviceId device);
+        void setSharedExpertDevice(int expert_idx, DeviceId device) override;
 
         /**
          * @brief Get device for shared expert
@@ -174,7 +189,7 @@ namespace llaminar2
          * @param expert_idx Expert index
          * @return DeviceId, or default if not set
          */
-        DeviceId getSharedExpertDevice(int expert_idx) const;
+        DeviceId getSharedExpertDevice(int expert_idx) const override;
 
         /**
          * @brief Set device for local expert in specific layer (MoE models)
@@ -186,7 +201,7 @@ namespace llaminar2
          * @param expert_idx Expert index within layer
          * @param device Target device
          */
-        void setLocalExpertDevice(int layer_idx, int expert_idx, DeviceId device);
+        void setLocalExpertDevice(int layer_idx, int expert_idx, DeviceId device) override;
 
         /**
          * @brief Get device for local expert in specific layer
@@ -195,12 +210,12 @@ namespace llaminar2
          * @param expert_idx Expert index within layer
          * @return DeviceId, or default if not set
          */
-        DeviceId getLocalExpertDevice(int layer_idx, int expert_idx) const;
+        DeviceId getLocalExpertDevice(int layer_idx, int expert_idx) const override;
 
         /**
          * @brief Clear all mappings (reset to default device only)
          */
-        void clear();
+        void clear() override;
 
         // ========== PlacementPlan Integration ==========
 
@@ -216,19 +231,19 @@ namespace llaminar2
          *
          * @param plan PlacementPlan computed by PlacementStrategy
          */
-        void applyPlan(const PlacementPlan &plan);
+        void applyPlan(const PlacementPlan &plan) override;
 
         /**
          * @brief Check if a plan has been applied
          * @return true if applyPlan() has been called
          */
-        bool hasPlan() const { return plan_applied_; }
+        bool hasPlan() const override { return plan_applied_; }
 
         /**
          * @brief Get the strategy name from the applied plan (for logging)
          * @return Strategy name, or empty string if no plan applied
          */
-        const std::string &appliedStrategyName() const { return applied_strategy_name_; }
+        const std::string &appliedStrategyName() const override { return applied_strategy_name_; }
 
     private:
         /**
@@ -254,6 +269,11 @@ namespace llaminar2
         // MoE-specific mappings (Phase 2)
         std::unordered_map<int, DeviceId> shared_expert_to_device_;        ///< Shared expert index → device
         std::unordered_map<std::string, DeviceId> local_expert_to_device_; ///< "layer_X:expert_Y" → device
+
+        // Phase-aware decode placement (CPU participation)
+        std::vector<std::vector<DeviceId>> layer_decode_devices_;     ///< Layer index → decode devices
+        std::vector<std::vector<float>> layer_decode_fractions_;      ///< Layer index → decode fractions
+        std::vector<bool> layer_cpu_participates_;                    ///< Layer index → CPU participates in decode
 
         // PlacementPlan tracking
         bool plan_applied_ = false;         ///< Whether applyPlan() has been called

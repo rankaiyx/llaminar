@@ -167,6 +167,38 @@ namespace llaminar2
         }
     }
 
+    bool CUDABackend::memset(void *ptr, int value, size_t bytes, int device_id)
+    {
+        if (ptr == nullptr || bytes == 0)
+        {
+            return true; // No-op for null pointer or zero bytes
+        }
+
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_ERROR("[CUDABackend] Invalid device ID " << device_id << " for cudaMemset");
+            return false;
+        }
+
+        // Set device before memset
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend] Failed to set device " << device_id << " before cudaMemset: "
+                                                            << cudaGetErrorString(err));
+            return false;
+        }
+
+        err = cudaMemset(ptr, value, bytes);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend] cudaMemset failed: " << cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
     // ====================================================================
     // Device Query Operations
     // ====================================================================

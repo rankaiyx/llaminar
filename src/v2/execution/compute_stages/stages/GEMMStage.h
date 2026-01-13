@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -29,6 +29,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Type-safe tensor pointers (required)
             const ITensor *A = nullptr; ///< Input activation tensor [m, k]
             const ITensor *B = nullptr; ///< Weight tensor [k, n] (may be quantized)
@@ -72,9 +74,7 @@ namespace llaminar2
             const ITensor *gate_input = nullptr;
             bool do_swiglu = false;
 
-            // MPI context for tensor-parallel execution (optional)
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
+            // device_id and mpi_ctx inherited from StageParamsBase
 
             // =================================================================
             // Tensor Parallelism Parameters (Phase 2)
@@ -103,7 +103,7 @@ namespace llaminar2
         bool requiresAllreduce() const override { return params_.needs_allreduce; }
 
         /// Target device for coherence management
-        DeviceId preferredDevice() const override { return params_.device_id; }
+
 
         const Params &getParams() const { return params_; }
 

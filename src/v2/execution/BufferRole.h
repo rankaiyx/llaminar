@@ -301,6 +301,20 @@ namespace llaminar2
         TensorLayout expected_layout = TensorLayout::UNKNOWN;
 
         // =====================================================================
+        // Collective Operation Fields (Phase 3: Buffer Registration API)
+        // =====================================================================
+
+        /// Whether this buffer participates in collective operations (AllReduce, etc.)
+        /// When true and a CollectiveContext with PCIeBARBackend is active,
+        /// the buffer will be allocated from the BAR region for cross-vendor P2P.
+        bool participates_in_collective = false;
+
+        /// Unique identifier linking buffers for the same collective operation
+        /// Multiple buffers with the same collective_id belong to the same collective
+        /// Example: "layer0_attn_allreduce" for attention output allreduce
+        std::string collective_id;
+
+        // =====================================================================
         // Convenience Methods
         // =====================================================================
 
@@ -461,6 +475,42 @@ namespace llaminar2
         bool hasProducer() const
         {
             return !producer_stage.empty();
+        }
+
+        // =====================================================================
+        // Fluent Builder Extensions (Collective Operations)
+        // =====================================================================
+
+        /**
+         * @brief Mark this buffer as participating in a collective operation
+         *
+         * When a buffer participates in a collective and the GraphBufferManager
+         * has a CollectiveContext with a backend requiring registration (e.g.,
+         * PCIeBARBackend), the buffer will be allocated from the BAR region
+         * for cross-vendor P2P transfers.
+         *
+         * @param collective_id Unique identifier for the collective
+         *                      (e.g., "layer0_attn_allreduce")
+         * @return Reference for chaining
+         *
+         * @code
+         * reqs.addOutput("attention_out", {seq_len, d_model})
+         *     .forCollective("layer0_attn_allreduce");
+         * @endcode
+         */
+        BufferDescriptor &forCollective(const std::string &id)
+        {
+            participates_in_collective = true;
+            collective_id = id;
+            return *this;
+        }
+
+        /**
+         * @brief Check if buffer participates in a collective
+         */
+        bool isCollectiveBuffer() const
+        {
+            return participates_in_collective && !collective_id.empty();
         }
     };
 

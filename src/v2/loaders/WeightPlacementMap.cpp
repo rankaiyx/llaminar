@@ -54,6 +54,40 @@ namespace llaminar2
         return default_device_;
     }
 
+    WeightDeviceInfo WeightPlacementMap::getDeviceInfoForWeight(const std::string &tensor_name, int layer_idx) const
+    {
+        // Get the prefill device using existing logic
+        DeviceId prefill_device = getDeviceForWeight(tensor_name, layer_idx);
+
+        // Determine effective layer index
+        int effective_layer = layer_idx;
+        if (effective_layer < 0)
+        {
+            effective_layer = extractLayerIndex(tensor_name);
+        }
+
+        // Check if we have decode placement info for this layer
+        if (effective_layer >= 0 && effective_layer < static_cast<int>(layer_decode_devices_.size()))
+        {
+            const auto &decode_devices = layer_decode_devices_[effective_layer];
+            const auto &decode_fractions = layer_decode_fractions_[effective_layer];
+            bool cpu_participates = layer_cpu_participates_[effective_layer];
+
+            if (!decode_devices.empty())
+            {
+                WeightDeviceInfo info;
+                info.prefill_device = prefill_device;
+                info.decode_devices = decode_devices;
+                info.decode_fractions = decode_fractions;
+                info.cpu_decode_participation = cpu_participates;
+                return info;
+            }
+        }
+
+        // Fallback: single device for both prefill and decode
+        return WeightDeviceInfo(prefill_device);
+    }
+
     void WeightPlacementMap::setTensorDevice(const std::string &tensor_name, DeviceId device)
     {
         tensor_to_device_[tensor_name] = device;
@@ -88,6 +122,10 @@ namespace llaminar2
         pattern_to_device_.clear();
         shared_expert_to_device_.clear();
         local_expert_to_device_.clear();
+        // Clear decode placement info
+        layer_decode_devices_.clear();
+        layer_decode_fractions_.clear();
+        layer_cpu_participates_.clear();
     }
 
     // ========== Block-Level Convenience Methods (Phase 2) ==========
@@ -251,6 +289,22 @@ namespace llaminar2
         setPatternDevice("final_norm*", toDeviceId(plan.global.final_norm_device));
         setPatternDevice("norm*", toDeviceId(plan.global.final_norm_device)); // Some models use just "norm"
 
+        // Resize decode placement vectors to accommodate all layers
+        if (!plan.layers.empty())
+        {
+            int max_layer = 0;
+            for (const auto &layer : plan.layers)
+            {
+                if (layer.layer_idx > max_layer)
+                {
+                    max_layer = layer.layer_idx;
+                }
+            }
+            layer_decode_devices_.resize(max_layer + 1);
+            layer_decode_fractions_.resize(max_layer + 1);
+            layer_cpu_participates_.resize(max_layer + 1, false);
+        }
+
         // Apply per-layer placements
         for (const auto &layer : plan.layers)
         {
@@ -270,6 +324,30 @@ namespace llaminar2
             {
                 // Same device for entire layer
                 setLayerDevice(layer_idx, toDeviceId(layer.device));
+            }
+
+            // Store decode placement info from LayerPlacement
+            if (!layer.decode_devices.empty())
+            {
+                std::vector<DeviceId> decode_device_ids;
+                decode_device_ids.reserve(layer.decode_devices.size());
+                for (const auto &d : layer.decode_devices)
+                {
+                    decode_device_ids.push_back(toDeviceId(d));
+                }
+                layer_decode_devices_[layer_idx] = std::move(decode_device_ids);
+                layer_decode_fractions_[layer_idx] = layer.decode_weight_fractions;
+                layer_cpu_participates_[layer_idx] = layer.cpu_participates_in_decode;
+            }
+            else
+            {
+                // No explicit decode devices - use prefill device for decode too
+                DeviceId prefill_device = layer.split_attention_ffn
+                    ? layer.getAttentionDevice()  // Use attention device as representative
+                    : toDeviceId(layer.device);
+                layer_decode_devices_[layer_idx] = {prefill_device};
+                layer_decode_fractions_[layer_idx] = {1.0f};
+                layer_cpu_participates_[layer_idx] = prefill_device.is_cpu();
             }
         }
     }

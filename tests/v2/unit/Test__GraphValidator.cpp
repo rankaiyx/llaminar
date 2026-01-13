@@ -24,8 +24,8 @@ using namespace llaminar2;
 class MockValidatorStage : public IComputeStage
 {
 public:
-    MockValidatorStage(StageBufferRequirements reqs)
-        : requirements_(std::move(reqs)) {}
+    MockValidatorStage(StageBufferRequirements reqs, DeviceId device = DeviceId::cpu())
+        : IComputeStage(device), requirements_(std::move(reqs)) {}
 
     bool execute(IDeviceContext *) override { return true; }
     ComputeStageType type() const override { return ComputeStageType::COPY; }

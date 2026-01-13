@@ -14,6 +14,7 @@
 #include "../loaders/ModelLoader.h"
 #include "../loaders/WeightManager.h"
 #include "../loaders/WeightPreloader.h"
+#include "../loaders/WeightStreamerFactory.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 
@@ -87,7 +88,7 @@ namespace llaminar2
         }
 
         // Configure weight sharding from Qwen2 schema
-        auto weight_mgr = model_ctx->weightManager();
+        auto weight_mgr = model_ctx->concreteWeightManager();
         if (weight_mgr)
         {
             Qwen2SchemaFactory schema_factory;
@@ -96,7 +97,7 @@ namespace llaminar2
         }
 
         // Get model metadata
-        auto &loader = model_ctx->loader();
+        ModelLoader &loader = model_ctx->concreteLoader();
         const auto &model = loader.getModel();
 
         // Build Qwen2GraphConfig from model metadata
@@ -334,6 +335,23 @@ namespace llaminar2
             return nullptr;
         }
 
+        // =====================================================================
+        // Weight Streaming (Option B) - Create streamer from environment
+        // =====================================================================
+        // If LLAMINAR_WEIGHT_STREAMING=1, create a LayerWeightStreamer.
+        // The streamer manages GPU-side weight caching and on-demand transfers.
+        // Note: weight_mgr is already declared above (line 91)
+        // =====================================================================
+        if (weight_mgr)
+        {
+            auto weight_streamer = WeightStreamerFactory::createFromEnv(
+                weight_mgr, graph_config.n_layers);
+            if (weight_streamer)
+            {
+                orchestrator->setWeightStreamer(std::move(weight_streamer));
+            }
+        }
+
         LOG_INFO("[InferenceRunner] GraphOrchestrator created successfully");
 
         // GraphOrchestrator implements IInferenceRunner directly
@@ -350,11 +368,22 @@ namespace llaminar2
             return false;
         }
 
-        auto weight_mgr = model_ctx->weightManager();
+        auto weight_mgr = model_ctx->concreteWeightManager();
         if (!weight_mgr)
         {
             LOG_ERROR("[InferenceRunner] No weight manager in model context");
             return false;
+        }
+
+        // =====================================================================
+        // Set WeightManager and PlacementMap for phase-aware weight access
+        // (Gap 3: CPU Decode Participation)
+        // =====================================================================
+        orchestrator->setWeightManager(weight_mgr);
+        if (auto placement_map = model_ctx->placementMap())
+        {
+            orchestrator->setWeightPlacementMap(placement_map);
+            LOG_DEBUG("[InferenceRunner] Phase-aware weight access configured with placement map");
         }
 
         // =====================================================================
@@ -431,6 +460,156 @@ namespace llaminar2
         orchestrator->setWeights(weights);
         LOG_INFO("[InferenceRunner] Weights configured on orchestrator");
         return true;
+    }
+
+    // =========================================================================
+    // Testable Factory Function (Interface-Based)
+    // =========================================================================
+
+    std::unique_ptr<IInferenceRunner> createTestableInferenceRunner(
+        std::shared_ptr<IModelContext> model_ctx,
+        DeviceId device,
+        const InferenceRunnerConfig &config)
+    {
+        LOG_DEBUG("[InferenceRunner] createTestableInferenceRunner called");
+
+        if (!model_ctx)
+        {
+            LOG_ERROR("[InferenceRunner] model_ctx is null");
+            return nullptr;
+        }
+
+        // Validate device
+        if (!device.is_valid())
+        {
+            LOG_ERROR("[InferenceRunner] Invalid device " << device
+                                                          << ". Use DeviceId::cpu() for CPU.");
+            return nullptr;
+        }
+        LOG_DEBUG("[InferenceRunner] Using device " << device);
+
+        // Currently only Qwen2 is supported
+        std::string architecture = model_ctx->architecture();
+        if (architecture != "qwen2")
+        {
+            LOG_ERROR("[InferenceRunner] Only qwen2 architecture is supported, got: " << architecture);
+            return nullptr;
+        }
+
+        // Build Qwen2GraphConfig from IModelContext
+        Qwen2GraphConfig graph_config;
+        graph_config.vocab_size = model_ctx->vocabSize();
+        graph_config.d_model = model_ctx->embeddingLength();
+        graph_config.n_layers = model_ctx->blockCount();
+        graph_config.n_heads = model_ctx->headCount();
+        graph_config.n_kv_heads = model_ctx->headCountKV();
+        graph_config.head_dim = graph_config.d_model / graph_config.n_heads;
+        graph_config.max_seq_len = config.max_seq_len;
+        graph_config.default_device = device;
+        graph_config.activation_precision = config.activation_precision;
+        graph_config.fused_attention_backend = config.fused_attention_backend;
+        graph_config.kv_cache_scale = config.kv_cache_scale;
+
+        // Estimate d_ff as ~4x d_model (common SwiGLU ratio) - tests can override
+        // In real usage, IModelContext implementations can provide accurate d_ff
+        graph_config.d_ff = graph_config.d_model * 4;
+
+        // Single rank configuration (testable runner doesn't use MPI by default)
+        graph_config.head_start = 0;
+        graph_config.local_n_heads = graph_config.n_heads;
+        graph_config.local_n_kv_heads = graph_config.n_kv_heads;
+        graph_config.qkv_column_parallel = false;
+        graph_config.d_ff_local = graph_config.d_ff;
+        graph_config.ffn_column_parallel = false;
+        graph_config.vocab_local = graph_config.vocab_size;
+        graph_config.lm_head_column_parallel = false;
+
+        LOG_DEBUG("[InferenceRunner] TestableGraphConfig: "
+                  << "vocab=" << graph_config.vocab_size
+                  << ", d_model=" << graph_config.d_model
+                  << ", n_layers=" << graph_config.n_layers
+                  << ", n_heads=" << graph_config.n_heads
+                  << ", n_kv_heads=" << graph_config.n_kv_heads
+                  << ", d_ff=" << graph_config.d_ff);
+
+        // Create Dependencies struct
+        GraphOrchestrator::Dependencies deps;
+        deps.model_ctx = model_ctx;
+        // topology and collective_ctx left as nullptr for single-rank testing
+
+        // Create GraphOrchestrator with injected dependencies
+        GraphCacheConfig cache_config;
+        cache_config.enabled = true;
+        cache_config.decode_seq_len = 1;
+
+        auto orchestrator = std::make_unique<GraphOrchestrator>(
+            std::move(deps), graph_config, cache_config);
+
+        // Initialize graph cache
+        orchestrator->initializeGraphCache(graph_config.n_layers);
+
+        // Initialize inference state (allocates buffers)
+        if (!orchestrator->initializeInferenceState(
+                config.batch_size, config.max_seq_len, device))
+        {
+            LOG_ERROR("[InferenceRunner] Failed to initialize inference state");
+            return nullptr;
+        }
+
+        // Configure weights from IModelContext
+        // Build Qwen2ModelWeights using IModelContext::getWeight
+        Qwen2ModelWeights weights;
+
+        // Get global weights via interface
+        auto embedding = model_ctx->getWeight("token_embd.weight");
+        auto final_norm = model_ctx->getWeight("output_norm.weight");
+        auto lm_head = model_ctx->getWeight("output.weight");
+
+        if (!embedding || !final_norm || !lm_head)
+        {
+            LOG_ERROR("[InferenceRunner] Missing global weights from IModelContext");
+            return nullptr;
+        }
+
+        weights.embedding_table = embedding.get();
+        weights.final_norm = final_norm.get();
+        weights.lm_head = lm_head.get();
+
+        // Layer weight accessor using IModelContext interface
+        // Capture model_ctx by value (shared_ptr copy) for lambda lifetime
+        weights.get_layer_weights = [model_ctx](int layer_idx) -> Qwen2LayerWeights
+        {
+            Qwen2LayerWeights layer;
+            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+
+            // Attention weights
+            layer.wq = model_ctx->getWeight(prefix + "attn_q.weight").get();
+            layer.wk = model_ctx->getWeight(prefix + "attn_k.weight").get();
+            layer.wv = model_ctx->getWeight(prefix + "attn_v.weight").get();
+            layer.wo = model_ctx->getWeight(prefix + "attn_output.weight").get();
+            layer.attn_norm = model_ctx->getWeight(prefix + "attn_norm.weight").get();
+
+            // Attention biases (may be null)
+            auto q_bias = model_ctx->getWeight(prefix + "attn_q.bias");
+            auto k_bias = model_ctx->getWeight(prefix + "attn_k.bias");
+            auto v_bias = model_ctx->getWeight(prefix + "attn_v.bias");
+            layer.q_bias = q_bias ? q_bias.get() : nullptr;
+            layer.k_bias = k_bias ? k_bias.get() : nullptr;
+            layer.v_bias = v_bias ? v_bias.get() : nullptr;
+
+            // FFN weights
+            layer.gate_proj = model_ctx->getWeight(prefix + "ffn_gate.weight").get();
+            layer.up_proj = model_ctx->getWeight(prefix + "ffn_up.weight").get();
+            layer.down_proj = model_ctx->getWeight(prefix + "ffn_down.weight").get();
+            layer.ffn_norm = model_ctx->getWeight(prefix + "ffn_norm.weight").get();
+
+            return layer;
+        };
+
+        orchestrator->setWeights(weights);
+        LOG_INFO("[InferenceRunner] Testable GraphOrchestrator created successfully");
+
+        return orchestrator;
     }
 
 } // namespace llaminar2

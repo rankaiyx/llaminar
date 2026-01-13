@@ -41,9 +41,9 @@
 #include "cuda/attention/CUDAFlashAttentionKernelT.h" // Flash Attention
 #endif
 
-// ROCm kernel factory (when implemented)
+// ROCm kernel classes
 #ifdef HAVE_ROCM
-// #include "rocm/RocmGemmFactory.h"
+#include "rocm/ROCmFloatingPointGemmKernel.h" // FP32/FP16/BF16 via hipBLAS
 #endif
 
 namespace llaminar
@@ -160,6 +160,42 @@ namespace llaminar
 
                     // Fallback to device 0 if no CUDA device found via DeviceManager
                     LOG_WARN("[KernelFactory] No CUDA device found in DeviceManager, using device 0");
+                    return 0;
+                }
+#endif
+
+#ifdef HAVE_ROCM
+                /**
+                 * @brief Get ROCm device ID for kernel creation
+                 *
+                 * For weight tensors that are CPU-only (typical for GGUF models), we use
+                 * the first available ROCm device (device 0). For tensors already on GPU,
+                 * we use their actual device.
+                 *
+                 * @param tensor The tensor to check (usually a weight tensor)
+                 * @return ROCm device ID (backend-specific, usually 0)
+                 */
+                int getROCmDeviceIdForKernel(const llaminar2::TensorBase *tensor)
+                {
+                    const auto &dm = llaminar2::DeviceManager::instance();
+                    const auto &devices = dm.devices();
+
+                    // Check if tensor is currently on a ROCm device
+                    auto current_dev = tensor->current_device();
+                    if (current_dev.has_value() && current_dev->is_rocm())
+                    {
+                        return current_dev->rocm_ordinal();
+                    }
+
+                    // Tensor not on ROCm GPU - find the first ROCm device
+                    int rocm_dm_idx = dm.find_device(llaminar2::ComputeBackendType::GPU_ROCM, 0);
+                    if (rocm_dm_idx >= 0 && static_cast<size_t>(rocm_dm_idx) < devices.size())
+                    {
+                        return devices[rocm_dm_idx].device_id;
+                    }
+
+                    // Fallback to device 0 if no ROCm device found via DeviceManager
+                    LOG_WARN("[KernelFactory] No ROCm device found in DeviceManager, using device 0");
                     return 0;
                 }
 #endif
@@ -1281,6 +1317,16 @@ namespace llaminar
                     int cuda_device_id = getCUDADeviceIdForKernel(tensor);
                     return std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
                         tensor, cuda_device_id, llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP32);
+                }
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                {
+                    LOG_DEBUG("[KernelFactory] FP32 GEMM: Using ROCmFloatingPointGemmKernel");
+                    int rocm_device_id = getROCmDeviceIdForKernel(tensor);
+                    return std::make_unique<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
+                        tensor, rocm_device_id, llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::FP32);
                 }
 #endif
 
@@ -2784,16 +2830,26 @@ namespace llaminar
                 }
 #endif
 #ifdef HAVE_ROCM
-                else if (target_device == DeviceType::ROCm)
+                if (target_device == DeviceType::ROCm)
                 {
                     // NO FALLBACK: ROCm device-targeted kernels not yet implemented
                     throw std::runtime_error("ROCm device-targeted GEMM kernels not yet implemented - no silent fallback to CPU");
                 }
 #endif
-                else
+
+#if !defined(HAVE_CUDA) && !defined(HAVE_ROCM)
+                // Neither CUDA nor ROCm - only CPU supported
+                if (target_device != DeviceType::CPU)
+                {
+                    throw std::runtime_error("Unsupported target device type: " + std::to_string(static_cast<int>(target_device)) + " - no GPU backends compiled");
+                }
+#else
+                // Validate that we handled the target device (CUDA or ROCm path should have run)
+                if (target_device != DeviceType::CPU && target_device != DeviceType::CUDA && target_device != DeviceType::ROCm)
                 {
                     throw std::runtime_error("Unsupported target device type: " + std::to_string(static_cast<int>(target_device)));
                 }
+#endif
 
                 // We should always have a kernel if we get here (all error paths throw)
                 if (!kernel)

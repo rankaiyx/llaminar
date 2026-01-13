@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include "../interfaces/IModelLoader.h" // Interface
 #include "../backends/DeviceId.h"
 #include "../execution/RuntimeConfig.h" // for WeightPrecision
 #include "../tensors/TensorFactory.h"   // for owned_factory_
@@ -193,13 +194,15 @@ namespace llaminar2
     /**
      * @brief Streamlined GGUF model loader for V2
      *
+     * Implements IModelLoader interface for production GGUF file loading.
+     *
      * Usage:
      *   ModelLoader loader;
      *   if (!loader.loadModel("model.gguf")) { error(); }
      *   auto embedding = loader.loadTensor("token_embd.weight", device_idx);
      *   auto wq = loader.loadTensor("blk.0.attn_q.weight", device_idx);
      */
-    class ModelLoader
+    class ModelLoader : public IModelLoader
     {
     public:
         /**
@@ -207,7 +210,7 @@ namespace llaminar2
          * @param factory TensorFactory for NUMA-aware tensor creation (optional)
          */
         explicit ModelLoader(TensorFactory *factory = nullptr);
-        ~ModelLoader() = default;
+        ~ModelLoader() override = default;
 
         /**
          * @brief Load GGUF file and parse metadata
@@ -224,17 +227,21 @@ namespace llaminar2
          */
         void initializeTestModel(uint32_t block_count = 1);
 
+        // =========================================================================
+        // IModelLoader Implementation
+        // =========================================================================
+
         /**
          * @brief Check if model has been loaded
          */
-        bool isLoaded() const { return loaded_; }
+        bool isLoaded() const override { return loaded_; }
 
         /**
          * @brief Check if a tensor exists in the model
          * @param tensor_name Name of tensor to check
          * @return true if tensor exists, false otherwise
          */
-        bool hasTensor(const std::string &tensor_name) const;
+        bool hasTensor(const std::string &tensor_name) const override;
 
         /**
          * @brief Get parsed model metadata
@@ -255,7 +262,7 @@ namespace llaminar2
          */
         std::shared_ptr<TensorBase> loadTensor(const std::string &tensor_name,
                                                DeviceId device = DeviceId::cpu(),
-                                               WeightPrecision weight_precision = WeightPrecision::NATIVE);
+                                               WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
         /**
          * @brief Load a row slice of a tensor from GGUF file (memory-efficient)
@@ -277,7 +284,7 @@ namespace llaminar2
         std::shared_ptr<TensorBase> loadTensorRowSlice(const std::string &tensor_name,
                                                        size_t row_start, size_t row_end,
                                                        DeviceId device = DeviceId::cpu(),
-                                                       WeightPrecision weight_precision = WeightPrecision::NATIVE);
+                                                       WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
         /**
          * @brief Load a column slice of a tensor from GGUF file (memory-efficient)
@@ -302,7 +309,31 @@ namespace llaminar2
         std::shared_ptr<TensorBase> loadTensorColumnSlice(const std::string &tensor_name,
                                                           size_t col_start, size_t col_end,
                                                           DeviceId device = DeviceId::cpu(),
-                                                          WeightPrecision weight_precision = WeightPrecision::NATIVE);
+                                                          WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
+
+        // =========================================================================
+        // IModelLoader - Metadata Accessors
+        // =========================================================================
+
+        std::vector<std::string> tensorNames() const override;
+        std::string architecture() const override { return model_.architecture; }
+        size_t tensorCount() const override { return model_.tensor_count; }
+        size_t totalBytes() const override;
+
+        int getInt(const std::string &key, int default_val = 0) const override;
+        uint64_t getUInt64(const std::string &key, uint64_t default_val = 0) const override;
+        float getFloat(const std::string &key, float default_val = 0.0f) const override;
+        std::string getString(const std::string &key, const std::string &default_val = "") const override;
+
+        // Convenience accessors (common hyperparameters)
+        uint64_t blockCount() const override { return model_.block_count; }
+        uint64_t embeddingLength() const override { return model_.embedding_length; }
+        uint64_t headCount() const override { return model_.head_count; }
+        uint64_t headCountKV() const override { return model_.head_count_kv; }
+        uint64_t vocabSize() const override { return model_.vocab_size; }
+        uint64_t contextLength() const override { return model_.context_length; }
+        float ropeTheta() const override { return model_.rope_theta; }
+        float rmsNormEps() const override { return model_.rms_norm_eps; }
 
     private:
         // Tensor factory (created internally if not provided)

@@ -15,6 +15,8 @@
  * - Equal work division by default, with hooks for future heterogeneous distribution
  * - Uses existing TensorSlice/SliceMetadata from tensors/TensorSlice.h
  *
+ * Implements IMPITopology interface for testability (January 2026 refactor).
+ *
  * @author David Sanftenberg
  * @date December 2025
  */
@@ -26,6 +28,8 @@
 #include <string>
 #include <memory>
 #include <functional>
+#include "../interfaces/IMPITopology.h"
+#include "../execution/DeviceInventory.h"
 
 namespace llaminar2
 {
@@ -195,6 +199,8 @@ namespace llaminar2
      * 3. AllGather exchanges capabilities across all ranks
      * 4. Work distribution can then be computed (equal or weighted)
      *
+     * Implements IMPITopology interface for testability.
+     *
      * Usage:
      * ```cpp
      * MPITopology topo(MPI_COMM_WORLD);
@@ -210,7 +216,7 @@ namespace llaminar2
      * topo.is_compute_participant(); // true for all ranks by default
      * ```
      */
-    class MPITopology
+    class MPITopology : public IMPITopology
     {
     public:
         // =========================================================================
@@ -242,7 +248,7 @@ namespace llaminar2
                     MPI_Comm comm = MPI_COMM_WORLD);
 
         /// Destructor (frees derived communicators)
-        ~MPITopology();
+        ~MPITopology() override;
 
         // Non-copyable, movable
         MPITopology(const MPITopology &) = delete;
@@ -251,33 +257,36 @@ namespace llaminar2
         MPITopology &operator=(MPITopology &&) noexcept;
 
         // =========================================================================
-        // Basic Topology Queries
+        // Basic Topology Queries (IMPITopology interface)
         // =========================================================================
 
         /// This rank's ID (0..world_size-1)
-        int rank() const { return rank_; }
+        int rank() const override { return rank_; }
 
         /// Total number of MPI ranks
-        int world_size() const { return world_size_; }
+        int world_size() const override { return world_size_; }
 
         /// Number of physical nodes (machines)
-        int node_count() const { return node_count_; }
+        int node_count() const override { return node_count_; }
 
         /// Ranks per physical node (assumes uniform distribution)
-        int ranks_per_node() const { return ranks_per_node_; }
+        int ranks_per_node() const override { return ranks_per_node_; }
 
         /// Get this rank's full placement information
-        const RankPlacement &placement() const { return placement_; }
+        const RankPlacement &placement() const override { return placement_; }
 
         /// Get placement for any rank (after capability exchange)
-        const RankPlacement &get_placement(int rank) const;
+        const RankPlacement &get_placement(int rank) const override;
+
+        /// Get all known rank placements (after capability exchange)
+        const std::vector<RankPlacement> &all_placements() const override { return all_placements_; }
 
         /// Check if this rank is the coordinator (rank 0)
         /// Note: Coordinator ALSO participates in compute by default
-        bool is_coordinator() const { return rank_ == 0; }
+        bool is_coordinator() const override { return rank_ == 0; }
 
         /// Check if this rank participates in compute (default: ALL ranks)
-        bool is_compute_participant() const { return compute_participant_; }
+        bool is_compute_participant() const override { return compute_participant_; }
 
         /// Set whether this rank participates in compute
         /// Use sparingly - typically all ranks should compute
@@ -285,6 +294,9 @@ namespace llaminar2
 
         /// Number of ranks that participate in compute
         int compute_world_size() const;
+
+        /// Check if this rank is the leader of its node (local_rank == 0)
+        bool is_node_leader() const override { return placement_.local_rank == 0; }
 
         // =========================================================================
         // Communication Patterns
@@ -304,11 +316,8 @@ namespace llaminar2
         /// Get the global communicator
         MPI_Comm world_comm() const { return world_comm_; }
 
-        /// Check if this rank is the leader of its node (local_rank == 0)
-        bool is_node_leader() const { return placement_.local_rank == 0; }
-
         // =========================================================================
-        // Tensor Parallelism: Work Distribution
+        // Tensor Parallelism: Work Distribution (IMPITopology interface)
         // =========================================================================
 
         /**
@@ -320,7 +329,7 @@ namespace llaminar2
          * - Rank 0: [0, 7)
          * - Rank 1: [7, 14)
          */
-        WorkRange get_head_range(int total_heads) const;
+        WorkRange get_head_range(int total_heads) const override;
 
         /**
          * @brief Get KV head range for this rank (GQA-aware)
@@ -330,7 +339,7 @@ namespace llaminar2
          * Note: If total_kv_heads < world_size, some ranks will have empty ranges.
          * In GQA, Q heads are sharded but KV heads may be replicated.
          */
-        WorkRange get_kv_head_range(int total_kv_heads) const;
+        WorkRange get_kv_head_range(int total_kv_heads) const override;
 
         /**
          * @brief Get column range for column-parallel GEMM
@@ -340,7 +349,7 @@ namespace llaminar2
          * Used for: Q/K/V projections, Gate/Up projections, LM Head
          * Each rank computes output[:, range.start:range.end]
          */
-        WorkRange get_column_range(size_t total_cols) const;
+        WorkRange get_column_range(size_t total_cols) const override;
 
         /**
          * @brief Get row range for row-parallel GEMM
@@ -350,24 +359,24 @@ namespace llaminar2
          * Used for: Wo projection, Down projection
          * Each rank has weight[range.start:range.end, :] and computes partial output
          */
-        WorkRange get_row_range(size_t total_rows) const;
+        WorkRange get_row_range(size_t total_rows) const override;
 
         /**
          * @brief Get vocabulary range for parallel LM head
          * @param vocab_size Total vocabulary size
          * @return WorkRange specifying vocab range for this rank
          */
-        WorkRange get_vocab_range(size_t vocab_size) const;
+        WorkRange get_vocab_range(size_t vocab_size) const override;
 
         /**
          * @brief Get FFN intermediate dimension range
          * @param ffn_dim Total FFN intermediate dimension
          * @return WorkRange for this rank's FFN portion
          */
-        WorkRange get_ffn_range(size_t ffn_dim) const;
+        WorkRange get_ffn_range(size_t ffn_dim) const override;
 
         // =========================================================================
-        // SliceMetadata Creation (integrates with TensorSlice.h)
+        // SliceMetadata Creation (integrates with TensorSlice.h) - IMPITopology interface
         // =========================================================================
 
         /**
@@ -380,7 +389,7 @@ namespace llaminar2
         SliceMetadata createRowParallelMeta(
             size_t original_rows,
             size_t original_cols,
-            bool inner_is_presliced = false) const;
+            bool inner_is_presliced = false) const override;
 
         /**
          * @brief Create SliceMetadata for column-parallel sharding
@@ -392,10 +401,10 @@ namespace llaminar2
         SliceMetadata createColumnParallelMeta(
             size_t original_rows,
             size_t original_cols,
-            bool inner_is_presliced = false) const;
+            bool inner_is_presliced = false) const override;
 
         // =========================================================================
-        // Device Capability Management
+        // Device Capability Management (IMPITopology interface)
         // =========================================================================
 
         /**
@@ -408,11 +417,12 @@ namespace llaminar2
          */
         void exchangeCapabilities();
 
-        /// Get all known rank placements (after capability exchange)
-        const std::vector<RankPlacement> &all_placements() const { return all_placements_; }
-
         /// Get compute weights for all ranks (for weighted work distribution)
-        std::vector<float> get_compute_weights() const;
+        std::vector<float> get_compute_weights() const override;
+
+        /// Get cluster-wide device inventory (required by IMPITopology)
+        /// Note: Returns a reference to a local ClusterInventory built on demand
+        const ClusterInventory& clusterInventory() const override;
 
         // =========================================================================
         // Placement Strategy
@@ -463,24 +473,24 @@ namespace llaminar2
         PlacementPlan computePlacement(PlacementInput input) const;
 
         // =========================================================================
-        // Device Mapping
+        // Device Mapping (IMPITopology interface)
         // =========================================================================
 
         /// Get primary compute device for this rank
-        int get_device() const;
+        int get_device() const override;
 
         /// Get all devices available to this rank
-        const std::vector<DeviceCapability> &get_devices() const { return placement_.devices; }
+        const std::vector<DeviceCapability> &get_devices() const override { return placement_.devices; }
 
         /// Check if this rank has GPU/accelerator access
-        bool has_accelerator() const;
+        bool has_accelerator() const override;
 
         // =========================================================================
         // Debugging / Logging
         // =========================================================================
 
         /// Get human-readable topology summary
-        std::string to_string() const;
+        std::string to_string() const override;
 
         /// Print topology to LOG_INFO (all ranks print in order)
         void print_topology() const;
@@ -494,6 +504,8 @@ namespace llaminar2
 
         RankPlacement placement_;
         std::vector<RankPlacement> all_placements_; ///< Placements from all ranks
+        mutable ClusterInventory cluster_inventory_; ///< Cached cluster inventory (lazy-built)
+        mutable bool cluster_inventory_built_ = false; ///< Whether cluster inventory was built
 
         MPI_Comm world_comm_;
         MPI_Comm intra_node_comm_;
@@ -511,6 +523,8 @@ namespace llaminar2
 
         /// Detect GPU/accelerator capabilities for this rank
         void detect_device_capabilities();
-    };
+
+        /// Build cluster inventory from all_placements_ (lazy)
+        void buildClusterInventory() const;    };
 
 } // namespace llaminar2

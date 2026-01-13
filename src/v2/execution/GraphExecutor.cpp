@@ -597,7 +597,7 @@ namespace llaminar2
         // =========================================================================
         {
             auto policy = node.stage->coherencePolicy();
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->preferredDevice();
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
 
             if (policy == CoherencePolicy::INPUT || policy == CoherencePolicy::FULL)
             {

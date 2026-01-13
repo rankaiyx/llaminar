@@ -23,6 +23,7 @@
 #include "WeightPlacementMap.h"
 #include "../backends/DeviceId.h"
 #include "../execution/GraphSchema.h"
+#include "../interfaces/IWeightManager.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
@@ -68,7 +69,7 @@ namespace llaminar2
      *   auto wq = mgr->getWeight("blk.0.attn_q.weight", device_idx);
      *   auto wk = mgr->getWeight("blk.0.attn_k.weight", device_idx);
      */
-    class WeightManager
+    class WeightManager : public IWeightManager
     {
     public:
         /**
@@ -97,22 +98,22 @@ namespace llaminar2
          * @param layer_idx Optional layer index for placement map lookup
          * @return Shared pointer to tensor, or nullptr on error
          */
-        std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu(), int layer_idx = -1);
+        std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu(), int layer_idx = -1) override;
 
         /**
          * @brief Get current distribution strategy
          */
-        WeightDistributionStrategy strategy() const { return strategy_; }
+        WeightDistributionStrategy strategy() const override { return strategy_; }
 
         /**
          * @brief Get number of cached weights
          */
-        size_t cacheSize() const { return cache_.size(); }
+        size_t cacheSize() const override { return cache_.size(); }
 
         /**
          * @brief Clear weight cache (frees memory)
          */
-        void clearCache() { cache_.clear(); }
+        void clearCache() override { cache_.clear(); }
 
         /**
          * @brief Set model-specific weight sharding configuration
@@ -134,14 +135,14 @@ namespace llaminar2
          * @param name Weight tensor name
          * @return true if weight is column or row parallel sharded
          */
-        bool isWeightSharded(const std::string &name) const;
+        bool isWeightSharded(const std::string &name) const override;
 
         /**
          * @brief Get sharding mode for a weight
          * @param name Weight tensor name
          * @return ShardingMode indicating how weight is partitioned
          */
-        ShardingMode getShardingMode(const std::string &name) const;
+        ShardingMode getShardingMode(const std::string &name) const override;
 
         /**
          * @brief Check if a weight is used for GEMM operations
@@ -151,7 +152,7 @@ namespace llaminar2
          * @param name Weight tensor name
          * @return true if weight is a GEMM matrix (should release raw data after packing)
          */
-        bool isGemmWeight(const std::string &name) const;
+        bool isGemmWeight(const std::string &name) const override;
 
         // =========================================================================
         // Static utility methods (public for tensor slicing)
@@ -193,6 +194,74 @@ namespace llaminar2
          * @return Shared pointer to placement map (may be nullptr)
          */
         std::shared_ptr<WeightPlacementMap> placementMap() const { return placement_map_; }
+
+        /**
+         * @brief Get or create decode weight shard for a weight tensor
+         *
+         * For Option A (Selective Duplication) in CPU decode participation:
+         * - Returns a SLICED copy of the weight for decode phase
+         * - The shard is the "tail" portion based on fraction
+         * - Cached separately from the full prefill weight
+         *
+         * Slicing behavior by ShardingMode:
+         * - COLUMN_PARALLEL (Q, K, V, Gate, Up): slice tail rows (output dimension)
+         * - ROW_PARALLEL (Wo): slice tail columns (input dimension)
+         * - INPUT_PARALLEL (Down): slice tail columns (input dimension)
+         * - REPLICATE (norms): return full copy (no slicing needed)
+         *
+         * @param name Weight tensor name (e.g., "blk.0.attn_q.weight")
+         * @param decode_device Device for the decode shard (typically CPU)
+         * @param fraction Fraction of weight for this shard (e.g., 0.20 = tail 20%)
+         * @param layer_idx Layer index for sharding mode lookup
+         * @return Shared pointer to sliced weight tensor, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> getDecodeWeight(
+            const std::string &name,
+            DeviceId decode_device,
+            float fraction,
+            int layer_idx = -1) override;
+
+        /**
+         * @brief Get number of cached decode weight shards
+         */
+        size_t decodeCacheSize() const override { return decode_cache_.size(); }
+
+        /**
+         * @brief Clear decode weight cache (frees decode shard memory)
+         */
+        void clearDecodeCache() override { decode_cache_.clear(); }
+
+        // =========================================================================
+        // Static utility methods for decode shard slicing
+        // =========================================================================
+
+        /**
+         * @brief Slice tail rows from a tensor (for column-parallel decode shards)
+         *
+         * For weight matrix [out_dim, in_dim], extracts [out_local, in_dim]
+         * where out_local = out_dim * fraction, starting from out_dim - out_local.
+         *
+         * @param full_tensor Full weight tensor
+         * @param fraction Fraction of rows to extract (from tail)
+         * @return Sliced tensor containing tail rows
+         */
+        static std::shared_ptr<TensorBase> sliceTailRows(
+            const std::shared_ptr<TensorBase> &full_tensor,
+            float fraction);
+
+        /**
+         * @brief Slice tail columns from a tensor (for row/input-parallel decode shards)
+         *
+         * For weight matrix [out_dim, in_dim], extracts [out_dim, in_local]
+         * where in_local = in_dim * fraction, starting from in_dim - in_local.
+         *
+         * @param full_tensor Full weight tensor
+         * @param fraction Fraction of columns to extract (from tail)
+         * @return Sliced tensor containing tail columns
+         */
+        static std::shared_ptr<TensorBase> sliceTailColumns(
+            const std::shared_ptr<TensorBase> &full_tensor,
+            float fraction);
 
     private:
         // Allow WeightPreloader to access cache_ directly for iteration
@@ -242,6 +311,9 @@ namespace llaminar2
         mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
         WeightShardingConfig sharding_config_;                                      ///< Model-specific sharding patterns
         bool has_sharding_config_ = false;                                          ///< True if config was set explicitly
+
+        // Decode weight shard cache (separate from prefill cache)
+        std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache
     };
 
 } // namespace llaminar2

@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -26,6 +26,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Type-safe tensor pointers (required)
             const ITensor *input = nullptr; ///< Input activation tensor [m, k]
             int m = 0;                      ///< Batch size * seq_len
@@ -48,9 +50,6 @@ namespace llaminar2
             ITensor *output_v = nullptr;
             int n_v = 0;
             const TensorBase *bias_v = nullptr; ///< Optional bias tensor for tensor-aware GPU path
-
-            // Device target for kernel dispatch
-            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit FusedQKVGEMMStage(Params params);

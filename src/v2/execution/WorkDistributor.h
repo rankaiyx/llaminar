@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include "../interfaces/IWorkDistributor.h"
 #include "../backends/DeviceId.h"
 #include <cstddef>
 #include <vector>
@@ -44,7 +45,7 @@ namespace llaminar2
      *
      * All splits use contiguous ranges for cache efficiency.
      */
-    class WorkDistributor
+    class WorkDistributor : public IWorkDistributor
     {
     public:
         /**
@@ -58,58 +59,11 @@ namespace llaminar2
             std::vector<float> device_weights; ///< Relative compute power per device (default: equal)
         };
 
-        /**
-         * @brief A contiguous slice of work
-         */
-        struct WorkSlice
-        {
-            size_t start = 0; ///< First element (inclusive)
-            size_t end = 0;   ///< Last element (exclusive)
-            size_t count = 0; ///< Number of elements (end - start)
-            int owner = -1;   ///< Owner index (rank or device)
-
-            bool empty() const { return count == 0; }
-            bool contains(size_t idx) const { return idx >= start && idx < end; }
-        };
-
-        /**
-         * @brief Full hierarchical slice with both rank and device info
-         */
-        struct HierarchicalSlice
-        {
-            int rank;            ///< MPI rank that owns this slice
-            DeviceId device;     ///< Device within the rank
-            size_t global_start; ///< Start offset in global work
-            size_t global_end;   ///< End offset in global work (exclusive)
-            size_t local_start;  ///< Start offset within this device's portion
-            size_t local_count;  ///< Elements assigned to this device
-        };
-
-        /**
-         * @brief Expert assignment for MoE architectures
-         *
-         * Maps experts to devices for expert-parallel execution.
-         */
-        struct ExpertAssignment
-        {
-            int expert_id;   ///< Expert index (0 to num_experts-1)
-            DeviceId device; ///< Device that owns this expert
-            int rank;        ///< MPI rank (for distributed experts)
-        };
-
-        /**
-         * @brief Token routing for MoE dispatch
-         *
-         * After router selects top-k experts per token, this struct tracks
-         * which tokens go to which expert/device.
-         */
-        struct TokenRouting
-        {
-            int expert_id;                  ///< Target expert
-            DeviceId device;                ///< Device hosting this expert
-            std::vector<int> token_indices; ///< Tokens routed to this expert
-            std::vector<float> weights;     ///< Router weights for combining
-        };
+        // Use types from IWorkDistributor interface
+        using WorkSlice = IWorkDistributor::WorkSlice;
+        using HierarchicalSlice = IWorkDistributor::HierarchicalSlice;
+        using ExpertAssignment = IWorkDistributor::ExpertAssignment;
+        using TokenRouting = IWorkDistributor::TokenRouting;
 
         // =========================================================================
         // Construction
@@ -142,21 +96,21 @@ namespace llaminar2
          * @param total_elements Total elements to distribute
          * @return WorkSlice for this rank
          */
-        WorkSlice getRankSlice(size_t total_elements) const;
+        WorkSlice getRankSlice(size_t total_elements) const override;
 
         /**
          * @brief Get work slices for all ranks
          * @param total_elements Total elements to distribute
          * @return Vector of WorkSlice, one per rank
          */
-        std::vector<WorkSlice> getAllRankSlices(size_t total_elements) const;
+        std::vector<WorkSlice> getAllRankSlices(size_t total_elements) const override;
 
         /**
          * @brief Check if this rank has any work
          * @param total_elements Total elements to distribute
          * @return true if getRankSlice().count > 0
          */
-        bool rankHasWork(size_t total_elements) const;
+        bool rankHasWork(size_t total_elements) const override;
 
         // =========================================================================
         // Device-Level Distribution (Heterogeneous Execution)
@@ -172,14 +126,14 @@ namespace llaminar2
          * @param device Device identifier
          * @return WorkSlice for the specified device
          */
-        WorkSlice getDeviceSlice(size_t rank_elements, DeviceId device) const;
+        WorkSlice getDeviceSlice(size_t rank_elements, DeviceId device) const override;
 
         /**
          * @brief Get work slices for all devices in this rank
          * @param rank_elements Elements assigned to this rank
          * @return Vector of WorkSlice, one per device
          */
-        std::vector<WorkSlice> getAllDeviceSlices(size_t rank_elements) const;
+        std::vector<WorkSlice> getAllDeviceSlices(size_t rank_elements) const override;
 
         /**
          * @brief Get device index that should handle a specific element
@@ -187,7 +141,7 @@ namespace llaminar2
          * @param rank_elements Total elements for this rank
          * @return Device index in this rank
          */
-        int getDeviceForElement(size_t element_idx, size_t rank_elements) const;
+        int getDeviceForElement(size_t element_idx, size_t rank_elements) const override;
 
         // =========================================================================
         // Full Hierarchy Distribution
@@ -202,14 +156,14 @@ namespace llaminar2
          * @param total_elements Total elements to distribute
          * @return Vector of HierarchicalSlice for this rank's devices
          */
-        std::vector<HierarchicalSlice> distribute(size_t total_elements) const;
+        std::vector<HierarchicalSlice> distribute(size_t total_elements) const override;
 
         /**
          * @brief Get the hierarchical slice for this rank's primary device
          * @param total_elements Total elements to distribute
          * @return HierarchicalSlice for device 0 of this rank
          */
-        HierarchicalSlice getPrimaryDeviceSlice(size_t total_elements) const;
+        HierarchicalSlice getPrimaryDeviceSlice(size_t total_elements) const override;
 
         // =========================================================================
         // MoE Expert Distribution
@@ -224,7 +178,7 @@ namespace llaminar2
          * @param num_experts Total number of experts in the MoE layer
          * @return Vector of ExpertAssignment mapping experts to devices
          */
-        std::vector<ExpertAssignment> distributeExperts(int num_experts) const;
+        std::vector<ExpertAssignment> distributeExperts(int num_experts) const override;
 
         /**
          * @brief Route tokens to experts based on router output
@@ -244,7 +198,7 @@ namespace llaminar2
             const std::vector<ExpertAssignment> &expert_assignments,
             int top_k,
             int seq_len,
-            int num_experts) const;
+            int num_experts) const override;
 
         /**
          * @brief Get experts assigned to a specific device
@@ -268,24 +222,24 @@ namespace llaminar2
          * @param total_bytes Total bytes to distribute
          * @return Bytes per device (average if weighted)
          */
-        size_t estimateMemoryPerDevice(size_t total_bytes) const;
+        size_t estimateMemoryPerDevice(size_t total_bytes) const override;
 
         /**
          * @brief Get element counts per device for allocations
          * @param total_elements Total elements
          * @return Vector of element counts, one per device
          */
-        std::vector<size_t> getElementCountsPerDevice(size_t total_elements) const;
+        std::vector<size_t> getElementCountsPerDevice(size_t total_elements) const override;
 
         // =========================================================================
         // Accessors
         // =========================================================================
 
-        int worldSize() const { return config_.world_size; }
-        int rank() const { return config_.rank; }
-        const std::vector<DeviceId> &devices() const { return config_.devices; }
-        size_t deviceCount() const { return config_.devices.size(); }
-        bool hasMultipleDevices() const { return config_.devices.size() > 1; }
+        int worldSize() const override { return config_.world_size; }
+        int rank() const override { return config_.rank; }
+        const std::vector<DeviceId> &devices() const override { return config_.devices; }
+        size_t deviceCount() const override { return config_.devices.size(); }
+        bool hasMultipleDevices() const override { return config_.devices.size() > 1; }
 
     private:
         Config config_;

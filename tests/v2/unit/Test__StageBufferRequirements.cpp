@@ -804,8 +804,8 @@ TEST_F(Test__StageBufferRequirements, AllreduceStage_DeclaresInoutBuffer)
     auto buffer = createFP32Tensor(SEQ_LEN, D_MODEL);
 
     AllreduceStage::Params params{
-        .buffer = buffer.get(),
         .mpi_ctx = nullptr, // Null ctx is ok for buffer requirements
+        .buffer = buffer.get(),
     };
     AllreduceStage stage(params);
 
@@ -824,8 +824,8 @@ TEST_F(Test__StageBufferRequirements, AllreduceStage_DeclaresInoutBuffer)
 TEST_F(Test__StageBufferRequirements, AllreduceStage_NullBuffer_ReturnsEmpty)
 {
     AllreduceStage::Params params{
-        .buffer = nullptr,
         .mpi_ctx = nullptr,
+        .buffer = nullptr,
     };
     AllreduceStage stage(params);
 

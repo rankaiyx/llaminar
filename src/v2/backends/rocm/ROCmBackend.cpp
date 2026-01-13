@@ -164,6 +164,38 @@ namespace llaminar2
         }
     }
 
+    bool ROCmBackend::memset(void *ptr, int value, size_t bytes, int device_id)
+    {
+        if (ptr == nullptr || bytes == 0)
+        {
+            return true; // No-op for null pointer or zero bytes
+        }
+
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_ERROR("[ROCmBackend] Invalid device ID " << device_id << " for hipMemset");
+            return false;
+        }
+
+        // Set device before memset
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend] Failed to set device " << device_id << " before hipMemset: "
+                                                            << hipGetErrorString(err));
+            return false;
+        }
+
+        err = hipMemset(ptr, value, bytes);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend] hipMemset failed: " << hipGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
     // ====================================================================
     // Device Query Operations
     // ====================================================================

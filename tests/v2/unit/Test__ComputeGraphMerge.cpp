@@ -26,7 +26,8 @@ using namespace llaminar2;
 class NoOpStage : public IComputeStage
 {
 public:
-    explicit NoOpStage(std::string name) : name_(std::move(name)) {}
+    explicit NoOpStage(std::string name, DeviceId device = DeviceId::cpu())
+        : IComputeStage(device), name_(std::move(name)) {}
 
     bool execute(IDeviceContext *) override { return true; }
     std::string name() const override { return name_; }

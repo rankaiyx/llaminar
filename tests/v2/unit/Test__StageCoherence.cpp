@@ -338,7 +338,7 @@ TEST(Test__StageCoherence, AllreduceStage_HasNoneCoherencePolicy)
     EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::NONE);
 }
 
-TEST(Test__StageCoherence, AttentionComputeStage_PreferredDevice)
+TEST(Test__StageCoherence, AttentionComputeStage_Device)
 {
     // Create minimal tensors for AttentionComputeStage
     const int batch = 1;
@@ -376,10 +376,10 @@ TEST(Test__StageCoherence, AttentionComputeStage_PreferredDevice)
     AttentionComputeStage stage(params);
 
     // Should report CPU as preferred device
-    EXPECT_EQ(stage.preferredDevice(), DeviceId::cpu());
+    EXPECT_EQ(stage.device(), DeviceId::cpu());
 }
 
-TEST(Test__StageCoherence, GEMMStage_PreferredDevice_CPU)
+TEST(Test__StageCoherence, GEMMStage_Device_CPU)
 {
     // GEMMStage should report its configured device
     auto A = std::make_unique<FP32Tensor>(
@@ -400,7 +400,7 @@ TEST(Test__StageCoherence, GEMMStage_PreferredDevice_CPU)
 
     GEMMStage stage(params);
 
-    EXPECT_EQ(stage.preferredDevice(), DeviceId::cpu());
+    EXPECT_EQ(stage.device(), DeviceId::cpu());
 }
 
 // =============================================================================
@@ -434,9 +434,9 @@ TEST(Test__StageCoherence, IComputeStage_DefaultCoherencePolicy_IsFull)
     EXPECT_EQ(base_ptr->coherencePolicy(), CoherencePolicy::FULL);
 }
 
-TEST(Test__StageCoherence, IComputeStage_DefaultPreferredDevice_IsCPU)
+TEST(Test__StageCoherence, IComputeStage_DefaultDevice_IsCPU)
 {
-    // Default preferredDevice() should return CPU
+    // Default device() should return CPU
 
     auto A = std::make_unique<FP32Tensor>(
         std::vector<size_t>{4, 8}, DeviceId::cpu());
@@ -457,5 +457,5 @@ TEST(Test__StageCoherence, IComputeStage_DefaultPreferredDevice_IsCPU)
     GEMMStage stage(params);
 
     // Default device_id in Params is cpu()
-    EXPECT_EQ(stage.preferredDevice(), DeviceId::cpu());
+    EXPECT_EQ(stage.device(), DeviceId::cpu());
 }

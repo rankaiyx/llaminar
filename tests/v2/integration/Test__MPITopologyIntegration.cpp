@@ -262,12 +262,18 @@ TEST_F(Test__MPITopologyIntegration, PlacementPlanIsDeterministicAcrossRanks)
         return h;
     };
 
+    // Convert PlacementDevice to an int for comparison
+    auto device_to_int = [](const PlacementDevice &d)
+    {
+        return (d.type << 8) | d.gpu_index;
+    };
+
     PlanSummary my_summary{
         my_plan.n_layers,
         my_plan.world_size,
         hash_string(my_plan.strategy_name),
-        static_cast<int>(my_plan.layers.empty() ? PlacementDevice::CPU : my_plan.layers[0].device),
-        static_cast<int>(my_plan.layers.empty() ? PlacementDevice::CPU : my_plan.layers.back().device)};
+        my_plan.layers.empty() ? 0 : device_to_int(my_plan.layers[0].device),
+        my_plan.layers.empty() ? 0 : device_to_int(my_plan.layers.back().device)};
 
     std::vector<PlanSummary> all_summaries(world_size_);
     MPI_Allgather(&my_summary, sizeof(PlanSummary), MPI_BYTE,
@@ -303,7 +309,7 @@ TEST_F(Test__MPITopologyIntegration, CPUOnlyStrategySelectedWithoutGPU)
     // All layers should be on CPU
     for (const auto &layer : plan.layers)
     {
-        EXPECT_EQ(layer.device, PlacementDevice::CPU)
+        EXPECT_TRUE(layer.device.isCPU())
             << "Layer " << layer.layer_idx << " should be on CPU";
     }
 }

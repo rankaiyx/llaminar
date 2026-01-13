@@ -1331,6 +1331,19 @@ namespace llaminar2::test
         }
 
         /**
+         * @brief Create Q8_1 tensor by quantizing an existing FP32 tensor
+         *
+         * @param fp32_tensor Source FP32 tensor to quantize
+         * @return Q8_1 tensor with same shape
+         */
+        static std::shared_ptr<Q8_1Tensor> createQ8_1FromFP32(const FP32Tensor *fp32_tensor)
+        {
+            if (!fp32_tensor)
+                return nullptr;
+            return Q8_1Tensor::quantize_from_fp32(fp32_tensor->data(), fp32_tensor->shape());
+        }
+
+        /**
          * @brief Pack a quantized tensor to VNNI format for Q16 attention
          *
          * Takes a Q8_1 (or other INT8-based) tensor and returns VNNI-packed

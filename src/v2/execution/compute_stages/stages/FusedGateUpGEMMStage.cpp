@@ -18,7 +18,11 @@ namespace llaminar2
     // FusedGateUpGEMMStage Implementation
     // =============================================================================
 
-    FusedGateUpGEMMStage::FusedGateUpGEMMStage(Params params) : params_(std::move(params)) {}
+    FusedGateUpGEMMStage::FusedGateUpGEMMStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool FusedGateUpGEMMStage::execute(IDeviceContext *ctx)
     {

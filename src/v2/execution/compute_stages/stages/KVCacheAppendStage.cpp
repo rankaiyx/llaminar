@@ -23,7 +23,10 @@ namespace llaminar2
     // =============================================================================
 
     KVCacheAppendStage::KVCacheAppendStage(Params params)
-        : params_(std::move(params)) {}
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool KVCacheAppendStage::execute(IDeviceContext *ctx)
     {

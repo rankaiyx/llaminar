@@ -38,6 +38,7 @@ namespace llaminar2
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
         void free(void *ptr, int device_id) override;
+        bool memset(void *ptr, int value, size_t bytes, int device_id) override;
 
         // Device query operations
         int deviceCount() const override;

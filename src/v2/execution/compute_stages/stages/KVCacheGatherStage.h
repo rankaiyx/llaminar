@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -22,6 +23,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             IKVCache *kv_cache = nullptr;
             int layer_idx = 0;
             int batch_size = 1;

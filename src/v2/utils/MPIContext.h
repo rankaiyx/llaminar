@@ -19,6 +19,7 @@
 #include <vector>
 #include "../tensors/BlockStructures.h"
 #include "../tensors/SIMDHelpers.h"
+#include "../interfaces/IMPIContext.h"
 
 namespace llaminar2
 {
@@ -28,8 +29,10 @@ namespace llaminar2
      *
      * Encapsulates MPI state and provides clean API for collective operations.
      * Thread-safe for MPI_THREAD_MULTIPLE environments.
+     * 
+     * Implements IMPIContext interface for testability.
      */
-    class MPIContext
+    class MPIContext : public IMPIContext
     {
     public:
         /**
@@ -42,9 +45,10 @@ namespace llaminar2
         MPIContext(int rank, int world_size, MPI_Comm comm = MPI_COMM_WORLD)
             : rank_(rank), world_size_(world_size), comm_(comm) {}
 
-        // Accessors
-        int rank() const { return rank_; }
-        int world_size() const { return world_size_; }
+        // Accessors (IMPIContext overrides)
+        int rank() const override { return rank_; }
+        int world_size() const override { return world_size_; }
+        bool is_root() const override { return rank_ == 0; }
         MPI_Comm comm() const { return comm_; }
 
         /**
@@ -54,7 +58,7 @@ namespace llaminar2
          * @param recv_data Output data (global sum)
          * @param count Number of elements
          */
-        void allreduce_sum(const float *send_data, float *recv_data, size_t count) const
+        void allreduce_sum(const float *send_data, float *recv_data, size_t count) const override
         {
             MPI_Allreduce(send_data, recv_data, count, MPI_FLOAT, MPI_SUM, comm_);
         }
@@ -67,7 +71,7 @@ namespace llaminar2
          * @param data Data buffer (input and output)
          * @param count Number of elements
          */
-        void allreduce_sum_inplace(float *data, size_t count) const
+        void allreduce_sum_inplace(float *data, size_t count) const override
         {
             MPI_Allreduce(MPI_IN_PLACE, data, count, MPI_FLOAT, MPI_SUM, comm_);
         }
@@ -89,7 +93,7 @@ namespace llaminar2
          * @param data Q8_1 block buffer (input and output), size = n_blocks
          * @param n_blocks Number of Q8_1 blocks per rank
          */
-        void allreduce_q8_1_inplace(Q8_1Block *data, size_t n_blocks) const
+        void allreduce_q8_1_inplace(Q8_1Block *data, size_t n_blocks) const override
         {
             if (world_size_ == 1)
             {
@@ -129,7 +133,7 @@ namespace llaminar2
          * @param data Q16_1 block buffer (input and output)
          * @param n_blocks Number of Q16_1 blocks per rank
          */
-        void allreduce_q16_1_inplace(Q16_1Block *data, size_t n_blocks) const
+        void allreduce_q16_1_inplace(Q16_1Block *data, size_t n_blocks) const override
         {
             if (world_size_ == 1)
             {
@@ -218,7 +222,7 @@ namespace llaminar2
          * @param data FP16 buffer (uint16_t, input and output)
          * @param count Number of FP16 elements per rank
          */
-        void allreduce_fp16_inplace(uint16_t *data, size_t count) const
+        void allreduce_fp16_inplace(uint16_t *data, size_t count) const override
         {
             if (world_size_ == 1)
             {
@@ -259,7 +263,7 @@ namespace llaminar2
          * @param data BF16 buffer (uint16_t, input and output)
          * @param count Number of BF16 elements per rank
          */
-        void allreduce_bf16_inplace(uint16_t *data, size_t count) const
+        void allreduce_bf16_inplace(uint16_t *data, size_t count) const override
         {
             if (world_size_ == 1)
             {
@@ -294,7 +298,7 @@ namespace llaminar2
          * @param count Number of elements
          * @param root Root rank (default: 0)
          */
-        void broadcast(float *data, size_t count, int root = 0) const
+        void broadcast(float *data, size_t count, int root = 0) const override
         {
             MPI_Bcast(data, count, MPI_FLOAT, root, comm_);
         }
@@ -306,7 +310,7 @@ namespace llaminar2
          * @param recv_data Global data (concatenated from all ranks)
          * @param count Number of elements per rank
          */
-        void allgather(const float *send_data, float *recv_data, size_t count) const
+        void allgather(const float *send_data, float *recv_data, size_t count) const override
         {
             MPI_Allgather(send_data, count, MPI_FLOAT, recv_data, count, MPI_FLOAT, comm_);
         }
@@ -322,7 +326,7 @@ namespace llaminar2
          * @param recv_data Global data (concatenated from all ranks)
          * @param byte_count Number of bytes per rank
          */
-        void allgather_bytes(const void *send_data, void *recv_data, size_t byte_count) const
+        void allgather_bytes(const void *send_data, void *recv_data, size_t byte_count) const override
         {
             MPI_Allgather(send_data, byte_count, MPI_BYTE, recv_data, byte_count, MPI_BYTE, comm_);
         }
@@ -340,7 +344,7 @@ namespace llaminar2
          * @param displs Array of displacements in recv_data for each rank
          */
         void allgatherv_bytes(const void *send_data, int send_count,
-                              void *recv_data, const int *recv_counts, const int *displs) const
+                              void *recv_data, const int *recv_counts, const int *displs) const override
         {
             MPI_Allgatherv(send_data, send_count, MPI_BYTE,
                            recv_data, recv_counts, displs, MPI_BYTE, comm_);
@@ -351,7 +355,7 @@ namespace llaminar2
          *
          * Blocks until all ranks reach this point.
          */
-        void barrier() const
+        void barrier() const override
         {
             MPI_Barrier(comm_);
         }
@@ -362,7 +366,7 @@ namespace llaminar2
          * @param total_elements Total number of elements to distribute
          * @return {start_index, count} for this rank
          */
-        std::pair<size_t, size_t> get_local_slice(size_t total_elements) const
+        std::pair<size_t, size_t> get_local_slice(size_t total_elements) const override
         {
             size_t base_count = total_elements / world_size_;
             size_t remainder = total_elements % world_size_;
@@ -379,7 +383,7 @@ namespace llaminar2
          * @param total_rows Total number of rows
          * @return {start_row, num_rows} for this rank
          */
-        std::pair<size_t, size_t> distribute_rows(size_t total_rows) const
+        std::pair<size_t, size_t> distribute_rows(size_t total_rows) const override
         {
             return get_local_slice(total_rows);
         }

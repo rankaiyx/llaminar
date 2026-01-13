@@ -1327,6 +1327,12 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 | `LLAMINAR_STAGE_OUTPUT_PRINT_ROWS` | Rows to print (first and last) | 2 |
 | `LLAMINAR_STAGE_OUTPUT_PRINT_STAGES` | Stage names to print (substring match) | `all` |
 | `LLAMINAR_DETERMINISTIC` | Force deterministic execution | Disabled |
+| `LLAMINAR_CPU_PREFILL_PARTICIPATE` | Enable CPU participation in PREFILL phase (Option C fallback for memory-constrained systems) | Disabled |
+| `LLAMINAR_WEIGHT_STREAMING` | Enable weight streaming for VRAM-constrained systems (Option B) | Disabled |
+| `LLAMINAR_STREAM_MEMORY_MB` | GPU memory budget for weight streaming cache (0 = auto) | 0 |
+| `LLAMINAR_STREAM_PREFETCH_DEPTH` | Layers to prefetch ahead during streaming | 1 |
+| `LLAMINAR_STREAM_EVICTION_POLICY` | Cache eviction policy: lru, fifo, none | lru |
+| `LLAMINAR_STREAM_VERBOSE` | Verbose logging for weight streaming operations | Disabled |
 | `LLAMINAR_SNAPSHOT_TENSOR_DUMP` | Enable raw tensor dump to disk | Disabled |
 | `LLAMINAR_SNAPSHOT_DUMP_DIR` | Output directory for tensor dumps | `/tmp/llaminar_tensor_dumps` |
 | `LLAMINAR_SNAPSHOT_DUMP_LAYERS` | Comma-separated layer indices to dump | `all` |

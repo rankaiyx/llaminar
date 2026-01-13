@@ -27,9 +27,9 @@ namespace llaminar2
         oss << "\n";
 
         oss << "  global:\n";
-        oss << "    embedding: device=" << static_cast<int>(global.embedding_device)
+        oss << "    embedding: device=" << global.embedding_device.toString()
             << " shard=" << (global.shard_embedding ? "yes" : "no") << "\n";
-        oss << "    lm_head: device=" << static_cast<int>(global.lm_head_device)
+        oss << "    lm_head: device=" << global.lm_head_device.toString()
             << " shard=" << (global.shard_lm_head ? "yes" : "no") << "\n";
 
         oss << "  layers:\n";
@@ -58,7 +58,7 @@ namespace llaminar2
                         oss << "    layers " << start_layer << "-" << (i - 1) << ": ";
                     }
                     oss << "rank=" << current.owner_rank
-                        << " device=" << static_cast<int>(current.device) << "\n";
+                        << " device=" << current.device.toString() << "\n";
 
                     if (i < static_cast<int>(layers.size()))
                     {

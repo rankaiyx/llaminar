@@ -27,6 +27,7 @@
 
 #include "IInferenceRunner.h"
 #include "../loaders/ModelContext.h"
+#include "../interfaces/IModelContext.h"
 #include "RuntimeConfig.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
@@ -76,6 +77,32 @@ namespace llaminar2
     std::unique_ptr<IInferenceRunner> createInferenceRunner(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
+        DeviceId device,
+        const InferenceRunnerConfig &config = {});
+
+    /**
+     * @brief Factory function to create GraphOrchestrator with injected dependencies
+     *
+     * This factory function enables unit testing by accepting interface types
+     * instead of concrete implementations. Use MockModelContext, MockMPITopology,
+     * etc. for isolated testing without GGUF files or MPI runtime.
+     *
+     * @param model_ctx Model context interface (can be MockModelContext)
+     * @param device Target device
+     * @param config Runner configuration
+     * @return Unique pointer to IInferenceRunner, or nullptr on failure
+     *
+     * @code
+     * // Unit test example
+     * auto mock_ctx = MockModelContextBuilder()
+     *     .usePreset(ModelPreset::QWEN2_05B)
+     *     .build();
+     * auto runner = createTestableInferenceRunner(mock_ctx, DeviceId::cpu());
+     * runner->forward(tokens.data(), seq_len);
+     * @endcode
+     */
+    std::unique_ptr<IInferenceRunner> createTestableInferenceRunner(
+        std::shared_ptr<IModelContext> model_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config = {});
 

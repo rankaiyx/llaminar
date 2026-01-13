@@ -2686,4 +2686,168 @@ namespace llaminar2
         temp_tensor->to_fp32(fp32_buffer.data());
     }
 
+    // =============================================================================
+    // IModelLoader INTERFACE IMPLEMENTATIONS
+    // =============================================================================
+
+    std::vector<std::string> ModelLoader::tensorNames() const
+    {
+        std::vector<std::string> names;
+        names.reserve(model_.tensors.size());
+        for (const auto &t : model_.tensors)
+        {
+            names.push_back(t.name);
+        }
+        return names;
+    }
+
+    size_t ModelLoader::totalBytes() const
+    {
+        size_t total = 0;
+        for (const auto &t : model_.tensors)
+        {
+            total += t.size_bytes;
+        }
+        return total;
+    }
+
+    int ModelLoader::getInt(const std::string &key, int default_val) const
+    {
+        // Try direct model fields first (common hyperparameters)
+        if (key == "block_count")
+            return static_cast<int>(model_.block_count);
+        if (key == "head_count")
+            return static_cast<int>(model_.head_count);
+        if (key == "head_count_kv")
+            return static_cast<int>(model_.head_count_kv);
+
+        // Search metadata with architecture prefix
+        std::string full_key = model_.architecture + "." + key;
+        auto it = model_.metadata.find(full_key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::UINT32)
+                return static_cast<int>(it->second.asUInt32());
+            if (it->second.type == GGUFValueType::INT32)
+            {
+                int32_t val;
+                std::memcpy(&val, it->second.data.data(), 4);
+                return val;
+            }
+        }
+
+        // Try without architecture prefix
+        it = model_.metadata.find(key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::UINT32)
+                return static_cast<int>(it->second.asUInt32());
+        }
+
+        return default_val;
+    }
+
+    uint64_t ModelLoader::getUInt64(const std::string &key, uint64_t default_val) const
+    {
+        // Try direct model fields first (common hyperparameters)
+        if (key == "block_count")
+            return model_.block_count;
+        if (key == "embedding_length")
+            return model_.embedding_length;
+        if (key == "context_length")
+            return model_.context_length;
+        if (key == "head_count")
+            return model_.head_count;
+        if (key == "head_count_kv")
+            return model_.head_count_kv;
+        if (key == "vocab_size")
+            return model_.vocab_size;
+
+        // Search metadata with architecture prefix
+        std::string full_key = model_.architecture + "." + key;
+        auto it = model_.metadata.find(full_key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::UINT64)
+                return it->second.asUInt64();
+            if (it->second.type == GGUFValueType::UINT32)
+                return static_cast<uint64_t>(it->second.asUInt32());
+        }
+
+        // Try without architecture prefix
+        it = model_.metadata.find(key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::UINT64)
+                return it->second.asUInt64();
+            if (it->second.type == GGUFValueType::UINT32)
+                return static_cast<uint64_t>(it->second.asUInt32());
+        }
+
+        return default_val;
+    }
+
+    float ModelLoader::getFloat(const std::string &key, float default_val) const
+    {
+        // Try direct model fields first
+        if (key == "rope_theta")
+            return model_.rope_theta;
+        if (key == "rms_norm_eps")
+            return model_.rms_norm_eps;
+
+        // Search metadata with architecture prefix
+        std::string full_key = model_.architecture + "." + key;
+        auto it = model_.metadata.find(full_key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::FLOAT32)
+                return it->second.asFloat32();
+        }
+
+        // Try without architecture prefix
+        it = model_.metadata.find(key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::FLOAT32)
+                return it->second.asFloat32();
+        }
+
+        return default_val;
+    }
+
+    std::string ModelLoader::getString(const std::string &key, const std::string &default_val) const
+    {
+        // Try direct model fields first
+        if (key == "architecture")
+            return model_.architecture;
+
+        // Search metadata with prefix
+        std::string full_key = model_.architecture + "." + key;
+        auto it = model_.metadata.find(full_key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::STRING)
+                return it->second.asString();
+        }
+
+        // Try general prefix
+        full_key = "general." + key;
+        it = model_.metadata.find(full_key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::STRING)
+                return it->second.asString();
+        }
+
+        // Try without prefix
+        it = model_.metadata.find(key);
+        if (it != model_.metadata.end())
+        {
+            if (it->second.type == GGUFValueType::STRING)
+                return it->second.asString();
+        }
+
+        return default_val;
+    }
+
 } // namespace llaminar2

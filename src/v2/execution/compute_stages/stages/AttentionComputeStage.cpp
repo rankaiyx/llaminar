@@ -20,7 +20,10 @@ namespace llaminar2
     // =============================================================================
 
     AttentionComputeStage::AttentionComputeStage(Params params)
-        : params_(std::move(params)) {}
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool AttentionComputeStage::execute(IDeviceContext *ctx)
     {

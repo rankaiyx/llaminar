@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -35,6 +36,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             const ITensor *K = nullptr; ///< Key to append
             const ITensor *V = nullptr; ///< Value to append
             IKVCache *kv_cache = nullptr;

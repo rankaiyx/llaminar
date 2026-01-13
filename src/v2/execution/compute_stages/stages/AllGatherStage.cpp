@@ -1,15 +1,22 @@
 /**
  * @file AllGatherStage.cpp
- * @brief Implementation of AllGatherStage
+ * @brief Implementation of AllGatherStage with CollectiveContext support
+ *
+ * Supports two execution modes:
+ * 1. CollectiveContext (preferred): Uses new collective infrastructure
+ * 2. Direct MPI (legacy): Falls back to MPI for backward compatibility
  */
 
 #include "AllGatherStage.h"
 #include "../ComputeStageUtils.h"
+#include "../../../execution/CollectiveContext.h"
+#include "../../../collective/ICollectiveBackend.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/MPIContext.h"
 #include <mpi.h>
+#include <chrono>
 
 namespace llaminar2
 {
@@ -18,11 +25,84 @@ namespace llaminar2
     // AllGatherStage Implementation
     // =============================================================================
 
-    AllGatherStage::AllGatherStage(Params params) : params_(std::move(params)) {}
+    AllGatherStage::AllGatherStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool AllGatherStage::execute(IDeviceContext *ctx)
     {
         (void)ctx;
+
+        if (!params_.local_input)
+        {
+            LOG_ERROR("[AllGatherStage] Null local_input buffer");
+            return false;
+        }
+
+        if (!params_.full_output)
+        {
+            LOG_ERROR("[AllGatherStage] Null full_output buffer");
+            return false;
+        }
+
+        // Prefer CollectiveContext if available
+        if (params_.collective_ctx)
+        {
+            return executeViaCollectiveContext();
+        }
+
+        // Fall back to direct MPI
+        return executeViaMPI();
+    }
+
+    bool AllGatherStage::executeViaCollectiveContext()
+    {
+        const auto &mpi_env = debugEnv().mpi_logging;
+
+        // Get shapes
+        const auto &local_shape = params_.local_input->shape();
+        const auto &full_shape = params_.full_output->shape();
+
+        if (local_shape.size() != 2 || full_shape.size() != 2)
+        {
+            LOG_ERROR("[AllGatherStage] Expected 2D tensors, got local_shape.size()="
+                      << local_shape.size() << " full_shape.size()=" << full_shape.size());
+            return false;
+        }
+
+        size_t buffer_seq_len = local_shape[0];
+        size_t seq_len = params_.actual_seq_len > 0 ? params_.actual_seq_len : buffer_seq_len;
+
+        if (mpi_env.log_collectives)
+        {
+            LOG_INFO("[AllGatherStage] Using CollectiveContext, seq_len=" << seq_len
+                                                                          << " local_dim=" << local_shape[1]
+                                                                          << " full_dim=" << full_shape[1]);
+        }
+
+        // Determine device where tensor resides
+        DeviceId tensor_device = DeviceId::cpu(); // Default to CPU
+        // TODO: Query tensor for actual device once we have multi-device support
+
+        // Delegate to CollectiveContext
+        bool success = params_.collective_ctx->executeAllgather(
+            params_.local_input,
+            params_.full_output,
+            seq_len,
+            tensor_device);
+
+        if (mpi_env.log_collectives)
+        {
+            LOG_INFO("[AllGatherStage] CollectiveContext result=" << (success ? "SUCCESS" : "FAILED"));
+        }
+
+        return success;
+    }
+
+    bool AllGatherStage::executeViaMPI()
+    {
         const auto &mpi_env = debugEnv().mpi_logging;
 
         if (!params_.local_input)

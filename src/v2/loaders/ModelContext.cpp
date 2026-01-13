@@ -11,6 +11,74 @@
 namespace llaminar2
 {
 
+    /**
+     * @brief Internal wrapper to expose ModelLoader (by reference) as IModelLoader shared_ptr
+     *
+     * This wrapper allows ModelContext to return IModelLoader interface while the actual
+     * ModelLoader is owned by value within ModelContext. The wrapper holds a reference
+     * and relies on the ModelContext outliving any use of the interface pointer.
+     */
+    class ModelLoaderInterfaceWrapper : public IModelLoader {
+    public:
+        explicit ModelLoaderInterfaceWrapper(ModelLoader& loader) : loader_(loader) {}
+
+        bool isLoaded() const override { return loader_.isLoaded(); }
+
+        std::shared_ptr<TensorBase> loadTensor(
+            const std::string& name,
+            DeviceId device,
+            WeightPrecision weight_precision) override {
+            return loader_.loadTensor(name, device, weight_precision);
+        }
+
+        std::shared_ptr<TensorBase> loadTensorRowSlice(
+            const std::string& name,
+            size_t row_start, size_t row_end,
+            DeviceId device,
+            WeightPrecision weight_precision) override {
+            return loader_.loadTensorRowSlice(name, row_start, row_end, device, weight_precision);
+        }
+
+        std::shared_ptr<TensorBase> loadTensorColumnSlice(
+            const std::string& name,
+            size_t col_start, size_t col_end,
+            DeviceId device,
+            WeightPrecision weight_precision) override {
+            return loader_.loadTensorColumnSlice(name, col_start, col_end, device, weight_precision);
+        }
+
+        bool hasTensor(const std::string& name) const override { return loader_.hasTensor(name); }
+        std::vector<std::string> tensorNames() const override { return loader_.tensorNames(); }
+        std::string architecture() const override { return loader_.architecture(); }
+        size_t tensorCount() const override { return loader_.tensorCount(); }
+        size_t totalBytes() const override { return loader_.totalBytes(); }
+
+        int getInt(const std::string& key, int default_val) const override {
+            return loader_.getInt(key, default_val);
+        }
+        uint64_t getUInt64(const std::string& key, uint64_t default_val) const override {
+            return loader_.getUInt64(key, default_val);
+        }
+        float getFloat(const std::string& key, float default_val) const override {
+            return loader_.getFloat(key, default_val);
+        }
+        std::string getString(const std::string& key, const std::string& default_val) const override {
+            return loader_.getString(key, default_val);
+        }
+
+        uint64_t blockCount() const override { return loader_.blockCount(); }
+        uint64_t embeddingLength() const override { return loader_.embeddingLength(); }
+        uint64_t headCount() const override { return loader_.headCount(); }
+        uint64_t headCountKV() const override { return loader_.headCountKV(); }
+        uint64_t vocabSize() const override { return loader_.vocabSize(); }
+        uint64_t contextLength() const override { return loader_.contextLength(); }
+        float ropeTheta() const override { return loader_.ropeTheta(); }
+        float rmsNormEps() const override { return loader_.rmsNormEps(); }
+
+    private:
+        ModelLoader& loader_;
+    };
+
     ModelContext::ModelContext(const std::string &model_path,
                                std::shared_ptr<MPIContext> mpi_ctx,
                                std::shared_ptr<WeightPlacementMap> placement_map,
@@ -59,6 +127,43 @@ namespace llaminar2
         // Create WeightManager with loaded model and placement map
         ctx->weight_manager_ = std::make_shared<WeightManager>(
             ctx->loader_, mpi_ctx, placement_map, strategy, weight_precision);
+
+        // Set up interface wrappers
+        ctx->loader_interface_ = std::make_shared<ModelLoaderInterfaceWrapper>(ctx->loader_);
+
+        return ctx;
+    }
+
+    std::shared_ptr<ModelContext> ModelContext::createForTesting(
+        const std::string &model_path,
+        std::shared_ptr<MPIContext> mpi_ctx,
+        uint32_t block_count)
+    {
+        // Create TensorFactory from MPI context (if provided) to prevent ModelLoader
+        // from creating internal MPI_COMM_NULL context that conflicts with test's MPI_COMM_WORLD
+        std::unique_ptr<TensorFactory> owned_factory;
+        TensorFactory *factory = nullptr;
+        if (mpi_ctx)
+        {
+            owned_factory = std::make_unique<TensorFactory>(*mpi_ctx);
+            factory = owned_factory.get();
+        }
+
+        auto ctx = std::shared_ptr<ModelContext>(
+            new ModelContext(model_path, mpi_ctx, nullptr, factory, WeightDistributionStrategy::REPLICATED));
+
+        // Store owned factory so it lives as long as the context
+        if (owned_factory)
+        {
+            ctx->owned_test_factory_ = std::move(owned_factory);
+        }
+
+        // Initialize minimal valid model structure to prevent accessing uninitialized memory
+        ctx->loader_.initializeTestModel(block_count);
+
+        // Set up interface wrappers (no WeightManager for test contexts by default)
+        ctx->loader_interface_ = std::make_shared<ModelLoaderInterfaceWrapper>(ctx->loader_);
+        // weight_manager_interface_ remains nullptr - tests should use MockModelContext instead
 
         return ctx;
     }

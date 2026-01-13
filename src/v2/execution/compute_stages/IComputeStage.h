@@ -316,6 +316,17 @@ namespace llaminar2
     class IComputeStage
     {
     public:
+        /**
+         * @brief Construct a stage with required device assignment
+         *
+         * Every derived stage MUST call this in its initializer list:
+         *   MyStage(Params p) : IComputeStage(p.device_id), params_(std::move(p)) {}
+         *
+         * This ensures device assignment is compiler-enforced - forgetting to
+         * pass device_id causes a compilation error (no default constructor).
+         */
+        explicit IComputeStage(DeviceId device) : device_id_(device) {}
+
         virtual ~IComputeStage() = default;
 
         // =========================================================================
@@ -473,15 +484,17 @@ namespace llaminar2
         virtual CoherencePolicy coherencePolicy() const { return CoherencePolicy::FULL; }
 
         /**
-         * @brief Get preferred device for execution
+         * @brief Get the device for execution (non-virtual, authoritative)
          *
-         * Returns the device ID where this stage should execute.
-         * Used by coherence system to determine target device for
-         * automatic ensureOnDevice() calls.
+         * Returns the DeviceId where this stage will execute.
+         * Set by each stage's constructor via setDevice(params.device_id).
          *
-         * @return DeviceId::cpu() by default
+         * This is NOT a "preference" - it's the authoritative device assignment.
+         * Stages MUST call setDevice() in their constructor to set this.
+         *
+         * @return The device this stage executes on (CPU by default if not set)
          */
-        virtual DeviceId preferredDevice() const { return DeviceId::cpu(); }
+        DeviceId device() const { return device_id_; }
 
         /**
          * @brief Update dynamic parameters for graph reuse
@@ -601,6 +614,8 @@ namespace llaminar2
                                   const std::string &b_name, const ITensor *b) const;
 
     private:
+        DeviceId device_id_; ///< Authoritative device (set via constructor, no default)
+
         static bool shapesMatch(const std::vector<size_t> &actual,
                                 const std::vector<size_t> &expected,
                                 bool allow_broadcast);

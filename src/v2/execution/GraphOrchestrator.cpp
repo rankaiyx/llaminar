@@ -10,6 +10,8 @@
 
 #include "GraphOrchestrator.h"
 #include "HybridPrecisionConfig.h"
+#include "../loaders/WeightManager.h"
+#include "../loaders/WeightPlacementMap.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/MPIContext.h"
@@ -24,6 +26,65 @@ namespace llaminar2
     // =========================================================================
     // Constructors
     // =========================================================================
+
+    GraphOrchestrator::GraphOrchestrator(
+        Dependencies deps,
+        const Qwen2GraphConfig &graph_config,
+        const GraphCacheConfig &cache_config)
+        : graph_builder_(std::make_shared<Qwen2Graph>(graph_config, nullptr)), // Create graph without MPI (uses topology)
+          mpi_ctx_(nullptr), // No direct MPI context - use injected topology
+          cache_config_(cache_config),
+          injected_model_ctx_(std::move(deps.model_ctx)),
+          injected_topology_(std::move(deps.topology)),
+          injected_collective_ctx_(std::move(deps.collective_ctx))
+    {
+        if (!injected_model_ctx_)
+        {
+            throw std::invalid_argument("GraphOrchestrator Dependencies requires a valid model_ctx");
+        }
+
+        if (!graph_builder_)
+        {
+            throw std::invalid_argument("GraphOrchestrator failed to create graph builder");
+        }
+
+        // Configure executor from graph builder's config
+        GraphExecutorConfig exec_config;
+        exec_config.default_device = graph_builder_->config().default_device;
+
+        // Parse execution mode and profiling from environment
+        const auto &env = debugEnv();
+
+        // Enable profiling from either graph config or env variable
+        exec_config.enable_profiling = graph_builder_->config().enable_profiling || env.execution.executor_profiling;
+        exec_config.enable_validation = graph_builder_->config().enable_validation;
+
+        if (env.execution.execution_mode == "parallel")
+        {
+            exec_config.mode = ExecutionMode::PARALLEL;
+        }
+        else if (env.execution.execution_mode == "pipelined")
+        {
+            exec_config.mode = ExecutionMode::PIPELINED;
+        }
+        else
+        {
+            exec_config.mode = ExecutionMode::SEQUENTIAL;
+        }
+
+        executor_ = GraphExecutor(exec_config);
+
+        // Propagate MPI rank to executor for stage dumping (from injected topology)
+        if (injected_topology_)
+        {
+            executor_.setMPIRank(injected_topology_->rank());
+        }
+
+        LOG_INFO("[GraphOrchestrator] Initialized with injected dependencies, caching="
+                 << (cache_config_.enabled ? "enabled" : "disabled")
+                 << ", topology=" << (injected_topology_ ? "provided" : "none")
+                 << ", collective=" << (injected_collective_ctx_ ? "provided" : "none"));
+    }
 
     GraphOrchestrator::GraphOrchestrator(
         std::shared_ptr<Qwen2Graph> graph_builder,
@@ -630,16 +691,58 @@ namespace llaminar2
         LOG_INFO("[GraphOrchestrator::executeLayer] LAYER_EXEC_ENTERED layer_idx="
                  << layer_idx << " seq_len=" << seq_len);
 
+        // =====================================================================
+        // Weight Streaming Hooks (Option B)
+        // =====================================================================
+        // Before layer execution: Ensure weights are on device
+        // After layer execution: Release layer and prefetch next
+        // =====================================================================
+        if (weight_streamer_)
+        {
+            // Ensure this layer's weights are on the target device
+            if (!weight_streamer_->ensureLayerOnDevice(layer_idx, device))
+            {
+                LOG_ERROR("[GraphOrchestrator::executeLayer] Failed to stream layer "
+                          << layer_idx << " to device " << device.toString());
+                return false;
+            }
+
+            // Prefetch next layer(s) asynchronously to overlap with compute
+            int n_layers = graph_builder_ ? graph_builder_->config().n_layers : 0;
+            if (layer_idx + 1 < n_layers)
+            {
+                weight_streamer_->prefetchLayer(layer_idx + 1, device);
+                LOG_TRACE("[GraphOrchestrator::executeLayer] Prefetching layer " << (layer_idx + 1));
+            }
+        }
+
         // Execute attention block
         if (!executeAttention(layer, buffers, layer_idx, seq_len, kv_cache, position_ids, device))
         {
+            // Release layer on failure if streaming
+            if (weight_streamer_)
+            {
+                weight_streamer_->releaseLayer(layer_idx);
+            }
             return false;
         }
 
         // Execute FFN block
         if (!executeFFN(layer, buffers, layer_idx, seq_len, device))
         {
+            // Release layer on failure if streaming
+            if (weight_streamer_)
+            {
+                weight_streamer_->releaseLayer(layer_idx);
+            }
             return false;
+        }
+
+        // After layer execution: Release layer (marks as eligible for eviction)
+        if (weight_streamer_)
+        {
+            weight_streamer_->releaseLayer(layer_idx);
+            LOG_TRACE("[GraphOrchestrator::executeLayer] Released layer " << layer_idx);
         }
 
         return true;
@@ -1078,6 +1181,19 @@ namespace llaminar2
             return nullptr;
         }
 
+        // =====================================================================
+        // Gap 4: Automatic phase transition based on sequence length
+        // =====================================================================
+        // - seq_len > 1: PREFILL phase (processing prompt, compute-bound)
+        // - seq_len == 1: DECODE phase (generating tokens, bandwidth-bound)
+        //
+        // This affects weight selection via getPhaseAwareWeight():
+        // - PREFILL: Full weights on GPU (compute-bound - all weights needed)
+        // - DECODE: May use CPU decode shards for parallel execution
+        // =====================================================================
+        InferencePhase new_phase = (seq_len > 1) ? InferencePhase::PREFILL : InferencePhase::DECODE;
+        transitionToPhase(new_phase);
+
         // Build position IDs
         std::vector<int> position_ids;
         position_ids.reserve(total_tokens);
@@ -1327,6 +1443,180 @@ namespace llaminar2
 
         const auto &cache = layer_graph_cache_[layer_idx];
         return cache.valid && cache.cached_seq_len == seq_len;
+    }
+
+    // =========================================================================
+    // Phase-Aware Weight Access (Gap 3 - CPU Decode Participation)
+    // =========================================================================
+
+    void GraphOrchestrator::setWeightManager(std::shared_ptr<WeightManager> weight_manager)
+    {
+        weight_manager_ = std::move(weight_manager);
+        LOG_DEBUG("[GraphOrchestrator] WeightManager set");
+    }
+
+    void GraphOrchestrator::setWeightPlacementMap(std::shared_ptr<WeightPlacementMap> placement_map)
+    {
+        weight_placement_map_ = std::move(placement_map);
+        LOG_DEBUG("[GraphOrchestrator] WeightPlacementMap set");
+    }
+
+    void GraphOrchestrator::transitionToPhase(InferencePhase phase)
+    {
+        if (current_phase_ != phase)
+        {
+            InferencePhase old_phase = current_phase_;
+            current_phase_ = phase;
+
+            LOG_DEBUG("[GraphOrchestrator] Phase transition: " << toString(old_phase)
+                                                               << " -> " << toString(phase));
+
+            // Notify weight streamer of phase transition (if streaming is enabled)
+            if (weight_streamer_)
+            {
+                weight_streamer_->onPhaseTransition(old_phase, phase);
+                LOG_DEBUG("[GraphOrchestrator] Weight streamer notified of phase transition");
+            }
+        }
+    }
+
+    // =========================================================================
+    // Weight Streaming (Option B)
+    // =========================================================================
+
+    void GraphOrchestrator::setWeightStreamer(std::shared_ptr<IWeightStreamer> streamer)
+    {
+        weight_streamer_ = std::move(streamer);
+        if (weight_streamer_)
+        {
+            LOG_INFO("[GraphOrchestrator] Weight streaming enabled");
+        }
+        else
+        {
+            LOG_DEBUG("[GraphOrchestrator] Weight streaming disabled");
+        }
+    }
+
+    bool GraphOrchestrator::isWeightStreamingEnabled() const
+    {
+        return weight_streamer_ != nullptr;
+    }
+
+    std::shared_ptr<TensorBase> GraphOrchestrator::getPhaseAwareWeight(
+        const std::string &name,
+        int layer_idx,
+        InferencePhase phase) const
+    {
+        if (!weight_manager_)
+        {
+            LOG_ERROR("[GraphOrchestrator::getPhaseAwareWeight] WeightManager not set");
+            return nullptr;
+        }
+
+        // PREFILL phase: Always use full weight (GPU is primary, compute-bound)
+        if (phase == InferencePhase::PREFILL)
+        {
+            LOG_TRACE("[GraphOrchestrator::getPhaseAwareWeight] PREFILL phase - returning full weight for " << name);
+            return weight_manager_->getWeight(name);
+        }
+
+        // DECODE phase: Check if CPU should participate
+        if (!shouldUseCPUDecodeWeight(name, layer_idx))
+        {
+            // No CPU participation - use full weight (GPU handles it)
+            LOG_TRACE("[GraphOrchestrator::getPhaseAwareWeight] DECODE phase, no CPU participation - returning full weight for " << name);
+            return weight_manager_->getWeight(name);
+        }
+
+        // CPU decode participation enabled - get decode shard
+        if (!weight_placement_map_)
+        {
+            // No placement map - fall back to full weight
+            LOG_WARN("[GraphOrchestrator::getPhaseAwareWeight] CPU decode participation but no placement map - using full weight for " << name);
+            return weight_manager_->getWeight(name);
+        }
+
+        // Get device info from placement map
+        WeightDeviceInfo device_info = weight_placement_map_->getDeviceInfoForWeight(name, layer_idx);
+
+        if (!device_info.cpu_decode_participation)
+        {
+            // This weight doesn't have CPU decode participation
+            LOG_TRACE("[GraphOrchestrator::getPhaseAwareWeight] DECODE phase, weight " << name << " has no CPU participation - returning full weight");
+            return weight_manager_->getWeight(name);
+        }
+
+        // Find the CPU device in decode_devices and get its fraction
+        for (size_t i = 0; i < device_info.decode_devices.size(); ++i)
+        {
+            if (device_info.decode_devices[i].is_cpu())
+            {
+                float fraction = device_info.decode_fractions[i];
+                LOG_DEBUG("[GraphOrchestrator::getPhaseAwareWeight] DECODE phase - returning CPU decode shard for "
+                          << name << " (fraction=" << fraction << ")");
+                return weight_manager_->getDecodeWeight(name, DeviceId::cpu(), fraction, layer_idx);
+            }
+        }
+
+        // No CPU in decode devices - use full weight
+        LOG_TRACE("[GraphOrchestrator::getPhaseAwareWeight] DECODE phase, CPU not in decode devices - returning full weight for " << name);
+        return weight_manager_->getWeight(name);
+    }
+
+    bool GraphOrchestrator::shouldUseCPUDecodeWeight(const std::string &name, int layer_idx) const
+    {
+        // Check phase constraint:
+        // - Default (cpu_prefill_participate=false): CPU only participates in DECODE phase
+        // - With cpu_prefill_participate=true: CPU participates in BOTH phases (Option C fallback)
+        if (current_phase_ == InferencePhase::PREFILL)
+        {
+            // Check if CPU prefill participation is enabled (Option C: memory-constrained systems)
+            if (!debugEnv().execution.cpu_prefill_participate)
+            {
+                return false;
+            }
+            // If cpu_prefill_participate is true, continue with the rest of the checks
+        }
+        // DECODE phase always allows CPU participation if configured
+
+        // Must have placement map
+        if (!weight_placement_map_)
+        {
+            return false;
+        }
+
+        // Get device info
+        WeightDeviceInfo device_info = weight_placement_map_->getDeviceInfoForWeight(name, layer_idx);
+
+        // Check if CPU decode participation is enabled for this weight
+        if (!device_info.cpu_decode_participation)
+        {
+            return false;
+        }
+
+        // Check if this MPI rank should handle CPU decode
+        // For now, rank 0 is the designated CPU decode participant
+        // This could be made configurable in the future
+        int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+
+        // The CPU decode participant is typically the first rank (rank 0)
+        // In future, could look at device_info.decode_devices to find which
+        // ranks have CPUs and distribute work accordingly
+        bool is_cpu_decode_rank = (my_rank == 0);
+
+        if (is_cpu_decode_rank)
+        {
+            // Verify that CPU is actually in the decode devices
+            for (const auto &dev : device_info.decode_devices)
+            {
+                if (dev.is_cpu())
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
 } // namespace llaminar2

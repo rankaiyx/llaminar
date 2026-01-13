@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -26,6 +26,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Input/output tensors
             ITensor *Q = nullptr;
             ITensor *K = nullptr;
@@ -59,10 +61,6 @@ namespace llaminar2
 
             // Position offset for decode mode causal masking
             int position_offset = 0;
-
-            // Optional MPI context
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit AttentionComputeStage(Params params);
@@ -76,7 +74,7 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
 
         /// Target device for coherence management
-        DeviceId preferredDevice() const override { return params_.device_id; }
+
 
         void updateDynamicParams(int pos_offset, int seq_len) override
         {

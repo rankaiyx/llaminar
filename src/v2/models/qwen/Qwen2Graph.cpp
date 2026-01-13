@@ -1218,6 +1218,7 @@ namespace llaminar2
                     graph.addNode(wo_producer_node,
                                   ComputeStageFactory::createGEMM(
                                       GEMMStage::Params{
+                                          .device_id = device,
                                           .A = buffers.attn_output,
                                           .B = layer.wo,
                                           .C = buffers.attn_proj,
@@ -1226,8 +1227,7 @@ namespace llaminar2
                                           .k = wo_k,
                                           .alpha = 1.0f,
                                           .beta = 0.0f,
-                                          .transpose_B = false,
-                                          .device_id = device}),
+                                          .transpose_B = false}),
                                   device);
 
                     if (env.execution.exec_attention)
@@ -1257,9 +1257,10 @@ namespace llaminar2
                     graph.addNode(prefix + "wo_allreduce",
                                   ComputeStageFactory::createAllreduce(
                                       AllreduceStage::Params{
-                                          allreduce_buffer,
-                                          mpi_ctx_.get(),
-                                          allreduce_count}),
+                                          .device_id = device,
+                                          .mpi_ctx = mpi_ctx_.get(),
+                                          .buffer = allreduce_buffer,
+                                          .count = allreduce_count}),
                                   device);
 
                     graph.addDependency(prefix + "wo_allreduce", wo_producer_node);
@@ -1403,6 +1404,7 @@ namespace llaminar2
             graph.addNode(prefix + "down_proj",
                           ComputeStageFactory::createGEMM(
                               GEMMStage::Params{
+                                  .device_id = device,
                                   .A = buffers.up,
                                   .B = layer.down_proj,
                                   .C = buffers.attn_proj,
@@ -1411,8 +1413,7 @@ namespace llaminar2
                                   .k = down_k,
                                   .alpha = 1.0f,
                                   .beta = 0.0f,
-                                  .transpose_B = false,
-                                  .device_id = device}),
+                                  .transpose_B = false}),
                           device);
 
             if (env.execution.exec_swiglu)
@@ -1434,9 +1435,10 @@ namespace llaminar2
                 graph.addNode(prefix + "down_allreduce",
                               ComputeStageFactory::createAllreduce(
                                   AllreduceStage::Params{
-                                      buffers.attn_proj,
-                                      mpi_ctx_.get(),
-                                      allreduce_count}),
+                                      .device_id = device,
+                                      .mpi_ctx = mpi_ctx_.get(),
+                                      .buffer = buffers.attn_proj,
+                                      .count = allreduce_count}),
                               device);
 
                 graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");

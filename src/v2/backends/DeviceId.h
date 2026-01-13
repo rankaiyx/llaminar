@@ -105,6 +105,14 @@ namespace llaminar2
         }
         bool operator!=(const DeviceId &other) const { return !(*this == other); }
 
+        // Ordering comparison (for std::map)
+        bool operator<(const DeviceId &other) const
+        {
+            if (type != other.type)
+                return static_cast<int>(type) < static_cast<int>(other.type);
+            return ordinal < other.ordinal;
+        }
+
         // =========================================================================
         // String Conversion (for logging)
         // =========================================================================

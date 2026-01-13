@@ -150,6 +150,29 @@ namespace llaminar2
          */
         virtual void free(void *ptr, int device_id) = 0;
 
+        /**
+         * @brief Set device memory to a byte value
+         *
+         * @param ptr Device pointer to fill
+         * @param value Byte value to set (0-255)
+         * @param bytes Number of bytes to set
+         * @param device_id GPU device ID (0-based)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaMemset(ptr, value, bytes)
+         * - ROCm: hipMemset(ptr, value, bytes)
+         * - CPU: memset(ptr, value, bytes)
+         *
+         * **Common Use Cases**:
+         * - Zero-initialize output buffers before kernel execution
+         * - Set corruption patterns (0xCC) for data integrity verification
+         * - Clear buffers between operations in P2P testing
+         *
+         * **Thread Safety**: Caller must ensure device is set before calling
+         */
+        virtual bool memset(void *ptr, int value, size_t bytes, int device_id) = 0;
+
         // ====================================================================
         // Device Query Operations
         // ====================================================================

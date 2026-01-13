@@ -59,6 +59,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Google Test / gMock for unit tests
     libgtest-dev \
     libgmock-dev \
+    # Graphics libraries (for GPU compute / transfer)
+    libgbm-dev \
+    libdrm-dev \
     # Additional tools
     git \
     curl \
@@ -127,21 +130,23 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
     fi && \
     rm -rf /var/lib/apt/lists/*
 
-# Install ROCm 6.4 (conditional)
+# Install ROCm 7.1.1 (conditional)
+# ROCm 7.1.1 dropped gfx906 (MI50) support, so we copy Tensile files from Arch Linux package
 RUN if [ "$INSTALL_ROCM" = "true" ]; then \
-    mkdir -p --mode=0755 /etc/apt/keyrings && \
-    wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
-    gpg --dearmor | tee /etc/apt/keyrings/rocm.gpg > /dev/null && \
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4.2 noble main" \
-    | tee /etc/apt/sources.list.d/rocm.list && \
-    echo 'Package: *' \
-    | tee /etc/apt/preferences.d/rocm-pin-600 && \
-    echo 'Pin: release o=repo.radeon.com' \
-    | tee -a /etc/apt/preferences.d/rocm-pin-600 && \
-    echo 'Pin-Priority: 600' \
-    | tee -a /etc/apt/preferences.d/rocm-pin-600 && \
+    # Download and install amdgpu-install tool for ROCm 7.1.1
+    wget https://repo.radeon.com/amdgpu-install/7.1.1/ubuntu/noble/amdgpu-install_7.1.1.70101-1_all.deb -O /tmp/amdgpu-install.deb && \
     apt-get update && \
-    apt-get install -y rocm && \
+    apt-get install -y /tmp/amdgpu-install.deb && \
+    # Install ROCm 7.1.1 (no DKMS - kernel driver comes from host)
+    amdgpu-install --usecase=rocm --no-dkms -y && \
+    # Download rocBLAS from Arch Linux (has gfx906 Tensile files)
+    apt-get install -y zstd && \
+    wget -O /tmp/rocblas-arch.pkg.tar.zst "https://archlinux.org/packages/extra/x86_64/rocblas/download" && \
+    cd /tmp && tar -I zstd -xf rocblas-arch.pkg.tar.zst && \
+    # Copy gfx906 Tensile files to ROCm installation
+    cp /tmp/opt/rocm/lib/rocblas/library/*gfx906* /opt/rocm/lib/rocblas/library/ && \
+    # Cleanup
+    rm -rf /tmp/amdgpu-install.deb /tmp/rocblas-arch.pkg.tar.zst /tmp/opt /tmp/usr && \
     apt-get autoremove -y && \
     apt-get clean; \
     else \

@@ -17,7 +17,11 @@ namespace llaminar2
     // RMSNormStage Implementation (Type-Safe via IActivationTensor)
     // =============================================================================
 
-    RMSNormStage::RMSNormStage(Params params) : params_(std::move(params)) {}
+    RMSNormStage::RMSNormStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool RMSNormStage::execute(IDeviceContext *ctx)
     {

@@ -13,6 +13,7 @@
 #include "ModelLoader.h"
 #include "WeightManager.h"
 #include "WeightPlacementMap.h"
+#include "../interfaces/IModelContext.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
@@ -24,6 +25,8 @@ namespace llaminar2
 
     /**
      * @brief Model context for pipeline initialization
+     *
+     * Implements IModelContext interface for production use with GGUF files.
      *
      * Contains:
      * - Model file path
@@ -37,7 +40,7 @@ namespace llaminar2
      *   // Pipeline reads hyperparameters from ctx->model()
      *   // Pipeline loads weights via ctx->getWeight(name, device_idx)
      */
-    class ModelContext
+    class ModelContext : public IModelContext
     {
     public:
         /**
@@ -72,34 +75,16 @@ namespace llaminar2
         static std::shared_ptr<ModelContext> createForTesting(
             const std::string &model_path = "test.gguf",
             std::shared_ptr<MPIContext> mpi_ctx = nullptr,
-            uint32_t block_count = 1)
-        {
-            // Create TensorFactory from MPI context (if provided) to prevent ModelLoader
-            // from creating internal MPI_COMM_NULL context that conflicts with test's MPI_COMM_WORLD
-            std::unique_ptr<TensorFactory> owned_factory;
-            TensorFactory *factory = nullptr;
-            if (mpi_ctx)
-            {
-                owned_factory = std::make_unique<TensorFactory>(*mpi_ctx);
-                factory = owned_factory.get();
-            }
+            uint32_t block_count = 1);
 
-            auto ctx = std::shared_ptr<ModelContext>(
-                new ModelContext(model_path, mpi_ctx, nullptr, factory, WeightDistributionStrategy::REPLICATED));
+        // =========================================================================
+        // IModelContext Implementation
+        // =========================================================================
 
-            // Store owned factory so it lives as long as the context
-            if (owned_factory)
-            {
-                ctx->owned_test_factory_ = std::move(owned_factory);
-            }
-
-            // Initialize minimal valid model structure to prevent accessing uninitialized memory
-            ctx->loader_.initializeTestModel(block_count);
-            return ctx;
-        } /**
-           * @brief Get model file path
-           */
-        const std::string &path() const { return model_path_; }
+        /**
+         * @brief Get model file path
+         */
+        const std::string &path() const override { return model_path_; }
 
         /**
          * @brief Get GGUF model metadata
@@ -109,13 +94,18 @@ namespace llaminar2
         /**
          * @brief Get architecture string
          */
-        const std::string &architecture() const { return loader_.getModel().architecture; }
+        const std::string &architecture() const override { return loader_.getModel().architecture; }
 
         /**
-         * @brief Get ModelLoader for tensor loading
+         * @brief Get ModelLoader interface for tensor loading
          */
-        ModelLoader &loader() { return loader_; }
-        const ModelLoader &loader() const { return loader_; }
+        std::shared_ptr<IModelLoader> loader() override { return loader_interface_; }
+
+        /**
+         * @brief Get concrete ModelLoader for internal use
+         */
+        ModelLoader &concreteLoader() { return loader_; }
+        const ModelLoader &concreteLoader() const { return loader_; }
 
         /**
          * @brief Get weight tensor by name
@@ -126,7 +116,7 @@ namespace llaminar2
          * @param device Device for tensor placement (default: CPU)
          * @return Shared pointer to tensor, or nullptr on error
          */
-        std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu())
+        std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu()) override
         {
             return weight_manager_->getWeight(name, device);
         }
@@ -136,15 +126,33 @@ namespace llaminar2
          * @param name GGUF tensor name to check
          * @return true if tensor exists, false otherwise
          */
-        bool hasTensor(const std::string &name) const
+        bool hasTensor(const std::string &name) const override
         {
             return loader_.hasTensor(name);
         }
 
         /**
-         * @brief Get weight manager
+         * @brief Get weight manager interface (for IModelContext)
          */
-        std::shared_ptr<WeightManager> weightManager() { return weight_manager_; }
+        std::shared_ptr<IWeightManager> weightManager() override { return weight_manager_; }
+
+        /**
+         * @brief Get concrete weight manager for production code
+         *
+         * Use this when you need WeightManager-specific methods not on the interface.
+         */
+        std::shared_ptr<WeightManager> concreteWeightManager() { return weight_manager_; }
+
+        // =========================================================================
+        // Convenience Hyperparameter Accessors (IModelContext)
+        // =========================================================================
+
+        int blockCount() const override { return static_cast<int>(loader_.blockCount()); }
+        int embeddingLength() const override { return static_cast<int>(loader_.embeddingLength()); }
+        int headCount() const override { return static_cast<int>(loader_.headCount()); }
+        int headCountKV() const override { return static_cast<int>(loader_.headCountKV()); }
+        int vocabSize() const override { return static_cast<int>(loader_.vocabSize()); }
+        int contextLength() const override { return static_cast<int>(loader_.contextLength()); }
 
         /**
          * @brief Get weight placement map (Phase 6: Multi-GPU support)
@@ -173,6 +181,9 @@ namespace llaminar2
         std::unique_ptr<TensorFactory> owned_test_factory_; // For createForTesting() only - must be declared BEFORE loader_!
         ModelLoader loader_;
         std::shared_ptr<WeightManager> weight_manager_;
+
+        // Interface wrapper for loader (since loader_ is stored by value, not as shared_ptr)
+        std::shared_ptr<IModelLoader> loader_interface_;
     };
 
 } // namespace llaminar2

@@ -11,6 +11,11 @@
  * PlacementPlan is computed once at startup (after capability exchange)
  * and then applied to WeightPlacementMap for weight loading.
  *
+ * Key concept: Placement is hierarchical:
+ * - ClusterPlacement: Global view (rank 0 computes, all ranks have identical copy)
+ * - RankPlacement: What this rank should do (extracted from ClusterPlacement)
+ * - LayerPlacement: Where each layer's compute happens
+ *
  * @author David Sanftenberg
  * @date December 2025
  */
@@ -27,42 +32,96 @@ namespace llaminar2
 {
 
     /**
-     * @brief Device type for placement decisions
+     * @brief Device specification for placement decisions
      *
-     * Simplified enum for placement - actual device index determined
-     * by rank-local device enumeration.
+     * Supports arbitrary GPU counts (up to 32 per rank).
+     * CPU is always device index 0, GPUs are 1+.
      */
-    enum class PlacementDevice
+    struct PlacementDevice
     {
-        CPU,        ///< Execute on CPU (device_idx = 0)
-        GPU_0,      ///< Execute on first GPU (device_idx = 1, if available)
-        GPU_1,      ///< Execute on second GPU (device_idx = 2, if available)
-        GPU_2,      ///< Execute on third GPU (device_idx = 3, if available)
-        GPU_3,      ///< Execute on fourth GPU (device_idx = 4, if available)
-        GPU_ANY,    ///< Use any available GPU (resolve at runtime)
-        REPLICATED, ///< Replicate on all devices (for small tensors like norms)
+        enum Type
+        {
+            CPU = 0,     ///< Execute on CPU
+            GPU = 1,     ///< Execute on GPU (use gpu_index for which one)
+            ANY_GPU = 2, ///< Use any available GPU (resolve at runtime)
+            REPLICATED = 3, ///< Replicate on all devices
+        };
+
+        Type type = CPU;
+        int gpu_index = 0; ///< GPU index within rank (0-31), only valid if type == GPU
+
+        /// Construct CPU placement
+        static PlacementDevice cpu() { return {CPU, 0}; }
+
+        /// Construct GPU placement with specific index
+        static PlacementDevice gpu(int index) { return {GPU, index}; }
+
+        /// Construct any-GPU placement
+        static PlacementDevice anyGpu() { return {ANY_GPU, 0}; }
+
+        /// Construct replicated placement
+        static PlacementDevice replicated() { return {REPLICATED, 0}; }
+
+        /// Check if this is a CPU placement
+        bool isCPU() const { return type == CPU; }
+
+        /// Check if this is a GPU placement
+        bool isGPU() const { return type == GPU || type == ANY_GPU; }
+
+        /// Get effective GPU index (0 if CPU or ANY_GPU)
+        int effectiveGpuIndex() const { return type == GPU ? gpu_index : 0; }
+
+        /// Comparison operators
+        bool operator==(const PlacementDevice &other) const
+        {
+            return type == other.type && gpu_index == other.gpu_index;
+        }
+        bool operator!=(const PlacementDevice &other) const { return !(*this == other); }
+
+        /// Convert to string for logging
+        std::string toString() const
+        {
+            switch (type)
+            {
+            case CPU:
+                return "CPU";
+            case GPU:
+                return "GPU_" + std::to_string(gpu_index);
+            case ANY_GPU:
+                return "GPU_ANY";
+            case REPLICATED:
+                return "REPLICATED";
+            }
+            return "UNKNOWN";
+        }
     };
+
+    // Legacy compatibility aliases
+    namespace LegacyPlacement
+    {
+        constexpr auto CPU = PlacementDevice::CPU;
+        constexpr auto GPU_0 = PlacementDevice::GPU;
+        constexpr auto GPU_1 = PlacementDevice::GPU;
+        constexpr auto GPU_2 = PlacementDevice::GPU;
+        constexpr auto GPU_3 = PlacementDevice::GPU;
+        constexpr auto GPU_ANY = PlacementDevice::ANY_GPU;
+        constexpr auto REPLICATED = PlacementDevice::REPLICATED;
+    }
 
     /**
      * @brief Convert PlacementDevice to DeviceId
-     * @param device PlacementDevice enum
+     * @param device PlacementDevice struct
      * @return DeviceId (CPU or CUDA device)
      */
-    inline DeviceId toDeviceId(PlacementDevice device)
+    inline DeviceId toDeviceId(const PlacementDevice &device)
     {
-        switch (device)
+        switch (device.type)
         {
         case PlacementDevice::CPU:
             return DeviceId::cpu();
-        case PlacementDevice::GPU_0:
-            return DeviceId::cuda(0);
-        case PlacementDevice::GPU_1:
-            return DeviceId::cuda(1);
-        case PlacementDevice::GPU_2:
-            return DeviceId::cuda(2);
-        case PlacementDevice::GPU_3:
-            return DeviceId::cuda(3);
-        case PlacementDevice::GPU_ANY:
+        case PlacementDevice::GPU:
+            return DeviceId::cuda(device.gpu_index);
+        case PlacementDevice::ANY_GPU:
             return DeviceId::cuda(0); // Default to first GPU
         case PlacementDevice::REPLICATED:
             return DeviceId::cpu(); // Replicated tensors loaded to CPU by default
@@ -72,47 +131,66 @@ namespace llaminar2
 
     /**
      * @brief Convert PlacementDevice to device index (DEPRECATED)
-     * @param device PlacementDevice enum
+     * @param device PlacementDevice struct
      * @return Device index (0 = CPU, 1+ = GPUs)
      * @deprecated Use toDeviceId() instead
      */
     [[deprecated("Use toDeviceId() instead")]]
-    inline int toDeviceIndex(PlacementDevice device)
+    inline int toDeviceIndex(const PlacementDevice &device)
     {
-        switch (device)
+        switch (device.type)
         {
         case PlacementDevice::CPU:
             return 0;
-        case PlacementDevice::GPU_0:
-            return 1;
-        case PlacementDevice::GPU_1:
-            return 2;
-        case PlacementDevice::GPU_2:
-            return 3;
-        case PlacementDevice::GPU_3:
-            return 4;
-        case PlacementDevice::GPU_ANY:
+        case PlacementDevice::GPU:
+            return 1 + device.gpu_index;
+        case PlacementDevice::ANY_GPU:
             return 1; // Default to first GPU
         case PlacementDevice::REPLICATED:
-            return 0; // Replicated tensors loaded to CPU by default
+            return 0;
         }
         return 0;
     }
 
     /**
      * @brief Placement decision for a single layer's weights/compute
+     *
+     * Specifies where a layer's compute happens and which rank owns the weights.
+     * Supports placing attention and FFN on different devices within the same rank.
+     *
+     * PHASE-AWARE DESIGN:
+     * - `device`, `attention_device`, `ffn_device`: Used for PREFILL (compute-bound, GPUs only)
+     * - `decode_devices`: Used for DECODE (bandwidth-bound, includes CPU!)
+     *
+     * During decode, CPUs are first-class participants because decode is memory-bandwidth-bound.
+     * A modern Xeon with 6-8 memory channels provides significant bandwidth that should not be wasted.
      */
     struct LayerPlacement
     {
         int layer_idx = -1;      ///< Layer index (0-based)
         int owner_rank = 0;      ///< MPI rank that owns this layer's weights (for TP sharding)
-        PlacementDevice device = ///< Device for compute
-            PlacementDevice::CPU;
+        PlacementDevice device = ///< Device for compute (PREFILL default)
+            PlacementDevice::cpu();
 
         // Fine-grained placement (optional - if attention/FFN on different devices)
-        PlacementDevice attention_device = PlacementDevice::CPU;
-        PlacementDevice ffn_device = PlacementDevice::CPU;
+        PlacementDevice attention_device = PlacementDevice::cpu();
+        PlacementDevice ffn_device = PlacementDevice::cpu();
         bool split_attention_ffn = false; ///< If true, use separate attention_device/ffn_device
+
+        // =====================================================================
+        // Phase-Aware Decode Placement (CPU as first-class participant)
+        // =====================================================================
+
+        /// Devices participating in DECODE for this layer (bandwidth-proportional)
+        /// If empty, falls back to single-device placement (device/attention_device/ffn_device)
+        std::vector<PlacementDevice> decode_devices;
+
+        /// Weight shard fractions per decode device (sum to 1.0)
+        /// decode_weight_fractions[i] = fraction of weights handled by decode_devices[i]
+        std::vector<float> decode_weight_fractions;
+
+        /// Whether to include CPU in decode execution
+        bool cpu_participates_in_decode = false;
 
         /// Get DeviceId for attention compute
         DeviceId getAttentionDevice() const
@@ -124,6 +202,36 @@ namespace llaminar2
         DeviceId getFFNDevice() const
         {
             return toDeviceId(split_attention_ffn ? ffn_device : device);
+        }
+
+        /// Get decode devices (returns single-device fallback if decode_devices empty)
+        std::vector<DeviceId> getDecodeDevices() const
+        {
+            if (decode_devices.empty())
+            {
+                // Fallback to single-device (prefill device)
+                return {getAttentionDevice()};
+            }
+            std::vector<DeviceId> result;
+            result.reserve(decode_devices.size());
+            for (const auto& d : decode_devices)
+            {
+                result.push_back(toDeviceId(d));
+            }
+            return result;
+        }
+
+        /// Check if CPU participates in decode for this layer
+        bool cpuInDecode() const
+        {
+            if (cpu_participates_in_decode)
+                return true;
+            for (const auto& d : decode_devices)
+            {
+                if (d.isCPU())
+                    return true;
+            }
+            return false;
         }
 
         /// Get device index for attention compute (DEPRECATED)
@@ -152,9 +260,9 @@ namespace llaminar2
      */
     struct GlobalPlacement
     {
-        PlacementDevice embedding_device = PlacementDevice::CPU;
-        PlacementDevice lm_head_device = PlacementDevice::CPU;
-        PlacementDevice final_norm_device = PlacementDevice::CPU;
+        PlacementDevice embedding_device = PlacementDevice::cpu();
+        PlacementDevice lm_head_device = PlacementDevice::cpu();
+        PlacementDevice final_norm_device = PlacementDevice::cpu();
 
         /// Whether to shard embedding across ranks (for large vocab)
         bool shard_embedding = false;
@@ -233,13 +341,13 @@ namespace llaminar2
         {
             for (const auto &layer : layers)
             {
-                if (layer.device != PlacementDevice::CPU)
+                if (layer.device.isGPU())
                 {
                     return true;
                 }
             }
-            return global.embedding_device != PlacementDevice::CPU ||
-                   global.lm_head_device != PlacementDevice::CPU;
+            return global.embedding_device.isGPU() ||
+                   global.lm_head_device.isGPU();
         }
 
         /**

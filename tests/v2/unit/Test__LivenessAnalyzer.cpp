@@ -25,8 +25,8 @@ protected:
     class MockStage : public IComputeStage
     {
     public:
-        explicit MockStage(StageBufferRequirements reqs)
-            : reqs_(std::move(reqs)) {}
+        explicit MockStage(StageBufferRequirements reqs, DeviceId device = DeviceId::cpu())
+            : IComputeStage(device), reqs_(std::move(reqs)) {}
 
         bool execute(IDeviceContext *ctx) override
         {

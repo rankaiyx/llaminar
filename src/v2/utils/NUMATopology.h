@@ -195,6 +195,52 @@ namespace llaminar2
          */
         static int detectGPUViaROCmSMI(int rocm_device_id);
 #endif
+
+    public:
+        // =========================================================================
+        // CPU Memory Bandwidth Estimation (for phase-aware placement)
+        // =========================================================================
+
+        /**
+         * @brief Estimated CPU memory bandwidth in GB/s
+         *
+         * Contains estimated memory bandwidth for decode phase placement.
+         * Modern Xeons with 6-8 memory channels should NOT be idle during decode!
+         */
+        struct CPUBandwidthInfo
+        {
+            float bandwidth_gbps = 0.0f;       ///< Estimated total bandwidth in GB/s
+            int memory_channels = 0;           ///< Number of memory channels per socket
+            int num_sockets = 1;               ///< Number of CPU sockets
+            std::string detection_method;      ///< How bandwidth was estimated
+            bool is_estimate = true;           ///< true if estimated, false if measured
+        };
+
+        /**
+         * @brief Estimate CPU memory bandwidth for this system
+         *
+         * Detection methods (in order):
+         * 1. Parse DMI/SMBIOS for memory speed and channel count
+         * 2. Read /proc/cpuinfo for processor model and estimate
+         * 3. Fallback to conservative estimate based on socket count
+         *
+         * Common estimates:
+         * - Xeon Scalable (8 channels DDR5-4800): ~307 GB/s per socket
+         * - Xeon Scalable (6 channels DDR4-3200): ~205 GB/s per socket
+         * - Consumer DDR5-5600 (2 channels): ~90 GB/s
+         * - Consumer DDR4-3200 (2 channels): ~51 GB/s
+         *
+         * @return CPU bandwidth info with detection status
+         */
+        static CPUBandwidthInfo estimateCPUBandwidth();
+
+        /**
+         * @brief Get DDR bandwidth for common memory types
+         * @param ddr_type DDR type string (e.g., "DDR4-3200", "DDR5-4800")
+         * @param channels Number of memory channels
+         * @return Estimated bandwidth in GB/s
+         */
+        static float getDDRBandwidth(const std::string& ddr_type, int channels);
     };
 
 } // namespace llaminar2

@@ -55,6 +55,8 @@
 
 #include "BufferRole.h"
 #include "LivenessAnalyzer.h"
+#include "CollectiveContext.h"
+#include "../interfaces/IGraphBufferManager.h"
 #include "../tensors/TensorFactory.h"
 #include "../utils/MPIContext.h"
 #include <memory>
@@ -68,6 +70,7 @@ namespace llaminar2
     // Forward declarations
     class ComputeGraph;
     class CPUTensorBase;
+    class PCIeBARBackend;
     using TensorBase = CPUTensorBase; // Backward compatibility alias
 
     // =========================================================================
@@ -166,7 +169,7 @@ namespace llaminar2
      * Multiple non-overlapping SCRATCH buffers can share the same
      * physical allocation to reduce memory usage.
      */
-    class GraphBufferManager
+    class GraphBufferManager : public IGraphBufferManager
     {
     public:
         /**
@@ -187,6 +190,30 @@ namespace llaminar2
         GraphBufferManager &operator=(GraphBufferManager &&) = default;
 
         // =====================================================================
+        // Collective Context (Phase 3: Buffer Registration API)
+        // =====================================================================
+
+        /**
+         * @brief Set the collective context for BAR-aware allocation
+         *
+         * When set, buffers marked with `participates_in_collective=true`
+         * will be allocated from the BAR region if the context has a
+         * PCIeBARBackend and the buffer targets a ROCm device.
+         *
+         * @param ctx Shared pointer to CollectiveContext (may be nullptr)
+         */
+        void setCollectiveContext(std::shared_ptr<CollectiveContext> ctx) override;
+
+        /**
+         * @brief Get the current collective context
+         * @return Shared pointer to CollectiveContext (may be nullptr)
+         */
+        std::shared_ptr<CollectiveContext> collectiveContext() const override
+        {
+            return collective_ctx_;
+        }
+
+        // =====================================================================
         // Allocation
         // =====================================================================
 
@@ -202,7 +229,7 @@ namespace llaminar2
          * @param graph The compute graph to allocate for
          * @return true if all allocations succeeded
          */
-        bool allocateForGraph(ComputeGraph &graph);
+        bool allocateForGraph(ComputeGraph &graph) override;
 
         /**
          * @brief Allocate a single buffer from a descriptor
@@ -213,7 +240,7 @@ namespace llaminar2
          * @param desc Buffer descriptor
          * @return true if allocation succeeded
          */
-        bool allocateBuffer(const std::string &node_name, const BufferDescriptor &desc);
+        bool allocateBuffer(const std::string &node_name, const BufferDescriptor &desc) override;
 
         /**
          * @brief Allocate all buffers with aliasing optimization
@@ -227,12 +254,12 @@ namespace llaminar2
          * @param graph The compute graph to allocate for
          * @return true if all allocations succeeded
          */
-        bool allocateWithAliasing(ComputeGraph &graph);
+        bool allocateWithAliasing(ComputeGraph &graph) override;
 
         /**
          * @brief Release all managed buffers
          */
-        void releaseAll();
+        void releaseAll() override;
 
         // =====================================================================
         // Buffer Retrieval
@@ -244,14 +271,14 @@ namespace llaminar2
          * @param buffer_name Buffer name within the stage
          * @return Pointer to tensor (nullptr if not found)
          */
-        TensorBase *getBuffer(const std::string &node_name, const std::string &buffer_name);
+        TensorBase *getBuffer(const std::string &node_name, const std::string &buffer_name) override;
 
         /**
          * @brief Get a buffer by composite key
          * @param key Buffer key (node_name, buffer_name)
          * @return Pointer to tensor (nullptr if not found)
          */
-        TensorBase *getBuffer(const BufferKey &key);
+        TensorBase *getBuffer(const BufferKey &key) override;
 
         /**
          * @brief Check if a buffer exists
@@ -259,13 +286,13 @@ namespace llaminar2
          * @param buffer_name Buffer name
          * @return true if buffer is allocated
          */
-        bool hasBuffer(const std::string &node_name, const std::string &buffer_name) const;
+        bool hasBuffer(const std::string &node_name, const std::string &buffer_name) const override;
 
         /**
          * @brief Get all buffer keys
          * @return Vector of all allocated buffer keys
          */
-        std::vector<BufferKey> getAllBufferKeys() const;
+        std::vector<BufferKey> getAllBufferKeys() const override;
 
         // =====================================================================
         // Binding (for future stage integration)
@@ -286,7 +313,7 @@ namespace llaminar2
          */
         bool bindBuffer(const std::string &node_name,
                         const std::string &buffer_name,
-                        TensorBase **target_ptr);
+                        TensorBase **target_ptr) override;
 
         // =====================================================================
         // Statistics
@@ -295,38 +322,38 @@ namespace llaminar2
         /**
          * @brief Get allocation statistics
          */
-        const BufferAllocationStats &stats() const { return stats_; }
+        const BufferAllocationStats &stats() const override { return stats_; }
 
         /**
          * @brief Reset statistics
          */
-        void resetStats() { stats_.reset(); }
+        void resetStats() override { stats_.reset(); }
 
         /**
          * @brief Get number of allocated buffers
          */
-        size_t bufferCount() const { return buffers_.size(); }
+        size_t bufferCount() const override { return buffers_.size(); }
 
         /**
          * @brief Get total allocated bytes
          */
-        size_t totalAllocatedBytes() const { return stats_.total_bytes; }
+        size_t totalAllocatedBytes() const override { return stats_.total_bytes; }
 
         /**
          * @brief Get memory savings from aliasing
          * @return Percentage (0-100) of SCRATCH memory saved
          */
-        double aliasingSavingsPercent() const { return aliasing_savings_percent_; }
+        double aliasingSavingsPercent() const override { return aliasing_savings_percent_; }
 
         /**
          * @brief Get number of aliasing groups
          */
-        size_t aliasingGroupCount() const { return aliasing_groups_.size(); }
+        size_t aliasingGroupCount() const override { return aliasing_groups_.size(); }
 
         /**
          * @brief Get aliasing groups for inspection
          */
-        const std::vector<AliasingGroup> &aliasingGroups() const { return aliasing_groups_; }
+        const std::vector<AliasingGroup> &aliasingGroups() const override { return aliasing_groups_; }
 
         // =====================================================================
         // Debug
@@ -336,7 +363,7 @@ namespace llaminar2
          * @brief Dump buffer inventory to log
          * @param log_level Log level (DEBUG, INFO, etc.)
          */
-        void dumpBufferInventory() const;
+        void dumpBufferInventory() const override;
 
     private:
         TensorFactory *factory_;      ///< Tensor factory (not owned)
@@ -359,10 +386,40 @@ namespace llaminar2
         /// Map from logical buffer key to aliasing group index
         std::unordered_map<BufferKey, size_t, BufferKeyHash> buffer_to_group_;
 
+        /// Collective context for BAR-aware allocation (Phase 3)
+        std::shared_ptr<CollectiveContext> collective_ctx_;
+
         // Internal helpers
         std::unique_ptr<TensorBase> createTensorFromDescriptor(const BufferDescriptor &desc);
         void updateStats(const BufferDescriptor &desc, size_t allocated_bytes);
         bool allocateAliasingGroups(const std::vector<BufferLiveness> &lifetimes);
+
+        /**
+         * @brief Check if a buffer should use BAR allocation
+         *
+         * Returns true if:
+         * 1. Buffer has participates_in_collective = true
+         * 2. Buffer targets a ROCm device
+         * 3. A CollectiveContext is set with a PCIeBARBackend
+         *
+         * @param desc Buffer descriptor
+         * @return true if BAR allocation should be used
+         */
+        bool shouldUseBarAllocation(const BufferDescriptor &desc) const;
+
+        /**
+         * @brief Allocate a buffer from the BAR region
+         *
+         * Uses PCIeBARBackend::allocateInBarRegion() to get BAR memory,
+         * then creates a tensor wrapping the external memory.
+         *
+         * @param node_name Node name for the buffer
+         * @param desc Buffer descriptor
+         * @return Allocated tensor, or nullptr on failure
+         */
+        std::unique_ptr<TensorBase> allocateFromBarRegion(
+            const std::string &node_name,
+            const BufferDescriptor &desc);
     };
 
 } // namespace llaminar2

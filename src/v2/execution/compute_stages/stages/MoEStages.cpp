@@ -17,7 +17,11 @@ namespace llaminar2
     // MoE Stages Implementation
     // =============================================================================
 
-    MoERouterStage::MoERouterStage(Params params) : params_(std::move(params)) {}
+    MoERouterStage::MoERouterStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool MoERouterStage::execute(IDeviceContext *ctx)
     {
@@ -148,7 +152,11 @@ namespace llaminar2
 
     // -----------------------------------------------------------------------------
 
-    MoEExpertStage::MoEExpertStage(Params params) : params_(std::move(params)) {}
+    MoEExpertStage::MoEExpertStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool MoEExpertStage::execute(IDeviceContext *ctx)
     {
@@ -278,7 +286,11 @@ namespace llaminar2
 
     // -----------------------------------------------------------------------------
 
-    MoECombineStage::MoECombineStage(Params params) : params_(std::move(params)) {}
+    MoECombineStage::MoECombineStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool MoECombineStage::execute(IDeviceContext *ctx)
     {

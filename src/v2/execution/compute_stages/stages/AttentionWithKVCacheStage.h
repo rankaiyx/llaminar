@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -43,6 +43,8 @@ namespace llaminar2
 
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Input/output tensors (already projected)
             ITensor *Q = nullptr;
             ITensor *K = nullptr;
@@ -65,8 +67,8 @@ namespace llaminar2
             bool causal = true;
             int window_size = -1;
 
-            // MPI configuration
-            std::shared_ptr<MPIContext> mpi_ctx;
+            // MPI configuration - shared_ptr version for lifetime management
+            std::shared_ptr<MPIContext> mpi_ctx_shared;
             int mpi_strategy = 0;
 
             // Workspace buffers
@@ -79,9 +81,6 @@ namespace llaminar2
 
             // Position offset for decode mode
             int position_offset = 0;
-
-            // Device placement
-            DeviceId device_id = DeviceId::cpu();
 
             // Tensor Parallelism Parameters
             int head_start = 0;

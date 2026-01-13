@@ -1,10 +1,16 @@
 /**
  * @file AllreduceStage.cpp
- * @brief Implementation of AllreduceStage
+ * @brief Implementation of AllreduceStage with CollectiveContext support
+ *
+ * Supports two execution modes:
+ * 1. CollectiveContext (preferred): Uses new collective infrastructure
+ * 2. Direct MPI (legacy): Falls back to MPI for backward compatibility
  */
 
 #include "AllreduceStage.h"
 #include "../ComputeStageUtils.h"
+#include "../../../execution/CollectiveContext.h"
+#include "../../../collective/ICollectiveBackend.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -19,11 +25,65 @@ namespace llaminar2
     // AllreduceStage Implementation
     // =============================================================================
 
-    AllreduceStage::AllreduceStage(Params params) : params_(std::move(params)) {}
+    AllreduceStage::AllreduceStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool AllreduceStage::execute(IDeviceContext *ctx)
     {
         (void)ctx;
+
+        if (!params_.buffer)
+        {
+            LOG_ERROR("[AllreduceStage] Null buffer");
+            return false;
+        }
+
+        // Prefer CollectiveContext if available
+        if (params_.collective_ctx)
+        {
+            return executeViaCollectiveContext();
+        }
+
+        // Fall back to direct MPI
+        return executeViaMPI();
+    }
+
+    bool AllreduceStage::executeViaCollectiveContext()
+    {
+        const auto &mpi_env = debugEnv().mpi_logging;
+
+        size_t count = params_.count > 0 ? params_.count : params_.buffer->numel();
+
+        if (mpi_env.log_collectives)
+        {
+            LOG_INFO("[AllreduceStage] Using CollectiveContext, count=" << count
+                                                                        << " dtype=" << params_.buffer->dtype_name());
+        }
+
+        // Determine device where tensor resides
+        DeviceId tensor_device = DeviceId::cpu(); // Default to CPU
+        // TODO: Query tensor for actual device once we have multi-device support
+
+        // Delegate to CollectiveContext
+        bool success = params_.collective_ctx->executeAllreduce(
+            params_.buffer,
+            count,
+            tensor_device,
+            CollectiveOp::ALLREDUCE_SUM);
+
+        if (mpi_env.log_collectives)
+        {
+            LOG_INFO("[AllreduceStage] CollectiveContext result=" << (success ? "SUCCESS" : "FAILED"));
+        }
+
+        return success;
+    }
+
+    bool AllreduceStage::executeViaMPI()
+    {
         const auto &mpi_env = debugEnv().mpi_logging;
 
         if (!params_.buffer)

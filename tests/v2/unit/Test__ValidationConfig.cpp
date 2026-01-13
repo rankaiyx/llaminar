@@ -194,8 +194,9 @@ namespace llaminar2::test
     class MockValidationStage : public IComputeStage
     {
     public:
-        explicit MockValidationStage(float *data, size_t rows, size_t cols)
-            : data_(data), rows_(rows), cols_(cols) {}
+        explicit MockValidationStage(float *data, size_t rows, size_t cols,
+                                     DeviceId device = DeviceId::cpu())
+            : IComputeStage(device), data_(data), rows_(rows), cols_(cols) {}
 
         bool execute(IDeviceContext * /*ctx*/) override
         {

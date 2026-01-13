@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 #include <memory>
 
 namespace llaminar2
@@ -36,6 +36,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Input tensors (Q8_1 format) - ITensor for device-agnostic interface
             ITensor *Q = nullptr;
             ITensor *K = nullptr;
@@ -66,10 +68,6 @@ namespace llaminar2
             // KV cache for dynamic kv_len query
             IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
-
-            // Optional MPI context
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
 
             // Optional context snapshot buffer for debugging
             ITensor *context_snapshot = nullptr;

@@ -18,7 +18,11 @@ namespace llaminar2
     // LMHeadStage Implementation
     // =============================================================================
 
-    LMHeadStage::LMHeadStage(Params params) : params_(std::move(params)) {}
+    LMHeadStage::LMHeadStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool LMHeadStage::execute(IDeviceContext *ctx)
     {

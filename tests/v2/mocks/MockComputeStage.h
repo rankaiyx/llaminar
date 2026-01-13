@@ -44,8 +44,9 @@ namespace llaminar2
         {
         public:
             explicit MockComputeStage(ComputeStageType type = ComputeStageType::GEMM,
-                                      std::string name = "MockStage")
-                : type_(type), name_(std::move(name)) {}
+                                      std::string name = "MockStage",
+                                      DeviceId device = DeviceId::cpu())
+                : IComputeStage(device), type_(type), name_(std::move(name)) {}
 
             bool execute(IDeviceContext *ctx) override
             {

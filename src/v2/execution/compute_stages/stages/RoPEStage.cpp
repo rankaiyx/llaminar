@@ -41,7 +41,11 @@ namespace llaminar2
     // RoPEStage Implementation (Type-Safe via KernelFactory)
     // =============================================================================
 
-    RoPEStage::RoPEStage(Params params) : params_(std::move(params)) {}
+    RoPEStage::RoPEStage(Params params)
+        : IComputeStage(params.device_id)
+        , params_(std::move(params))
+    {
+    }
 
     bool RoPEStage::execute(IDeviceContext *ctx)
     {

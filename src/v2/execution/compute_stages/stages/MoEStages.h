@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -18,6 +19,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             const ITensor *hidden = nullptr;
             const ITensor *gate_weights = nullptr;
             ITensor *router_logits = nullptr;
@@ -50,6 +53,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             int expert_id = 0;
             const ITensor *input = nullptr;
             ITensor *output = nullptr;
@@ -83,6 +88,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             const std::vector<const ITensor *> *expert_outputs = nullptr;
             const std::vector<float> *expert_weights = nullptr;
             const std::vector<int> *token_expert_map = nullptr;

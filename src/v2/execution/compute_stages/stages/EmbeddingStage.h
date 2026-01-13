@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../IComputeStage.h"
-#include "backends/DeviceId.h"
+#include "../StageParamsBase.h"
 
 namespace llaminar2
 {
@@ -25,6 +25,8 @@ namespace llaminar2
     public:
         struct Params
         {
+            STAGE_PARAMS_COMMON_FIELDS;
+
             // Input/output tensors
             const ITensor *embed_table = nullptr;
             const int *token_ids = nullptr;
@@ -38,10 +40,6 @@ namespace llaminar2
             // Batched input (alternative to token_ids)
             const std::vector<std::vector<int>> *token_batches = nullptr;
             int padded_seq_len = 0;
-
-            // Device placement
-            const MPIContext *mpi_ctx = nullptr;
-            DeviceId device_id = DeviceId::cpu();
         };
 
         explicit EmbeddingStage(Params params);
