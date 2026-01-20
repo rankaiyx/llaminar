@@ -738,6 +738,27 @@ namespace llaminar2
         virtual bool ensureOnDevice(DeviceId target_device);
 
         /**
+         * @brief Allocate GPU buffer without uploading host data
+         *
+         * Only allocates device memory - does NOT copy host data to GPU.
+         * Use this for OUTPUT tensors where the kernel will overwrite the contents.
+         *
+         * @param target_device DeviceId for the target GPU device
+         * @return true if allocation succeeded, false on error
+         *
+         * **Thread Safety**: Caller must ensure no concurrent modifications to tensor data
+         * **Memory**: GPU buffer is allocated if not present; reuses existing if already on target
+         * **Coherence**: Sets device_valid_=false (kernel will write), host_valid_ unchanged
+         *
+         * Compared to ensureOnDevice():
+         *   - ensureOnDevice(): allocate + H2D upload (for INPUT tensors)
+         *   - allocateOnDevice(): allocate only (for OUTPUT tensors)
+         *
+         * @note Implementation in TensorBase.cpp
+         */
+        virtual bool allocateOnDevice(DeviceId target_device);
+
+        /**
          * @brief Invalidate GPU data, forcing re-upload on next ensureOnDevice() call
          *
          * Call this when host data has been modified and GPU copy is now stale.
@@ -1371,8 +1392,9 @@ namespace llaminar2
         // - Use DMA transfers instead of staging through internal buffers
         // - Run truly asynchronously without blocking on device sync
         // Host memory is pinned lazily on first GPU transfer attempt.
-        bool host_pinned_ = false; // True if host buffer is registered as pinned
-        size_t pinned_bytes_ = 0;  // Size of pinned region (for unregister)
+        bool host_pinned_ = false;        // True if host buffer is registered as pinned
+        size_t pinned_bytes_ = 0;         // Size of pinned region (for unregister)
+        void *pinned_host_ptr_ = nullptr; // Pointer used when pinning (for unpin in destructor)
 
         /**
          * @brief Register host buffer as pinned memory for fast GPU transfers

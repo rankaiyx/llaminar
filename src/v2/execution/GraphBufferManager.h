@@ -83,6 +83,37 @@ namespace llaminar2
     // =========================================================================
 
     /**
+     * @brief Configuration for GraphBufferManager
+     *
+     * Controls buffer allocation behavior, including mapped memory support
+     * for zero-copy GPU↔CPU access when snapshot/debugging mode is enabled.
+     *
+     * @see FP32Tensor::createMapped() for mapped allocation details
+     */
+    struct GraphBufferManagerConfig
+    {
+        /**
+         * @brief Use mapped memory for activation buffers
+         *
+         * When enabled, FP32 activation buffers are allocated using mapped
+         * memory (hipHostMallocMapped/cudaHostAllocMapped) which enables
+         * zero-copy access from both host and device.
+         *
+         * Benefits:
+         * - No memcpy required for ensureOnHost()/ensureOnDevice()
+         * - Snapshot callback can access data without D2H transfer
+         * - Reduces latency for debugging/profiling scenarios
+         *
+         * Tradeoffs:
+         * - Slower access from GPU (PCIe bandwidth vs VRAM bandwidth)
+         * - Only useful when both host and device need frequent access
+         *
+         * Enable via: LLAMINAR_SNAPSHOT_USE_MAPPED=1 environment variable
+         */
+        bool use_mapped_memory = false;
+    };
+
+    /**
      * @brief Configuration for workspace memory budget calculation
      *
      * Controls how GraphBufferManager computes workspace budgets for GPU and CPU
@@ -203,8 +234,10 @@ namespace llaminar2
          * @brief Construct buffer manager
          * @param factory TensorFactory for allocation (not owned)
          * @param mpi_ctx MPI context for NUMA awareness (not owned)
+         * @param config Configuration for buffer allocation behavior
          */
-        explicit GraphBufferManager(TensorFactory *factory, const MPIContext *mpi_ctx = nullptr);
+        explicit GraphBufferManager(TensorFactory *factory, const MPIContext *mpi_ctx = nullptr,
+                                    const GraphBufferManagerConfig &config = GraphBufferManagerConfig{});
 
         ~GraphBufferManager();
 
@@ -473,9 +506,10 @@ namespace llaminar2
         void dumpBufferInventory() const override;
 
     private:
-        TensorFactory *factory_;      ///< Tensor factory (not owned)
-        const MPIContext *mpi_ctx_;   ///< MPI context (not owned)
-        BufferAllocationStats stats_; ///< Allocation statistics
+        TensorFactory *factory_;          ///< Tensor factory (not owned)
+        const MPIContext *mpi_ctx_;       ///< MPI context (not owned)
+        GraphBufferManagerConfig config_; ///< Configuration for buffer allocation
+        BufferAllocationStats stats_;     ///< Allocation statistics
 
         /// Buffer storage: key -> owned tensor
         std::unordered_map<BufferKey, std::unique_ptr<TensorBase>, BufferKeyHash> buffers_;

@@ -779,6 +779,9 @@ namespace llaminar2
      *   LLAMINAR_SNAPSHOT_DUMP_LAYERS=21 \
      *   LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_INPUT_RESIDUAL,FFN_DOWN,FFN_RESIDUAL \
      *   ./run_llaminar.sh -m model.gguf -p "test"
+     *
+     *   # Enable zero-copy mapped memory for snapshots
+     *   LLAMINAR_SNAPSHOT_USE_MAPPED=1 ./run_llaminar.sh -m model.gguf -p "test"
      */
     struct SnapshotConfig
     {
@@ -789,6 +792,7 @@ namespace llaminar2
         int dump_rank = 0;                                   ///< MPI rank to dump (-1=all)
         bool dump_all_layers = true;                         ///< Whether to dump all layers
         bool dump_all_stages = true;                         ///< Whether to dump all stages
+        bool use_mapped_memory = false;                      ///< Use mapped memory for zero-copy snapshots
 
         SnapshotConfig()
         {
@@ -801,6 +805,16 @@ namespace llaminar2
             if (enabled_env)
             {
                 tensor_dump_enabled = (std::atoi(enabled_env) != 0);
+            }
+
+            // LLAMINAR_SNAPSHOT_USE_MAPPED - Enable mapped memory for zero-copy snapshots
+            // When enabled, FP32 activation buffers are allocated using mapped memory
+            // (hipHostMallocMapped/cudaHostAllocMapped) which enables zero-copy access
+            // from both host and device without memcpy.
+            const char *mapped_env = std::getenv("LLAMINAR_SNAPSHOT_USE_MAPPED");
+            if (mapped_env)
+            {
+                use_mapped_memory = (std::atoi(mapped_env) != 0);
             }
 
             const char *dir_env = std::getenv("LLAMINAR_SNAPSHOT_DUMP_DIR");

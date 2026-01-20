@@ -289,6 +289,19 @@ add_v2_test(V2_Unit_TensorBasics
     LABELS "V2;Unit;TensorOperations;FP32;Basics;GEMM"
 )
 
+# Test: TensorAllocateOnDevice - CPUTensorBase::allocateOnDevice() method
+add_executable(v2_test_tensor_allocate_on_device unit/Test__TensorAllocateOnDevice.cpp)
+target_link_libraries(v2_test_tensor_allocate_on_device 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorAllocateOnDevice 
+    COMMAND $<TARGET_FILE:v2_test_tensor_allocate_on_device>
+    LABELS "V2;Unit;TensorOperations;GPU;Coherence;DeviceMemory"
+    MPI_PROCS 1
+)
+
 # Test: CacheInfo - CPU cache detection and batch size optimization
 add_executable(v2_test_cache_info unit/Test__CacheInfo.cpp)
 target_link_libraries(v2_test_cache_info 
@@ -356,6 +369,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_direct_p2p>
         LABELS "V2;Integration;DeviceManagement;P2P;PCIeBAR;CUDA;ROCm;CrossVendor"
         MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
     # Test: CrossVendorTensorParallel - Real tensor parallel inference across NVIDIA+AMD
@@ -3037,6 +3051,52 @@ add_v2_test(V2_Integration_TensorCoherence
     COMMAND $<TARGET_FILE:v2_integration_tensor_coherence>
     LABELS "V2;Integration;CUDA;TensorTransfer;Coherence;StateMachine;FP32;BF16;FP16;GPUMemory;DeviceManagement"
     MPI_PROCS 1  # Tests GPU coherence locally, no MPI needed
+)
+
+# Test: GPU-Resident Data Flow (Phase 1: verifies no unnecessary D2H transfers)
+# Tests StageCoherence functions with MockBackend transfer tracking
+# Verifies: cohereInputs, cohereOutputs, markOutputsDirty behavior
+# See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
+add_executable(v2_integration_gpu_resident_data_flow integration/Test__GpuResidentDataFlow.cpp)
+target_link_libraries(v2_integration_gpu_resident_data_flow llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_GpuResidentDataFlow
+    COMMAND $<TARGET_FILE:v2_integration_gpu_resident_data_flow>
+    LABELS "V2;Integration;StageCoherence;GpuResident;TransferTracking;MockBackend;FP32"
+    MPI_PROCS 1  # Tests coherence logic locally, no MPI needed
+)
+
+# Test: Mapped Memory Coherence (Phase 3: verifies zero-copy snapshot mode)
+# Tests FP32Tensor::createMapped() behavior for GPU↔CPU shared memory
+# Verifies: gpu_data_ptr valid after creation, ensureOnHost is no-op, 
+#           kernel writes visible on host, both valid flags stay true
+# See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
+add_executable(v2_integration_mapped_memory_coherence integration/Test__MappedMemoryCoherence.cpp)
+target_include_directories(v2_integration_mapped_memory_coherence PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_integration_mapped_memory_coherence llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_MappedMemoryCoherence
+    COMMAND $<TARGET_FILE:v2_integration_mapped_memory_coherence>
+    LABELS "V2;Integration;MappedMemory;ZeroCopy;Coherence;Snapshot;FP32;GPUMemory;DeviceManagement"
+    MPI_PROCS 1  # Tests mapped memory locally, no MPI needed
+)
+
+# Performance: Coherence Transfer Overhead Benchmark (Phase 4: Performance Validation)
+# Measures transfer overhead for different tensor allocation strategies:
+# - ensureOnDevice (baseline with H2D upload)
+# - allocateOnDevice (optimized, no H2D upload)
+# - mapped memory (zero-copy)
+# Validates GPU-resident execution optimization
+# See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
+add_executable(v2_perf_coherence_transfer_overhead performance/Test__CoherenceTransferOverhead.cpp)
+target_include_directories(v2_perf_coherence_transfer_overhead PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_perf_coherence_transfer_overhead llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CoherenceTransferOverhead
+    COMMAND $<TARGET_FILE:v2_perf_coherence_transfer_overhead>
+    LABELS "V2;Performance;Coherence;TransferOverhead;H2D;DeviceManagement;GPUMemory;ZeroCopy"
+    MPI_PROCS 1  # Benchmarks run locally, no MPI needed
 )
 
 # Test: CUDA GEMM Parity (FP32 and IQ4_NL: CUDA vs CPU kernel comparison)

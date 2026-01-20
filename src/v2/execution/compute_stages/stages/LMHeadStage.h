@@ -61,14 +61,17 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
 
         /**
-         * @brief Return INPUT policy - kernel manages its own weight upload
+         * @brief Return FULL policy - cohere inputs AND allocate output GPU buffers
          *
          * Quantized GEMM kernels (ROCm/CUDA) pack and upload weights internally
-         * to their own INT8 buffers. The coherence system should NOT upload the
-         * raw quantized weight tensor - it would be wasteful and the pointer
-         * wouldn't be used anyway.
+         * to their own INT8 buffers via KernelFactory. The coherence system handles:
+         * - Input tensors (hidden_states) → uploaded to GPU
+         * - Output tensors (logits) → GPU buffers allocated for kernel to write
+         *
+         * Note: Weight tensors are managed by the kernel's internal INT8 packing,
+         * but getDumpInfo() correctly classifies them as weights (not inputs).
          */
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::INPUT; }
+        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::FULL; }
 
         // =================================================================
         // IWorkspaceConsumerStage Implementation

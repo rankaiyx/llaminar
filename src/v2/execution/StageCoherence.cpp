@@ -147,19 +147,19 @@ namespace llaminar2
             }
 
             // Ensure output buffer is allocated on device
-            // This allocates GPU memory but doesn't necessarily upload host data
-            // (the kernel will write to the GPU buffer)
+            // Use allocateOnDevice() - allocates GPU memory but does NOT upload host data
+            // (the kernel will write to the GPU buffer, so H2D upload would be wasteful)
             auto start = std::chrono::high_resolution_clock::now();
-            bool success = tensor_base->ensureOnDevice(target_device);
+            bool success = tensor_base->allocateOnDevice(target_device);
             auto end = std::chrono::high_resolution_clock::now();
             auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
             if (trace_coherence)
             {
-                LOG_INFO("[StageCoherence] ensureOnDevice OUTPUT('" << (buf.name ? buf.name : "unknown")
-                                                                    << "') to " << target_device.to_string()
-                                                                    << " took " << elapsed_us << " us"
-                                                                    << " (numel=" << tensor_base->numel() << ")");
+                LOG_INFO("[StageCoherence] allocateOnDevice OUTPUT('" << (buf.name ? buf.name : "unknown")
+                                                                      << "') to " << target_device.to_string()
+                                                                      << " took " << elapsed_us << " us"
+                                                                      << " (numel=" << tensor_base->numel() << ")");
             }
 
             if (!success)

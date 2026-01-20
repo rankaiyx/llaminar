@@ -124,10 +124,35 @@ namespace llaminar2
     // Clears the kernel cache entry for this tensor to prevent use-after-free
     // when a new tensor is allocated at the same memory address.
     // Also frees mapped memory if this tensor used zero-copy allocation.
+    // Also frees GPU memory and unpins host memory if allocated.
     CPUTensorBase::~CPUTensorBase()
     {
-        // Free mapped memory if allocated
+        // Free mapped memory if allocated (must be done first)
         freeMappedMemory();
+
+        // Free GPU memory if allocated (before unpinning host memory)
+        if (gpu_data_ptr_ && gpu_device_.has_value())
+        {
+            IBackend *backend = getBackendForDevice(*gpu_device_);
+            if (backend)
+            {
+                int backend_device_id = gpu_device_->gpu_ordinal();
+
+                // Destroy completion event if it exists
+                if (device_completion_event_)
+                {
+                    backend->destroyEvent(device_completion_event_, backend_device_id);
+                    device_completion_event_ = nullptr;
+                }
+
+                backend->free(gpu_data_ptr_, backend_device_id);
+            }
+            gpu_data_ptr_ = nullptr;
+            device_valid_ = false;
+        }
+
+        // Unpin host memory if pinned (after freeing GPU memory)
+        unpinHostMemory();
 
         // Clear kernel cache
         llaminar::v2::kernels::KernelFactory::clearCacheFor(this);
@@ -682,6 +707,7 @@ namespace llaminar2
         {
             host_pinned_ = true;
             pinned_bytes_ = bytes;
+            pinned_host_ptr_ = host_ptr; // Store for unpinning in destructor
         }
         else
         {
@@ -700,11 +726,13 @@ namespace llaminar2
             return; // Not pinned
         }
 
-        void *host_ptr = raw_host_data_ptr();
+        // Use the stored pointer from when we pinned - avoids virtual call during destruction
+        void *host_ptr = pinned_host_ptr_;
         if (!host_ptr)
         {
             host_pinned_ = false;
             pinned_bytes_ = 0;
+            pinned_host_ptr_ = nullptr;
             return;
         }
 
@@ -728,6 +756,7 @@ namespace llaminar2
 
         host_pinned_ = false;
         pinned_bytes_ = 0;
+        pinned_host_ptr_ = nullptr;
     }
 
     // =========================================================================
@@ -929,6 +958,112 @@ namespace llaminar2
         if (trace && overall_us > 1000)
         {
             LOG_INFO("[CPUTensorBase::ensureOnDevice] TOTAL took " << overall_us << " us for " << bytes << " bytes");
+        }
+
+        return true;
+    }
+
+    bool CPUTensorBase::allocateOnDevice(DeviceId target_device)
+    {
+        // Validate target device - must be a GPU
+        if (!target_device.is_gpu())
+        {
+            LOG_ERROR("[CPUTensorBase::allocateOnDevice] Invalid device (must be GPU): " << target_device.toString());
+            return false;
+        }
+
+        const bool trace = debugEnv().rocm.trace_coherence;
+
+        // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
+        // If tensor uses mapped memory, GPU can access host memory directly.
+        // No allocation needed - just ensure we're tracking the target device.
+        if (is_mapped_ && mapped_device_ptr_ != nullptr)
+        {
+            if (!gpu_device_.has_value() || *gpu_device_ != target_device)
+            {
+                gpu_device_ = target_device;
+            }
+            if (gpu_data_ptr_ != mapped_device_ptr_)
+            {
+                gpu_data_ptr_ = mapped_device_ptr_;
+            }
+            // Mapped memory: both host and device are always valid
+            host_valid_ = true;
+            device_valid_ = true;
+
+            if (trace)
+            {
+                LOG_INFO("[CPUTensorBase::allocateOnDevice] ZERO-COPY: Tensor is mapped, no allocation needed");
+            }
+            return true;
+        }
+
+        // Check if already allocated on target device - reuse existing allocation
+        if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ == target_device)
+        {
+            // Already allocated on correct device - mark as invalid (kernel will overwrite)
+            device_valid_ = false;
+            if (trace)
+            {
+                LOG_INFO("[CPUTensorBase::allocateOnDevice] Reusing existing allocation on " << target_device.toString());
+            }
+            return true;
+        }
+
+        // Get backend for target device
+        IBackend *target_backend = getBackendForDevice(target_device);
+        if (!target_backend)
+        {
+            LOG_ERROR("[CPUTensorBase::allocateOnDevice] No backend available for device " << target_device.toString());
+            return false;
+        }
+
+        int backend_device_id = target_device.gpu_ordinal();
+
+        // Free existing device memory if on different device
+        if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ != target_device)
+        {
+            IBackend *old_backend = getBackendForDevice(*gpu_device_);
+            int old_backend_device_id = gpu_device_->gpu_ordinal();
+            if (old_backend)
+            {
+                old_backend->free(gpu_data_ptr_, old_backend_device_id);
+            }
+            gpu_data_ptr_ = nullptr;
+            gpu_device_.reset();
+            device_valid_ = false;
+        }
+
+        // Allocate on target device
+        size_t bytes = byte_size();
+        if (!gpu_data_ptr_)
+        {
+            auto alloc_start = std::chrono::high_resolution_clock::now();
+            gpu_data_ptr_ = target_backend->allocate(bytes, backend_device_id);
+            auto alloc_end = std::chrono::high_resolution_clock::now();
+            auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(alloc_end - alloc_start).count();
+
+            if (trace)
+            {
+                LOG_INFO("[CPUTensorBase::allocateOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
+            }
+
+            if (!gpu_data_ptr_)
+            {
+                LOG_ERROR("[CPUTensorBase::allocateOnDevice] Failed to allocate " << bytes
+                                                                                  << " bytes on device " << target_device.toString()
+                                                                                  << " (backend device ID: " << backend_device_id << ")");
+                return false;
+            }
+
+            gpu_device_ = target_device;
+            // device_valid_ = false: kernel will write to this buffer
+            device_valid_ = false;
+            // host_valid_ unchanged: we didn't touch host data
+
+            LOG_DEBUG("[CPUTensorBase::allocateOnDevice] Allocated " << bytes
+                                                                     << " bytes on device " << target_device.toString()
+                                                                     << " (NO H2D upload - output buffer)");
         }
 
         return true;

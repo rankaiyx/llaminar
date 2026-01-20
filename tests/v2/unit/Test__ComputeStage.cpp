@@ -633,7 +633,11 @@ TEST_F(ComputeStageTest, BackendSupport)
 #else
     EXPECT_FALSE(rms_stage.supportsBackend(ComputeBackendType::GPU_CUDA));
 #endif
+#ifdef HAVE_ROCM
+    EXPECT_TRUE(rms_stage.supportsBackend(ComputeBackendType::GPU_ROCM));
+#else
     EXPECT_FALSE(rms_stage.supportsBackend(ComputeBackendType::GPU_ROCM));
+#endif
 }
 
 // =============================================================================

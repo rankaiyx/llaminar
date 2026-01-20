@@ -14,6 +14,7 @@
 #include "../backends/BackendManager.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../execution/compute_stages/IComputeStage.h"
+#include "../tensors/cpu/CPUTensors.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -23,12 +24,17 @@ namespace llaminar2
     // Constructor / Destructor
     // =========================================================================
 
-    GraphBufferManager::GraphBufferManager(TensorFactory *factory, const MPIContext *mpi_ctx)
-        : factory_(factory), mpi_ctx_(mpi_ctx)
+    GraphBufferManager::GraphBufferManager(TensorFactory *factory, const MPIContext *mpi_ctx,
+                                           const GraphBufferManagerConfig &config)
+        : factory_(factory), mpi_ctx_(mpi_ctx), config_(config)
     {
         if (!factory_)
         {
             LOG_WARN("GraphBufferManager created with null TensorFactory - allocations will fail");
+        }
+        if (config_.use_mapped_memory)
+        {
+            LOG_INFO("GraphBufferManager: Mapped memory mode enabled for activation buffers");
         }
     }
 
@@ -662,6 +668,21 @@ namespace llaminar2
         switch (desc.tensor_type)
         {
         case BufferTensorType::FP32:
+            // Use mapped memory for FP32 activation buffers when configured
+            // This enables zero-copy GPU↔CPU access for snapshot/debugging mode
+            if (config_.use_mapped_memory && device.is_gpu())
+            {
+                auto mapped_tensor = FP32Tensor::createMapped(shape, device);
+                if (mapped_tensor && mapped_tensor->isMapped())
+                {
+                    LOG_DEBUG("GraphBufferManager: Created mapped FP32 tensor for '"
+                              << desc.name << "' on " << device.toString());
+                    return mapped_tensor;
+                }
+                // Fall through to regular allocation if mapped allocation failed
+                LOG_WARN("GraphBufferManager: Mapped allocation failed for '"
+                         << desc.name << "', using regular allocation");
+            }
             return factory_->createFP32(shape, device);
 
         case BufferTensorType::FP16:
