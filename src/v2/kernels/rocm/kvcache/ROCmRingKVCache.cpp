@@ -671,9 +671,7 @@ namespace llaminar2
                 num_seqs, max_kv_len, max_seq_len_, kv_dim_, stream);
         }
 
-        // Synchronize before returning
-        hipStreamSynchronize(stream);
-
+        // Removed hipStreamSynchronize() - caller manages coherence via events
         // Workspace buffers are caller-owned, no cleanup needed
     }
 

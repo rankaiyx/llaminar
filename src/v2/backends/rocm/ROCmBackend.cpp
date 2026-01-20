@@ -11,6 +11,7 @@
 #include "ROCmBackend.h"
 #include "../../utils/Logger.h"
 #include <hip/hip_runtime.h>
+#include <chrono>
 #include <stdexcept>
 #include <sstream>
 
@@ -159,6 +160,8 @@ namespace llaminar2
 
     bool ROCmBackend::waitForEvent(void *event, int device_id)
     {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
         if (!event || device_id >= device_count_ || device_id < 0)
         {
             return false;
@@ -170,12 +173,28 @@ namespace llaminar2
             return false;
         }
 
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double set_device_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        // Use event-based sync for fine-grained synchronization
+        // This waits only for the specific kernel that recorded this event,
+        // NOT for all work on the stream (which could include unrelated prior work)
         hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
         err = hipEventSynchronize(hip_event);
+
+        auto t2 = std::chrono::high_resolution_clock::now();
+        double event_sync_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend::waitForEvent] hipEventSynchronize failed: " << hipGetErrorString(err));
             return false;
+        }
+
+        double total_ms = std::chrono::duration<double, std::milli>(t2 - t0).count();
+        if (total_ms > 1.0)
+        {
+            LOG_WARN("[ROCmBackend::waitForEvent] setDevice=" << set_device_ms << "ms, eventSync=" << event_sync_ms << "ms, TOTAL=" << total_ms << "ms");
         }
 
         return true;

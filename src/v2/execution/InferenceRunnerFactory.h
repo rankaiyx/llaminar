@@ -63,6 +63,12 @@ namespace llaminar2
         // See RuntimeConfig.h for detailed documentation on scale selection.
         // Default 64.0f covers Q8_1 activation ranges (max ±35) with ~2× headroom.
         float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
+
+        // Use mapped memory for GPU tensor allocation (zero-copy host access)
+        // When true, FP32 activation buffers are allocated using cudaHostAllocMapped /
+        // hipHostMallocMapped, enabling direct host access without memcpy.
+        // Essential for snapshot capture mode on GPU to avoid slow D2H syncs.
+        bool use_mapped_memory = false;
     };
 
     /**

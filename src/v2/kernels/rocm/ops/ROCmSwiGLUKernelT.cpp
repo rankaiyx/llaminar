@@ -95,12 +95,8 @@ namespace llaminar2
             float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
 
             int size = rows * cols;
-            bool ok = hipOps_swiglu_fp32(d_gate, d_up, d_output, size, dev);
-            if (ok)
-            {
-                hipDeviceSynchronize();
-            }
-            return ok;
+            // No sync needed - coherence system handles sync when data is read
+            return hipOps_swiglu_fp32(d_gate, d_up, d_output, size, dev);
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -111,10 +107,8 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = hipOps_swiglu_fp32(gate, up, output, size, dev);
-            if (ok)
-                hipDeviceSynchronize();
-            return ok;
+            // No sync needed - coherence system handles sync when data is read
+            return hipOps_swiglu_fp32(gate, up, output, size, dev);
         }
 
         // =========================================================================
@@ -168,12 +162,8 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
             int size = rows * cols;
-            bool ok = hipOps_swiglu_bf16(d_gate, d_up, d_output, size, dev);
-            if (ok)
-            {
-                hipDeviceSynchronize();
-            }
-            return ok;
+            // No sync needed - coherence system handles sync when data is read
+            return hipOps_swiglu_bf16(d_gate, d_up, d_output, size, dev);
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -184,10 +174,8 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = hipOps_swiglu_bf16(gate, up, output, size, dev);
-            if (ok)
-                hipDeviceSynchronize();
-            return ok;
+            // No sync needed - coherence system handles sync when data is read
+            return hipOps_swiglu_bf16(gate, up, output, size, dev);
         }
 
         // =========================================================================
@@ -241,12 +229,8 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
             int size = rows * cols;
-            bool ok = hipOps_swiglu_fp16(d_gate, d_up, d_output, size, dev);
-            if (ok)
-            {
-                hipDeviceSynchronize();
-            }
-            return ok;
+            // No sync needed - coherence system handles sync when data is read
+            return hipOps_swiglu_fp16(d_gate, d_up, d_output, size, dev);
         }
 
         bool ROCmSwiGLUKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -257,10 +241,8 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = hipOps_swiglu_fp16(gate, up, output, size, dev);
-            if (ok)
-                hipDeviceSynchronize();
-            return ok;
+            // No sync needed - coherence system handles sync when data is read
+            return hipOps_swiglu_fp16(gate, up, output, size, dev);
         }
 
     } // namespace rocm

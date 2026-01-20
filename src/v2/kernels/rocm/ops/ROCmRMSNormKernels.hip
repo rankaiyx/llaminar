@@ -257,7 +257,7 @@ extern "C" bool hipOps_rmsnorm_fp32(
         return false;
     }
 
-    hipDeviceSynchronize();
+    // No sync needed - coherence system handles sync when data is read
     return true;
 }
 
@@ -298,7 +298,7 @@ extern "C" bool hipOps_rmsnorm_bf16(
         return false;
     }
 
-    hipDeviceSynchronize();
+    // No sync needed - coherence system handles sync when data is read
     return true;
 }
 
@@ -339,6 +339,6 @@ extern "C" bool hipOps_rmsnorm_fp16(
         return false;
     }
 
-    hipDeviceSynchronize();
+    // No sync needed - coherence system handles sync when data is read
     return true;
 }

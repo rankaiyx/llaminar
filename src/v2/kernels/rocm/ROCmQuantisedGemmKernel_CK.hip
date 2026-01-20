@@ -1046,6 +1046,11 @@ extern "C"
         // No D tensors - empty arrays
         std::array<const void*, 0> p_ds = {};
         std::array<ck::index_t, 0> strides_ds = {};
+        
+        // DEBUG: Time the actual CK GEMM execution (including GPU work completion)
+        // This adds a sync so we can measure ACTUAL kernel execution time
+        static thread_local bool debug_timing = (getenv("LLAMINAR_CK_GEMM_TIMING") != nullptr);
+        auto t0 = std::chrono::high_resolution_clock::now();
 
         // =====================================================================
         // 3-WAY DISPATCH BASED ON M
@@ -1118,6 +1123,15 @@ extern "C"
 
             auto invoker = device_gemm.MakeInvoker();
             invoker.Run(argument, StreamConfig{nullptr, false});
+        }
+        
+        // DEBUG: If timing enabled, sync and report actual GEMM execution time
+        if (debug_timing) {
+            hipError_t sync_err = hipDeviceSynchronize();
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            fprintf(stderr, "[CK_GEMM_EXEC] M=%d N=%d K=%d  time=%.3fms  sync=%s\n", 
+                    M, N, K, ms, (sync_err == hipSuccess ? "ok" : hipGetErrorString(sync_err)));
         }
         
         return true;
@@ -1238,6 +1252,19 @@ extern "C"
         int M, int N, int K,
         int rocm_device_id)
     {
+        auto t_total_start = std::chrono::high_resolution_clock::now();
+        auto t_step_start = t_total_start;
+        auto t_step_end = t_total_start;
+        
+        auto log_timing = [&](const char* step) {
+            t_step_end = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t_step_end - t_step_start).count();
+            if (ms > 0.5) {
+                fprintf(stderr, "[CK_GEMM_TIMING] %s: %.3f ms (M=%d N=%d K=%d)\n", step, ms, M, N, K);
+            }
+            t_step_start = t_step_end;
+        };
+        
         if (M <= 0 || N <= 0 || K <= 0)
             return true;
 
@@ -1253,6 +1280,7 @@ extern "C"
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_cached] CK NoScale GEMM failed\n");
             return false;
         }
+        log_timing("CK_executeNoScale");
 
         // 2. Apply scales: E_fp32[m,n] = C_int32[m,n] * scale_A[m] * scale_B[n]
         const int total = M * N;
@@ -1270,6 +1298,14 @@ extern "C"
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_cached] applyScales_kernel failed: %s\n",
                     hipGetErrorString(err));
             return false;
+        }
+        log_timing("applyScales_kernel_launch");
+        
+        // Log total time
+        auto t_total_end = std::chrono::high_resolution_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+        if (total_ms > 1.0) {
+            fprintf(stderr, "[CK_GEMM_TIMING] TOTAL: %.3f ms (M=%d N=%d K=%d)\n", total_ms, M, N, K);
         }
 
         return true;
@@ -1491,6 +1527,19 @@ extern "C"
         int N, int K,
         int rocm_device_id)
     {
+        auto t_total_start = std::chrono::high_resolution_clock::now();
+        auto t_step_start = t_total_start;
+        auto t_step_end = t_total_start;
+        
+        auto log_timing = [&](const char* step) {
+            t_step_end = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t_step_end - t_step_start).count();
+            if (ms > 0.5) {
+                fprintf(stderr, "[CK_GEMM_TIMING] %s: %.3f ms (M=%d N=%d K=%d)\n", step, ms, M, N, K);
+            }
+            t_step_start = t_step_end;
+        };
+        
         if (M <= 0 || N <= 0 || K <= 0)
             return true;
 
@@ -1507,6 +1556,7 @@ extern "C"
         }
 
         hipError_t err;
+        log_timing("param_validation");
 
         // 1. Zero-initialize the padded activation buffer (padding rows will be zeros)
         err = hipMemsetAsync(d_A_padded, 0, static_cast<size_t>(padded_m) * K * sizeof(int8_t), nullptr);
@@ -1516,6 +1566,7 @@ extern "C"
                     hipGetErrorString(err));
             return false;
         }
+        log_timing("hipMemsetAsync_A_padded");
 
         // Copy actual activations into first M rows (async)
         err = hipMemcpyAsync(d_A_padded, d_A_int8, static_cast<size_t>(M) * K * sizeof(int8_t), 
@@ -1526,6 +1577,7 @@ extern "C"
                     hipGetErrorString(err));
             return false;
         }
+        log_timing("hipMemcpyAsync_A_to_padded");
 
         // 2. Copy actual scales and fill padding with 1.0 (neutral scale)
         err = hipMemcpyAsync(d_scale_A_padded, d_scale_A, static_cast<size_t>(M) * sizeof(float), 
@@ -1536,13 +1588,27 @@ extern "C"
                     hipGetErrorString(err));
             return false;
         }
+        log_timing("hipMemcpyAsync_scales");
 
-        // Fill padding scales with 1.0 on host then copy (small buffer, ok to sync)
+        // Fill padding scales with 1.0 - use async copy to avoid blocking on previous work
         if (padded_m > M)
         {
-            std::vector<float> padding_scales(padded_m - M, 1.0f);
-            err = hipMemcpy(d_scale_A_padded + M, padding_scales.data(),
-                           (padded_m - M) * sizeof(float), hipMemcpyHostToDevice);
+            // Use a static buffer for the padding scales to avoid repeated allocation
+            static thread_local std::vector<float> padding_scales;
+            size_t padding_count = static_cast<size_t>(padded_m - M);
+            if (padding_scales.size() < padding_count)
+            {
+                padding_scales.resize(padding_count, 1.0f);
+            }
+            else
+            {
+                // Ensure all values are 1.0 (they should be from initial resize, but be safe)
+                std::fill(padding_scales.begin(), padding_scales.begin() + padding_count, 1.0f);
+            }
+            
+            // Use async copy to avoid blocking - small buffer (<1KB for padded_m=128)
+            err = hipMemcpyAsync(d_scale_A_padded + M, padding_scales.data(),
+                           padding_count * sizeof(float), hipMemcpyHostToDevice, nullptr);
             if (err != hipSuccess)
             {
                 fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to fill padding scales: %s\n",
@@ -1550,6 +1616,7 @@ extern "C"
                 return false;
             }
         }
+        log_timing("fill_padding_scales");
 
         // 3. Run CK INT8 GEMM on padded dimensions: C_int32 = A_padded × B (no scaling)
         if (!rocmQuantGemm_executeNoScale(d_A_padded, d_B_int8, d_C_int32, padded_m, N, K, rocm_device_id))
@@ -1557,6 +1624,7 @@ extern "C"
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] CK NoScale GEMM failed\n");
             return false;
         }
+        log_timing("CK_executeNoScale");
 
         // 4. Apply scales to full padded output: E_padded[m,n] = C_int32[m,n] * scale_A_padded[m] * scale_B[n]
         const int total_padded = padded_m * N;
@@ -1575,6 +1643,7 @@ extern "C"
                     hipGetErrorString(err));
             return false;
         }
+        log_timing("applyScales_kernel_launch");
 
         // 5. Extract first M rows of padded output to actual output (async)
         //    E_fp32[M × N] = E_padded[0:M, :]
@@ -1585,6 +1654,14 @@ extern "C"
             fprintf(stderr, "[rocmQuantGemm_executeTwoKernel_padded_cached] Failed to extract output: %s\n",
                     hipGetErrorString(err));
             return false;
+        }
+        log_timing("hipMemcpyAsync_extract_output");
+        
+        // Log total time
+        auto t_total_end = std::chrono::high_resolution_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+        if (total_ms > 1.0) {
+            fprintf(stderr, "[CK_GEMM_TIMING] TOTAL: %.3f ms (M=%d N=%d K=%d)\n", total_ms, M, N, K);
         }
 
         // No cleanup needed - buffers are caller-owned!
@@ -1964,14 +2041,7 @@ extern "C"
             return false;
         }
 
-        err = hipDeviceSynchronize();
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_applyScaling] hipDeviceSynchronize failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-
+        // No sync needed - coherence system handles sync when data is read
         return true;
     }
 
@@ -2026,14 +2096,7 @@ extern "C"
             return false;
         }
 
-        err = hipDeviceSynchronize();
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_biasAdd] hipDeviceSynchronize failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-
+        // No sync needed - coherence system handles sync when data is read
         return true;
     }
 

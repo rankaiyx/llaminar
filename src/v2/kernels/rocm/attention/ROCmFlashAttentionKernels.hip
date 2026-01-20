@@ -1031,11 +1031,5 @@ extern "C"
         return hipSetDevice(device_idx) == hipSuccess ? 0 : -1;
     }
 
-    /**
-     * @brief Synchronize HIP device
-     */
-    int hipFlashAttn_synchronize()
-    {
-        return hipDeviceSynchronize() == hipSuccess ? 0 : -1;
-    }
+    // hipFlashAttn_synchronize() removed - caller manages coherence via events
 }

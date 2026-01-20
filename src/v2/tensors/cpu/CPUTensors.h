@@ -804,7 +804,8 @@ namespace llaminar2
          *   - device_valid_ = true (device just got written to)
          *   - host_valid_ = false (host is now stale) -- UNLESS tensor is mapped
          *
-         * For mapped tensors, both host and device stay valid since they share memory.
+         * For mapped tensors, both host and device stay valid since they share memory,
+         * but we set mapped_needs_sync_ so ensureOnHost() knows to synchronize.
          */
         virtual void mark_device_dirty()
         {
@@ -812,6 +813,11 @@ namespace llaminar2
             // For mapped memory, host is ALSO valid since they share the same memory
             // For non-mapped memory, host is now stale
             host_valid_ = is_mapped_;
+            // For mapped memory: signal that sync is needed before CPU reads
+            if (is_mapped_)
+            {
+                mapped_needs_sync_ = true;
+            }
         }
 
         /**
@@ -1367,6 +1373,11 @@ namespace llaminar2
         bool is_mapped_ = false;            // True if using mapped memory
         void *mapped_device_ptr_ = nullptr; // Device-visible pointer for mapped host memory
         void *mapped_host_ptr_ = nullptr;   // Host-visible pointer for mapped memory
+
+        // For mapped memory: tracks whether GPU has written since last sync.
+        // Set to true by mark_device_dirty(), cleared by ensureOnHost() after sync.
+        // This avoids redundant hipDeviceSynchronize() calls.
+        bool mapped_needs_sync_ = false;
 
         /**
          * @brief Initialize mapped memory for this tensor (protected helper)

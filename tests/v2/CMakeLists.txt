@@ -3099,6 +3099,27 @@ add_v2_test(V2_Perf_CoherenceTransferOverhead
     MPI_PROCS 1  # Benchmarks run locally, no MPI needed
 )
 
+# CUDA Event Synchronization Tests
+# =============================================================================
+# Tests for CUDA event-based synchronization in the backend.
+# Validates that waitForEvent() uses cudaEventSynchronize() instead of
+# cudaDeviceSynchronize(), which is essential for snapshot capture performance.
+
+add_executable(v2_integration_cuda_event_synchronization
+    integration/Test__CUDAEventSynchronization.cpp
+)
+target_link_libraries(v2_integration_cuda_event_synchronization
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_CUDAEventSynchronization
+    COMMAND $<TARGET_FILE:v2_integration_cuda_event_synchronization>
+    LABELS "V2;Integration;CUDA;Backend;EventSync;Coherence;Performance"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added CUDA Event Synchronization tests")
+
 # Test: CUDA GEMM Parity (FP32 and IQ4_NL: CUDA vs CPU kernel comparison)
 # Tests CUDAFloatingPointGemmKernel and CUDAQuantisedGemmKernel through KernelFactory
 # with cosine similarity metrics against CPU reference kernels
@@ -5575,6 +5596,23 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel performance benchmarks")
 
+    # Performance Test: CK GEMM Isolation Test
+    # Isolated test to reproduce and characterize CK GEMM performance issues
+    add_executable(v2_perf_rocm_ck_gemm_isolation
+        performance/Perf__ROCmCKGemmIsolation.cpp
+    )
+    target_link_libraries(v2_perf_rocm_ck_gemm_isolation 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmCKGemmIsolation
+        COMMAND $<TARGET_FILE:v2_perf_rocm_ck_gemm_isolation>
+        LABELS "V2;Performance;ROCm;GEMM;INT8;ComposableKernel;gfx906;Isolation;Debug"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added CK GEMM isolation performance test")
+
     # NOTE: FP16 vs INT8 benchmark removed (January 2026) - INT8 proven faster for all sizes.
     # Results documented in changelog/2026-01-10-rocm-int8-gemm-optimization.md
 
@@ -5765,4 +5803,25 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm ResidualAdd parity tests")
+
+    # ROCm Event Synchronization Tests
+    # =============================================================================
+    # Critical regression test for event-based synchronization fix.
+    # Validates that waitForEvent() uses hipEventSynchronize() instead of
+    # hipStreamSynchronize(), which is essential for snapshot capture performance.
+
+    add_executable(v2_integration_rocm_event_synchronization
+        integration/Test__ROCmEventSynchronization.cpp
+    )
+    target_link_libraries(v2_integration_rocm_event_synchronization
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmEventSynchronization
+        COMMAND $<TARGET_FILE:v2_integration_rocm_event_synchronization>
+        LABELS "V2;Integration;ROCm;Backend;EventSync;Coherence;Performance;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Event Synchronization tests")
 endif()

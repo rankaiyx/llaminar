@@ -630,7 +630,16 @@ namespace llaminar2::test::parity
             inf_config.batch_size = 1;
             inf_config.force_graph = true;
 
-            runner_ = createInferenceRunner(model_ctx_, nullptr, getDevice(), inf_config);
+            // Enable mapped memory for GPU devices to avoid slow D2H syncs during snapshot capture
+            // This works for both CUDA and ROCm - mapped memory enables zero-copy host access
+            DeviceId device = getDevice();
+            if (device.is_gpu())
+            {
+                inf_config.use_mapped_memory = true;
+                LOG_INFO("[" << getBackendName() << " Parity] Enabling mapped memory for GPU snapshot capture");
+            }
+
+            runner_ = createInferenceRunner(model_ctx_, nullptr, device, inf_config);
             if (!runner_)
             {
                 LOG_ERROR("[Parity] Failed to create inference runner");

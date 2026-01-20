@@ -1071,15 +1071,57 @@ namespace llaminar2
 
     bool CPUTensorBase::ensureOnHost()
     {
-        // ===== ZERO-COPY MAPPED MEMORY FAST PATH =====
+        // ===== ZERO-COPY MAPPED MEMORY PATH =====
         // If tensor uses mapped memory, host and device share the same memory.
-        // No memcpy needed - data is already visible to host.
+        // No memcpy needed, BUT we still need to synchronize if GPU wrote to buffer.
+        // The GPU writes through PCIe; host can only read after kernel completes.
+        //
+        // We use EVENT-BASED sync instead of hipDeviceSynchronize() because
+        // hipDeviceSynchronize is extremely slow on ROCm (~1-10 seconds!).
+        // Event waiting is much faster as it only waits for the specific kernel.
         if (is_mapped_)
         {
+            // Only synchronize if GPU has written since last sync
+            if (mapped_needs_sync_ && gpu_device_.has_value())
+            {
+                IBackend *backend = getBackendForDevice(*gpu_device_);
+                if (backend)
+                {
+                    int backend_device_id = gpu_device_->gpu_ordinal();
+
+                    auto t0 = std::chrono::high_resolution_clock::now();
+
+                    // Use event-based sync if we have a completion event (much faster than device sync)
+                    if (device_completion_event_)
+                    {
+                        LOG_TRACE("[CPUTensorBase::ensureOnHost] ZERO-COPY: Waiting on completion event");
+                        if (!backend->waitForEvent(device_completion_event_, backend_device_id))
+                        {
+                            LOG_WARN("[CPUTensorBase::ensureOnHost] Event wait failed for mapped tensor");
+                            // Don't fall back to device sync - it's too slow on ROCm
+                        }
+                    }
+                    else
+                    {
+                        // No event recorded - this shouldn't happen if mark_device_dirty_with_event was called
+                        LOG_WARN("[CPUTensorBase::ensureOnHost] ZERO-COPY: No completion event, using stream sync");
+                        backend->synchronize(backend_device_id);
+                    }
+
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    auto elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    if (elapsed_ms > 1.0)
+                    {
+                        LOG_WARN("[CPUTensorBase::ensureOnHost] MAPPED SYNC took " << elapsed_ms << " ms"
+                                                                                   << " (event=" << (device_completion_event_ ? "yes" : "NO") << ")");
+                    }
+                }
+                mapped_needs_sync_ = false; // Sync complete, won't sync again until next GPU write
+            }
+
             // Both host and device are always valid for mapped memory
             host_valid_ = true;
             device_valid_ = true;
-            LOG_TRACE("[CPUTensorBase::ensureOnHost] ZERO-COPY: Tensor is mapped, no memcpy needed");
             return true;
         }
 
@@ -1152,6 +1194,12 @@ namespace llaminar2
         // For mapped memory, both host and device stay valid
         device_valid_ = true;
         host_valid_ = is_mapped_; // Mapped memory: host is also valid
+
+        // For mapped memory: signal that sync is needed before CPU reads
+        if (is_mapped_)
+        {
+            mapped_needs_sync_ = true;
+        }
 
         // If we have a device, record an event for fine-grained sync
         if (gpu_device_.has_value())

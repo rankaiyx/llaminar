@@ -89,8 +89,7 @@ namespace llaminar2
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             bool ok = hipOps_rope_fp32(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
                                        head_dim, rope_theta, dev);
-            if (ok)
-                hipDeviceSynchronize();
+            // Removed hipDeviceSynchronize() - caller manages coherence via events
             return ok;
         }
 
@@ -124,8 +123,7 @@ namespace llaminar2
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             bool ok = hipOps_rope_bf16(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
                                        head_dim, rope_theta, dev);
-            if (ok)
-                hipDeviceSynchronize();
+            // Removed hipDeviceSynchronize() - caller manages coherence via events
             return ok;
         }
 
@@ -159,8 +157,7 @@ namespace llaminar2
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             bool ok = hipOps_rope_fp16(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
                                        head_dim, rope_theta, dev);
-            if (ok)
-                hipDeviceSynchronize();
+            // Removed hipDeviceSynchronize() - caller manages coherence via events
             return ok;
         }
 

@@ -18,6 +18,7 @@
 #include "../utils/DebugEnv.h"
 #include "../utils/MPIContext.h"
 #include "../tensors/TensorFactory.h"
+#include "../tensors/cpu/CPUTensors.h" // For FP32Tensor::createMapped()
 #include "../kernels/cpu/CPUKVCache.h"
 #include "../kernels/KernelFactory.h"
 #include "../interfaces/IWorkspaceConsumer.h"
@@ -286,9 +287,20 @@ namespace llaminar2
             return false;
         }
 
+        // Configure buffer manager with mapped memory for GPU + snapshot scenarios
+        // Mapped memory enables zero-copy host access (avoids slow hipMemcpy/cudaMemcpy syncs)
+        // This benefits both CUDA and ROCm backends equally
+        GraphBufferManagerConfig buffer_config;
+        bool use_mapped = state_.device_id.is_gpu() && snapshot_enabled_;
+        if (use_mapped)
+        {
+            buffer_config.use_mapped_memory = true;
+            LOG_INFO("[GraphOrchestrator] Enabling mapped memory for GPU + snapshot mode (zero-copy host access)");
+        }
+
         // Create buffer manager with TensorFactory
         buffer_manager_ = std::make_unique<GraphBufferManager>(
-            tensor_factory_, mpi_ctx_.get());
+            tensor_factory_, mpi_ctx_.get(), buffer_config);
 
         // Build layer buffer specifications using BufferAllocator
         auto layer_reqs = BufferAllocator::resolveLayerBuffers(schema, resolver_config);
@@ -1073,7 +1085,8 @@ namespace llaminar2
     bool GraphOrchestrator::initializeInferenceState(
         int batch_size,
         int max_seq_len,
-        DeviceId device)
+        DeviceId device,
+        const InferenceStateInitConfig &init_config)
     {
         if (!graph_builder_)
         {
@@ -1120,6 +1133,15 @@ namespace llaminar2
         // Create tensor factory
         TensorFactory factory(*local_mpi_ctx);
 
+        // Enable mapped memory allocation for GPU tensors when requested
+        // This enables zero-copy host access for all FP32 GPU tensors, avoiding slow memcpy syncs
+        // Works for both CUDA and ROCm backends (cudaHostAllocMapped / hipHostMallocMapped)
+        if (init_config.use_mapped_memory && device.is_gpu())
+        {
+            factory.setUseMappedMemoryForGPU(true);
+            LOG_INFO("[GraphOrchestrator] Enabling mapped memory for ALL GPU tensors (zero-copy host access)");
+        }
+
         // Get activation precision from config
         ActivationPrecision act_prec = config.activation_precision;
         LOG_INFO("[GraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
@@ -1128,9 +1150,23 @@ namespace llaminar2
         state_.hidden = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device);
-        state_.logits = factory.createFP32(
-            {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
-            device);
+
+        // Logits ALWAYS use mapped memory on GPU devices (regardless of init_config)
+        // because logits are returned to the caller for sampling - they must be host-accessible.
+        // Mapped memory avoids the slow synchronous hipMemcpy/cudaMemcpy in ensureOnHost().
+        if (device.is_gpu())
+        {
+            state_.logits = FP32Tensor::createMapped(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
+                device);
+            LOG_INFO("[GraphOrchestrator] Allocated logits with mapped memory (zero-copy for sampling)");
+        }
+        else
+        {
+            state_.logits = factory.createFP32(
+                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
+                device);
+        }
 
         // Phase 5: Allocate local logits buffer for column-parallel LM head
         if (config.lm_head_column_parallel && config.vocab_local > 0)

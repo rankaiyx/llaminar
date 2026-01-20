@@ -321,8 +321,12 @@ namespace llaminar2
         orchestrator->initializeGraphCache(graph_config.n_layers);
 
         // Initialize inference state (allocates buffers)
+        // Pass mapped memory config for GPU zero-copy access
+        InferenceStateInitConfig init_config;
+        init_config.use_mapped_memory = config.use_mapped_memory;
+
         if (!orchestrator->initializeInferenceState(
-                config.batch_size, config.max_seq_len, device))
+                config.batch_size, config.max_seq_len, device, init_config))
         {
             LOG_ERROR("[InferenceRunner] Failed to initialize inference state");
             return nullptr;
@@ -594,8 +598,12 @@ namespace llaminar2
         orchestrator->initializeGraphCache(graph_config.n_layers);
 
         // Initialize inference state (allocates buffers)
+        // Pass mapped memory config for GPU zero-copy access
+        InferenceStateInitConfig init_config;
+        init_config.use_mapped_memory = config.use_mapped_memory;
+
         if (!orchestrator->initializeInferenceState(
-                config.batch_size, config.max_seq_len, device))
+                config.batch_size, config.max_seq_len, device, init_config))
         {
             LOG_ERROR("[InferenceRunner] Failed to initialize inference state");
             return nullptr;

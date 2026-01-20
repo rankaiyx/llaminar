@@ -244,7 +244,7 @@ extern "C"
         rocm_embedding_fp32_kernel<<<grid_size, block_size, 0, stream>>>(
             embed_data, token_ids, output, num_tokens, d_model);
 
-        hipDeviceSynchronize();
+        // No sync needed - coherence system handles sync when data is read
         return hipGetLastError();
     }
 
@@ -266,7 +266,7 @@ extern "C"
         rocm_embedding_bf16_kernel<<<grid_size, block_size, 0, stream>>>(
             embed_data, token_ids, output, num_tokens, d_model);
 
-        hipDeviceSynchronize();
+        // No sync needed - coherence system handles sync when data is read
         return hipGetLastError();
     }
 
@@ -288,7 +288,7 @@ extern "C"
         rocm_embedding_fp16_kernel<<<grid_size, block_size, 0, stream>>>(
             embed_data, token_ids, output, num_tokens, d_model);
 
-        hipDeviceSynchronize();
+        // No sync needed - coherence system handles sync when data is read
         return hipGetLastError();
     }
 
@@ -319,7 +319,7 @@ extern "C"
         rocm_embedding_q8_1_kernel<<<grid, block, 0, stream>>>(
             embed_data, token_ids, static_cast<Q8_1Block *>(output), num_tokens, d_model);
 
-        hipDeviceSynchronize();
+        // Removed hipDeviceSynchronize() - caller manages coherence via events
         return hipGetLastError();
     }
 

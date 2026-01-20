@@ -94,6 +94,35 @@ namespace llaminar2
     };
 
     /**
+     * @brief Configuration for inference state initialization
+     *
+     * Controls how buffers are allocated during initializeInferenceState().
+     */
+    struct InferenceStateInitConfig
+    {
+        /**
+         * @brief Use mapped memory for GPU tensor allocation
+         *
+         * When true and the target device is a GPU (CUDA or ROCm), FP32 activation
+         * buffers will be allocated using zero-copy mapped memory:
+         * - CUDA: cudaHostAllocMapped | cudaHostAllocWriteCombined
+         * - ROCm: hipHostMallocMapped | hipHostMallocWriteCombined
+         *
+         * This enables the host to read GPU tensor data without memcpy, which is
+         * essential for:
+         * - Snapshot capture mode (parity testing, debugging)
+         * - Any scenario where host needs frequent access to GPU tensors
+         *
+         * Tradeoffs:
+         * - Slightly slower GPU access (PCIe vs VRAM bandwidth)
+         * - But eliminates ~5-10 second sync delays for snapshot callbacks
+         *
+         * Default: false (use device memory for best GPU performance)
+         */
+        bool use_mapped_memory = false;
+    };
+
+    /**
      * @brief Inference state owned by GraphOrchestrator (Phase 5)
      *
      * This struct encapsulates all mutable inference state, allowing the
@@ -710,16 +739,17 @@ namespace llaminar2
          * Allocates all buffers needed for inference. After calling this,
          * the simplified forward() API can be used without passing buffers.
          *
-         * @param config Configuration specifying dimensions
          * @param batch_size Maximum batch size
          * @param max_seq_len Maximum sequence length
-         * @param device_idx Device for buffer allocation
+         * @param device_id Device for buffer allocation (default: CPU)
+         * @param init_config Configuration for buffer allocation (mapped memory, etc.)
          * @return true if initialization succeeded
          */
         bool initializeInferenceState(
             int batch_size,
             int max_seq_len,
-            DeviceId device_id = DeviceId::cpu());
+            DeviceId device_id = DeviceId::cpu(),
+            const InferenceStateInitConfig &init_config = InferenceStateInitConfig{});
 
         /**
          * @brief Check if inference state is initialized

@@ -1454,15 +1454,66 @@ namespace llaminar2
 
                     if (needs_padding)
                     {
-                        // For padded case, we need padded activation/scale buffers
-                        // Fall back to executeTwoKernel_padded + separate bias add
-                        success = rocmQuantGemm_executeTwoKernel_padded(
+                        // Use CACHED padded buffers (from this kernel's impl_) to avoid
+                        // hipMalloc/hipFree per call which is extremely slow on ROCm!
+                        // Ensure padding buffers are large enough
+                        const size_t padded_a_size = static_cast<size_t>(padded_m) * k;
+                        if (!impl_->using_workspace_buffers && padded_a_size > impl_->d_A_padded_capacity)
+                        {
+                            if (impl_->d_A_padded)
+                                rocmQuantGemm_freeDevice(impl_->d_A_padded);
+                            impl_->d_A_padded = nullptr;
+                            impl_->d_A_padded_capacity = 0;
+                            if (!rocmQuantGemm_allocInt8(&impl_->d_A_padded, padded_a_size, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate padded A buffer");
+                                all_success = false;
+                                break;
+                            }
+                            impl_->d_A_padded_capacity = padded_a_size;
+                        }
+
+                        const size_t padded_scale_size = static_cast<size_t>(padded_m);
+                        if (!impl_->using_workspace_buffers && padded_scale_size > impl_->d_scale_A_padded_capacity)
+                        {
+                            if (impl_->d_scale_A_padded)
+                                rocmQuantGemm_freeDevice(impl_->d_scale_A_padded);
+                            impl_->d_scale_A_padded = nullptr;
+                            impl_->d_scale_A_padded_capacity = 0;
+                            if (!rocmQuantGemm_allocFloat(&impl_->d_scale_A_padded, padded_scale_size, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate padded scale buffer");
+                                all_success = false;
+                                break;
+                            }
+                            impl_->d_scale_A_padded_capacity = padded_scale_size;
+                        }
+
+                        const size_t padded_e_size = static_cast<size_t>(padded_m) * n;
+                        if (!impl_->using_workspace_buffers && padded_e_size > impl_->d_E_padded_capacity)
+                        {
+                            if (impl_->d_E_padded)
+                                rocmQuantGemm_freeDevice(impl_->d_E_padded);
+                            impl_->d_E_padded = nullptr;
+                            impl_->d_E_padded_capacity = 0;
+                            if (!rocmQuantGemm_allocFloat(&impl_->d_E_padded, padded_e_size, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate padded E buffer");
+                                all_success = false;
+                                break;
+                            }
+                            impl_->d_E_padded_capacity = padded_e_size;
+                        }
+
+                        // Use CACHED version to avoid hipMalloc/hipFree per call!
+                        success = rocmQuantGemm_executeTwoKernel_padded_cached(
                             impl_->d_A_int8,
                             d_weights_int8,
                             d_output,
                             impl_->d_scales_A,
                             d_scales_B,
                             rocm_kernel->impl_->d_CK_int32,
+                            impl_->d_A_padded, impl_->d_scale_A_padded, impl_->d_E_padded,
                             m, padded_m, n, k, rocm_device_id_);
 
                         if (success)

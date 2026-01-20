@@ -43,7 +43,7 @@ extern "C"
     void hipFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l);
 
     int hipFlashAttn_setDevice(int device_idx);
-    int hipFlashAttn_synchronize();
+    // hipFlashAttn_synchronize() removed - caller manages coherence via events
 }
 
 namespace llaminar2
@@ -306,13 +306,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Synchronize to ensure completion
-            if (hipFlashAttn_synchronize() != 0)
-            {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Synchronization failed");
-                return false;
-            }
-
+            // Removed hipFlashAttn_synchronize() - caller manages coherence via events
             return true;
         }
 
