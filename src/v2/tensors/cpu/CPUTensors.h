@@ -545,8 +545,12 @@ namespace llaminar2
      * This allows concrete tensors to inherit type-safe typed_data() from TypedTensorBase
      * while still getting the full TensorBase infrastructure.
      */
+    class TensorSlice; // Forward declaration for friend
+
     class CPUTensorBase : public virtual ITensor, public std::enable_shared_from_this<CPUTensorBase>
     {
+        friend class TensorSlice; // Allow TensorSlice to access protected byte_size()/raw_host_data_ptr()
+
     public:
         virtual ~CPUTensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
 

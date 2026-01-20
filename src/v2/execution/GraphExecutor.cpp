@@ -400,8 +400,8 @@ namespace llaminar2
             auto stage_end = std::chrono::high_resolution_clock::now();
             double stage_ms = std::chrono::duration<double, std::milli>(stage_end - stage_start).count();
 
-            // Log every stage for ROCm debugging
-            LOG_INFO("[GraphExecutor] Stage " << stage_idx << "/" << order.size() << ": " << name << " took " << stage_ms << "ms");
+            // Per-stage timing - TRACE level (use LLAMINAR_EXECUTOR_PROFILING=1 for detailed stats)
+            LOG_TRACE("[GraphExecutor] Stage " << stage_idx << "/" << order.size() << ": " << name << " took " << stage_ms << "ms");
             stage_idx++;
 
             graph.markCompleted(name);
@@ -421,7 +421,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[GraphExecutor] Total execution: " << total_ms << "ms for " << order.size() << " stages (" << (total_ms / order.size()) << "ms/stage avg)");
+        LOG_DEBUG("[GraphExecutor] Total execution: " << total_ms << "ms for " << order.size() << " stages (" << (total_ms / order.size()) << "ms/stage avg)");
 
         stats_.total_time_ms += total_ms;
         stats_.total_stages_executed += order.size();

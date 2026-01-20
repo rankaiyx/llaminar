@@ -355,6 +355,19 @@ public:
          */
         std::vector<size_t> get_devices_by_type(ComputeBackendType type) const;
 
+        /**
+         * @brief Get the backend-specific device ID for the N-th device of a given type
+         *
+         * This is useful for NUMA-aware device selection. When user specifies "rocm:0",
+         * this method returns the actual HIP device ordinal of the first NUMA-local ROCm
+         * device, which may differ from 0 if the rank is on NUMA node 1.
+         *
+         * @param type Backend type (e.g., GPU_ROCM)
+         * @param local_index Index into the filtered list of devices of this type (0-based)
+         * @return The backend-specific device_id, or -1 if index out of range
+         */
+        int get_device_id_for_type(ComputeBackendType type, int local_index) const;
+
     private:
         DeviceManager() = default;
 

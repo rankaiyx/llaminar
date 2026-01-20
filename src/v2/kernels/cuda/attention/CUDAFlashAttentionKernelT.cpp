@@ -9,6 +9,8 @@
  */
 
 #include "CUDAFlashAttentionKernelT.h"
+#include "../../../execution/DeviceWorkspaceManager.h"
+#include "../../../execution/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include <cstring>
 
@@ -74,7 +76,8 @@ namespace llaminar2
               partial_m_buf_(other.partial_m_buf_),
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
-              max_splits_(other.max_splits_)
+              max_splits_(other.max_splits_),
+              workspace_(other.workspace_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -82,6 +85,7 @@ namespace llaminar2
             other.partial_l_buf_ = nullptr;
             other.workspace_size_ = 0;
             other.max_splits_ = 0;
+            other.workspace_ = nullptr;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32> &
@@ -98,6 +102,7 @@ namespace llaminar2
                 partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
+                workspace_ = other.workspace_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -105,6 +110,7 @@ namespace llaminar2
                 other.partial_l_buf_ = nullptr;
                 other.workspace_size_ = 0;
                 other.max_splits_ = 0;
+                other.workspace_ = nullptr;
             }
             return *this;
         }
@@ -392,6 +398,69 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // FP32 IWorkspaceConsumer Interface Implementation
+        // =====================================================================
+
+        WorkspaceRequirements CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspaceRequirements(
+            int m, int n, int k) const
+        {
+            WorkspaceRequirements reqs;
+
+            // Default parameters for Flash Decoding workspace sizing
+            // Conservative estimates for maximum expected configuration
+            const int batch_size = (m > 0) ? m : 1;
+            const int n_heads = (n > 0) ? n : 128;     // Max expected heads
+            const int head_dim = (k > 0) ? k : 128;    // Max expected head dim
+            const int num_splits = DEFAULT_NUM_SPLITS; // 8 splits
+
+            // partial_output: [batch × n_heads × num_splits × head_dim] FP32
+            size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
+
+            // partial_m: [batch × n_heads × num_splits] FP32 (max scores per split)
+            size_t partial_m_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+
+            // partial_l: [batch × n_heads × num_splits] FP32 (logsumexp per split)
+            size_t partial_l_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
+
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
+            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
+
+            LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
+                      << "batch=" << batch_size << " n_heads=" << n_heads << " head_dim=" << head_dim
+                      << " num_splits=" << num_splits
+                      << " => partial_output=" << (partial_output_bytes / 1024) << "KB"
+                      << ", partial_m=" << partial_m_bytes << "B"
+                      << ", partial_l=" << partial_l_bytes << "B");
+
+            return reqs;
+        }
+
+        void CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::bindWorkspace(
+            DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            if (workspace)
+            {
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Bound workspace manager, entering managed mode");
+            }
+            else
+            {
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Unbound workspace, returning to legacy mode");
+            }
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspace() const
+        {
+            return workspace_;
+        }
+
+        // =====================================================================
         // FP16 Specialization Implementation (stub - delegates to FP32)
         // =====================================================================
 
@@ -415,12 +484,14 @@ namespace llaminar2
               partial_m_buf_(other.partial_m_buf_),
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
-              max_splits_(other.max_splits_)
+              max_splits_(other.max_splits_),
+              workspace_(other.workspace_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
             other.partial_m_buf_ = nullptr;
             other.partial_l_buf_ = nullptr;
+            other.workspace_ = nullptr;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16> &
@@ -437,10 +508,12 @@ namespace llaminar2
                 partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
+                workspace_ = other.workspace_;
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
                 other.partial_m_buf_ = nullptr;
                 other.partial_l_buf_ = nullptr;
+                other.workspace_ = nullptr;
             }
             return *this;
         }
@@ -573,6 +646,42 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // FP16 IWorkspaceConsumer Interface Implementation
+        // =====================================================================
+
+        WorkspaceRequirements CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::getWorkspaceRequirements(
+            int m, int n, int k) const
+        {
+            // Delegate to FP32 implementation (same workspace requirements)
+            CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            return fp32_kernel.getWorkspaceRequirements(m, n, k);
+        }
+
+        void CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::bindWorkspace(
+            DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            if (workspace)
+            {
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Bound workspace manager, entering managed mode");
+            }
+            else
+            {
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Unbound workspace, returning to legacy mode");
+            }
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::getWorkspace() const
+        {
+            return workspace_;
+        }
+
+        // =====================================================================
         // BF16 Specialization Implementation (stub - delegates to FP32)
         // =====================================================================
 
@@ -596,12 +705,14 @@ namespace llaminar2
               partial_m_buf_(other.partial_m_buf_),
               partial_l_buf_(other.partial_l_buf_),
               workspace_size_(other.workspace_size_),
-              max_splits_(other.max_splits_)
+              max_splits_(other.max_splits_),
+              workspace_(other.workspace_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
             other.partial_m_buf_ = nullptr;
             other.partial_l_buf_ = nullptr;
+            other.workspace_ = nullptr;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16> &
@@ -618,10 +729,12 @@ namespace llaminar2
                 partial_l_buf_ = other.partial_l_buf_;
                 workspace_size_ = other.workspace_size_;
                 max_splits_ = other.max_splits_;
+                workspace_ = other.workspace_;
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
                 other.partial_m_buf_ = nullptr;
                 other.partial_l_buf_ = nullptr;
+                other.workspace_ = nullptr;
             }
             return *this;
         }
@@ -749,6 +862,42 @@ namespace llaminar2
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
                                               head_start, local_n_heads, local_n_kv_heads);
+        }
+
+        // =====================================================================
+        // BF16 IWorkspaceConsumer Interface Implementation
+        // =====================================================================
+
+        WorkspaceRequirements CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::getWorkspaceRequirements(
+            int m, int n, int k) const
+        {
+            // Delegate to FP32 implementation (same workspace requirements)
+            CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            return fp32_kernel.getWorkspaceRequirements(m, n, k);
+        }
+
+        void CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::bindWorkspace(
+            DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            if (workspace)
+            {
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Bound workspace manager, entering managed mode");
+            }
+            else
+            {
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Unbound workspace, returning to legacy mode");
+            }
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::getWorkspace() const
+        {
+            return workspace_;
         }
 
     } // namespace cuda

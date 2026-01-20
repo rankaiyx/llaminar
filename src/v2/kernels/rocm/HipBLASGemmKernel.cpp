@@ -16,8 +16,9 @@
 // to avoid std:: namespace conflicts in HIP template metaprogramming
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>  // For __half and __float2half
+#include <hip/hip_fp16.h> // For __half and __float2half
 #include <hipblas/hipblas.h>
+#include <hipblaslt/hipblaslt.h> // For fused GEMM+bias
 #endif
 
 #include "HipBLASGemmKernel.h"
@@ -40,37 +41,50 @@ namespace llaminar2
         // Helper macros for error checking
         // =====================================================================
 
-#define HIPBLAS_CHECK(call)                                                      \
-    do                                                                           \
-    {                                                                            \
-        hipblasStatus_t status = call;                                           \
-        if (status != HIPBLAS_STATUS_SUCCESS)                                    \
-        {                                                                        \
-            HIP_LOG_ERROR("[HipBLASGemmKernel] hipBLAS error: " << status            \
-                                                           << " at " << __FILE__ \
-                                                           << ":" << __LINE__);  \
-            return false;                                                        \
-        }                                                                        \
+#define HIPBLAS_CHECK(call)                                                           \
+    do                                                                                \
+    {                                                                                 \
+        hipblasStatus_t status = call;                                                \
+        if (status != HIPBLAS_STATUS_SUCCESS)                                         \
+        {                                                                             \
+            HIP_LOG_ERROR("[HipBLASGemmKernel] hipBLAS error: " << status             \
+                                                                << " at " << __FILE__ \
+                                                                << ":" << __LINE__);  \
+            return false;                                                             \
+        }                                                                             \
     } while (0)
 
-#define HIP_CHECK(call)                                                           \
-    do                                                                            \
-    {                                                                             \
-        hipError_t err = call;                                                    \
-        if (err != hipSuccess)                                                    \
-        {                                                                         \
+#define HIPBLASLT_CHECK(call)                                                           \
+    do                                                                                  \
+    {                                                                                   \
+        hipblasStatus_t status = call;                                                  \
+        if (status != HIPBLAS_STATUS_SUCCESS)                                           \
+        {                                                                               \
+            HIP_LOG_ERROR("[HipBLASGemmKernel] hipBLASLt error: " << status             \
+                                                                  << " at " << __FILE__ \
+                                                                  << ":" << __LINE__);  \
+            return false;                                                               \
+        }                                                                               \
+    } while (0)
+
+#define HIP_CHECK(call)                                                               \
+    do                                                                                \
+    {                                                                                 \
+        hipError_t err = call;                                                        \
+        if (err != hipSuccess)                                                        \
+        {                                                                             \
             HIP_LOG_ERROR("[HipBLASGemmKernel] HIP error: " << hipGetErrorString(err) \
-                                                        << " at " << __FILE__     \
-                                                        << ":" << __LINE__);      \
-            return false;                                                         \
-        }                                                                         \
+                                                            << " at " << __FILE__     \
+                                                            << ":" << __LINE__);      \
+            return false;                                                             \
+        }                                                                             \
     } while (0)
 
         // =====================================================================
         // Constructor / Destructor
         // =====================================================================
 
-        HipBLASGemmKernel::HipBLASGemmKernel(const DeviceId& device_id, Precision precision)
+        HipBLASGemmKernel::HipBLASGemmKernel(const DeviceId &device_id, Precision precision)
             : device_id_(device_id), precision_(precision)
         {
             if (device_id.type != DeviceType::ROCm)
@@ -97,18 +111,35 @@ namespace llaminar2
                     std::string("[HipBLASGemmKernel] Failed to create hipBLAS handle: ") +
                     std::to_string(static_cast<int>(hipblas_err)));
             }
-            handle_ = static_cast<void*>(temp_handle);
+            handle_ = static_cast<void *>(temp_handle);
+
+            // Create hipBLASLt handle for fused operations (e.g., GEMM + bias)
+            hipblasLtHandle_t temp_lt_handle = nullptr;
+            hipblasStatus_t lt_err = hipblasLtCreate(&temp_lt_handle);
+            if (lt_err != HIPBLAS_STATUS_SUCCESS)
+            {
+                hipblasDestroy(temp_handle);
+                throw std::runtime_error(
+                    std::string("[HipBLASGemmKernel] Failed to create hipBLASLt handle: ") +
+                    std::to_string(static_cast<int>(lt_err)));
+            }
+            lt_handle_ = static_cast<void *>(temp_lt_handle);
 
             // Note: hipBLAS doesn't have explicit Tensor Core mode like cuBLAS
             // It will automatically use the best available math mode
 
             HIP_LOG_DEBUG("[HipBLASGemmKernel] Created on device " << device_id_.to_string()
-                                                               << " with precision "
-                                                               << static_cast<int>(precision_));
+                                                                   << " with precision "
+                                                                   << static_cast<int>(precision_));
         }
 
         HipBLASGemmKernel::~HipBLASGemmKernel()
         {
+            if (lt_handle_)
+            {
+                hipblasLtDestroy(static_cast<hipblasLtHandle_t>(lt_handle_));
+                lt_handle_ = nullptr;
+            }
             if (handle_)
             {
                 hipblasDestroy(static_cast<hipblasHandle_t>(handle_));
@@ -119,10 +150,12 @@ namespace llaminar2
         // Move constructor
         HipBLASGemmKernel::HipBLASGemmKernel(HipBLASGemmKernel &&other) noexcept
             : handle_(other.handle_),
+              lt_handle_(other.lt_handle_),
               device_id_(other.device_id_),
               precision_(other.precision_)
         {
             other.handle_ = nullptr;
+            other.lt_handle_ = nullptr;
         }
 
         // Move assignment
@@ -130,14 +163,20 @@ namespace llaminar2
         {
             if (this != &other)
             {
+                if (lt_handle_)
+                {
+                    hipblasLtDestroy(static_cast<hipblasLtHandle_t>(lt_handle_));
+                }
                 if (handle_)
                 {
                     hipblasDestroy(static_cast<hipblasHandle_t>(handle_));
                 }
                 handle_ = other.handle_;
+                lt_handle_ = other.lt_handle_;
                 device_id_ = other.device_id_;
                 precision_ = other.precision_;
                 other.handle_ = nullptr;
+                other.lt_handle_ = nullptr;
             }
             return *this;
         }
@@ -222,6 +261,163 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // GEMM with Fused Bias (using hipBLASLt)
+        // =====================================================================
+
+        bool HipBLASGemmKernel::execute_with_bias(
+            const float *d_A, const float *d_B, float *d_C,
+            const float *d_bias,
+            int M, int N, int K,
+            bool transA, bool transB,
+            float alpha, float beta)
+        {
+            if (!lt_handle_)
+            {
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_with_bias] hipBLASLt handle is null");
+                return false;
+            }
+
+            // Ensure we're on the correct device
+            hipError_t hip_err = hipSetDevice(device_id_.ordinal);
+            if (hip_err != hipSuccess)
+            {
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_with_bias] Failed to set device: " << hipGetErrorString(hip_err));
+                return false;
+            }
+
+            hipblasLtHandle_t ltHandle = static_cast<hipblasLtHandle_t>(lt_handle_);
+
+            // Create operation descriptors
+            hipblasLtMatmulDesc_t operationDesc = nullptr;
+            hipblasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
+            hipblasLtMatmulPreference_t preference = nullptr;
+
+            // =================================================================
+            // Create operation descriptor with epilogue
+            // =================================================================
+
+            HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&operationDesc,
+                                                      HIPBLAS_COMPUTE_32F,
+                                                      HIP_R_32F));
+
+            // Set transpose operations - same logic as for cuBLASLt
+            hipblasOperation_t opA = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+            hipblasOperation_t opB = transB ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+
+            HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                            HIPBLASLT_MATMUL_DESC_TRANSA,
+                                                            &opB, sizeof(opB)));
+            HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                            HIPBLASLT_MATMUL_DESC_TRANSB,
+                                                            &opA, sizeof(opA)));
+
+            // Set epilogue with bias
+            hipblasLtEpilogue_t epilogue = HIPBLASLT_EPILOGUE_BIAS;
+            HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                            HIPBLASLT_MATMUL_DESC_EPILOGUE,
+                                                            &epilogue, sizeof(epilogue)));
+
+            // Set bias pointer
+            HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(operationDesc,
+                                                            HIPBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                                            &d_bias, sizeof(d_bias)));
+
+            // =================================================================
+            // Create matrix layouts
+            // =================================================================
+
+            int lda = K;
+            int ldb = transB ? K : N;
+            int ldc = N;
+
+            // Similar to cuBLASLt: we swap A and B for row-major handling
+            if (transB)
+            {
+                // B[N×K] row-major → hipBLASLt sees [K×N] col-major
+                HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&Adesc, HIP_R_32F, K, N, ldb));
+            }
+            else
+            {
+                // B[K×N] row-major → hipBLASLt sees [N×K] col-major
+                HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&Adesc, HIP_R_32F, N, K, ldb));
+            }
+
+            // Create layout for "B" in hipBLASLt call (which is our A[M×K])
+            HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&Bdesc, HIP_R_32F, K, M, lda));
+
+            // Create layout for C (and D): C[M×N] row-major → [N×M] col-major
+            HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&Cdesc, HIP_R_32F, N, M, ldc));
+
+            // =================================================================
+            // Set up algorithm heuristics
+            // =================================================================
+
+            HIPBLASLT_CHECK(hipblasLtMatmulPreferenceCreate(&preference));
+
+            // Request workspace
+            size_t workspaceSize = 4 * 1024 * 1024; // 4MB workspace
+            void *workspace = nullptr;
+            HIP_CHECK(hipMalloc(&workspace, workspaceSize));
+
+            HIPBLASLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(preference,
+                                                                  HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                                  &workspaceSize, sizeof(workspaceSize)));
+
+            // Get best algorithm
+            int returnedResults = 0;
+            hipblasLtMatmulHeuristicResult_t heuristicResult = {};
+            HIPBLASLT_CHECK(hipblasLtMatmulAlgoGetHeuristic(ltHandle,
+                                                            operationDesc,
+                                                            Adesc, Bdesc, Cdesc, Cdesc,
+                                                            preference,
+                                                            1, &heuristicResult, &returnedResults));
+
+            if (returnedResults == 0)
+            {
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_with_bias] No suitable algorithm found");
+                hipFree(workspace);
+                hipblasLtMatmulPreferenceDestroy(preference);
+                hipblasLtMatrixLayoutDestroy(Cdesc);
+                hipblasLtMatrixLayoutDestroy(Bdesc);
+                hipblasLtMatrixLayoutDestroy(Adesc);
+                hipblasLtMatmulDescDestroy(operationDesc);
+                return false;
+            }
+
+            // =================================================================
+            // Execute the matmul with fused bias
+            // =================================================================
+
+            hipblasStatus_t status = hipblasLtMatmul(ltHandle,
+                                                     operationDesc,
+                                                     &alpha,
+                                                     d_B, Adesc, // A in hipBLASLt = our B
+                                                     d_A, Bdesc, // B in hipBLASLt = our A
+                                                     &beta,
+                                                     d_C, Cdesc, // C
+                                                     d_C, Cdesc, // D (output, same as C)
+                                                     &heuristicResult.algo,
+                                                     workspace, workspaceSize,
+                                                     0); // stream = 0 (default)
+
+            // Cleanup
+            hipFree(workspace);
+            hipblasLtMatmulPreferenceDestroy(preference);
+            hipblasLtMatrixLayoutDestroy(Cdesc);
+            hipblasLtMatrixLayoutDestroy(Bdesc);
+            hipblasLtMatrixLayoutDestroy(Adesc);
+            hipblasLtMatmulDescDestroy(operationDesc);
+
+            if (status != HIPBLAS_STATUS_SUCCESS)
+            {
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_with_bias] hipblasLtMatmul failed: " << status);
+                return false;
+            }
+
+            return true;
+        }
+
+        // =====================================================================
         // FP16 GEMM Implementation
         // =====================================================================
 
@@ -275,7 +471,7 @@ namespace llaminar2
         // =====================================================================
 
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
-            const DeviceId& device_id,
+            const DeviceId &device_id,
             HipBLASGemmKernel::Precision precision)
         {
             return std::make_unique<HipBLASGemmKernel>(device_id, precision);
@@ -286,7 +482,7 @@ namespace llaminar2
             DeviceKernelCache::registerFactory(
                 DeviceType::ROCm,
                 KernelType::BLAS_GEMM,
-                [](const DeviceId& device) -> std::unique_ptr<IDeviceKernel>
+                [](const DeviceId &device) -> std::unique_ptr<IDeviceKernel>
                 {
                     return std::make_unique<HipBLASGemmKernel>(device);
                 });
@@ -297,7 +493,7 @@ namespace llaminar2
 
         // Stub implementations when ROCm is not available
 
-        HipBLASGemmKernel::HipBLASGemmKernel(const DeviceId& device_id, Precision precision)
+        HipBLASGemmKernel::HipBLASGemmKernel(const DeviceId &device_id, Precision precision)
             : device_id_(device_id), precision_(precision)
         {
             throw std::runtime_error("[HipBLASGemmKernel] ROCm support not compiled");
@@ -316,6 +512,15 @@ namespace llaminar2
             return false;
         }
 
+        bool HipBLASGemmKernel::execute_with_bias(
+            const float *, const float *, float *,
+            const float *,
+            int, int, int,
+            bool, bool, float, float)
+        {
+            return false;
+        }
+
         bool HipBLASGemmKernel::execute_fp16(
             const void *, const void *, void *,
             int, int, int,
@@ -324,7 +529,7 @@ namespace llaminar2
             return false;
         }
 
-        std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(const DeviceId&, HipBLASGemmKernel::Precision)
+        std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(const DeviceId &, HipBLASGemmKernel::Precision)
         {
             return nullptr;
         }

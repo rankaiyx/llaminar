@@ -284,6 +284,7 @@ namespace llaminar2
              * @param transpose_B Whether weights are transposed (ignored, always true)
              * @param alpha Scale factor for result
              * @param beta Scale for existing C (accumulate if != 0)
+             * @param bias Optional bias tensor [n] to add after GEMM (nullptr = no bias)
              * @param mpi_ctx MPI context (unused for ROCm kernel)
              * @param device_idx Device index (unused, kernel bound to rocm_device_id_)
              * @param workspace Pre-allocated device workspace (nullptr = kernel allocates)
@@ -294,6 +295,7 @@ namespace llaminar2
                 const TensorBase *A, TensorBase *C,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr) override;
@@ -308,6 +310,7 @@ namespace llaminar2
                 int m, int n, int k,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr) override;

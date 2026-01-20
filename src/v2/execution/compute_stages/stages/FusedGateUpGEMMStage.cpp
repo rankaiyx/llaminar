@@ -72,14 +72,14 @@ namespace llaminar2
         // Get the target device type from device_id
         DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
-        LOG_INFO("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
-                                                                      << " up=" << (void *)w_up_base << " device=" << static_cast<int>(target_dev_type));
+        LOG_DEBUG("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
+                                                                       << " up=" << (void *)w_up_base << " device=" << static_cast<int>(target_dev_type));
 
         // Get fused Gate/Up kernel from KernelFactory
         auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
             w_gate_base, w_up_base, target_dev_type);
 
-        LOG_INFO("[FusedGateUpGEMMStage] Got fused_kernel=" << (void *)fused_kernel);
+        LOG_DEBUG("[FusedGateUpGEMMStage] Got fused_kernel=" << (void *)fused_kernel);
 
         if (!fused_kernel)
         {

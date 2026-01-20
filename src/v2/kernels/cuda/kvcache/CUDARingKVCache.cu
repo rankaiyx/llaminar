@@ -13,6 +13,8 @@
  */
 
 #include "CUDARingKVCache.h"
+#include "../../../execution/DeviceWorkspaceManager.h"
+#include "../../../execution/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -641,16 +643,41 @@ namespace llaminar2
         int *kv_lens, int max_kv_len,
         int num_seqs, cudaStream_t stream)
     {
-        // Allocate device arrays for kernel
-        DataT **d_k_caches;
-        DataT **d_v_caches;
-        int *d_tails;
-        int *d_counts;
+        // Device arrays for kernel
+        DataT **d_k_caches = nullptr;
+        DataT **d_v_caches = nullptr;
+        int *d_tails = nullptr;
+        int *d_counts = nullptr;
+        bool using_workspace = false;
 
-        cudaMalloc(&d_k_caches, num_seqs * sizeof(DataT *));
-        cudaMalloc(&d_v_caches, num_seqs * sizeof(DataT *));
-        cudaMalloc(&d_tails, num_seqs * sizeof(int));
-        cudaMalloc(&d_counts, num_seqs * sizeof(int));
+        if (hasWorkspace())
+        {
+            // Use pre-allocated workspace buffers (fast path)
+            d_k_caches = static_cast<DataT **>(
+                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_K_PTRS));
+            d_v_caches = static_cast<DataT **>(
+                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_V_PTRS));
+            d_tails = static_cast<int *>(
+                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_TAILS));
+            d_counts = static_cast<int *>(
+                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_COUNTS));
+
+            if (d_k_caches && d_v_caches && d_tails && d_counts)
+            {
+                using_workspace = true;
+                LOG_TRACE("[CUDARingKVCache] Using workspace buffers for gather, num_seqs=" << num_seqs);
+            }
+        }
+
+        if (!using_workspace)
+        {
+            // Fallback to per-call allocation (backward compatibility)
+            LOG_TRACE("[CUDARingKVCache] Fallback to per-call allocation for gather, num_seqs=" << num_seqs);
+            cudaMalloc(&d_k_caches, num_seqs * sizeof(DataT *));
+            cudaMalloc(&d_v_caches, num_seqs * sizeof(DataT *));
+            cudaMalloc(&d_tails, num_seqs * sizeof(int));
+            cudaMalloc(&d_counts, num_seqs * sizeof(int));
+        }
 
         // Prepare host arrays
         std::vector<DataT *> h_k_caches(num_seqs);
@@ -686,11 +713,14 @@ namespace llaminar2
             d_tails, d_counts,
             num_seqs, max_kv_len, max_seq_len_, kv_dim_);
 
-        // Free temporary device arrays
-        cudaFreeAsync(d_k_caches, stream);
-        cudaFreeAsync(d_v_caches, stream);
-        cudaFreeAsync(d_tails, stream);
-        cudaFreeAsync(d_counts, stream);
+        // Free temporary device arrays only if we allocated them
+        if (!using_workspace)
+        {
+            cudaFreeAsync(d_k_caches, stream);
+            cudaFreeAsync(d_v_caches, stream);
+            cudaFreeAsync(d_tails, stream);
+            cudaFreeAsync(d_counts, stream);
+        }
     }
 
     template <ActivationPrecision Precision>
@@ -728,6 +758,79 @@ namespace llaminar2
         {
             clear_sequence(layer, seq);
         }
+    }
+
+    // =========================================================================
+    // IWorkspaceConsumer Implementation
+    // =========================================================================
+
+    template <ActivationPrecision Precision>
+    WorkspaceRequirements CUDARingKVCache<Precision>::getWorkspaceRequirements(
+        int m, int n, int k) const
+    {
+        // m = batch size (number of sequences in gather operation)
+        // n, k unused for KV cache
+        // Default to batch_size_ if m is 0
+        (void)n;
+        (void)k;
+
+        const int actual_batch_size = (m > 0) ? m : batch_size_;
+
+        WorkspaceRequirements reqs;
+
+        // Buffer for K cache pointers: DataT* per sequence
+        reqs.buffers.push_back({
+            KVCacheWorkspaceBuffers::BATCH_K_PTRS,
+            static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+            256,  // Alignment
+            false // Not required - fallback to per-call allocation
+        });
+
+        // Buffer for V cache pointers: DataT* per sequence
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_V_PTRS,
+                                static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+                                256,
+                                false});
+
+        // Buffer for tail indices: int per sequence
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_TAILS,
+                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                256,
+                                false});
+
+        // Buffer for count values: int per sequence
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_COUNTS,
+                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                256,
+                                false});
+
+        LOG_DEBUG("[CUDARingKVCache] Workspace requirements: batch_size="
+                  << actual_batch_size
+                  << " BATCH_K_PTRS=" << actual_batch_size * sizeof(DataT *)
+                  << " BATCH_V_PTRS=" << actual_batch_size * sizeof(DataT *)
+                  << " BATCH_TAILS=" << actual_batch_size * sizeof(int)
+                  << " BATCH_COUNTS=" << actual_batch_size * sizeof(int));
+
+        return reqs;
+    }
+
+    template <ActivationPrecision Precision>
+    void CUDARingKVCache<Precision>::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        workspace_ = workspace;
+        LOG_DEBUG("[CUDARingKVCache] Workspace bound: " << (workspace ? "yes" : "no"));
+    }
+
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::hasWorkspace() const
+    {
+        return workspace_ != nullptr;
+    }
+
+    template <ActivationPrecision Precision>
+    DeviceWorkspaceManager *CUDARingKVCache<Precision>::getWorkspace() const
+    {
+        return workspace_;
     }
 
     // =========================================================================

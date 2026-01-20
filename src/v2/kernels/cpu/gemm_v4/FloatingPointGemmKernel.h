@@ -63,7 +63,7 @@ namespace llaminar2
         // ========== OneDNN GEMM Primitives ==========
 
         /**
-         * @brief Execute FP32 matrix multiplication using OneDNN
+         * @brief Execute FP32 matrix multiplication using OneDNN with optional fused bias
          *
          * @param A Input matrix A [M, K] (FP32, row-major)
          * @param B Input matrix B [K, N] or [N, K] if transpose_B (FP32)
@@ -74,6 +74,7 @@ namespace llaminar2
          * @param transpose_B Whether B is transposed (stored as [N, K])
          * @param alpha Scale factor for A*B
          * @param beta Scale factor for existing C (for accumulation)
+         * @param bias Optional bias vector [N] to fuse into GEMM (nullptr = no bias)
          * @return true on success
          */
         inline bool run_onednn_fp32_matmul(const float *A,
@@ -84,7 +85,8 @@ namespace llaminar2
                                            int K,
                                            bool transpose_B,
                                            float alpha = 1.0f,
-                                           float beta = 0.0f)
+                                           float beta = 0.0f,
+                                           const float *bias = nullptr)
         {
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
@@ -98,6 +100,14 @@ namespace llaminar2
                 auto src_md = dnnl::memory::desc(src_dims, dt::f32, tag::ab);
                 auto weight_md = dnnl::memory::desc(weight_dims, dt::f32, transpose_B ? tag::ba : tag::ab);
                 auto dst_md = dnnl::memory::desc(dst_dims, dt::f32, tag::ab);
+
+                // Optional bias descriptor - shape [1, N] for broadcast across rows
+                dnnl::memory::desc bias_md;
+                if (bias)
+                {
+                    dnnl::memory::dims bias_dims = {1, N};
+                    bias_md = dnnl::memory::desc(bias_dims, dt::f32, tag::ab);
+                }
 
                 dnnl::primitive_attr attr;
                 dnnl::post_ops ops;
@@ -114,7 +124,10 @@ namespace llaminar2
                 }
                 attr.set_post_ops(ops);
 
-                dnnl::matmul::primitive_desc matmul_pd(onednn_engine(), src_md, weight_md, dst_md, attr);
+                // Create primitive descriptor with or without bias
+                dnnl::matmul::primitive_desc matmul_pd = bias
+                                                             ? dnnl::matmul::primitive_desc(onednn_engine(), src_md, weight_md, bias_md, dst_md, attr)
+                                                             : dnnl::matmul::primitive_desc(onednn_engine(), src_md, weight_md, dst_md, attr);
 
                 dnnl::memory src_mem(src_md, onednn_engine(), const_cast<float *>(A));
                 dnnl::memory weight_mem(weight_md, onednn_engine(), const_cast<float *>(B));
@@ -124,6 +137,13 @@ namespace llaminar2
                 args.insert({DNNL_ARG_SRC, src_mem});
                 args.insert({DNNL_ARG_WEIGHTS, weight_mem});
                 args.insert({DNNL_ARG_DST, dst_mem});
+
+                // Add bias memory if provided
+                if (bias)
+                {
+                    dnnl::memory bias_mem(bias_md, onednn_engine(), const_cast<float *>(bias));
+                    args.insert({DNNL_ARG_BIAS, bias_mem});
+                }
 
                 dnnl::matmul(matmul_pd).execute(onednn_stream(), args);
                 onednn_stream().wait();
@@ -909,6 +929,7 @@ namespace llaminar2
                 const TensorBase *A, TensorBase *C,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr) override
@@ -939,6 +960,9 @@ namespace llaminar2
                     return false;
                 }
 
+                // Extract bias pointer (FP32 fused bias only for now)
+                const float *bias_ptr = bias ? bias->data() : nullptr;
+
                 switch (weight_type_)
                 {
                 case TensorType::FP32:
@@ -946,7 +970,8 @@ namespace llaminar2
                     const float *A_data = A->data();
                     float *C_data = C->mutable_data();
                     const float *B_data = weight_tensor_->data();
-                    return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                    // OneDNN FP32 matmul supports fused bias natively
+                    return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
                 }
 
                 case TensorType::FP16:
@@ -961,6 +986,11 @@ namespace llaminar2
                     const uint16_t *A_data = A_fp16->typed_data();
                     const uint16_t *B_data = B_fp16->typed_data();
                     float *C_data = C->mutable_data();
+                    // TODO: Add fused bias support for FP16 matmul
+                    if (bias_ptr)
+                    {
+                        LOG_WARN("[FloatingPointGemmKernel] Bias not yet supported for FP16 GEMM");
+                    }
                     return run_onednn_fp16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
                 }
 
@@ -976,6 +1006,11 @@ namespace llaminar2
                     const uint16_t *A_data = A_bf16->typed_data();
                     const uint16_t *B_data = B_bf16->typed_data();
                     float *C_data = C->mutable_data();
+                    // TODO: Add fused bias support for BF16 matmul
+                    if (bias_ptr)
+                    {
+                        LOG_WARN("[FloatingPointGemmKernel] Bias not yet supported for BF16 GEMM");
+                    }
                     return run_onednn_bf16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
                 }
 
@@ -999,6 +1034,7 @@ namespace llaminar2
              * @param transpose_B Whether B is transposed (typical: true for weights)
              * @param alpha Scale factor
              * @param beta Accumulate factor
+             * @param bias Optional bias tensor [n] to add after GEMM (nullptr = no bias)
              * @param mpi_ctx MPI context
              * @param device_idx Device index
              *
@@ -1009,6 +1045,7 @@ namespace llaminar2
                 int m, int n, int k,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr) override
@@ -1033,6 +1070,9 @@ namespace llaminar2
                     return false;
                 }
 
+                // Extract bias pointer (FP32 fused bias only for now)
+                const float *bias_ptr = bias ? bias->data() : nullptr;
+
                 switch (weight_type_)
                 {
                 case TensorType::FP32:
@@ -1040,7 +1080,8 @@ namespace llaminar2
                     const float *A_data = A->data();
                     float *C_data = C->mutable_data();
                     const float *B_data = weight_tensor_->data();
-                    return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                    // OneDNN FP32 matmul supports fused bias natively
+                    return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
                 }
 
                 case TensorType::FP16:
@@ -1055,6 +1096,11 @@ namespace llaminar2
                     const uint16_t *A_data = A_fp16->typed_data();
                     const uint16_t *B_data = B_fp16->typed_data();
                     float *C_data = C->mutable_data();
+                    // TODO: Add fused bias support for FP16 matmul
+                    if (bias_ptr)
+                    {
+                        LOG_WARN("[FloatingPointGemmKernel] Bias not yet supported for FP16 GEMM");
+                    }
                     return run_onednn_fp16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
                 }
 
@@ -1070,6 +1116,11 @@ namespace llaminar2
                     const uint16_t *A_data = A_bf16->typed_data();
                     const uint16_t *B_data = B_bf16->typed_data();
                     float *C_data = C->mutable_data();
+                    // TODO: Add fused bias support for BF16 matmul
+                    if (bias_ptr)
+                    {
+                        LOG_WARN("[FloatingPointGemmKernel] Bias not yet supported for BF16 GEMM");
+                    }
                     return run_onednn_bf16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
                 }
 

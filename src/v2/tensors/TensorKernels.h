@@ -381,6 +381,7 @@ namespace llaminar2
          * @param transpose_B Whether B (packed weights) is transposed (typical: true)
          * @param alpha Scale factor for A@B
          * @param beta Scale factor for existing C (for fused add)
+         * @param bias Optional bias tensor [n] to add after GEMM (nullptr = no bias)
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
          * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
@@ -394,6 +395,7 @@ namespace llaminar2
             const TensorBase *A, TensorBase *C,
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
+            const TensorBase *bias = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr)
@@ -405,6 +407,7 @@ namespace llaminar2
             (void)transpose_B;
             (void)alpha;
             (void)beta;
+            (void)bias;
             (void)mpi_ctx;
             (void)device_idx;
             (void)workspace;
@@ -427,6 +430,7 @@ namespace llaminar2
          * @param transpose_B Whether B (packed weights) is transposed (typical: true)
          * @param alpha Scale factor for A@B
          * @param beta Scale factor for existing C (for fused add)
+         * @param bias Optional bias tensor [n] to add after GEMM (nullptr = no bias)
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
          * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
@@ -438,6 +442,7 @@ namespace llaminar2
             int m, int n, int k,
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
+            const TensorBase *bias = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr)
@@ -451,6 +456,7 @@ namespace llaminar2
             (void)transpose_B;
             (void)alpha;
             (void)beta;
+            (void)bias;
             (void)mpi_ctx;
             (void)device_idx;
             (void)workspace;
@@ -661,13 +667,14 @@ namespace llaminar2
 
                 // Use tensor-aware multiply - kernel handles device placement
                 // Note: Must pass transpose_B explicitly before alpha/beta to match signature:
-                //   multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, workspace)
+                //   multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, mpi_ctx, device_idx, workspace)
                 bool success = proj.kernel->multiply_tensor(
                     input, proj.output,
                     m, proj.n, k,
-                    true, // transpose_B (weights are [K,N] stored as [N,K] transposed)
-                    1.0f, // alpha
-                    0.0f, // beta
+                    true,      // transpose_B (weights are [K,N] stored as [N,K] transposed)
+                    1.0f,      // alpha
+                    0.0f,      // beta
+                    proj.bias, // bias tensor (may be nullptr)
                     mpi_ctx,
                     -1, // device_idx (use default)
                     workspace);
@@ -677,7 +684,7 @@ namespace llaminar2
                     return false;
                 }
 
-                // Note: bias and SwiGLU fusion not handled in default implementation
+                // Note: SwiGLU fusion not handled in default implementation
                 // Optimized implementations should handle these in fused manner
             }
             return true;

@@ -549,7 +549,7 @@ namespace llaminar2
                     auto elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                     if (elapsed_ms > 1.0)
                     {
-                        LOG_WARN("[StageDumpInfo::ensureOutputsOnHost] '" << output.name << "' took " << elapsed_ms << " ms");
+                        LOG_TRACE("[StageDumpInfo::ensureOutputsOnHost] '" << output.name << "' took " << elapsed_ms << " ms");
                     }
                     // Update data pointer after sync (may have changed)
                     output.data = cpu_tensor->raw_data();

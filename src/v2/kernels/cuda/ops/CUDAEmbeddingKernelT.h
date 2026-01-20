@@ -7,6 +7,14 @@
  *
  * Supports FP32 embedding tables with FP32 output.
  *
+ * ## Workspace Support (REQUIRED)
+ *
+ * Implements IWorkspaceConsumer for allocation-free hot-path execution.
+ * **Workspace MUST be bound via bindWorkspace() before calling apply_tensor().**
+ * The workspace provides pre-allocated buffers from DeviceWorkspaceManager.
+ *
+ * Without a bound workspace, apply_tensor() will return false with an error.
+ *
  * @author David Sanftenberg
  */
 
@@ -14,14 +22,20 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 
 namespace llaminar2
 {
 
     /**
      * @brief CUDA implementation of embedding kernel for FP32
+     *
+     * ## Workspace Support (REQUIRED)
+     *
+     * Implements IWorkspaceConsumer for allocation-free hot-path execution.
+     * **Workspace MUST be bound via bindWorkspace() before calling apply_tensor().**
      */
-    class CUDAEmbeddingKernelT : public ITensorEmbedding
+    class CUDAEmbeddingKernelT : public ITensorEmbedding, public IWorkspaceConsumer
     {
     public:
         explicit CUDAEmbeddingKernelT(int device_idx = 0) : device_idx_(device_idx) {}
@@ -102,8 +116,53 @@ namespace llaminar2
                 .withScalar("d_model", "embedding dimension", KernelBufferDtype::INT32);
         }
 
+        // =========================================================================
+        // IWorkspaceConsumer Interface
+        // =========================================================================
+
+        /**
+         * @brief Get workspace requirements for embedding lookup
+         *
+         * Returns buffers needed for embedding:
+         * - embed_token_ids [max_seq_len]: INT32 token IDs on GPU
+         * - embed_table_temp [vocab_size × d_model]: FP32 temp buffer for non-GPU embed tables
+         *
+         * @param m Maximum sequence length (num_tokens)
+         * @param n Not used (pass 0)
+         * @param k d_model dimension (embedding dimension)
+         * @return WorkspaceRequirements describing all needed buffers
+         *
+         * @note For embed_table_temp, vocab_size is estimated as 151936 (Qwen2 vocab).
+         *       Actual vocab size may be smaller; the buffer will be sufficient.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m, int n = 0, int k = 0) const override;
+
+        /**
+         * @brief Bind workspace manager (REQUIRED for apply_tensor)
+         *
+         * **MUST be called before apply_tensor().** After binding, the kernel uses
+         * pre-allocated buffers from the workspace manager for allocation-free execution.
+         *
+         * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
+         */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+        /**
+         * @brief Check if a workspace is currently bound
+         */
+        bool hasWorkspace() const override;
+
+        /**
+         * @brief Get the currently bound workspace manager
+         */
+        DeviceWorkspaceManager *getWorkspace() const override;
+
     private:
         int device_idx_ = 0;
+
+        // IWorkspaceConsumer state
+        DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
     };
 
     // Convenience alias

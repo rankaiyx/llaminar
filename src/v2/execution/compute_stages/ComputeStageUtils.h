@@ -67,7 +67,7 @@ namespace llaminar2
         if (!tensor)
             return nullptr;
         auto *base = dynamic_cast<TensorBase *>(tensor);
-        LLAMINAR_ASSERTF(base, name << " must be a CPU TensorBase (GPU not yet supported)");
+        LLAMINAR_ASSERTF(base, name << " must derive from TensorBase");
         return base;
     }
 
@@ -83,7 +83,7 @@ namespace llaminar2
         if (!tensor)
             return nullptr;
         auto *base = dynamic_cast<const TensorBase *>(tensor);
-        LLAMINAR_ASSERTF(base, name << " must be a CPU TensorBase (GPU not yet supported)");
+        LLAMINAR_ASSERTF(base, name << " must derive from TensorBase");
         return base;
     }
 

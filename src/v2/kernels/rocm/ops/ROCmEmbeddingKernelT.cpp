@@ -297,11 +297,11 @@ namespace llaminar2
         // =====================================================================
         // Step 4: Launch kernel with GPU pointers
         // =====================================================================
-        LOG_INFO("[ROCmEmbeddingKernelT] Launching kernel: d_embed=" << static_cast<void *>(d_embed)
-                                                                     << " d_token_ids=" << static_cast<void *>(d_token_ids)
-                                                                     << " d_output=" << static_cast<void *>(d_output)
-                                                                     << " num_tokens=" << num_tokens << " d_model=" << d_model
-                                                                     << " dev=" << dev);
+        LOG_DEBUG("[ROCmEmbeddingKernelT] Launching kernel: d_embed=" << static_cast<void *>(d_embed)
+                                                                      << " d_token_ids=" << static_cast<void *>(d_token_ids)
+                                                                      << " d_output=" << static_cast<void *>(d_output)
+                                                                      << " num_tokens=" << num_tokens << " d_model=" << d_model
+                                                                      << " dev=" << dev);
 
         err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model, nullptr);
 

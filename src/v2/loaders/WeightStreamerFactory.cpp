@@ -35,7 +35,7 @@ namespace llaminar2
             // Create config from environment variables
             StreamingConfig config = createStreamingConfigFromEnv();
 
-            LOG_INFO("[WeightStreamerFactory] Creating LayerWeightStreamer (streaming mode)");
+            LOG_DEBUG("[WeightStreamerFactory] Creating LayerWeightStreamer (streaming mode)");
             LOG_DEBUG("[WeightStreamerFactory]   num_layers=" << num_layers);
             LOG_DEBUG("[WeightStreamerFactory]   gpu_memory_budget="
                       << (config.gpu_memory_budget / (1024 * 1024)) << " MB");
@@ -79,7 +79,7 @@ namespace llaminar2
                     std::to_string(num_layers));
             }
 
-            LOG_INFO("[WeightStreamerFactory] Creating LayerWeightStreamer (STREAMING mode)");
+            LOG_DEBUG("[WeightStreamerFactory] Creating LayerWeightStreamer (STREAMING mode)");
             LOG_DEBUG("[WeightStreamerFactory]   num_layers=" << num_layers);
             LOG_DEBUG("[WeightStreamerFactory]   gpu_memory_budget="
                       << (config.gpu_memory_budget / (1024 * 1024)) << " MB");

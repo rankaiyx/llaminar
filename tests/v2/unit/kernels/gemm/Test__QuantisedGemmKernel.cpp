@@ -1362,7 +1362,7 @@ TEST(Test__QuantisedGemmKernel, MultiplyTensor_WithNullWorkspace_Succeeds)
     auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
 
     // Call multiply_tensor with explicit workspace=nullptr
-    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f, nullptr, -1, nullptr);
+    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f, nullptr, nullptr, -1, nullptr);
     EXPECT_TRUE(success);
 
     // Verify output is non-zero
@@ -1411,7 +1411,7 @@ TEST(Test__QuantisedGemmKernel, MultiplyTensor_WithWorkspace_Succeeds)
     ASSERT_NE(workspace, nullptr);
 
     // Call multiply_tensor with non-null workspace (CPU kernel should accept but ignore it)
-    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f, nullptr, -1, workspace.get());
+    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), true, 1.0f, 0.0f, nullptr, nullptr, -1, workspace.get());
     EXPECT_TRUE(success);
 
     // Verify output is non-zero
@@ -1458,7 +1458,7 @@ TEST(Test__QuantisedGemmKernel, MultiplyTensorExplicitDims_WithWorkspace_Succeed
     ASSERT_NE(workspace, nullptr);
 
     // Call multiply_tensor with explicit dimensions and workspace
-    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, true, 1.0f, 0.0f, nullptr, -1, workspace.get());
+    bool success = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1, workspace.get());
     EXPECT_TRUE(success);
 
     // Verify output is non-zero

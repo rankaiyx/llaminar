@@ -16,6 +16,8 @@
 #include "CUDAEmbeddingKernelT.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../backends/DeviceId.h"
+#include "../../../execution/DeviceWorkspaceManager.h"
+#include "../../../execution/WorkspaceDescriptor.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -737,26 +739,35 @@ namespace llaminar2
 
         // Determine target CUDA device
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
-        DeviceId target_device = DeviceId::cuda(dev);
+        (void)dev; // Used below for device selection if needed
 
         // =====================================================================
-        // Step 1: Allocate and copy token_ids to GPU
+        // Step 1: Get token_ids buffer from workspace and copy data
         // =====================================================================
         int *d_token_ids = nullptr;
         size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
-        cudaError_t err = cudaMalloc(&d_token_ids, token_bytes);
-        if (err != cudaSuccess)
+
+        if (!hasWorkspace())
         {
-            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to allocate GPU memory for token_ids: %s\n",
-                    cudaGetErrorString(err));
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Workspace not bound - hot-path allocation disabled. "
+                            "Call bindWorkspace() before apply_tensor()\n");
             return false;
         }
-        err = cudaMemcpy(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice);
+
+        // Use pre-allocated workspace buffer (workspace is required)
+        d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        if (!d_token_ids)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Workspace buffer '%s' not found\n",
+                    EmbeddingWorkspaceBuffers::TOKEN_IDS);
+            return false;
+        }
+
+        cudaError_t err = cudaMemcpy(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice);
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy token_ids to GPU: %s\n",
                     cudaGetErrorString(err));
-            cudaFree(d_token_ids);
             return false;
         }
 
@@ -767,7 +778,6 @@ namespace llaminar2
         if (!d_output)
         {
             fprintf(stderr, "[CUDAEmbeddingKernelT] Output GPU pointer is null\n");
-            cudaFree(d_token_ids);
             return false;
         }
 
@@ -775,7 +785,6 @@ namespace llaminar2
         // Step 3: Get or upload embedding table to GPU
         // =====================================================================
         float *d_embed = nullptr;
-        bool need_free_embed = false;
 
         // Check if embed_table is FP32 and on GPU
         auto *embed_fp32 = dynamic_cast<const FP32Tensor *>(embed_table);
@@ -786,17 +795,17 @@ namespace llaminar2
         }
         else
         {
-            // Slow path: Need to copy dequantized embedding data to GPU
+            // Slow path: Need to copy dequantized embedding data to GPU using workspace
             size_t vocab_size = embed_table->rows();
             size_t embed_dim = static_cast<size_t>(d_model);
             size_t embed_bytes = vocab_size * embed_dim * sizeof(float);
 
-            err = cudaMalloc(&d_embed, embed_bytes);
-            if (err != cudaSuccess)
+            // Use pre-allocated workspace buffer (workspace is required)
+            d_embed = static_cast<float *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE));
+            if (!d_embed)
             {
-                fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to allocate GPU memory for embeddings: %s\n",
-                        cudaGetErrorString(err));
-                cudaFree(d_token_ids);
+                fprintf(stderr, "[CUDAEmbeddingKernelT] Workspace buffer '%s' not found\n",
+                        EmbeddingWorkspaceBuffers::EMBED_TABLE);
                 return false;
             }
 
@@ -805,11 +814,8 @@ namespace llaminar2
             {
                 fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy embeddings to GPU: %s\n",
                         cudaGetErrorString(err));
-                cudaFree(d_embed);
-                cudaFree(d_token_ids);
                 return false;
             }
-            need_free_embed = true;
         }
 
         // =====================================================================
@@ -817,16 +823,62 @@ namespace llaminar2
         // =====================================================================
         bool result = apply(d_embed, d_token_ids, num_tokens, d_model, d_output, mpi_ctx, device_idx);
 
-        // =====================================================================
-        // Step 5: Cleanup temporary GPU buffers
-        // =====================================================================
-        if (need_free_embed)
-        {
-            cudaFree(d_embed);
-        }
-        cudaFree(d_token_ids);
+        // No cleanup needed - workspace buffers are managed by DeviceWorkspaceManager
 
         return result;
+    }
+
+    // =============================================================================
+    // IWorkspaceConsumer Interface Implementation
+    // =============================================================================
+
+    WorkspaceRequirements CUDAEmbeddingKernelT::getWorkspaceRequirements(
+        int m, int n, int k) const
+    {
+        (void)n; // Unused for embedding
+
+        WorkspaceRequirements reqs;
+
+        // Buffer 1: Token IDs [max_seq_len × sizeof(int)]
+        // m is the maximum sequence length
+        size_t token_ids_bytes = static_cast<size_t>(m) * sizeof(int);
+        reqs.buffers.push_back({
+            EmbeddingWorkspaceBuffers::TOKEN_IDS,
+            token_ids_bytes,
+            256, // Alignment for CUDA
+            true // Required
+        });
+
+        // Buffer 2: Embedding table temp [vocab_size × d_model × sizeof(float)]
+        // Used when embedding table is not already on GPU (quantized tables)
+        // Use conservative estimates: vocab_size = 151936 (Qwen2), d_model = k
+        // If k not provided, use 896 (Qwen2.5-0.5B d_model)
+        constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
+        size_t d_model_size = (k > 0) ? static_cast<size_t>(k) : 896;
+        size_t embed_table_bytes = DEFAULT_VOCAB_SIZE * d_model_size * sizeof(float);
+        reqs.buffers.push_back({
+            EmbeddingWorkspaceBuffers::EMBED_TABLE,
+            embed_table_bytes,
+            256, // Alignment for CUDA
+            true // Required - needed for quantized embedding tables
+        });
+
+        return reqs;
+    }
+
+    void CUDAEmbeddingKernelT::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        workspace_ = workspace;
+    }
+
+    bool CUDAEmbeddingKernelT::hasWorkspace() const
+    {
+        return workspace_ != nullptr && workspace_->isAllocated();
+    }
+
+    DeviceWorkspaceManager *CUDAEmbeddingKernelT::getWorkspace() const
+    {
+        return workspace_;
     }
 
 } // namespace llaminar2

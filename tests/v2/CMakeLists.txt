@@ -302,6 +302,21 @@ add_v2_test(V2_Unit_TensorAllocateOnDevice
     MPI_PROCS 1
 )
 
+# Test: TensorByteSize - Verify byte_size() implementation for all tensor types
+# This is critical because CPUTensorBase::byte_size() throws if not overridden,
+# which causes GPU transfer failures.
+add_executable(v2_test_tensor_byte_size unit/Test__TensorByteSize.cpp)
+target_link_libraries(v2_test_tensor_byte_size 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorByteSize 
+    COMMAND $<TARGET_FILE:v2_test_tensor_byte_size>
+    LABELS "V2;Unit;TensorOperations;ByteSize;Quantization;GPU"
+    MPI_PROCS 1
+)
+
 # Test: CacheInfo - CPU cache detection and batch size optimization
 add_executable(v2_test_cache_info unit/Test__CacheInfo.cpp)
 target_link_libraries(v2_test_cache_info 
@@ -1479,6 +1494,23 @@ add_v2_test(V2_Unit_KernelFactoryTensorSliceCUDA
     COMMAND $<TARGET_FILE:v2_test_kernel_factory_tensorslice_cuda>
     LABELS "V2;Unit;Kernels;KernelFactory;TensorSlice;CUDA;TensorParallelism;Regression"
     MPI_PROCS 1  # TensorSlice tests, single rank
+)
+
+# Test: TensorSlice device coherence delegation
+# Verifies TensorSlice properly delegates coherence methods to inner tensor
+# Critical for MPI tensor parallelism where weights are wrapped in TensorSlice
+# Root cause: TensorSlice inherits from CPUTensorBase but doesn't override coherence methods
+# Solution: StageCoherence.cpp unwraps TensorSlice to access inner tensor
+add_executable(v2_test_tensorslice_coherence unit/Test__TensorSliceCoherence.cpp)
+target_link_libraries(v2_test_tensorslice_coherence
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TensorSliceCoherence
+    COMMAND $<TARGET_FILE:v2_test_tensorslice_coherence>
+    LABELS "V2;Unit;Tensors;TensorSlice;Coherence;DeviceManagement;TensorParallelism;Regression"
+    MPI_PROCS 1  # Coherence tests, single rank
 )
 
 # Test: NUMATopology NUMA detection (local node, GPU affinity) - INTEGRATION (requires real GPUs)

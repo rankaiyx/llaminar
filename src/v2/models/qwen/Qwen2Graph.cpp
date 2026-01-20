@@ -41,17 +41,17 @@ namespace llaminar2
           model_ctx_(std::move(model_ctx)),
           mpi_ctx_(std::move(mpi_ctx))
     {
-        LOG_INFO("[Qwen2Graph] Initializing (full): n_layers=" << config_.n_layers
-                                                               << " d_model=" << config_.d_model
-                                                               << " vocab_size=" << config_.vocab_size
-                                                               << " d_ff=" << config_.d_ff
-                                                               << " ffn_column_parallel=" << config_.ffn_column_parallel
-                                                               << " n_heads=" << config_.n_heads
-                                                               << " n_kv_heads=" << config_.n_kv_heads);
+        LOG_DEBUG("[Qwen2Graph] Initializing (full): n_layers=" << config_.n_layers
+                                                                << " d_model=" << config_.d_model
+                                                                << " vocab_size=" << config_.vocab_size
+                                                                << " d_ff=" << config_.d_ff
+                                                                << " ffn_column_parallel=" << config_.ffn_column_parallel
+                                                                << " n_heads=" << config_.n_heads
+                                                                << " n_kv_heads=" << config_.n_kv_heads);
 
-        LOG_INFO("[Qwen2Graph] Initialized (full) with " << config_.n_layers
-                                                         << " layers, precision="
-                                                         << activationPrecisionToString(config_.activation_precision));
+        LOG_DEBUG("[Qwen2Graph] Initialized (full) with " << config_.n_layers
+                                                          << " layers, precision="
+                                                          << activationPrecisionToString(config_.activation_precision));
     }
 
     Qwen2Graph::Qwen2Graph(const Qwen2GraphConfig &config,
@@ -61,14 +61,14 @@ namespace llaminar2
           mpi_ctx_(std::move(mpi_ctx))
     {
         // This constructor is for layer-level operations only (no model context needed)
-        LOG_INFO("[Qwen2Graph] Initializing (layer-only): d_model=" << config_.d_model
-                                                                    << " d_ff=" << config_.d_ff
-                                                                    << " ffn_column_parallel=" << config_.ffn_column_parallel
-                                                                    << " n_heads=" << config_.n_heads
-                                                                    << " n_kv_heads=" << config_.n_kv_heads
-                                                                    << " mpi_ctx=" << (mpi_ctx_ ? "valid" : "nullptr")
-                                                                    << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1)
-                                                                    << " default_device=" << config_.default_device.to_string());
+        LOG_DEBUG("[Qwen2Graph] Initializing (layer-only): d_model=" << config_.d_model
+                                                                     << " d_ff=" << config_.d_ff
+                                                                     << " ffn_column_parallel=" << config_.ffn_column_parallel
+                                                                     << " n_heads=" << config_.n_heads
+                                                                     << " n_kv_heads=" << config_.n_kv_heads
+                                                                     << " mpi_ctx=" << (mpi_ctx_ ? "valid" : "nullptr")
+                                                                     << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1)
+                                                                     << " default_device=" << config_.default_device.to_string());
 
         LOG_DEBUG("[Qwen2Graph] Initialized (layer-only)");
     }
@@ -326,7 +326,7 @@ namespace llaminar2
         lm_params.seq_len = total_tokens;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
-        lm_params.bias = nullptr; // Qwen2 has no LM head bias
+        lm_params.bias_tensor = nullptr; // Qwen2 has no LM head bias
         lm_params.device_id = config_.default_device;
 
         graph.addNode("lm_head",
@@ -637,7 +637,7 @@ namespace llaminar2
         lm_params.seq_len = total_tokens;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
-        lm_params.bias = nullptr;
+        lm_params.bias_tensor = nullptr;
         lm_params.device_id = device;
 
         graph.addNode("lm_head",

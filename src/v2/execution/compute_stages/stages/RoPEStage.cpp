@@ -42,8 +42,7 @@ namespace llaminar2
     // =============================================================================
 
     RoPEStage::RoPEStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -162,39 +161,42 @@ namespace llaminar2
             LOG_DEBUG("[RoPEStage] block_size=" << static_cast<int>(block_size)
                                                 << " kv_cache_scale=" << params_.kv_cache_scale);
 
-            // Debug: Check K_in state from GEMM (TRACE level)
-            auto *k16_in = dynamic_cast<Q16_1Tensor *>(K_base);
-            if (k16_in)
+            // Debug: Check K_in state from GEMM (TRACE level only - fp32_data() is expensive)
+            if (Logger::getInstance().shouldLog(LogLevel::TRACE))
             {
-                LOG_TRACE("[RoPEStage] K_in block_size=" << static_cast<int>(k16_in->block_size())
-                                                         << " shape=[" << k16_in->shape()[0] << "," << k16_in->shape()[1] << "]");
-                const float *k_fp32 = k16_in->fp32_data();
-                if (k_fp32)
+                auto *k16_in = dynamic_cast<Q16_1Tensor *>(K_base);
+                if (k16_in)
                 {
-                    float max_val = 0.0f;
-                    int nonzero_count = 0;
-                    for (int i = 0; i < std::min(128, static_cast<int>(k16_in->numel())); ++i)
+                    LOG_TRACE("[RoPEStage] K_in block_size=" << static_cast<int>(k16_in->block_size())
+                                                             << " shape=[" << k16_in->shape()[0] << "," << k16_in->shape()[1] << "]");
+                    const float *k_fp32 = k16_in->fp32_data();
+                    if (k_fp32)
                     {
-                        if (k_fp32[i] != 0.0f)
-                            nonzero_count++;
-                        max_val = std::max(max_val, std::fabs(k_fp32[i]));
+                        float max_val = 0.0f;
+                        int nonzero_count = 0;
+                        for (int i = 0; i < std::min(128, static_cast<int>(k16_in->numel())); ++i)
+                        {
+                            if (k_fp32[i] != 0.0f)
+                                nonzero_count++;
+                            max_val = std::max(max_val, std::fabs(k_fp32[i]));
+                        }
+                        LOG_TRACE("[RoPEStage] K_in[0:128] nonzero=" << nonzero_count
+                                                                     << " max_abs=" << max_val << " fp32[0]=" << k_fp32[0]);
                     }
-                    LOG_TRACE("[RoPEStage] K_in[0:128] nonzero=" << nonzero_count
-                                                                 << " max_abs=" << max_val << " fp32[0]=" << k_fp32[0]);
-                }
-                // Debug: Check actual block d values
-                const auto *k_typed = k16_in->typed_data();
-                if (k_typed)
-                {
-                    const int blocks_per_head = params_.head_dim / 64; // Q16_1Block_64
-                    float max_d = 0.0f;
-                    for (int b = 0; b < std::min(blocks_per_head, 4); ++b)
+                    // Debug: Check actual block d values
+                    const auto *k_typed = k16_in->typed_data();
+                    if (k_typed)
                     {
-                        max_d = std::max(max_d, std::fabs(k_typed[b].d));
+                        const int blocks_per_head = params_.head_dim / 64; // Q16_1Block_64
+                        float max_d = 0.0f;
+                        for (int b = 0; b < std::min(blocks_per_head, 4); ++b)
+                        {
+                            max_d = std::max(max_d, std::fabs(k_typed[b].d));
+                        }
+                        LOG_TRACE("[RoPEStage] K_in block d values: d[0]=" << k_typed[0].d
+                                                                           << " d[1]=" << (blocks_per_head > 1 ? k_typed[1].d : 0.0f)
+                                                                           << " max_d=" << max_d);
                     }
-                    LOG_TRACE("[RoPEStage] K_in block d values: d[0]=" << k_typed[0].d
-                                                                       << " d[1]=" << (blocks_per_head > 1 ? k_typed[1].d : 0.0f)
-                                                                       << " max_d=" << max_d);
                 }
             }
 

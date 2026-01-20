@@ -794,7 +794,7 @@ namespace llaminar2
             params.seq_len = seq_len;
             params.d_model = d_model;
             params.vocab_size = stage.int_params.count("vocab_size") ? stage.int_params.at("vocab_size") : 0;
-            params.bias = nullptr;
+            params.bias_tensor = nullptr; // TODO: Support bias from stage.inputs[2] if provided
             params.device_id = stage.device;
             return ComputeStageFactory::createLMHead(params);
         }

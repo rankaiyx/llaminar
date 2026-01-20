@@ -32,6 +32,7 @@
 
 #ifdef HAVE_CUDA
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #endif
 
 namespace llaminar2
@@ -134,6 +135,33 @@ namespace llaminar2
                 bool transA = false, bool transB = false,
                 float alpha = 1.0f, float beta = 0.0f);
 
+            /**
+             * @brief GPU GEMM with fused bias: C = alpha * A @ B + beta * C + bias
+             *
+             * Uses cuBLASLt epilogue for fused bias addition.
+             * Bias is a 1D vector of length N, broadcast across rows.
+             *
+             * @param d_A Device pointer to A [M × K]
+             * @param d_B Device pointer to B [N × K] or [K × N]
+             * @param d_C Device pointer to C [M × N]
+             * @param d_bias Device pointer to bias [N]
+             * @param M Rows in A and C
+             * @param N Columns in C (rows in B if transposed)
+             * @param K Columns in A (and B's inner dimension)
+             * @param transA Transpose A (typically false)
+             * @param transB Transpose B (typically true for weights)
+             * @param alpha Scale for A@B
+             * @param beta Scale for C
+             *
+             * @return true on success
+             */
+            bool execute_with_bias(
+                const float *d_A, const float *d_B, float *d_C,
+                const float *d_bias,
+                int M, int N, int K,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
             // Getters
             int device_id() const { return device_id_; }
             Precision precision() const { return precision_; }
@@ -141,6 +169,7 @@ namespace llaminar2
         private:
 #ifdef HAVE_CUDA
             cublasHandle_t handle_ = nullptr;
+            cublasLtHandle_t lt_handle_ = nullptr;
 #endif
             int device_id_ = 0;
             Precision precision_ = Precision::FP32;

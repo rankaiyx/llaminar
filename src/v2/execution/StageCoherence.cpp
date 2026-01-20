@@ -8,6 +8,7 @@
 #include "StageCoherence.h"
 #include "compute_stages/IComputeStage.h"
 #include "../tensors/cpu/CPUTensors.h"
+#include "../tensors/TensorSlice.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include <chrono>
@@ -41,10 +42,28 @@ namespace llaminar2
             auto *tensor_base = dynamic_cast<CPUTensorBase *>(buf.tensor);
             if (!tensor_base)
             {
-                // Tensor doesn't support coherence - skip
-                LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
-                                                     << "' does not support device coherence");
-                continue;
+                // Tensor doesn't support coherence - try to unwrap TensorSlice
+                auto *slice = dynamic_cast<TensorSlice *>(buf.tensor);
+                if (slice)
+                {
+                    // It's a TensorSlice - delegate to inner tensor
+                    tensor_base = dynamic_cast<CPUTensorBase *>(slice->inner());
+                    if (!tensor_base)
+                    {
+                        LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
+                                                             << "' is TensorSlice but inner doesn't support coherence");
+                        continue;
+                    }
+                    LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
+                                                         << "' unwrapped from TensorSlice to "
+                                                         << tensor_base->dtype_name());
+                }
+                else
+                {
+                    LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
+                                                         << "' does not support device coherence (not CPUTensorBase or TensorSlice)");
+                    continue;
+                }
             }
 
             // Check if tensor is already on device
@@ -56,6 +75,17 @@ namespace llaminar2
                                                         << "' already on " << target_device.to_string());
                 }
                 continue;
+            }
+
+            // DEBUG: Log why is_on_device returned false for weights
+            if (trace_coherence && (std::string(buf.name ? buf.name : "").find("w") == 0))
+            {
+                auto current_dev = tensor_base->current_device();
+                LOG_WARN("[StageCoherence] WEIGHT '" << (buf.name ? buf.name : "unknown")
+                                                     << "' is_on_device(" << target_device.to_string() << ") = false"
+                                                     << " | gpu_device=" << (current_dev.has_value() ? current_dev->to_string() : "none")
+                                                     << " device_valid=" << (tensor_base->is_on_device(target_device) ? "true" : "false (rechecked)")
+                                                     << " ptr=" << tensor_base);
             }
 
             // Ensure tensor is on target device

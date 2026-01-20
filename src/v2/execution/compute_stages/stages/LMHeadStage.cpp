@@ -9,7 +9,6 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include <omp.h>
 
 namespace llaminar2
 {
@@ -42,13 +41,13 @@ namespace llaminar2
             return false;
         }
 
-        // Cast ITensor* to TensorBase* for CPU operations
+        // Cast ITensor* to TensorBase* (works for both CPU and GPU tensor types)
         auto *hidden_states = requireTensorBase(params_.hidden_states, "hidden_states");
         auto *lm_head_weight = requireTensorBase(params_.lm_head_weight, "lm_head_weight");
         auto *logits = requireTensorBase(params_.logits, "logits");
         if (!hidden_states || !lm_head_weight || !logits)
         {
-            LOG_ERROR("[LMHeadStage] GPU tensors not yet supported");
+            LOG_ERROR("[LMHeadStage] Failed to cast tensors to TensorBase");
             return false;
         }
 
@@ -68,9 +67,10 @@ namespace llaminar2
             return false;
         }
 
-        // LM head: logits = hidden @ lm_head^T
+        // LM head: logits = hidden @ lm_head^T + bias
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
         // output: [seq_len, vocab_size]
+        // Bias is passed directly to GEMM kernel for fused application
         bool success = lm_gemm->multiply_tensor(
             hidden_states,
             logits,
@@ -79,6 +79,7 @@ namespace llaminar2
             params_.d_model,
             true, // transpose_B (lm_head is [vocab_size, d_model])
             1.0f, 0.0f,
+            params_.bias_tensor, // Bias fused into GEMM
             params_.mpi_ctx,
             params_.device_id.toKernelDeviceIndex());
 
@@ -86,28 +87,6 @@ namespace llaminar2
         {
             LOG_ERROR("[LMHeadStage] GEMM failed");
             return false;
-        }
-
-        // Apply bias if present
-        if (params_.bias)
-        {
-            float *logits_data = logits->mutable_data();
-            if (!logits_data)
-            {
-                LOG_ERROR("[LMHeadStage] Failed to get logits data for bias add");
-                return false;
-            }
-
-// Add bias to each row
-#pragma omp parallel for
-            for (int s = 0; s < params_.seq_len; ++s)
-            {
-                float *row = logits_data + s * params_.vocab_size;
-                for (int v = 0; v < params_.vocab_size; ++v)
-                {
-                    row[v] += params_.bias[v];
-                }
-            }
         }
 
         return true;
@@ -167,7 +146,7 @@ namespace llaminar2
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("vocab_size", params_.vocab_size);
-        info.addScalarBool("has_bias", params_.bias != nullptr);
+        info.addScalarBool("has_bias", params_.bias_tensor != nullptr);
         info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 
         return info;
@@ -198,10 +177,11 @@ namespace llaminar2
                        {static_cast<size_t>(params_.seq_len), static_cast<size_t>(params_.vocab_size)},
                        logits_type);
 
-        // Optional bias
-        if (params_.bias)
+        // Optional bias tensor
+        if (params_.bias_tensor)
         {
-            reqs.addWeight("bias", {static_cast<size_t>(params_.vocab_size)}, BufferTensorType::FP32);
+            BufferTensorType bias_type = toBufferTensorType(params_.bias_tensor->native_type());
+            reqs.addWeight("bias", {static_cast<size_t>(params_.vocab_size)}, bias_type);
         }
 
         return reqs;

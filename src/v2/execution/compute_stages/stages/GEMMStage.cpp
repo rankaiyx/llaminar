@@ -237,6 +237,7 @@ namespace llaminar2
                     params_.m, effective_n, params_.k,
                     params_.transpose_B,
                     params_.alpha, params_.beta,
+                    nullptr, // bias (not supported in GEMMStage yet)
                     params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
                     getWorkspace()); // Pass workspace from IWorkspaceConsumerStage
 
@@ -289,6 +290,7 @@ namespace llaminar2
         // Use multiply_tensor if available for type-aware dispatch
         if (gemm->multiply_tensor(A_base_fallback, C_base_fallback, params_.m, effective_n, params_.k,
                                   params_.transpose_B, params_.alpha, params_.beta,
+                                  nullptr, // bias (not supported in GEMMStage yet)
                                   params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
                                   getWorkspace())) // Pass workspace from IWorkspaceConsumerStage
         {

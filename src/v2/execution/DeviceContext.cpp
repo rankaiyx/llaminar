@@ -355,7 +355,7 @@ namespace llaminar2
         {
             LOG_ERROR("CUDADeviceContext: failed to set CUDA device " << cuda_device_id);
         }
-        LOG_INFO("CUDADeviceContext created: " << backend.deviceName(cuda_device_id));
+        LOG_DEBUG("CUDADeviceContext created: " << backend.deviceName(cuda_device_id));
     }
 
     CUDADeviceContext::~CUDADeviceContext()
@@ -480,7 +480,7 @@ namespace llaminar2
         {
             LOG_ERROR("ROCmDeviceContext: failed to set HIP device " << hip_device_id);
         }
-        LOG_INFO("ROCmDeviceContext created: " << backend.deviceName(hip_device_id));
+        LOG_DEBUG("ROCmDeviceContext created: " << backend.deviceName(hip_device_id));
     }
 
     ROCmDeviceContext::~ROCmDeviceContext()

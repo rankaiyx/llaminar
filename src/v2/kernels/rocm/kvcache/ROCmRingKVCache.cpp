@@ -130,10 +130,10 @@ namespace llaminar2
           head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(device_id),
           is_sharded_(false)
     {
-        LOG_INFO("[ROCmRingKVCache] Creating cache: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
-                 << ", precision=" << static_cast<int>(Precision));
+        LOG_DEBUG("[ROCmRingKVCache] Creating cache: "
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                  << ", precision=" << static_cast<int>(Precision));
 
         hipSetDevice(device_id_);
 
@@ -156,9 +156,9 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[ROCmRingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+        LOG_DEBUG("[ROCmRingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
     }
 
     template <ActivationPrecision Precision>
@@ -171,12 +171,12 @@ namespace llaminar2
           head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(device_id),
           is_sharded_(local_n_kv_heads != n_kv_heads)
     {
-        LOG_INFO("[ROCmRingKVCache] Creating sharded cache: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
-                 << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
-                 << ", local_kv_dim=" << kv_dim_
-                 << ", precision=" << static_cast<int>(Precision));
+        LOG_DEBUG("[ROCmRingKVCache] Creating sharded cache: "
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
+                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
+                  << ", local_kv_dim=" << kv_dim_
+                  << ", precision=" << static_cast<int>(Precision));
 
         hipSetDevice(device_id_);
 
@@ -199,9 +199,9 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[ROCmRingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+        LOG_DEBUG("[ROCmRingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
     }
 
     template <ActivationPrecision Precision>

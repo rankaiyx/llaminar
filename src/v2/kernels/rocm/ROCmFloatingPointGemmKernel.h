@@ -116,6 +116,7 @@ namespace llaminar2
                 const TensorBase *A, TensorBase *C,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr) override;
@@ -128,6 +129,7 @@ namespace llaminar2
                 int m, int n, int k,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr) override;

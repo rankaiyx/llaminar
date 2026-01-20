@@ -3561,6 +3561,7 @@ namespace llaminar
                         m, n_gate, k,
                         false,      // transpose_B
                         1.0f, 0.0f, // alpha, beta
+                        nullptr,    // bias
                         nullptr,    // mpi_ctx
                         device_idx);
 
@@ -3575,6 +3576,7 @@ namespace llaminar
                         m, n_up, k,
                         false,      // transpose_B
                         1.0f, 0.0f, // alpha, beta
+                        nullptr,    // bias
                         nullptr,    // mpi_ctx
                         device_idx);
 

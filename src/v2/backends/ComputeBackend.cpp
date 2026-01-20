@@ -298,11 +298,11 @@ namespace llaminar2
         // Log NUMA filtering mode
         if (local_numa_node >= 0)
         {
-            LOG_INFO("[DeviceManager] Initializing with NUMA node " << local_numa_node << " filtering (MPI rank mode)");
+            LOG_DEBUG("[DeviceManager] Initializing with NUMA node " << local_numa_node << " filtering (MPI rank mode)");
         }
         else
         {
-            LOG_INFO("[DeviceManager] Initializing without NUMA filtering (all devices visible)");
+            LOG_DEBUG("[DeviceManager] Initializing without NUMA filtering (all devices visible)");
         }
 
         // Always enumerate CPU first (device index 0)
@@ -327,8 +327,8 @@ namespace llaminar2
                 if (NUMATopology::isGPULocalToProcess(gpu_info.numa_node, local_numa_node))
                 {
                     filtered_cuda.push_back(dev);
-                    LOG_INFO("[DeviceManager] Including CUDA GPU " << dev.device_id
-                                                                   << " (NUMA node " << gpu_info.numa_node << ", " << gpu_info.detection_method << ")");
+                    LOG_DEBUG("[DeviceManager] Including CUDA GPU " << dev.device_id
+                                                                    << " (NUMA node " << gpu_info.numa_node << ", " << gpu_info.detection_method << ")");
                 }
                 else
                 {
@@ -361,8 +361,8 @@ namespace llaminar2
                 if (NUMATopology::isGPULocalToProcess(gpu_info.numa_node, local_numa_node))
                 {
                     filtered_rocm.push_back(dev);
-                    LOG_INFO("[DeviceManager] Including ROCm GPU " << dev.device_id
-                                                                   << " (NUMA node " << gpu_info.numa_node << ")");
+                    LOG_DEBUG("[DeviceManager] Including ROCm GPU " << dev.device_id
+                                                                    << " (NUMA node " << gpu_info.numa_node << ")");
                 }
                 else
                 {
@@ -546,8 +546,8 @@ namespace llaminar2
         // Cache context
         contexts_[device_index] = ctx;
 
-        LOG_INFO("[DeviceManager] Created context for device " << device_index
-                                                               << " (" << backend_type_name(device.type) << ")");
+        LOG_DEBUG("[DeviceManager] Created context for device " << device_index
+                                                                << " (" << backend_type_name(device.type) << ")");
 
         return ctx;
     }
@@ -581,7 +581,7 @@ namespace llaminar2
 
         // For now, always use CPU backend since GPU kernels are under development
         // All devices remain available for future heterogeneous work distribution
-        LOG_INFO("[DeviceManager] Using CPU backend (GPU kernels under development)");
+        LOG_DEBUG("[DeviceManager] Using CPU backend (GPU kernels under development)");
         return 0; // CPU is always device 0
     }
 
@@ -636,6 +636,23 @@ namespace llaminar2
             }
         }
         return result;
+    }
+
+    int DeviceManager::get_device_id_for_type(ComputeBackendType type, int local_index) const
+    {
+        int count = 0;
+        for (const auto &dev : devices_)
+        {
+            if (dev.type == type)
+            {
+                if (count == local_index)
+                {
+                    return dev.device_id;
+                }
+                count++;
+            }
+        }
+        return -1; // Not found
     }
 
     // ============================================================================

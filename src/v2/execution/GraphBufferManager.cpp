@@ -34,7 +34,7 @@ namespace llaminar2
         }
         if (config_.use_mapped_memory)
         {
-            LOG_INFO("GraphBufferManager: Mapped memory mode enabled for activation buffers");
+            LOG_DEBUG("GraphBufferManager: Mapped memory mode enabled for activation buffers");
         }
     }
 

@@ -59,7 +59,7 @@ namespace llaminar2
         size_t current = 0;
         bool all_success = true;
 
-        LOG_INFO("[WeightPreloader] Preloading " << total << " weights...");
+        LOG_DEBUG("[WeightPreloader] Preloading " << total << " weights...");
 
         for (const auto &name : weight_names)
         {
@@ -98,8 +98,8 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[WeightPreloader] Preloading complete: "
-                 << num_cpu_packed_ << " CPU, " << num_gpu_packed_ << " GPU");
+        LOG_DEBUG("[WeightPreloader] Preloading complete: "
+                  << num_cpu_packed_ << " CPU, " << num_gpu_packed_ << " GPU");
 
         return all_success;
     }
@@ -114,8 +114,8 @@ namespace llaminar2
         size_t current = 0;
         bool all_success = true;
 
-        LOG_INFO("[WeightPreloader] Preloading " << total << " weights to "
-                                                 << override_device.to_string() << "...");
+        LOG_DEBUG("[WeightPreloader] Preloading " << total << " weights to "
+                                                  << override_device.to_string() << "...");
 
         for (const auto &name : weight_names)
         {
@@ -143,8 +143,8 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[WeightPreloader] Preloading complete: "
-                 << num_cpu_packed_ << " CPU, " << num_gpu_packed_ << " GPU");
+        LOG_DEBUG("[WeightPreloader] Preloading complete: "
+                  << num_cpu_packed_ << " CPU, " << num_gpu_packed_ << " GPU");
 
         return all_success;
     }
@@ -181,8 +181,8 @@ namespace llaminar2
         // Convert DeviceType to DeviceId (ordinal 0 by default since we don't know better)
         if (!placement_map_ && !matching_names.empty())
         {
-            LOG_INFO("[WeightPreloader] No placement map - preloading all "
-                     << matching_names.size() << " GEMM weights to target device");
+            LOG_DEBUG("[WeightPreloader] No placement map - preloading all "
+                      << matching_names.size() << " GEMM weights to target device");
             // Convert DeviceType to DeviceId with ordinal 0 (legacy path)
             DeviceId target_id = (target_device == DeviceType::CPU) ? DeviceId::cpu() : (target_device == DeviceType::CUDA) ? DeviceId::cuda(0)
                                                                                                                             : DeviceId::rocm(0);
@@ -207,8 +207,8 @@ namespace llaminar2
         // on the correct device in multi-GPU setups
         if (target_device.is_rocm())
         {
-            LOG_INFO("[WeightPreloader] Setting ROCm ordinal " << target_device.ordinal
-                                                               << " for weight preloading");
+            LOG_DEBUG("[WeightPreloader] Setting ROCm ordinal " << target_device.ordinal
+                                                                << " for weight preloading");
             // Create guard - will be active for entire preload operation
             KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
 
@@ -233,9 +233,9 @@ namespace llaminar2
 
             if (!placement_map_ && !matching_names.empty())
             {
-                LOG_INFO("[WeightPreloader] No placement map - preloading all "
-                         << matching_names.size() << " GEMM weights to ROCm device "
-                         << target_device.ordinal);
+                LOG_DEBUG("[WeightPreloader] No placement map - preloading all "
+                          << matching_names.size() << " GEMM weights to ROCm device "
+                          << target_device.ordinal);
                 return preloadWithOverrideDevice(matching_names, target_device, progress_callback, release_raw_data);
             }
             return preload(matching_names, progress_callback, release_raw_data);
@@ -307,12 +307,12 @@ namespace llaminar2
                     auto *rocm_kernel = dynamic_cast<llaminar2::rocm::ROCmQuantisedGemmKernel *>(kernel);
                     if (rocm_kernel)
                     {
-                        LOG_INFO("[WeightPreloader] Calling ensureWeightsConverted for ROCm tensor="
-                                 << (void *)tensor << " kernel=" << (void *)kernel
-                                 << " shape=" << tensor->shape()[0] << "x" << tensor->shape()[1]);
+                        LOG_TRACE("[WeightPreloader] Calling ensureWeightsConverted for ROCm tensor="
+                                  << (void *)tensor << " kernel=" << (void *)kernel
+                                  << " shape=" << tensor->shape()[0] << "x" << tensor->shape()[1]);
                         rocm_kernel->ensureWeightsConverted();
-                        LOG_INFO("[WeightPreloader] Uploaded ROCm weights: "
-                                 << tensor->shape()[0] << "x" << tensor->shape()[1]);
+                        LOG_TRACE("[WeightPreloader] Uploaded ROCm weights: "
+                                  << tensor->shape()[0] << "x" << tensor->shape()[1]);
                     }
                     else
                     {

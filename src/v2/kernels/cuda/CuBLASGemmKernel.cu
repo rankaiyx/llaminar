@@ -15,6 +15,7 @@
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #endif
 
 namespace llaminar2
@@ -39,6 +40,19 @@ namespace llaminar2
                                                           << ":" << __LINE__);  \
             return false;                                                       \
         }                                                                       \
+    } while (0)
+
+#define CUBLASLT_CHECK(call)                                                      \
+    do                                                                            \
+    {                                                                             \
+        cublasStatus_t status = call;                                             \
+        if (status != CUBLAS_STATUS_SUCCESS)                                      \
+        {                                                                         \
+            LOG_ERROR("[CuBLASGemmKernel] cuBLASLt error: " << status             \
+                                                            << " at " << __FILE__ \
+                                                            << ":" << __LINE__);  \
+            return false;                                                         \
+        }                                                                         \
     } while (0)
 
 #define CUDA_CHECK(call)                                                           \
@@ -83,6 +97,16 @@ namespace llaminar2
             // CUBLAS_TENSOR_OP_MATH enables use of Tensor Cores when available
             cublasSetMathMode(handle_, CUBLAS_TENSOR_OP_MATH);
 
+            // Create cuBLASLt handle for fused operations (e.g., GEMM + bias)
+            cublasStatus_t lt_err = cublasLtCreate(&lt_handle_);
+            if (lt_err != CUBLAS_STATUS_SUCCESS)
+            {
+                cublasDestroy(handle_);
+                throw std::runtime_error(
+                    std::string("[CuBLASGemmKernel] Failed to create cuBLASLt handle: ") +
+                    std::to_string(static_cast<int>(lt_err)));
+            }
+
             LOG_DEBUG("[CuBLASGemmKernel] Created on device " << device_id_
                                                               << " with precision "
                                                               << static_cast<int>(precision_));
@@ -90,6 +114,11 @@ namespace llaminar2
 
         CuBLASGemmKernel::~CuBLASGemmKernel()
         {
+            if (lt_handle_)
+            {
+                cublasLtDestroy(lt_handle_);
+                lt_handle_ = nullptr;
+            }
             if (handle_)
             {
                 cublasDestroy(handle_);
@@ -100,10 +129,12 @@ namespace llaminar2
         // Move constructor
         CuBLASGemmKernel::CuBLASGemmKernel(CuBLASGemmKernel &&other) noexcept
             : handle_(other.handle_),
+              lt_handle_(other.lt_handle_),
               device_id_(other.device_id_),
               precision_(other.precision_)
         {
             other.handle_ = nullptr;
+            other.lt_handle_ = nullptr;
         }
 
         // Move assignment
@@ -111,14 +142,20 @@ namespace llaminar2
         {
             if (this != &other)
             {
+                if (lt_handle_)
+                {
+                    cublasLtDestroy(lt_handle_);
+                }
                 if (handle_)
                 {
                     cublasDestroy(handle_);
                 }
                 handle_ = other.handle_;
+                lt_handle_ = other.lt_handle_;
                 device_id_ = other.device_id_;
                 precision_ = other.precision_;
                 other.handle_ = nullptr;
+                other.lt_handle_ = nullptr;
             }
             return *this;
         }
@@ -218,6 +255,170 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // GEMM with Fused Bias (using cuBLASLt)
+        // =====================================================================
+
+        bool CuBLASGemmKernel::execute_with_bias(
+            const float *d_A, const float *d_B, float *d_C,
+            const float *d_bias,
+            int M, int N, int K,
+            bool transA, bool transB,
+            float alpha, float beta)
+        {
+            if (!lt_handle_)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] cuBLASLt handle is null");
+                return false;
+            }
+
+            // Ensure we're on the correct device
+            CUDA_CHECK(cudaSetDevice(device_id_));
+
+            // Create operation descriptors
+            cublasLtMatmulDesc_t operationDesc = nullptr;
+            cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
+            cublasLtMatmulPreference_t preference = nullptr;
+
+            // =================================================================
+            // Create operation descriptor with epilogue
+            // =================================================================
+
+            CUBLASLT_CHECK(cublasLtMatmulDescCreate(&operationDesc,
+                                                    CUBLAS_COMPUTE_32F,
+                                                    CUDA_R_32F));
+
+            // Set transpose operations
+            // For row-major data with cuBLASLt, we swap A and B:
+            //   C_rm = A_rm @ B_rm  becomes  C_cm^T = B_cm^T @ A_cm^T
+            // cuBLASLt sees our row-major A[M×K] as column-major A^T[K×M]
+            cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+            cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+            CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                          CUBLASLT_MATMUL_DESC_TRANSA,
+                                                          &opB, sizeof(opB)));
+            CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                          CUBLASLT_MATMUL_DESC_TRANSB,
+                                                          &opA, sizeof(opA)));
+
+            // Set epilogue with bias
+            cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+            CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                          CUBLASLT_MATMUL_DESC_EPILOGUE,
+                                                          &epilogue, sizeof(epilogue)));
+
+            // Set bias pointer
+            CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                          CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                                          &d_bias, sizeof(d_bias)));
+
+            // =================================================================
+            // Create matrix layouts
+            // =================================================================
+            // For row-major data interpreted as column-major:
+            // Our A[M×K] row-major is seen as A^T[K×M] column-major (ld=K)
+            // Our B[K×N] or B[N×K] needs appropriate layout
+            // Our C[M×N] row-major is seen as C^T[N×M] column-major (ld=N)
+
+            int lda = K;
+            int ldb = transB ? K : N;
+            int ldc = N;
+
+            // We're computing in column-major, so we swap A and B in the call:
+            // cuBLASLt gemm: D = alpha * op(A_lt) @ op(B_lt) + beta * C
+            // where A_lt (in cuBLASLt call) = B (our matrix), B_lt = A (our matrix)
+
+            // Create layout for "A" in cuBLASLt call (which is our B)
+            // If transB=true: our B is [N×K] row-major → [K×N] col-major
+            // If transB=false: our B is [K×N] row-major → [N×K] col-major
+            if (transB)
+            {
+                // B[N×K] row-major → cuBLASLt sees [K×N] col-major
+                CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_32F, K, N, ldb));
+            }
+            else
+            {
+                // B[K×N] row-major → cuBLASLt sees [N×K] col-major
+                CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_32F, N, K, ldb));
+            }
+
+            // Create layout for "B" in cuBLASLt call (which is our A[M×K])
+            // A[M×K] row-major → cuBLASLt sees [K×M] col-major
+            CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_32F, K, M, lda));
+
+            // Create layout for C (and D): C[M×N] row-major → [N×M] col-major
+            CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32F, N, M, ldc));
+
+            // =================================================================
+            // Set up algorithm heuristics
+            // =================================================================
+
+            CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&preference));
+
+            // Request workspace (optional, can improve performance)
+            size_t workspaceSize = 4 * 1024 * 1024; // 4MB workspace
+            void *workspace = nullptr;
+            CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
+
+            CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(preference,
+                                                                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                                &workspaceSize, sizeof(workspaceSize)));
+
+            // Get best algorithm
+            int returnedResults = 0;
+            cublasLtMatmulHeuristicResult_t heuristicResult = {};
+            CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(lt_handle_,
+                                                          operationDesc,
+                                                          Adesc, Bdesc, Cdesc, Cdesc,
+                                                          preference,
+                                                          1, &heuristicResult, &returnedResults));
+
+            if (returnedResults == 0)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] No suitable algorithm found");
+                cudaFree(workspace);
+                cublasLtMatmulPreferenceDestroy(preference);
+                cublasLtMatrixLayoutDestroy(Cdesc);
+                cublasLtMatrixLayoutDestroy(Bdesc);
+                cublasLtMatrixLayoutDestroy(Adesc);
+                cublasLtMatmulDescDestroy(operationDesc);
+                return false;
+            }
+
+            // =================================================================
+            // Execute the matmul with fused bias
+            // =================================================================
+
+            cublasStatus_t status = cublasLtMatmul(lt_handle_,
+                                                   operationDesc,
+                                                   &alpha,
+                                                   d_B, Adesc, // A in cuBLASLt = our B
+                                                   d_A, Bdesc, // B in cuBLASLt = our A
+                                                   &beta,
+                                                   d_C, Cdesc, // C
+                                                   d_C, Cdesc, // D (output, same as C)
+                                                   &heuristicResult.algo,
+                                                   workspace, workspaceSize,
+                                                   0); // stream = 0 (default)
+
+            // Cleanup
+            cudaFree(workspace);
+            cublasLtMatmulPreferenceDestroy(preference);
+            cublasLtMatrixLayoutDestroy(Cdesc);
+            cublasLtMatrixLayoutDestroy(Bdesc);
+            cublasLtMatrixLayoutDestroy(Adesc);
+            cublasLtMatmulDescDestroy(operationDesc);
+
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] cublasLtMatmul failed: " << status);
+                return false;
+            }
+
+            return true;
+        }
+
+        // =====================================================================
         // Factory function
         // =====================================================================
 
@@ -245,6 +446,15 @@ namespace llaminar2
 
         bool CuBLASGemmKernel::execute(
             const float *, const float *, float *,
+            int, int, int,
+            bool, bool, float, float)
+        {
+            return false;
+        }
+
+        bool CuBLASGemmKernel::execute_with_bias(
+            const float *, const float *, float *,
+            const float *,
             int, int, int,
             bool, bool, float, float)
         {

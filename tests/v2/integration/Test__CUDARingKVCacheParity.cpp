@@ -19,6 +19,8 @@
 #include <random>
 #include <cmath>
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
+#include "interfaces/IWorkspaceConsumer.h"
+#include "execution/WorkspaceDescriptor.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;
@@ -722,4 +724,193 @@ TEST(Test__CUDARingKVCache, MultiPrecision_BF16)
     cudaFree(d_V);
 
     LOG_INFO("[MultiPrecision_BF16] PASSED");
+}
+
+// =============================================================================
+// Test: IWorkspaceConsumer Interface - getWorkspaceRequirements
+// =============================================================================
+
+TEST(Test__CUDARingKVCache, WorkspaceRequirements)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 4;
+    const int max_seq_len = 64;
+    const int n_kv_heads = 2;
+    const int head_dim = 32;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP32,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+
+    // Cast to IWorkspaceConsumer to test the interface
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+
+    // Get workspace requirements with default batch size
+    auto reqs = workspace_consumer->getWorkspaceRequirements(0);
+    EXPECT_EQ(reqs.buffers.size(), 4u); // K_PTRS, V_PTRS, TAILS, COUNTS
+
+    // Verify buffer names and sizes
+    bool found_k_ptrs = false, found_v_ptrs = false;
+    bool found_tails = false, found_counts = false;
+
+    for (const auto &buf : reqs.buffers)
+    {
+        if (buf.name == KVCacheWorkspaceBuffers::BATCH_K_PTRS)
+        {
+            found_k_ptrs = true;
+            EXPECT_EQ(buf.size_bytes, batch_size * sizeof(void *));
+            EXPECT_FALSE(buf.required); // Optional buffer
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::BATCH_V_PTRS)
+        {
+            found_v_ptrs = true;
+            EXPECT_EQ(buf.size_bytes, batch_size * sizeof(void *));
+            EXPECT_FALSE(buf.required);
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::BATCH_TAILS)
+        {
+            found_tails = true;
+            EXPECT_EQ(buf.size_bytes, batch_size * sizeof(int));
+            EXPECT_FALSE(buf.required);
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::BATCH_COUNTS)
+        {
+            found_counts = true;
+            EXPECT_EQ(buf.size_bytes, batch_size * sizeof(int));
+            EXPECT_FALSE(buf.required);
+        }
+    }
+
+    EXPECT_TRUE(found_k_ptrs) << "Missing BATCH_K_PTRS buffer";
+    EXPECT_TRUE(found_v_ptrs) << "Missing BATCH_V_PTRS buffer";
+    EXPECT_TRUE(found_tails) << "Missing BATCH_TAILS buffer";
+    EXPECT_TRUE(found_counts) << "Missing BATCH_COUNTS buffer";
+
+    // Test with explicit batch size
+    auto reqs2 = workspace_consumer->getWorkspaceRequirements(8);
+    for (const auto &buf : reqs2.buffers)
+    {
+        if (buf.name == KVCacheWorkspaceBuffers::BATCH_K_PTRS ||
+            buf.name == KVCacheWorkspaceBuffers::BATCH_V_PTRS)
+        {
+            EXPECT_EQ(buf.size_bytes, 8u * sizeof(void *));
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::BATCH_TAILS ||
+                 buf.name == KVCacheWorkspaceBuffers::BATCH_COUNTS)
+        {
+            EXPECT_EQ(buf.size_bytes, 8u * sizeof(int));
+        }
+    }
+
+    LOG_INFO("[WorkspaceRequirements] PASSED");
+}
+
+// =============================================================================
+// Test: IWorkspaceConsumer Interface - bindWorkspace/hasWorkspace
+// =============================================================================
+
+TEST(Test__CUDARingKVCache, WorkspaceBinding)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 4;
+    const int max_seq_len = 64;
+    const int n_kv_heads = 2;
+    const int head_dim = 32;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP32,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+
+    // Initially no workspace bound
+    EXPECT_FALSE(workspace_consumer->hasWorkspace());
+    EXPECT_EQ(workspace_consumer->getWorkspace(), nullptr);
+
+    // Bind nullptr (unbind)
+    workspace_consumer->bindWorkspace(nullptr);
+    EXPECT_FALSE(workspace_consumer->hasWorkspace());
+
+    LOG_INFO("[WorkspaceBinding] PASSED");
+}
+
+// =============================================================================
+// Test: BatchedGather works without workspace (backward compatibility)
+// =============================================================================
+
+TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 2;
+    const int max_seq_len = 32;
+    const int n_kv_heads = 2;
+    const int head_dim = 16;
+    const int kv_dim = n_kv_heads * head_dim;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP32,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+
+    // Verify no workspace bound
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    EXPECT_FALSE(workspace_consumer->hasWorkspace());
+
+    // Fill sequences
+    float *d_K, *d_V;
+    cudaMalloc(&d_K, 10 * kv_dim * sizeof(float));
+    cudaMalloc(&d_V, 10 * kv_dim * sizeof(float));
+
+    auto h_K = generateRandomFP32(10 * kv_dim, 42);
+    auto h_V = generateRandomFP32(10 * kv_dim, 43);
+
+    for (int seq = 0; seq < batch_size; ++seq)
+    {
+        int seq_len = 5 + seq * 3; // 5 and 8 tokens
+        cudaMemcpy(d_K, h_K.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_V, h_V.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cache->append(0, seq, d_K, d_V, seq_len);
+    }
+
+    // Gather without workspace - should fall back to per-call allocation
+    int max_kv_len = 10;
+    float *d_K_gathered, *d_V_gathered;
+    cudaMalloc(&d_K_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
+    cudaMalloc(&d_V_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
+
+    std::vector<int> kv_lens(batch_size);
+    int actual_max = cache->gather_kv_batched(0, batch_size,
+                                              d_K_gathered, d_V_gathered,
+                                              kv_lens.data(), max_kv_len);
+
+    EXPECT_GT(actual_max, 0);
+    EXPECT_EQ(kv_lens[0], 5);
+    EXPECT_EQ(kv_lens[1], 8);
+
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_K_gathered);
+    cudaFree(d_V_gathered);
+
+    LOG_INFO("[BatchedGatherWithoutWorkspace] PASSED - backward compatibility verified");
 }

@@ -82,7 +82,7 @@ namespace llaminar2
              *
              * @throws std::runtime_error if hipBLAS handle creation fails
              */
-            explicit HipBLASGemmKernel(const DeviceId& device_id, Precision precision = Precision::FP32);
+            explicit HipBLASGemmKernel(const DeviceId &device_id, Precision precision = Precision::FP32);
 
             /**
              * @brief Destructor - destroys hipBLAS handle
@@ -148,6 +148,33 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f);
 
             /**
+             * @brief GPU GEMM with fused bias: C = alpha * A @ B + beta * C + bias
+             *
+             * Uses hipBLASLt epilogue for fused bias addition.
+             * Bias is a 1D vector of length N, broadcast across rows.
+             *
+             * @param d_A Device pointer to A [M × K]
+             * @param d_B Device pointer to B [N × K] or [K × N]
+             * @param d_C Device pointer to C [M × N]
+             * @param d_bias Device pointer to bias [N]
+             * @param M Rows in A and C
+             * @param N Columns in C (rows in B if transposed)
+             * @param K Columns in A (and B's inner dimension)
+             * @param transA Transpose A (typically false)
+             * @param transB Transpose B (typically true for weights)
+             * @param alpha Scale for A@B
+             * @param beta Scale for C
+             *
+             * @return true on success
+             */
+            bool execute_with_bias(
+                const float *d_A, const float *d_B, float *d_C,
+                const float *d_bias,
+                int M, int N, int K,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /**
              * @brief FP16 GEMM: C = alpha * A @ B + beta * C
              *
              * Uses hipblasHgemm for native FP16 computation.
@@ -163,9 +190,10 @@ namespace llaminar2
             Precision precision() const { return precision_; }
 
         private:
-            // hipblasHandle_t stored as void* to avoid including HIP headers in this header.
+            // hipblasHandle_t and hipblasLtHandle_t stored as void* to avoid including HIP headers.
             // This allows g++-compiled files to include this header without HIP namespace pollution.
-            void* handle_ = nullptr;
+            void *handle_ = nullptr;
+            void *lt_handle_ = nullptr; // hipBLASLt handle for fused operations
             DeviceId device_id_;
             Precision precision_ = Precision::FP32;
         };
@@ -174,7 +202,7 @@ namespace llaminar2
          * @brief Factory function for hipBLAS GEMM kernel
          */
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
-            const DeviceId& device_id,
+            const DeviceId &device_id,
             HipBLASGemmKernel::Precision precision = HipBLASGemmKernel::Precision::FP32);
 
         /**

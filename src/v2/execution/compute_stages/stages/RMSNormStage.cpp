@@ -18,8 +18,7 @@ namespace llaminar2
     // =============================================================================
 
     RMSNormStage::RMSNormStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -68,14 +67,17 @@ namespace llaminar2
                                                      << " tensor_type=" << input_base->dtype_name()
                                                      << " device=" << static_cast<int>(dev_type));
 
-        // DEBUG: Log input for parity debugging
-        const float *in_data = params_.input->fp32_data();
-        if (in_data)
+        // DEBUG: Log input for parity debugging (guard expensive fp32_data() call)
+        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
         {
-            LOG_DEBUG("[RMSNormStage] input[0:8]=" << std::setprecision(6)
-                                                   << in_data[0] << "," << in_data[1] << "," << in_data[2] << "," << in_data[3] << ","
-                                                   << in_data[4] << "," << in_data[5] << "," << in_data[6] << "," << in_data[7]
-                                                   << " device_id=" << params_.device_id.to_string());
+            const float *in_data = params_.input->fp32_data();
+            if (in_data)
+            {
+                LOG_DEBUG("[RMSNormStage] input[0:8]=" << std::setprecision(6)
+                                                       << in_data[0] << "," << in_data[1] << "," << in_data[2] << "," << in_data[3] << ","
+                                                       << in_data[4] << "," << in_data[5] << "," << in_data[6] << "," << in_data[7]
+                                                       << " device_id=" << params_.device_id.to_string());
+            }
         }
         auto kernel = llaminar::v2::kernels::KernelFactory::createRMSNorm(input_base, dev_type);
         if (!kernel)
@@ -96,8 +98,8 @@ namespace llaminar2
             params_.mpi_ctx,
             params_.device_id.toKernelDeviceIndex());
 
-        // DEBUG: Log RMSNorm output for parity debugging
-        if (success)
+        // DEBUG: Log RMSNorm output for parity debugging (guard expensive fp32_data() call)
+        if (success && Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
         {
             // Get output from host after GPU kernel (if GPU, needs sync)
             const float *out_data = params_.output->fp32_data();

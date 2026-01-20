@@ -227,11 +227,13 @@ if(HAVE_CUDA)
     # - nvrtc: NVRTC runtime compiler (for JIT kernel compilation)
     # - cuda: CUDA Driver API (for cuLaunchKernel, cuModuleLoad, etc.)
     # - cublas: cuBLAS library for dense GEMM (FP32/FP16/BF16)
+    # - cublasLt: cuBLAS Light for fused GEMM+bias operations
     target_link_libraries(cuda_backend PUBLIC 
         CUDA::cudart
         CUDA::nvrtc
         CUDA::cuda_driver
         CUDA::cublas
+        CUDA::cublasLt
     )
     
     # Link ONNX Runtime if enabled
@@ -680,26 +682,15 @@ message(STATUS "V2: BLAS backend: OpenBLAS (FP32 only)")
 # =============================================================================
 
 # =============================================================================
-# llama.cpp Integration (for dequant parity testing)
+# llama.cpp Integration (REMOVED)
 # =============================================================================
-message(STATUS "V2: Configuring llama.cpp submodule for dequant reference...")
-set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Disable llama.cpp tests" FORCE)
-set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Disable llama.cpp CLI tools" FORCE)
-set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Disable llama.cpp examples" FORCE)
-set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Disable llama.cpp server" FORCE)
-set(LLAMA_BUILD_COMMON OFF CACHE BOOL "Disable llama.cpp common utils" FORCE)
-set(LLAMA_CURL OFF CACHE BOOL "Disable llama.cpp libcurl dependency" FORCE)
-set(GGML_CUDA OFF CACHE BOOL "Disable GGML CUDA backend" FORCE)
-set(GGML_METAL OFF CACHE BOOL "Disable GGML Metal backend" FORCE)
-set(GGML_SYCL OFF CACHE BOOL "Disable GGML SYCL backend" FORCE)
-set(GGML_RPC OFF CACHE BOOL "Disable GGML RPC backend" FORCE)
-set(GGML_NATIVE ON CACHE BOOL "Enable native CPU optimizations for GGML" FORCE)
-
-# Only add llama.cpp if not already added by parent project
-if(NOT TARGET ggml)
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../external/llama.cpp 
-                     ${CMAKE_CURRENT_BINARY_DIR}/llama.cpp)
-endif()
+# llama.cpp submodule is kept in the repo for reference but not linked in V2.
+# V2 uses native implementations for all operations (tokenization, dequantization, etc.)
+# The submodule remains available at external/llama.cpp for:
+#   - Reference implementations
+#   - GGUF format documentation
+#   - Quantization algorithm reference
+# =============================================================================
 
 # =============================================================================
 # FTXUI Integration (for interactive chat UI)
@@ -1009,9 +1000,10 @@ if(HAVE_CUDA)
     target_link_libraries(llaminar2_core PUBLIC 
         CUDA::cudart 
         CUDA::cublas
+        CUDA::cublasLt  # For fused GEMM+bias operations
         CUDA::nvml  # For GPU NUMA node detection
     )
-    message(STATUS "V2: Linked CUDA runtime, cuBLAS, and NVML")
+    message(STATUS "V2: Linked CUDA runtime, cuBLAS, cuBLASLt, and NVML")
 endif()
 
 # =============================================================================
@@ -1023,12 +1015,14 @@ if(HAVE_ROCM)
         ${ROCM_PATH}/include
         ${ROCM_PATH}/hip/include
         ${ROCM_PATH}/hipblas/include
+        ${ROCM_PATH}/hipblaslt/include
     )
     target_link_libraries(llaminar2_core PUBLIC 
         hip::host      # HIP runtime
         roc::hipblas   # hipBLAS
+        ${ROCM_PATH}/lib/libhipblaslt.so  # hipBLASLt for fused GEMM+bias
     )
-    message(STATUS "V2: Linked HIP runtime and hipBLAS")
+    message(STATUS "V2: Linked HIP runtime, hipBLAS, and hipBLASLt")
 endif()
 
 if(HAVE_VULKAN)

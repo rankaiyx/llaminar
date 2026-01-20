@@ -141,6 +141,7 @@ namespace llaminar2
             const TensorBase *A, TensorBase *C,
             bool transpose_B,
             float alpha, float beta,
+            const TensorBase *bias,
             const MPIContext * /*mpi_ctx*/,
             int /*device_idx*/,
             DeviceWorkspaceManager *workspace)
@@ -156,7 +157,7 @@ namespace llaminar2
             int n = static_cast<int>(N_);
             int k = static_cast<int>(K_);
 
-            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, nullptr, -1, workspace);
+            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, nullptr, -1, workspace);
         }
 
         bool ROCmFloatingPointGemmKernel::multiply_tensor(
@@ -164,6 +165,7 @@ namespace llaminar2
             int m, int n, int k,
             bool transpose_B,
             float alpha, float beta,
+            const TensorBase *bias,
             const MPIContext * /*mpi_ctx*/,
             int /*device_idx*/,
             DeviceWorkspaceManager *workspace)
@@ -201,8 +203,48 @@ namespace llaminar2
                 return false;
             }
 
-            bool success = multiply(d_A, d_C, m, n, k, transpose_B, alpha, beta, nullptr, -1, workspace);
-            return success;
+            // Extract bias pointer if provided
+            const float *d_bias = nullptr;
+            if (bias)
+            {
+                if (bias->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Bias must be FP32, got: "
+                              << static_cast<int>(bias->native_type()));
+                    return false;
+                }
+                d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                if (!d_bias)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Bias tensor must be on GPU");
+                    return false;
+                }
+            }
+
+            // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
+            if (d_bias)
+            {
+                return hipblas_kernel_->execute_with_bias(
+                    d_A,                                    // d_A
+                    static_cast<const float *>(d_weights_), // d_B
+                    d_C,                                    // d_C
+                    d_bias,                                 // d_bias
+                    m, n, k,
+                    false,       // transA = false
+                    transpose_B, // transB
+                    alpha, beta);
+            }
+            else
+            {
+                return hipblas_kernel_->execute(
+                    d_A,                                    // d_A
+                    static_cast<const float *>(d_weights_), // d_B
+                    d_C,                                    // d_C
+                    m, n, k,
+                    false,       // transA = false
+                    transpose_B, // transB
+                    alpha, beta);
+            }
         }
 
         // =====================================================================

@@ -177,14 +177,17 @@ namespace llaminar2
             }
         }
 
-        // DEBUG: Log embedding output for parity debugging
-        const float *out_data = params_.output->fp32_data();
-        if (out_data && params_.num_tokens > 0)
+        // DEBUG: Log embedding output for parity debugging (guard expensive fp32_data() call)
+        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
         {
-            LOG_DEBUG("[EmbeddingStage] output[0:8]=" << std::setprecision(6)
-                                                      << out_data[0] << "," << out_data[1] << "," << out_data[2] << "," << out_data[3] << ","
-                                                      << out_data[4] << "," << out_data[5] << "," << out_data[6] << "," << out_data[7]
-                                                      << " device_id=" << params_.device_id.to_string());
+            const float *out_data = params_.output->fp32_data();
+            if (out_data && params_.num_tokens > 0)
+            {
+                LOG_DEBUG("[EmbeddingStage] output[0:8]=" << std::setprecision(6)
+                                                          << out_data[0] << "," << out_data[1] << "," << out_data[2] << "," << out_data[3] << ","
+                                                          << out_data[4] << "," << out_data[5] << "," << out_data[6] << "," << out_data[7]
+                                                          << " device_id=" << params_.device_id.to_string());
+            }
         }
 
         return true;

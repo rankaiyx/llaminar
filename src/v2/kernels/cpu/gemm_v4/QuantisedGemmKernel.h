@@ -2479,6 +2479,7 @@ namespace llaminar2
              * @param transpose_B Whether B is transposed (ignored, weights pre-packed)
              * @param alpha Scale factor for result
              * @param beta Accumulate factor (0.0 = overwrite, 1.0 = add)
+             * @param bias Optional bias tensor [n] to add after GEMM (nullptr = no bias)
              * @param mpi_ctx MPI context
              * @param device_idx Device index
              *
@@ -2488,6 +2489,7 @@ namespace llaminar2
                 const TensorBase *A, TensorBase *C,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr) override
@@ -2520,8 +2522,8 @@ namespace llaminar2
                             A_q8->typed_data(),
                             C_q8->mutable_typed_data(),
                             m, n, k,
-                            nullptr, // bias
-                            false,   // accumulate (not supported for Q8_1 output)
+                            bias,
+                            false, // accumulate (not supported for Q8_1 output)
                             mpi_ctx, device_idx);
                     }
                     else
@@ -2544,7 +2546,7 @@ namespace llaminar2
                     return multiply_q8_1_direct(
                         static_cast<const Q8_1Tensor *>(A),
                         C->mutable_data(), m, n, k,
-                        beta != 0.0f, alpha, beta, mpi_ctx, device_idx);
+                        bias, beta != 0.0f, alpha, beta, mpi_ctx, device_idx);
                 }
 
                 // Any IActivationTensor → FP32: Use tensor's quantize_to_q8_1()
@@ -2565,7 +2567,7 @@ namespace llaminar2
                     // Use pre-quantized path → FP32 output
                     return multiply_with_precomputed_q8_1(
                         q8_1_buffer.data(), C->mutable_data(), m, n, k,
-                        nullptr, // bias
+                        bias,
                         beta != 0.0f, alpha, beta,
                         mpi_ctx, device_idx,
                         GemmFusedOps::none());
@@ -2592,6 +2594,7 @@ namespace llaminar2
              * @param transpose_B Whether B is transposed (ignored, weights pre-packed)
              * @param alpha Scale factor
              * @param beta Accumulate factor
+             * @param bias Optional bias tensor [n] to add after GEMM (nullptr = no bias)
              * @param mpi_ctx MPI context
              * @param device_idx Device index
              *
@@ -2602,6 +2605,7 @@ namespace llaminar2
                 int m, int n, int k,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
+                const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr) override
@@ -2628,8 +2632,8 @@ namespace llaminar2
                             A_q8->typed_data(),
                             C_q8->mutable_typed_data(),
                             m, n, k,
-                            nullptr, // bias
-                            false,   // accumulate (not supported for Q8_1 output)
+                            bias,
+                            false, // accumulate (not supported for Q8_1 output)
                             mpi_ctx, device_idx);
                     }
                     else
@@ -2652,7 +2656,7 @@ namespace llaminar2
                     return multiply_q8_1_direct(
                         static_cast<const Q8_1Tensor *>(A),
                         C->mutable_data(), m, n, k,
-                        beta != 0.0f, alpha, beta, mpi_ctx, device_idx);
+                        bias, beta != 0.0f, alpha, beta, mpi_ctx, device_idx);
                 }
 
                 // Any IActivationTensor → FP32: Use tensor's quantize_to_q8_1()
@@ -2673,7 +2677,7 @@ namespace llaminar2
                     // Use pre-quantized path → FP32 output
                     return multiply_with_precomputed_q8_1(
                         q8_1_buffer.data(), C->mutable_data(), m, n, k,
-                        nullptr, // bias
+                        bias,
                         beta != 0.0f, alpha, beta,
                         mpi_ctx, device_idx,
                         GemmFusedOps::none());
@@ -2760,12 +2764,15 @@ namespace llaminar2
             bool multiply_q8_1_direct(
                 const Q8_1Tensor *A_tensor, float *C,
                 int m, int n, int k,
+                const TensorBase *bias,
                 bool accumulate, float alpha, float beta,
                 const MPIContext *ctx, int device_idx)
             {
                 (void)ctx;
                 (void)device_idx;
                 (void)alpha; // Currently ignored (assumed 1.0)
+
+                const float *bias_ptr = bias ? bias->fp32_data() : nullptr;
 
                 // Validate Q8_1Tensor before processing
                 if (!A_tensor)
@@ -2975,7 +2982,7 @@ namespace llaminar2
                                 params_v.K_blocks = k_blocks;
                                 params_v.N = 64;
                                 params_v.ldc = N_padded; // Stride for comp/scales arrays, NOT C output
-                                params_v.bias = nullptr;
+                                params_v.bias = bias_ptr ? bias_ptr + n_blk : nullptr;
                                 params_v.mask = nullptr;
                                 params_v.A_stride = blocks_per_row_input * sizeof(Q8_1Block);
                                 params_v.local_max = nullptr;

@@ -174,4 +174,20 @@ namespace llaminar2
         constexpr const char *ROCM_CK_INT32 = "rocm_ck_int32";             ///< [padded_m × N] INT32 CK accumulator
     }
 
+    // =============================================================================
+    // Standard Buffer Names for Embedding Kernels
+    // =============================================================================
+
+    /**
+     * Standard buffer names used by embedding workspace consumers.
+     *
+     * Using consistent names across CUDA/ROCm kernels enables the workspace
+     * manager to share buffers between different kernel types on the same device.
+     */
+    namespace EmbeddingWorkspaceBuffers
+    {
+        constexpr const char *TOKEN_IDS = "embed_token_ids";    ///< [max_seq_len] INT32 token IDs
+        constexpr const char *EMBED_TABLE = "embed_table_temp"; ///< [vocab_size × d_model] FP32 temp for non-GPU embed tables
+    }
+
 } // namespace llaminar2

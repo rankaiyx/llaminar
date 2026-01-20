@@ -82,10 +82,10 @@ namespace llaminar2
         auto it = cache_.find(name);
         if (it != cache_.end())
         {
-            LOG_INFO("[WeightManager] Cache hit: " << name << " ptr=" << (void *)it->second.get());
+            LOG_TRACE("[WeightManager] Cache hit: " << name << " ptr=" << (void *)it->second.get());
             return it->second;
         }
-        LOG_INFO("[WeightManager] Cache miss: " << name << " (loading now)");
+        LOG_DEBUG("[WeightManager] Cache miss: " << name << " (loading now)");
 
         // Determine device from placement map if not explicitly provided
         DeviceId target_device = device;

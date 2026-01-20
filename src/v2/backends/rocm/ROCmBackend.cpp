@@ -194,7 +194,7 @@ namespace llaminar2
         double total_ms = std::chrono::duration<double, std::milli>(t2 - t0).count();
         if (total_ms > 1.0)
         {
-            LOG_WARN("[ROCmBackend::waitForEvent] setDevice=" << set_device_ms << "ms, eventSync=" << event_sync_ms << "ms, TOTAL=" << total_ms << "ms");
+            LOG_TRACE("[ROCmBackend::waitForEvent] setDevice=" << set_device_ms << "ms, eventSync=" << event_sync_ms << "ms, TOTAL=" << total_ms << "ms");
         }
 
         return true;

@@ -65,7 +65,7 @@ namespace llaminar2
 
         // Graph is the only execution path (as of January 2025 cleanup)
         std::string architecture = model_ctx->architecture();
-        LOG_INFO("[InferenceRunner] Using GRAPH path");
+        LOG_DEBUG("[InferenceRunner] Using GRAPH path");
         return createGraphOrchestratorImpl(model_ctx, mpi_ctx, device, config, architecture);
     }
 
@@ -212,11 +212,11 @@ namespace llaminar2
             graph_config.local_n_kv_heads = static_cast<int>(local_n_kv_h);
             graph_config.qkv_column_parallel = true;
 
-            LOG_INFO("[InferenceRunner] QKV Column-Parallel enabled: "
-                     << "head_start=" << graph_config.head_start
-                     << ", local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
-                     << ", local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads
-                     << " (rank " << mpi_ctx->rank() << "/" << mpi_ctx->world_size() << ")");
+            LOG_DEBUG("[InferenceRunner] QKV Column-Parallel enabled: "
+                      << "head_start=" << graph_config.head_start
+                      << ", local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
+                      << ", local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads
+                      << " (rank " << mpi_ctx->rank() << "/" << mpi_ctx->world_size() << ")");
         }
         else
         {
@@ -255,9 +255,9 @@ namespace llaminar2
             graph_config.d_ff_local = graph_config.d_ff / world_size;
             graph_config.ffn_column_parallel = true;
 
-            LOG_INFO("[InferenceRunner] FFN Column-Parallel enabled: "
-                     << "d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff
-                     << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
+            LOG_DEBUG("[InferenceRunner] FFN Column-Parallel enabled: "
+                      << "d_ff_local=" << graph_config.d_ff_local << "/" << graph_config.d_ff
+                      << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
         }
         else
         {
@@ -286,9 +286,9 @@ namespace llaminar2
             graph_config.vocab_local = graph_config.vocab_size / world_size;
             graph_config.lm_head_column_parallel = true;
 
-            LOG_INFO("[InferenceRunner] LM Head Column-Parallel enabled: "
-                     << "vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size
-                     << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
+            LOG_DEBUG("[InferenceRunner] LM Head Column-Parallel enabled: "
+                      << "vocab_local=" << graph_config.vocab_local << "/" << graph_config.vocab_size
+                      << " (rank " << mpi_ctx->rank() << "/" << world_size << ")");
         }
         else
         {
@@ -356,7 +356,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[InferenceRunner] GraphOrchestrator created successfully");
+        LOG_DEBUG("[InferenceRunner] GraphOrchestrator created successfully");
 
         // GraphOrchestrator implements IInferenceRunner directly
         return orchestrator;
@@ -438,7 +438,7 @@ namespace llaminar2
         // =====================================================================
         // This ensures weights are in cache for WeightPreloader to iterate
         int n_layers = model_ctx->blockCount();
-        LOG_INFO("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
+        LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
         for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
         {
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
@@ -457,7 +457,7 @@ namespace llaminar2
             weight_mgr->getWeight(prefix + "attn_k.bias");
             weight_mgr->getWeight(prefix + "attn_v.bias");
         }
-        LOG_INFO("[InferenceRunner] All layer weights loaded into cache");
+        LOG_DEBUG("[InferenceRunner] All layer weights loaded into cache");
 
         // =====================================================================
         // NOW preload weights for target device (GPU packing/upload)
@@ -472,7 +472,7 @@ namespace llaminar2
         }
         else
         {
-            LOG_INFO("[InferenceRunner] Preloaded weights for " << device_name);
+            LOG_DEBUG("[InferenceRunner] Preloaded weights for " << device_name);
         }
 
         // Layer weight accessor - capture weight_mgr by value (shared_ptr copy)
@@ -507,7 +507,7 @@ namespace llaminar2
         };
 
         orchestrator->setWeights(weights);
-        LOG_INFO("[InferenceRunner] Weights configured on orchestrator");
+        LOG_DEBUG("[InferenceRunner] Weights configured on orchestrator");
         return true;
     }
 

@@ -469,9 +469,9 @@ namespace llaminar2
         }
 
         // Build forward graph via declarative builder
-        LOG_INFO("[GraphOrchestrator] Building forward graph...");
+        LOG_DEBUG("[GraphOrchestrator] Building forward graph...");
         ComputeGraph graph = graph_builder_->buildFullForwardGraph(effective_input, output);
-        LOG_INFO("[GraphOrchestrator] Forward graph built with " << graph.size() << " stages");
+        LOG_DEBUG("[GraphOrchestrator] Forward graph built with " << graph.size() << " stages");
 
         if (graph.size() == 0)
         {
@@ -480,14 +480,14 @@ namespace llaminar2
         }
 
         // Get device context
-        LOG_INFO("[GraphOrchestrator] Getting device context for " << input.device << "...");
+        LOG_DEBUG("[GraphOrchestrator] Getting device context for " << input.device << "...");
         IDeviceContext *ctx = getDeviceContext(input.device);
         if (!ctx)
         {
             LOG_ERROR("[GraphOrchestrator] Failed to get device context");
             return false;
         }
-        LOG_INFO("[GraphOrchestrator] Got device context, starting execution...");
+        LOG_DEBUG("[GraphOrchestrator] Got device context, starting execution...");
 
         // Ensure GPU workspace is allocated for GEMM kernels (lazy initialization)
         ensureDeviceWorkspaceAllocated(graph);
@@ -550,22 +550,28 @@ namespace llaminar2
         //   - ROCM_A_PADDED: 8 × K × sizeof(int8_t)   - padded activations for M < 8
         //   - ROCM_SCALE_A_PADDED: 8 × sizeof(float)  - padded scales
         //
-        // Formula: 3 × (M × N × 4) + M×K buffers + 10% safety margin for alignment
+        // Embedding kernel requires (when table not on GPU):
+        //   - EMBED_TABLE_TEMP: vocab_size × d_model × sizeof(float) - dequantized embedding table
+        //
+        // Formula: 3 × (M × N × 4) + M×K buffers + embedding table + 10% safety margin
         const size_t mn_buffer_size = static_cast<size_t>(actual_max_seq_len) * actual_vocab_size * sizeof(float);
         const size_t lm_head_workspace = 3 * mn_buffer_size; // 3 M×N-sized buffers
         const size_t mk_overhead = static_cast<size_t>(actual_max_seq_len) * actual_d_model * sizeof(float) * 2;
-        const size_t padded_n_buffer = 8ULL * actual_vocab_size * sizeof(float);               // ROCM_E_PADDED
-        const size_t safety_margin = (lm_head_workspace + mk_overhead + padded_n_buffer) / 10; // 10% safety
-        const size_t min_budget = 768ULL * 1024 * 1024;                                        // Floor at 768 MB for small models
-        const size_t workspace_budget = std::max(min_budget, lm_head_workspace + mk_overhead + padded_n_buffer + safety_margin);
+        const size_t padded_n_buffer = 8ULL * actual_vocab_size * sizeof(float);                                 // ROCM_E_PADDED
+        const size_t embed_table_temp = static_cast<size_t>(actual_vocab_size) * actual_d_model * sizeof(float); // Embedding table temp
+        const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer + embed_table_temp;
+        const size_t safety_margin = base_workspace / 10; // 10% safety
+        const size_t min_budget = 768ULL * 1024 * 1024;   // Floor at 768 MB for small models
+        const size_t workspace_budget = std::max(min_budget, base_workspace + safety_margin);
 
         LOG_DEBUG("[GraphOrchestrator] Workspace sizing: max_seq_len=" << actual_max_seq_len
                                                                        << " n_heads=" << actual_n_heads << " head_dim=" << actual_head_dim
                                                                        << " d_model=" << config.d_model << " vocab_size=" << actual_vocab_size
                                                                        << " batch_size=" << actual_batch_size);
-        LOG_INFO("[GraphOrchestrator] Workspace budget: " << (workspace_budget / (1024 * 1024)) << " MB"
-                                                          << " (LM head: 3×" << (mn_buffer_size / (1024 * 1024)) << "MB M×N buffers"
-                                                          << " @ max_seq_len=" << actual_max_seq_len << " × vocab_size=" << actual_vocab_size << ")");
+        LOG_DEBUG("[GraphOrchestrator] Workspace budget: " << (workspace_budget / (1024 * 1024)) << " MB"
+                                                           << " (LM head: 3×" << (mn_buffer_size / (1024 * 1024)) << "MB M×N buffers"
+                                                           << ", embed_table_temp: " << (embed_table_temp / (1024 * 1024)) << "MB"
+                                                           << " @ max_seq_len=" << actual_max_seq_len << " × vocab_size=" << actual_vocab_size << ")");
 
         // Collect all workspace-consuming stages by device
         // Track extra info for each consumer to customize workspace sizing
@@ -1075,7 +1081,7 @@ namespace llaminar2
     {
         layer_graph_cache_.resize(n_layers);
         cache_stats_.cached_layers = n_layers;
-        LOG_INFO("[GraphOrchestrator] Graph cache initialized for " << n_layers << " layers");
+        LOG_DEBUG("[GraphOrchestrator] Graph cache initialized for " << n_layers << " layers");
     }
 
     // =========================================================================
@@ -1109,10 +1115,10 @@ namespace llaminar2
         int buffer_n_kv_heads = config.qkv_column_parallel ? config.local_n_kv_heads : n_kv_heads;
         int buffer_d_ff = config.ffn_column_parallel ? config.d_ff_local : d_ff;
 
-        LOG_INFO("[GraphOrchestrator] Initializing inference state: batch_size=" << batch_size
-                                                                                 << " max_seq_len=" << max_seq_len
-                                                                                 << " d_model=" << d_model
-                                                                                 << " vocab_size=" << vocab_size);
+        LOG_DEBUG("[GraphOrchestrator] Initializing inference state: batch_size=" << batch_size
+                                                                                  << " max_seq_len=" << max_seq_len
+                                                                                  << " d_model=" << d_model
+                                                                                  << " vocab_size=" << vocab_size);
 
         if (config.qkv_column_parallel)
         {
@@ -1139,12 +1145,12 @@ namespace llaminar2
         if (init_config.use_mapped_memory && device.is_gpu())
         {
             factory.setUseMappedMemoryForGPU(true);
-            LOG_INFO("[GraphOrchestrator] Enabling mapped memory for ALL GPU tensors (zero-copy host access)");
+            LOG_DEBUG("[GraphOrchestrator] Enabling mapped memory for ALL GPU tensors (zero-copy host access)");
         }
 
         // Get activation precision from config
         ActivationPrecision act_prec = config.activation_precision;
-        LOG_INFO("[GraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
+        LOG_DEBUG("[GraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
 
         // Allocate core buffers (always FP32 - interface with embeddings/softmax)
         state_.hidden = factory.createFP32(
@@ -1237,16 +1243,16 @@ namespace llaminar2
                 act_prec, HybridBufferType::Q_After_RoPE, nullptr);
             ActivationPrecision k_rope_prec = resolveBufferPrecision(
                 act_prec, HybridBufferType::K_After_RoPE, nullptr);
-            LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                            << " mode: allocating Q_rope buffer ("
-                                            << activationPrecisionToString(q_rope_prec) << ")");
+            LOG_DEBUG("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                             << " mode: allocating Q_rope buffer ("
+                                             << activationPrecisionToString(q_rope_prec) << ")");
             // Pass head_dim for Q16 block size selection (must match KV cache block size)
             state_.Q_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
                 q_rope_prec, head_dim, device);
-            LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                            << " mode: allocating K_rope buffer ("
-                                            << activationPrecisionToString(k_rope_prec) << ")");
+            LOG_DEBUG("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                             << " mode: allocating K_rope buffer ("
+                                             << activationPrecisionToString(k_rope_prec) << ")");
             state_.K_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
                 k_rope_prec, head_dim, device);
@@ -1258,9 +1264,9 @@ namespace llaminar2
             state_.V_dequant = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
                 kv_cache_prec, head_dim, device);
-            LOG_INFO("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                            << " mode: allocating V_dequant buffer ("
-                                            << activationPrecisionToString(kv_cache_prec) << ")");
+            LOG_DEBUG("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                             << " mode: allocating V_dequant buffer ("
+                                             << activationPrecisionToString(kv_cache_prec) << ")");
 
             // HybridQ16 K precision fix: allocate per-head K scales buffer
             // This stores dynamic scales from RoPE Q16→Q16 path for attention kernel
@@ -1268,9 +1274,9 @@ namespace llaminar2
             {
                 const size_t k_head_scales_size = static_cast<size_t>(batch_size * max_seq_len * buffer_n_kv_heads);
                 state_.K_head_scales.resize(k_head_scales_size, 1.0f);
-                LOG_INFO("[GraphOrchestrator] HybridQ16 K precision fix: allocating K_head_scales buffer ("
-                         << k_head_scales_size << " floats, "
-                         << k_head_scales_size * sizeof(float) / 1024 << " KB)");
+                LOG_DEBUG("[GraphOrchestrator] HybridQ16 K precision fix: allocating K_head_scales buffer ("
+                          << k_head_scales_size << " floats, "
+                          << k_head_scales_size * sizeof(float) / 1024 << " KB)");
             }
         }
 
@@ -1420,7 +1426,7 @@ namespace llaminar2
         state_.vocab_size = vocab_size;
         state_.device_id = device;
 
-        LOG_INFO("[GraphOrchestrator] Inference state initialized successfully");
+        LOG_DEBUG("[GraphOrchestrator] Inference state initialized successfully");
         return true;
     }
 
@@ -1765,7 +1771,7 @@ namespace llaminar2
         weight_streamer_ = std::move(streamer);
         if (weight_streamer_)
         {
-            LOG_INFO("[GraphOrchestrator] Weight streaming enabled");
+            LOG_DEBUG("[GraphOrchestrator] Weight streaming enabled");
         }
         else
         {

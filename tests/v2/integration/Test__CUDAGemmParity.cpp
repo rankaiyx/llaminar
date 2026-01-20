@@ -1153,7 +1153,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     ASSERT_NE(cpu_kernel, nullptr);
     ASSERT_TRUE(cpu_kernel->multiply_tensor(
         input_tensor.get(), output_cpu.get(),
-        M, N, K, true, 1.0f, 0.0f, nullptr, -1));
+        M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1));
 
     // ===== CUDA: multiply_tensor() =====
     // First ensure weights are on GPU
@@ -1172,7 +1172,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
         {
             return cuda_kernel->multiply_tensor(
                 input_tensor.get(), output_cuda.get(),
-                M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+                M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
 
     // ===== Compare =====
@@ -1298,13 +1298,13 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
         {
             return cuda_kernel_q->multiply_tensor(
                        input_tensor.get(), output_q_separate.get(),
-                       M, N_q, K, true, 1.0f, 0.0f, nullptr, -1) &&
+                       M, N_q, K, true, 1.0f, 0.0f, nullptr, nullptr, -1) &&
                    cuda_kernel_k->multiply_tensor(
                        input_tensor.get(), output_k_separate.get(),
-                       M, N_k, K, true, 1.0f, 0.0f, nullptr, -1) &&
+                       M, N_k, K, true, 1.0f, 0.0f, nullptr, nullptr, -1) &&
                    cuda_kernel_v->multiply_tensor(
                        input_tensor.get(), output_v_separate.get(),
-                       M, N_v, K, true, 1.0f, 0.0f, nullptr, -1);
+                       M, N_v, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
 
     // ===== FUSED PATH: multiply_fused_tensor() =====
@@ -1600,7 +1600,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
         {
             return fresh_kernel->multiply_tensor(
                 input_tensor.get(), output_fresh.get(),
-                M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+                M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
 
     // Run cached kernel with coherence wrapper
@@ -1612,7 +1612,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
         {
             return cached_kernel->multiply_tensor(
                 input_tensor.get(), output_cached.get(),
-                M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+                M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
 
     // Compare: should be EXACTLY the same (same kernel, same weights)
@@ -1695,7 +1695,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
             {
                 return kernel->multiply_tensor(
                     input.get(), output.get(),
-                    M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+                    M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
             }));
 
         outputs[run].resize(M * N);
@@ -1792,7 +1792,7 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
             {
                 return kernel->multiply_tensor(
                     input.get(), output_cuda.get(),
-                    M, N, K, true, 1.0f, 0.0f, nullptr, -1);
+                    M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
             }));
 
         // CPU reference

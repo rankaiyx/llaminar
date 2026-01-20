@@ -577,6 +577,7 @@ namespace llaminar2
             const TensorBase *A, TensorBase *C,
             bool transpose_B,
             float alpha, float beta,
+            const TensorBase *bias,
             const MPIContext *mpi_ctx,
             int device_idx,
             DeviceWorkspaceManager *workspace)
@@ -602,7 +603,7 @@ namespace llaminar2
                 return false;
             }
 
-            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, workspace);
+            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, mpi_ctx, device_idx, workspace);
         }
 
         bool ROCmQuantisedGemmKernel::multiply_tensor(
@@ -610,6 +611,7 @@ namespace llaminar2
             int m, int n, int k,
             bool transpose_B,
             float alpha, float beta,
+            const TensorBase *bias,
             const MPIContext *mpi_ctx,
             int device_idx,
             DeviceWorkspaceManager *workspace)
@@ -662,6 +664,24 @@ namespace llaminar2
             auto phase_start = std::chrono::high_resolution_clock::now();
             auto phase_end = phase_start;
 
+            // Fast path: if bias is present and we're on GPU, use multiply_fp32_to_fp32_with_bias
+            if (bias && use_gpu_path)
+            {
+                const float *d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                if (d_bias)
+                {
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using bias path (d_input="
+                              << d_input << ", d_output=" << d_output << ", d_bias=" << d_bias << ")");
+                    bool result = multiply_fp32_to_fp32_with_bias(d_input, d_output, d_bias, m, n, k, alpha, beta);
+                    // Restore original workspace binding
+                    if (ws && ws != saved_workspace)
+                    {
+                        workspace_ = saved_workspace;
+                    }
+                    return result;
+                }
+            }
+
             if (use_gpu_path)
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using GPU-to-GPU path (d_input="
@@ -674,7 +694,7 @@ namespace llaminar2
             phase_end = std::chrono::high_resolution_clock::now();
             double weights_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             if (weights_ms > 1.0)
-                LOG_INFO("[ROCmGEMM::PHASES] ensureWeightsConverted: " << weights_ms << "ms");
+                LOG_TRACE("[ROCmGEMM::PHASES] ensureWeightsConverted: " << weights_ms << "ms");
 
             // Get weight device pointers
             int8_t *d_weights_int8 = nullptr;
@@ -705,7 +725,7 @@ namespace llaminar2
             phase_end = std::chrono::high_resolution_clock::now();
             double workbuf_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             if (workbuf_ms > 1.0)
-                LOG_INFO("[ROCmGEMM::PHASES] ensureWorkBuffers: " << workbuf_ms << "ms");
+                LOG_TRACE("[ROCmGEMM::PHASES] ensureWorkBuffers: " << workbuf_ms << "ms");
 
             int8_t *d_A_int8 = impl_->d_A_int8;
             float *d_scales_A = impl_->d_scales_A;
@@ -748,7 +768,7 @@ namespace llaminar2
                 phase_end = std::chrono::high_resolution_clock::now();
                 double alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 if (alloc_ms > 1.0)
-                    LOG_INFO("[ROCmGEMM::PHASES] d_A_fp32 alloc: " << alloc_ms << "ms");
+                    LOG_TRACE("[ROCmGEMM::PHASES] d_A_fp32 alloc: " << alloc_ms << "ms");
 
                 LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using cached d_A_fp32=" << (void *)d_A_fp32_src);
 
@@ -761,7 +781,7 @@ namespace llaminar2
                 phase_end = std::chrono::high_resolution_clock::now();
                 double h2d_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 if (h2d_ms > 1.0)
-                    LOG_INFO("[ROCmGEMM::PHASES] H2D copy (A_fp32): " << h2d_ms << "ms");
+                    LOG_TRACE("[ROCmGEMM::PHASES] H2D copy (A_fp32): " << h2d_ms << "ms");
                 LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Copied activations to device");
             }
 
@@ -777,7 +797,7 @@ namespace llaminar2
             phase_end = std::chrono::high_resolution_clock::now();
             double quant_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             if (quant_ms > 1.0)
-                LOG_INFO("[ROCmGEMM::PHASES] quantizeActivations: " << quant_ms << "ms");
+                LOG_TRACE("[ROCmGEMM::PHASES] quantizeActivations: " << quant_ms << "ms");
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Quantized activations, now executing CK GEMM");
 
@@ -974,7 +994,7 @@ namespace llaminar2
                     m, padded_m, n, k, rocm_device_id_);
                 auto gemm_end = std::chrono::high_resolution_clock::now();
                 double gemm_ms = std::chrono::duration<double, std::milli>(gemm_end - gemm_start).count();
-                LOG_INFO("[ROCmGEMM::TIMING] executeTwoKernel_padded_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
+                LOG_TRACE("[ROCmGEMM::TIMING] executeTwoKernel_padded_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
             }
             else
             {
@@ -987,7 +1007,7 @@ namespace llaminar2
                     m, n, k, rocm_device_id_);
                 auto gemm_end = std::chrono::high_resolution_clock::now();
                 double gemm_ms = std::chrono::duration<double, std::milli>(gemm_end - gemm_start).count();
-                LOG_INFO("[ROCmGEMM::TIMING] executeTwoKernel_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
+                LOG_TRACE("[ROCmGEMM::TIMING] executeTwoKernel_cached M=" << m << " N=" << n << " K=" << k << " took " << gemm_ms << "ms");
             }
 
             if (!success)
@@ -1014,7 +1034,7 @@ namespace llaminar2
                 phase_end = std::chrono::high_resolution_clock::now();
                 double d2h_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 if (d2h_ms > 1.0)
-                    LOG_INFO("[ROCmGEMM::PHASES] D2H copy (C_fp32): " << d2h_ms << "ms");
+                    LOG_TRACE("[ROCmGEMM::PHASES] D2H copy (C_fp32): " << d2h_ms << "ms");
             }
             LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Completed " << m << "x" << n << "x" << k);
 
@@ -1423,16 +1443,10 @@ namespace llaminar2
                         break;
                     }
 
-                    auto *fp32_bias = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
-                    if (!fp32_bias)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to cast bias to FP32Tensor");
-                        all_success = false;
-                        break;
-                    }
-
-                    // Coherence handled automatically by GraphExecutor
-                    d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                    // Use TensorBase interface - works with both FP32Tensor and TensorSlice
+                    // Cast away const to access gpu_data_ptr() (coherence is managed by GraphExecutor)
+                    auto *bias_tensor = const_cast<TensorBase *>(proj.bias);
+                    d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
                     if (!d_bias)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i);

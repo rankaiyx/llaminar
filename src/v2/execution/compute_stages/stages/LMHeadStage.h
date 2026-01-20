@@ -46,8 +46,8 @@ namespace llaminar2
             int d_model = 0;
             int vocab_size = 0;
 
-            // Optional bias
-            const float *bias = nullptr;
+            // Optional bias tensor [vocab_size] - passed to GEMM for fused addition
+            const TensorBase *bias_tensor = nullptr;
         };
 
         explicit LMHeadStage(Params params);

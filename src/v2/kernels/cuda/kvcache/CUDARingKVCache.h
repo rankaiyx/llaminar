@@ -31,8 +31,9 @@
 #pragma once
 
 // Minimal includes - avoid MPI headers for nvcc compatibility
-#include "../../IKVCache.h"                   // Unified KVCache interface
-#include "../../../execution/RuntimeConfig.h" // For ActivationPrecision
+#include "../../IKVCache.h"                         // Unified KVCache interface
+#include "../../../execution/RuntimeConfig.h"       // For ActivationPrecision
+#include "../../../interfaces/IWorkspaceConsumer.h" // Workspace management
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -42,6 +43,29 @@
 
 namespace llaminar2
 {
+    // Forward declarations
+    class DeviceWorkspaceManager;
+    struct WorkspaceRequirements;
+
+    // =========================================================================
+    // KV Cache Workspace Buffer Names
+    // =========================================================================
+
+    /**
+     * Standard buffer names for KV cache gather workspace.
+     * Used by launch_gather_kernel() for batched attention.
+     */
+    namespace KVCacheWorkspaceBuffers
+    {
+        /// Array of K cache pointers [batch_size × sizeof(void*)]
+        constexpr const char *BATCH_K_PTRS = "kvcache_batch_k_ptrs";
+        /// Array of V cache pointers [batch_size × sizeof(void*)]
+        constexpr const char *BATCH_V_PTRS = "kvcache_batch_v_ptrs";
+        /// Array of tail indices [batch_size × sizeof(int)]
+        constexpr const char *BATCH_TAILS = "kvcache_batch_tails";
+        /// Array of count values [batch_size × sizeof(int)]
+        constexpr const char *BATCH_COUNTS = "kvcache_batch_counts";
+    }
 
     // =========================================================================
     // ICUDARingKVCache Interface
@@ -302,9 +326,11 @@ namespace llaminar2
      * - FP32: 32-bit float
      * - FP16: 16-bit half precision
      * - BF16: 16-bit brain float
+     *
+     * Implements IWorkspaceConsumer for zero-alloc gather operations.
      */
     template <ActivationPrecision Precision = ActivationPrecision::FP32>
-    class CUDARingKVCache : public ICUDARingKVCache
+    class CUDARingKVCache : public ICUDARingKVCache, public IWorkspaceConsumer
     {
     public:
         using DataT = typename detail::CUDAKVCacheType<Precision>::Type;
@@ -405,6 +431,45 @@ namespace llaminar2
                           const DataT *d_k, const DataT *d_v,
                           int num_tokens, cudaStream_t stream = 0);
 
+        // =====================================================================
+        // IWorkspaceConsumer Interface
+        // =====================================================================
+
+        /**
+         * @brief Get workspace requirements for batched gather operations
+         *
+         * Returns buffer requirements for pointer arrays used in launch_gather_kernel().
+         * When workspace is bound, gather operations use pre-allocated buffers
+         * instead of cudaMalloc/cudaFree per call.
+         *
+         * @param m Batch size (number of sequences)
+         * @param n Unused
+         * @param k Unused
+         * @return WorkspaceRequirements with buffer specifications
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m = 0, int n = 0, int k = 0) const override;
+
+        /**
+         * @brief Bind workspace manager for managed mode
+         *
+         * When bound, gather operations use pre-allocated buffers instead of
+         * per-call cudaMalloc/cudaFree.
+         *
+         * @param workspace Pointer to workspace manager (NOT owned, must outlive cache)
+         */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+        /**
+         * @brief Check if workspace is currently bound
+         */
+        bool hasWorkspace() const override;
+
+        /**
+         * @brief Get the currently bound workspace manager
+         */
+        DeviceWorkspaceManager *getWorkspace() const override;
+
     private:
         int n_layers_;
         int batch_size_;
@@ -413,6 +478,10 @@ namespace llaminar2
         int head_dim_;
         int kv_dim_;
         int device_id_;
+
+        // Workspace manager for batched gather operations
+        // When bound, launch_gather_kernel() uses pre-allocated buffers instead of cudaMalloc/cudaFree
+        DeviceWorkspaceManager *workspace_ = nullptr;
 
         // Entry storage: [n_layers][batch_size]
         std::vector<std::vector<EntryT>> entries_;

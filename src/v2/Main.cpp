@@ -105,9 +105,9 @@ DeviceId parse_device(const std::string &device_str, DeviceManager &dm)
 
     if (device_str.substr(0, 5) == "cuda:")
     {
-        int device_id = std::stoi(device_str.substr(5));
+        int local_index = std::stoi(device_str.substr(5));
 
-        // Validate CUDA device exists
+        // Validate CUDA device exists in the NUMA-filtered list
         int cuda_count = dm.cuda_device_count();
         if (cuda_count == 0)
         {
@@ -115,19 +115,30 @@ DeviceId parse_device(const std::string &device_str, DeviceManager &dm)
             LOG_ERROR("Available backends: " << dm.device_count() << " total (use --list-devices to see)");
             return DeviceId(); // Invalid
         }
-        if (device_id >= cuda_count)
+        if (local_index >= cuda_count)
         {
-            LOG_ERROR("Error: CUDA device " << device_id << " does not exist. Found " << cuda_count << " CUDA device(s).");
+            LOG_ERROR("Error: CUDA device " << local_index << " does not exist. Found " << cuda_count << " CUDA device(s) on this NUMA node.");
             return DeviceId(); // Invalid
         }
-        return DeviceId::cuda(device_id);
+
+        // Get the actual CUDA device ordinal for the N-th NUMA-local CUDA device
+        int actual_device_id = dm.get_device_id_for_type(ComputeBackendType::GPU_CUDA, local_index);
+        if (actual_device_id < 0)
+        {
+            LOG_ERROR("Error: Failed to get device ID for CUDA device " << local_index);
+            return DeviceId(); // Invalid
+        }
+
+        LOG_DEBUG("Mapping cuda:" << local_index << " to CUDA device " << actual_device_id
+                                  << " (NUMA-aware)");
+        return DeviceId::cuda(actual_device_id);
     }
 
     if (device_str.substr(0, 5) == "rocm:")
     {
-        int device_id = std::stoi(device_str.substr(5));
+        int local_index = std::stoi(device_str.substr(5));
 
-        // Validate ROCm device exists
+        // Validate ROCm device exists in the NUMA-filtered list
         int rocm_count = dm.rocm_device_count();
         if (rocm_count == 0)
         {
@@ -137,12 +148,23 @@ DeviceId parse_device(const std::string &device_str, DeviceManager &dm)
             LOG_ERROR("Available backends: " << dm.device_count() << " total (use --list-devices to see)");
             return DeviceId(); // Invalid
         }
-        if (device_id >= rocm_count)
+        if (local_index >= rocm_count)
         {
-            LOG_ERROR("Error: ROCm device " << device_id << " does not exist. Found " << rocm_count << " ROCm device(s).");
+            LOG_ERROR("Error: ROCm device " << local_index << " does not exist. Found " << rocm_count << " ROCm device(s) on this NUMA node.");
             return DeviceId(); // Invalid
         }
-        return DeviceId::rocm(device_id);
+
+        // Get the actual HIP device ordinal for the N-th NUMA-local ROCm device
+        int actual_device_id = dm.get_device_id_for_type(ComputeBackendType::GPU_ROCM, local_index);
+        if (actual_device_id < 0)
+        {
+            LOG_ERROR("Error: Failed to get device ID for ROCm device " << local_index);
+            return DeviceId(); // Invalid
+        }
+
+        LOG_DEBUG("Mapping rocm:" << local_index << " to HIP device " << actual_device_id
+                                  << " (NUMA-aware)");
+        return DeviceId::rocm(actual_device_id);
     }
 
     LOG_ERROR("Error: Unknown device format: " << device_str);

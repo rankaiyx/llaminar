@@ -530,10 +530,12 @@ namespace llaminar2
             const TensorBase *A, TensorBase *C,
             bool transpose_B,
             float alpha, float beta,
+            const TensorBase *bias,
             const MPIContext *mpi_ctx,
             int device_idx,
             DeviceWorkspaceManager *workspace)
         {
+            (void)bias; // TODO: Implement bias support
             if (!A || !C)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor] Null input or output tensor");
@@ -544,7 +546,7 @@ namespace llaminar2
             int n = static_cast<int>(N_);
             int k = static_cast<int>(K_);
 
-            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx, workspace);
+            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, mpi_ctx, device_idx, workspace);
         }
 
         bool CUDAQuantisedGemmKernel::multiply_tensor(
@@ -552,6 +554,7 @@ namespace llaminar2
             int m, int n, int k,
             bool /*transpose_B*/,
             float alpha, float beta,
+            const TensorBase *bias,
             const MPIContext * /*mpi_ctx*/,
             int /*device_idx*/,
             DeviceWorkspaceManager *workspace)
@@ -563,17 +566,18 @@ namespace llaminar2
                 // Temporarily use passed workspace for this call
                 DeviceWorkspaceManager *saved_ws = workspace_;
                 workspace_ = effective_ws;
-                bool result = multiply_tensor_impl(A, C, m, n, k, alpha, beta);
+                bool result = multiply_tensor_impl(A, C, m, n, k, alpha, beta, bias);
                 workspace_ = saved_ws;
                 return result;
             }
-            return multiply_tensor_impl(A, C, m, n, k, alpha, beta);
+            return multiply_tensor_impl(A, C, m, n, k, alpha, beta, bias);
         }
 
         bool CUDAQuantisedGemmKernel::multiply_tensor_impl(
             const TensorBase *A, TensorBase *C,
             int m, int n, int k,
-            float alpha, float beta)
+            float alpha, float beta,
+            const TensorBase *bias)
         {
             if (!A || !C)
             {
@@ -632,7 +636,18 @@ namespace llaminar2
                     return false;
                 }
 
-                bool success = multiply_fp32_to_fp32(d_A, d_C, m, n, k, alpha, beta);
+                // Extract bias pointer if present
+                const float *d_bias = bias ? static_cast<const float *>(bias->gpu_data_ptr()) : nullptr;
+
+                bool success;
+                if (d_bias)
+                {
+                    success = multiply_fp32_to_fp32_with_bias(d_A, d_C, d_bias, m, n, k, alpha, beta);
+                }
+                else
+                {
+                    success = multiply_fp32_to_fp32(d_A, d_C, m, n, k, alpha, beta);
+                }
                 return success;
             }
             else if (a_type == TensorType::Q8_1 && c_type == TensorType::Q8_1)

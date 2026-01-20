@@ -596,7 +596,7 @@ TEST_F(Test__StageBufferRequirements, LMHeadStage_WithBias_IncludesBiasBuffer)
     auto hidden_states = createFP32Tensor(SEQ_LEN, D_MODEL);
     auto lm_head_weight = createFP32Tensor(VOCAB_SIZE, D_MODEL);
     auto logits = createFP32Tensor(SEQ_LEN, VOCAB_SIZE);
-    std::vector<float> bias(VOCAB_SIZE, 0.0f);
+    auto bias_tensor = createFP32Tensor(1, VOCAB_SIZE); // Create as TensorBase
 
     LMHeadStage::Params params{
         .hidden_states = hidden_states.get(),
@@ -605,7 +605,7 @@ TEST_F(Test__StageBufferRequirements, LMHeadStage_WithBias_IncludesBiasBuffer)
         .seq_len = static_cast<int>(SEQ_LEN),
         .d_model = static_cast<int>(D_MODEL),
         .vocab_size = static_cast<int>(VOCAB_SIZE),
-        .bias = bias.data(),
+        .bias_tensor = bias_tensor.get(),
     };
     LMHeadStage stage(params);
 

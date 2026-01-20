@@ -61,6 +61,15 @@ namespace llaminar2
             total_size += buf.size_bytes;
         }
 
+        // Log all buffer requirements
+        LOG_DEBUG("[DeviceWorkspaceManager] Workspace requirements (" << requirements.buffers.size() << " buffers):");
+        for (const auto &buf : requirements.buffers)
+        {
+            LOG_DEBUG("[DeviceWorkspaceManager]   - " << buf.name << ": " << (buf.size_bytes / (1024 * 1024)) << " MB"
+                                                      << (buf.required ? " (required)" : " (optional)"));
+        }
+        LOG_DEBUG("[DeviceWorkspaceManager] Total size needed: " << (total_size / (1024 * 1024)) << " MB, budget: " << (budget_bytes_ / (1024 * 1024)) << " MB");
+
         // Check budget
         if (total_size > budget_bytes_)
         {
