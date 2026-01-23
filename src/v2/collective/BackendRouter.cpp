@@ -11,6 +11,12 @@
 #include "backends/MPIBackend.h"
 #include "backends/UPIBackend.h"
 #include "../config/TPDomain.h"
+#ifdef HAVE_NCCL
+#include "backends/NCCLBackend.h"
+#endif
+#ifdef HAVE_RCCL
+#include "backends/RCCLBackend.h"
+#endif
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 #include "backends/PCIeBARBackend.h"
 #endif
@@ -514,14 +520,20 @@ namespace llaminar2
             return std::make_unique<MPIBackend>(mpi_ctx);
 
         case CollectiveBackendType::NCCL:
-            // NCCL backend not yet implemented
-            LOG_INFO("DefaultBackendFactory::createBackend - NCCL backend not yet implemented");
+#ifdef HAVE_NCCL
+            return std::make_unique<NCCLBackend>(mpi_ctx);
+#else
+            LOG_INFO("DefaultBackendFactory::createBackend - NCCL not available (HAVE_NCCL not defined)");
             return nullptr;
+#endif
 
         case CollectiveBackendType::RCCL:
-            // RCCL backend not yet implemented
-            LOG_INFO("DefaultBackendFactory::createBackend - RCCL backend not yet implemented");
+#ifdef HAVE_RCCL
+            return std::make_unique<RCCLBackend>(mpi_ctx);
+#else
+            LOG_INFO("DefaultBackendFactory::createBackend - RCCL not available (HAVE_RCCL not defined)");
             return nullptr;
+#endif
 
         case CollectiveBackendType::PCIE_BAR:
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)

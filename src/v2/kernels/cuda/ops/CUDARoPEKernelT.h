@@ -14,7 +14,9 @@
 
 #include "../../../execution/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, FP16Tensor
 #include "../../../tensors/BlockStructures.h"
+#include "../../../utils/Logger.h"
 #include <cstdint>
 
 namespace llaminar2
@@ -126,6 +128,85 @@ namespace llaminar2
                 float rope_theta,
                 int device_idx = -1);
 
+            // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
+            bool apply_tensor(
+                TensorBase *Q,
+                TensorBase *K,
+                const int *position_ids,
+                int seq_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                float rope_theta,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)mpi_ctx;
+
+                LOG_DEBUG("[CUDARoPEKernelT<FP32>] apply_tensor called: seq_len=" << seq_len 
+                          << " n_heads=" << n_heads << " device_idx=" << device_idx);
+
+                if (!Q || Q->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<FP32>::apply_tensor: Q must be FP32Tensor");
+                    return false;
+                }
+
+                auto *q_fp32 = dynamic_cast<FP32Tensor *>(Q);
+                if (!q_fp32)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<FP32>::apply_tensor: Q dynamic_cast failed");
+                    return false;
+                }
+
+                // Get GPU pointer for Q - this may upload if needed via ensureOnDevice
+                float *q_gpu = static_cast<float *>(q_fp32->gpu_data_ptr());
+                if (!q_gpu)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<FP32>::apply_tensor: Q has no GPU data");
+                    return false;
+                }
+
+                // Handle K tensor if provided
+                float *k_gpu = nullptr;
+                FP32Tensor *k_fp32 = nullptr;
+                if (K)
+                {
+                    if (K->native_type() != TensorType::FP32)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<FP32>::apply_tensor: K must be FP32Tensor");
+                        return false;
+                    }
+                    k_fp32 = dynamic_cast<FP32Tensor *>(K);
+                    if (!k_fp32)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<FP32>::apply_tensor: K dynamic_cast failed");
+                        return false;
+                    }
+                    k_gpu = static_cast<float *>(k_fp32->gpu_data_ptr());
+                    if (!k_gpu)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<FP32>::apply_tensor: K has no GPU data");
+                        return false;
+                    }
+                }
+
+                // Execute on GPU
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+
+                // Mark tensors as modified on GPU
+                if (success)
+                {
+                    q_fp32->mark_device_dirty();
+                    if (k_fp32)
+                    {
+                        k_fp32->mark_device_dirty();
+                    }
+                }
+
+                return success;
+            }
+
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
             static const char *precision_name() { return "FP32"; }
 
@@ -227,6 +308,82 @@ namespace llaminar2
                 float rope_theta,
                 int device_idx = -1);
 
+            // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
+            bool apply_tensor(
+                TensorBase *Q,
+                TensorBase *K,
+                const int *position_ids,
+                int seq_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                float rope_theta,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)mpi_ctx;
+
+                if (!Q || Q->native_type() != TensorType::BF16)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<BF16>::apply_tensor: Q must be BF16Tensor");
+                    return false;
+                }
+
+                auto *q_bf16 = dynamic_cast<BF16Tensor *>(Q);
+                if (!q_bf16)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<BF16>::apply_tensor: Q dynamic_cast failed");
+                    return false;
+                }
+
+                // Get GPU pointer for Q
+                uint16_t *q_gpu = static_cast<uint16_t *>(q_bf16->gpu_data_ptr());
+                if (!q_gpu)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<BF16>::apply_tensor: Q has no GPU data");
+                    return false;
+                }
+
+                // Handle K tensor if provided
+                uint16_t *k_gpu = nullptr;
+                BF16Tensor *k_bf16 = nullptr;
+                if (K)
+                {
+                    if (K->native_type() != TensorType::BF16)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<BF16>::apply_tensor: K must be BF16Tensor");
+                        return false;
+                    }
+                    k_bf16 = dynamic_cast<BF16Tensor *>(K);
+                    if (!k_bf16)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<BF16>::apply_tensor: K dynamic_cast failed");
+                        return false;
+                    }
+                    k_gpu = static_cast<uint16_t *>(k_bf16->gpu_data_ptr());
+                    if (!k_gpu)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<BF16>::apply_tensor: K has no GPU data");
+                        return false;
+                    }
+                }
+
+                // Execute on GPU
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+
+                // Mark tensors as modified on GPU
+                if (success)
+                {
+                    q_bf16->mark_device_dirty();
+                    if (k_bf16)
+                    {
+                        k_bf16->mark_device_dirty();
+                    }
+                }
+
+                return success;
+            }
+
             static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
             static const char *precision_name() { return "BF16"; }
 
@@ -327,6 +484,82 @@ namespace llaminar2
                 int head_dim,
                 float rope_theta,
                 int device_idx = -1);
+
+            // ===== Tensor-aware API (uses GPU memory, marks outputs dirty) =====
+            bool apply_tensor(
+                TensorBase *Q,
+                TensorBase *K,
+                const int *position_ids,
+                int seq_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                float rope_theta,
+                const MPIContext *mpi_ctx = nullptr,
+                int device_idx = -1) override
+            {
+                (void)mpi_ctx;
+
+                if (!Q || Q->native_type() != TensorType::FP16)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<FP16>::apply_tensor: Q must be FP16Tensor");
+                    return false;
+                }
+
+                auto *q_fp16 = dynamic_cast<FP16Tensor *>(Q);
+                if (!q_fp16)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<FP16>::apply_tensor: Q dynamic_cast failed");
+                    return false;
+                }
+
+                // Get GPU pointer for Q
+                uint16_t *q_gpu = static_cast<uint16_t *>(q_fp16->gpu_data_ptr());
+                if (!q_gpu)
+                {
+                    LOG_ERROR("CUDARoPEKernelT<FP16>::apply_tensor: Q has no GPU data");
+                    return false;
+                }
+
+                // Handle K tensor if provided
+                uint16_t *k_gpu = nullptr;
+                FP16Tensor *k_fp16 = nullptr;
+                if (K)
+                {
+                    if (K->native_type() != TensorType::FP16)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<FP16>::apply_tensor: K must be FP16Tensor");
+                        return false;
+                    }
+                    k_fp16 = dynamic_cast<FP16Tensor *>(K);
+                    if (!k_fp16)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<FP16>::apply_tensor: K dynamic_cast failed");
+                        return false;
+                    }
+                    k_gpu = static_cast<uint16_t *>(k_fp16->gpu_data_ptr());
+                    if (!k_gpu)
+                    {
+                        LOG_ERROR("CUDARoPEKernelT<FP16>::apply_tensor: K has no GPU data");
+                        return false;
+                    }
+                }
+
+                // Execute on GPU
+                bool success = apply_typed(q_gpu, k_gpu, position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx);
+
+                // Mark tensors as modified on GPU
+                if (success)
+                {
+                    q_fp16->mark_device_dirty();
+                    if (k_fp16)
+                    {
+                        k_fp16->mark_device_dirty();
+                    }
+                }
+
+                return success;
+            }
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
             static const char *precision_name() { return "FP16"; }

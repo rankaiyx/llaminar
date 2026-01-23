@@ -85,6 +85,19 @@ namespace llaminar2
                 continue;
             }
 
+            // Check if tensor has cached device data (e.g., packed INT8 weights for CUDA GEMM)
+            // These tensors don't need raw data upload - the kernel uses its own representation
+            if (tensor_base->hasCachedDeviceData(target_device.type))
+            {
+                if (trace_coherence)
+                {
+                    LOG_INFO("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
+                                                        << "' has cached device data for " << target_device.to_string()
+                                                        << " (skipping raw upload)");
+                }
+                continue;
+            }
+
             // DEBUG: Log why is_on_device returned false for weights
             if (trace_coherence && (std::string(buf.name ? buf.name : "").find("w") == 0))
             {
@@ -176,7 +189,17 @@ namespace llaminar2
             }
 
             // Check if tensor is already on device
-            if (tensor_base->is_on_device(target_device))
+            bool already_on_device = tensor_base->is_on_device(target_device);
+            if (trace_coherence && !already_on_device)
+            {
+                // Debug: why is_on_device returned false?
+                auto current_dev = tensor_base->current_device();
+                LOG_INFO("[StageCoherence] OUTPUT '" << (buf.name ? buf.name : "unknown")
+                                                     << "' NOT on " << target_device.to_string()
+                                                     << " | gpu_device=" << (current_dev.has_value() ? current_dev->to_string() : "none")
+                                                     << " ptr=" << static_cast<void *>(tensor_base));
+            }
+            if (already_on_device)
             {
                 if (trace_coherence)
                 {

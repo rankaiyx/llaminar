@@ -84,15 +84,15 @@
 
 #pragma once
 
-#include "ITensor.h"
-#include "TypedTensorBase.h" // CRTP base for type-safe typed_data() access
-#include "TensorKernels.h"
-#include "FP16Utils.h"
-#include "BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
-#include "TensorLayout.h"    // Tensor memory layout contracts
-#include "SIMDHelpers.h"
-#include "AlignedVector.h"
-#include "../backends/DeviceId.h" // DeviceId for ensureOnDevice
+#include "../ITensor.h"
+#include "../TypedTensorBase.h" // CRTP base for type-safe typed_data() access
+#include "../TensorKernels.h"
+#include "../FP16Utils.h"
+#include "../BlockStructures.h" // Must be included BEFORE SIMDHelpers.h
+#include "../TensorLayout.h"    // Tensor memory layout contracts
+#include "../SIMDHelpers.h"
+#include "../AlignedVector.h"
+#include "../../backends/DeviceId.h" // DeviceId for ensureOnDevice
 #include <vector>
 #include <memory>
 #include <cstddef>
@@ -547,21 +547,21 @@ namespace llaminar2
      */
     class TensorSlice; // Forward declaration for friend
 
-    class TensorBase : public virtual ITensor, public std::enable_shared_from_this<TensorBase>
+    class CPUTensorBase : public virtual ITensor, public std::enable_shared_from_this<CPUTensorBase>
     {
         friend class TensorSlice; // Allow TensorSlice to access protected byte_size()/raw_host_data_ptr()
 
     public:
-        virtual ~TensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
+        virtual ~CPUTensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
 
         // Non-copyable: tensors contain mutexes and cached kernels
         // Use copyFrom() method to copy data between tensors
-        TensorBase(const TensorBase &) = delete;
-        TensorBase &operator=(const TensorBase &) = delete;
+        CPUTensorBase(const CPUTensorBase &) = delete;
+        CPUTensorBase &operator=(const CPUTensorBase &) = delete;
 
         // Move is also disabled due to enable_shared_from_this semantics
-        TensorBase(TensorBase &&) = delete;
-        TensorBase &operator=(TensorBase &&) = delete;
+        CPUTensorBase(CPUTensorBase &&) = delete;
+        CPUTensorBase &operator=(CPUTensorBase &&) = delete;
 
         // Generic cache for CPU kernel state (e.g. packed VNNI weights)
         mutable std::any cache_;
@@ -850,22 +850,6 @@ namespace llaminar2
         bool isDeviceValid() const { return device_valid_ && gpu_data_ptr_ != nullptr; }
 
         /**
-         * @brief Check if tensor has cached device data via internal packing mechanisms
-         *
-         * CUDA/ROCm GEMM kernels often convert quantized weights to a different
-         * representation (e.g., Q8_0 -> INT8 + per-column scales) and upload that
-         * instead of the raw tensor data. This method checks if such cached data exists.
-         *
-         * Use this to skip redundant ensureOnDevice() calls for weight tensors
-         * that use internal packing - they don't need raw tensor uploads.
-         *
-         * @param device_type Device type to check (CUDA or ROCm)
-         * @return true if tensor has cached device data uploaded for the given device type
-         * @note Implementation checks cuda_cache_/rocm_cache_ for uploaded packed weights
-         */
-        virtual bool hasCachedDeviceData(DeviceType device_type) const;
-
-        /**
          * @brief Check if tensor uses zero-copy mapped memory
          * @return true if tensor was allocated with mapped memory (shared host/device)
          *
@@ -935,7 +919,7 @@ namespace llaminar2
         virtual bool is_fp32_backed() const { return false; }
 
         // Device transfers (Phase 4.2)
-        virtual bool copyFrom(const TensorBase *src) = 0; // Copy data from another tensor (handles device transfers)
+        virtual bool copyFrom(const CPUTensorBase *src) = 0; // Copy data from another tensor (handles device transfers)
 
         // Kernel creation (only for weight matrices - GEMM)
         // NOTE: RoPE, SwiGLU, Softmax, RMSNorm, Attention moved to IActivationTensor
@@ -1080,7 +1064,7 @@ namespace llaminar2
          * EXPECT_GT(similarity, 0.999);  // Very similar
          * @endcode
          */
-        double cosineSimilarityTo(const TensorBase *other) const;
+        double cosineSimilarityTo(const CPUTensorBase *other) const;
 
         /**
          * @brief Compute maximum absolute difference between this tensor and another
@@ -1099,7 +1083,7 @@ namespace llaminar2
          * EXPECT_LT(max_diff, 1e-3f);  // Max error < 0.001
          * @endcode
          */
-        float maxAbsDiffTo(const TensorBase *other) const;
+        float maxAbsDiffTo(const CPUTensorBase *other) const;
 
         /**
          * @brief Compute mean absolute difference between this tensor and another
@@ -1118,7 +1102,7 @@ namespace llaminar2
          * EXPECT_LT(mean_diff, 1e-5f);  // Mean error < 0.00001
          * @endcode
          */
-        float meanAbsDiffTo(const TensorBase *other) const;
+        float meanAbsDiffTo(const CPUTensorBase *other) const;
 
         /**
          * @brief Compute relative L2 norm (Frobenius distance normalized by reference)
@@ -1139,7 +1123,7 @@ namespace llaminar2
          * EXPECT_LT(rel_l2, 0.01);  // Relative error < 1%
          * @endcode
          */
-        double relativeL2To(const TensorBase *other) const;
+        double relativeL2To(const CPUTensorBase *other) const;
 
         /**
          * @brief Compute KL divergence treating tensors as probability distributions
@@ -1164,7 +1148,7 @@ namespace llaminar2
          * EXPECT_LT(kl_div, 0.1);  // Distributions are similar
          * @endcode
          */
-        double klDivergenceTo(const TensorBase *other) const;
+        double klDivergenceTo(const CPUTensorBase *other) const;
 
         /**
          * @brief Get a summary of comparison metrics between this tensor and another
@@ -1195,7 +1179,7 @@ namespace llaminar2
             }
         };
 
-        ComparisonSummary compareTo(const TensorBase *other) const;
+        ComparisonSummary compareTo(const CPUTensorBase *other) const;
 
         // =========================================================================
         // Debug-Mode Validity Tracking (Task 4: Tensor Validity Assertions)
@@ -1312,7 +1296,7 @@ namespace llaminar2
 
     protected:
         // Default constructor for derived classes
-        TensorBase() = default;
+        CPUTensorBase() = default;
 
 #ifndef NDEBUG
         // Debug validity tracking state
@@ -1531,7 +1515,7 @@ namespace llaminar2
          * @note The view borrows data from the parent tensor. The parent must outlive the view.
          * @note Total elements in new_shape must not exceed available elements from offset.
          */
-        virtual std::shared_ptr<TensorBase> create_view(
+        virtual std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) = 0;
     };
@@ -1555,7 +1539,7 @@ namespace llaminar2
      * `data()` method is equivalent for FP32Tensor.
      */
     class FP32Tensor : public TypedTensorBase<FP32Tensor, float>,
-                       public TensorBase,
+                       public CPUTensorBase,
                        public IActivationTensor,
                        public ITensorGemmTileDataProvider,
                        public IQ8_0Decodable,
@@ -1627,16 +1611,16 @@ namespace llaminar2
         // Both TypedTensorBase and TensorBase provide ITensor overrides.
         // FP32Tensor must provide final overrides to disambiguate.
         // We delegate to TensorBase's implementations (already working).
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
         // ===== Unified FP32 Access (Phase 1 Infrastructure) =====
         float *mutable_fp32_data() override { return mutable_data(); }
         bool is_fp32_backed() const override { return true; }
 
-        bool copyFrom(const TensorBase *src) override;
+        bool copyFrom(const CPUTensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -1693,7 +1677,7 @@ namespace llaminar2
 
         // ===== TensorBase View Support =====
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -1773,7 +1757,7 @@ namespace llaminar2
         AlignedVector<float> *parent_data_ptr_; // Borrowed data pointer (only used when is_view_)
         size_t view_offset_;                    // Offset into parent data (only used when is_view_)
         std::shared_ptr<FP32Tensor> parent_;    // Keep parent alive (only used when is_view_)
-        // Note: mapped memory uses TensorBase::mapped_host_ptr_ (cast to float* in raw_host_data_ptr)
+        // Note: mapped memory uses CPUTensorBase::mapped_host_ptr_ (cast to float* in raw_host_data_ptr)
     };
 
     // Implementation: FP16Tensor.cpp
@@ -1795,7 +1779,7 @@ namespace llaminar2
      * **Usage**: Activation tensor for FP16 inference (2× memory savings, GPU-optimized).
      */
     class FP16Tensor : public TypedTensorBase<FP16Tensor, uint16_t>,
-                       public TensorBase,
+                       public CPUTensorBase,
                        public IActivationTensor,
                        public ITensorGemmTileDataProvider,
                        public IQ8_0Decodable,
@@ -1828,16 +1812,16 @@ namespace llaminar2
         float *mutable_data() override;     // Not supported
 
         // ===== Diamond Inheritance Resolution =====
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
         // ===== Unified FP32 Access (Phase 1 Infrastructure) =====
         // FP16 is NOT FP32-backed - requires FP16→FP32 conversion
         bool is_fp32_backed() const override { return false; }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -1894,7 +1878,7 @@ namespace llaminar2
 
         // View support
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -2008,7 +1992,7 @@ namespace llaminar2
      * **Usage**: Preferred activation tensor for CPU/GPU mixed precision (better overflow resistance than FP16).
      */
     class BF16Tensor : public TypedTensorBase<BF16Tensor, uint16_t>,
-                       public TensorBase,
+                       public CPUTensorBase,
                        public IActivationTensor,
                        public ITensorGemmTileDataProvider,
                        public IQ8_0Decodable,
@@ -2041,12 +2025,12 @@ namespace llaminar2
         float *mutable_data() override;     // Not supported
 
         // ===== Diamond Inheritance Resolution =====
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -2103,7 +2087,7 @@ namespace llaminar2
 
         // View support
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -2213,7 +2197,7 @@ namespace llaminar2
      * **NOT implemented**: IActivationTensor (INT8Tensor represents weights, not activations)
      */
     class INT8Tensor : public TypedTensorBase<INT8Tensor, int8_t>,
-                       public TensorBase,
+                       public CPUTensorBase,
                        public ITensorGemmTileDataProvider
     {
     public:
@@ -2247,19 +2231,19 @@ namespace llaminar2
         float *mutable_data() override;     // Not supported
 
         // ===== Diamond Inheritance Resolution =====
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override;
+        bool copyFrom(const CPUTensorBase *src) override;
 
         // TensorBase pure virtual - required implementation
         std::unique_ptr<ITensorGemm> createGemm() override;
 
         // Phase 2 fused kernel factory methods
-        std::unique_ptr<class FusedGEMM> createFusedDualGemm(TensorBase *gate_weight, TensorBase *up_weight);
-        std::unique_ptr<class FusedGEMM> createFusedTripleGemm(TensorBase *q_weight, TensorBase *k_weight, TensorBase *v_weight);
+        std::unique_ptr<class FusedGEMM> createFusedDualGemm(CPUTensorBase *gate_weight, CPUTensorBase *up_weight);
+        std::unique_ptr<class FusedGEMM> createFusedTripleGemm(CPUTensorBase *q_weight, CPUTensorBase *k_weight, CPUTensorBase *v_weight);
 
         bool from_int32_with_scales(
             const int32_t *accum,
@@ -2280,7 +2264,7 @@ namespace llaminar2
 
         // View support (future)
         bool is_view() const override { return false; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -2365,7 +2349,7 @@ namespace llaminar2
      * - `to_fp32()`: Dequantize to FP32 for final output or parity testing
      */
     class INT32Tensor : public TypedTensorBase<INT32Tensor, int32_t>,
-                        public TensorBase
+                        public CPUTensorBase
     {
     public:
         /// Native storage type (same as TypedTensorBase::value_type)
@@ -2398,12 +2382,12 @@ namespace llaminar2
         float *mutable_data() override;     // Not supported
 
         // ===== Diamond Inheritance Resolution =====
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override;
+        bool copyFrom(const CPUTensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -2426,7 +2410,7 @@ namespace llaminar2
 
         // View support (not yet implemented)
         bool is_view() const override { return false; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -2503,7 +2487,7 @@ namespace llaminar2
      * **Usage**: Default quantization format for model weights (balance of size and quality).
      */
 
-    class IQ4_NLTensor : public TypedTensorBase<IQ4_NLTensor, IQ4_NLBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ4_NLTensor : public TypedTensorBase<IQ4_NLTensor, IQ4_NLBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -2530,12 +2514,12 @@ namespace llaminar2
         float *mutable_data() override;     // Not supported for quantized tensors
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const override { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const override { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override; // Fused dequant+GEMM
         ITensorGemm *createGemmRaw();
@@ -2613,7 +2597,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -2703,10 +2687,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_; // Quantized blocks on device (if uploaded)
@@ -2718,7 +2702,7 @@ namespace llaminar2
         IQ4_NLTensor(const std::vector<size_t> &shape,
                      const uint8_t *parent_raw_data,
                      size_t byte_offset,
-                     std::shared_ptr<TensorBase> parent);
+                     std::shared_ptr<CPUTensorBase> parent);
 
         // Decode helpers
         static void decode_to_fp32_microkernel(float *dst, const IQ4_NLBlock *blocks, int rows, int cols, size_t blocks_per_row);
@@ -2733,7 +2717,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + int8[32] values
      * Compression: 4× vs FP32
      */
-    class Q8_0Tensor : public TypedTensorBase<Q8_0Tensor, Q8_0Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q8_0Tensor : public TypedTensorBase<Q8_0Tensor, Q8_0Block>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -2760,12 +2744,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -2857,7 +2841,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -2914,10 +2898,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -2928,7 +2912,7 @@ namespace llaminar2
         Q8_0Tensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
     };
 
     // ===== Q8_1 Tensor (8-bit quantization with pre-computed sum) =====
@@ -2964,7 +2948,7 @@ namespace llaminar2
      *   next_kernel->apply_q8_1(output->q8_1_blocks(), ...);
      */
     class Q8_1Tensor : public TypedTensorBase<Q8_1Tensor, Q8_1Block>,
-                       public TensorBase,
+                       public CPUTensorBase,
                        public IActivationTensor,
                        public ITensorGemmTileDataProvider,
                        public IQ8_1Decodable,
@@ -3037,12 +3021,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // ===== Diamond Inheritance Resolution =====
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override;
+        bool copyFrom(const CPUTensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -3170,7 +3154,7 @@ namespace llaminar2
          */
         bool is_mutable() const { return is_mutable_; }
 
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -3361,10 +3345,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -3377,7 +3361,7 @@ namespace llaminar2
         Q8_1Tensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
     };
 
     // ===== Q16_1 Tensor (16-bit quantization with pre-computed sum) =====
@@ -3407,7 +3391,7 @@ namespace llaminar2
      * across 20+ transformer layers causes token prediction divergence with Q8_1.
      */
     class Q16_1Tensor : public TypedTensorBase<Q16_1Tensor, Q16_1Block>,
-                        public TensorBase,
+                        public CPUTensorBase,
                         public IActivationTensor,
                         public ITensorGemmTileDataProvider
     {
@@ -3497,12 +3481,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // ===== Diamond Inheritance Resolution =====
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override;
+        bool copyFrom(const CPUTensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -3564,7 +3548,7 @@ namespace llaminar2
         bool is_view() const override { return is_view_; }
         bool is_mutable() const { return is_mutable_; }
 
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -3820,7 +3804,7 @@ namespace llaminar2
         std::vector<uint8_t> raw_data_;
         const uint8_t *raw_data_ptr_;
         size_t view_byte_offset_;
-        std::shared_ptr<TensorBase> parent_;
+        std::shared_ptr<CPUTensorBase> parent_;
 
         DeviceId device_;
         void *device_blocks_;
@@ -3892,7 +3876,7 @@ namespace llaminar2
         Q16_1Tensor(const std::vector<size_t> &shape,
                     const uint8_t *parent_raw_data,
                     size_t byte_offset,
-                    std::shared_ptr<TensorBase> parent);
+                    std::shared_ptr<CPUTensorBase> parent);
     };
 
     // ===== Q4_0 Tensor (4-bit quantization) =====
@@ -3904,7 +3888,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + 4-bit packed values
      * Compression: 8× vs FP32
      */
-    class Q4_0Tensor : public TypedTensorBase<Q4_0Tensor, Q4_0Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q4_0Tensor : public TypedTensorBase<Q4_0Tensor, Q4_0Block>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -3931,12 +3915,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -4015,7 +3999,7 @@ namespace llaminar2
         }
 
         // View support (row-slice only due to block alignment)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -4076,10 +4060,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4090,7 +4074,7 @@ namespace llaminar2
         Q4_0Tensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
     };
 
     // ===== Q4_1 Tensor (4-bit with min) =====
@@ -4102,7 +4086,7 @@ namespace llaminar2
      * Block format: 32 elements per block, FP16 scale + FP16 min + 4-bit packed values
      * Compression: ~7.1× vs FP32
      */
-    class Q4_1Tensor : public TypedTensorBase<Q4_1Tensor, Q4_1Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q4_1Tensor : public TypedTensorBase<Q4_1Tensor, Q4_1Block>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4129,12 +4113,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -4217,7 +4201,7 @@ namespace llaminar2
         }
 
         // View support (row-slice only due to block alignment)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -4272,10 +4256,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4286,7 +4270,7 @@ namespace llaminar2
         Q4_1Tensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
     };
 
     // ===== Q5_0 Tensor (5-bit uniform quantization) =====
@@ -4299,7 +4283,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~6.4× vs FP32
      */
-    class Q5_0Tensor : public TypedTensorBase<Q5_0Tensor, Q5_0Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q5_0Tensor : public TypedTensorBase<Q5_0Tensor, Q5_0Block>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4325,12 +4309,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -4404,7 +4388,7 @@ namespace llaminar2
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only due to block alignment)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -4459,10 +4443,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4473,7 +4457,7 @@ namespace llaminar2
         Q5_0Tensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
     };
 
     // ===== Q5_1 Tensor (5-bit with min) =====
@@ -4486,7 +4470,7 @@ namespace llaminar2
      * High bit stored separately in qh[4] array (32 bits for 32 elements)
      * Compression: ~5.7× vs FP32
      */
-    class Q5_1Tensor : public TypedTensorBase<Q5_1Tensor, Q5_1Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q5_1Tensor : public TypedTensorBase<Q5_1Tensor, Q5_1Block>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4512,12 +4496,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -4591,7 +4575,7 @@ namespace llaminar2
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only due to block alignment)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -4646,10 +4630,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4660,7 +4644,7 @@ namespace llaminar2
         Q5_1Tensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
     };
 
     // ===== K-quant Tensors =====
@@ -4669,7 +4653,7 @@ namespace llaminar2
     /**
      * @brief Q6_K tensor (6-bit K-quant super-block)
      */
-    class Q6_KTensor : public TypedTensorBase<Q6_KTensor, Q6_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q6_KTensor : public TypedTensorBase<Q6_KTensor, Q6_KBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4695,12 +4679,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -4736,7 +4720,7 @@ namespace llaminar2
         void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
 
         // View support (row-slice only, preserves 256-element super-block alignment)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -4794,10 +4778,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4808,14 +4792,14 @@ namespace llaminar2
         Q6_KTensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
     };
 
     // Implementation: Q2_KTensor.cpp
     /**
      * @brief Q2_K tensor (2-bit K-quant super-block)
      */
-    class Q2_KTensor : public TypedTensorBase<Q2_KTensor, Q2_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q2_KTensor : public TypedTensorBase<Q2_KTensor, Q2_KBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4841,12 +4825,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -4885,7 +4869,7 @@ namespace llaminar2
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only, preserves 256-element super-block alignment)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -4939,10 +4923,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -4953,7 +4937,7 @@ namespace llaminar2
         Q2_KTensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
 
         static void decodeBlock(const Q2_KBlock &block, float *output);
     };
@@ -4962,7 +4946,7 @@ namespace llaminar2
     /**
      * @brief Q5_K tensor (5-bit K-quant super-block)
      */
-    class Q5_KTensor : public TypedTensorBase<Q5_KTensor, Q5_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q5_KTensor : public TypedTensorBase<Q5_KTensor, Q5_KBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -4995,12 +4979,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -5032,7 +5016,7 @@ namespace llaminar2
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice views for MPI partitioning)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -5090,7 +5074,7 @@ namespace llaminar2
             const std::vector<size_t> &shape,
             const uint8_t *parent_raw_data,
             size_t byte_offset,
-            std::shared_ptr<TensorBase> parent);
+            std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
         std::vector<uint8_t> raw_data_; // Owned only by parent tensor
@@ -5101,9 +5085,9 @@ namespace llaminar2
 
         // View support fields
         bool is_view_;
-        const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
-        size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
-        std::shared_ptr<TensorBase> parent_; // Keeps parent alive
+        const uint8_t *raw_data_ptr_;           // Points to parent's raw_data_.data()
+        size_t view_byte_offset_;               // Byte offset from raw_data_ptr_
+        std::shared_ptr<CPUTensorBase> parent_; // Keeps parent alive
 
         static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m);
     };
@@ -5112,7 +5096,7 @@ namespace llaminar2
     /**
      * @brief Q3_K tensor (3-bit K-quant super-block)
      */
-    class Q3_KTensor : public TypedTensorBase<Q3_KTensor, Q3_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q3_KTensor : public TypedTensorBase<Q3_KTensor, Q3_KBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5138,12 +5122,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -5182,7 +5166,7 @@ namespace llaminar2
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice only, preserves 256-element super-block alignment)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -5237,10 +5221,10 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5251,14 +5235,14 @@ namespace llaminar2
         Q3_KTensor(const std::vector<size_t> &shape,
                    const uint8_t *parent_raw_data,
                    size_t byte_offset,
-                   std::shared_ptr<TensorBase> parent);
+                   std::shared_ptr<CPUTensorBase> parent);
     };
 
     // Implementation: Q4_KTensor.cpp
     /**
      * @brief Q4_K tensor (4-bit K-quant super-block)
      */
-    class Q4_KTensor : public TypedTensorBase<Q4_KTensor, Q4_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class Q4_KTensor : public TypedTensorBase<Q4_KTensor, Q4_KBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5284,12 +5268,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -5328,7 +5312,7 @@ namespace llaminar2
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
 
         // View support (row-slice views for MPI partitioning)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -5386,7 +5370,7 @@ namespace llaminar2
             const std::vector<size_t> &shape,
             const uint8_t *parent_raw_data,
             size_t byte_offset,
-            std::shared_ptr<TensorBase> parent);
+            std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
         std::vector<uint8_t> raw_data_; // Owned only by parent tensor
@@ -5397,9 +5381,9 @@ namespace llaminar2
 
         // View support fields
         bool is_view_;
-        const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
-        size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
-        std::shared_ptr<TensorBase> parent_; // Keeps parent alive
+        const uint8_t *raw_data_ptr_;           // Points to parent's raw_data_.data()
+        size_t view_byte_offset_;               // Byte offset from raw_data_ptr_
+        std::shared_ptr<CPUTensorBase> parent_; // Keeps parent alive
 
         static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m);
     };
@@ -5408,7 +5392,7 @@ namespace llaminar2
     /**
      * @brief Q8_K tensor (8-bit K-quant super-block)
      */
-    class Q8_KTensor : public TypedTensorBase<Q8_KTensor, Q8_KBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
+    class Q8_KTensor : public TypedTensorBase<Q8_KTensor, Q8_KBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5434,12 +5418,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -5471,7 +5455,7 @@ namespace llaminar2
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
 
         // View support (row-slice views for MPI partitioning)
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -5529,7 +5513,7 @@ namespace llaminar2
             const std::vector<size_t> &shape,
             const uint8_t *parent_raw_data,
             size_t byte_offset,
-            std::shared_ptr<TensorBase> parent);
+            std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
         std::vector<uint8_t> raw_data_; // Owned only by parent tensor
@@ -5540,9 +5524,9 @@ namespace llaminar2
 
         // View support fields
         bool is_view_;
-        const uint8_t *raw_data_ptr_;        // Points to parent's raw_data_.data()
-        size_t view_byte_offset_;            // Byte offset from raw_data_ptr_
-        std::shared_ptr<TensorBase> parent_; // Keeps parent alive
+        const uint8_t *raw_data_ptr_;           // Points to parent's raw_data_.data()
+        size_t view_byte_offset_;               // Byte offset from raw_data_ptr_
+        std::shared_ptr<CPUTensorBase> parent_; // Keeps parent alive
     };
 
     // ===== IQ Tensors =====
@@ -5551,7 +5535,7 @@ namespace llaminar2
     /**
      * @brief IQ4_XS tensor (4-bit extra-small IQ)
      */
-    class IQ4_XSTensor : public TypedTensorBase<IQ4_XSTensor, IQ4_XSBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ4_XSTensor : public TypedTensorBase<IQ4_XSTensor, IQ4_XSBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5577,12 +5561,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -5614,7 +5598,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -5707,16 +5691,16 @@ namespace llaminar2
 
     private:
         IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
-                     size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+                     size_t view_byte_offset, std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5728,7 +5712,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XXS tensor (2-bit extra-extra-small IQ)
      */
-    class IQ2_XXSTensor : public TypedTensorBase<IQ2_XXSTensor, IQ2_XXSBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ2_XXSTensor : public TypedTensorBase<IQ2_XXSTensor, IQ2_XXSBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5754,12 +5738,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -5791,7 +5775,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -5872,16 +5856,16 @@ namespace llaminar2
 
     private:
         IQ2_XXSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
-                      size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+                      size_t view_byte_offset, std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -5893,7 +5877,7 @@ namespace llaminar2
     /**
      * @brief IQ2_XS tensor (2-bit extra-small IQ)
      */
-    class IQ2_XSTensor : public TypedTensorBase<IQ2_XSTensor, IQ2_XSBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ2_XSTensor : public TypedTensorBase<IQ2_XSTensor, IQ2_XSBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -5919,12 +5903,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -5956,7 +5940,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -6037,16 +6021,16 @@ namespace llaminar2
 
     private:
         IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
-                     size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+                     size_t view_byte_offset, std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6058,7 +6042,7 @@ namespace llaminar2
     /**
      * @brief IQ3_XXS tensor (3-bit extra-extra-small IQ)
      */
-    class IQ3_XXSTensor : public TypedTensorBase<IQ3_XXSTensor, IQ3_XXSBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ3_XXSTensor : public TypedTensorBase<IQ3_XXSTensor, IQ3_XXSBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -6084,12 +6068,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -6121,7 +6105,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -6206,16 +6190,16 @@ namespace llaminar2
 
     private:
         IQ3_XXSTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
-                      size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+                      size_t view_byte_offset, std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6227,7 +6211,7 @@ namespace llaminar2
     /**
      * @brief IQ2_S tensor (2-bit small IQ)
      */
-    class IQ2_STensor : public TypedTensorBase<IQ2_STensor, IQ2_SBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ2_STensor : public TypedTensorBase<IQ2_STensor, IQ2_SBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -6253,12 +6237,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -6290,7 +6274,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -6371,16 +6355,16 @@ namespace llaminar2
 
     private:
         IQ2_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
-                    size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+                    size_t view_byte_offset, std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6392,7 +6376,7 @@ namespace llaminar2
     /**
      * @brief IQ3_S tensor (3-bit small IQ)
      */
-    class IQ3_STensor : public TypedTensorBase<IQ3_STensor, IQ3_SBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ3_STensor : public TypedTensorBase<IQ3_STensor, IQ3_SBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -6418,12 +6402,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -6455,7 +6439,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -6540,16 +6524,16 @@ namespace llaminar2
 
     private:
         IQ3_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
-                    size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+                    size_t view_byte_offset, std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6561,7 +6545,7 @@ namespace llaminar2
     /**
      * @brief IQ1_S tensor (1-bit small IQ)
      */
-    class IQ1_STensor : public TypedTensorBase<IQ1_STensor, IQ1_SBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ1_STensor : public TypedTensorBase<IQ1_STensor, IQ1_SBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -6587,12 +6571,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -6624,7 +6608,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -6705,16 +6689,16 @@ namespace llaminar2
 
     private:
         IQ1_STensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
-                    size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+                    size_t view_byte_offset, std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;
@@ -6726,7 +6710,7 @@ namespace llaminar2
     /**
      * @brief IQ1_M tensor (1-bit medium IQ)
      */
-    class IQ1_MTensor : public TypedTensorBase<IQ1_MTensor, IQ1_MBlock>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    class IQ1_MTensor : public TypedTensorBase<IQ1_MTensor, IQ1_MBlock>, public CPUTensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
     {
     public:
         /// Native storage type for CRTP-style type-safe access
@@ -6752,12 +6736,12 @@ namespace llaminar2
         float *mutable_data() override;
 
         // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
-        int native_type_id() const final { return TensorBase::native_type_id(); }
-        size_t size_bytes() const final { return TensorBase::size_bytes(); }
-        const void *raw_data() const final { return TensorBase::raw_data(); }
-        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+        int native_type_id() const final { return CPUTensorBase::native_type_id(); }
+        size_t size_bytes() const final { return CPUTensorBase::size_bytes(); }
+        const void *raw_data() const final { return CPUTensorBase::raw_data(); }
+        void *raw_mutable_data() final { return CPUTensorBase::raw_mutable_data(); }
 
-        bool copyFrom(const TensorBase *src) override; // Phase 4.2: Stub (read-only)
+        bool copyFrom(const CPUTensorBase *src) override; // Phase 4.2: Stub (read-only)
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
@@ -6789,7 +6773,7 @@ namespace llaminar2
 
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
-        std::shared_ptr<TensorBase> create_view(
+        std::shared_ptr<CPUTensorBase> create_view(
             const std::vector<size_t> &new_shape,
             size_t offset = 0) override;
 
@@ -6870,16 +6854,16 @@ namespace llaminar2
 
     private:
         IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
-                    size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+                    size_t view_byte_offset, std::shared_ptr<CPUTensorBase> parent);
 
         std::vector<size_t> shape_;
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
-        const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
-        size_t view_byte_offset_;            // Byte offset in parent's raw_data_
-        std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
+        std::vector<uint8_t> raw_data_;         // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;           // Borrowed data (if is_view_)
+        size_t view_byte_offset_;               // Byte offset in parent's raw_data_
+        std::shared_ptr<CPUTensorBase> parent_; // Keep parent alive (if is_view_)
 
         DeviceId device_;
         void *device_blocks_;

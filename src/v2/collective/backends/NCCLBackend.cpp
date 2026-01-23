@@ -2,6 +2,10 @@
  * @file NCCLBackend.cpp
  * @brief NCCL-based collective backend implementation
  *
+ * All CUDA runtime and NCCL API calls are isolated in NCCLBackendCUDA.cu to avoid
+ * conflicts with HIP headers when building with both CUDA and ROCm support.
+ * This file only uses wrapper functions from the nccl_cuda_wrappers namespace.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
@@ -10,7 +14,118 @@
 #include "../../utils/Logger.h"
 
 #ifdef HAVE_NCCL
-#include <cuda_runtime.h>
+#include <mpi.h>
+#include <atomic>
+#include <thread>
+#include <string>
+#include <cstring>
+
+// Forward declarations for CUDA and NCCL wrappers (implemented in NCCLBackendCUDA.cu)
+namespace llaminar2
+{
+    namespace nccl_backend_detail
+    {
+        // CUDA runtime wrappers
+        bool cudaSetDeviceOrdinal(int device_ordinal);
+        bool cudaGetDeviceCountWrapper(int *count);
+        bool cudaCreateStream(void **stream_ptr);
+        bool cudaDestroyStream(void *stream);
+        bool cudaSynchronizeStream(void *stream);
+        std::string cudaGetLastErrorString();
+
+        // NCCL unique ID
+        size_t ncclUniqueIdSize();
+        bool ncclGetUniqueIdWrapper(void *id_out);
+
+        // NCCL communicator management
+        bool ncclCommInitRankWrapper(void **comm_out, int nranks, void *unique_id, int rank, std::string &error_out);
+        bool ncclCommInitAllWrapper(void **comms_out, int ndevs, const int *devlist, std::string &error_out);
+        void ncclCommDestroyWrapper(void *comm);
+
+        // NCCL collective operations
+        bool ncclAllReduceWrapper(void *sendbuff, void *recvbuff, size_t count,
+                                  int dtype_int, int op_int, void *comm, void *stream,
+                                  std::string &error_out);
+        bool ncclAllGatherWrapper(const void *sendbuff, void *recvbuff, size_t sendcount,
+                                  int dtype_int, void *comm, void *stream,
+                                  std::string &error_out);
+        bool ncclBroadcastWrapper(void *buff, size_t count, int dtype_int, int root,
+                                  void *comm, void *stream, std::string &error_out);
+        bool ncclReduceScatterWrapper(const void *sendbuff, void *recvbuff, size_t recvcount,
+                                      int dtype_int, int op_int, void *comm, void *stream,
+                                      std::string &error_out);
+
+        // NCCL group operations (for multi-GPU single process)
+        bool ncclGroupStartWrapper(std::string &error_out);
+        bool ncclGroupEndWrapper(std::string &error_out);
+        bool ncclAllReduceInGroupWrapper(void *sendbuff, void *recvbuff, size_t count,
+                                         int dtype_int, int op_int, void *comm, void *stream,
+                                         std::string &error_out);
+        bool ncclAllGatherInGroupWrapper(const void *sendbuff, void *recvbuff, size_t sendcount,
+                                         int dtype_int, void *comm, void *stream,
+                                         std::string &error_out);
+        bool ncclBroadcastInGroupWrapper(void *buff, size_t count, int dtype_int, int root,
+                                         void *comm, void *stream, std::string &error_out);
+
+        // Point-to-point operations (for allgatherv emulation)
+        bool ncclSendWrapper(const void *sendbuff, size_t count, int dtype_int, int peer,
+                             void *comm, void *stream, std::string &error_out);
+        bool ncclRecvWrapper(void *recvbuff, size_t count, int dtype_int, int peer,
+                             void *comm, void *stream, std::string &error_out);
+    } // namespace nccl_backend_detail
+} // namespace llaminar2
+
+// Helper macro for CUDA wrapper error checking
+#define CUDA_WRAPPER_CHECK(cmd, msg)                                                                      \
+    do                                                                                                    \
+    {                                                                                                     \
+        if (!(cmd))                                                                                       \
+        {                                                                                                 \
+            last_error_ = std::string(msg) + " failed: " + nccl_backend_detail::cudaGetLastErrorString(); \
+            LOG_ERROR(last_error_);                                                                       \
+            return false;                                                                                 \
+        }                                                                                                 \
+    } while (0)
+
+// Convert CollectiveDataType to int for wrapper functions
+static int toNcclDataTypeInt(llaminar2::CollectiveDataType dtype)
+{
+    switch (dtype)
+    {
+    case llaminar2::CollectiveDataType::FLOAT32:
+        return 0;
+    case llaminar2::CollectiveDataType::FLOAT16:
+        return 1;
+    case llaminar2::CollectiveDataType::BFLOAT16:
+        return 2;
+    case llaminar2::CollectiveDataType::INT32:
+        return 3;
+    case llaminar2::CollectiveDataType::INT8:
+        return 4; // Maps to ncclInt8
+    default:
+        return 0;
+    }
+}
+
+// Convert CollectiveOp to int for wrapper functions
+static int toNcclRedOpInt(llaminar2::CollectiveOp op)
+{
+    switch (op)
+    {
+    case llaminar2::CollectiveOp::ALLREDUCE_SUM:
+        return 0; // ncclSum
+    case llaminar2::CollectiveOp::REDUCE_SCATTER:
+        return 0; // Default to sum for reduce-scatter
+    // Note: ALLREDUCE_MAX and ALLREDUCE_MIN map to ncclMax and ncclMin
+    case llaminar2::CollectiveOp::ALLREDUCE_MAX:
+        return 3; // ncclMax
+    case llaminar2::CollectiveOp::ALLREDUCE_MIN:
+        return 2; // ncclMin
+    default:
+        return 0; // Default to sum
+    }
+}
+
 #endif
 
 namespace llaminar2
@@ -20,9 +135,10 @@ namespace llaminar2
     // Constructor / Destructor
     // =========================================================================
 
-    NCCLBackend::NCCLBackend()
+    NCCLBackend::NCCLBackend(std::shared_ptr<MPIContext> mpi_ctx)
+        : mpi_ctx_(std::move(mpi_ctx))
     {
-        LOG_DEBUG("NCCLBackend: Created");
+        LOG_DEBUG("NCCLBackend: Created" << (mpi_ctx_ ? " with MPI context (world_size=" + std::to_string(mpi_ctx_->world_size()) + ")" : " (single-process mode)"));
     }
 
     NCCLBackend::~NCCLBackend()
@@ -41,8 +157,11 @@ namespace llaminar2
     {
 #ifdef HAVE_NCCL
         int cuda_device_count = 0;
-        cudaError_t err = cudaGetDeviceCount(&cuda_device_count);
-        return (err == cudaSuccess && cuda_device_count > 0);
+        if (!nccl_backend_detail::cudaGetDeviceCountWrapper(&cuda_device_count))
+        {
+            return false;
+        }
+        return (cuda_device_count > 0);
 #else
         return false;
 #endif
@@ -82,69 +201,200 @@ namespace llaminar2
             return false;
         }
 
-        // Set the CUDA device for this rank
+        // Set the CUDA device for this rank BEFORE creating stream/communicator
         DeviceId local_device = group.localDevice();
-        cudaError_t cuda_err = cudaSetDevice(local_device.ordinal);
-        if (cuda_err != cudaSuccess)
-        {
-            last_error_ = "Failed to set CUDA device " + std::to_string(local_device.ordinal);
-            LOG_ERROR(last_error_);
-            return false;
-        }
+        CUDA_WRAPPER_CHECK(nccl_backend_detail::cudaSetDeviceOrdinal(local_device.ordinal), "cudaSetDevice");
+        LOG_DEBUG("NCCLBackend: Set CUDA device to " << local_device.ordinal);
 
-        // Create CUDA stream
-        cuda_err = cudaStreamCreate(&stream_);
-        if (cuda_err != cudaSuccess)
-        {
-            last_error_ = "Failed to create CUDA stream";
-            LOG_ERROR(last_error_);
-            return false;
-        }
+        // Create CUDA stream on the selected device
+        void *stream_ptr = nullptr;
+        CUDA_WRAPPER_CHECK(nccl_backend_detail::cudaCreateStream(&stream_ptr), "cudaStreamCreate");
+        stream_ = stream_ptr;
 
-        // Create NCCL communicator
-        // For single-process multi-GPU, we use ncclCommInitAll
-        // For multi-process, we'd use ncclCommInitRank with unique ID
-        if (num_ranks_ == 1)
+        // Determine if we're in multi-process (MPI) mode
+        const bool is_multi_process = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+
+        // Allocate buffer for NCCL unique ID (opaque structure, ~128 bytes)
+        const size_t unique_id_size = nccl_backend_detail::ncclUniqueIdSize();
+        std::vector<char> unique_id_buffer(unique_id_size);
+
+        if (is_multi_process)
         {
-            // Single GPU - create a trivial communicator
-            ncclResult_t nccl_err = ncclCommInitAll(&comm_, 1, nullptr);
-            if (nccl_err != ncclSuccess)
+            // Multi-process mode: coordinate NCCL unique ID via MPI
+            LOG_DEBUG("NCCLBackend: Multi-process mode - MPI rank " << mpi_ctx_->rank()
+                                                                    << "/" << mpi_ctx_->world_size());
+
+            // Rank 0 generates the unique ID
+            if (mpi_ctx_->rank() == 0)
             {
-                last_error_ = "ncclCommInitAll failed: " + std::string(ncclGetErrorString(nccl_err));
+                if (!nccl_backend_detail::ncclGetUniqueIdWrapper(unique_id_buffer.data()))
+                {
+                    last_error_ = "ncclGetUniqueId failed";
+                    LOG_ERROR(last_error_);
+                    nccl_backend_detail::cudaDestroyStream(stream_);
+                    stream_ = nullptr;
+                    return false;
+                }
+                LOG_DEBUG("NCCLBackend: Rank 0 generated NCCL unique ID");
+            }
+
+            // Broadcast unique ID from rank 0 to all other ranks
+            int mpi_err = MPI_Bcast(unique_id_buffer.data(), static_cast<int>(unique_id_size), MPI_BYTE, 0, mpi_ctx_->comm());
+            if (mpi_err != MPI_SUCCESS)
+            {
+                last_error_ = "MPI_Bcast of NCCL unique ID failed";
                 LOG_ERROR(last_error_);
-                cudaStreamDestroy(stream_);
+                nccl_backend_detail::cudaDestroyStream(stream_);
                 stream_ = nullptr;
                 return false;
             }
+            LOG_DEBUG("NCCLBackend: NCCL unique ID broadcast complete");
+
+            // Initialize NCCL communicator with the broadcast ID
+            // Use MPI world_size and rank for the communicator
+            std::string nccl_error;
+            void *comm_ptr = nullptr;
+            if (!nccl_backend_detail::ncclCommInitRankWrapper(&comm_ptr, mpi_ctx_->world_size(),
+                                                              unique_id_buffer.data(), mpi_ctx_->rank(), nccl_error))
+            {
+                last_error_ = "ncclCommInitRank failed: " + nccl_error;
+                LOG_ERROR(last_error_);
+                nccl_backend_detail::cudaDestroyStream(stream_);
+                stream_ = nullptr;
+                return false;
+            }
+            comm_ = comm_ptr;
+
+            // Update num_ranks_ to reflect MPI world size
+            num_ranks_ = mpi_ctx_->world_size();
+            local_rank_ = mpi_ctx_->rank();
+
+            LOG_INFO("NCCLBackend: Initialized multi-process communicator with "
+                     << num_ranks_ << " ranks, local_rank=" << local_rank_
+                     << ", device=" << local_device.ordinal);
+        }
+        else if (num_ranks_ == 1)
+        {
+            // Single GPU - create a trivial communicator
+            LOG_DEBUG("NCCLBackend: Single-GPU mode");
+            std::string nccl_error;
+            void *comm_ptr = nullptr;
+            if (!nccl_backend_detail::ncclCommInitAllWrapper(&comm_ptr, 1, nullptr, nccl_error))
+            {
+                last_error_ = "ncclCommInitAll failed: " + nccl_error;
+                LOG_ERROR(last_error_);
+                nccl_backend_detail::cudaDestroyStream(stream_);
+                stream_ = nullptr;
+                return false;
+            }
+            comm_ = comm_ptr;
+            LOG_INFO("NCCLBackend: Initialized single-GPU communicator");
         }
         else
         {
-            // Multi-GPU single process
-            // TODO: For multi-process, need to broadcast unique ID via MPI
-            ncclUniqueId id;
-            ncclResult_t nccl_err = ncclGetUniqueId(&id);
-            if (nccl_err != ncclSuccess)
+            // Multi-GPU single process (no MPI)
+            // This requires per-GPU communicators and streams with threaded initialization
+            LOG_DEBUG("NCCLBackend: Single-process multi-GPU mode with " << num_ranks_ << " GPUs");
+
+            is_multi_gpu_single_process_ = true;
+
+            // Store device ordinals from the group
+            device_ordinals_.clear();
+            for (const auto &device : group.devices)
+            {
+                device_ordinals_.push_back(device.ordinal);
+            }
+
+            // Generate unique ID for this communicator group
+            std::vector<char> multi_gpu_id_buffer(nccl_backend_detail::ncclUniqueIdSize());
+            if (!nccl_backend_detail::ncclGetUniqueIdWrapper(multi_gpu_id_buffer.data()))
             {
                 last_error_ = "ncclGetUniqueId failed";
                 LOG_ERROR(last_error_);
-                cudaStreamDestroy(stream_);
+                nccl_backend_detail::cudaDestroyStream(stream_);
                 stream_ = nullptr;
                 return false;
             }
 
-            nccl_err = ncclCommInitRank(&comm_, num_ranks_, id, local_rank_);
-            if (nccl_err != ncclSuccess)
+            // Resize vectors for per-GPU resources
+            all_comms_.resize(num_ranks_, nullptr);
+            all_streams_.resize(num_ranks_, nullptr);
+
+            // Create per-GPU streams
+            for (int i = 0; i < num_ranks_; ++i)
             {
-                last_error_ = "ncclCommInitRank failed: " + std::string(ncclGetErrorString(nccl_err));
+                nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+                void *stream_ptr = nullptr;
+                if (!nccl_backend_detail::cudaCreateStream(&stream_ptr))
+                {
+                    last_error_ = "cudaStreamCreate failed for GPU " + std::to_string(i);
+                    LOG_ERROR(last_error_);
+                    // Clean up already-created streams
+                    for (int j = 0; j < i; ++j)
+                    {
+                        nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[j]);
+                        nccl_backend_detail::cudaDestroyStream(all_streams_[j]);
+                    }
+                    all_streams_.clear();
+                    return false;
+                }
+                all_streams_[i] = stream_ptr;
+            }
+
+            // Initialize communicators using threaded ncclCommInitRank
+            // Each GPU must call ncclCommInitRank in a separate thread
+            std::vector<std::thread> init_threads;
+            std::atomic<int> init_errors{0};
+            std::vector<std::string> thread_errors(num_ranks_);
+
+            for (int i = 0; i < num_ranks_; ++i)
+            {
+                init_threads.emplace_back([this, i, &multi_gpu_id_buffer, &init_errors, &thread_errors]()
+                                          {
+                    nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+                    void* comm_ptr = nullptr;
+                    if (!nccl_backend_detail::ncclCommInitRankWrapper(&comm_ptr, num_ranks_, 
+                                                                      multi_gpu_id_buffer.data(), i, thread_errors[i]))
+                    {
+                        LOG_ERROR("ncclCommInitRank failed for GPU " << i << ": " << thread_errors[i]);
+                        init_errors++;
+                    }
+                    else
+                    {
+                        all_comms_[i] = comm_ptr;
+                    } });
+            }
+
+            // Wait for all threads to complete
+            for (auto &t : init_threads)
+            {
+                t.join();
+            }
+
+            if (init_errors > 0)
+            {
+                last_error_ = "ncclCommInitRank failed for " + std::to_string(init_errors.load()) + " GPU(s)";
                 LOG_ERROR(last_error_);
-                cudaStreamDestroy(stream_);
-                stream_ = nullptr;
+                // Clean up streams
+                for (int i = 0; i < num_ranks_; ++i)
+                {
+                    nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+                    if (all_streams_[i])
+                        nccl_backend_detail::cudaDestroyStream(all_streams_[i]);
+                    if (all_comms_[i])
+                        nccl_backend_detail::ncclCommDestroyWrapper(all_comms_[i]);
+                }
+                all_streams_.clear();
+                all_comms_.clear();
+                device_ordinals_.clear();
                 return false;
             }
+
+            LOG_INFO("NCCLBackend: Initialized multi-GPU single-process (threaded ncclCommInitRank) with "
+                     << num_ranks_ << " GPU(s), local_rank=" << local_rank_);
         }
 
         initialized_ = true;
-        LOG_INFO("NCCLBackend: Initialized with " << num_ranks_ << " GPU(s), local_rank=" << local_rank_);
         return true;
 #else
         last_error_ = "NCCL not available (HAVE_NCCL not defined)";
@@ -161,15 +411,41 @@ namespace llaminar2
             return;
         }
 
+        // Clean up multi-GPU single-process resources
+        if (is_multi_gpu_single_process_)
+        {
+            for (size_t i = 0; i < all_comms_.size(); ++i)
+            {
+                if (all_comms_[i])
+                {
+                    nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+                    nccl_backend_detail::ncclCommDestroyWrapper(all_comms_[i]);
+                }
+            }
+            all_comms_.clear();
+
+            for (size_t i = 0; i < all_streams_.size(); ++i)
+            {
+                if (all_streams_[i])
+                {
+                    nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+                    nccl_backend_detail::cudaDestroyStream(all_streams_[i]);
+                }
+            }
+            all_streams_.clear();
+            device_ordinals_.clear();
+            is_multi_gpu_single_process_ = false;
+        }
+
         if (comm_)
         {
-            ncclCommDestroy(comm_);
+            nccl_backend_detail::ncclCommDestroyWrapper(comm_);
             comm_ = nullptr;
         }
 
         if (stream_)
         {
-            cudaStreamDestroy(stream_);
+            nccl_backend_detail::cudaDestroyStream(stream_);
             stream_ = nullptr;
         }
 
@@ -195,18 +471,18 @@ namespace llaminar2
             return false;
         }
 
-        ncclResult_t err = ncclAllReduce(
-            buffer,
-            buffer, // In-place: send and recv are the same
-            count,
-            toNcclDataType(dtype),
-            toNcclRedOp(op),
-            comm_,
-            stream_);
-
-        if (err != ncclSuccess)
+        std::string nccl_error;
+        if (!nccl_backend_detail::ncclAllReduceWrapper(
+                buffer,
+                buffer, // In-place: send and recv are the same
+                count,
+                toNcclDataTypeInt(dtype),
+                toNcclRedOpInt(op),
+                comm_,
+                stream_,
+                nccl_error))
         {
-            last_error_ = "ncclAllReduce failed: " + std::string(ncclGetErrorString(err));
+            last_error_ = "ncclAllReduce failed: " + nccl_error;
             LOG_ERROR(last_error_);
             return false;
         }
@@ -231,17 +507,17 @@ namespace llaminar2
             return false;
         }
 
-        ncclResult_t err = ncclAllGather(
-            send_buf,
-            recv_buf,
-            send_count,
-            toNcclDataType(dtype),
-            comm_,
-            stream_);
-
-        if (err != ncclSuccess)
+        std::string nccl_error;
+        if (!nccl_backend_detail::ncclAllGatherWrapper(
+                send_buf,
+                recv_buf,
+                send_count,
+                toNcclDataTypeInt(dtype),
+                comm_,
+                stream_,
+                nccl_error))
         {
-            last_error_ = "ncclAllGather failed: " + std::string(ncclGetErrorString(err));
+            last_error_ = "ncclAllGather failed: " + nccl_error;
             LOG_ERROR(last_error_);
             return false;
         }
@@ -297,12 +573,12 @@ namespace llaminar2
 
         // Variable counts - NCCL doesn't support this natively
         // Fall back to point-to-point sends/recvs
-        ncclDataType_t nccl_dtype = toNcclDataType(dtype);
+        int dtype_int = toNcclDataTypeInt(dtype);
 
-        ncclResult_t err = ncclGroupStart();
-        if (err != ncclSuccess)
+        std::string error_out;
+        if (!nccl_backend_detail::ncclGroupStartWrapper(error_out))
         {
-            last_error_ = "ncclGroupStart failed";
+            last_error_ = "ncclGroupStart failed: " + error_out;
             return false;
         }
 
@@ -328,29 +604,26 @@ namespace llaminar2
         for (int peer = 0; peer < num_ranks_; ++peer)
         {
             // Send my data to peer
-            err = ncclSend(send_buf, send_count, nccl_dtype, peer, comm_, stream_);
-            if (err != ncclSuccess)
+            if (!nccl_backend_detail::ncclSendWrapper(send_buf, send_count, dtype_int, peer, comm_, stream_, error_out))
             {
-                ncclGroupEnd();
-                last_error_ = "ncclSend failed in allgatherv";
+                nccl_backend_detail::ncclGroupEndWrapper(error_out);
+                last_error_ = "ncclSend failed in allgatherv: " + error_out;
                 return false;
             }
 
             // Receive from peer at their offset
             char *recv_ptr = static_cast<char *>(recv_buf) + displacements[peer] * dtype_size;
-            err = ncclRecv(recv_ptr, recv_counts[peer], nccl_dtype, peer, comm_, stream_);
-            if (err != ncclSuccess)
+            if (!nccl_backend_detail::ncclRecvWrapper(recv_ptr, recv_counts[peer], dtype_int, peer, comm_, stream_, error_out))
             {
-                ncclGroupEnd();
-                last_error_ = "ncclRecv failed in allgatherv";
+                nccl_backend_detail::ncclGroupEndWrapper(error_out);
+                last_error_ = "ncclRecv failed in allgatherv: " + error_out;
                 return false;
             }
         }
 
-        err = ncclGroupEnd();
-        if (err != ncclSuccess)
+        if (!nccl_backend_detail::ncclGroupEndWrapper(error_out))
         {
-            last_error_ = "ncclGroupEnd failed";
+            last_error_ = "ncclGroupEnd failed: " + error_out;
             return false;
         }
 
@@ -375,18 +648,18 @@ namespace llaminar2
             return false;
         }
 
-        ncclResult_t err = ncclReduceScatter(
-            send_buf,
-            recv_buf,
-            recv_count,
-            toNcclDataType(dtype),
-            toNcclRedOp(op),
-            comm_,
-            stream_);
-
-        if (err != ncclSuccess)
+        std::string nccl_error;
+        if (!nccl_backend_detail::ncclReduceScatterWrapper(
+                send_buf,
+                recv_buf,
+                recv_count,
+                toNcclDataTypeInt(dtype),
+                toNcclRedOpInt(op),
+                comm_,
+                stream_,
+                nccl_error))
         {
-            last_error_ = "ncclReduceScatter failed: " + std::string(ncclGetErrorString(err));
+            last_error_ = "ncclReduceScatter failed: " + nccl_error;
             LOG_ERROR(last_error_);
             return false;
         }
@@ -411,24 +684,245 @@ namespace llaminar2
             return false;
         }
 
-        ncclResult_t err = ncclBroadcast(
-            buffer,
-            buffer,
-            count,
-            toNcclDataType(dtype),
-            root,
-            comm_,
-            stream_);
-
-        if (err != ncclSuccess)
+        std::string nccl_error;
+        if (!nccl_backend_detail::ncclBroadcastWrapper(
+                buffer,
+                count,
+                toNcclDataTypeInt(dtype),
+                root,
+                comm_,
+                stream_,
+                nccl_error))
         {
-            last_error_ = "ncclBroadcast failed: " + std::string(ncclGetErrorString(err));
+            last_error_ = "ncclBroadcast failed: " + nccl_error;
             LOG_ERROR(last_error_);
             return false;
         }
 
         return true;
 #else
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // Multi-GPU Single-Process Support
+    // =========================================================================
+
+    bool NCCLBackend::isMultiGpuSingleProcess() const
+    {
+        return is_multi_gpu_single_process_;
+    }
+
+    bool NCCLBackend::allreduceMulti(const std::vector<void *> &buffers, size_t count,
+                                     CollectiveDataType dtype, CollectiveOp op)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") does not match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        int dtype_int = toNcclDataTypeInt(dtype);
+        int op_int = toNcclRedOpInt(op);
+        std::string nccl_error;
+
+        // Use group API for multi-GPU single-process
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+            if (!nccl_backend_detail::ncclAllReduceInGroupWrapper(buffers[i], buffers[i], count, dtype_int, op_int,
+                                                                  all_comms_[i], all_streams_[i], nccl_error))
+            {
+                last_error_ = "ncclAllReduce failed for GPU " + std::to_string(i) + ": " + nccl_error;
+                LOG_ERROR(last_error_);
+                nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+                return false;
+            }
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::allgatherMulti(const std::vector<const void *> &send_buffers,
+                                     const std::vector<void *> &recv_buffers, size_t send_count,
+                                     CollectiveDataType dtype)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allgatherMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_ranks_) ||
+            recv_buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        int dtype_int = toNcclDataTypeInt(dtype);
+        std::string nccl_error;
+
+        // Use group API for multi-GPU single-process
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+            if (!nccl_backend_detail::ncclAllGatherInGroupWrapper(send_buffers[i], recv_buffers[i], send_count, dtype_int,
+                                                                  all_comms_[i], all_streams_[i], nccl_error))
+            {
+                last_error_ = "ncclAllGather failed for GPU " + std::to_string(i) + ": " + nccl_error;
+                LOG_ERROR(last_error_);
+                nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+                return false;
+            }
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)send_count;
+        (void)dtype;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::broadcastMulti(const std::vector<void *> &buffers, size_t count,
+                                     CollectiveDataType dtype, int root)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "broadcastMulti requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") does not match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (root < 0 || root >= num_ranks_)
+        {
+            last_error_ = "Invalid root rank: " + std::to_string(root);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        int dtype_int = toNcclDataTypeInt(dtype);
+        std::string nccl_error;
+
+        // Use group API for multi-GPU single-process
+        if (!nccl_backend_detail::ncclGroupStartWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupStart failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+            if (!nccl_backend_detail::ncclBroadcastInGroupWrapper(buffers[i], count, dtype_int, root,
+                                                                  all_comms_[i], all_streams_[i], nccl_error))
+            {
+                last_error_ = "ncclBroadcast failed for GPU " + std::to_string(i) + ": " + nccl_error;
+                LOG_ERROR(last_error_);
+                nccl_backend_detail::ncclGroupEndWrapper(nccl_error);
+                return false;
+            }
+        }
+
+        if (!nccl_backend_detail::ncclGroupEndWrapper(nccl_error))
+        {
+            last_error_ = "ncclGroupEnd failed: " + nccl_error;
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)root;
         last_error_ = "NCCL not available";
         return false;
 #endif
@@ -446,8 +940,23 @@ namespace llaminar2
             return true;
         }
 
-        cudaError_t err = cudaStreamSynchronize(stream_);
-        if (err != cudaSuccess)
+        // In multi-GPU single-process mode, synchronize all streams
+        if (is_multi_gpu_single_process_)
+        {
+            for (size_t i = 0; i < all_streams_.size(); ++i)
+            {
+                nccl_backend_detail::cudaSetDeviceOrdinal(device_ordinals_[i]);
+                if (!nccl_backend_detail::cudaSynchronizeStream(all_streams_[i]))
+                {
+                    last_error_ = "cudaStreamSynchronize failed for GPU " + std::to_string(i);
+                    LOG_ERROR(last_error_);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (!nccl_backend_detail::cudaSynchronizeStream(stream_))
         {
             last_error_ = "cudaStreamSynchronize failed";
             LOG_ERROR(last_error_);
@@ -461,45 +970,8 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Type Conversion Helpers
+    // Type Conversion Helpers (removed - now using int-based converters above)
     // =========================================================================
-
-#ifdef HAVE_NCCL
-    ncclDataType_t NCCLBackend::toNcclDataType(CollectiveDataType dtype)
-    {
-        switch (dtype)
-        {
-        case CollectiveDataType::FLOAT32:
-            return ncclFloat32;
-        case CollectiveDataType::FLOAT16:
-            return ncclFloat16;
-        case CollectiveDataType::BFLOAT16:
-            return ncclBfloat16;
-        case CollectiveDataType::INT32:
-            return ncclInt32;
-        case CollectiveDataType::INT8:
-            return ncclInt8;
-        default:
-            LOG_WARN("NCCLBackend: Unknown dtype, defaulting to float32");
-            return ncclFloat32;
-        }
-    }
-
-    ncclRedOp_t NCCLBackend::toNcclRedOp(CollectiveOp op)
-    {
-        switch (op)
-        {
-        case CollectiveOp::ALLREDUCE_SUM:
-            return ncclSum;
-        case CollectiveOp::ALLREDUCE_MAX:
-            return ncclMax;
-        case CollectiveOp::ALLREDUCE_MIN:
-            return ncclMin;
-        default:
-            LOG_WARN("NCCLBackend: Unknown op, defaulting to SUM");
-            return ncclSum;
-        }
-    }
-#endif
+    // See toNcclDataTypeInt() and toNcclRedOpInt() for the portable implementations.
 
 } // namespace llaminar2

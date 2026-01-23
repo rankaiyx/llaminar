@@ -6,6 +6,7 @@
 #include <set>
 #include <sstream>
 #include <algorithm>
+#include <atomic>
 
 /**
  * @file DebugEnv.h
@@ -1681,6 +1682,110 @@ namespace llaminar2
     };
 
     /**
+     * @brief Memory transfer tracing configuration
+     *
+     * Provides diagnostic instrumentation for GPU memory transfers (H2D and D2H).
+     * When enabled, logs transfers with stack traces to identify wasteful transfers.
+     *
+     * Environment variables:
+     * - `LLAMINAR_TRACE_TRANSFERS=1` - Enable transfer tracing (logs all H2D/D2H)
+     * - `LLAMINAR_TRACE_TRANSFERS_STACKTRACE=1` - Include C++23 stacktrace in log
+     * - `LLAMINAR_TRACE_TRANSFERS_THROW=1` - Throw exception with stacktrace for unexpected transfers
+     * - `LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=0` - Minimum transfer size to trace (default: 0 = all)
+     * - `LLAMINAR_TRACE_TRANSFERS_ONLY_D2H=1` - Only trace D2H transfers (not H2D)
+     *
+     * @code
+     *   # Log all D2H transfers larger than 1MB with stack traces
+     *   LLAMINAR_TRACE_TRANSFERS=1 \
+     *   LLAMINAR_TRACE_TRANSFERS_STACKTRACE=1 \
+     *   LLAMINAR_TRACE_TRANSFERS_ONLY_D2H=1 \
+     *   LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1048576 \
+     *   ./build_v2_release/llaminar2 -m model.gguf -p "test"
+     * @endcode
+     */
+    struct TransferTracingConfig
+    {
+        bool enabled = false;            ///< Master enable for transfer tracing
+        bool include_stacktrace = false; ///< Include C++23 stacktrace in log output
+        bool throw_on_transfer = false;  ///< Throw exception with stacktrace for unexpected transfers
+        size_t min_bytes = 0;            ///< Minimum transfer size to trace (0 = all)
+        bool only_d2h = false;           ///< Only trace D2H transfers (D2H is more suspicious)
+
+        // Transfer counters for testing (mutable to allow incrementing from const context)
+        mutable std::atomic<size_t> h2d_count{0}; ///< Count of H2D transfers matching filter
+        mutable std::atomic<size_t> d2h_count{0}; ///< Count of D2H transfers matching filter
+        mutable std::atomic<size_t> h2d_bytes{0}; ///< Total H2D bytes transferred
+        mutable std::atomic<size_t> d2h_bytes{0}; ///< Total D2H bytes transferred
+
+        /// Reset transfer counters (call before test runs)
+        void resetCounters() const
+        {
+            h2d_count.store(0, std::memory_order_relaxed);
+            d2h_count.store(0, std::memory_order_relaxed);
+            h2d_bytes.store(0, std::memory_order_relaxed);
+            d2h_bytes.store(0, std::memory_order_relaxed);
+        }
+
+        /// Record an H2D transfer
+        void recordH2D(size_t bytes) const
+        {
+            h2d_count.fetch_add(1, std::memory_order_relaxed);
+            h2d_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+
+        /// Record a D2H transfer
+        void recordD2H(size_t bytes) const
+        {
+            d2h_count.fetch_add(1, std::memory_order_relaxed);
+            d2h_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+
+        TransferTracingConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            enabled = false;
+            include_stacktrace = false;
+            throw_on_transfer = false;
+            min_bytes = 0;
+            only_d2h = false;
+
+            const char *trace_env = std::getenv("LLAMINAR_TRACE_TRANSFERS");
+            if (trace_env)
+            {
+                enabled = (std::atoi(trace_env) != 0);
+            }
+
+            const char *stack_env = std::getenv("LLAMINAR_TRACE_TRANSFERS_STACKTRACE");
+            if (stack_env)
+            {
+                include_stacktrace = (std::atoi(stack_env) != 0);
+            }
+
+            const char *throw_env = std::getenv("LLAMINAR_TRACE_TRANSFERS_THROW");
+            if (throw_env)
+            {
+                throw_on_transfer = (std::atoi(throw_env) != 0);
+            }
+
+            const char *min_env = std::getenv("LLAMINAR_TRACE_TRANSFERS_MIN_BYTES");
+            if (min_env)
+            {
+                min_bytes = static_cast<size_t>(std::atoll(min_env));
+            }
+
+            const char *only_d2h_env = std::getenv("LLAMINAR_TRACE_TRANSFERS_ONLY_D2H");
+            if (only_d2h_env)
+            {
+                only_d2h = (std::atoi(only_d2h_env) != 0);
+            }
+        }
+    };
+
+    /**
      * @brief ROCm-specific debugging and instrumentation configuration
      *
      * Environment variables:
@@ -1749,6 +1854,7 @@ namespace llaminar2
         ValidationConfig validation;               ///< Buffer validation configuration
         StreamingEnv streaming;                    ///< Weight streaming configuration (Option B)
         ROCmConfig rocm;                           ///< ROCm-specific debugging configuration
+        TransferTracingConfig transfer_tracing;    ///< Memory transfer tracing for H2D/D2H debugging
 
         DebugEnv() = default;
 
@@ -1767,6 +1873,7 @@ namespace llaminar2
             validation.reload();
             streaming.reload();
             rocm.reload();
+            transfer_tracing.reload();
         }
     };
 

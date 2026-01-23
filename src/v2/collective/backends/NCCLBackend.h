@@ -19,10 +19,12 @@
 
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
+#include "../../utils/MPIContext.h"
 
-#ifdef HAVE_NCCL
-#include <nccl.h>
-#endif
+// Note: NCCL types are NOT exposed in this header to avoid conflicts with RCCL/HIP
+// when building with both CUDA and ROCm. All NCCL-specific operations are isolated
+// in NCCLBackendCUDA.cu, and void* is used for opaque handles here.
+// The actual types (ncclComm_t, cudaStream_t) are defined in the implementation.
 
 #include <memory>
 #include <string>
@@ -43,7 +45,13 @@ namespace llaminar2
     class NCCLBackend : public ICollectiveBackend
     {
     public:
-        NCCLBackend();
+        /**
+         * @brief Construct NCCLBackend
+         * @param mpi_ctx Optional MPI context for multi-process initialization.
+         *                If provided and world_size > 1, uses MPI to broadcast
+         *                NCCL unique ID for distributed communicator setup.
+         */
+        explicit NCCLBackend(std::shared_ptr<MPIContext> mpi_ctx = nullptr);
         ~NCCLBackend() override;
 
         // =====================================================================
@@ -116,6 +124,34 @@ namespace llaminar2
             int root) override;
 
         // =====================================================================
+        // Multi-GPU Single-Process Operations
+        // =====================================================================
+
+        /// Check if initialized in multi-GPU single-process mode
+        bool isMultiGpuSingleProcess() const override;
+
+        /// Multi-GPU AllReduce (each GPU has its own buffer)
+        bool allreduceMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op) override;
+
+        /// Multi-GPU AllGather (each GPU sends from send_bufs, receives to recv_bufs)
+        bool allgatherMulti(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype) override;
+
+        /// Multi-GPU Broadcast (root's buffer is broadcast to all)
+        bool broadcastMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            int root) override;
+
+        // =====================================================================
         // Synchronization
         // =====================================================================
 
@@ -142,14 +178,20 @@ namespace llaminar2
         std::string last_error_;
         int num_ranks_ = 0;
         int local_rank_ = 0;
+        std::shared_ptr<MPIContext> mpi_ctx_;
+        bool is_multi_gpu_single_process_ = false;
 
 #ifdef HAVE_NCCL
-        ncclComm_t comm_ = nullptr;
-        cudaStream_t stream_ = nullptr;
+        // NOTE: We use void* for comm and streams to avoid CUDA/HIP/NCCL header conflicts.
+        // When building with both CUDA and ROCm, NCCL headers can conflict with RCCL/HIP.
+        // The actual types (ncclComm_t, cudaStream_t) are cast in the .cpp/.cu implementation.
+        void *comm_ = nullptr;
+        void *stream_ = nullptr;
 
-        // Helper to convert our types to NCCL types
-        static ncclDataType_t toNcclDataType(CollectiveDataType dtype);
-        static ncclRedOp_t toNcclRedOp(CollectiveOp op);
+        // Multi-GPU single-process: per-GPU communicators and streams
+        std::vector<void *> all_comms_;    // One communicator per GPU (ncclComm_t)
+        std::vector<void *> all_streams_;  // One stream per GPU (cudaStream_t)
+        std::vector<int> device_ordinals_; // Device ordinals for each GPU
 #endif
     };
 

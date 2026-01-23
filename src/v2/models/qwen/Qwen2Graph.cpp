@@ -817,6 +817,7 @@ namespace llaminar2
             int pos_offset = position_ids ? position_ids[0] : 0;
 
             RoPEStage::Params rope_params;
+            rope_params.device_id = device;            // Use graph's target device for kernel dispatch
             rope_params.Q = buffers.Q;
             rope_params.K = buffers.K;
             rope_params.n_heads = local_n_heads;       // Use local head count for TP
@@ -1285,6 +1286,7 @@ namespace llaminar2
         if (env.execution.exec_residual && !inference_mode.isHybridQ16())
         {
             ResidualAddStage::Params res_params;
+            res_params.device_id = device;     // Use graph's target device for kernel dispatch
             res_params.input = buffers.attn_proj;
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
@@ -1461,6 +1463,7 @@ namespace llaminar2
             InferenceMode inference_mode_ffn_res(config_.activation_precision);
 
             ResidualAddStage::Params res_params;
+            res_params.device_id = device;     // Use graph's target device for kernel dispatch
             res_params.input = buffers.attn_proj;
             res_params.residual = (inference_mode_ffn_res.isHybridQ16() && buffers.residual)
                                       ? buffers.residual

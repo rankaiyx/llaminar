@@ -2,3 +2,6 @@
 onednn/
 # cnpy
 cnpy/
+# RCCL - auto-cloned and built by CMake (ROCm collective communications)
+# Ubuntu's packaged RCCL has broken gfx906 (MI50/MI60) support, so we build from source
+rccl/

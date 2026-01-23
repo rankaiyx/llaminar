@@ -77,6 +77,11 @@ namespace llaminar2
             int cuda_device_id = -1;       ///< Device where data is uploaded
             bool uploaded = false;         ///< Whether device memory is allocated
 
+            // Back-reference to source tensor for coherence marking
+            // When weights are uploaded, we mark source_tensor_->device_valid_ = true
+            // so StageCoherence doesn't try to re-upload the raw tensor data
+            TensorBase *source_tensor_ = nullptr;
+
             ~CUDAPackedWeights();
         };
 

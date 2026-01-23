@@ -20,6 +20,8 @@
 #include "../utils/DebugEnv.h"
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
+#include <iostream>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -45,6 +47,94 @@ namespace llaminar2
         default:
             return "UNKNOWN";
         }
+    }
+
+    // =============================================================================
+    // GraphExecutorStats Implementation
+    // =============================================================================
+
+    void GraphExecutorStats::printProfilingSummary(size_t decode_tokens) const
+    {
+        // Calculate totals
+        double total_overhead = overhead.total();
+        double total_all = total_execute_ms + total_overhead;
+
+        // Calculate per-token averages if we have decode tokens
+        double stages_per_token = decode_tokens > 0 ? static_cast<double>(total_stages_executed) / decode_tokens : 0;
+        double execute_per_token = decode_tokens > 0 ? total_execute_ms / decode_tokens : 0;
+        double overhead_per_token = decode_tokens > 0 ? total_overhead / decode_tokens : 0;
+
+        std::cout << "\n";
+        std::cout << "╔══════════════════════════════════════════════════════════════════════════════╗\n";
+        std::cout << "║                    EXECUTOR OVERHEAD PROFILING SUMMARY                       ║\n";
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+
+        // Summary line
+        std::cout << "║ Total stages executed: " << std::setw(8) << total_stages_executed;
+        if (decode_tokens > 0)
+        {
+            std::cout << "  (" << std::fixed << std::setprecision(1) << stages_per_token << " stages/token)";
+        }
+        std::cout << std::string(std::max(0, 31 - (decode_tokens > 0 ? 22 : 0)), ' ') << "║\n";
+
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+        std::cout << "║  CATEGORY                    │    TOTAL (ms)  │  PER-TOKEN (ms) │    %      ║\n";
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+
+        // Helper lambda for printing rows
+        auto printRow = [&](const char *name, double value_ms)
+        {
+            double per_token = decode_tokens > 0 ? value_ms / decode_tokens : 0;
+            double pct = total_all > 0 ? (value_ms / total_all) * 100.0 : 0;
+            std::cout << "║  " << std::left << std::setw(26) << name << " │ "
+                      << std::right << std::setw(13) << std::fixed << std::setprecision(2) << value_ms << " │ "
+                      << std::setw(15) << std::fixed << std::setprecision(3) << per_token << " │ "
+                      << std::setw(7) << std::fixed << std::setprecision(1) << pct << "%  ║\n";
+        };
+
+        // Kernel execution time (the actual work)
+        printRow("Kernel Execution", total_execute_ms);
+
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+        std::cout << "║  COHERENCE OVERHEAD:                                                         ║\n";
+        printRow("  Input Coherence", overhead.input_cohere_ms);
+        printRow("  Weight Coherence", overhead.weight_cohere_ms);
+        printRow("  Output Allocation", overhead.output_alloc_ms);
+        printRow("  Mark Dirty (events)", overhead.mark_dirty_ms);
+
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+        std::cout << "║  FRAMEWORK OVERHEAD:                                                         ║\n";
+        printRow("  getDumpInfo() calls", overhead.get_dump_info_ms);
+        printRow("  extractBuffers() calls", overhead.extract_buffers_ms);
+        printRow("  Buffer Verification", overhead.verify_ms);
+        printRow("  Snapshot Callbacks", overhead.callback_ms);
+
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+        std::cout << "║  STAGE DUMP (if enabled):                                                    ║\n";
+        printRow("  Dump Inputs", overhead.dump_input_ms);
+        printRow("  Dump Outputs", overhead.dump_output_ms);
+
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+
+        // Totals
+        printRow("TOTAL OVERHEAD", total_overhead);
+        printRow("TOTAL (kernel + overhead)", total_all);
+
+        std::cout << "╠══════════════════════════════════════════════════════════════════════════════╣\n";
+
+        // Efficiency metric
+        double efficiency = total_all > 0 ? (total_execute_ms / total_all) * 100.0 : 0;
+        std::cout << "║  Kernel Efficiency: " << std::fixed << std::setprecision(1) << efficiency << "%";
+        std::cout << "  (higher = less overhead)                            ║\n";
+
+        if (decode_tokens > 0)
+        {
+            std::cout << "║  Overhead per token: " << std::fixed << std::setprecision(3) << overhead_per_token << " ms";
+            std::cout << "                                             ║\n";
+        }
+
+        std::cout << "╚══════════════════════════════════════════════════════════════════════════════╝\n";
+        std::cout << std::endl;
     }
 
     // =============================================================================
@@ -653,6 +743,8 @@ namespace llaminar2
         double dump_input_ms = 0.0;
         double execute_ms = 0.0;
         double mark_dirty_ms = 0.0;
+        double get_dump_info_ms = 0.0;
+        double extract_buffers_ms = 0.0;
 
         // =========================================================================
         // Stage Coherence: Ensure inputs are on target device BEFORE execution
@@ -666,11 +758,19 @@ namespace llaminar2
 
             if (policy == CoherencePolicy::INPUT || policy == CoherencePolicy::FULL)
             {
+                // Time getDumpInfo separately
+                phase_start = std::chrono::high_resolution_clock::now();
                 auto dump_info = node.stage->getDumpInfo();
+                phase_end = std::chrono::high_resolution_clock::now();
+                get_dump_info_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
 
-                // Cohere inputs
+                // Cohere inputs (includes extract time)
                 phase_start = std::chrono::high_resolution_clock::now();
                 auto inputs = extractInputBuffers(dump_info);
+                phase_end = std::chrono::high_resolution_clock::now();
+                extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+
+                phase_start = std::chrono::high_resolution_clock::now();
                 if (!cohereInputs(inputs, target_device))
                 {
                     LOG_ERROR("[GraphExecutor] Failed to cohere inputs for stage '" << node.name << "'");
@@ -682,6 +782,10 @@ namespace llaminar2
                 // Cohere weights (needed for GPU execution - biases, etc.)
                 phase_start = std::chrono::high_resolution_clock::now();
                 auto weights = extractWeightBuffers(dump_info);
+                phase_end = std::chrono::high_resolution_clock::now();
+                extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+
+                phase_start = std::chrono::high_resolution_clock::now();
                 if (!cohereInputs(weights, target_device)) // Weights are read-only like inputs
                 {
                     LOG_ERROR("[GraphExecutor] Failed to cohere weights for stage '" << node.name << "'");
@@ -694,10 +798,18 @@ namespace llaminar2
             // For GPU targets, outputs also need GPU buffers allocated before kernel runs
             if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
             {
+                // Time getDumpInfo separately
                 phase_start = std::chrono::high_resolution_clock::now();
                 auto dump_info = node.stage->getDumpInfo();
-                auto outputs = extractOutputBuffers(dump_info);
+                phase_end = std::chrono::high_resolution_clock::now();
+                get_dump_info_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
 
+                phase_start = std::chrono::high_resolution_clock::now();
+                auto outputs = extractOutputBuffers(dump_info);
+                phase_end = std::chrono::high_resolution_clock::now();
+                extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+
+                phase_start = std::chrono::high_resolution_clock::now();
                 if (!cohereOutputs(outputs, target_device))
                 {
                     LOG_ERROR("[GraphExecutor] Failed to allocate output buffers for stage '" << node.name << "'");
@@ -775,16 +887,23 @@ namespace llaminar2
 
             if (policy == CoherencePolicy::OUTPUT || policy == CoherencePolicy::FULL)
             {
+                // Time getDumpInfo separately
                 phase_start = std::chrono::high_resolution_clock::now();
-                auto getDumpInfo_start = std::chrono::high_resolution_clock::now();
                 auto dump_info = node.stage->getDumpInfo();
-                auto getDumpInfo_end = std::chrono::high_resolution_clock::now();
-                double getDumpInfo_ms = std::chrono::duration<double, std::milli>(getDumpInfo_end - getDumpInfo_start).count();
-                if (getDumpInfo_ms > 10.0)
+                phase_end = std::chrono::high_resolution_clock::now();
+                double this_get_dump_info_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                get_dump_info_ms += this_get_dump_info_ms;
+                if (this_get_dump_info_ms > 10.0)
                 {
-                    LOG_WARN("[GraphExecutor] getDumpInfo('" << node.name << "') took " << getDumpInfo_ms << " ms");
+                    LOG_WARN("[GraphExecutor] getDumpInfo('" << node.name << "') took " << this_get_dump_info_ms << " ms");
                 }
+
+                phase_start = std::chrono::high_resolution_clock::now();
                 auto outputs = extractOutputBuffers(dump_info);
+                phase_end = std::chrono::high_resolution_clock::now();
+                extract_buffers_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+
+                phase_start = std::chrono::high_resolution_clock::now();
                 markOutputsDirty(outputs);
                 phase_end = std::chrono::high_resolution_clock::now();
                 mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
@@ -853,7 +972,7 @@ namespace llaminar2
         }
 
         // Log phase breakdown at TRACE level (only for stages taking >1ms total or any phase >0.5ms)
-        double total_overhead_ms = input_cohere_ms + weight_cohere_ms + output_alloc_ms + dump_input_ms + mark_dirty_ms + dump_output_ms + verify_ms + callback_ms;
+        double total_overhead_ms = input_cohere_ms + weight_cohere_ms + output_alloc_ms + dump_input_ms + mark_dirty_ms + dump_output_ms + verify_ms + callback_ms + get_dump_info_ms + extract_buffers_ms;
         double total_ms = total_overhead_ms + execute_ms;
         if (total_ms > 1.0 || input_cohere_ms > 0.5 || weight_cohere_ms > 0.5 ||
             output_alloc_ms > 0.5 || execute_ms > 0.5 || verify_ms > 0.5 || callback_ms > 0.5)
@@ -868,14 +987,30 @@ namespace llaminar2
                                                  << " dump_out=" << dump_output_ms << "ms"
                                                  << " verify=" << verify_ms << "ms"
                                                  << " callback=" << callback_ms << "ms"
+                                                 << " get_dump_info=" << get_dump_info_ms << "ms"
+                                                 << " extract_buffers=" << extract_buffers_ms << "ms"
                                                  << " total=" << total_ms << "ms");
         }
 
         if (config_.enable_profiling)
         {
             stats_.stage_times_ms[node.name] = total_ms;
+            stats_.total_execute_ms += execute_ms;
+            stats_.total_stages_executed++;
 
-            LOG_DEBUG("[GraphExecutor] Stage '" << node.name << "' took " << total_ms << " ms");
+            // Accumulate overhead breakdown
+            stats_.overhead.input_cohere_ms += input_cohere_ms;
+            stats_.overhead.weight_cohere_ms += weight_cohere_ms;
+            stats_.overhead.output_alloc_ms += output_alloc_ms;
+            stats_.overhead.mark_dirty_ms += mark_dirty_ms;
+            stats_.overhead.dump_input_ms += dump_input_ms;
+            stats_.overhead.dump_output_ms += dump_output_ms;
+            stats_.overhead.verify_ms += verify_ms;
+            stats_.overhead.callback_ms += callback_ms;
+            stats_.overhead.get_dump_info_ms += get_dump_info_ms;
+            stats_.overhead.extract_buffers_ms += extract_buffers_ms;
+
+            LOG_DEBUG("[GraphExecutor] Stage '" << node.name << "' took " << total_ms << " ms (execute=" << execute_ms << "ms, overhead=" << total_overhead_ms << "ms)");
         }
 
         return success;

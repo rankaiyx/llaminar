@@ -79,6 +79,63 @@ namespace llaminar2
     using LayerExecutorConfig = GraphExecutorConfig;
 
     /**
+     * @brief Overhead breakdown for stage execution
+     *
+     * Tracks time spent in various non-kernel activities during stage execution.
+     * These overheads are cumulative across all stages executed.
+     */
+    struct ExecutionOverhead
+    {
+        double input_cohere_ms = 0.0;    ///< Time cohering inputs to target device
+        double weight_cohere_ms = 0.0;   ///< Time cohering weights to target device
+        double output_alloc_ms = 0.0;    ///< Time allocating output buffers on device
+        double mark_dirty_ms = 0.0;      ///< Time marking outputs as device-dirty
+        double dump_input_ms = 0.0;      ///< Time dumping input tensors (stage dump)
+        double dump_output_ms = 0.0;     ///< Time dumping output tensors (stage dump)
+        double verify_ms = 0.0;          ///< Time in buffer verification
+        double callback_ms = 0.0;        ///< Time in snapshot callbacks
+        double get_dump_info_ms = 0.0;   ///< Time calling getDumpInfo()
+        double extract_buffers_ms = 0.0; ///< Time extracting buffer lists
+
+        /// Total overhead (sum of all categories)
+        double total() const
+        {
+            return input_cohere_ms + weight_cohere_ms + output_alloc_ms +
+                   mark_dirty_ms + dump_input_ms + dump_output_ms +
+                   verify_ms + callback_ms + get_dump_info_ms + extract_buffers_ms;
+        }
+
+        void reset()
+        {
+            input_cohere_ms = 0.0;
+            weight_cohere_ms = 0.0;
+            output_alloc_ms = 0.0;
+            mark_dirty_ms = 0.0;
+            dump_input_ms = 0.0;
+            dump_output_ms = 0.0;
+            verify_ms = 0.0;
+            callback_ms = 0.0;
+            get_dump_info_ms = 0.0;
+            extract_buffers_ms = 0.0;
+        }
+
+        ExecutionOverhead &operator+=(const ExecutionOverhead &other)
+        {
+            input_cohere_ms += other.input_cohere_ms;
+            weight_cohere_ms += other.weight_cohere_ms;
+            output_alloc_ms += other.output_alloc_ms;
+            mark_dirty_ms += other.mark_dirty_ms;
+            dump_input_ms += other.dump_input_ms;
+            dump_output_ms += other.dump_output_ms;
+            verify_ms += other.verify_ms;
+            callback_ms += other.callback_ms;
+            get_dump_info_ms += other.get_dump_info_ms;
+            extract_buffers_ms += other.extract_buffers_ms;
+            return *this;
+        }
+    };
+
+    /**
      * @brief Graph execution statistics
      */
     struct GraphExecutorStats
@@ -86,15 +143,24 @@ namespace llaminar2
         size_t total_stages_executed = 0;
         size_t total_flops = 0;
         double total_time_ms = 0.0;
+        double total_execute_ms = 0.0; ///< Time in actual kernel/stage execution
         std::unordered_map<std::string, double> stage_times_ms;
+
+        /// Accumulated overhead breakdown
+        ExecutionOverhead overhead;
 
         void reset()
         {
             total_stages_executed = 0;
             total_flops = 0;
             total_time_ms = 0.0;
+            total_execute_ms = 0.0;
             stage_times_ms.clear();
+            overhead.reset();
         }
+
+        /// Print a formatted profiling summary to stdout
+        void printProfilingSummary(size_t decode_tokens = 0) const;
     };
 
     // Backwards compatibility alias

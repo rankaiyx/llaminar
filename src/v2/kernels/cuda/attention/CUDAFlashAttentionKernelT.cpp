@@ -304,8 +304,8 @@ namespace llaminar2
                     stream_);
             }
 
-            // Synchronize to ensure completion (for testing; remove for async)
-            cudaFlashAttn_synchronize();
+            // Note: No cudaFlashAttn_synchronize() - rely on CUDA stream ordering
+            // This enables GPU pipeline parallelism
 
             if (result != 0)
             {

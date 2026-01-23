@@ -214,10 +214,18 @@ if(HAVE_CUDA)
     # because they include MPI headers which nvcc cannot process
     
     # CUDA backend library includes backend + kernels + enumeration
+    # Note: NCCLBackendCUDA.cu isolates CUDA runtime calls from NCCLBackend.cpp
+    # Note: HostBackendCUDA.cu isolates CUDA runtime calls from HostBackend.cpp
+    # Both are needed to avoid conflicts with HIP headers when building with both CUDA and ROCm
+    # Note: CUDARingKVCacheTensorAdapter.cpp provides ITensor interface implementations for
+    # CUDARingKVCache and must be in cuda_backend to satisfy template instantiation dependencies
     add_library(cuda_backend STATIC 
         backends/cuda/CUDABackend.cu
         backends/cuda/CUDATensorValidation.cu
         backends/CUDAEnumeration.cu
+        collective/backends/NCCLBackendCUDA.cu
+        collective/backends/HostBackendCUDA.cu
+        kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp
         ${CUDA_KERNEL_SOURCES}
     )
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -278,8 +286,8 @@ if(HAVE_CUDA)
         target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
         target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
         
-        # CUTLASS requires C++17 minimum, we use C++20
-        target_compile_features(cuda_backend PUBLIC cxx_std_20)
+        # CUTLASS requires C++17 minimum, we use C++23 for stacktrace
+        target_compile_features(cuda_backend PUBLIC cxx_std_23)
         
         # Add CUTLASS NVCC flags for Tensor Cores
         # SM 86 = RTX 3090 (Ampere), SM 80 = A100, SM 75 = Turing
@@ -298,6 +306,51 @@ if(HAVE_CUDA)
     add_compile_definitions(HAVE_CUDA)
     
     message(STATUS "V2: CUDA backend library configured with ${CMAKE_CURRENT_LIST_LENGTH} kernel(s)")
+    
+    # =========================================================================
+    # NCCL Detection (NVIDIA Collective Communications Library)
+    # =========================================================================
+    # NCCL provides optimized multi-GPU and multi-node collective operations.
+    # Used by NCCLBackend for AllReduce, AllGather, etc. in tensor parallelism.
+    find_path(NCCL_INCLUDE_DIR nccl.h
+        HINTS
+            ${CUDAToolkit_INCLUDE_DIRS}
+            ${CUDA_TOOLKIT_ROOT_DIR}/include
+        PATHS
+            /usr/include
+            /usr/local/include
+            /opt/nccl/include
+            /usr/local/cuda/include
+    )
+    find_library(NCCL_LIBRARY nccl
+        HINTS
+            ${CUDAToolkit_LIBRARY_DIR}
+            ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+            ${CUDA_TOOLKIT_ROOT_DIR}/lib
+        PATHS
+            /usr/lib/x86_64-linux-gnu
+            /usr/lib64
+            /usr/local/lib
+            /opt/nccl/lib
+            /usr/local/cuda/lib64
+    )
+    
+    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+        set(HAVE_NCCL ON CACHE BOOL "NCCL library found")
+        add_compile_definitions(HAVE_NCCL)
+        message(STATUS "V2: NCCL found")
+        message(STATUS "V2:   Include: ${NCCL_INCLUDE_DIR}")
+        message(STATUS "V2:   Library: ${NCCL_LIBRARY}")
+    else()
+        set(HAVE_NCCL OFF CACHE BOOL "NCCL library not found")
+        message(WARNING "V2: NCCL not found - NCCLBackend will be disabled")
+        if(NOT NCCL_INCLUDE_DIR)
+            message(WARNING "V2:   nccl.h not found in standard paths")
+        endif()
+        if(NOT NCCL_LIBRARY)
+            message(WARNING "V2:   libnccl.so not found in standard paths")
+        endif()
+    endif()
 endif()
 
 # =============================================================================
@@ -385,6 +438,7 @@ if(HAVE_ROCM)
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/ROCmEnumeration.cpp
+        collective/backends/HostBackendROCm.cpp              # HIP-specific host memory registration
         ${ROCM_KERNEL_SOURCES}
     )
     target_include_directories(rocm_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -404,6 +458,7 @@ if(HAVE_ROCM)
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/ROCmEnumeration.cpp
+        collective/backends/HostBackendROCm.cpp
         ${ROCM_KERNEL_SOURCES}
         PROPERTIES LANGUAGE HIP
     )
@@ -437,6 +492,200 @@ if(HAVE_ROCM)
     add_compile_definitions(HAVE_ROCM)
     
     message(STATUS "V2: ROCm backend library configured with hipBLAS GEMM kernels")
+    
+    # =========================================================================
+    # RCCL Auto-Clone and Build for ROCm Multi-GPU Support
+    # =========================================================================
+    # The Ubuntu-packaged RCCL (rccl 2.27.7.70101-38~24.04) has broken gfx906
+    # (MI50/MI60) kernel binaries. When using multi-GPU on these architectures,
+    # the library crashes with SIGSEGV in ihipLaunchKernel() because the GPU
+    # kernels fail to load (hipErrorNoBinaryForGpu).
+    #
+    # Workaround: Build RCCL from source with explicit GPU_TARGETS for gfx906.
+    # See: https://github.com/ROCm/rocm-systems/issues/2805
+    #
+    # Like oneDNN and ComposableKernel, we clone to external/rccl if not present
+    # and build locally. The build is cached based on git commit hash.
+    find_package(Git REQUIRED)
+    
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
+    set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
+    set(RCCL_GIT_REF "rocm-7.1.1")  # Match our ROCm version
+    
+    # Auto-detect GPU architecture for RCCL build
+    # Default to gfx906 (MI50/MI60) which is known to be broken in packaged RCCL
+    if(NOT DEFINED RCCL_GPU_TARGETS)
+        # Try to detect from rocminfo
+        execute_process(
+            COMMAND bash -c "rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-z]+' | head -1"
+            OUTPUT_VARIABLE DETECTED_GPU_TARGET
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(DETECTED_GPU_TARGET)
+            set(RCCL_GPU_TARGETS "${DETECTED_GPU_TARGET}")
+            message(STATUS "V2: Auto-detected GPU target for RCCL: ${RCCL_GPU_TARGETS}")
+        else()
+            set(RCCL_GPU_TARGETS "gfx906")
+            message(STATUS "V2: Using default GPU target for RCCL: ${RCCL_GPU_TARGETS}")
+        endif()
+    endif()
+    
+    if(NOT EXISTS "${REPO_ROOT}/external")
+        file(MAKE_DIRECTORY "${REPO_ROOT}/external")
+    endif()
+    
+    if(NOT EXISTS "${RCCL_EXTERNAL_DIR}")
+        message(STATUS "V2: RCCL not found in external/, cloning ${RCCL_GIT_URL} (${RCCL_GIT_REF})...")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${RCCL_GIT_REF}
+                ${RCCL_GIT_URL}
+                rccl
+            WORKING_DIRECTORY "${REPO_ROOT}/external"
+            RESULT_VARIABLE GIT_CLONE_RESULT
+            OUTPUT_VARIABLE GIT_CLONE_OUTPUT
+            ERROR_VARIABLE GIT_CLONE_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_STRIP_TRAILING_WHITESPACE
+        )
+        
+        if(NOT GIT_CLONE_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to clone RCCL: ${GIT_CLONE_ERROR}")
+        endif()
+        
+        message(STATUS "V2: RCCL ${RCCL_GIT_REF} cloned successfully")
+    else()
+        message(STATUS "V2: RCCL already present at ${RCCL_EXTERNAL_DIR}; leaving existing checkout untouched")
+    endif()
+    
+    # Get current commit hash for cache validation
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+        WORKING_DIRECTORY "${RCCL_EXTERNAL_DIR}"
+        RESULT_VARIABLE RCCL_REV_PARSE_RESULT
+        OUTPUT_VARIABLE RCCL_COMMIT
+        ERROR_VARIABLE RCCL_REV_PARSE_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT RCCL_REV_PARSE_RESULT EQUAL 0)
+        message(FATAL_ERROR "V2: Failed to determine RCCL commit: ${RCCL_REV_PARSE_ERROR}")
+    endif()
+    
+    # Check if RCCL build is up-to-date
+    set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
+    set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
+    
+    set(RCCL_BUILD_COMMIT "missing")
+    if(EXISTS "${RCCL_VERSION_FILE}")
+        file(READ "${RCCL_VERSION_FILE}" RCCL_BUILD_COMMIT_RAW)
+        string(STRIP "${RCCL_BUILD_COMMIT_RAW}" RCCL_BUILD_COMMIT)
+    endif()
+    
+    if(EXISTS "${RCCL_BUILD_DIR}" AND NOT RCCL_BUILD_COMMIT STREQUAL RCCL_COMMIT)
+        message(STATUS "V2: RCCL build cache (${RCCL_BUILD_COMMIT}) is stale vs ${RCCL_COMMIT}, rebuilding...")
+        file(REMOVE_RECURSE "${RCCL_BUILD_DIR}")
+    endif()
+    
+    # Build RCCL if needed
+    if(NOT EXISTS "${RCCL_BUILD_DIR}/librccl.so")
+        message(STATUS "V2: Building RCCL (${RCCL_GIT_URL}@${RCCL_GIT_REF} @ ${RCCL_COMMIT}) from source...")
+        message(STATUS "V2: RCCL GPU targets: ${RCCL_GPU_TARGETS}")
+        message(STATUS "V2: NOTE: This may take 30-60+ minutes on first build")
+        
+        # Configure RCCL
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -B "${RCCL_BUILD_DIR}" -S "${RCCL_EXTERNAL_DIR}"
+                    -DCMAKE_BUILD_TYPE=Release
+                    -DCMAKE_PREFIX_PATH=/opt/rocm
+                    -DGPU_TARGETS=${RCCL_GPU_TARGETS}
+                    -DBUILD_TESTS=OFF
+            RESULT_VARIABLE RCCL_CONFIG_RESULT
+            OUTPUT_VARIABLE RCCL_CONFIG_OUTPUT
+            ERROR_VARIABLE RCCL_CONFIG_ERROR
+        )
+        
+        if(NOT RCCL_CONFIG_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to configure RCCL: ${RCCL_CONFIG_ERROR}")
+        endif()
+        
+        # Build RCCL
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} --build "${RCCL_BUILD_DIR}" --parallel
+            RESULT_VARIABLE RCCL_BUILD_RESULT
+            OUTPUT_VARIABLE RCCL_BUILD_OUTPUT
+            ERROR_VARIABLE RCCL_BUILD_ERROR
+        )
+        
+        if(NOT RCCL_BUILD_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to build RCCL: ${RCCL_BUILD_ERROR}")
+        endif()
+        
+        # Write version file for cache validation
+        file(WRITE "${RCCL_VERSION_FILE}" "${RCCL_COMMIT}\n")
+        
+        message(STATUS "V2: RCCL built successfully in ${RCCL_BUILD_DIR}")
+    else()
+        message(STATUS "V2: RCCL already built in ${RCCL_BUILD_DIR}")
+    endif()
+    
+    # =========================================================================
+    # RCCL Detection (ROCm Collective Communications Library)
+    # =========================================================================
+    # Search for RCCL - prioritize our local build over system packages
+    # (system packages may have broken GPU binaries for certain architectures)
+    find_path(RCCL_INCLUDE_DIR rccl/rccl.h rccl.h
+        HINTS
+            ${RCCL_BUILD_DIR}/include        # Our local build (highest priority)
+            ${RCCL_EXTERNAL_DIR}/src/include # RCCL source headers
+            ${ROCM_PATH}/include
+            ${ROCM_PATH}/rccl/include
+        PATHS
+            /opt/rocm/include
+            /opt/rocm/rccl/include
+            /usr/include
+            /usr/local/include
+        NO_DEFAULT_PATH
+    )
+    find_library(RCCL_LIBRARY rccl
+        HINTS
+            ${RCCL_BUILD_DIR}                # Our local build (highest priority)
+            ${ROCM_PATH}/lib
+            ${ROCM_PATH}/rccl/lib
+        PATHS
+            /opt/rocm/lib
+            /opt/rocm/rccl/lib
+            /usr/lib/x86_64-linux-gnu
+            /usr/lib64
+            /usr/local/lib
+        NO_DEFAULT_PATH
+    )
+    
+    if(RCCL_INCLUDE_DIR AND RCCL_LIBRARY)
+        set(HAVE_RCCL ON CACHE BOOL "RCCL library found")
+        add_compile_definitions(HAVE_RCCL)
+        
+        # Check if we're using our local build or system RCCL
+        string(FIND "${RCCL_LIBRARY}" "${RCCL_BUILD_DIR}" RCCL_IS_LOCAL)
+        if(NOT RCCL_IS_LOCAL EQUAL -1)
+            message(STATUS "V2: RCCL found (locally built for ${RCCL_GPU_TARGETS})")
+        else()
+            message(STATUS "V2: RCCL found (system)")
+            message(WARNING "V2: Using system RCCL - may have broken GPU binaries for gfx906")
+        endif()
+        message(STATUS "V2:   Include: ${RCCL_INCLUDE_DIR}")
+        message(STATUS "V2:   Library: ${RCCL_LIBRARY}")
+    else()
+        set(HAVE_RCCL OFF CACHE BOOL "RCCL library not found")
+        message(WARNING "V2: RCCL not found - RCCLBackend will be disabled")
+        if(NOT RCCL_INCLUDE_DIR)
+            message(WARNING "V2:   rccl.h not found in standard paths")
+        endif()
+        if(NOT RCCL_LIBRARY)
+            message(WARNING "V2:   librccl.so not found in standard paths")
+        endif()
+    endif()
 endif()
 
 # =============================================================================
@@ -473,9 +722,6 @@ if(HAVE_CUDA AND HAVE_ROCM)
         backends/p2p/DirectP2P.cpp
         backends/p2p/DirectP2P_CUDA.cu
         backends/p2p/DirectP2P_ROCm.cpp
-        # HostBackend runtime-specific helpers (must be in separate compilation units)
-        collective/backends/HostBackendCUDA.cu
-        collective/backends/HostBackendROCm.cpp
         # PCIe BAR collective backend for CUDA↔ROCm direct P2P
         collective/backends/PCIeBARBackend.cpp
     )
@@ -934,8 +1180,30 @@ if(DUMP_ATTENTION_INPUTS)
     message(STATUS "V2: Attention input dumping ENABLED (will dump Q/K/V/mask to disk)")
 endif()
 
-# Compile features - C++20 for concepts, ranges, and improved constexpr
-target_compile_features(llaminar2_core PUBLIC cxx_std_20)
+# Compile features - C++23 for std::stacktrace (transfer diagnostics) and C++20 features
+target_compile_features(llaminar2_core PUBLIC cxx_std_23)
+
+# C++23 stacktrace library support
+# GCC 13+ supports stacktrace with -lstdc++_libbacktrace, BUT when ROCm is enabled
+# the linker is clang++ which can't link against this GCC-specific library.
+# Therefore we disable stacktrace when ROCm is enabled.
+if(HAVE_ROCM)
+    message(STATUS "V2: C++23 stacktrace DISABLED (ROCm uses clang++ linker, incompatible with stdc++_libbacktrace)")
+    target_compile_definitions(llaminar2_core PUBLIC LLAMINAR_DISABLE_STACKTRACE)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+    # Check if the library exists
+    find_library(STDCXX_LIBBACKTRACE stdc++_libbacktrace)
+    if(STDCXX_LIBBACKTRACE)
+        message(STATUS "V2: Found stdc++_libbacktrace for C++23 stacktrace support")
+        target_link_libraries(llaminar2_core PUBLIC ${STDCXX_LIBBACKTRACE})
+    else()
+        message(STATUS "V2: stdc++_libbacktrace not found - stacktrace disabled")
+        target_compile_definitions(llaminar2_core PUBLIC LLAMINAR_DISABLE_STACKTRACE)
+    endif()
+else()
+    message(STATUS "V2: C++23 stacktrace disabled (requires GCC 13+)")
+    target_compile_definitions(llaminar2_core PUBLIC LLAMINAR_DISABLE_STACKTRACE)
+endif()
 
 # Dependencies
 find_package(MPI REQUIRED)
@@ -978,10 +1246,11 @@ if(HAVE_CUDA)
     
     # Add CUDA kernel C++ adapter files (compiled with C++ compiler, NOT nvcc)
     # These implement ITensorGemm interface and can include MPI headers
+    # NOTE: CUDARingKVCacheTensorAdapter.cpp moved to cuda_backend to satisfy
+    # template instantiation dependencies from CUDARingKVCache.cu
     target_sources(llaminar2_core PRIVATE
         kernels/cuda/CUDAFloatingPointGemmKernel.cpp
         kernels/cuda/CUDAQuantisedGemmKernel.cpp
-        kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp # ICUDARingKVCache::append(TensorBase*) impl
         kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
     )
@@ -1024,6 +1293,13 @@ if(HAVE_CUDA)
         CUDA::nvml  # For GPU NUMA node detection
     )
     message(STATUS "V2: Linked CUDA runtime, cuBLAS, cuBLASLt, and NVML")
+    
+    # Link NCCL if found
+    if(HAVE_NCCL)
+        target_include_directories(llaminar2_core PUBLIC ${NCCL_INCLUDE_DIR})
+        target_link_libraries(llaminar2_core PUBLIC ${NCCL_LIBRARY})
+        message(STATUS "V2: Linked NCCL for multi-GPU collective operations")
+    endif()
 endif()
 
 # =============================================================================
@@ -1043,6 +1319,13 @@ if(HAVE_ROCM)
         ${ROCM_PATH}/lib/libhipblaslt.so  # hipBLASLt for fused GEMM+bias
     )
     message(STATUS "V2: Linked HIP runtime, hipBLAS, and hipBLASLt")
+    
+    # Link RCCL if found
+    if(HAVE_RCCL)
+        target_include_directories(llaminar2_core PUBLIC ${RCCL_INCLUDE_DIR})
+        target_link_libraries(llaminar2_core PUBLIC ${RCCL_LIBRARY})
+        message(STATUS "V2: Linked RCCL for multi-GPU collective operations")
+    endif()
 endif()
 
 if(HAVE_VULKAN)

@@ -20,8 +20,7 @@ namespace llaminar2
     // =============================================================================
 
     ResidualAddStage::ResidualAddStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
@@ -159,23 +158,31 @@ namespace llaminar2
     {
         (void)ctx; // Now unused - KernelFactory handles device dispatch
 
-        // Cast ITensor* to TensorBase* for CPU operations
+        // Cast ITensor* to TensorBase* for kernel dispatch
         auto *input_base = requireTensorBase(params_.input, "input");
-        if (!input_base)
+        auto *residual_base = requireTensorBase(params_.residual, "residual");
+        auto *output_base = requireTensorBase(params_.output, "output");
+        if (!input_base || !residual_base || !output_base)
         {
-            LOG_ERROR("[ResidualAddStage::FP32] GPU tensors not yet supported");
+            LOG_ERROR("[ResidualAddStage::FP32] Failed to cast tensors to TensorBase");
             return false;
         }
 
-        const float *input = params_.input->data();
-        const float *residual = params_.residual->data();
-        float *output = params_.output->mutable_data();
         const size_t n = num_elements;
 
-        LOG_DEBUG("[ResidualAddStage::FP32] input[0:4]="
-                  << input[0] << "," << input[1] << "," << input[2] << "," << input[3]
-                  << " residual[0:4]="
-                  << residual[0] << "," << residual[1] << "," << residual[2] << "," << residual[3]);
+        // Debug logging - use fp32_data() which handles sync properly
+        if (Logger::getInstance().shouldLog(LogLevel::TRACE))
+        {
+            const float *input = params_.input->fp32_data();
+            const float *residual = params_.residual->fp32_data();
+            if (input && residual)
+            {
+                LOG_DEBUG("[ResidualAddStage::FP32] input[0:4]="
+                          << input[0] << "," << input[1] << "," << input[2] << "," << input[3]
+                          << " residual[0:4]="
+                          << residual[0] << "," << residual[1] << "," << residual[2] << "," << residual[3]);
+            }
+        }
 
         // Create kernel via KernelFactory with automatic device dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
@@ -186,10 +193,19 @@ namespace llaminar2
             return false;
         }
 
-        bool ok = kernel->apply(input, residual, output, n, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex());
+        // Use apply_tensor() which handles GPU pointers correctly via active_data_ptr()
+        bool ok = kernel->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
+                                       params_.device_id.toKernelDeviceIndex());
 
-        LOG_DEBUG("[ResidualAddStage::FP32] output[0:4]="
-                  << output[0] << "," << output[1] << "," << output[2] << "," << output[3]);
+        if (Logger::getInstance().shouldLog(LogLevel::TRACE))
+        {
+            const float *output = params_.output->fp32_data();
+            if (output)
+            {
+                LOG_DEBUG("[ResidualAddStage::FP32] output[0:4]="
+                          << output[0] << "," << output[1] << "," << output[2] << "," << output[3]);
+            }
+        }
 
         return ok;
     }
@@ -568,55 +584,69 @@ namespace llaminar2
         if (!params_.input || !params_.residual || !params_.output)
             return info;
 
-        // Determine dtype string based on tensor type
-        const char *dtype = params_.input->dtype_name();
-        size_t elem_size = sizeof(float);
-        TensorType ttype = params_.input->native_type();
-        switch (ttype)
-        {
-        case TensorType::BF16:
-        case TensorType::FP16:
-            elem_size = 2;
-            break;
-        case TensorType::Q8_1:
-            // Q8_1Block: 36 bytes per 32 elements = 1.125 bytes/elem
-            // For dump purposes, use 1 (closest integer approximation)
-            elem_size = 1;
-            break;
-        default:
-            break;
-        }
-
         // Use explicit num_elements if provided (for pre-allocated buffers)
         // Otherwise derive from tensor dimensions
         size_t actual_elements = (params_.num_elements > 0) ? params_.num_elements : params_.input->numel();
         int cols = static_cast<int>(params_.input->cols());
         int rows = (cols > 0) ? static_cast<int>(actual_elements / cols) : 1;
 
-        // Input tensors - use safe FP32 accessor
-        const float *input_data = getSafeFp32Data(params_.input);
-        const float *residual_data = getSafeFp32Data(params_.residual);
-        const float *output_data = getSafeFp32Data(params_.output);
+        // OPTIMIZATION: For FP32 tensors, use tensor-based API to avoid GPU->host sync.
+        // The sync is deferred to ensureOutputsOnHost().
+        const bool is_fp32 = params_.input->native_type() == TensorType::FP32;
 
-        if (input_data)
+        if (is_fp32)
         {
-            info.inputs.push_back({"input", input_data,
-                                   static_cast<size_t>(rows), static_cast<size_t>(cols),
-                                   dtype, elem_size});
+            // Fast path: tensor-based addInput/addOutput (no GPU sync)
+            info.addInput("input", params_.input, rows, cols);
+            info.addInput("residual", params_.residual, rows, cols);
+            info.addOutput("output", params_.output, rows, cols);
         }
-        if (residual_data)
+        else
         {
-            info.inputs.push_back({"residual", residual_data,
-                                   static_cast<size_t>(rows), static_cast<size_t>(cols),
-                                   dtype, elem_size});
-        }
+            // Legacy path: Q8_1/BF16/FP16 modes need data conversion
+            const char *dtype = params_.input->dtype_name();
+            size_t elem_size = sizeof(float);
+            TensorType ttype = params_.input->native_type();
+            switch (ttype)
+            {
+            case TensorType::BF16:
+            case TensorType::FP16:
+                elem_size = 2;
+                break;
+            case TensorType::Q8_1:
+                // Q8_1Block: 36 bytes per 32 elements = 1.125 bytes/elem
+                // For dump purposes, use 1 (closest integer approximation)
+                elem_size = 1;
+                break;
+            default:
+                break;
+            }
 
-        // Output
-        if (output_data)
-        {
-            info.outputs.push_back({"output", output_data,
-                                    static_cast<size_t>(rows), static_cast<size_t>(cols),
-                                    dtype, elem_size});
+            // Input tensors - use safe FP32 accessor
+            const float *input_data = getSafeFp32Data(params_.input);
+            const float *residual_data = getSafeFp32Data(params_.residual);
+            const float *output_data = getSafeFp32Data(params_.output);
+
+            if (input_data)
+            {
+                info.inputs.push_back({"input", input_data,
+                                       static_cast<size_t>(rows), static_cast<size_t>(cols),
+                                       dtype, elem_size});
+            }
+            if (residual_data)
+            {
+                info.inputs.push_back({"residual", residual_data,
+                                       static_cast<size_t>(rows), static_cast<size_t>(cols),
+                                       dtype, elem_size});
+            }
+
+            // Output
+            if (output_data)
+            {
+                info.outputs.push_back({"output", output_data,
+                                        static_cast<size_t>(rows), static_cast<size_t>(cols),
+                                        dtype, elem_size});
+            }
         }
 
         // Scalar params

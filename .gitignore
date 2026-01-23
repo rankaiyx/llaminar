@@ -96,3 +96,7 @@ src/v2/kernels/cuda/*.csv
 src/v2/kernels/cuda/*.png
 src/v2/kernels/cuda/*.txt
 src/v2/kernels/cuda/*_heuristic_*.h
+*.sqlite
+*.nsys-rep
+*.lock
+*.lock-*

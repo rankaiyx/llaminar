@@ -1369,8 +1369,37 @@ TEST(Test__MyNewKernel, BasicFunctionality) {
 | `LLAMINAR_MPI_LOG_TIMING` | Log timing of MPI operations | Disabled |
 | `LLAMINAR_MPI_VERIFY_CHECKSUMS` | Verify checksums before/after MPI ops | Disabled |
 | `LLAMINAR_DEQUANT_STATS` | Log per-tensor dequant stats | Disabled |
+| `LLAMINAR_TRACE_TRANSFERS` | Enable H2D/D2H transfer tracing (0/1) | Disabled |
+| `LLAMINAR_TRACE_TRANSFERS_STACKTRACE` | Include C++23 stacktrace in transfer logs | Disabled |
+| `LLAMINAR_TRACE_TRANSFERS_THROW` | Throw exception on transfer (for debugging) | Disabled |
+| `LLAMINAR_TRACE_TRANSFERS_MIN_BYTES` | Minimum transfer size to trace (bytes) | 0 (all) |
+| `LLAMINAR_TRACE_TRANSFERS_ONLY_D2H` | Only trace Device-to-Host transfers | Disabled |
 
 For the full list, see `src/v2/utils/DebugEnv.h`.
+
+### Transfer Tracing for Coherence Debugging
+
+The transfer tracing system helps identify unnecessary or wasteful memory transfers between host and device. This is critical for GPU performance optimization.
+
+**Example Usage**:
+```bash
+# Trace all large D2H transfers (often indicates bugs like data() called in hot path)
+LLAMINAR_TRACE_TRANSFERS=1 \
+LLAMINAR_TRACE_TRANSFERS_ONLY_D2H=1 \
+LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
+./build_v2_release/llaminar2 -m model.gguf -p "test" -n 10
+
+# Throw exception on first large transfer (for stack trace debugging)
+LLAMINAR_TRACE_TRANSFERS=1 \
+LLAMINAR_TRACE_TRANSFERS_THROW=1 \
+LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
+./build_v2_release/llaminar2 -m model.gguf -p "test"
+```
+
+**Common Issues Detected**:
+- `LOG_DEBUG` or `LOG_TRACE` statements calling `tensor->data()` (triggers D2H)
+- Debug code unconditionally calling `data()` even when logging is disabled
+- Forgotten `ensureOnDevice()` calls causing re-uploads every iteration
 
 ---
 

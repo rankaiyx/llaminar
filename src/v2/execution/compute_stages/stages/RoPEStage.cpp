@@ -366,90 +366,114 @@ namespace llaminar2
                                      (params_.Q_out->native_type() == TensorType::Q16_1);
 
         const bool separate_output_mode = hybrid_mode || hybrid_q16_mode;
+        
+        // OPTIMIZATION: For FP32 in-place RoPE (standard CUDA path), use tensor-based API
+        // to avoid GPU->host sync. The sync is deferred to ensureOutputsOnHost().
+        const bool is_fp32_inplace = !separate_output_mode && 
+                                     params_.Q->native_type() == TensorType::FP32;
 
-        // Q input
-        const float *q_input_data = getSafeFp32Data(params_.Q);
-        if (q_input_data)
+        if (is_fp32_inplace)
         {
-            info.addInput("Q", q_input_data,
-                          seq_len, params_.n_heads * params_.head_dim);
-        }
+            // Fast path: tensor-based addInput/addOutput (no GPU sync)
+            info.addInput("Q", params_.Q, seq_len, params_.n_heads * params_.head_dim);
+            info.addOutput("Q", params_.Q, seq_len, params_.n_heads * params_.head_dim);
 
-        // Q output - use Q_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
-        if (separate_output_mode && params_.Q_out)
-        {
-            const float *q_out_data = getSafeFp32Data(params_.Q_out);
-            if (q_out_data)
+            if (params_.K)
             {
-                // HybridQ16 RoPE outputs Q in head-major layout [n_heads, seq, dim]
-                // for the attention kernel. But snapshots expect seq-major [seq, n_heads * dim]
-                // to match FP32 reference. Convert layout for snapshot comparison.
-                if (hybrid_q16_mode)
+                int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+                info.addInput("K", params_.K, seq_len, n_kv_heads * params_.head_dim);
+                info.addOutput("K", params_.K, seq_len, n_kv_heads * params_.head_dim);
+            }
+        }
+        else
+        {
+            // Legacy path: Q8_1/Hybrid modes need data conversion, use getSafeFp32Data()
+            // This path is NOT used for standard CUDA FP32 inference
+
+            // Q input
+            const float *q_input_data = getSafeFp32Data(params_.Q);
+            if (q_input_data)
+            {
+                info.addInput("Q", q_input_data,
+                              seq_len, params_.n_heads * params_.head_dim);
+            }
+
+            // Q output - use Q_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
+            if (separate_output_mode && params_.Q_out)
+            {
+                const float *q_out_data = getSafeFp32Data(params_.Q_out);
+                if (q_out_data)
                 {
-                    const int d_model = params_.n_heads * params_.head_dim;
-                    // Cache the converted buffer in the stage (lazy allocation)
-                    if (q_transposed_cache_.size() != static_cast<size_t>(seq_len * d_model))
+                    // HybridQ16 RoPE outputs Q in head-major layout [n_heads, seq, dim]
+                    // for the attention kernel. But snapshots expect seq-major [seq, n_heads * dim]
+                    // to match FP32 reference. Convert layout for snapshot comparison.
+                    if (hybrid_q16_mode)
                     {
-                        q_transposed_cache_.resize(seq_len * d_model);
-                    }
-                    // Convert [n_heads, seq, dim] -> [seq, n_heads * dim]
-                    for (int h = 0; h < params_.n_heads; ++h)
-                    {
-                        for (int s = 0; s < seq_len; ++s)
+                        const int d_model = params_.n_heads * params_.head_dim;
+                        // Cache the converted buffer in the stage (lazy allocation)
+                        if (q_transposed_cache_.size() != static_cast<size_t>(seq_len * d_model))
                         {
-                            for (int d = 0; d < params_.head_dim; ++d)
+                            q_transposed_cache_.resize(seq_len * d_model);
+                        }
+                        // Convert [n_heads, seq, dim] -> [seq, n_heads * dim]
+                        for (int h = 0; h < params_.n_heads; ++h)
+                        {
+                            for (int s = 0; s < seq_len; ++s)
                             {
-                                // Source: head-major [h][s][d]
-                                const int src_idx = h * seq_len * params_.head_dim + s * params_.head_dim + d;
-                                // Dest: seq-major [s][h*dim + d]
-                                const int dst_idx = s * d_model + h * params_.head_dim + d;
-                                q_transposed_cache_[dst_idx] = q_out_data[src_idx];
+                                for (int d = 0; d < params_.head_dim; ++d)
+                                {
+                                    // Source: head-major [h][s][d]
+                                    const int src_idx = h * seq_len * params_.head_dim + s * params_.head_dim + d;
+                                    // Dest: seq-major [s][h*dim + d]
+                                    const int dst_idx = s * d_model + h * params_.head_dim + d;
+                                    q_transposed_cache_[dst_idx] = q_out_data[src_idx];
+                                }
                             }
                         }
+                        info.addOutput("Q", q_transposed_cache_.data(),
+                                       seq_len, d_model);
                     }
-                    info.addOutput("Q", q_transposed_cache_.data(),
-                                   seq_len, d_model);
-                }
-                else
-                {
-                    info.addOutput("Q", q_out_data,
-                                   seq_len, params_.n_heads * params_.head_dim);
+                    else
+                    {
+                        info.addOutput("Q", q_out_data,
+                                       seq_len, params_.n_heads * params_.head_dim);
+                    }
                 }
             }
-        }
-        else if (q_input_data)
-        {
-            info.addOutput("Q", q_input_data,
-                           seq_len, params_.n_heads * params_.head_dim);
-        }
-
-        // K tensor (optional)
-        if (params_.K)
-        {
-            int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
-
-            // K input
-            const float *k_input_data = getSafeFp32Data(params_.K);
-            if (k_input_data)
+            else if (q_input_data)
             {
-                info.addInput("K", k_input_data,
-                              seq_len, n_kv_heads * params_.head_dim);
+                info.addOutput("Q", q_input_data,
+                               seq_len, params_.n_heads * params_.head_dim);
             }
 
-            // K output - use K_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
-            if (separate_output_mode && params_.K_out)
+            // K tensor (optional)
+            if (params_.K)
             {
-                const float *k_out_data = getSafeFp32Data(params_.K_out);
-                if (k_out_data)
+                int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+
+                // K input
+                const float *k_input_data = getSafeFp32Data(params_.K);
+                if (k_input_data)
                 {
-                    info.addOutput("K", k_out_data,
+                    info.addInput("K", k_input_data,
+                                  seq_len, n_kv_heads * params_.head_dim);
+                }
+
+                // K output - use K_out in Hybrid/HybridQ16 modes, otherwise same as input (in-place)
+                if (separate_output_mode && params_.K_out)
+                {
+                    const float *k_out_data = getSafeFp32Data(params_.K_out);
+                    if (k_out_data)
+                    {
+                        info.addOutput("K", k_out_data,
+                                       seq_len, n_kv_heads * params_.head_dim);
+                    }
+                }
+                else if (k_input_data)
+                {
+                    info.addOutput("K", k_input_data,
                                    seq_len, n_kv_heads * params_.head_dim);
                 }
-            }
-            else if (k_input_data)
-            {
-                info.addOutput("K", k_input_data,
-                               seq_len, n_kv_heads * params_.head_dim);
             }
         }
 

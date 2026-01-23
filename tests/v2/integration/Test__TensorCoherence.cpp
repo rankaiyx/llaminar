@@ -32,6 +32,7 @@
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
 #include "execution/DeviceContext.h"
+#include "utils/DebugEnv.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #endif
@@ -693,4 +694,227 @@ TEST_F(Test__TensorCoherence, ActiveDataPtr_ReturnsAppropriatePointer)
     // After release: should return host pointer again
     ASSERT_TRUE(tensor->releaseDeviceMemory());
     EXPECT_EQ(tensor->active_data_ptr(), host_ptr);
+}
+
+// ============================================================================
+// Transfer Counting Tests (for debugging transfer overhead)
+// ============================================================================
+
+/**
+ * @brief Helper to enable transfer tracing and reset counters
+ */
+class TransferCountGuard
+{
+public:
+    TransferCountGuard()
+    {
+        auto &cfg = const_cast<DebugEnv &>(debugEnv()).transfer_tracing;
+        was_enabled_ = cfg.enabled;
+        cfg.enabled = true;
+        cfg.resetCounters();
+    }
+
+    ~TransferCountGuard()
+    {
+        auto &cfg = const_cast<DebugEnv &>(debugEnv()).transfer_tracing;
+        cfg.enabled = was_enabled_;
+    }
+
+    size_t h2d_count() const { return debugEnv().transfer_tracing.h2d_count.load(); }
+    size_t d2h_count() const { return debugEnv().transfer_tracing.d2h_count.load(); }
+    size_t h2d_bytes() const { return debugEnv().transfer_tracing.h2d_bytes.load(); }
+    size_t d2h_bytes() const { return debugEnv().transfer_tracing.d2h_bytes.load(); }
+
+private:
+    bool was_enabled_ = false;
+};
+
+TEST_F(Test__TensorCoherence, TransferCounting_SingleUpload)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    // Single upload
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+
+    EXPECT_EQ(guard.h2d_count(), 1) << "Should have exactly 1 H2D transfer";
+    EXPECT_EQ(guard.d2h_count(), 0) << "Should have no D2H transfers";
+    EXPECT_EQ(guard.h2d_bytes(), 64 * 64 * sizeof(float));
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_MultipleUploads_NoRedundant)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    // Multiple uploads without host modification - should NOT re-upload
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_)); // Second call
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_)); // Third call
+
+    EXPECT_EQ(guard.h2d_count(), 1) << "Subsequent ensureOnDevice should NOT re-upload";
+    EXPECT_EQ(guard.d2h_count(), 0) << "Should have no D2H transfers";
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_DataCallAfterGpuWrite_SingleD2H)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    // Upload
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+
+    // Simulate GPU write
+    tensor->mark_device_dirty();
+
+    // data() should trigger download
+    const float *data = tensor->data();
+    ASSERT_NE(data, nullptr);
+
+    EXPECT_EQ(guard.h2d_count(), 1) << "Should have 1 H2D for initial upload";
+    EXPECT_EQ(guard.d2h_count(), 1) << "Should have 1 D2H after data() call";
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_DataCallAfterGpuWrite_NoRedundantD2H)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+    tensor->mark_device_dirty();
+
+    // Multiple data() calls should NOT re-download
+    const float *data1 = tensor->data();
+    const float *data2 = tensor->data();
+    const float *data3 = tensor->data();
+
+    ASSERT_EQ(data1, data2);
+    ASSERT_EQ(data2, data3);
+
+    EXPECT_EQ(guard.d2h_count(), 1) << "Multiple data() calls should NOT cause multiple downloads";
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_HostModificationTriggersReupload)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    // Initial upload
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+
+    // Host modification
+    tensor->mutable_data()[0] = 999.0f;
+
+    // Re-upload (should transfer because host was modified)
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+
+    EXPECT_EQ(guard.h2d_count(), 2) << "Host modification should trigger re-upload";
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_GpuDataPtrNoTransfer)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+    size_t initial_h2d = guard.h2d_count();
+
+    // gpu_data_ptr() should NOT trigger any transfer
+    void *ptr1 = tensor->gpu_data_ptr();
+    void *ptr2 = tensor->gpu_data_ptr();
+    void *ptr3 = tensor->gpu_data_ptr();
+
+    ASSERT_NE(ptr1, nullptr);
+    EXPECT_EQ(guard.h2d_count(), initial_h2d) << "gpu_data_ptr() should NOT trigger transfer";
+    EXPECT_EQ(guard.d2h_count(), 0) << "gpu_data_ptr() should NOT trigger D2H";
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_RoundTrip)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    // Full round trip: host → device → host → device
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_)); // H2D #1
+    tensor->mark_device_dirty();
+    tensor->ensureOnHost();                           // D2H #1
+    tensor->mutable_data()[0] = 42.0f;                // Mark device stale
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_)); // H2D #2
+
+    EXPECT_EQ(guard.h2d_count(), 2) << "Should have 2 H2D transfers";
+    EXPECT_EQ(guard.d2h_count(), 1) << "Should have 1 D2H transfer";
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_LargeTensor_CorrectBytes)
+{
+    TransferCountGuard guard;
+
+    // 1MB tensor
+    const size_t rows = 512;
+    const size_t cols = 512;
+    const size_t expected_bytes = rows * cols * sizeof(float);
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols});
+    fillSequential(tensor.get());
+
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+    tensor->mark_device_dirty();
+    tensor->data(); // Trigger D2H
+
+    EXPECT_EQ(guard.h2d_bytes(), expected_bytes) << "H2D bytes should match tensor size";
+    EXPECT_EQ(guard.d2h_bytes(), expected_bytes) << "D2H bytes should match tensor size";
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_CachedGpuDataSkipsUpload)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    // Upload and mark dirty (simulates GPU kernel writing to it)
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+    tensor->mark_device_dirty();
+
+    // Now device has valid data. Another ensureOnDevice should NOT re-upload
+    // because device is already valid (even if host is stale).
+    ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
+
+    EXPECT_EQ(guard.h2d_count(), 1) << "When device is valid, ensureOnDevice should skip upload";
+}
+
+TEST_F(Test__TensorCoherence, TransferCounting_NoTransferWhenHostAuthoritative)
+{
+    TransferCountGuard guard;
+
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{64, 64});
+    fillSequential(tensor.get());
+
+    // Multiple reads without any GPU involvement - no transfers
+    const float *data1 = tensor->data();
+    const float *data2 = tensor->data();
+    float *mdata1 = tensor->mutable_data();
+    const float *data3 = tensor->data();
+
+    ASSERT_NE(data1, nullptr);
+    ASSERT_NE(data2, nullptr);
+    ASSERT_NE(mdata1, nullptr);
+    ASSERT_NE(data3, nullptr);
+
+    EXPECT_EQ(guard.h2d_count(), 0) << "Host-only access should NOT trigger any transfers";
+    EXPECT_EQ(guard.d2h_count(), 0) << "Host-only access should NOT trigger any transfers";
 }

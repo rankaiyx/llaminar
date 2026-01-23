@@ -11,6 +11,7 @@
 #include "../utils/CPUFeatures.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
+#include "../utils/StackTrace.h"
 #include "../backends/BackendManager.h"
 #include "../backends/ComputeBackend.h"
 #include "../backends/DeviceId.h"
@@ -792,6 +793,14 @@ namespace llaminar2
         if (gpu_data_ptr_)
         {
             device_valid_ = false;
+            // CRITICAL WARNING: Repeated invalidation causes re-uploads!
+            // This is being called by something that shouldn't modify GPU-resident data.
+            if (debugEnv().rocm.trace_coherence)
+            {
+                LOG_WARN("[TensorBase::invalidateGpuData] EXPENSIVE! Device data marked stale for ptr="
+                         << static_cast<void *>(this) << " dtype=" << dtype_name()
+                         << " gpu_ptr=" << gpu_data_ptr_ << " numel=" << numel());
+            }
             LOG_DEBUG("[TensorBase::invalidateGpuData] Device data marked stale (memory retained)");
         }
     }
@@ -924,11 +933,43 @@ namespace llaminar2
                 return false;
             }
 
+            // Transfer tracing for H2D debugging
+            const auto &trace_cfg = debugEnv().transfer_tracing;
+            if (trace_cfg.enabled && !trace_cfg.only_d2h && bytes >= trace_cfg.min_bytes)
+            {
+                std::ostringstream msg;
+                msg << "[TRANSFER TRACE] H2D transfer: " << bytes << " bytes"
+                    << ", tensor=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                    << ", shape=[" << rows() << "x" << cols() << "]"
+                    << ", device=" << target_device.toString();
+
+                if (trace_cfg.include_stacktrace)
+                {
+                    msg << "\n"
+                        << captureStackTrace(2, 16); // Skip 2 frames
+                }
+
+                if (trace_cfg.throw_on_transfer)
+                {
+                    throw TransferViolationException(msg.str(), captureStackTrace(2, 32));
+                }
+                else
+                {
+                    LOG_WARN(msg.str());
+                }
+            }
+
             auto h2d_start = std::chrono::high_resolution_clock::now();
             bool h2d_ok = target_backend->hostToDevice(gpu_data_ptr_, src, bytes, backend_device_id);
             auto h2d_end = std::chrono::high_resolution_clock::now();
             auto h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(h2d_end - h2d_start).count();
             double bandwidth_gbps = (bytes / 1e9) / (h2d_us / 1e6);
+
+            // Record transfer for testing
+            if (trace_cfg.enabled)
+            {
+                trace_cfg.recordH2D(bytes);
+            }
 
             if (trace)
             {
@@ -1171,10 +1212,42 @@ namespace llaminar2
                 }
             }
 
+            // Transfer tracing for D2H debugging
+            const auto &trace_cfg = debugEnv().transfer_tracing;
+            if (trace_cfg.enabled && bytes >= trace_cfg.min_bytes)
+            {
+                std::ostringstream msg;
+                msg << "[TRANSFER TRACE] D2H transfer: " << bytes << " bytes"
+                    << ", tensor=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                    << ", shape=[" << rows() << "x" << cols() << "]"
+                    << ", device=" << gpu_device_->toString();
+
+                if (trace_cfg.include_stacktrace)
+                {
+                    msg << "\n"
+                        << captureStackTrace(2, 16); // Skip 2 frames (this + ensureOnHost)
+                }
+
+                if (trace_cfg.throw_on_transfer)
+                {
+                    throw TransferViolationException(msg.str(), captureStackTrace(2, 32));
+                }
+                else
+                {
+                    LOG_WARN(msg.str());
+                }
+            }
+
             if (!backend->deviceToHost(dst, gpu_data_ptr_, bytes, backend_device_id))
             {
                 LOG_ERROR("[TensorBase::ensureOnHost] deviceToHost failed");
                 return false;
+            }
+
+            // Record transfer for testing
+            if (trace_cfg.enabled)
+            {
+                trace_cfg.recordD2H(bytes);
             }
 
             host_valid_ = true; // Host now has current data
@@ -1627,6 +1700,54 @@ namespace llaminar2
         }
 
         return summary;
+    }
+
+    // ========================================================================
+    // hasCachedDeviceData - Check for kernel-cached device representations
+    // ========================================================================
+
+    bool TensorBase::hasCachedDeviceData(DeviceType device_type) const
+    {
+        // Check if we have cached packed weights for the given device type
+        // These caches are populated by KernelFactory when creating GEMM kernels
+        // and contain converted/packed weight data that's already on device.
+
+        if (device_type == DeviceType::CUDA)
+        {
+#ifdef HAVE_CUDA
+            if (cuda_cache_.has_value())
+            {
+                // The cache contains TensorCUDAPackedWeightsCache* which wraps CUDAPackedWeights
+                // We can't include the header here, but we know if cuda_cache_ has a value,
+                // the packing was done. Check if uploaded by examining the value.
+                try
+                {
+                    // Use the packed weights header type to check upload status
+                    // This relies on KernelFactory storing the cache in a known format
+                    // For now, if cuda_cache_ has value, assume it's been packed
+                    // The actual upload status is tracked in CUDAPackedWeights::uploaded
+                    return true; // Cache exists = packed weights ready
+                }
+                catch (...)
+                {
+                    return false;
+                }
+            }
+#endif
+            return false;
+        }
+        else if (device_type == DeviceType::ROCm)
+        {
+#ifdef HAVE_ROCM
+            if (rocm_cache_.has_value())
+            {
+                return true; // Cache exists = packed weights ready
+            }
+#endif
+            return false;
+        }
+
+        return false; // CPU doesn't use device caching
     }
 
 } // namespace llaminar2

@@ -129,12 +129,9 @@ namespace llaminar2
             const float *d_weight = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
 
-            bool ok = cudaOps_rmsnorm_fp32(d_input, d_weight, d_output, rows, cols, epsilon, dev);
-            if (ok)
-            {
-                cudaDeviceSynchronize();
-            }
-            return ok;
+            // Launch kernel asynchronously - no sync needed since all ops are on default stream
+            // Stream ordering guarantees subsequent kernels wait for this one
+            return cudaOps_rmsnorm_fp32(d_input, d_weight, d_output, rows, cols, epsilon, dev);
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -194,12 +191,8 @@ namespace llaminar2
             const float *d_weight = weight_fp32 ? static_cast<const float *>(weight_fp32->gpu_data_ptr()) : weight->data();
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
-            bool ok = cudaOps_rmsnorm_bf16(d_input, d_weight, d_output, rows, cols, epsilon, dev);
-            if (ok)
-            {
-                cudaDeviceSynchronize();
-            }
-            return ok;
+            // No sync needed - GraphExecutor handles async execution via stream ordering
+            return cudaOps_rmsnorm_bf16(d_input, d_weight, d_output, rows, cols, epsilon, dev);
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -259,12 +252,8 @@ namespace llaminar2
             const float *d_weight = weight_fp32 ? static_cast<const float *>(weight_fp32->gpu_data_ptr()) : weight->data();
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
-            bool ok = cudaOps_rmsnorm_fp16(d_input, d_weight, d_output, rows, cols, epsilon, dev);
-            if (ok)
-            {
-                cudaDeviceSynchronize();
-            }
-            return ok;
+            // No sync needed - GraphExecutor handles async execution via stream ordering
+            return cudaOps_rmsnorm_fp16(d_input, d_weight, d_output, rows, cols, epsilon, dev);
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -335,12 +324,8 @@ namespace llaminar2
             float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
 
             int size = rows * cols;
-            bool ok = cudaOps_swiglu_fp32(d_gate, d_up, d_output, size, dev);
-            if (ok)
-            {
-                cudaDeviceSynchronize();
-            }
-            return ok;
+            // Launch kernel asynchronously - stream ordering handles dependencies
+            return cudaOps_swiglu_fp32(d_gate, d_up, d_output, size, dev);
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -351,10 +336,8 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_swiglu_fp32(gate, up, output, size, dev);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            // Launch kernel asynchronously
+            return cudaOps_swiglu_fp32(gate, up, output, size, dev);
         }
 
         // =========================================================================
@@ -409,12 +392,8 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
             int size = rows * cols;
-            bool ok = cudaOps_swiglu_bf16(d_gate, d_up, d_output, size, dev);
-            if (ok)
-            {
-                cudaDeviceSynchronize();
-            }
-            return ok;
+            // No sync needed - GraphExecutor handles async execution via stream ordering
+            return cudaOps_swiglu_bf16(d_gate, d_up, d_output, size, dev);
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -483,12 +462,8 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
             int size = rows * cols;
-            bool ok = cudaOps_swiglu_fp16(d_gate, d_up, d_output, size, dev);
-            if (ok)
-            {
-                cudaDeviceSynchronize();
-            }
-            return ok;
+            // No sync needed - GraphExecutor handles async execution via stream ordering
+            return cudaOps_swiglu_fp16(d_gate, d_up, d_output, size, dev);
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -537,11 +512,9 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rope_fp32(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
-                                        head_dim, rope_theta, dev);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            // Launch kernel asynchronously
+            return cudaOps_rope_fp32(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
+                                     head_dim, rope_theta, dev);
         }
 
         // =========================================================================
@@ -572,11 +545,9 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rope_bf16(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
-                                        head_dim, rope_theta, dev);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            // No sync needed - GraphExecutor handles async execution via stream ordering
+            return cudaOps_rope_bf16(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
+                                     head_dim, rope_theta, dev);
         }
 
         // =========================================================================
@@ -607,11 +578,9 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rope_fp16(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
-                                        head_dim, rope_theta, dev);
-            if (ok)
-                cudaDeviceSynchronize();
-            return ok;
+            // No sync needed - GraphExecutor handles async execution via stream ordering
+            return cudaOps_rope_fp16(Q, K, position_ids, seq_len, n_heads, n_kv_heads,
+                                     head_dim, rope_theta, dev);
         }
 
     } // namespace cuda
@@ -641,7 +610,7 @@ namespace llaminar2
                     cudaGetErrorString(err));
             return false;
         }
-        cudaDeviceSynchronize();
+        // Async - stream ordering handles dependencies
         return true;
     }
 

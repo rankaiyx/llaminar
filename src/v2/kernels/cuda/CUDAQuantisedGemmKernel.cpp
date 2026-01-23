@@ -900,7 +900,8 @@ namespace llaminar2
                 }
                 // Coherence handled automatically by GraphExecutor
                 d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input << " cpu_ptr=" << fp32_input->data());
+                // NOTE: Don't log fp32_input->data() here - it triggers D2H transfer!
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
             }
             else
             {
@@ -1130,7 +1131,8 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            // Debug: Sample scales_B (weight scales)
+#ifdef LLAMINAR_DEBUG_GEMM_VALUES
+            // Debug: Sample scales_B (weight scales) - EXPENSIVE, guarded by compile flag
             LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] d_scales_B="
                       << static_cast<const void *>(impl_->d_scales_B)
                       << " d_weights_int8=" << static_cast<const void *>(impl_->d_weights_int8));
@@ -1142,6 +1144,7 @@ namespace llaminar2
                           << h_scales_B[0] << "," << (h_scales_B.size() > 1 ? h_scales_B[1] : 0.f) << ","
                           << (h_scales_B.size() > 2 ? h_scales_B[2] : 0.f) << "," << (h_scales_B.size() > 3 ? h_scales_B[3] : 0.f));
             }
+#endif
 
             // Step 1: Quantize activations
             if (!cudaQuantGemm_quantizeActivations(
@@ -1151,7 +1154,8 @@ namespace llaminar2
                 return false;
             }
 
-            // Debug: dump scales_A (activation row scales)
+#ifdef LLAMINAR_DEBUG_GEMM_VALUES
+            // Debug: dump scales_A (activation row scales) - EXPENSIVE, guarded by compile flag
             if (d_scales_A && m > 0)
             {
                 std::vector<float> h_scales_A(std::min(m, 8));
@@ -1160,6 +1164,7 @@ namespace llaminar2
                           << h_scales_A[0] << "," << (h_scales_A.size() > 1 ? h_scales_A[1] : 0.f) << ","
                           << (h_scales_A.size() > 2 ? h_scales_A[2] : 0.f) << "," << (h_scales_A.size() > 3 ? h_scales_A[3] : 0.f));
             }
+#endif
 
             // Step 2: Execute CUTLASS INT8 GEMM
             if (!cudaQuantGemm_execute(
@@ -1170,7 +1175,8 @@ namespace llaminar2
                 return false;
             }
 
-            // Debug: dump some int32 outputs
+#ifdef LLAMINAR_DEBUG_GEMM_VALUES
+            // Debug: dump some int32 outputs - EXPENSIVE, guarded by compile flag
             if (d_C_int32 && m > 0 && n > 0)
             {
                 size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
@@ -1190,6 +1196,7 @@ namespace llaminar2
                               << h_C_int32_row1[2] << "," << h_C_int32_row1[3]);
                 }
             }
+#endif
 
             // Step 3: Apply scaling and output to FP32 (no bias)
             const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
@@ -1201,7 +1208,8 @@ namespace llaminar2
                 return false;
             }
 
-            // Debug: dump final FP32 outputs
+#ifdef LLAMINAR_DEBUG_GEMM_VALUES
+            // Debug: dump final FP32 outputs - EXPENSIVE, guarded by compile flag
             if (d_C && m > 0 && n > 0)
             {
                 size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
@@ -1221,6 +1229,7 @@ namespace llaminar2
                               << h_C_fp32_row1[2] << "," << h_C_fp32_row1[3]);
                 }
             }
+#endif
 
             LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete");
             return true;

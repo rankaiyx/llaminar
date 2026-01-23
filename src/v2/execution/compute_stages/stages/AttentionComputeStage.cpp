@@ -234,20 +234,6 @@ namespace llaminar2
             return false;
         }
 
-        // Debug: dump first few output values
-        if (params_.output)
-        {
-            const float *out_data = getSafeFp32Data(params_.output);
-            if (out_data)
-            {
-                LOG_DEBUG("[AttentionComputeStage] output=" << (void *)params_.output
-                                                            << " Q_type=" << (params_.Q ? params_.Q->dtype_name() : "null")
-                                                            << " device=" << params_.device_id.to_string()
-                                                            << " out[0:8]=" << out_data[0] << "," << out_data[1] << "," << out_data[2] << "," << out_data[3]
-                                                            << "," << out_data[4] << "," << out_data[5] << "," << out_data[6] << "," << out_data[7]);
-            }
-        }
-
         LOG_DEBUG("[AttentionComputeStage] Execute complete (mode=" << attention_mode_name(mode) << ")");
         return true;
     }

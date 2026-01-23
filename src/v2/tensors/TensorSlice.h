@@ -247,6 +247,14 @@ namespace llaminar2
         const float *data() const override { return inner()->data(); }
         float *mutable_data() override { return inner()->mutable_data(); }
         bool copyFrom(const TensorBase *src) override { return inner()->copyFrom(src); }
+        
+        // GPU coherence (critical: delegate to inner tensor, not TensorSlice's own gpu_data_ptr_)
+        bool ensureOnDevice(DeviceId device) override { return inner()->ensureOnDevice(device); }
+        bool allocateOnDevice(DeviceId device) override { return inner()->allocateOnDevice(device); }
+        void mark_device_dirty() override { inner()->mark_device_dirty(); }
+        void mark_device_dirty_with_event() override { inner()->mark_device_dirty_with_event(); }
+        void *gpu_data_ptr() override { return inner()->gpu_data_ptr(); }
+        const void *gpu_data_ptr() const override { return inner()->gpu_data_ptr(); }
 
         // =======================================================================
         // GPU Transfer Support (delegate to inner) - Required for ensureOnDevice()

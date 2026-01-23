@@ -17,6 +17,47 @@ namespace llaminar2
 {
 
     // =========================================================================
+    // Helper: Convert TensorType to CollectiveDataType
+    // =========================================================================
+
+    /**
+     * @brief Convert tensor native type to collective data type for MPI/NCCL/RCCL
+     * @param tensor The tensor to query (must not be nullptr)
+     * @return CollectiveDataType matching the tensor's storage format
+     * @throws std::invalid_argument if tensor is nullptr
+     * @throws std::invalid_argument if tensor type is not supported for collectives
+     */
+    CollectiveDataType tensorToCollectiveDataType(const ITensor *tensor)
+    {
+        if (!tensor)
+        {
+            throw std::invalid_argument(
+                "tensorToCollectiveDataType: tensor is nullptr");
+        }
+
+        switch (tensor->native_type())
+        {
+        case TensorType::FP32:
+            return CollectiveDataType::FLOAT32;
+        case TensorType::FP16:
+            return CollectiveDataType::FLOAT16;
+        case TensorType::BF16:
+            return CollectiveDataType::BFLOAT16;
+        case TensorType::INT32:
+            return CollectiveDataType::INT32;
+        case TensorType::INT8:
+            return CollectiveDataType::INT8;
+        default:
+            // Quantized types (Q8_0, Q4_0, IQ4_NL, etc.) are not valid for
+            // collective operations. Collectives should operate on activation
+            // buffers (FP32/FP16/BF16), not weight buffers (quantized).
+            throw std::invalid_argument(
+                std::string("tensorToCollectiveDataType: unsupported tensor type '") +
+                tensor->dtype_name() + "' for collective operation");
+        }
+    }
+
+    // =========================================================================
     // CollectiveContext Implementation
     // =========================================================================
 
@@ -98,12 +139,14 @@ namespace llaminar2
             return false;
         }
 
-        // Determine data type from buffer
-        CollectiveDataType dtype = CollectiveDataType::FLOAT32; // Default
-        // TODO: Query buffer for actual dtype
+        // Query buffer for actual dtype
+        CollectiveDataType dtype = tensorToCollectiveDataType(buffer);
 
         // Execute collective
-        void *data_ptr = buffer->mutable_data();
+        // CRITICAL: Use active_mutable_data_ptr() to get GPU pointer without invalidating
+        // GPU data. Using mutable_data() would mark device_valid_=false, causing expensive
+        // re-uploads on subsequent operations that need this tensor on GPU.
+        void *data_ptr = buffer->active_mutable_data_ptr();
         size_t actual_count = count > 0 ? count : buffer->numel();
 
         return backend->allreduce(data_ptr, actual_count, dtype, op);
@@ -132,12 +175,17 @@ namespace llaminar2
             return false;
         }
 
+        // Query buffer for actual dtype (use input tensor as reference)
+        CollectiveDataType dtype = tensorToCollectiveDataType(local_input);
+
         // Execute collective
-        const void *send_buf = local_input->data();
-        void *recv_buf = full_output->mutable_data();
+        // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
+        // to avoid invalidating GPU data on tensors that should remain on device
+        const void *send_buf = local_input->active_data_ptr();
+        void *recv_buf = full_output->active_mutable_data_ptr();
         size_t send_count = actual_seq_len > 0 ? actual_seq_len : local_input->numel();
 
-        return backend->allgather(send_buf, recv_buf, send_count, CollectiveDataType::FLOAT32);
+        return backend->allgather(send_buf, recv_buf, send_count, dtype);
     }
 
     bool CollectiveContext::executeAllgatherv(
@@ -183,13 +231,18 @@ namespace llaminar2
             scaled_displacements[i] = static_cast<int>(seq_len) * displacements[i];
         }
 
+        // Query buffer for actual dtype (use input tensor as reference)
+        CollectiveDataType dtype = tensorToCollectiveDataType(local_input);
+
         // Execute collective
-        const void *send_buf = local_input->data();
-        void *recv_buf = full_output->mutable_data();
+        // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
+        // to avoid invalidating GPU data on tensors that should remain on device
+        const void *send_buf = local_input->active_data_ptr();
+        void *recv_buf = full_output->active_mutable_data_ptr();
 
         return backend->allgatherv(send_buf, send_count, recv_buf,
                                    scaled_recv_counts, scaled_displacements,
-                                   CollectiveDataType::FLOAT32);
+                                   dtype);
     }
 
     bool CollectiveContext::executeBroadcast(
@@ -215,11 +268,15 @@ namespace llaminar2
             return false;
         }
 
+        // Query buffer for actual dtype
+        CollectiveDataType dtype = tensorToCollectiveDataType(buffer);
+
         // Execute collective
-        void *data_ptr = buffer->mutable_data();
+        // Use active_mutable_data_ptr() to get GPU pointer without invalidating GPU data
+        void *data_ptr = buffer->active_mutable_data_ptr();
         size_t actual_count = count > 0 ? count : buffer->numel();
 
-        return backend->broadcast(data_ptr, actual_count, CollectiveDataType::FLOAT32, root_rank);
+        return backend->broadcast(data_ptr, actual_count, dtype, root_rank);
     }
 
     bool CollectiveContext::requiresCollectives() const
@@ -392,12 +449,14 @@ namespace llaminar2
                                                                        << ", size=" << domain->domain_size
                                                                        << ") via " << toString(backend->type()));
 
-        // Determine data type from buffer
-        CollectiveDataType dtype = CollectiveDataType::FLOAT32; // Default
-        // TODO: Query buffer for actual dtype
+        // Query buffer for actual dtype
+        CollectiveDataType dtype = tensorToCollectiveDataType(buffer);
 
         // Execute collective
-        void *data_ptr = buffer->mutable_data();
+        // CRITICAL: Use active_mutable_data_ptr() to get GPU pointer without invalidating
+        // GPU data. Using mutable_data() would mark device_valid_=false, causing expensive
+        // re-uploads on subsequent operations that need this tensor on GPU.
+        void *data_ptr = buffer->active_mutable_data_ptr();
         size_t actual_count = count > 0 ? count : buffer->numel();
 
         return backend->allreduce(data_ptr, actual_count, dtype, op);
@@ -445,12 +504,17 @@ namespace llaminar2
                                                                        << ", size=" << domain->domain_size
                                                                        << ") via " << toString(backend->type()));
 
+        // Query buffer for actual dtype (use input tensor as reference)
+        CollectiveDataType dtype = tensorToCollectiveDataType(local_input);
+
         // Execute collective
-        const void *send_buf = local_input->data();
-        void *recv_buf = full_output->mutable_data();
+        // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
+        // to avoid invalidating GPU data on tensors that should remain on device
+        const void *send_buf = local_input->active_data_ptr();
+        void *recv_buf = full_output->active_mutable_data_ptr();
         size_t send_count = actual_seq_len > 0 ? actual_seq_len : local_input->numel();
 
-        return backend->allgather(send_buf, recv_buf, send_count, CollectiveDataType::FLOAT32);
+        return backend->allgather(send_buf, recv_buf, send_count, dtype);
     }
 
     bool CollectiveContext::executeAllgathervInDomain(
@@ -516,13 +580,18 @@ namespace llaminar2
             scaled_displacements[i] = static_cast<int>(seq_len) * displacements[i];
         }
 
+        // Query buffer for actual dtype (use input tensor as reference)
+        CollectiveDataType dtype = tensorToCollectiveDataType(local_input);
+
         // Execute collective
-        const void *send_buf = local_input->data();
-        void *recv_buf = full_output->mutable_data();
+        // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
+        // to avoid invalidating GPU data on tensors that should remain on device
+        const void *send_buf = local_input->active_data_ptr();
+        void *recv_buf = full_output->active_mutable_data_ptr();
 
         return backend->allgatherv(send_buf, send_count, recv_buf,
                                    scaled_recv_counts, scaled_displacements,
-                                   CollectiveDataType::FLOAT32);
+                                   dtype);
     }
 
     // =========================================================================

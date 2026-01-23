@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/backends/DeviceId.h"
+#include "../../../src/v2/execution/CollectiveContext.h"
 #include "../../../src/v2/execution/GraphOrchestrator.h"
 #include "../../../src/v2/execution/GraphExecutor.h"
 #include "../../../src/v2/execution/RuntimeConfig.h"
@@ -354,6 +355,68 @@ TEST_F(Test__GraphOrchestrator, MoveAssignment)
     *orchestrator2 = std::move(*orchestrator1);
 
     EXPECT_EQ(orchestrator2->graphBuilder(), graph_builder_.get());
+}
+
+// =============================================================================
+// CollectiveContext Tests (NCCL/RCCL GPU Collectives Wiring)
+// =============================================================================
+
+TEST_F(Test__GraphOrchestrator, SetCollectiveContext_NullByDefault)
+{
+    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+
+    // CollectiveContext should be null by default
+    EXPECT_EQ(orchestrator->collectiveContext(), nullptr);
+    EXPECT_FALSE(orchestrator->isGpuCollectivesEnabled());
+}
+
+TEST_F(Test__GraphOrchestrator, SetCollectiveContext_SetAndGet)
+{
+    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+
+    // Create a single-device context (doesn't require GPUs)
+    auto ctx = CollectiveContextFactory::createSingleDevice();
+    auto raw_ptr = ctx.get();
+
+    // Set the context
+    orchestrator->setCollectiveContext(std::move(ctx));
+
+    // Verify it was set
+    EXPECT_EQ(orchestrator->collectiveContext().get(), raw_ptr);
+    EXPECT_TRUE(orchestrator->isGpuCollectivesEnabled());
+}
+
+TEST_F(Test__GraphOrchestrator, SetCollectiveContext_ClearWithNull)
+{
+    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+
+    // Set a context first
+    auto ctx = CollectiveContextFactory::createSingleDevice();
+    orchestrator->setCollectiveContext(std::move(ctx));
+    EXPECT_TRUE(orchestrator->isGpuCollectivesEnabled());
+
+    // Clear it by setting null
+    orchestrator->setCollectiveContext(nullptr);
+    EXPECT_FALSE(orchestrator->isGpuCollectivesEnabled());
+    EXPECT_EQ(orchestrator->collectiveContext(), nullptr);
+}
+
+TEST_F(Test__GraphOrchestrator, SetCollectiveContext_ReplacesExisting)
+{
+    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+
+    // Set first context
+    auto ctx1 = CollectiveContextFactory::createSingleDevice();
+    auto ptr1 = ctx1.get();
+    orchestrator->setCollectiveContext(std::move(ctx1));
+    EXPECT_EQ(orchestrator->collectiveContext().get(), ptr1);
+
+    // Set second context (replaces first)
+    auto ctx2 = CollectiveContextFactory::createSingleDevice();
+    auto ptr2 = ctx2.get();
+    orchestrator->setCollectiveContext(std::move(ctx2));
+    EXPECT_EQ(orchestrator->collectiveContext().get(), ptr2);
+    EXPECT_NE(ptr1, ptr2);
 }
 
 // =============================================================================

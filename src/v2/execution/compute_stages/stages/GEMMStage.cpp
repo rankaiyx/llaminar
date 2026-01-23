@@ -147,6 +147,8 @@ namespace llaminar2
 
         // Debug: Log input values for Wo projection (weight shape [896, 448] or [896, 896])
         // Only log if input is FP32 (Q8_1 data() throws to prevent accidental dequantization)
+        // NOTE: ONLY call data() when TRACE logging is actually enabled - it triggers D2H transfer!
+#if 0 // DISABLED: calling data() triggers expensive D2H transfer even if LOG_TRACE doesn't print
         if (params_.B && params_.B->shape()[0] == 896 && (params_.B->shape()[1] == 448 || params_.B->shape()[1] == 896))
         {
             if (std::string(params_.A->dtype_name()) == "FP32")
@@ -161,6 +163,7 @@ namespace llaminar2
                 }
             }
         }
+#endif
 
         // Cast weights to TensorBase for KernelFactory
         auto *B_base = requireTensorBase(params_.B, "weight B");

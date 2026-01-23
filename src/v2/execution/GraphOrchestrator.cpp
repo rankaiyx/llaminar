@@ -1866,6 +1866,22 @@ namespace llaminar2
         return weight_streamer_ != nullptr;
     }
 
+    void GraphOrchestrator::setCollectiveContext(std::shared_ptr<ICollectiveContext> collective_ctx)
+    {
+        injected_collective_ctx_ = std::move(collective_ctx);
+        if (injected_collective_ctx_)
+        {
+            // Wire to executor for GPU-native collective interception
+            executor_.setCollectiveContext(injected_collective_ctx_.get());
+            LOG_INFO("[GraphOrchestrator] GPU-native collectives enabled via CollectiveContext");
+        }
+        else
+        {
+            executor_.setCollectiveContext(nullptr);
+            LOG_DEBUG("[GraphOrchestrator] CollectiveContext cleared - using CPU MPI fallback");
+        }
+    }
+
     std::shared_ptr<TensorBase> GraphOrchestrator::getPhaseAwareWeight(
         const std::string &name,
         int layer_idx,

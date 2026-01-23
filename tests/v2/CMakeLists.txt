@@ -3341,6 +3341,44 @@ add_v2_test(V2_Integration_CUDARingKVCacheParity
     LABELS "V2;Integration;CUDA;Parity;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;BF16"
     MPI_PROCS 1  # Tests GPU KV cache locally, no MPI needed
 )
+
+# Test: NCCL Backend Integration
+# Tests NCCL-based collective operations for multi-GPU communication
+# Validates initialization, allreduce, allgather, broadcast, and clean shutdown
+if(HAVE_NCCL)
+add_executable(v2_integration_nccl_backend integration/Test__NCCLBackend.cpp)
+target_link_libraries(v2_integration_nccl_backend 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_NCCLBackend
+    COMMAND $<TARGET_FILE:v2_integration_nccl_backend>
+    LABELS "V2;Integration;CUDA;NCCL;Collective;AllReduce;AllGather;Broadcast;MultiGPU"
+    MPI_PROCS 1  # Tests NCCL locally - single rank
+)
+message(STATUS "V2 Tests: Added NCCL backend integration tests")
+endif()
+
+endif()
+
+# Test: RCCL Backend Integration
+# Tests RCCL-based collective operations for multi-GPU communication on AMD ROCm
+# Validates initialization, allreduce, allgather, broadcast, and clean shutdown
+# NOTE: RCCL is for ROCm (AMD GPUs), separate from NCCL (NVIDIA CUDA)
+if(HAVE_RCCL)
+add_executable(v2_integration_rccl_backend integration/Test__RCCLBackend.cpp)
+target_link_libraries(v2_integration_rccl_backend 
+    llaminar2_core 
+    GTest::gtest 
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_RCCLBackend
+    COMMAND $<TARGET_FILE:v2_integration_rccl_backend>
+    LABELS "V2;Integration;ROCm;RCCL;Collective;AllReduce;AllGather;Broadcast;MultiGPU"
+    MPI_PROCS 1  # Tests RCCL locally - single rank
+)
+message(STATUS "V2 Tests: Added RCCL backend integration tests")
 endif()
 
 # Test: CUDA Full Model Inference
@@ -6506,4 +6544,34 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Event Synchronization tests")
+endif()
+
+# =============================================================================
+# CollectiveContext GPU Integration Tests
+# =============================================================================
+# Tests CollectiveContext with GPU backends (NCCL/RCCL)
+# Validates backend selection, AllReduce, AllGather, and Broadcast on GPU tensors
+
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_collective_context_gpu
+        integration/Test__CollectiveContext_GPU.cpp
+    )
+    target_link_libraries(v2_integration_collective_context_gpu PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    # Conditionally link GPU libraries
+    if(HAVE_CUDA)
+        target_link_libraries(v2_integration_collective_context_gpu PRIVATE CUDA::cudart)
+    endif()
+    if(HAVE_ROCM)
+        target_link_libraries(v2_integration_collective_context_gpu PRIVATE hip::host)
+    endif()
+    add_v2_test(V2_Integration_CollectiveContext_GPU
+        COMMAND $<TARGET_FILE:v2_integration_collective_context_gpu>
+        LABELS "V2;Integration;Collective;CollectiveContext;GPU;NCCL;RCCL;AllReduce;AllGather;Broadcast"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added CollectiveContext GPU integration tests")
 endif()

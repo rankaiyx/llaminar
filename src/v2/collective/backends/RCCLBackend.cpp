@@ -11,6 +11,9 @@
 
 #ifdef HAVE_RCCL
 #include <hip/hip_runtime.h>
+#include <mpi.h>
+#include <thread>
+#include <atomic>
 #endif
 
 namespace llaminar2
@@ -20,9 +23,10 @@ namespace llaminar2
     // Constructor / Destructor
     // =========================================================================
 
-    RCCLBackend::RCCLBackend()
+    RCCLBackend::RCCLBackend(std::shared_ptr<MPIContext> mpi_ctx)
+        : mpi_ctx_(std::move(mpi_ctx))
     {
-        LOG_DEBUG("RCCLBackend: Created");
+        LOG_DEBUG("RCCLBackend: Created" << (mpi_ctx_ ? " with MPI context (world_size=" + std::to_string(mpi_ctx_->world_size()) + ")" : ""));
     }
 
     RCCLBackend::~RCCLBackend()
@@ -72,8 +76,21 @@ namespace llaminar2
             }
         }
 
-        num_ranks_ = static_cast<int>(group.size());
-        local_rank_ = group.local_rank;
+        // Determine if this is multi-process (MPI) or single-process
+        const bool is_multi_process = mpi_ctx_ && mpi_ctx_->world_size() > 1;
+
+        if (is_multi_process)
+        {
+            // Multi-process mode: use MPI world size/rank
+            num_ranks_ = mpi_ctx_->world_size();
+            local_rank_ = mpi_ctx_->rank();
+        }
+        else
+        {
+            // Single-process mode: use DeviceGroup size/rank
+            num_ranks_ = static_cast<int>(group.size());
+            local_rank_ = group.local_rank;
+        }
 
         if (num_ranks_ < 1)
         {
@@ -87,7 +104,8 @@ namespace llaminar2
         hipError_t hip_err = hipSetDevice(local_device.ordinal);
         if (hip_err != hipSuccess)
         {
-            last_error_ = "Failed to set HIP device " + std::to_string(local_device.ordinal);
+            last_error_ = "Failed to set HIP device " + std::to_string(local_device.ordinal) +
+                          ": " + hipGetErrorString(hip_err);
             LOG_ERROR(last_error_);
             return false;
         }
@@ -96,15 +114,58 @@ namespace llaminar2
         hip_err = hipStreamCreate(&stream_);
         if (hip_err != hipSuccess)
         {
-            last_error_ = "Failed to create HIP stream";
+            last_error_ = "Failed to create HIP stream: " + std::string(hipGetErrorString(hip_err));
             LOG_ERROR(last_error_);
             return false;
         }
 
         // Create RCCL communicator
-        // For single-process multi-GPU, we use ncclCommInitAll
-        // For multi-process, we'd use ncclCommInitRank with unique ID
-        if (num_ranks_ == 1)
+        if (is_multi_process)
+        {
+            // Multi-process: coordinate via MPI
+            // Rank 0 generates unique ID, broadcasts to all ranks
+            ncclUniqueId id;
+
+            if (mpi_ctx_->rank() == 0)
+            {
+                ncclResult_t rccl_err = ncclGetUniqueId(&id);
+                if (rccl_err != ncclSuccess)
+                {
+                    last_error_ = "ncclGetUniqueId failed: " + std::string(ncclGetErrorString(rccl_err));
+                    LOG_ERROR(last_error_);
+                    hipStreamDestroy(stream_);
+                    stream_ = nullptr;
+                    return false;
+                }
+            }
+
+            // Broadcast the unique ID from rank 0 to all other ranks
+            int mpi_err = MPI_Bcast(&id, sizeof(ncclUniqueId), MPI_BYTE, 0, mpi_ctx_->comm());
+            if (mpi_err != MPI_SUCCESS)
+            {
+                last_error_ = "MPI_Bcast of ncclUniqueId failed";
+                LOG_ERROR(last_error_);
+                hipStreamDestroy(stream_);
+                stream_ = nullptr;
+                return false;
+            }
+
+            // All ranks initialize their communicator with the shared unique ID
+            ncclResult_t rccl_err = ncclCommInitRank(&comm_, num_ranks_, id, local_rank_);
+            if (rccl_err != ncclSuccess)
+            {
+                last_error_ = "ncclCommInitRank failed (multi-process): " + std::string(ncclGetErrorString(rccl_err));
+                LOG_ERROR(last_error_);
+                hipStreamDestroy(stream_);
+                stream_ = nullptr;
+                return false;
+            }
+
+            LOG_INFO("RCCLBackend: Initialized multi-process with " << num_ranks_
+                                                                    << " MPI ranks, local_rank=" << local_rank_
+                                                                    << ", device=" << local_device.ordinal);
+        }
+        else if (num_ranks_ == 1)
         {
             // Single GPU - create a trivial communicator
             ncclResult_t rccl_err = ncclCommInitAll(&comm_, 1, nullptr);
@@ -116,35 +177,138 @@ namespace llaminar2
                 stream_ = nullptr;
                 return false;
             }
+            LOG_INFO("RCCLBackend: Initialized single-GPU mode");
         }
         else
         {
-            // Multi-GPU single process
-            // TODO: For multi-process, need to broadcast unique ID via MPI
+            // Multi-GPU single process (no MPI context)
+            // Use threaded ncclCommInitRank - each GPU gets its own thread
+            // This tests the same code path used in multi-process scenarios
+            //
+            // ncclCommInitRank requires ALL ranks to call it concurrently,
+            // so we spawn N threads, each calling ncclCommInitRank for its rank.
+
             ncclUniqueId id;
             ncclResult_t rccl_err = ncclGetUniqueId(&id);
             if (rccl_err != ncclSuccess)
             {
-                last_error_ = "ncclGetUniqueId failed";
+                last_error_ = "ncclGetUniqueId failed: " + std::string(ncclGetErrorString(rccl_err));
                 LOG_ERROR(last_error_);
                 hipStreamDestroy(stream_);
                 stream_ = nullptr;
                 return false;
             }
 
-            rccl_err = ncclCommInitRank(&comm_, num_ranks_, id, local_rank_);
-            if (rccl_err != ncclSuccess)
+            // Allocate arrays for per-GPU resources
+            all_comms_.resize(num_ranks_, nullptr);
+            all_streams_.resize(num_ranks_, nullptr);
+            device_ordinals_.resize(num_ranks_);
+            std::atomic<int> error_count{0};
+            std::vector<std::string> thread_errors(num_ranks_);
+
+            // Build device list from group
+            for (int i = 0; i < num_ranks_; ++i)
             {
-                last_error_ = "ncclCommInitRank failed: " + std::string(ncclGetErrorString(rccl_err));
+                device_ordinals_[i] = group.devices[i].ordinal;
+            }
+
+            // Launch threads - each thread initializes one GPU's communicator and stream
+            std::vector<std::thread> threads;
+            threads.reserve(num_ranks_);
+
+            for (int rank = 0; rank < num_ranks_; ++rank)
+            {
+                threads.emplace_back([this, rank, &id, &error_count, &thread_errors]()
+                                     {
+                    // Set device for this thread
+                    hipError_t hip_err = hipSetDevice(device_ordinals_[rank]);
+                    if (hip_err != hipSuccess) {
+                        thread_errors[rank] = "hipSetDevice failed for rank " + std::to_string(rank) +
+                                              ": " + hipGetErrorString(hip_err);
+                        error_count.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+
+                    // Create stream for this GPU
+                    hip_err = hipStreamCreate(&all_streams_[rank]);
+                    if (hip_err != hipSuccess) {
+                        thread_errors[rank] = "hipStreamCreate failed for rank " + std::to_string(rank) +
+                                              ": " + hipGetErrorString(hip_err);
+                        error_count.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+
+                    // Initialize communicator for this rank
+                    // All threads call this concurrently with the same unique ID
+                    ncclResult_t err = ncclCommInitRank(&all_comms_[rank], num_ranks_, id, rank);
+                    if (err != ncclSuccess) {
+                        thread_errors[rank] = "ncclCommInitRank failed for rank " + std::to_string(rank) +
+                                              ": " + ncclGetErrorString(err);
+                        error_count.fetch_add(1, std::memory_order_relaxed);
+                        // Clean up the stream we created
+                        hipStreamDestroy(all_streams_[rank]);
+                        all_streams_[rank] = nullptr;
+                        return;
+                    } });
+            }
+
+            // Wait for all threads to complete
+            for (auto &t : threads)
+            {
+                t.join();
+            }
+
+            // Check for errors
+            if (error_count.load() > 0)
+            {
+                // Collect error messages
+                std::string combined_errors;
+                for (int i = 0; i < num_ranks_; ++i)
+                {
+                    if (!thread_errors[i].empty())
+                    {
+                        if (!combined_errors.empty())
+                            combined_errors += "; ";
+                        combined_errors += thread_errors[i];
+                    }
+                }
+                last_error_ = "Threaded ncclCommInitRank failed: " + combined_errors;
                 LOG_ERROR(last_error_);
+
+                // Cleanup any successfully created resources
+                for (int i = 0; i < num_ranks_; ++i)
+                {
+                    if (all_comms_[i])
+                    {
+                        ncclCommDestroy(all_comms_[i]);
+                        all_comms_[i] = nullptr;
+                    }
+                    if (all_streams_[i])
+                    {
+                        hipStreamDestroy(all_streams_[i]);
+                        all_streams_[i] = nullptr;
+                    }
+                }
+                all_comms_.clear();
+                all_streams_.clear();
+                device_ordinals_.clear();
                 hipStreamDestroy(stream_);
                 stream_ = nullptr;
                 return false;
             }
+
+            // Store the communicator and stream for local_rank
+            comm_ = all_comms_[local_rank_];
+            // Keep using the main stream_ for single-buffer APIs
+            // The all_streams_ array is for multi-buffer APIs
+
+            is_multi_gpu_single_process_ = true;
+
+            LOG_INFO("RCCLBackend: Initialized multi-GPU single-process (threaded ncclCommInitRank) with "
+                     << num_ranks_ << " GPU(s), local_rank=" << local_rank_);
         }
 
         initialized_ = true;
-        LOG_INFO("RCCLBackend: Initialized with " << num_ranks_ << " GPU(s), local_rank=" << local_rank_);
         return true;
 #else
         last_error_ = "RCCL not available (HAVE_RCCL not defined)";
@@ -161,7 +325,26 @@ namespace llaminar2
             return;
         }
 
-        if (comm_)
+        // If we used multi-GPU single-process mode, destroy all resources
+        if (!all_comms_.empty())
+        {
+            for (size_t i = 0; i < all_comms_.size(); ++i)
+            {
+                if (all_comms_[i])
+                {
+                    ncclCommDestroy(all_comms_[i]);
+                }
+                if (i < all_streams_.size() && all_streams_[i])
+                {
+                    hipStreamDestroy(all_streams_[i]);
+                }
+            }
+            all_comms_.clear();
+            all_streams_.clear();
+            device_ordinals_.clear();
+            comm_ = nullptr; // comm_ was pointing into all_comms_
+        }
+        else if (comm_)
         {
             ncclCommDestroy(comm_);
             comm_ = nullptr;
@@ -172,6 +355,8 @@ namespace llaminar2
             hipStreamDestroy(stream_);
             stream_ = nullptr;
         }
+
+        is_multi_gpu_single_process_ = false;
 
         initialized_ = false;
         LOG_DEBUG("RCCLBackend: Shutdown complete");
@@ -435,6 +620,250 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Multi-GPU Single-Process Collective Operations
+    // =========================================================================
+
+    bool RCCLBackend::isMultiGpuSingleProcess() const
+    {
+        return is_multi_gpu_single_process_;
+    }
+
+    bool RCCLBackend::allreduceMulti(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceMulti requires multi-GPU single-process mode";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match GPU count (" + std::to_string(num_ranks_) + ")";
+            return false;
+        }
+
+        // Use ncclGroupStart/End to issue all operations atomically
+        ncclResult_t err = ncclGroupStart();
+        if (err != ncclSuccess)
+        {
+            last_error_ = "ncclGroupStart failed: " + std::string(ncclGetErrorString(err));
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Issue AllReduce on each GPU with its buffer, communicator, and stream
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            // Set device context (required for RCCL to know which GPU)
+            hipSetDevice(device_ordinals_[i]);
+
+            err = ncclAllReduce(
+                buffers[i],
+                buffers[i], // In-place
+                count,
+                toRcclDataType(dtype),
+                toRcclRedOp(op),
+                all_comms_[i],
+                all_streams_[i]);
+
+            if (err != ncclSuccess)
+            {
+                ncclGroupEnd(); // Try to clean up
+                last_error_ = "ncclAllReduce failed on GPU " + std::to_string(i) +
+                              ": " + std::string(ncclGetErrorString(err));
+                LOG_ERROR(last_error_);
+                return false;
+            }
+        }
+
+        err = ncclGroupEnd();
+        if (err != ncclSuccess)
+        {
+            last_error_ = "ncclGroupEnd failed: " + std::string(ncclGetErrorString(err));
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allgatherMulti(
+        const std::vector<const void *> &send_bufs,
+        const std::vector<void *> &recv_bufs,
+        size_t send_count,
+        CollectiveDataType dtype)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allgatherMulti requires multi-GPU single-process mode";
+            return false;
+        }
+
+        if (send_bufs.size() != static_cast<size_t>(num_ranks_) ||
+            recv_bufs.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count doesn't match GPU count";
+            return false;
+        }
+
+        ncclResult_t err = ncclGroupStart();
+        if (err != ncclSuccess)
+        {
+            last_error_ = "ncclGroupStart failed: " + std::string(ncclGetErrorString(err));
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            hipSetDevice(device_ordinals_[i]);
+
+            err = ncclAllGather(
+                send_bufs[i],
+                recv_bufs[i],
+                send_count,
+                toRcclDataType(dtype),
+                all_comms_[i],
+                all_streams_[i]);
+
+            if (err != ncclSuccess)
+            {
+                ncclGroupEnd();
+                last_error_ = "ncclAllGather failed on GPU " + std::to_string(i) +
+                              ": " + std::string(ncclGetErrorString(err));
+                LOG_ERROR(last_error_);
+                return false;
+            }
+        }
+
+        err = ncclGroupEnd();
+        if (err != ncclSuccess)
+        {
+            last_error_ = "ncclGroupEnd failed: " + std::string(ncclGetErrorString(err));
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_bufs;
+        (void)recv_bufs;
+        (void)send_count;
+        (void)dtype;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::broadcastMulti(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        int root)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "broadcastMulti requires multi-GPU single-process mode";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count doesn't match GPU count";
+            return false;
+        }
+
+        if (root < 0 || root >= num_ranks_)
+        {
+            last_error_ = "Invalid root rank: " + std::to_string(root);
+            return false;
+        }
+
+        ncclResult_t err = ncclGroupStart();
+        if (err != ncclSuccess)
+        {
+            last_error_ = "ncclGroupStart failed: " + std::string(ncclGetErrorString(err));
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        for (int i = 0; i < num_ranks_; ++i)
+        {
+            hipSetDevice(device_ordinals_[i]);
+
+            err = ncclBroadcast(
+                buffers[i],
+                buffers[i],
+                count,
+                toRcclDataType(dtype),
+                root,
+                all_comms_[i],
+                all_streams_[i]);
+
+            if (err != ncclSuccess)
+            {
+                ncclGroupEnd();
+                last_error_ = "ncclBroadcast failed on GPU " + std::to_string(i) +
+                              ": " + std::string(ncclGetErrorString(err));
+                LOG_ERROR(last_error_);
+                return false;
+            }
+        }
+
+        err = ncclGroupEnd();
+        if (err != ncclSuccess)
+        {
+            last_error_ = "ncclGroupEnd failed: " + std::string(ncclGetErrorString(err));
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)root;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    // =========================================================================
     // Synchronization
     // =========================================================================
 
@@ -446,6 +875,24 @@ namespace llaminar2
             return true;
         }
 
+        // In multi-GPU single-process mode, synchronize ALL streams
+        if (is_multi_gpu_single_process_)
+        {
+            for (int i = 0; i < num_ranks_; ++i)
+            {
+                hipSetDevice(device_ordinals_[i]);
+                hipError_t err = hipStreamSynchronize(all_streams_[i]);
+                if (err != hipSuccess)
+                {
+                    last_error_ = "hipStreamSynchronize failed on GPU " + std::to_string(i);
+                    LOG_ERROR(last_error_);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Single-GPU or MPI mode: just sync the main stream
         hipError_t err = hipStreamSynchronize(stream_);
         if (err != hipSuccess)
         {

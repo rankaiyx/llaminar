@@ -2502,6 +2502,11 @@ namespace llaminar
                     throw std::runtime_error("KernelFactory: failed to pack CUDA weights");
                 }
 
+                // Store back-reference to source tensor for coherence marking
+                // const_cast is safe here because we only use it to mark device_valid_
+                // after uploading the packed weights to GPU
+                new_cache->packed.source_tensor_ = const_cast<llaminar2::TensorBase *>(tensor);
+
                 // Store in tensor's cuda_cache_ (tensor owns the packed data)
                 tensor->cuda_cache_ = new_cache;
 
@@ -2945,6 +2950,8 @@ namespace llaminar
                             throw std::runtime_error(
                                 "TensorSlice of non-quantized type not supported on CUDA - no silent fallback to CPU");
                         }
+                        // Use the inner tensor for type dispatch
+                        dispatch_tensor = slice->inner();
                     }
 
                     // Create CUDA kernel based on tensor type
@@ -2978,6 +2985,12 @@ namespace llaminar
                     }
                     else
                     {
+                        // Debug: What type IS dispatch_tensor?
+                        LOG_ERROR("[KernelFactory::getOrCreateGemm] CUDA dispatch FAILED for tensor type "
+                                  << static_cast<int>(tensor->native_type())
+                                  << " (dispatch_tensor=" << dispatch_tensor
+                                  << " tensor=" << tensor
+                                  << " typeid=" << typeid(*dispatch_tensor).name() << ")");
                         // NO FALLBACK: tensor type not supported on CUDA
                         throw std::runtime_error(
                             "Tensor type " + std::to_string(static_cast<int>(tensor->native_type())) +
@@ -2999,6 +3012,8 @@ namespace llaminar
                             throw std::runtime_error(
                                 "TensorSlice of non-quantized type not supported on ROCm - no silent fallback to CPU");
                         }
+                        // Use the inner tensor for type dispatch
+                        dispatch_tensor = slice->inner();
                     }
 
                     // Create ROCm kernel based on tensor type

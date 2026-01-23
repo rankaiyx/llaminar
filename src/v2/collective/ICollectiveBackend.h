@@ -325,6 +325,96 @@ namespace llaminar2
             int root_rank) = 0;
 
         // =====================================================================
+        // Multi-GPU Single-Process Collective Operations
+        // =====================================================================
+        // These methods are for single-process scenarios managing multiple GPUs.
+        // They take arrays of buffers (one per GPU) and issue the collective
+        // across all GPUs using ncclGroupStart/ncclGroupEnd.
+        //
+        // Backends that don't support multi-GPU single-process return false.
+        // NCCL and RCCL backends support these when initialized with multiple GPUs.
+
+        /**
+         * @brief Check if multi-GPU single-process mode is active
+         * @return true if initialized with multiple GPUs in single process
+         */
+        virtual bool isMultiGpuSingleProcess() const { return false; }
+
+        /**
+         * @brief Multi-GPU AllReduce (single process)
+         *
+         * Each buffer[i] is on GPU i. All buffers are reduced together,
+         * result placed back in each buffer (in-place).
+         *
+         * @param buffers Array of device buffers (one per GPU)
+         * @param count Elements per buffer
+         * @param dtype Data type
+         * @param op Reduction operation
+         * @return true on success, false if not supported
+         */
+        virtual bool allreduceMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Multi-GPU AllGather (single process)
+         *
+         * Each send_bufs[i] on GPU i contributes send_count elements.
+         * Each recv_bufs[i] receives all data (size = send_count * num_gpus).
+         *
+         * @param send_bufs Array of send buffers (one per GPU)
+         * @param recv_bufs Array of receive buffers (one per GPU)
+         * @param send_count Elements per GPU to send
+         * @param dtype Data type
+         * @return true on success, false if not supported
+         */
+        virtual bool allgatherMulti(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype)
+        {
+            (void)send_bufs;
+            (void)recv_bufs;
+            (void)send_count;
+            (void)dtype;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Multi-GPU Broadcast (single process)
+         *
+         * Root GPU's buffer is broadcast to all other GPUs' buffers.
+         *
+         * @param buffers Array of buffers (one per GPU)
+         * @param count Elements to broadcast
+         * @param dtype Data type
+         * @param root GPU index (0 to num_gpus-1) that broadcasts
+         * @return true on success, false if not supported
+         */
+        virtual bool broadcastMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            int root)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)root;
+            return false; // Not supported by default
+        }
+
+        // =====================================================================
         // Registered Buffer Operations
         // =====================================================================
 

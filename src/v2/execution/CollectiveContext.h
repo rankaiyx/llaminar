@@ -44,6 +44,20 @@ namespace llaminar2
     class ClusterInventory;
     class PCIeBARBackend;
 
+    // =========================================================================
+    // Utility Functions
+    // =========================================================================
+
+    /**
+     * @brief Convert tensor native type to collective data type for MPI/NCCL/RCCL
+     *
+     * @param tensor The tensor to query (must not be nullptr)
+     * @return CollectiveDataType matching the tensor's storage format
+     * @throws std::invalid_argument if tensor is nullptr
+     * @throws std::invalid_argument if tensor type is not supported (e.g., quantized types)
+     */
+    CollectiveDataType tensorToCollectiveDataType(const ITensor *tensor);
+
     /**
      * @brief Runtime context for collective operations
      *

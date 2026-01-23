@@ -14,6 +14,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 #include "execution/CollectiveContext.h"
 #include "collective/test/CollectiveTestMocks.h"
 #include "config/TPDomain.h"
@@ -570,4 +571,115 @@ TEST_F(Test__CollectiveContext, ExecuteAllreduceInDomainFailsWhenBackendReturnsN
     // Should fail when backend is null
     EXPECT_FALSE(ctx->executeAllreduceInDomain(
         buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, &domain));
+}
+
+// =============================================================================
+// tensorToCollectiveDataType Tests
+// =============================================================================
+
+TEST(Test__TensorToCollectiveDataType, ThrowsOnNullTensor)
+{
+    EXPECT_THROW(tensorToCollectiveDataType(nullptr), std::invalid_argument);
+
+    // Verify the exception message
+    try
+    {
+        tensorToCollectiveDataType(nullptr);
+        FAIL() << "Expected std::invalid_argument";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        EXPECT_THAT(e.what(), ::testing::HasSubstr("nullptr"));
+    }
+}
+
+TEST(Test__TensorToCollectiveDataType, ReturnsFLOAT32ForFP32Tensor)
+{
+    auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+    EXPECT_EQ(tensorToCollectiveDataType(tensor.get()), CollectiveDataType::FLOAT32);
+}
+
+TEST(Test__TensorToCollectiveDataType, ReturnsFLOAT16ForFP16Tensor)
+{
+    auto tensor = std::make_unique<FP16Tensor>(std::vector<size_t>{4, 4});
+    EXPECT_EQ(tensorToCollectiveDataType(tensor.get()), CollectiveDataType::FLOAT16);
+}
+
+TEST(Test__TensorToCollectiveDataType, ReturnsBFLOAT16ForBF16Tensor)
+{
+    auto tensor = std::make_unique<BF16Tensor>(std::vector<size_t>{4, 4});
+    EXPECT_EQ(tensorToCollectiveDataType(tensor.get()), CollectiveDataType::BFLOAT16);
+}
+
+TEST(Test__TensorToCollectiveDataType, ReturnsINT32ForINT32Tensor)
+{
+    auto tensor = std::make_unique<INT32Tensor>(std::vector<size_t>{4, 4});
+    EXPECT_EQ(tensorToCollectiveDataType(tensor.get()), CollectiveDataType::INT32);
+}
+
+TEST(Test__TensorToCollectiveDataType, ReturnsINT8ForINT8Tensor)
+{
+    auto tensor = std::make_unique<INT8Tensor>(std::vector<size_t>{4, 4});
+    EXPECT_EQ(tensorToCollectiveDataType(tensor.get()), CollectiveDataType::INT8);
+}
+
+TEST(Test__TensorToCollectiveDataType, ThrowsForQuantizedQ8_0Tensor)
+{
+    // Q8_0 block size is 32 elements, 34 bytes per block (32 int8 + 2 bytes for scale)
+    // 4 rows x 32 cols = 4 blocks = 4 * 34 = 136 bytes
+    std::vector<uint8_t> raw_data(4 * 34, 0);
+    auto tensor = std::make_unique<Q8_0Tensor>(std::vector<size_t>{4, 32}, raw_data);
+    EXPECT_THROW(tensorToCollectiveDataType(tensor.get()), std::invalid_argument);
+
+    // Verify the exception message includes the tensor type
+    try
+    {
+        tensorToCollectiveDataType(tensor.get());
+        FAIL() << "Expected std::invalid_argument";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        EXPECT_THAT(e.what(), ::testing::HasSubstr("Q8_0"));
+        EXPECT_THAT(e.what(), ::testing::HasSubstr("unsupported"));
+    }
+}
+
+TEST(Test__TensorToCollectiveDataType, ThrowsForQuantizedQ4_0Tensor)
+{
+    // Q4_0 block size is 32 elements, 18 bytes per block (16 nibbles + 2 bytes for scale)
+    // 4 rows x 32 cols = 4 blocks = 4 * 18 = 72 bytes
+    std::vector<uint8_t> raw_data(4 * 18, 0);
+    auto tensor = std::make_unique<Q4_0Tensor>(std::vector<size_t>{4, 32}, raw_data);
+    EXPECT_THROW(tensorToCollectiveDataType(tensor.get()), std::invalid_argument);
+
+    // Verify the exception message includes the tensor type
+    try
+    {
+        tensorToCollectiveDataType(tensor.get());
+        FAIL() << "Expected std::invalid_argument";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        EXPECT_THAT(e.what(), ::testing::HasSubstr("Q4_0"));
+    }
+}
+
+TEST(Test__TensorToCollectiveDataType, ThrowsForQuantizedIQ4_NLTensor)
+{
+    // IQ4_NL block size is 32 elements, 18 bytes per block
+    // 4 rows x 32 cols = 4 blocks = 4 * 18 = 72 bytes
+    std::vector<uint8_t> raw_data(4 * 18, 0);
+    auto tensor = std::make_unique<IQ4_NLTensor>(std::vector<size_t>{4, 32}, raw_data);
+    EXPECT_THROW(tensorToCollectiveDataType(tensor.get()), std::invalid_argument);
+
+    // Verify the exception message includes the tensor type
+    try
+    {
+        tensorToCollectiveDataType(tensor.get());
+        FAIL() << "Expected std::invalid_argument";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        EXPECT_THAT(e.what(), ::testing::HasSubstr("IQ4_NL"));
+    }
 }

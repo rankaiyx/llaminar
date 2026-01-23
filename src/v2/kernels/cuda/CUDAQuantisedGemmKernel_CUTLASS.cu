@@ -369,15 +369,8 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        // Synchronize to catch any async errors from the kernel
-        cudaError_t sync_err = cudaDeviceSynchronize();
-        if (sync_err != cudaSuccess)
-        {
-            std::ostringstream oss;
-            oss << "[CUDAQuantGemm] CUTLASS kernel async error: " << cudaGetErrorString(sync_err)
-                << " (M=" << M << ", N=" << N << ", K=" << K << ")";
-            throw std::runtime_error(oss.str());
-        }
+        // Note: No cudaDeviceSynchronize() here - let CUDA stream ordering handle dependencies
+        // This enables GPU pipeline parallelism between consecutive kernel launches
 
         return true;
     }
@@ -427,7 +420,7 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        CUDA_CHECK_THROW(cudaDeviceSynchronize());
+        // Note: No sync - CUDA stream ordering handles dependencies
         return true;
     }
 
@@ -469,7 +462,7 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        CUDA_CHECK_THROW(cudaDeviceSynchronize());
+        // Note: No sync - CUDA stream ordering handles dependencies
         return true;
     }
 

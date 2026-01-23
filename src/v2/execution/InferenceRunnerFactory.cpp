@@ -7,6 +7,9 @@
 
 #include "InferenceRunnerFactory.h"
 #include "../backends/DeviceId.h"
+#include "../backends/BackendManager.h"
+#include "CollectiveContext.h"
+#include "DeviceInventory.h"
 #include "../models/qwen/Qwen2Graph.h"
 #include "../models/qwen/Qwen2Schema.h"
 #include "GraphOrchestrator.h"
@@ -33,6 +36,78 @@ namespace llaminar2
         GraphOrchestrator *orchestrator,
         std::shared_ptr<ModelContext> model_ctx,
         DeviceId device);
+
+    // =========================================================================
+    // Helper: Build ClusterInventory for GPU Collective Context
+    // =========================================================================
+
+    /**
+     * @brief Build a ClusterInventory from available GPU backends
+     *
+     * Detects local CUDA and ROCm GPUs via backend APIs and builds a
+     * single-rank ClusterInventory suitable for CollectiveContextFactory.
+     *
+     * For multi-node MPI, each rank builds its local inventory, and
+     * the full cluster inventory would be built via MPI_Allgather.
+     * For now, we support single-node with multiple GPUs.
+     *
+     * @param mpi_ctx MPI context (for rank info)
+     * @return ClusterInventory with detected devices
+     */
+    static ClusterInventory buildLocalClusterInventory(
+        const std::shared_ptr<MPIContext> &mpi_ctx)
+    {
+        ClusterInventory inventory;
+        RankInventory rank_inv;
+
+        rank_inv.rank = mpi_ctx ? mpi_ctx->rank() : 0;
+        rank_inv.node_id = 0; // Single-node for now
+        rank_inv.local_rank = rank_inv.rank;
+        rank_inv.hostname = "localhost";
+
+#ifdef HAVE_CUDA
+        IBackend *cuda_backend = getCUDABackend();
+        if (cuda_backend)
+        {
+            int cuda_count = cuda_backend->deviceCount();
+            for (int i = 0; i < cuda_count; ++i)
+            {
+                DeviceInfo gpu;
+                gpu.type = DeviceType::CUDA;
+                gpu.local_device_id = i;
+                gpu.memory_bytes = cuda_backend->deviceMemoryTotal(i);
+                gpu.name = cuda_backend->deviceName(i);
+                gpu.supports_p2p = true;
+                rank_inv.gpus.push_back(gpu);
+            }
+            LOG_DEBUG("[InferenceRunner] Detected " << cuda_count << " CUDA GPU(s)");
+        }
+#endif
+
+#ifdef HAVE_ROCM
+        IBackend *rocm_backend = getROCmBackend();
+        if (rocm_backend)
+        {
+            int rocm_count = rocm_backend->deviceCount();
+            for (int i = 0; i < rocm_count; ++i)
+            {
+                DeviceInfo gpu;
+                gpu.type = DeviceType::ROCm;
+                gpu.local_device_id = i;
+                gpu.memory_bytes = rocm_backend->deviceMemoryTotal(i);
+                gpu.name = rocm_backend->deviceName(i);
+                rank_inv.gpus.push_back(gpu);
+            }
+            LOG_DEBUG("[InferenceRunner] Detected " << rocm_count << " ROCm GPU(s)");
+        }
+#endif
+
+        inventory.ranks.push_back(rank_inv);
+        inventory.world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
+        inventory.buildNodeAggregations();
+
+        return inventory;
+    }
 
     // =========================================================================
     // Factory Function
@@ -369,6 +444,45 @@ namespace llaminar2
             if (weight_streamer)
             {
                 orchestrator->setWeightStreamer(std::move(weight_streamer));
+            }
+        }
+
+        // =====================================================================
+        // GPU-Native Collectives (NCCL/RCCL/PCIeBAR)
+        // =====================================================================
+        // Create CollectiveContext for GPU-native collective operations.
+        // This eliminates GPU→CPU→GPU transfers during tensor-parallel inference:
+        // - NCCL for CUDA devices
+        // - RCCL for ROCm devices
+        // - MPI fallback for CPU-only or heterogeneous setups
+        // =====================================================================
+        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        {
+            // Build local cluster inventory (detects CUDA/ROCm GPUs)
+            ClusterInventory cluster_inventory = buildLocalClusterInventory(mpi_ctx);
+
+            // Only enable GPU collectives if we have GPUs
+            if (cluster_inventory.hasAnyGPU())
+            {
+                // Create intra-node context which automatically selects:
+                // - NCCL for all-CUDA groups
+                // - RCCL for all-ROCm groups
+                // - MPI fallback for mixed or CPU-only groups
+                auto collective_ctx = CollectiveContextFactory::createIntraNode(
+                    cluster_inventory, mpi_ctx);
+                if (collective_ctx)
+                {
+                    orchestrator->setCollectiveContext(std::move(collective_ctx));
+                    LOG_INFO("[InferenceRunner] GPU-native collectives enabled (NCCL/RCCL)");
+                }
+                else
+                {
+                    LOG_WARN("[InferenceRunner] Failed to create CollectiveContext - using CPU MPI fallback");
+                }
+            }
+            else
+            {
+                LOG_DEBUG("[InferenceRunner] No GPUs detected - using CPU MPI for collectives");
             }
         }
 

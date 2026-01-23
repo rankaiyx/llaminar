@@ -384,6 +384,12 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
+        // Weight: embedding table (must be added for coherence to upload to GPU!)
+        if (params_.embed_table)
+        {
+            info.addWeight("embed_table", params_.embed_table);
+        }
+
         if (params_.output)
         {
             info.addOutput("embeddings", params_.output,

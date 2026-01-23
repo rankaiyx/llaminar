@@ -19,6 +19,7 @@
 
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
+#include "../../utils/MPIContext.h"
 
 #ifdef HAVE_RCCL
 #include <rccl/rccl.h>
@@ -44,7 +45,13 @@ namespace llaminar2
     class RCCLBackend : public ICollectiveBackend
     {
     public:
-        RCCLBackend();
+        /**
+         * @brief Construct RCCLBackend
+         * @param mpi_ctx Optional MPI context for multi-process initialization.
+         *                If provided and world_size > 1, uses MPI to coordinate
+         *                RCCL communicator creation across processes.
+         */
+        explicit RCCLBackend(std::shared_ptr<MPIContext> mpi_ctx = nullptr);
         ~RCCLBackend() override;
 
         // =====================================================================
@@ -117,6 +124,30 @@ namespace llaminar2
             int root) override;
 
         // =====================================================================
+        // Multi-GPU Single-Process Collective Operations
+        // =====================================================================
+
+        bool isMultiGpuSingleProcess() const override;
+
+        bool allreduceMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op) override;
+
+        bool allgatherMulti(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype) override;
+
+        bool broadcastMulti(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            int root) override;
+
+        // =====================================================================
         // Synchronization
         // =====================================================================
 
@@ -143,10 +174,17 @@ namespace llaminar2
         std::string last_error_;
         int num_ranks_ = 0;
         int local_rank_ = 0;
+        std::shared_ptr<MPIContext> mpi_ctx_;      // Optional MPI context for multi-process
+        bool is_multi_gpu_single_process_ = false; // True if multi-GPU without MPI
 
 #ifdef HAVE_RCCL
         ncclComm_t comm_ = nullptr; // RCCL uses same types as NCCL
         hipStream_t stream_ = nullptr;
+
+        // For multi-GPU single-process mode: one comm and stream per GPU
+        std::vector<ncclComm_t> all_comms_;
+        std::vector<hipStream_t> all_streams_;
+        std::vector<int> device_ordinals_; // GPU ordinals for each rank
 
         // Helper to convert our types to RCCL types
         static ncclDataType_t toRcclDataType(CollectiveDataType dtype);

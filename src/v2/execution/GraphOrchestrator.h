@@ -549,6 +549,36 @@ namespace llaminar2
         bool isWeightStreamingEnabled() const;
 
         // =========================================================================
+        // Collective Context (NCCL/RCCL/PCIeBAR)
+        // =========================================================================
+
+        /**
+         * @brief Set collective context for GPU-native collective operations
+         *
+         * When set, AllreduceStage and AllGatherStage execution will be intercepted
+         * by GraphExecutor and routed through the BackendRouter for device-native
+         * collectives (NCCL for CUDA, RCCL for ROCm, PCIeBAR for P2P).
+         *
+         * This eliminates the need for GPU→CPU→GPU transfers during tensor-parallel
+         * inference, significantly reducing coherence overhead.
+         *
+         * @param collective_ctx Shared pointer to ICollectiveContext (nullptr to disable)
+         */
+        void setCollectiveContext(std::shared_ptr<ICollectiveContext> collective_ctx);
+
+        /**
+         * @brief Get collective context
+         * @return Shared pointer to ICollectiveContext (may be nullptr)
+         */
+        std::shared_ptr<ICollectiveContext> collectiveContext() const { return injected_collective_ctx_; }
+
+        /**
+         * @brief Check if GPU-native collectives are enabled
+         * @return true if CollectiveContext is set and ready
+         */
+        bool isGpuCollectivesEnabled() const { return injected_collective_ctx_ != nullptr; }
+
+        // =========================================================================
         // Weight Manager and Phase-Aware Weight Access (Gap 3)
         // =========================================================================
 
@@ -933,6 +963,16 @@ namespace llaminar2
          * @brief Get architecture name
          */
         const char *architecture() const override { return "qwen2"; }
+
+        /**
+         * @brief Get executor statistics for profiling
+         */
+        const GraphExecutorStats *executorStats() const override { return &executor_.stats(); }
+
+        /**
+         * @brief Reset executor statistics
+         */
+        void resetExecutorStats() override { executor_.resetStats(); }
 
         // =========================================================================
         // Batch Interface (IInferenceRunner overrides)

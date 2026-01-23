@@ -15,8 +15,9 @@
 
 namespace llaminar2
 {
-    // Forward declaration for placement plan
+    // Forward declarations
     struct PlacementPlan;
+    struct GraphExecutorStats;
 
     /**
      * @brief Execution path type
@@ -185,6 +186,22 @@ namespace llaminar2
         {
             return {}; // No snapshots by default
         }
+
+        // =====================================================================
+        // Profiling API
+        // =====================================================================
+
+        /**
+         * @brief Get executor statistics for profiling
+         *
+         * @return Pointer to GraphExecutorStats, or nullptr if not available
+         */
+        virtual const GraphExecutorStats *executorStats() const { return nullptr; }
+
+        /**
+         * @brief Reset executor statistics
+         */
+        virtual void resetExecutorStats() {}
 
         // =====================================================================
         // Orchestration API (for heterogeneous device placement)

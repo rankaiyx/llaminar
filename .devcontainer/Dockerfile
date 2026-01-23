@@ -62,6 +62,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Graphics libraries (for GPU compute / transfer)
     libgbm-dev \
     libdrm-dev \
+    libnccl2 \
+    libnccl-dev \
     # Additional tools
     git \
     curl \
