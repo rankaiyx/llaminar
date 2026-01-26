@@ -94,20 +94,20 @@ cmake --build build_v2_integration --parallel
 The `llaminar2` executable automatically bootstraps MPI and configures the runtime environment:
 
 ```bash
-# Standard inference (auto-detects topology, self-launches MPI)
+# Standard inference (auto-detects topology, single device)
 ./build_v2_release/llaminar2 -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
 
 # Debug logging
 LLAMINAR_LOG_LEVEL=DEBUG ./build_v2/llaminar2 -m models/qwen2.5-0.5b-instruct-q4_0.gguf -p "Hello, world!" -n 50
 
-# Specify MPI process count (e.g., 2 ranks for tensor parallelism)
-./build_v2_release/llaminar2 --mpi-procs 2 -m models/qwen2.5-7b-instruct-q4_0.gguf -p "Hello!" -n 50
+# Specify device explicitly
+./build_v2_release/llaminar2 -d cuda:0 -m model.gguf -p "Hello" -n 50
 
 # Dry-run to preview configuration without execution
 ./build_v2_release/llaminar2 --dry-run -m models/qwen2.5-0.5b-instruct-q4_0.gguf
 
-# Disable MPI bootstrap (single-rank only)
-./build_v2_release/llaminar2 --no-mpi-bootstrap -m model.gguf -p "Hello"
+# Show detected topology and exit
+./build_v2_release/llaminar2 --show-topology
 ```
 
 The executable automatically configures:
@@ -116,16 +116,77 @@ The executable automatically configures:
 - **MPI**: `OMPI_MCA_mpi_leave_pinned=1`, socket binding, process mapping
 - **BLAS**: `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`
 
-### MPI Bootstrap Options
+### Orchestration CLI Options
 
+The orchestration system provides fine-grained control over device placement and parallelism:
+
+**Introspection Flags**:
 | Option | Description |
 |--------|-------------|
-| `--mpi-procs N` | Number of MPI processes (default: auto-detect from topology) |
-| `--hostfile PATH` | MPI hostfile for multi-machine setup (OpenMPI format) |
-| `--oversubscribe` | Allow more MPI ranks than available CPU slots |
 | `--dry-run` | Show configuration without executing |
-| `--mpi-verbose` | Verbose MPI launch output |
-| `--no-mpi-bootstrap` | Disable auto-bootstrap, run single-rank |
+| `--explain-placement` | Explain device placement decisions |
+| `--show-topology` | Show detected topology and exit |
+| `--show-numa` | Show NUMA configuration and exit |
+| `--validate-only` | Validate configuration without running |
+
+**Device Assignment**:
+| Option | Description | Example |
+|--------|-------------|----------|
+| `-d, --device <spec>` | Device for this rank | `-d cuda:0`, `-d rocm:0`, `-d cpu` |
+| `--device-mode <mode>` | Assignment mode: `auto`, `local_gpu`, `round_robin`, `explicit` | `--device-mode round_robin` |
+| `--device-map <map>` | Explicit rank→device mapping | `--device-map "0=cuda:0,1=cuda:1"` |
+
+**Tensor Parallelism**:
+| Option | Description | Example |
+|--------|-------------|----------|
+| `-t, --tp <degree>` | TP parallelism degree | `--tp 2` |
+| `--tp-scope <scope>` | Scope: `auto`, `local`, `global`, `hybrid` | `--tp-scope local` |
+| `--tp-devices <list>` | Explicit device list for LOCAL TP | `--tp-devices "cuda:0,cuda:1"` |
+| `--tp-weights <list>` | Proportional weight distribution | `--tp-weights "0.73,0.27"` |
+| `--tp-local <degree>` | Local TP degree (hybrid mode) | `--tp-local 2` |
+| `--tp-global <degree>` | Global TP degree (hybrid mode) | `--tp-global 4` |
+
+**Pipeline Parallelism**:
+| Option | Description | Example |
+|--------|-------------|----------|
+| `-p, --pp <degree>` | PP parallelism degree | `--pp 2` |
+| `--pp-split <mode>` | Layer split: `equal`, `weighted`, `manual` | `--pp-split weighted` |
+
+**Layer Placement**:
+| Option | Description | Example |
+|--------|-------------|----------|
+| `--cpu-layers <n>` | Number of layers on CPU | `--cpu-layers 4` |
+| `--cpu-layers-first` | Put CPU layers at beginning (default: end) | `--cpu-layers 4 --cpu-layers-first` |
+
+**Collective Backend**:
+| Option | Description | Example |
+|--------|-------------|----------|
+| `-b, --backend <type>` | Default collective backend | `--backend nccl` |
+
+Valid backends: `auto`, `nccl`, `rccl`, `pcie_bar`, `upi`, `mpi`, `host`
+
+**Configuration File**:
+| Option | Description | Example |
+|--------|-------------|----------|
+| `-c, --config <path>` | Load configuration from YAML file | `--config orchestration.yaml` |
+
+### Named Domains (Advanced)
+
+For complex heterogeneous setups, define named TP domains and PP stage mappings:
+
+```bash
+# Define named domains with devices and optional weights/backend
+--define-domain "gpu_fast=cuda:0,cuda:1;weights=0.6,0.4;backend=nccl"
+--define-domain "gpu_slow=rocm:0,rocm:1;backend=rccl"
+
+# Map PP stages to domains and layer ranges
+--pp-stage "0=gpu_fast:0-13"   # Layers 0-13 on gpu_fast domain
+--pp-stage "1=gpu_slow:14-27"  # Layers 14-27 on gpu_slow domain
+```
+
+**Domain Definition Format**: `name=device1,device2[;weights=w1,w2][;backend=type]`
+
+**PP Stage Format**: `stage_id=domain_name:first_layer-last_layer`
 
 ---
 
@@ -653,8 +714,8 @@ ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen2" -V
 
 **Step 4**: Enable stage tracing for full visibility:
 ```bash
-LLAMINAR_STAGE_DUMP=1 LLAMINAR_MPI_LOG_COLLECTIVES=1 \
-./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "test"
+LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_MPI_LOG_COLLECTIVES=1 \
+./build_v2_release/llaminar2 --tp 2 --explain-placement -m model.gguf -p "test"
 ```
 
 ---
@@ -1075,11 +1136,20 @@ const float* result = output->data();  // Correctly syncs GPU→host
 
 ### Overview
 
-Weight sharding enables Megatron-style tensor parallelism by distributing weights across MPI ranks.
+Weight sharding enables Megatron-style tensor parallelism by distributing weights across devices. Llaminar V2 supports two TP scopes:
 
-**Default Behavior** (December 2025):
-- Single rank: No sharding
-- Multiple ranks: Automatic sharding (equivalent to `--shard-weights`)
+- **LOCAL TP**: Multiple devices within a single MPI rank (NCCL/RCCL/PCIe BAR)
+- **GLOBAL TP**: Distributed across MPI ranks (MPI collectives)
+- **HYBRID TP**: Combination of local + global
+
+### TP Scope Selection
+
+| Scope | Use Case | Collective Backend |
+|-------|----------|--------------------|
+| `auto` | Let orchestrator decide (default) | Auto-detected |
+| `local` | Multi-GPU single machine | NCCL (CUDA), RCCL (ROCm), PCIe BAR (mixed) |
+| `global` | Multi-machine distributed | MPI |
+| `hybrid` | Multi-GPU + multi-machine | Local + MPI |
 
 ### Sharding Modes
 
@@ -1090,15 +1160,43 @@ Weight sharding enables Megatron-style tensor parallelism by distributing weight
 | `ffn_gate`, `ffn_up` | COLUMN_PARALLEL | Split output dim |
 | `ffn_down` | INPUT_PARALLEL | Split input dim, allreduce after |
 | `output` (LM head) | COLUMN_PARALLEL | Split vocab, allgather logits |
-| Norms, embeddings | REPLICATE | Full copy on each rank |
+| Norms, embeddings | REPLICATE | Full copy on each device |
 
 ### Memory Savings
 
-With 2 MPI ranks: ~50% reduction for sharded weights, ~25-30% overall.
+With 2-way TP: ~50% reduction for sharded weights, ~25-30% overall.
+
+### CLI Examples
 
 ```bash
-# Automatic sharding when world_size > 1
-./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "Hello"
+# 2-way LOCAL TP on CUDA GPUs (auto-detects NCCL)
+./build_v2_release/llaminar2 --tp 2 --tp-scope local -m model.gguf -p "Hello"
+
+# Explicit device list for LOCAL TP
+./build_v2_release/llaminar2 --tp-devices "cuda:0,cuda:1" -m model.gguf -p "Hello"
+
+# Proportional TP (73%/27% split for heterogeneous GPUs)
+./build_v2_release/llaminar2 --tp-devices "cuda:0,rocm:0" --tp-weights "0.73,0.27" -m model.gguf -p "Hello"
+
+# Preview TP configuration without running
+./build_v2_release/llaminar2 --tp 4 --tp-scope local --explain-placement --dry-run -m model.gguf
+```
+
+### YAML Configuration
+
+For complex setups, use a YAML config file:
+
+```yaml
+# orchestration.yaml
+tp_degree: 2
+tp_scope: local
+tp_devices: [cuda:0, cuda:1]
+tp_weights: [0.6, 0.4]
+backend: nccl
+```
+
+```bash
+./build_v2_release/llaminar2 --config orchestration.yaml -m model.gguf -p "Hello"
 ```
 
 ---
@@ -1126,10 +1224,10 @@ MPI_Barrier(MPI_COMM_WORLD);
 ```bash
 # Log all MPI collectives with timing
 LLAMINAR_MPI_LOG_COLLECTIVES=1 LLAMINAR_MPI_LOG_TIMING=1 \
-./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "test"
+mpirun -np 2 ./build_v2_release/llaminar2 -m model.gguf -p "test"
 
 # Enable checksum verification (slow)
-LLAMINAR_MPI_VERIFY_CHECKSUMS=1 ./build_v2_release/llaminar2 --mpi-procs 2 -m model.gguf -p "test"
+LLAMINAR_MPI_VERIFY_CHECKSUMS=1 mpirun -np 2 ./build_v2_release/llaminar2 -m model.gguf -p "test"
 ```
 
 ### Rank Comparison Testing

@@ -3783,15 +3783,24 @@ namespace llaminar
                 const llaminar2::TensorBase *w_up,
                 DeviceType dev_type)
             {
+                // Delegate to DeviceId version with ordinal 0
+                return createFusedGateUpGemm(w_gate, w_up, llaminar2::DeviceId(dev_type, 0));
+            }
+
+            std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> KernelFactory::createFusedGateUpGemm(
+                const llaminar2::TensorBase *w_gate,
+                const llaminar2::TensorBase *w_up,
+                llaminar2::DeviceId target_device)
+            {
                 if (!w_gate || !w_up)
                 {
                     LOG_ERROR("[KernelFactory] createFusedGateUpGemm: null weight tensor(s)");
                     throw std::runtime_error("FusedGateUpGemm requires non-null weight tensors");
                 }
 
-                // Get or create GEMM kernels for each weight
-                auto *gemm_gate = getOrCreateGemm(w_gate, dev_type);
-                auto *gemm_up = getOrCreateGemm(w_up, dev_type);
+                // Get or create GEMM kernels for each weight using explicit DeviceId
+                auto *gemm_gate = getOrCreateGemm(w_gate, target_device);
+                auto *gemm_up = getOrCreateGemm(w_up, target_device);
 
                 if (!gemm_gate || !gemm_up)
                 {
@@ -3799,7 +3808,7 @@ namespace llaminar
                     throw std::runtime_error("FusedGateUpGemm failed to create underlying GEMM kernels");
                 }
 
-                return std::make_unique<FusedGateUpGemmAdapter>(gemm_gate, gemm_up, dev_type);
+                return std::make_unique<FusedGateUpGemmAdapter>(gemm_gate, gemm_up, target_device.type);
             }
 
             llaminar2::ITensorFusedGateUpGemm *KernelFactory::getOrCreateFusedGateUpGemm(
@@ -3807,7 +3816,16 @@ namespace llaminar
                 const llaminar2::TensorBase *w_up,
                 DeviceType dev_type)
             {
-                FusedGateUpCacheKey key{w_gate, w_up, dev_type};
+                // Delegate to DeviceId version with ordinal 0
+                return getOrCreateFusedGateUpGemm(w_gate, w_up, llaminar2::DeviceId(dev_type, 0));
+            }
+
+            llaminar2::ITensorFusedGateUpGemm *KernelFactory::getOrCreateFusedGateUpGemm(
+                const llaminar2::TensorBase *w_gate,
+                const llaminar2::TensorBase *w_up,
+                llaminar2::DeviceId target_device)
+            {
+                FusedGateUpCacheKey key{w_gate, w_up, target_device};
 
                 // First check: acquire lock and check cache
                 {
@@ -3815,16 +3833,18 @@ namespace llaminar
                     auto it = fused_gate_up_cache_.find(key);
                     if (it != fused_gate_up_cache_.end())
                     {
-                        LOG_TRACE("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE HIT");
+                        LOG_TRACE("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE HIT for "
+                                  << target_device.to_string());
                         return it->second.get();
                     }
                 }
 
-                LOG_DEBUG("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE MISS - creating new kernel");
+                LOG_DEBUG("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE MISS for "
+                          << target_device.to_string() << " - creating new kernel");
 
                 // Create kernel WITHOUT holding lock (createFusedGateUpGemm calls getOrCreateGemm
                 // which also acquires cache_mutex_, so we must release first to avoid deadlock)
-                auto kernel = createFusedGateUpGemm(w_gate, w_up, dev_type);
+                auto kernel = createFusedGateUpGemm(w_gate, w_up, target_device);
 
                 // Second check: re-acquire lock and insert (double-checked locking)
                 {

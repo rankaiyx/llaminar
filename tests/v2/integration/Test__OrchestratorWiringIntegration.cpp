@@ -6,7 +6,7 @@
  *   1. MPITopology::computePlacement() is called during inference setup
  *   2. PlacementStrategyFactory::autoSelect() selects the right strategy
  *   3. HeterogeneousMultiDomainStrategy is used when appropriate
- *   4. The PlacementPlan flows through to GraphOrchestrator
+ *   4. The PlacementPlan flows through to DeviceGraphOrchestrator
  *
  * TDD APPROACH:
  *   - These tests are written FIRST to define expected behavior
@@ -25,7 +25,7 @@
 #include "execution/PlacementStrategy.h"
 #include "execution/PlacementPlan.h"
 #include "execution/placement/HeterogeneousMultiDomainStrategy.h"
-#include "execution/GraphOrchestrator.h"
+#include "execution/DeviceGraphOrchestrator.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 

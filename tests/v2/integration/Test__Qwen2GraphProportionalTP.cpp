@@ -8,7 +8,7 @@
 
 #include <gtest/gtest.h>
 #include "../../src/v2/models/qwen/Qwen2Graph.h"
-#include "../../src/v2/execution/GraphOrchestrator.h"
+#include "../../src/v2/execution/DeviceGraphOrchestrator.h"
 #include "../../src/v2/config/TensorParallelConfig.h"
 #include "../../src/v2/loaders/WeightManager.h"
 #include "../../src/v2/utils/MPIContext.h"
@@ -274,7 +274,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, EqualSplit_HomogeneousGPUs)
 }
 
 /**
- * @brief Test GraphOrchestrator accepts TensorParallelConfig
+ * @brief Test DeviceGraphOrchestrator accepts TensorParallelConfig
  */
 TEST_F(Test__Qwen2GraphProportionalTP, OrchestratorAcceptsTPConfig)
 {
@@ -289,7 +289,7 @@ TEST_F(Test__Qwen2GraphProportionalTP, OrchestratorAcceptsTPConfig)
     config.local_rank = 0;
 
     // Create orchestrator with config
-    GraphOrchestrator orchestrator(config, nullptr);
+    DeviceGraphOrchestrator orchestrator(config, nullptr);
 
     // Set TensorParallelConfig on orchestrator
     orchestrator.setTensorParallelConfig(tp_config);

@@ -2,6 +2,15 @@
  * @file WeightPreloader.h
  * @brief Pre-packs model weights before graph execution
  *
+ * @deprecated This class is DEPRECATED. Weight preloading functionality has been
+ * folded into WeightManager. Use the following WeightManager methods instead:
+ * - WeightManager::packGemmWeights() - pack GEMM weights for a device
+ * - WeightManager::uploadNonGemmWeights() - upload non-GEMM weights to GPU
+ * - WeightManager::preloadStats() - get preload statistics
+ *
+ * This file will be removed in a future release. New code should use
+ * WeightManager directly.
+ *
  * WeightPreloader ensures all model weights are packed for their target devices
  * before inference begins. This eliminates first-use packing overhead during
  * graph execution and allows memory to be released early.
@@ -32,6 +41,9 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <unordered_map>
+#include <mutex>
+#include <optional>
 
 namespace llaminar2
 {
@@ -189,8 +201,48 @@ namespace llaminar2
             PreloadProgressCallback progress_callback = nullptr,
             bool release_raw_data = true);
 
+        /**
+         * @brief Get or create a device-specific tensor for a non-GEMM weight
+         *
+         * For multi-GPU setups, each device needs its own copy of non-GEMM weights
+         * (biases, norms) because TensorBase can only track one GPU device at a time.
+         * This method returns the device-specific clone, creating it if necessary.
+         *
+         * @param original_name Name of the original weight in WeightManager cache
+         * @param original Original tensor from the shared cache
+         * @param target_device Target device for this tensor
+         * @return Device-specific tensor (may be original for first device, clone for others)
+         */
+        TensorBase *getOrCreateDeviceTensor(
+            const std::string &original_name,
+            TensorBase *original,
+            DeviceId target_device);
+
+        /**
+         * @brief Look up a device-specific tensor by original tensor pointer
+         *
+         * If the original tensor was cloned for the target device during preloading,
+         * returns the clone. Otherwise returns the original tensor.
+         * This is used by kernels to get the correct device-specific tensor.
+         *
+         * @param original Original tensor pointer (from stage params)
+         * @param target_device Target device
+         * @return Device-specific tensor, or original if no clone exists
+         */
+        TensorBase *getDeviceTensorFor(TensorBase *original, DeviceId target_device);
+
+    private:
         std::shared_ptr<WeightManager> weight_manager_;
         std::shared_ptr<WeightPlacementMap> placement_map_;
+
+        // Per-device tensor cache for non-GEMM weights (biases, norms)
+        // Key: "device_type:ordinal:weight_name" e.g. "cuda:0:blk.0.attn_norm"
+        // Value: Cloned tensor owned by this cache, uploaded to specific device
+        std::unordered_map<std::string, std::unique_ptr<TensorBase>> per_device_tensors_;
+        mutable std::mutex per_device_mutex_;
+
+        // Track which device was used first (original tensors stay on this device)
+        std::optional<DeviceId> first_device_;
 
         // Statistics
         size_t num_cpu_packed_ = 0;

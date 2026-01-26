@@ -21,6 +21,7 @@
 
 #include "DirectP2P.h"
 #include "../../utils/Logger.h"
+#include "../BackendManager.h"
 
 #include <algorithm>
 #include <chrono>
@@ -338,12 +339,24 @@ namespace llaminar2
                 cuda_stream_write = nullptr;
             }
 
-            // Release CUDA context
-            if (cuda_ctx && cu_device >= 0)
-            {
-                cuDevicePrimaryCtxRelease(cu_device);
-                cuda_ctx = nullptr;
-            }
+            // NOTE: We intentionally do NOT call cuDevicePrimaryCtxRelease here.
+            //
+            // The primary context is shared with the CUDA Runtime API (cudaSetDevice,
+            // cudaEventSynchronize, etc.) which the rest of the system uses. If we
+            // release the context here, it can invalidate pending events and streams
+            // that were created via the runtime API, leading to "context is destroyed"
+            // errors in multi-threaded scenarios.
+            //
+            // CUDA will clean up the primary context at process exit. The context
+            // remains valid for the lifetime of the process, which is the expected
+            // behavior when mixing Driver API and Runtime API.
+            //
+            // Previous code that caused issues:
+            // if (cuda_ctx && cu_device >= 0) {
+            //     cuDevicePrimaryCtxRelease(cu_device);
+            //     cuda_ctx = nullptr;
+            // }
+            cuda_ctx = nullptr; // Just clear the pointer, don't release
         }
     };
 
@@ -578,11 +591,14 @@ namespace llaminar2
         }
         impl_->cuda_ctx = cu_ctx;
 
-        err = cuCtxSetCurrent(cu_ctx);
-        if (err != CUDA_SUCCESS)
+        // Use cudaSetDevice via the backend to set up the thread's context.
+        // This ensures the runtime API and driver API share the same primary context.
+        // Using cudaSetDevice instead of cuCtxSetCurrent avoids potential conflicts
+        // between the driver API's context stack and the runtime API's thread-local state.
+        IBackend *cuda_backend = getCUDABackend();
+        if (!cuda_backend || !cuda_backend->setDevice(cuda_device.ordinal))
         {
-            LOG_ERROR("cuCtxSetCurrent failed: " << err);
-            cuDevicePrimaryCtxRelease(cu_device);
+            LOG_ERROR("cudaSetDevice failed for device " << cuda_device.ordinal);
             munmap(mapped, actual_map_size);
             close(impl_->bar_info.bar_fd);
             impl_->bar_info.bar_fd = -1;
@@ -606,7 +622,7 @@ namespace llaminar2
                 LOG_ERROR("  1. Run with sudo");
                 LOG_ERROR("  2. Run as root user");
             }
-            cuDevicePrimaryCtxRelease(cu_device);
+            // NOTE: Not releasing context - see cleanup() comment
             munmap(mapped, actual_map_size);
             close(impl_->bar_info.bar_fd);
             impl_->bar_info.bar_fd = -1;
@@ -619,7 +635,7 @@ namespace llaminar2
         {
             LOG_ERROR("cuMemHostGetDevicePointer failed: " << err);
             cuMemHostUnregister(mapped);
-            cuDevicePrimaryCtxRelease(cu_device);
+            // NOTE: Not releasing context - see cleanup() comment
             munmap(mapped, actual_map_size);
             close(impl_->bar_info.bar_fd);
             impl_->bar_info.bar_fd = -1;
@@ -628,6 +644,11 @@ namespace llaminar2
 
         impl_->bar_mapped = true;
         pcie_bar_active_ = true;
+
+        // NOTE: We use cudaSetDevice() (via the backend) instead of cuCtxSetCurrent().
+        // This ensures the CUDA runtime API and driver API share the same primary context
+        // without conflicting context stack management. The primary context remains
+        // current and valid for subsequent operations from any thread.
 
         LOG_INFO("PCIe BAR P2P initialized successfully!");
         LOG_INFO("  CUDA device pointer to AMD BAR: " << std::hex << impl_->cuda_bar_ptr << std::dec);
@@ -674,10 +695,47 @@ namespace llaminar2
             return result;
         }
 
+        // CRITICAL: Set the CUDA device using the backend abstraction layer.
+        // This function may be called from threads other than the one that initialized
+        // the P2P engine (e.g., the ROCm executor thread during LOCAL TP allreduce).
+        //
+        // Using BackendManager::getCUDABackend()->setDevice() instead of direct Driver API
+        // calls because:
+        // 1. setDevice() uses cudaSetDevice() which properly initializes the thread's
+        //    runtime context state
+        // 2. Avoids header conflicts between cuda_runtime.h and hip_runtime.h
+        // 3. Ensures the same context management path as the rest of the system
+        //
+        // After setDevice(), the driver API functions (cuMemcpyDtoD) will use the
+        // same primary context that the runtime API uses.
+        IBackend *cuda_backend = getCUDABackend();
+        if (!cuda_backend)
+        {
+            result.error_message = "CUDA backend not available";
+            return result;
+        }
+
+        if (!cuda_backend->setDevice(impl_->cu_device))
+        {
+            result.error_message = "Backend setDevice failed for device " + std::to_string(impl_->cu_device);
+            return result;
+        }
+
         CUdeviceptr bar_addr = impl_->cuda_bar_ptr + bar_offset;
         CUdeviceptr cuda_addr = reinterpret_cast<CUdeviceptr>(cuda_ptr);
 
         auto start = std::chrono::high_resolution_clock::now();
+
+        // CRITICAL: For driver API calls (cuMemcpyDtoD), we need to ensure
+        // the CUDA context is current on this thread. While cudaSetDevice()
+        // above sets the runtime API's thread-local device, the driver API
+        // operates on the current context which may be different.
+        CUresult ctx_err = cuCtxSetCurrent(impl_->cuda_ctx);
+        if (ctx_err != CUDA_SUCCESS)
+        {
+            result.error_message = "cuCtxSetCurrent failed: " + std::to_string(ctx_err);
+            return result;
+        }
 
         CUresult err;
         if (direction == Direction::ToNVIDIA)
@@ -699,8 +757,13 @@ namespace llaminar2
             return result;
         }
 
-        // Sync
-        cuCtxSynchronize();
+        // Sync using the backend abstraction - synchronize the default stream only
+        // (not all streams) to avoid draining pending work from other threads.
+        if (!cuda_backend->streamSynchronize(impl_->cu_device))
+        {
+            result.error_message = "Backend streamSynchronize failed";
+            return result;
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         result.transfer_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -859,11 +922,12 @@ namespace llaminar2
         }
         impl_->cuda_ctx = cu_ctx;
 
-        err = cuCtxSetCurrent(cu_ctx);
-        if (err != CUDA_SUCCESS)
+        // Use cudaSetDevice via the backend to set up the thread's context.
+        // This ensures the runtime API and driver API share the same primary context.
+        IBackend *cuda_backend = getCUDABackend();
+        if (!cuda_backend || !cuda_backend->setDevice(cuda_device.ordinal))
         {
-            LOG_ERROR("cuCtxSetCurrent failed: " << err);
-            cuDevicePrimaryCtxRelease(cu_device);
+            LOG_ERROR("cudaSetDevice failed for device " << cuda_device.ordinal);
             return false;
         }
 
@@ -972,6 +1036,10 @@ namespace llaminar2
             LOG_ERROR("Failed to map any AMD GPU BARs");
             return false;
         }
+
+        // NOTE: We use cudaSetDevice() (via the backend) instead of cuCtxSetCurrent().
+        // This ensures the CUDA runtime API and driver API share the same primary context
+        // without conflicting context stack management.
 
         pcie_bar_active_ = true;
         LOG_INFO("PCIe BAR Multi-GPU initialized: " << impl_->mapped_bars.size() << " BARs mapped");

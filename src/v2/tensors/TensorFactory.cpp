@@ -152,8 +152,8 @@ namespace llaminar2
     }
 
     std::unique_ptr<TensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
-                                                                   ActivationPrecision precision,
-                                                                   DeviceId device)
+                                                                ActivationPrecision precision,
+                                                                DeviceId device)
     {
         if (numa_node_ >= 0)
         {
@@ -186,7 +186,7 @@ namespace llaminar2
 
         case ActivationPrecision::HybridQ16:
             // For HybridQ16 mode, createActivation returns Q16_1 for residual buffers
-            // Buffer allocation logic in GraphOrchestrator handles specific buffer types
+            // Buffer allocation logic in DeviceGraphOrchestrator handles specific buffer types
             return createQ16_1(shape, device);
 
         default:
@@ -201,9 +201,9 @@ namespace llaminar2
     }
 
     std::unique_ptr<TensorBase> TensorFactory::createActivation(const std::vector<size_t> &shape,
-                                                                   ActivationPrecision precision,
-                                                                   int head_dim,
-                                                                   DeviceId device)
+                                                                ActivationPrecision precision,
+                                                                int head_dim,
+                                                                DeviceId device)
     {
         // For Q16_1 and HybridQ16, use optimal block size based on head_dim
         if (precision == ActivationPrecision::Q16_1 ||
@@ -220,8 +220,8 @@ namespace llaminar2
     }
 
     std::unique_ptr<TensorBase> TensorFactory::createQuantized(TensorType type,
-                                                                  const std::vector<size_t> &shape,
-                                                                  const std::vector<uint8_t> &raw_data)
+                                                               const std::vector<size_t> &shape,
+                                                               const std::vector<uint8_t> &raw_data)
     {
         if (numa_node_ >= 0)
         {

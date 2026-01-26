@@ -376,46 +376,52 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Select correct file stream based on split index
-        std::ifstream *stream = &file_stream_;
-        uint64_t data_offset = model_.data_offset;
-
-        if (model_.split_count > 1)
+        // Read raw bytes from file (thread-safe section)
+        std::vector<uint8_t> raw;
         {
-            if (info->split_idx == 0)
+            std::lock_guard<std::mutex> lock(file_mutex_);
+
+            // Select correct file stream based on split index
+            std::ifstream *stream = &file_stream_;
+            uint64_t data_offset = model_.data_offset;
+
+            if (model_.split_count > 1)
             {
-                // Tensor in main file
-                stream = &file_stream_;
-                data_offset = model_.split_data_offsets[0];
+                if (info->split_idx == 0)
+                {
+                    // Tensor in main file
+                    stream = &file_stream_;
+                    data_offset = model_.split_data_offsets[0];
+                }
+                else if (info->split_idx < model_.split_count)
+                {
+                    // Tensor in split file
+                    stream = &split_streams_[info->split_idx - 1];
+                    data_offset = model_.split_data_offsets[info->split_idx];
+                }
+                else
+                {
+                    LOG_ERROR("[ModelLoader] Invalid split index " << info->split_idx << " for tensor: " << tensor_name);
+                    return nullptr;
+                }
             }
-            else if (info->split_idx < model_.split_count)
+
+            // Seek to tensor data
+            stream->seekg(data_offset + info->offset, std::ios::beg);
+            if (!(*stream))
             {
-                // Tensor in split file
-                stream = &split_streams_[info->split_idx - 1];
-                data_offset = model_.split_data_offsets[info->split_idx];
-            }
-            else
-            {
-                LOG_ERROR("[ModelLoader] Invalid split index " << info->split_idx << " for tensor: " << tensor_name);
+                LOG_ERROR("[ModelLoader] Failed to seek to tensor: " << tensor_name);
                 return nullptr;
             }
-        }
 
-        // Seek to tensor data
-        stream->seekg(data_offset + info->offset, std::ios::beg);
-        if (!(*stream))
-        {
-            LOG_ERROR("[ModelLoader] Failed to seek to tensor: " << tensor_name);
-            return nullptr;
-        }
-
-        // Read raw bytes
-        std::vector<uint8_t> raw(info->size_bytes);
-        if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
-        {
-            LOG_ERROR("[ModelLoader] Failed to read tensor data: " << tensor_name);
-            return nullptr;
-        }
+            // Read raw bytes
+            raw.resize(info->size_bytes);
+            if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
+            {
+                LOG_ERROR("[ModelLoader] Failed to read tensor data: " << tensor_name);
+                return nullptr;
+            }
+        } // Release file_mutex_ - tensor creation can proceed in parallel
 
         // Convert dimensions to size_t vector (V2 uses size_t, not int)
         std::vector<size_t> shape;
@@ -815,44 +821,50 @@ namespace llaminar2
         LOG_TRACE("[ModelLoader] Row slice " << tensor_name << ": rows [" << row_start << ", " << row_end
                                              << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
 
-        // Select correct file stream based on split index
-        std::ifstream *stream = &file_stream_;
-        uint64_t data_offset = model_.data_offset;
-
-        if (model_.split_count > 1)
+        // Read only the slice bytes (thread-safe section)
+        std::vector<uint8_t> raw;
         {
-            if (info->split_idx == 0)
+            std::lock_guard<std::mutex> lock(file_mutex_);
+
+            // Select correct file stream based on split index
+            std::ifstream *stream = &file_stream_;
+            uint64_t data_offset = model_.data_offset;
+
+            if (model_.split_count > 1)
             {
-                stream = &file_stream_;
-                data_offset = model_.split_data_offsets[0];
+                if (info->split_idx == 0)
+                {
+                    stream = &file_stream_;
+                    data_offset = model_.split_data_offsets[0];
+                }
+                else if (info->split_idx < model_.split_count)
+                {
+                    stream = &split_streams_[info->split_idx - 1];
+                    data_offset = model_.split_data_offsets[info->split_idx];
+                }
+                else
+                {
+                    LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
+                    return nullptr;
+                }
             }
-            else if (info->split_idx < model_.split_count)
+
+            // Seek to slice start within tensor data
+            stream->seekg(data_offset + info->offset + slice_offset, std::ios::beg);
+            if (!(*stream))
             {
-                stream = &split_streams_[info->split_idx - 1];
-                data_offset = model_.split_data_offsets[info->split_idx];
-            }
-            else
-            {
-                LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
+                LOG_ERROR("[ModelLoader] Failed to seek to row slice for: " << tensor_name);
                 return nullptr;
             }
-        }
 
-        // Seek to slice start within tensor data
-        stream->seekg(data_offset + info->offset + slice_offset, std::ios::beg);
-        if (!(*stream))
-        {
-            LOG_ERROR("[ModelLoader] Failed to seek to row slice for: " << tensor_name);
-            return nullptr;
-        }
-
-        // Read only the slice bytes
-        std::vector<uint8_t> raw(slice_bytes);
-        if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
-        {
-            LOG_ERROR("[ModelLoader] Failed to read row slice data for: " << tensor_name);
-            return nullptr;
-        }
+            // Read only the slice bytes
+            raw.resize(slice_bytes);
+            if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
+            {
+                LOG_ERROR("[ModelLoader] Failed to read row slice data for: " << tensor_name);
+                return nullptr;
+            }
+        } // Release file_mutex_ - tensor creation can proceed in parallel
 
         // Create shape for sliced tensor
         std::vector<size_t> slice_shape = {slice_rows, cols};
@@ -1252,55 +1264,59 @@ namespace llaminar2
                                                 << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)"
                                                 << ", reading " << bytes_per_slice_row << " bytes from each of " << total_rows << " rows");
 
-        // Select correct file stream based on split index
-        std::ifstream *stream = &file_stream_;
-        uint64_t data_offset = model_.data_offset;
-
-        if (model_.split_count > 1)
-        {
-            if (info->split_idx == 0)
-            {
-                stream = &file_stream_;
-                data_offset = model_.split_data_offsets[0];
-            }
-            else if (info->split_idx < model_.split_count)
-            {
-                stream = &split_streams_[info->split_idx - 1];
-                data_offset = model_.split_data_offsets[info->split_idx];
-            }
-            else
-            {
-                LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
-                return nullptr;
-            }
-        }
-
         // Allocate buffer for sliced data
         std::vector<uint8_t> raw(slice_bytes);
 
-        // Read row by row, extracting only the needed column range
-        uint64_t tensor_start = data_offset + info->offset;
-        for (size_t row = 0; row < total_rows; ++row)
+        // Read row by row, extracting only the needed column range (thread-safe section)
         {
-            // Seek to the start of this row's slice
-            uint64_t row_offset = tensor_start + (row * bytes_per_row) + block_offset_bytes;
-            stream->seekg(row_offset, std::ios::beg);
-            if (!(*stream))
+            std::lock_guard<std::mutex> lock(file_mutex_);
+
+            // Select correct file stream based on split index
+            std::ifstream *stream = &file_stream_;
+            uint64_t data_offset = model_.data_offset;
+
+            if (model_.split_count > 1)
             {
-                LOG_ERROR("[ModelLoader] Failed to seek to column slice for row " << row
-                                                                                  << " of: " << tensor_name);
-                return nullptr;
+                if (info->split_idx == 0)
+                {
+                    stream = &file_stream_;
+                    data_offset = model_.split_data_offsets[0];
+                }
+                else if (info->split_idx < model_.split_count)
+                {
+                    stream = &split_streams_[info->split_idx - 1];
+                    data_offset = model_.split_data_offsets[info->split_idx];
+                }
+                else
+                {
+                    LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
+                    return nullptr;
+                }
             }
 
-            // Read the slice bytes for this row
-            uint8_t *dst = raw.data() + (row * bytes_per_slice_row);
-            if (!stream->read(reinterpret_cast<char *>(dst), bytes_per_slice_row))
+            uint64_t tensor_start = data_offset + info->offset;
+            for (size_t row = 0; row < total_rows; ++row)
             {
-                LOG_ERROR("[ModelLoader] Failed to read column slice data for row " << row
-                                                                                    << " of: " << tensor_name);
-                return nullptr;
+                // Seek to the start of this row's slice
+                uint64_t row_offset = tensor_start + (row * bytes_per_row) + block_offset_bytes;
+                stream->seekg(row_offset, std::ios::beg);
+                if (!(*stream))
+                {
+                    LOG_ERROR("[ModelLoader] Failed to seek to column slice for row " << row
+                                                                                      << " of: " << tensor_name);
+                    return nullptr;
+                }
+
+                // Read the slice bytes for this row
+                uint8_t *dst = raw.data() + (row * bytes_per_slice_row);
+                if (!stream->read(reinterpret_cast<char *>(dst), bytes_per_slice_row))
+                {
+                    LOG_ERROR("[ModelLoader] Failed to read column slice data for row " << row
+                                                                                        << " of: " << tensor_name);
+                    return nullptr;
+                }
             }
-        }
+        } // Release file_mutex_ - tensor creation can proceed in parallel
 
         // Create shape for sliced tensor
         std::vector<size_t> slice_shape = {total_rows, slice_cols};

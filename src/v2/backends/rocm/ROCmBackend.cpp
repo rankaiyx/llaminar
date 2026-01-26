@@ -93,6 +93,24 @@ namespace llaminar2
         return (err == hipSuccess);
     }
 
+    bool ROCmBackend::streamSynchronize(int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        hipError_t err_set = hipSetDevice(device_id);
+        if (err_set != hipSuccess)
+        {
+            return false;
+        }
+
+        // Synchronize only the default stream (nullptr), not all streams
+        hipError_t err = hipStreamSynchronize(nullptr);
+        return (err == hipSuccess);
+    }
+
     // ====================================================================
     // Event Operations (Fine-grained Synchronization)
     // ====================================================================

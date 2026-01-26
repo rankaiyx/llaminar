@@ -9,7 +9,7 @@
  *   - MPITopology: Device capability exchange, work distribution
  *   - WeightManager: Column/row-parallel weight sharding (QKV, FFN, LM Head)
  *   - Qwen2Graph: Graph building with TP configuration
- *   - GraphOrchestrator: Full forward execution with all stages
+ *   - DeviceGraphOrchestrator: Full forward execution with all stages
  *   - Sharded KV Cache: Per-rank cache with local heads
  *   - AllReduceStage: After Wo projection, FFN down projection
  *   - AllGatherStage: After LM head for logits aggregation
@@ -40,7 +40,7 @@
 
 #include "execution/InferenceRunnerFactory.h"
 #include "execution/IInferenceRunner.h"
-#include "execution/GraphOrchestrator.h"
+#include "execution/DeviceGraphOrchestrator.h"
 #include "models/qwen/Qwen2Graph.h"
 #include "models/qwen/Qwen2Schema.h"
 #include "loaders/ModelContext.h"
@@ -338,9 +338,9 @@ TEST_F(Test__MPI_E2E_TensorParallelInference, InferenceRunnerCreatesWithTP)
     auto runner = createTPRunner();
     ASSERT_NE(runner, nullptr);
 
-    // Cast to GraphOrchestrator to verify internal config
-    auto *orchestrator = dynamic_cast<GraphOrchestrator *>(runner.get());
-    ASSERT_NE(orchestrator, nullptr) << "Runner should be a GraphOrchestrator";
+    // Cast to DeviceGraphOrchestrator to verify internal config
+    auto *orchestrator = dynamic_cast<DeviceGraphOrchestrator *>(runner.get());
+    ASSERT_NE(orchestrator, nullptr) << "Runner should be a DeviceGraphOrchestrator";
 
     // Verify TP configuration via graphBuilder
     const auto *graph = orchestrator->graphBuilder();
@@ -497,7 +497,7 @@ TEST_F(Test__MPI_E2E_TensorParallelInference, KVCacheIsShardedCorrectly)
     auto runner = createTPRunner(128);
     ASSERT_NE(runner, nullptr);
 
-    auto *orchestrator = dynamic_cast<GraphOrchestrator *>(runner.get());
+    auto *orchestrator = dynamic_cast<DeviceGraphOrchestrator *>(runner.get());
     ASSERT_NE(orchestrator, nullptr);
 
     // Run prefill to populate KV cache

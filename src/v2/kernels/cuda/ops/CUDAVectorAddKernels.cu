@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cstdio>
 
 namespace llaminar2
 {
@@ -336,7 +337,14 @@ namespace llaminar2
                 vectorAddInplaceKernel_f32<<<blocks, threadsPerBlock, 0, stream>>>(output, input, count);
             }
 
-            return cudaGetLastError() == cudaSuccess;
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAVectorAdd] Kernel launch error: %s (code %d)\n",
+                        cudaGetErrorString(err), static_cast<int>(err));
+                return false;
+            }
+            return true;
         }
 
         bool launchVectorAddInplace_f16(

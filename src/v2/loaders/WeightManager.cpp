@@ -78,6 +78,8 @@ namespace llaminar2
 
     std::shared_ptr<TensorBase> WeightManager::getWeight(const std::string &name, DeviceId device, int layer_idx)
     {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
         // Check cache first
         auto it = cache_.find(name);
         if (it != cache_.end())
@@ -663,6 +665,8 @@ namespace llaminar2
             return nullptr;
         }
 
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
         // Generate cache key (includes fraction to allow different shard sizes)
         std::string cache_key = name + "@decode_" + std::to_string(fraction);
 
@@ -1074,6 +1078,599 @@ namespace llaminar2
             LOG_WARN("[WeightManager] calculateProportionalRowSlice called for non-row weight: " << name);
             return {0, total_cols};
         }
+    }
+
+    // =========================================================================
+    // Thread-safe cache accessors
+    // =========================================================================
+
+    size_t WeightManager::cacheSize() const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return cache_.size();
+    }
+
+    void WeightManager::clearCache()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        cache_.clear();
+    }
+
+    size_t WeightManager::decodeCacheSize() const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return decode_cache_.size();
+    }
+
+    void WeightManager::clearDecodeCache()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        decode_cache_.clear();
+    }
+
+    // =========================================================================
+    // Device-aware weight access (for multi-device LOCAL TP)
+    // =========================================================================
+
+    namespace
+    {
+        /**
+         * @brief Create a quantized tensor from raw bytes (generic for all tensor types)
+         *
+         * This mirrors TensorFactory::createQuantized() but doesn't require an instance.
+         * Handles all 27+ quantized tensor types in a single function.
+         *
+         * @param type Tensor type enum
+         * @param shape Tensor dimensions
+         * @param raw_data Raw bytes (moved into tensor)
+         * @return New tensor of the specified type, or nullptr on failure
+         */
+        std::unique_ptr<TensorBase> createQuantizedTensorFromRawData(
+            TensorType type,
+            const std::vector<size_t> &shape,
+            std::vector<uint8_t> raw_data)
+        {
+            switch (type)
+            {
+            case TensorType::Q4_0:
+                return std::make_unique<Q4_0Tensor>(shape, raw_data);
+            case TensorType::Q8_0:
+                return std::make_unique<Q8_0Tensor>(shape, raw_data);
+            case TensorType::Q8_1:
+                return std::make_unique<Q8_1Tensor>(shape, raw_data);
+            case TensorType::Q4_1:
+                return std::make_unique<Q4_1Tensor>(shape, raw_data);
+            case TensorType::Q5_0:
+                return std::make_unique<Q5_0Tensor>(shape, raw_data);
+            case TensorType::Q5_1:
+                return std::make_unique<Q5_1Tensor>(shape, raw_data);
+            case TensorType::Q6_K:
+                return std::make_unique<Q6_KTensor>(shape, raw_data);
+            case TensorType::Q2_K:
+                return std::make_unique<Q2_KTensor>(shape, raw_data);
+            case TensorType::Q5_K:
+                return std::make_unique<Q5_KTensor>(shape, raw_data);
+            case TensorType::Q3_K:
+                return std::make_unique<Q3_KTensor>(shape, raw_data);
+            case TensorType::Q4_K:
+                return std::make_unique<Q4_KTensor>(shape, raw_data);
+            case TensorType::Q8_K:
+                return std::make_unique<Q8_KTensor>(shape, raw_data);
+            case TensorType::IQ4_NL:
+                return std::make_unique<IQ4_NLTensor>(shape, raw_data);
+            case TensorType::IQ4_XS:
+                return std::make_unique<IQ4_XSTensor>(shape, raw_data);
+            case TensorType::IQ2_XXS:
+                return std::make_unique<IQ2_XXSTensor>(shape, raw_data);
+            case TensorType::IQ2_XS:
+                return std::make_unique<IQ2_XSTensor>(shape, raw_data);
+            case TensorType::IQ3_XXS:
+                return std::make_unique<IQ3_XXSTensor>(shape, raw_data);
+            case TensorType::IQ2_S:
+                return std::make_unique<IQ2_STensor>(shape, raw_data);
+            case TensorType::IQ3_S:
+                return std::make_unique<IQ3_STensor>(shape, raw_data);
+            case TensorType::IQ1_S:
+                return std::make_unique<IQ1_STensor>(shape, raw_data);
+            case TensorType::IQ1_M:
+                return std::make_unique<IQ1_MTensor>(shape, raw_data);
+            case TensorType::BF16:
+            {
+                std::vector<uint16_t> bf16_data(raw_data.size() / 2);
+                std::memcpy(bf16_data.data(), raw_data.data(), raw_data.size());
+                return std::make_unique<BF16Tensor>(shape, bf16_data);
+            }
+            case TensorType::FP16:
+            {
+                std::vector<uint16_t> fp16_data(raw_data.size() / 2);
+                std::memcpy(fp16_data.data(), raw_data.data(), raw_data.size());
+                return std::make_unique<FP16Tensor>(shape, fp16_data);
+            }
+            default:
+                LOG_ERROR("[WeightManager] Unsupported tensor type for cloning: "
+                          << static_cast<int>(type));
+                return nullptr;
+            }
+        }
+    } // anonymous namespace
+
+    std::shared_ptr<TensorBase> WeightManager::cloneTensorForDevice(
+        const std::string &name,
+        const std::shared_ptr<TensorBase> &original,
+        DeviceId target_device)
+    {
+        if (!original)
+        {
+            return nullptr;
+        }
+
+        TensorType tensor_type = original->native_type();
+        size_t byte_count = original->size_bytes();
+        const void *raw_ptr = original->raw_data();
+
+        if (!raw_ptr || byte_count == 0)
+        {
+            LOG_WARN("[WeightManager] Cannot clone tensor with no data: " << name);
+            return nullptr;
+        }
+
+        // Copy raw bytes
+        std::vector<uint8_t> raw_copy(byte_count);
+        std::memcpy(raw_copy.data(), raw_ptr, byte_count);
+
+        std::shared_ptr<TensorBase> clone;
+
+        // Special case for FP32 (most common for norms/biases) - uses different constructor
+        if (tensor_type == TensorType::FP32)
+        {
+            auto fp32_clone = std::make_shared<FP32Tensor>(original->shape());
+            std::memcpy(fp32_clone->mutable_data(), raw_ptr, byte_count);
+            clone = std::move(fp32_clone);
+        }
+        else
+        {
+            // All quantized types: use the common (shape, raw_data) constructor pattern
+            auto unique_clone = createQuantizedTensorFromRawData(
+                tensor_type, original->shape(), std::move(raw_copy));
+            if (!unique_clone)
+            {
+                LOG_WARN("[WeightManager] Failed to create clone for tensor type "
+                         << static_cast<int>(tensor_type));
+                return nullptr;
+            }
+            clone = std::shared_ptr<TensorBase>(std::move(unique_clone));
+        }
+
+        clone->setDebugName(name + "@" + target_device.to_string());
+
+        LOG_DEBUG("[WeightManager] Cloned tensor for " << target_device.to_string()
+                                                       << ": " << name << " ["
+                                                       << original->shape()[0] << "x"
+                                                       << (original->shape().size() > 1 ? original->shape()[1] : 1) << "]"
+                                                       << " type=" << static_cast<int>(tensor_type));
+
+        return clone;
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::getWeightForDevice(
+        const std::string &name,
+        DeviceId device,
+        int layer_idx)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        // Track first device - original tensors stay on this device
+        if (!first_device_.has_value())
+        {
+            first_device_ = device;
+            LOG_DEBUG("[WeightManager] First device for weights: " << device.to_string());
+        }
+
+        // Helper lambda to load weight if not in cache (reuses getWeight logic without re-locking)
+        auto ensureWeightLoaded = [this, &name, &device, layer_idx]() -> std::shared_ptr<TensorBase>
+        {
+            auto it = cache_.find(name);
+            if (it != cache_.end())
+            {
+                return it->second;
+            }
+
+            // Weight not in cache - load it now
+            LOG_DEBUG("[WeightManager] getWeightForDevice: loading " << name << " (not in cache)");
+
+            // Determine device from placement map if not explicitly provided
+            DeviceId target_device = device;
+            if (!target_device.is_valid() && placement_map_)
+            {
+                target_device = placement_map_->getDeviceForWeight(name, layer_idx);
+            }
+            if (!target_device.is_valid())
+            {
+                target_device = DeviceId::cpu();
+            }
+
+            // Load based on strategy (same logic as getWeight)
+            std::shared_ptr<TensorBase> tensor;
+            switch (strategy_)
+            {
+            case WeightDistributionStrategy::REPLICATED:
+                tensor = getReplicatedWeight(name, target_device);
+                break;
+            case WeightDistributionStrategy::SHARDED:
+                tensor = getShardedWeight(name, target_device);
+                break;
+            case WeightDistributionStrategy::INTERLEAVED:
+                tensor = getInterleavedWeight(name, target_device);
+                break;
+            default:
+                LOG_ERROR("[WeightManager] Unknown strategy: " << static_cast<int>(strategy_));
+                return nullptr;
+            }
+
+            if (tensor)
+            {
+                cache_[name] = tensor;
+                LOG_DEBUG("[WeightManager] Cached tensor via getWeightForDevice: " << name);
+            }
+            return tensor;
+        };
+
+        // For the first device, return the original tensor
+        if (first_device_.value() == device)
+        {
+            return ensureWeightLoaded();
+        }
+
+        // Check per-device cache for subsequent devices
+        std::string cache_key = device.to_string() + ":" + name;
+        auto it = per_device_cache_.find(cache_key);
+        if (it != per_device_cache_.end())
+        {
+            return it->second;
+        }
+
+        // Need to create a clone for this device
+        // First, ensure the original is loaded
+        auto original = ensureWeightLoaded();
+        if (!original)
+        {
+            LOG_ERROR("[WeightManager] getWeightForDevice: failed to load weight: " << name);
+            return nullptr;
+        }
+
+        auto clone = cloneTensorForDevice(name, original, device);
+        if (!clone)
+        {
+            LOG_ERROR("[WeightManager] getWeightForDevice: failed to clone " << name);
+            return nullptr;
+        }
+
+        per_device_cache_[cache_key] = clone;
+        return clone;
+    }
+
+    bool WeightManager::preloadForDevices(const std::vector<DeviceId> &devices)
+    {
+        if (devices.empty())
+        {
+            LOG_WARN("[WeightManager] preloadForDevices called with empty device list");
+            return true;
+        }
+
+        LOG_INFO("[WeightManager] Pre-loading weights for " << devices.size() << " devices");
+
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        // Set first device if not already set
+        if (!first_device_.has_value())
+        {
+            first_device_ = devices[0];
+            LOG_DEBUG("[WeightManager] First device set to: " << devices[0].to_string());
+        }
+
+        // Get all weight names from cache
+        std::vector<std::string> weight_names;
+        weight_names.reserve(cache_.size());
+        for (const auto &[name, _] : cache_)
+        {
+            weight_names.push_back(name);
+        }
+
+        if (weight_names.empty())
+        {
+            LOG_WARN("[WeightManager] No weights in cache - call getWeight() first to load weights");
+            return true;
+        }
+
+        size_t total_clones = 0;
+        size_t total_uploads = 0;
+
+        // For each device (except first), create clones and upload
+        for (size_t dev_idx = 0; dev_idx < devices.size(); ++dev_idx)
+        {
+            const DeviceId &device = devices[dev_idx];
+
+            // First device uses original tensors, just upload them
+            if (device == first_device_.value())
+            {
+                LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                                    << " is first device, uploading original tensors");
+                for (const auto &name : weight_names)
+                {
+                    auto &tensor = cache_[name];
+                    if (tensor && device.type != DeviceType::CPU)
+                    {
+                        if (tensor->ensureOnDevice(device))
+                        {
+                            ++total_uploads;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Subsequent devices need clones
+            LOG_DEBUG("[WeightManager] Creating clones for device " << device.to_string());
+            for (const auto &name : weight_names)
+            {
+                std::string cache_key = device.to_string() + ":" + name;
+
+                // Skip if already cloned
+                if (per_device_cache_.find(cache_key) != per_device_cache_.end())
+                {
+                    continue;
+                }
+
+                auto &original = cache_[name];
+                auto clone = cloneTensorForDevice(name, original, device);
+                if (clone)
+                {
+                    // Upload to device
+                    if (device.type != DeviceType::CPU)
+                    {
+                        if (clone->ensureOnDevice(device))
+                        {
+                            ++total_uploads;
+                        }
+                    }
+                    per_device_cache_[cache_key] = clone;
+                    ++total_clones;
+                }
+            }
+        }
+
+        LOG_INFO("[WeightManager] Pre-loaded " << total_clones << " clones, "
+                                               << total_uploads << " uploads for "
+                                               << devices.size() << " devices");
+        return true;
+    }
+
+    // =========================================================================
+    // Weight Packing and Preloading (folded from WeightPreloader)
+    // =========================================================================
+
+    bool WeightManager::packGemmWeights(
+        DeviceId target_device,
+        PreloadProgressCallback progress_cb,
+        bool release_raw_data)
+    {
+        using namespace llaminar::v2::kernels;
+
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        // Collect all GEMM weight names
+        std::vector<std::string> gemm_weights;
+        for (const auto &[name, tensor] : cache_)
+        {
+            if (isGemmWeight(name))
+            {
+                gemm_weights.push_back(name);
+            }
+        }
+
+        if (gemm_weights.empty())
+        {
+            LOG_DEBUG("[WeightManager] No GEMM weights to pack");
+            return true;
+        }
+
+        LOG_DEBUG("[WeightManager] Packing " << gemm_weights.size() << " GEMM weights for "
+                                             << target_device.to_string());
+
+        size_t total = gemm_weights.size();
+        size_t current = 0;
+        bool all_success = true;
+
+        // Set up device ordinal guards for GPU packing
+        // Lambda that performs the actual packing
+        auto do_packing = [&]() -> bool
+        {
+            for (const auto &name : gemm_weights)
+            {
+                current++;
+                if (progress_cb)
+                {
+                    progress_cb(current, total, name);
+                }
+
+                auto &tensor = cache_[name];
+                if (!tensor)
+                {
+                    LOG_WARN("[WeightManager] Weight not found in cache: " << name);
+                    continue;
+                }
+
+                if (!packWeight(tensor.get(), target_device, release_raw_data))
+                {
+                    LOG_ERROR("[WeightManager] Failed to pack weight: " << name);
+                    all_success = false;
+                }
+            }
+            return all_success;
+        };
+
+        // Use ordinal guards for GPU devices
+        if (target_device.is_rocm())
+        {
+            LOG_DEBUG("[WeightManager] Setting ROCm ordinal " << target_device.ordinal
+                                                              << " for weight packing");
+            KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
+            return do_packing();
+        }
+        else if (target_device.is_cuda())
+        {
+            LOG_DEBUG("[WeightManager] Setting CUDA ordinal " << target_device.ordinal
+                                                              << " for weight packing");
+            KernelFactory::CUDAOrdinalGuard guard(target_device.ordinal);
+            return do_packing();
+        }
+        else
+        {
+            return do_packing();
+        }
+    }
+
+    bool WeightManager::packWeight(
+        TensorBase *tensor,
+        DeviceId target_device,
+        bool release_raw_data)
+    {
+        if (!tensor)
+        {
+            return false;
+        }
+
+        using namespace llaminar::v2::kernels;
+
+        // Create kernel for target device (this creates the kernel with packed weights)
+        auto *kernel = KernelFactory::getOrCreateGemm(tensor, target_device);
+        if (!kernel)
+        {
+            LOG_ERROR("[WeightManager] Failed to create GEMM kernel for weight packing");
+            return false;
+        }
+
+        // Call prepareWeights() to upload to GPU if needed
+        // For CPU: this is a no-op
+        // For GPU: this calls ensureWeightsConverted() which uploads INT8 data
+        kernel->prepareWeights();
+
+        if (target_device.is_cpu())
+        {
+            num_cpu_packed_++;
+
+            // For CPU, we can release raw data since packed weights are in cache
+            if (release_raw_data)
+            {
+                tensor->release_raw_data();
+                LOG_TRACE("[WeightManager] Released raw data for: " << tensor->shape()[0]
+                                                                    << "x" << tensor->shape()[1]);
+            }
+        }
+        else
+        {
+            num_gpu_packed_++;
+            // For GPU, do NOT release raw data!
+            // The tensor coherence system (ensureOnDevice) still needs the host data
+            // to upload to GPU buffers during stage execution.
+            LOG_TRACE("[WeightManager] GPU weight packed (keeping raw data): "
+                      << tensor->shape()[0] << "x" << tensor->shape()[1]);
+        }
+
+        return true;
+    }
+
+    bool WeightManager::uploadNonGemmWeights(DeviceId target_device)
+    {
+        if (!target_device.is_gpu())
+        {
+            LOG_DEBUG("[WeightManager] uploadNonGemmWeights skipped for CPU target");
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        size_t uploaded_count = 0;
+
+        LOG_DEBUG("[WeightManager] Uploading non-GEMM weights to " << target_device.to_string() << "...");
+
+        for (const auto &[name, tensor] : cache_)
+        {
+            // Only process non-GEMM weights (norms, embeddings, biases)
+            if (isGemmWeight(name))
+            {
+                continue;
+            }
+
+            if (!tensor)
+            {
+                LOG_WARN("[WeightManager] Non-GEMM weight is null: " << name);
+                continue;
+            }
+
+            // Get the device-specific tensor if multi-GPU, otherwise use original
+            TensorBase *device_tensor = nullptr;
+
+            if (first_device_.has_value() && first_device_.value() == target_device)
+            {
+                // First device uses original tensor
+                device_tensor = tensor.get();
+            }
+            else if (first_device_.has_value())
+            {
+                // Subsequent devices need clones - check per-device cache
+                std::string cache_key = target_device.to_string() + ":" + name;
+                auto it = per_device_cache_.find(cache_key);
+                if (it != per_device_cache_.end())
+                {
+                    device_tensor = it->second.get();
+                }
+                else
+                {
+                    // Create clone for this device
+                    auto clone = cloneTensorForDevice(name, tensor, target_device);
+                    if (clone)
+                    {
+                        device_tensor = clone.get();
+                        per_device_cache_[cache_key] = clone;
+                    }
+                }
+            }
+            else
+            {
+                // First device not set yet, set it now
+                first_device_ = target_device;
+                device_tensor = tensor.get();
+            }
+
+            if (!device_tensor)
+            {
+                LOG_WARN("[WeightManager] Failed to get device tensor for: " << name);
+                continue;
+            }
+
+            // Set debug name so transfers can be traced
+            device_tensor->setDebugName(name);
+
+            // Upload to GPU using ensureOnDevice (no GEMM packing needed)
+            if (device_tensor->ensureOnDevice(target_device))
+            {
+                size_t rows = device_tensor->shape()[0];
+                size_t cols = device_tensor->shape().size() > 1 ? device_tensor->shape()[1] : 1;
+                size_t bytes = rows * cols * sizeof(float);
+                LOG_TRACE("[WeightManager] Uploaded non-GEMM weight: " << name
+                                                                       << " [" << rows << "x" << cols << "] = " << bytes << " bytes");
+                uploaded_count++;
+            }
+            else
+            {
+                LOG_WARN("[WeightManager] Failed to upload non-GEMM weight: " << name);
+            }
+        }
+
+        LOG_INFO("[WeightManager] Uploaded " << uploaded_count << " non-GEMM weights to "
+                                             << target_device.to_string());
+        return true;
     }
 
 } // namespace llaminar2

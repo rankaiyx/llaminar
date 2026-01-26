@@ -439,7 +439,9 @@ int main(int argc, char *argv[])
     }
 
     // Create orchestration config from ArgContext
-    OrchestrationConfig orch_config;
+    // NOTE: Using LegacyOrchestrationConfig for the old DeviceOrchestrator path
+    // New orchestration uses config/OrchestrationConfig.h via MultiDeviceOrchestrator
+    LegacyOrchestrationConfig orch_config;
     orch_config.strategy = strategy;
     orch_config.gpu_device = device_id;
     orch_config.offload_layers = args.offload_layers;

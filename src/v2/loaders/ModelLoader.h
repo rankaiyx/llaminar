@@ -32,6 +32,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -331,6 +332,7 @@ namespace llaminar2
         uint64_t headCountKV() const override { return model_.head_count_kv; }
         uint64_t vocabSize() const override { return model_.vocab_size; }
         uint64_t contextLength() const override { return model_.context_length; }
+        uint64_t feedForwardLength() const override { return getUInt64("feed_forward_length", 0); }
         float ropeTheta() const override { return model_.rope_theta; }
         float rmsNormEps() const override { return model_.rms_norm_eps; }
 
@@ -392,6 +394,7 @@ namespace llaminar2
         std::ifstream file_stream_;
         std::vector<std::ifstream> split_streams_; // Additional file streams for multi-part GGUF
         GGUFModel model_;
+        mutable std::mutex file_mutex_; // Protects file_stream_ and split_streams_ for thread-safety
     };
 
     // =============================================================================

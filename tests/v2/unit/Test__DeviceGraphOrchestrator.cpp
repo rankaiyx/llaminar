@@ -1,6 +1,6 @@
 /**
- * @file Test__GraphOrchestrator.cpp
- * @brief Unit tests for GraphOrchestrator class
+ * @file Test__DeviceGraphOrchestrator.cpp
+ * @brief Unit tests for DeviceGraphOrchestrator class
  * @author David Sanftenberg
  * @date December 2025
  *
@@ -11,7 +11,7 @@
 #include <gtest/gtest.h>
 #include "../../../src/v2/backends/DeviceId.h"
 #include "../../../src/v2/execution/CollectiveContext.h"
-#include "../../../src/v2/execution/GraphOrchestrator.h"
+#include "../../../src/v2/execution/DeviceGraphOrchestrator.h"
 #include "../../../src/v2/execution/GraphExecutor.h"
 #include "../../../src/v2/execution/RuntimeConfig.h"
 #include "../../../src/v2/execution/WorkspaceDescriptor.h"
@@ -30,9 +30,9 @@
 using namespace llaminar2;
 
 /**
- * @brief Test fixture for GraphOrchestrator unit tests
+ * @brief Test fixture for DeviceGraphOrchestrator unit tests
  */
-class Test__GraphOrchestrator : public ::testing::Test
+class Test__DeviceGraphOrchestrator : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -64,42 +64,42 @@ protected:
 // Construction Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, ConstructWithGraphBuilder)
+TEST_F(Test__DeviceGraphOrchestrator, ConstructWithGraphBuilder)
 {
     // Test construction with existing graph builder
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     EXPECT_NE(orchestrator, nullptr);
     EXPECT_EQ(orchestrator->graphBuilder(), graph_builder_.get());
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
-TEST_F(Test__GraphOrchestrator, ConstructWithConfig)
+TEST_F(Test__DeviceGraphOrchestrator, ConstructWithConfig)
 {
     // Test construction with config (creates internal graph builder)
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     EXPECT_NE(orchestrator, nullptr);
     EXPECT_NE(orchestrator->graphBuilder(), nullptr);
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
-TEST_F(Test__GraphOrchestrator, ConstructWithCacheDisabled)
+TEST_F(Test__DeviceGraphOrchestrator, ConstructWithCacheDisabled)
 {
     GraphCacheConfig cache_config;
     cache_config.enabled = false;
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
         graph_builder_, nullptr, cache_config);
 
     EXPECT_FALSE(orchestrator->isGraphCachingEnabled());
 }
 
-TEST_F(Test__GraphOrchestrator, NullGraphBuilderThrows)
+TEST_F(Test__DeviceGraphOrchestrator, NullGraphBuilderThrows)
 {
     // Construction with null graph builder should throw
     EXPECT_THROW(
-        GraphOrchestrator(std::shared_ptr<Qwen2Graph>(nullptr), nullptr),
+        DeviceGraphOrchestrator(std::shared_ptr<Qwen2Graph>(nullptr), nullptr),
         std::invalid_argument);
 }
 
@@ -107,9 +107,9 @@ TEST_F(Test__GraphOrchestrator, NullGraphBuilderThrows)
 // Cache Management Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, InitializeGraphCache)
+TEST_F(Test__DeviceGraphOrchestrator, InitializeGraphCache)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Before initialization, no cached graphs
     EXPECT_FALSE(orchestrator->hasValidCachedGraph(0, true));
@@ -123,9 +123,9 @@ TEST_F(Test__GraphOrchestrator, InitializeGraphCache)
     EXPECT_FALSE(orchestrator->hasValidCachedGraph(0, false));
 }
 
-TEST_F(Test__GraphOrchestrator, SetGraphCachingEnabled)
+TEST_F(Test__DeviceGraphOrchestrator, SetGraphCachingEnabled)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 
@@ -136,9 +136,9 @@ TEST_F(Test__GraphOrchestrator, SetGraphCachingEnabled)
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
-TEST_F(Test__GraphOrchestrator, ClearCacheResetsCacheStats)
+TEST_F(Test__DeviceGraphOrchestrator, ClearCacheResetsCacheStats)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator->initializeGraphCache(24);
 
     // Clear cache
@@ -152,18 +152,18 @@ TEST_F(Test__GraphOrchestrator, ClearCacheResetsCacheStats)
     EXPECT_EQ(stats.ffn_cache_misses, 0u);
 }
 
-TEST_F(Test__GraphOrchestrator, InvalidateGraphCacheSpecificLayer)
+TEST_F(Test__DeviceGraphOrchestrator, InvalidateGraphCacheSpecificLayer)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator->initializeGraphCache(24);
 
     // Invalidate specific layer (should not throw even if nothing cached)
     EXPECT_NO_THROW(orchestrator->invalidateGraphCache(5));
 }
 
-TEST_F(Test__GraphOrchestrator, InvalidateGraphCacheAllLayers)
+TEST_F(Test__DeviceGraphOrchestrator, InvalidateGraphCacheAllLayers)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator->initializeGraphCache(24);
 
     // Invalidate all layers
@@ -175,9 +175,9 @@ TEST_F(Test__GraphOrchestrator, InvalidateGraphCacheAllLayers)
 // Note: These tests may skip in environments without DeviceManager initialization
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, GetDeviceContextLazyCreation)
+TEST_F(Test__DeviceGraphOrchestrator, GetDeviceContextLazyCreation)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // First call creates context (may fail without DeviceManager init)
     IDeviceContext *ctx1 = orchestrator->getDeviceContext(DeviceId::cpu());
@@ -191,9 +191,9 @@ TEST_F(Test__GraphOrchestrator, GetDeviceContextLazyCreation)
     EXPECT_EQ(ctx1, ctx2);
 }
 
-TEST_F(Test__GraphOrchestrator, GetDeviceContextMultipleDevices)
+TEST_F(Test__DeviceGraphOrchestrator, GetDeviceContextMultipleDevices)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Get context for device 0 (may fail without DeviceManager init)
     IDeviceContext *ctx0 = orchestrator->getDeviceContext(DeviceId::cpu());
@@ -210,9 +210,9 @@ TEST_F(Test__GraphOrchestrator, GetDeviceContextMultipleDevices)
     }
 }
 
-TEST_F(Test__GraphOrchestrator, ClearCacheClearsDeviceContexts)
+TEST_F(Test__DeviceGraphOrchestrator, ClearCacheClearsDeviceContexts)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create a device context (may fail without DeviceManager init)
     IDeviceContext *ctx_before = orchestrator->getDeviceContext(DeviceId::cpu());
@@ -234,9 +234,9 @@ TEST_F(Test__GraphOrchestrator, ClearCacheClearsDeviceContexts)
 // Cache Statistics Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, CacheStatsInitialValues)
+TEST_F(Test__DeviceGraphOrchestrator, CacheStatsInitialValues)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     auto stats = orchestrator->getCacheStats();
     EXPECT_EQ(stats.attention_cache_hits, 0u);
@@ -246,9 +246,9 @@ TEST_F(Test__GraphOrchestrator, CacheStatsInitialValues)
     EXPECT_EQ(stats.cached_layers, 0u);
 }
 
-TEST_F(Test__GraphOrchestrator, CacheStatsAfterInitialize)
+TEST_F(Test__DeviceGraphOrchestrator, CacheStatsAfterInitialize)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator->initializeGraphCache(24);
 
     auto stats = orchestrator->getCacheStats();
@@ -259,7 +259,7 @@ TEST_F(Test__GraphOrchestrator, CacheStatsAfterInitialize)
 // GraphCacheConfig Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, CustomCacheConfig)
+TEST_F(Test__DeviceGraphOrchestrator, CustomCacheConfig)
 {
     GraphCacheConfig cache_config;
     cache_config.enabled = true;
@@ -267,7 +267,7 @@ TEST_F(Test__GraphOrchestrator, CustomCacheConfig)
     cache_config.cache_attention = false; // Disable attention caching
     cache_config.cache_ffn = true;
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
         graph_builder_, nullptr, cache_config);
 
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
@@ -279,30 +279,30 @@ TEST_F(Test__GraphOrchestrator, CustomCacheConfig)
 // Executor Access Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, ExecutorAccess)
+TEST_F(Test__DeviceGraphOrchestrator, ExecutorAccess)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Non-const access
     GraphExecutor &exec = orchestrator->executor();
     (void)exec; // Just verify we can access it
 
     // Const access
-    const GraphOrchestrator *const_orch = orchestrator.get();
+    const DeviceGraphOrchestrator *const_orch = orchestrator.get();
     const GraphExecutor &const_exec = const_orch->executor();
     (void)const_exec; // Just verify we can access it
 }
 
-TEST_F(Test__GraphOrchestrator, GraphBuilderAccess)
+TEST_F(Test__DeviceGraphOrchestrator, GraphBuilderAccess)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Non-const access
     Qwen2Graph *builder = orchestrator->graphBuilder();
     EXPECT_EQ(builder, graph_builder_.get());
 
     // Const access
-    const GraphOrchestrator *const_orch = orchestrator.get();
+    const DeviceGraphOrchestrator *const_orch = orchestrator.get();
     const Qwen2Graph *const_builder = const_orch->graphBuilder();
     EXPECT_EQ(const_builder, graph_builder_.get());
 }
@@ -311,9 +311,9 @@ TEST_F(Test__GraphOrchestrator, GraphBuilderAccess)
 // Edge Case Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, HasValidCachedGraphOutOfBounds)
+TEST_F(Test__DeviceGraphOrchestrator, HasValidCachedGraphOutOfBounds)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator->initializeGraphCache(24);
 
     // Layer index out of bounds should return false
@@ -322,9 +322,9 @@ TEST_F(Test__GraphOrchestrator, HasValidCachedGraphOutOfBounds)
     EXPECT_FALSE(orchestrator->hasValidCachedGraph(24, false)); // Exactly at boundary
 }
 
-TEST_F(Test__GraphOrchestrator, InvalidateGraphCacheOutOfBounds)
+TEST_F(Test__DeviceGraphOrchestrator, InvalidateGraphCacheOutOfBounds)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator->initializeGraphCache(24);
 
     // Should not throw for out-of-bounds indices
@@ -332,9 +332,9 @@ TEST_F(Test__GraphOrchestrator, InvalidateGraphCacheOutOfBounds)
     EXPECT_NO_THROW(orchestrator->invalidateGraphCache(-2));
 }
 
-TEST_F(Test__GraphOrchestrator, MoveConstruction)
+TEST_F(Test__DeviceGraphOrchestrator, MoveConstruction)
 {
-    auto orchestrator1 = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator1 = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator1->initializeGraphCache(24);
 
     // Move construct
@@ -344,12 +344,12 @@ TEST_F(Test__GraphOrchestrator, MoveConstruction)
     EXPECT_EQ(orchestrator2->graphBuilder(), graph_builder_.get());
 }
 
-TEST_F(Test__GraphOrchestrator, MoveAssignment)
+TEST_F(Test__DeviceGraphOrchestrator, MoveAssignment)
 {
-    auto orchestrator1 = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator1 = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator1->initializeGraphCache(24);
 
-    auto orchestrator2 = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator2 = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // Move assign
     *orchestrator2 = std::move(*orchestrator1);
@@ -361,18 +361,18 @@ TEST_F(Test__GraphOrchestrator, MoveAssignment)
 // CollectiveContext Tests (NCCL/RCCL GPU Collectives Wiring)
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, SetCollectiveContext_NullByDefault)
+TEST_F(Test__DeviceGraphOrchestrator, SetCollectiveContext_NullByDefault)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // CollectiveContext should be null by default
     EXPECT_EQ(orchestrator->collectiveContext(), nullptr);
     EXPECT_FALSE(orchestrator->isGpuCollectivesEnabled());
 }
 
-TEST_F(Test__GraphOrchestrator, SetCollectiveContext_SetAndGet)
+TEST_F(Test__DeviceGraphOrchestrator, SetCollectiveContext_SetAndGet)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create a single-device context (doesn't require GPUs)
     auto ctx = CollectiveContextFactory::createSingleDevice();
@@ -386,9 +386,9 @@ TEST_F(Test__GraphOrchestrator, SetCollectiveContext_SetAndGet)
     EXPECT_TRUE(orchestrator->isGpuCollectivesEnabled());
 }
 
-TEST_F(Test__GraphOrchestrator, SetCollectiveContext_ClearWithNull)
+TEST_F(Test__DeviceGraphOrchestrator, SetCollectiveContext_ClearWithNull)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Set a context first
     auto ctx = CollectiveContextFactory::createSingleDevice();
@@ -401,9 +401,9 @@ TEST_F(Test__GraphOrchestrator, SetCollectiveContext_ClearWithNull)
     EXPECT_EQ(orchestrator->collectiveContext(), nullptr);
 }
 
-TEST_F(Test__GraphOrchestrator, SetCollectiveContext_ReplacesExisting)
+TEST_F(Test__DeviceGraphOrchestrator, SetCollectiveContext_ReplacesExisting)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Set first context
     auto ctx1 = CollectiveContextFactory::createSingleDevice();
@@ -423,9 +423,9 @@ TEST_F(Test__GraphOrchestrator, SetCollectiveContext_ReplacesExisting)
 // Weight Configuration Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
+TEST_F(Test__DeviceGraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create mock weights (don't need valid data, just pointers)
     Qwen2ModelWeights weights;
@@ -449,9 +449,9 @@ TEST_F(Test__GraphOrchestrator, SetWeightsDelegatesToGraphBuilder)
     EXPECT_TRUE(orchestrator->graphBuilder()->isInitialized());
 }
 
-TEST_F(Test__GraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
+TEST_F(Test__DeviceGraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create mock buffers
     Qwen2ModelBuffers buffers;
@@ -467,18 +467,18 @@ TEST_F(Test__GraphOrchestrator, SetBuffersDelegatesToGraphBuilder)
     EXPECT_NO_THROW(orchestrator->setBuffers(buffers));
 }
 
-TEST_F(Test__GraphOrchestrator, HasGlobalWeightsReturnsFalseWhenNotSet)
+TEST_F(Test__DeviceGraphOrchestrator, HasGlobalWeightsReturnsFalseWhenNotSet)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Before setting weights, hasGlobalWeights should return false
     // (isInitialized checks get_layer_weights callback)
     EXPECT_FALSE(orchestrator->hasGlobalWeights());
 }
 
-TEST_F(Test__GraphOrchestrator, HasGlobalWeightsReturnsTrueWhenSet)
+TEST_F(Test__DeviceGraphOrchestrator, HasGlobalWeightsReturnsTrueWhenSet)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Set up minimal weights with layer accessor
     Qwen2ModelWeights weights;
@@ -504,17 +504,17 @@ TEST_F(Test__GraphOrchestrator, HasGlobalWeightsReturnsTrueWhenSet)
 // Inference State Management Tests (Phase 5)
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, InferenceStateNotInitializedByDefault)
+TEST_F(Test__DeviceGraphOrchestrator, InferenceStateNotInitializedByDefault)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // State should not be initialized by default
     EXPECT_FALSE(orchestrator->hasInferenceState());
 }
 
-TEST_F(Test__GraphOrchestrator, InitializeInferenceStateSuccess)
+TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateSuccess)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Initialize state
     int batch_size = 2;
@@ -526,9 +526,9 @@ TEST_F(Test__GraphOrchestrator, InitializeInferenceStateSuccess)
     EXPECT_TRUE(orchestrator->hasInferenceState());
 }
 
-TEST_F(Test__GraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
+TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     int batch_size = 2;
     int max_seq_len = 64;
@@ -541,9 +541,9 @@ TEST_F(Test__GraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
     EXPECT_NE(orchestrator->logits(), nullptr);
 }
 
-TEST_F(Test__GraphOrchestrator, ClearInferenceStateResetsPositions)
+TEST_F(Test__DeviceGraphOrchestrator, ClearInferenceStateResetsPositions)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     int batch_size = 2;
     int max_seq_len = 64;
@@ -559,26 +559,26 @@ TEST_F(Test__GraphOrchestrator, ClearInferenceStateResetsPositions)
     EXPECT_EQ(orchestrator->getPosition(1), 0);
 }
 
-TEST_F(Test__GraphOrchestrator, GetPositionReturnsZeroForUninitializedState)
+TEST_F(Test__DeviceGraphOrchestrator, GetPositionReturnsZeroForUninitializedState)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Without initialized state, getPosition should return 0
     EXPECT_EQ(orchestrator->getPosition(0), 0);
     EXPECT_EQ(orchestrator->getPosition(99), 0); // Out of bounds also returns 0
 }
 
-TEST_F(Test__GraphOrchestrator, LogitsReturnsNullptrWhenNotInitialized)
+TEST_F(Test__DeviceGraphOrchestrator, LogitsReturnsNullptrWhenNotInitialized)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Without initialized state, logits() should return nullptr
     EXPECT_EQ(orchestrator->logits(), nullptr);
 }
 
-TEST_F(Test__GraphOrchestrator, ForwardFailsWithoutState)
+TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutState)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // forward() should fail without initialized state
     std::vector<int> tokens = {1, 2, 3};
@@ -587,9 +587,9 @@ TEST_F(Test__GraphOrchestrator, ForwardFailsWithoutState)
     EXPECT_EQ(result, nullptr);
 }
 
-TEST_F(Test__GraphOrchestrator, ForwardFailsWithoutWeights)
+TEST_F(Test__DeviceGraphOrchestrator, ForwardFailsWithoutWeights)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Initialize state but not weights
     ASSERT_TRUE(orchestrator->initializeInferenceState(1, 64, DeviceId::cpu()));
@@ -601,9 +601,9 @@ TEST_F(Test__GraphOrchestrator, ForwardFailsWithoutWeights)
     EXPECT_EQ(result, nullptr);
 }
 
-TEST_F(Test__GraphOrchestrator, InferenceStateMultipleBatches)
+TEST_F(Test__DeviceGraphOrchestrator, InferenceStateMultipleBatches)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     int batch_size = 4;
     int max_seq_len = 128;
@@ -621,12 +621,12 @@ TEST_F(Test__GraphOrchestrator, InferenceStateMultipleBatches)
 // KV Cache Layout Mode Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
+TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
 {
     // Create config with FP32 precision
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<GraphOrchestrator>(fp32_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(fp32_config, nullptr);
 
     // Initialize state
     int batch_size = 1;
@@ -643,12 +643,12 @@ TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
     EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
 }
 
-TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
+TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
 {
     // Create config with BF16 precision
     auto bf16_config = config_;
     bf16_config.activation_precision = ActivationPrecision::BF16;
-    auto orchestrator = std::make_unique<GraphOrchestrator>(bf16_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(bf16_config, nullptr);
 
     // Initialize state
     int batch_size = 1;
@@ -666,12 +666,12 @@ TEST_F(Test__GraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)
 }
 
 // HybridQ16 tests disabled - HybridQ16 project on hold (2025-01)
-TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_HybridQ16_UsesHeadMajor)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_KVCacheLayoutMode_HybridQ16_UsesHeadMajor)
 {
     // Create config with HybridQ16 precision - this resolves KV cache to Q16_1
     auto hybrid_config = config_;
     hybrid_config.activation_precision = ActivationPrecision::HybridQ16;
-    auto orchestrator = std::make_unique<GraphOrchestrator>(hybrid_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(hybrid_config, nullptr);
 
     // Initialize state
     int batch_size = 1;
@@ -689,12 +689,12 @@ TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_HybridQ16_UsesHeadMaj
 }
 
 // Hybrid tests disabled - HybridQ16 project on hold (2025-01)
-TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_Hybrid_UsesPositionMajor)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_KVCacheLayoutMode_Hybrid_UsesPositionMajor)
 {
     // Create config with Hybrid precision - KV cache should be BF16
     auto hybrid_config = config_;
     hybrid_config.activation_precision = ActivationPrecision::Hybrid;
-    auto orchestrator = std::make_unique<GraphOrchestrator>(hybrid_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(hybrid_config, nullptr);
 
     // Initialize state
     int batch_size = 1;
@@ -718,10 +718,10 @@ TEST_F(Test__GraphOrchestrator, DISABLED_KVCacheLayoutMode_Hybrid_UsesPositionMa
 // by execute(). These tests verify the behavior through the public execute() API.
 // Full workspace integration testing with actual GPU stages is in integration tests.
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_EmptyGraph_Succeeds)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_EmptyGraph_Succeeds)
 {
     // Test that executing an empty graph doesn't fail workspace allocation
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create empty graph
     ComputeGraph graph;
@@ -742,11 +742,11 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_EmptyGraph_Succeeds)
     EXPECT_TRUE(result);
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_IsIdempotent)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_IsIdempotent)
 {
     // Test that calling execute() multiple times doesn't fail
     // (workspace allocation should be a no-op after first call)
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
 
@@ -769,10 +769,10 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_IsIdempotent)
     EXPECT_EQ(result1, result2);
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_CPUOnlyGraph_NoGPUWorkspaceNeeded)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_CPUOnlyGraph_NoGPUWorkspaceNeeded)
 {
     // Test that CPU-only stages don't trigger GPU workspace allocation
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create graph with CPU device explicitly
     ComputeGraph graph;
@@ -805,7 +805,7 @@ namespace
      * @brief Mock IComputeStage that also implements IWorkspaceConsumer for testing
      *
      * Captures the dimension arguments (m, n, k) passed to getWorkspaceRequirements()
-     * for verifying that GraphOrchestrator uses correct model dimensions.
+     * for verifying that DeviceGraphOrchestrator uses correct model dimensions.
      */
     class MockWorkspaceConsumerStage : public IComputeStage, public IWorkspaceConsumer
     {
@@ -840,7 +840,7 @@ namespace
         // IWorkspaceConsumer interface
         WorkspaceRequirements getWorkspaceRequirements(int m, int n, int k) const override
         {
-            // Capture the dimensions passed by GraphOrchestrator
+            // Capture the dimensions passed by DeviceGraphOrchestrator
             last_m_ = m;
             last_n_ = n;
             last_k_ = k;
@@ -931,10 +931,10 @@ namespace
     };
 } // anonymous namespace
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
 {
     // Test that ensureDeviceWorkspaceAllocated() skips CPU stages
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create a graph with a mock workspace consumer on CPU device
     ComputeGraph graph;
@@ -958,10 +958,10 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
     EXPECT_FALSE(cpu_stage_ptr->wasBound());
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_SkipsNonWorkspaceConsumerStages)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsNonWorkspaceConsumerStages)
 {
     // Test that stages not implementing IWorkspaceConsumer are skipped
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
     auto simple_stage = std::make_unique<MockCPUOnlyStage>("simple_stage");
@@ -979,10 +979,10 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_SkipsNonWorkspaceConsumerSta
     EXPECT_TRUE(result);
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_CollectsGPUStageRequirements)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_CollectsGPUStageRequirements)
 {
     // Test that GPU stages (simulated) have their requirements collected
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
     // Create a stage with CUDA device
@@ -1007,11 +1007,11 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_CollectsGPUStageRequirements
     EXPECT_GE(gpu_stage_ptr->getRequirementsCallCount(), 0); // May be called depending on device availability
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_MergesRequirements_MaxSizeWins)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_MergesRequirements_MaxSizeWins)
 {
     // Test that when multiple stages on same device have requirements,
     // the merged requirements use max sizes
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
 
@@ -1039,10 +1039,10 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_MergesRequirements_MaxSizeWi
     EXPECT_GE(stage1_ptr->getRequirementsCallCount() + stage2_ptr->getRequirementsCallCount(), 0);
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_BindsWorkspaceToAllConsumers)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_BindsWorkspaceToAllConsumers)
 {
     // Test that workspace is bound to all consumers on a device
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
 
@@ -1073,10 +1073,10 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_BindsWorkspaceToAllConsumers
     }
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_HandlesGraphWithNoGPUStages)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_HandlesGraphWithNoGPUStages)
 {
     // Test that a graph with stages but none on GPU works correctly
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
 
@@ -1104,7 +1104,7 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_HandlesGraphWithNoGPUStages)
     EXPECT_FALSE(stage2_ptr->wasBound());
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_IdempotentAcrossMultipleExecutions)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_IdempotentAcrossMultipleExecutions)
 {
     // Test that workspace manager is created only once across multiple executions.
     // NOTE: bindWorkspace() IS called each time because each graph has new stage objects.
@@ -1116,7 +1116,7 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_IdempotentAcrossMultipleExec
         GTEST_SKIP() << "CUDA backend not available";
     }
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1148,10 +1148,10 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_IdempotentAcrossMultipleExec
         << "Same workspace manager should be reused across executions";
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_MultipleDevices_SeparateWorkspaces)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_MultipleDevices_SeparateWorkspaces)
 {
     // Test that different GPU devices get separate workspace managers
-    auto orchestrator = std::make_unique<GraphOrchestrator>(graph_builder_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     ComputeGraph graph;
 
@@ -1183,17 +1183,17 @@ TEST_F(Test__GraphOrchestrator, WorkspaceAllocation_MultipleDevices_SeparateWork
 // =============================================================================
 // Workspace Sizing Tests - Model Dimensions
 // =============================================================================
-// These tests verify that GraphOrchestrator correctly uses model dimensions
+// These tests verify that DeviceGraphOrchestrator correctly uses model dimensions
 // from the config to size workspace buffers. This is critical to prevent
 // crashes from undersized buffers during inference.
 
-TEST_F(Test__GraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
 {
     // Configure specific max_seq_len
     auto custom_config = config_;
     custom_config.max_seq_len = 2048; // Non-default value
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1215,19 +1215,19 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
 // NOTE: The following tests are DISABLED because they test an aspirational feature
 // (passing n_heads/head_dim to workspace consumers) that was never implemented.
 // The current implementation intentionally passes 0 for N/K, letting kernels
-// determine their own dimensions. See GraphOrchestrator.cpp line ~680:
+// determine their own dimensions. See DeviceGraphOrchestrator.cpp line ~680:
 //   "GEMM kernels: use max_seq_len for M, let kernel determine N/K"
 //
 // These tests should be re-enabled if/when this feature is implemented.
 // For now, they verify the actual API contract (M = max_seq_len, N/K = 0).
 
-TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_UsesActualNHeads)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_UsesActualNHeads)
 {
     // Configure specific n_heads
     auto custom_config = config_;
     custom_config.n_heads = 32; // Non-default value
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_attn", DeviceId::cuda(0), 4096);
@@ -1246,7 +1246,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_UsesActualNHeads)
     EXPECT_EQ(gpu_ptr->getLastN(), 32) << "n_heads should be passed as n dimension";
 }
 
-TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_CalculatesHeadDimFromModel)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_CalculatesHeadDimFromModel)
 {
     // Configure d_model and n_heads to verify head_dim calculation
     auto custom_config = config_;
@@ -1254,7 +1254,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_CalculatesHeadDimFromMo
     custom_config.n_heads = 32;
     // Expected head_dim = 4096 / 32 = 128
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_attn", DeviceId::cuda(0), 4096);
@@ -1273,7 +1273,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_CalculatesHeadDimFromMo
     EXPECT_EQ(gpu_ptr->getLastK(), 128) << "head_dim should be calculated as d_model / n_heads";
 }
 
-TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_AllDimensionsFromQwen2Config)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_AllDimensionsFromQwen2Config)
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
     // Test with a realistic Qwen2-0.5B configuration
@@ -1288,7 +1288,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_AllDimensionsFromQwen2C
     qwen_config.max_seq_len = 32768;
     qwen_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(qwen_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(qwen_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("qwen_gemm", DeviceId::cuda(0), 4096);
@@ -1309,7 +1309,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_AllDimensionsFromQwen2C
     EXPECT_EQ(gpu_ptr->getLastK(), 64) << "head_dim should be 64 for Qwen2-0.5B";
 }
 
-TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_LlamaStyleConfig)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LlamaStyleConfig)
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
     // Test with a Llama-style configuration (different head_dim)
@@ -1324,7 +1324,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_LlamaStyleConfig)
     llama_config.max_seq_len = 8192;
     llama_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(llama_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(llama_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("llama_gemm", DeviceId::cuda(0), 4096);
@@ -1351,13 +1351,13 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_LlamaStyleConfig)
 // These tests verify that the orchestrator handles edge cases gracefully
 // by falling back to reasonable defaults instead of crashing.
 
-TEST_F(Test__GraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
 {
     // Test fallback when max_seq_len is 0 (uninitialized)
     auto custom_config = config_;
     custom_config.max_seq_len = 0; // Should fallback to 4096
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1377,14 +1377,14 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
     EXPECT_EQ(gpu_ptr->getLastM(), 4096) << "max_seq_len=0 should fallback to 4096";
 }
 
-TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenNHeadsZero)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenNHeadsZero)
 {
     // DISABLED: Tests unimplemented feature (passing n_heads fallback to workspace consumers)
     // Test fallback when n_heads is 0 (uninitialized)
     auto custom_config = config_;
     custom_config.n_heads = 0; // Should fallback to 128
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1404,7 +1404,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenNHeadsZero)
     EXPECT_EQ(gpu_ptr->getLastN(), 128) << "n_heads=0 should fallback to 128";
 }
 
-TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenDModelZero)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenDModelZero)
 {
     // DISABLED: Tests unimplemented feature (passing head_dim fallback to workspace consumers)
     // Test fallback when d_model is 0 (affects head_dim calculation)
@@ -1412,7 +1412,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenDModelZero)
     custom_config.d_model = 0;
     custom_config.n_heads = 32;
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1432,7 +1432,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenDModelZero)
     EXPECT_EQ(gpu_ptr->getLastK(), 128) << "head_dim should fallback to 128 when d_model=0";
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceSizing_NoCrashOnNegativeValues)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_NoCrashOnNegativeValues)
 {
     // Test robustness against negative config values (should use fallbacks)
     auto custom_config = config_;
@@ -1440,7 +1440,7 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_NoCrashOnNegativeValues)
     custom_config.n_heads = -1;
     custom_config.d_model = -1;
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1466,9 +1466,9 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_NoCrashOnNegativeValues)
 // These tests verify that workspace allocation behaves correctly for different
 // device types (CPU, CUDA, ROCm).
 
-TEST_F(Test__GraphOrchestrator, WorkspaceSizing_CUDAStage_GetsDimensions)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CUDAStage_GetsDimensions)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     ComputeGraph graph;
     auto cuda_stage = std::make_unique<MockWorkspaceConsumerStage>("cuda_gemm", DeviceId::cuda(0), 4096);
@@ -1489,9 +1489,9 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_CUDAStage_GetsDimensions)
     EXPECT_GT(cuda_ptr->getLastM(), 0) << "CUDA stage should receive positive m dimension";
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     ComputeGraph graph;
     auto rocm_stage = std::make_unique<MockWorkspaceConsumerStage>("rocm_gemm", DeviceId::rocm(0), 4096);
@@ -1512,9 +1512,9 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
     EXPECT_GT(rocm_ptr->getLastM(), 0) << "ROCm stage should receive positive m dimension";
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     ComputeGraph graph;
     auto cpu_stage = std::make_unique<MockWorkspaceConsumerStage>("cpu_gemm", DeviceId::cpu(), 4096);
@@ -1534,7 +1534,7 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
         << "CPU stage should not have workspace bound";
 }
 
-TEST_F(Test__GraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWorkspace)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWorkspace)
 {
     // Skip if neither CUDA nor ROCm backend available
     const auto &dm = DeviceManager::instance();
@@ -1545,7 +1545,7 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWorkspace
         GTEST_SKIP() << "Neither CUDA nor ROCm backend available";
     }
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     ComputeGraph graph;
 
@@ -1596,11 +1596,11 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWorkspace
 // Workspace Sizing - Batch Size Handling for KV Cache
 // =============================================================================
 // KV cache consumers use batch_size instead of max_seq_len for workspace sizing.
-// This verifies the special-case handling in GraphOrchestrator.
+// This verifies the special-case handling in DeviceGraphOrchestrator.
 
-TEST_F(Test__GraphOrchestrator, WorkspaceSizing_UsesActualBatchSizeFromInferenceState)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualBatchSizeFromInferenceState)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // Initialize inference state with specific batch size
     const int batch_size = 8;
@@ -1623,7 +1623,7 @@ TEST_F(Test__GraphOrchestrator, WorkspaceSizing_UsesActualBatchSizeFromInference
 // =============================================================================
 // Test with large model configs to verify no overflow or allocation issues.
 
-TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_LargeModelConfig_NoOverflow)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LargeModelConfig_NoOverflow)
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
     // Large model configuration (e.g., 70B-scale)
@@ -1638,7 +1638,7 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_LargeModelConfig_NoOver
     large_config.max_seq_len = 131072; // 128K context
     large_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(large_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(large_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("large_gemm", DeviceId::cuda(0), 4096);
@@ -1665,15 +1665,15 @@ TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceSizing_LargeModelConfig_NoOver
 // =============================================================================
 // Note: Activation precision affects which kernels are used (e.g., FP32 vs BF16
 // vs Q8_1 GEMM) and thus which workspace requirements are generated. The actual
-// buffer sizing is determined by the kernel implementations, not GraphOrchestrator.
+// buffer sizing is determined by the kernel implementations, not DeviceGraphOrchestrator.
 // These tests verify the precision is correctly propagated to the orchestrator.
 
-TEST_F(Test__GraphOrchestrator, ActivationPrecision_FP32_WorkspaceAllocation)
+TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_FP32_WorkspaceAllocation)
 {
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::FP32;
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("fp32_gemm", DeviceId::cuda(0), 4096);
@@ -1690,12 +1690,12 @@ TEST_F(Test__GraphOrchestrator, ActivationPrecision_FP32_WorkspaceAllocation)
     EXPECT_TRUE(result);
 }
 
-TEST_F(Test__GraphOrchestrator, ActivationPrecision_BF16_WorkspaceAllocation)
+TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_BF16_WorkspaceAllocation)
 {
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::BF16;
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("bf16_gemm", DeviceId::cuda(0), 4096);
@@ -1712,12 +1712,12 @@ TEST_F(Test__GraphOrchestrator, ActivationPrecision_BF16_WorkspaceAllocation)
     EXPECT_TRUE(result);
 }
 
-TEST_F(Test__GraphOrchestrator, ActivationPrecision_Hybrid_WorkspaceAllocation)
+TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_Hybrid_WorkspaceAllocation)
 {
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::Hybrid;
 
-    auto orchestrator = std::make_unique<GraphOrchestrator>(custom_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(custom_config, nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("hybrid_gemm", DeviceId::cuda(0), 4096);
@@ -1740,10 +1740,10 @@ TEST_F(Test__GraphOrchestrator, ActivationPrecision_Hybrid_WorkspaceAllocation)
 // Verify that workspace dimensions are consistent across multiple executions
 // and that the same model config always produces the same workspace sizing.
 
-TEST_F(Test__GraphOrchestrator, DISABLED_WorkspaceConsistency_SameDimensionsAcrossExecutions)
+TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceConsistency_SameDimensionsAcrossExecutions)
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // First graph with workspace consumer
     ComputeGraph graph1;

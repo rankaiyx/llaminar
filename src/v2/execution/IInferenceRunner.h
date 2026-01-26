@@ -4,7 +4,7 @@
  * @author David Sanftenberg
  * @date December 2025
  *
- * Interface implemented by GraphOrchestrator for inference execution.
+ * Interface implemented by DeviceGraphOrchestrator for inference execution.
  */
 
 #pragma once
@@ -25,13 +25,13 @@ namespace llaminar2
     enum class ExecutionPath
     {
         PIPELINE, ///< Traditional imperative pipeline (Qwen2Pipeline)
-        GRAPH     ///< Graph-based execution (GraphOrchestrator)
+        GRAPH     ///< Graph-based execution (DeviceGraphOrchestrator)
     };
 
     /**
      * @brief Interface for inference execution
      *
-     * Implemented by GraphOrchestrator for transformer model inference.
+     * Implemented by DeviceGraphOrchestrator for transformer model inference.
      */
     class IInferenceRunner
     {
@@ -138,7 +138,7 @@ namespace llaminar2
         // =====================================================================
         // These methods have default no-op implementations for builds without
         // snapshot support. Override in Pipeline (with ENABLE_PIPELINE_SNAPSHOTS)
-        // or GraphOrchestrator (always available) for actual snapshot capture.
+        // or DeviceGraphOrchestrator (always available) for actual snapshot capture.
 
         /**
          * @brief Enable snapshot capture of intermediate activations

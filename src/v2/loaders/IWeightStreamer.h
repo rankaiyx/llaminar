@@ -16,7 +16,7 @@
  * - Zero-copy where possible using pinned memory
  *
  * Usage Pattern:
- *   1. GraphOrchestrator calls ensureLayerOnDevice() before executing layer stages
+ *   1. DeviceGraphOrchestrator calls ensureLayerOnDevice() before executing layer stages
  *   2. Streamer uploads weights if not cached, potentially evicting old layers
  *   3. prefetchLayer() called for next layer(s) to overlap with compute
  *   4. releaseLayer() hints that a layer is no longer needed this iteration
@@ -151,26 +151,26 @@ namespace llaminar2
     struct StreamingStats
     {
         // === Transfer Counts ===
-        uint64_t layers_transferred = 0;   ///< Total H2D layer transfers
-        uint64_t layers_evicted = 0;       ///< Total layers evicted from cache
-        uint64_t cache_hits = 0;           ///< Layer found in cache
-        uint64_t cache_misses = 0;         ///< Layer not in cache, transfer needed
-        uint64_t prefetch_hits = 0;        ///< Prefetched layer was used
-        uint64_t prefetch_wasted = 0;      ///< Prefetched layer evicted before use
+        uint64_t layers_transferred = 0; ///< Total H2D layer transfers
+        uint64_t layers_evicted = 0;     ///< Total layers evicted from cache
+        uint64_t cache_hits = 0;         ///< Layer found in cache
+        uint64_t cache_misses = 0;       ///< Layer not in cache, transfer needed
+        uint64_t prefetch_hits = 0;      ///< Prefetched layer was used
+        uint64_t prefetch_wasted = 0;    ///< Prefetched layer evicted before use
 
         // === Data Volume ===
-        uint64_t bytes_transferred = 0;    ///< Total bytes transferred H2D
-        uint64_t bytes_evicted = 0;        ///< Total bytes evicted from cache
+        uint64_t bytes_transferred = 0; ///< Total bytes transferred H2D
+        uint64_t bytes_evicted = 0;     ///< Total bytes evicted from cache
 
         // === Timing ===
-        std::chrono::nanoseconds total_transfer_time{0};     ///< Cumulative transfer time
-        std::chrono::nanoseconds total_wait_time{0};         ///< Time spent waiting for transfers
-        std::chrono::nanoseconds max_transfer_latency{0};    ///< Worst-case single transfer
+        std::chrono::nanoseconds total_transfer_time{0};  ///< Cumulative transfer time
+        std::chrono::nanoseconds total_wait_time{0};      ///< Time spent waiting for transfers
+        std::chrono::nanoseconds max_transfer_latency{0}; ///< Worst-case single transfer
 
         // === Cache State ===
-        size_t current_cache_size = 0;     ///< Current bytes in GPU cache
-        size_t peak_cache_size = 0;        ///< Maximum bytes ever in cache
-        size_t current_layers_cached = 0;  ///< Number of layers currently cached
+        size_t current_cache_size = 0;    ///< Current bytes in GPU cache
+        size_t peak_cache_size = 0;       ///< Maximum bytes ever in cache
+        size_t current_layers_cached = 0; ///< Number of layers currently cached
 
         // === Derived Metrics (computed on request) ===
 

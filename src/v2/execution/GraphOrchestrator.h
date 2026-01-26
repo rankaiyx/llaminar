@@ -1277,6 +1277,22 @@ namespace llaminar2
                         return;
                     }
 
+                    // Handle lm_head_allgather - store as LM_HEAD (overwrites partial output)
+                    // In TP mode, lm_head produces partial vocab logits, but parity tests expect
+                    // full vocab. The allgather output is the correct comparison point.
+                    if (name == "lm_head_allgather")
+                    {
+                        if (!dump.outputs.empty() && dump.outputs[0].data)
+                        {
+                            const auto &out = dump.outputs[0];
+                            auto data = extractFp32FromOutput(out);
+                            LOG_DEBUG("[Snapshot] lm_head_allgather handler: storing as LM_HEAD (overwriting partial), count=" << data.size());
+                            if (!data.empty())
+                                snapshots_["LM_HEAD"] = std::move(data); // Overwrite partial with full
+                        }
+                        return;
+                    }
+
                     // Standard single-output stages
                     LOG_DEBUG("[Snapshot] Standard path: stage=" << name
                                                                  << " outputs.size=" << dump.outputs.size()

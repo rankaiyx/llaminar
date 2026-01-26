@@ -6,7 +6,7 @@
  */
 
 #include "MultiDomainOrchestrator.h"
-#include "GraphOrchestrator.h"
+#include "DeviceGraphOrchestrator.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -93,8 +93,8 @@ namespace llaminar2
             LOG_DEBUG("No TP config provided, will use default (single domain)");
         }
 
-        // Create inner GraphOrchestrator
-        // Note: Full implementation would create Qwen2Graph and pass to GraphOrchestrator
+        // Create inner DeviceGraphOrchestrator
+        // Note: Full implementation would create Qwen2Graph and pass to DeviceGraphOrchestrator
         // For now, we require model loading which will be implemented in integration
         if (config_.model_path.empty())
         {
@@ -218,10 +218,10 @@ namespace llaminar2
         return inner_runner_.get();
     }
 
-    GraphOrchestrator *MultiDomainOrchestrator::getInnerOrchestrator() const
+    DeviceGraphOrchestrator *MultiDomainOrchestrator::getInnerOrchestrator() const
     {
-        // Dynamic cast to GraphOrchestrator - returns nullptr for mocks in tests
-        return dynamic_cast<GraphOrchestrator *>(inner_runner_.get());
+        // Dynamic cast to DeviceGraphOrchestrator - returns nullptr for mocks in tests
+        return dynamic_cast<DeviceGraphOrchestrator *>(inner_runner_.get());
     }
 
     // =============================================================================

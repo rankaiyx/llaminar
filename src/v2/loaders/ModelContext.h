@@ -108,7 +108,7 @@ namespace llaminar2
         const ModelLoader &concreteLoader() const { return loader_; }
 
         /**
-         * @brief Get weight tensor by name
+         * @brief Get weight tensor by name (shared instance)
          *
          * Loads from GGUF with appropriate distribution strategy.
          *
@@ -119,6 +119,21 @@ namespace llaminar2
         std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu()) override
         {
             return weight_manager_->getWeight(name, device);
+        }
+
+        /**
+         * @brief Get weight tensor for a specific device (device-isolated instance)
+         *
+         * For multi-device scenarios (LOCAL TP), each device needs its own tensor
+         * instance to track coherence state independently.
+         *
+         * @param name GGUF tensor name
+         * @param device Target device for this tensor instance
+         * @return Device-specific tensor instance, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> getWeightForDevice(const std::string &name, DeviceId device) override
+        {
+            return weight_manager_->getWeightForDevice(name, device);
         }
 
         /**
@@ -153,6 +168,7 @@ namespace llaminar2
         int headCountKV() const override { return static_cast<int>(loader_.headCountKV()); }
         int vocabSize() const override { return static_cast<int>(loader_.vocabSize()); }
         int contextLength() const override { return static_cast<int>(loader_.contextLength()); }
+        int feedForwardLength() const override { return static_cast<int>(loader_.feedForwardLength()); }
 
         /**
          * @brief Get weight placement map (Phase 6: Multi-GPU support)

@@ -518,7 +518,7 @@ namespace llaminar2
     /**
      * @brief Execution framework configuration group
      *
-     * Controls the Graph-based execution system (LayerExecutor / GraphOrchestrator).
+     * Controls the Graph-based execution system (LayerExecutor / DeviceGraphOrchestrator).
      * As of December 2025, the Graph execution system is the PRIMARY path.
      *
      * Environment Variables:

@@ -1,15 +1,15 @@
 /**
  * @file MultiDomainOrchestrator.h
- * @brief Multi-domain tensor parallelism wrapper for GraphOrchestrator
+ * @brief Multi-domain tensor parallelism wrapper for DeviceGraphOrchestrator
  * @author David Sanftenberg
  * @date January 2026
  *
- * MultiDomainOrchestrator wraps GraphOrchestrator to add multi-domain tensor
+ * MultiDomainOrchestrator wraps DeviceGraphOrchestrator to add multi-domain tensor
  * parallelism support. It manages MultiDomainTPConfig and delegates inference
  * operations to the inner orchestrator.
  *
  * Design:
- * - Wrapper pattern: Delegates IInferenceRunner methods to inner GraphOrchestrator
+ * - Wrapper pattern: Delegates IInferenceRunner methods to inner DeviceGraphOrchestrator
  * - Domain management: Owns MultiDomainTPConfig and NodeTopology
  * - Stats tracking: Collects domain-level collective operation statistics
  * - Testability: createForTest() allows injecting mock orchestrators
@@ -29,7 +29,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class GraphOrchestrator;
+    class DeviceGraphOrchestrator;
     class ICollectiveContext;
     class MPIContext;
 
@@ -61,9 +61,9 @@ namespace llaminar2
     };
 
     /**
-     * @brief Multi-domain tensor parallelism wrapper for GraphOrchestrator
+     * @brief Multi-domain tensor parallelism wrapper for DeviceGraphOrchestrator
      *
-     * This class wraps GraphOrchestrator to add multi-domain TP support:
+     * This class wraps DeviceGraphOrchestrator to add multi-domain TP support:
      * - GPU_INTRA_RANK domain for attention head parallelism via PCIeBAR
      * - CPU_CROSS_RANK domain for FFN parallelism via MPI/UPI
      *
@@ -94,7 +94,7 @@ namespace llaminar2
         /**
          * @brief Create orchestrator with full configuration
          *
-         * Creates the inner GraphOrchestrator and configures multi-domain TP
+         * Creates the inner DeviceGraphOrchestrator and configures multi-domain TP
          * based on system topology and MPI context.
          *
          * @param config Configuration options
@@ -210,10 +210,10 @@ namespace llaminar2
         IInferenceRunner *getInnerRunner() const;
 
         /**
-         * @brief Get the inner GraphOrchestrator (production use only)
-         * @return Pointer to inner orchestrator, or nullptr if inner is not GraphOrchestrator
+         * @brief Get the inner DeviceGraphOrchestrator (production use only)
+         * @return Pointer to inner orchestrator, or nullptr if inner is not DeviceGraphOrchestrator
          */
-        GraphOrchestrator *getInnerOrchestrator() const;
+        DeviceGraphOrchestrator *getInnerOrchestrator() const;
 
         // =========================================================================
         // Statistics

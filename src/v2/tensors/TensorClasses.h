@@ -878,6 +878,33 @@ namespace llaminar2
         bool isMapped() const { return is_mapped_; }
 
         /**
+         * @brief Check if tensor uses BAR-backed memory (PCIeBAR cross-vendor zero-copy)
+         * @return true if tensor data resides in AMD VRAM accessed via PCIe BAR
+         *
+         * When a tensor is BAR-backed:
+         * - Buffer physically resides in AMD VRAM (not system DRAM)
+         * - CUDA writes go directly to AMD VRAM via PCIe (~2.65 GB/s)
+         * - AMD accesses locally (full VRAM bandwidth)
+         * - Both CUDA and ROCm see the same physical memory
+         * - Host access via mmap (slow, uncached)
+         *
+         * See BARBackedTensor.h for detailed design documentation.
+         */
+        bool isBARBacked() const { return is_bar_backed_; }
+
+        /**
+         * @brief Get the ROCm-accessible pointer to tensor data
+         *
+         * For BAR-backed tensors, this returns a pointer that ROCm kernels can
+         * use to access the buffer as local VRAM. For non-BAR-backed tensors,
+         * returns nullptr.
+         *
+         * @return void* ROCm device pointer, or nullptr if not BAR-backed
+         */
+        void *rocm_data_ptr() { return bar_rocm_ptr_; }
+        const void *rocm_data_ptr() const { return bar_rocm_ptr_; }
+
+        /**
          * @brief Release GPU memory, keeping only host copy
          *
          * Downloads data to host if needed, then frees GPU buffer.
@@ -1418,6 +1445,52 @@ namespace llaminar2
          */
         void freeMappedMemory();
 
+        // ===== BAR-Backed Memory (PCIeBAR cross-vendor zero-copy) =====
+        // When a tensor uses BAR-backed memory:
+        // - Buffer physically resides in AMD VRAM (not system DRAM)
+        // - CUDA writes go directly to AMD VRAM via PCIe posted writes (~2.65 GB/s)
+        // - AMD accesses locally (full VRAM bandwidth ~900 GB/s)
+        // - Host access via mmap (O_SYNC, uncached, ~1-2 GB/s)
+        //
+        // Use for: allreduce output buffers, small communication buffers
+        // Don't use for: weight tensors, large activation tensors
+        //
+        // See BARBackedTensor.h for detailed design documentation.
+        bool is_bar_backed_ = false;          // True if using BAR-backed allocation
+        size_t bar_offset_ = 0;               // Offset within BAR region
+        size_t bar_size_ = 0;                 // Allocated size in BAR
+        void *bar_rocm_ptr_ = nullptr;        // ROCm-accessible pointer (mmap'd BAR = AMD VRAM)
+        void *bar_cuda_device_ptr_ = nullptr; // CUDA-accessible pointer (cuMemHostGetDevicePointer)
+        DeviceId bar_host_device_;            // ROCm device whose BAR hosts this buffer
+        DeviceId bar_accessor_device_;        // CUDA device with registered BAR access
+
+        // Forward declaration - PCIeBARBackend manages BAR allocations
+        // Pointer stored here for deallocation in destructor
+        class PCIeBARBackend *bar_backend_ = nullptr;
+
+        /**
+         * @brief Initialize BAR-backed memory for this tensor (protected helper)
+         *
+         * Allocates buffer within the BAR-mapped region of an AMD GPU's VRAM.
+         * The buffer is accessible by both CUDA (via registered IOMEMORY pointer)
+         * and ROCm (via direct local VRAM access).
+         *
+         * @param bytes Size in bytes to allocate
+         * @param cuda_device CUDA device that will write to this tensor
+         * @param rocm_device ROCm device whose BAR hosts this tensor
+         * @param backend PCIeBARBackend managing the BAR (must outlive tensor)
+         * @return true on success, false if allocation failed
+         *
+         * @note Called by derived class factories (e.g., FP32Tensor::createBARBacked)
+         */
+        bool initBARBackedMemory(size_t bytes, DeviceId cuda_device, DeviceId rocm_device,
+                                 class PCIeBARBackend *backend);
+
+        /**
+         * @brief Free BAR-backed memory if allocated (called by destructor)
+         */
+        void freeBARBackedMemory();
+
         // ===== Pinned Memory for Fast GPU Transfers =====
         // When host buffer is pinned (page-locked), hipMemcpy/cudaMemcpy can:
         // - Use DMA transfers instead of staging through internal buffers
@@ -1611,6 +1684,43 @@ namespace llaminar2
         static std::unique_ptr<FP32Tensor> createMapped(
             const std::vector<size_t> &shape,
             DeviceId target_device);
+
+        /**
+         * @brief Create a BAR-backed FP32Tensor for zero-copy PCIeBAR allreduce
+         *
+         * Allocates tensor data in AMD GPU VRAM via PCIe BAR mapping.
+         * CUDA kernels can write directly to this buffer via the BAR,
+         * and AMD kernels access it as local VRAM.
+         *
+         * **Memory model**:
+         * - Buffer physically resides in AMD VRAM (not system DRAM)
+         * - CUDA writes via PCIe posted writes (~2.65 GB/s on PCIe 3.0)
+         * - AMD accesses locally (full VRAM bandwidth ~900 GB/s)
+         * - Host access via mmap (slow, uncached ~1-2 GB/s)
+         *
+         * **Coherence model**:
+         * - Both CUDA and ROCm see the same physical memory
+         * - mark_device_dirty() sets flag, no copy needed
+         * - ensureOnDevice() is no-op for both CUDA and ROCm
+         *
+         * **Use for**: allreduce output buffers, small communication buffers
+         * **Don't use for**: weight tensors, large activation tensors
+         *
+         * @param shape Tensor dimensions
+         * @param cuda_device CUDA device that will write to this tensor
+         * @param rocm_device ROCm device whose BAR will host this tensor
+         * @param backend PCIeBARBackend managing the BAR (must outlive tensor)
+         * @return unique_ptr<FP32Tensor> with BAR-backed memory, or nullptr on failure
+         *
+         * @note Requires HAVE_CUDA && HAVE_ROCM
+         * @note Requires CAP_SYS_ADMIN for IOMEMORY registration
+         * @see BARBackedTensor.h for detailed design documentation
+         */
+        static std::unique_ptr<FP32Tensor> createBARBacked(
+            const std::vector<size_t> &shape,
+            DeviceId cuda_device,
+            DeviceId rocm_device,
+            class PCIeBARBackend *backend);
 
         ~FP32Tensor() override;
 

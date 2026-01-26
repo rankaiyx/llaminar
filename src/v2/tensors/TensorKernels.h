@@ -597,6 +597,17 @@ namespace llaminar2
             return false; // Default: no optimized fusion, uses sequential fallback
         }
 
+        /**
+         * @brief Prepare weights for efficient execution
+         *
+         * For CPU kernels: no-op (packing happens lazily in KernelFactory)
+         * For GPU kernels: converts to INT8 + uploads to device memory
+         *
+         * Call this during weight preloading to avoid first-use overhead.
+         * This is called by WeightManager::packGemmWeights() during preloading.
+         */
+        virtual void prepareWeights() {}
+
         // =====================================================================
         // Tensor-aware fused projection API (preferred for GPU execution)
         // =====================================================================

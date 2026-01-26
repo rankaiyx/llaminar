@@ -124,6 +124,13 @@ namespace llaminar2
         DeviceId tensor_device,
         CollectiveOp op)
     {
+        // Single-device: AllReduce is a no-op (nothing to reduce across)
+        if (!requiresCollectives())
+        {
+            LOG_DEBUG("CollectiveContext: Single-device allreduce is a no-op");
+            return true;
+        }
+
         if (!router_)
         {
             LOG_ERROR("CollectiveContext: No router available");
@@ -726,18 +733,22 @@ namespace llaminar2
             return executeAllreduce(buffer, count, tensor_device, op);
         }
 
-        if (!router_)
-        {
-            LOG_ERROR("CollectiveContext: No router available for domain-aware allreduce");
-            return false;
-        }
-
         // Skip trivial domains (size 1, no communication needed)
+        // Check this BEFORE checking for router - trivial domains don't need a router
         if (domain->isTrivial())
         {
             LOG_DEBUG("CollectiveContext::executeAllreduceInDomain: Domain '" << domain->name
                                                                               << "' is trivial (size=" << domain->domain_size << "), skipping");
             return true;
+        }
+
+        // Single-device contexts without a router can only handle trivial domains
+        if (!router_)
+        {
+            LOG_ERROR("CollectiveContext: No router available for domain-aware allreduce "
+                      "(domain '"
+                      << domain->name << "' has size " << domain->domain_size << ")");
+            return false;
         }
 
         // Use domain-aware backend selection

@@ -614,6 +614,22 @@ namespace llaminar
                     DeviceType dev_type = DeviceType::CPU);
 
                 /**
+                 * @brief Create fused Gate/Up GEMM kernel with explicit DeviceId
+                 *
+                 * Same as createFusedGateUpGemm but uses DeviceId to specify BOTH
+                 * the device type AND ordinal. Use for multi-GPU scenarios.
+                 *
+                 * @param w_gate Gate weight tensor
+                 * @param w_up Up weight tensor
+                 * @param target_device DeviceId specifying type and ordinal
+                 * @return Kernel instance (caller owns)
+                 */
+                static std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> createFusedGateUpGemm(
+                    const llaminar2::TensorBase *w_gate,
+                    const llaminar2::TensorBase *w_up,
+                    llaminar2::DeviceId target_device);
+
+                /**
                  * @brief Get or create cached fused Gate/Up GEMM kernel
                  *
                  * Maintains a cache of kernels keyed by (w_gate, w_up, device_type).
@@ -628,6 +644,25 @@ namespace llaminar
                     const llaminar2::TensorBase *w_gate,
                     const llaminar2::TensorBase *w_up,
                     DeviceType dev_type = DeviceType::CPU);
+
+                /**
+                 * @brief Get or create cached fused Gate/Up GEMM kernel with explicit DeviceId
+                 *
+                 * Same as getOrCreateFusedGateUpGemm but uses DeviceId to specify BOTH
+                 * the device type AND the device ordinal (e.g., ROCm:1 vs ROCm:0).
+                 * Use this when weights are on CPU but need to run on a specific GPU.
+                 *
+                 * @param w_gate Gate weight tensor
+                 * @param w_up Up weight tensor
+                 * @param target_device DeviceId specifying type and ordinal
+                 * @return Kernel pointer (factory owns lifetime)
+                 *
+                 * @note Cache key includes DeviceId, so different ordinals get different kernels
+                 */
+                static llaminar2::ITensorFusedGateUpGemm *getOrCreateFusedGateUpGemm(
+                    const llaminar2::TensorBase *w_gate,
+                    const llaminar2::TensorBase *w_up,
+                    llaminar2::DeviceId target_device);
 
                 // ==========================================================================
                 // RoPE Kernel Creation - Device-aware dispatch
@@ -1234,17 +1269,18 @@ namespace llaminar
 
                 static std::unordered_map<FusedQKVCacheKey, std::unique_ptr<llaminar2::ITensorFusedQKVGemm>, FusedQKVKeyHash> fused_qkv_cache_;
 
-                // Fused Gate/Up GEMM cache - keyed by (w_gate, w_up, device)
+                // Fused Gate/Up GEMM cache - keyed by (w_gate, w_up, device_id)
+                // Uses DeviceId (not just DeviceType) to support multi-GPU with different ordinals
                 struct FusedGateUpCacheKey
                 {
                     const llaminar2::TensorBase *w_gate;
                     const llaminar2::TensorBase *w_up;
-                    DeviceType device;
+                    llaminar2::DeviceId device_id; // Full device ID including ordinal
 
                     bool operator==(const FusedGateUpCacheKey &other) const
                     {
                         return w_gate == other.w_gate && w_up == other.w_up &&
-                               device == other.device;
+                               device_id == other.device_id;
                     }
                 };
 
@@ -1254,7 +1290,8 @@ namespace llaminar
                     {
                         return std::hash<const void *>()(k.w_gate) ^
                                (std::hash<const void *>()(k.w_up) << 1) ^
-                               (std::hash<int>()(static_cast<int>(k.device)) << 2);
+                               (std::hash<int>()(static_cast<int>(k.device_id.type)) << 2) ^
+                               (std::hash<int>()(k.device_id.ordinal) << 4);
                     }
                 };
 

@@ -1,5 +1,5 @@
 /**
- * @file GraphOrchestrator.cpp
+ * @file DeviceGraphOrchestrator.cpp
  * @brief Implementation of Qwen2 compute graph orchestrator
  * @author David Sanftenberg
  * @date December 2025
@@ -8,7 +8,7 @@
  * graph execution, device contexts, and caching.
  */
 
-#include "GraphOrchestrator.h"
+#include "DeviceGraphOrchestrator.h"
 #include "HybridPrecisionConfig.h"
 #include "DeviceWorkspaceManager.h"
 #include "WorkspaceDescriptor.h"
@@ -33,7 +33,7 @@ namespace llaminar2
     // Constructors
     // =========================================================================
 
-    GraphOrchestrator::GraphOrchestrator(
+    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
         Dependencies deps,
         const Qwen2GraphConfig &graph_config,
         const GraphCacheConfig &cache_config)
@@ -46,12 +46,12 @@ namespace llaminar2
     {
         if (!injected_model_ctx_)
         {
-            throw std::invalid_argument("GraphOrchestrator Dependencies requires a valid model_ctx");
+            throw std::invalid_argument("DeviceGraphOrchestrator Dependencies requires a valid model_ctx");
         }
 
         if (!graph_builder_)
         {
-            throw std::invalid_argument("GraphOrchestrator failed to create graph builder");
+            throw std::invalid_argument("DeviceGraphOrchestrator failed to create graph builder");
         }
 
         // Configure executor from graph builder's config
@@ -90,16 +90,16 @@ namespace llaminar2
         if (injected_collective_ctx_)
         {
             executor_.setCollectiveContext(injected_collective_ctx_.get());
-            LOG_INFO("[GraphOrchestrator] Wired CollectiveContext to GraphExecutor");
+            LOG_INFO("[DeviceGraphOrchestrator] Wired CollectiveContext to GraphExecutor");
         }
 
-        LOG_INFO("[GraphOrchestrator] Initialized with injected dependencies, caching="
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized with injected dependencies, caching="
                  << (cache_config_.enabled ? "enabled" : "disabled")
                  << ", topology=" << (injected_topology_ ? "provided" : "none")
                  << ", collective=" << (injected_collective_ctx_ ? "provided" : "none"));
     }
 
-    GraphOrchestrator::GraphOrchestrator(
+    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
         std::shared_ptr<Qwen2Graph> graph_builder,
         std::shared_ptr<MPIContext> mpi_ctx,
         const GraphCacheConfig &cache_config)
@@ -109,7 +109,7 @@ namespace llaminar2
     {
         if (!graph_builder_)
         {
-            throw std::invalid_argument("GraphOrchestrator requires a valid graph builder");
+            throw std::invalid_argument("DeviceGraphOrchestrator requires a valid graph builder");
         }
 
         // Configure executor from graph builder's config
@@ -144,11 +144,11 @@ namespace llaminar2
             executor_.setMPIRank(mpi_ctx_->rank());
         }
 
-        LOG_INFO("[GraphOrchestrator] Initialized with graph builder, caching="
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized with graph builder, caching="
                  << (cache_config_.enabled ? "enabled" : "disabled"));
     }
 
-    GraphOrchestrator::GraphOrchestrator(
+    DeviceGraphOrchestrator::DeviceGraphOrchestrator(
         const Qwen2GraphConfig &graph_config,
         std::shared_ptr<MPIContext> mpi_ctx,
         const GraphCacheConfig &cache_config)
@@ -160,7 +160,7 @@ namespace llaminar2
         // Duplicate initialization logic from the other constructor
         if (!graph_builder_)
         {
-            throw std::invalid_argument("GraphOrchestrator requires a valid graph builder");
+            throw std::invalid_argument("DeviceGraphOrchestrator requires a valid graph builder");
         }
 
         // Configure executor from graph builder's config
@@ -194,7 +194,7 @@ namespace llaminar2
             executor_.setMPIRank(mpi_ctx_->rank());
         }
 
-        LOG_INFO("[GraphOrchestrator] Initialized with graph builder, caching="
+        LOG_INFO("[DeviceGraphOrchestrator] Initialized with graph builder, caching="
                  << (cache_config_.enabled ? "enabled" : "disabled"));
     }
 
@@ -202,7 +202,7 @@ namespace llaminar2
     // Device Context Management
     // =========================================================================
 
-    IDeviceContext *GraphOrchestrator::getDeviceContext(DeviceId device)
+    IDeviceContext *DeviceGraphOrchestrator::getDeviceContext(DeviceId device)
     {
         auto it = device_contexts_.find(device);
         if (it != device_contexts_.end())
@@ -214,14 +214,14 @@ namespace llaminar2
         auto ctx = IDeviceContext::create(device);
         if (!ctx)
         {
-            LOG_ERROR("[GraphOrchestrator] Failed to create device context for device " << device.toString());
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to create device context for device " << device.toString());
             return nullptr;
         }
 
         IDeviceContext *raw_ptr = ctx.get();
         device_contexts_[device] = std::move(ctx);
 
-        LOG_DEBUG("[GraphOrchestrator] Created device context for device " << device.to_string());
+        LOG_DEBUG("[DeviceGraphOrchestrator] Created device context for device " << device.to_string());
         return raw_ptr;
     }
 
@@ -229,29 +229,29 @@ namespace llaminar2
     // Weight and Buffer Configuration
     // =========================================================================
 
-    void GraphOrchestrator::setWeights(const Qwen2ModelWeights &weights)
+    void DeviceGraphOrchestrator::setWeights(const Qwen2ModelWeights &weights)
     {
         if (!graph_builder_)
         {
-            LOG_ERROR("[GraphOrchestrator] Cannot set weights: graph builder not initialized");
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot set weights: graph builder not initialized");
             return;
         }
         graph_builder_->setWeights(weights);
-        LOG_DEBUG("[GraphOrchestrator] Model weights configured for full forward pass");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Model weights configured for full forward pass");
     }
 
-    void GraphOrchestrator::setBuffers(const Qwen2ModelBuffers &buffers)
+    void DeviceGraphOrchestrator::setBuffers(const Qwen2ModelBuffers &buffers)
     {
         if (!graph_builder_)
         {
-            LOG_ERROR("[GraphOrchestrator] Cannot set buffers: graph builder not initialized");
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot set buffers: graph builder not initialized");
             return;
         }
         graph_builder_->setBuffers(buffers);
-        LOG_DEBUG("[GraphOrchestrator] Model buffers configured for full forward pass");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Model buffers configured for full forward pass");
     }
 
-    bool GraphOrchestrator::hasGlobalWeights() const
+    bool DeviceGraphOrchestrator::hasGlobalWeights() const
     {
         if (!graph_builder_)
         {
@@ -267,22 +267,22 @@ namespace llaminar2
     // Graph Buffer Management (Phase 3 - moved from Qwen2Graph)
     // =========================================================================
 
-    bool GraphOrchestrator::initializeBuffers(int seq_len)
+    bool DeviceGraphOrchestrator::initializeBuffers(int seq_len)
     {
         if (!graph_builder_)
         {
-            LOG_ERROR("[GraphOrchestrator] initializeBuffers called but graph_builder not set");
+            LOG_ERROR("[DeviceGraphOrchestrator] initializeBuffers called but graph_builder not set");
             return false;
         }
 
         const auto &config = graph_builder_->config();
         if (!config.use_graph_buffer_management)
         {
-            LOG_WARN("[GraphOrchestrator] initializeBuffers called but use_graph_buffer_management=false");
+            LOG_WARN("[DeviceGraphOrchestrator] initializeBuffers called but use_graph_buffer_management=false");
             return false;
         }
 
-        LOG_INFO("[GraphOrchestrator] Initializing buffers with graph management, seq_len=" << seq_len);
+        LOG_INFO("[DeviceGraphOrchestrator] Initializing buffers with graph management, seq_len=" << seq_len);
 
         // Get schema and resolver config from graph builder
         GraphSchema schema = graph_builder_->getSchema();
@@ -291,7 +291,7 @@ namespace llaminar2
         // Verify TensorFactory is set
         if (!tensor_factory_)
         {
-            LOG_ERROR("[GraphOrchestrator] TensorFactory not set. Call setTensorFactory() before initializeBuffers()");
+            LOG_ERROR("[DeviceGraphOrchestrator] TensorFactory not set. Call setTensorFactory() before initializeBuffers()");
             return false;
         }
 
@@ -303,7 +303,7 @@ namespace llaminar2
         if (use_mapped)
         {
             buffer_config.use_mapped_memory = true;
-            LOG_INFO("[GraphOrchestrator] Enabling mapped memory for GPU + snapshot mode (zero-copy host access)");
+            LOG_INFO("[DeviceGraphOrchestrator] Enabling mapped memory for GPU + snapshot mode (zero-copy host access)");
         }
 
         // Create buffer manager with TensorFactory
@@ -318,7 +318,7 @@ namespace llaminar2
         {
             if (!buffer_manager_->allocateBuffer("layer", desc))
             {
-                LOG_ERROR("[GraphOrchestrator] Failed to allocate layer buffer: " << desc.name);
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate layer buffer: " << desc.name);
                 return false;
             }
         }
@@ -330,7 +330,7 @@ namespace llaminar2
         {
             if (!buffer_manager_->allocateBuffer("model", desc))
             {
-                LOG_ERROR("[GraphOrchestrator] Failed to allocate model buffer: " << desc.name);
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate model buffer: " << desc.name);
                 return false;
             }
         }
@@ -339,7 +339,7 @@ namespace llaminar2
         bindGraphManagedBuffers(seq_len);
 
         auto &stats = buffer_manager_->stats();
-        LOG_INFO("[GraphOrchestrator] Buffer initialization complete: "
+        LOG_INFO("[DeviceGraphOrchestrator] Buffer initialization complete: "
                  << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB, "
                  << "scratch=" << (stats.scratch_bytes / (1024.0 * 1024.0)) << " MB, "
                  << "output=" << (stats.output_bytes / (1024.0 * 1024.0)) << " MB");
@@ -347,7 +347,7 @@ namespace llaminar2
         // Log theoretical aliasing savings
         auto [original, optimized] = BufferAllocator::estimateMemorySavings(schema, resolver_config);
         double savings = (original > 0) ? 100.0 * (original - optimized) / original : 0.0;
-        LOG_INFO("[GraphOrchestrator] Theoretical aliasing savings: "
+        LOG_INFO("[DeviceGraphOrchestrator] Theoretical aliasing savings: "
                  << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
                  << " (" << savings << "% reduction)");
 
@@ -357,13 +357,13 @@ namespace llaminar2
         return true;
     }
 
-    void GraphOrchestrator::releaseBuffers()
+    void DeviceGraphOrchestrator::releaseBuffers()
     {
         if (buffer_manager_)
         {
             buffer_manager_->releaseAll();
             buffer_manager_.reset();
-            LOG_INFO("[GraphOrchestrator] Buffers released");
+            LOG_INFO("[DeviceGraphOrchestrator] Buffers released");
         }
 
         owned_buffers_.clear();
@@ -372,22 +372,22 @@ namespace llaminar2
         managed_buffers_ = Qwen2ModelBuffers{};
     }
 
-    Qwen2ActivationBuffers &GraphOrchestrator::getInternalBuffers()
+    Qwen2ActivationBuffers &DeviceGraphOrchestrator::getInternalBuffers()
     {
         return managed_buffers_.layer_buffers;
     }
 
-    const Qwen2ActivationBuffers &GraphOrchestrator::getInternalBuffers() const
+    const Qwen2ActivationBuffers &DeviceGraphOrchestrator::getInternalBuffers() const
     {
         return managed_buffers_.layer_buffers;
     }
 
-    const Qwen2ModelBuffers &GraphOrchestrator::getModelBuffers() const
+    const Qwen2ModelBuffers &DeviceGraphOrchestrator::getModelBuffers() const
     {
         return managed_buffers_;
     }
 
-    const BufferAllocationStats *GraphOrchestrator::bufferStats() const
+    const BufferAllocationStats *DeviceGraphOrchestrator::bufferStats() const
     {
         if (!buffer_manager_)
         {
@@ -396,13 +396,13 @@ namespace llaminar2
         return &buffer_manager_->stats();
     }
 
-    void GraphOrchestrator::bindGraphManagedBuffers(int seq_len)
+    void DeviceGraphOrchestrator::bindGraphManagedBuffers(int seq_len)
     {
         (void)seq_len; // May be used for validation in the future
 
         if (!buffer_manager_)
         {
-            LOG_ERROR("[GraphOrchestrator] bindGraphManagedBuffers: buffer_manager_ is null");
+            LOG_ERROR("[DeviceGraphOrchestrator] bindGraphManagedBuffers: buffer_manager_ is null");
             return;
         }
 
@@ -431,7 +431,7 @@ namespace llaminar2
         managed_buffers_.current_hidden = buffer_manager_->getBuffer("model", BufferNames::CURRENT_HIDDEN);
         managed_buffers_.logits = buffer_manager_->getBuffer("model", BufferNames::LOGITS);
 
-        LOG_DEBUG("[GraphOrchestrator] Bound graph-managed buffers: "
+        LOG_DEBUG("[DeviceGraphOrchestrator] Bound graph-managed buffers: "
                   << "residual=" << lb.residual
                   << " Q=" << lb.Q
                   << " gate=" << lb.gate
@@ -443,7 +443,7 @@ namespace llaminar2
     // Execution Methods
     // =========================================================================
 
-    bool GraphOrchestrator::executeForward(
+    bool DeviceGraphOrchestrator::executeForward(
         const Qwen2ForwardInput &input,
         Qwen2ForwardOutput &output)
     {
@@ -451,19 +451,19 @@ namespace llaminar2
 
         if (!input.token_ids && !input.batches)
         {
-            LOG_ERROR("[GraphOrchestrator] No token input provided");
+            LOG_ERROR("[DeviceGraphOrchestrator] No token input provided");
             return false;
         }
 
         if (input.seq_len <= 0)
         {
-            LOG_ERROR("[GraphOrchestrator] Invalid sequence length: " << input.seq_len);
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid sequence length: " << input.seq_len);
             return false;
         }
 
-        LOG_TRACE("[GraphOrchestrator] executeForward: batch_size=" << input.batch_size
-                                                                    << ", seq_len=" << input.seq_len
-                                                                    << ", device=" << input.device);
+        LOG_TRACE("[DeviceGraphOrchestrator] executeForward: batch_size=" << input.batch_size
+                                                                          << ", seq_len=" << input.seq_len
+                                                                          << ", device=" << input.device);
 
         // Build position IDs if not provided externally
         std::vector<int> position_ids_storage;
@@ -477,25 +477,25 @@ namespace llaminar2
         }
 
         // Build forward graph via declarative builder
-        LOG_DEBUG("[GraphOrchestrator] Building forward graph...");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Building forward graph...");
         ComputeGraph graph = graph_builder_->buildFullForwardGraph(effective_input, output);
-        LOG_DEBUG("[GraphOrchestrator] Forward graph built with " << graph.size() << " stages");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Forward graph built with " << graph.size() << " stages");
 
         if (graph.size() == 0)
         {
-            LOG_ERROR("[GraphOrchestrator] Empty forward graph");
+            LOG_ERROR("[DeviceGraphOrchestrator] Empty forward graph");
             return false;
         }
 
         // Get device context
-        LOG_DEBUG("[GraphOrchestrator] Getting device context for " << input.device << "...");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Getting device context for " << input.device << "...");
         IDeviceContext *ctx = getDeviceContext(input.device);
         if (!ctx)
         {
-            LOG_ERROR("[GraphOrchestrator] Failed to get device context");
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to get device context");
             return false;
         }
-        LOG_DEBUG("[GraphOrchestrator] Got device context, starting execution...");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Got device context, starting execution...");
 
         // Ensure GPU workspace is allocated for GEMM kernels (lazy initialization)
         ensureDeviceWorkspaceAllocated(graph);
@@ -506,19 +506,19 @@ namespace llaminar2
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
 
-        LOG_DEBUG("[GraphOrchestrator] Forward completed in " << ms << "ms, success=" << success);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Forward completed in " << ms << "ms, success=" << success);
 
         return success;
     }
 
-    bool GraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)
+    bool DeviceGraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)
     {
         // Ensure GPU workspace is allocated for GEMM kernels
         ensureDeviceWorkspaceAllocated(graph);
         return executor_.execute(graph, ctx);
     }
 
-    bool GraphOrchestrator::ensureDeviceWorkspaceAllocated(const ComputeGraph &graph)
+    bool DeviceGraphOrchestrator::ensureDeviceWorkspaceAllocated(const ComputeGraph &graph)
     {
         // This function has two responsibilities:
         // 1. Allocate workspace memory on GPU (one-time, expensive)
@@ -527,7 +527,7 @@ namespace llaminar2
         // The graph is rebuilt for each forward() call with new stage objects,
         // so we MUST bind workspace to every new graph's consumers.
 
-        LOG_DEBUG("[GraphOrchestrator] Ensuring device workspace for " << graph.size() << " stage graph");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Ensuring device workspace for " << graph.size() << " stage graph");
 
         // Get actual model dimensions from config (instead of hardcoded defaults)
         // This ensures workspace is sized appropriately for the loaded model
@@ -572,14 +572,14 @@ namespace llaminar2
         const size_t min_budget = 768ULL * 1024 * 1024;   // Floor at 768 MB for small models
         const size_t workspace_budget = std::max(min_budget, base_workspace + safety_margin);
 
-        LOG_DEBUG("[GraphOrchestrator] Workspace sizing: max_seq_len=" << actual_max_seq_len
-                                                                       << " n_heads=" << actual_n_heads << " head_dim=" << actual_head_dim
-                                                                       << " d_model=" << config.d_model << " vocab_size=" << actual_vocab_size
-                                                                       << " batch_size=" << actual_batch_size);
-        LOG_DEBUG("[GraphOrchestrator] Workspace budget: " << (workspace_budget / (1024 * 1024)) << " MB"
-                                                           << " (LM head: 3×" << (mn_buffer_size / (1024 * 1024)) << "MB M×N buffers"
-                                                           << ", embed_table_temp: " << (embed_table_temp / (1024 * 1024)) << "MB"
-                                                           << " @ max_seq_len=" << actual_max_seq_len << " × vocab_size=" << actual_vocab_size << ")");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Workspace sizing: max_seq_len=" << actual_max_seq_len
+                                                                             << " n_heads=" << actual_n_heads << " head_dim=" << actual_head_dim
+                                                                             << " d_model=" << config.d_model << " vocab_size=" << actual_vocab_size
+                                                                             << " batch_size=" << actual_batch_size);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Workspace budget: " << (workspace_budget / (1024 * 1024)) << " MB"
+                                                                 << " (LM head: 3×" << (mn_buffer_size / (1024 * 1024)) << "MB M×N buffers"
+                                                                 << ", embed_table_temp: " << (embed_table_temp / (1024 * 1024)) << "MB"
+                                                                 << " @ max_seq_len=" << actual_max_seq_len << " × vocab_size=" << actual_vocab_size << ")");
 
         // Collect all workspace-consuming stages by device
         // Track extra info for each consumer to customize workspace sizing
@@ -602,9 +602,9 @@ namespace llaminar2
             auto *consumer = dynamic_cast<IWorkspaceConsumer *>(node->stage.get());
 
             // Debug: log which nodes are workspace consumers
-            LOG_DEBUG("[GraphOrchestrator] Checking node '" << node_name
-                                                            << "' for workspace: consumer=" << (consumer ? "yes" : "no")
-                                                            << " device=" << node->device.toString());
+            LOG_DEBUG("[DeviceGraphOrchestrator] Checking node '" << node_name
+                                                                  << "' for workspace: consumer=" << (consumer ? "yes" : "no")
+                                                                  << " device=" << node->device.toString());
 
             if (!consumer)
                 continue;
@@ -635,7 +635,7 @@ namespace llaminar2
                     kv_info.consumer = kv_consumer;
                     kv_info.is_kv_cache = true;
                     consumers_by_device[kv_device].push_back(kv_info);
-                    LOG_DEBUG("[GraphOrchestrator] KV cache registered as workspace consumer on device "
+                    LOG_DEBUG("[DeviceGraphOrchestrator] KV cache registered as workspace consumer on device "
                               << kv_device.toString());
                 }
             }
@@ -643,7 +643,7 @@ namespace llaminar2
 
         if (consumers_by_device.empty())
         {
-            LOG_DEBUG("[GraphOrchestrator] No GPU workspace consumers found in graph");
+            LOG_DEBUG("[DeviceGraphOrchestrator] No GPU workspace consumers found in graph");
             return true;
         }
 
@@ -656,8 +656,8 @@ namespace llaminar2
             if (ws_it != device_workspaces_.end() && ws_it->second)
             {
                 // Workspace already allocated - just bind to new consumers
-                LOG_DEBUG("[GraphOrchestrator] Binding existing workspace on " << device.toString()
-                                                                               << " to " << consumers.size() << " consumers");
+                LOG_DEBUG("[DeviceGraphOrchestrator] Binding existing workspace on " << device.toString()
+                                                                                     << " to " << consumers.size() << " consumers");
                 for (const auto &info : consumers)
                 {
                     info.consumer->bindWorkspace(ws_it->second.get());
@@ -709,10 +709,10 @@ namespace llaminar2
                     workspace_k = 0;
                 }
 
-                LOG_DEBUG("[GraphOrchestrator] Consumer workspace params: is_kv=" << info.is_kv_cache
-                                                                                  << " is_embed=" << info.is_embedding
-                                                                                  << " is_attn=" << info.is_attention
-                                                                                  << " m=" << workspace_m << " n=" << workspace_n << " k=" << workspace_k);
+                LOG_DEBUG("[DeviceGraphOrchestrator] Consumer workspace params: is_kv=" << info.is_kv_cache
+                                                                                        << " is_embed=" << info.is_embedding
+                                                                                        << " is_attn=" << info.is_attention
+                                                                                        << " m=" << workspace_m << " n=" << workspace_n << " k=" << workspace_k);
 
                 auto reqs = info.consumer->getWorkspaceRequirements(workspace_m, workspace_n, workspace_k);
                 merged.merge(reqs);
@@ -720,7 +720,7 @@ namespace llaminar2
 
             if (merged.buffers.empty())
             {
-                LOG_DEBUG("[GraphOrchestrator] No workspace buffers needed for device " << device.toString());
+                LOG_DEBUG("[DeviceGraphOrchestrator] No workspace buffers needed for device " << device.toString());
                 continue;
             }
 
@@ -728,14 +728,14 @@ namespace llaminar2
             auto workspace = std::make_unique<DeviceWorkspaceManager>(device, workspace_budget);
             if (!workspace->allocate(merged))
             {
-                LOG_ERROR("[GraphOrchestrator] Failed to allocate workspace for device " << device.toString()
-                                                                                         << " (needed=" << merged.total_bytes_with_alignment()
-                                                                                         << ", budget=" << workspace_budget << ")");
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate workspace for device " << device.toString()
+                                                                                               << " (needed=" << merged.total_bytes_with_alignment()
+                                                                                               << ", budget=" << workspace_budget << ")");
                 return false;
             }
 
-            LOG_INFO("[GraphOrchestrator] Allocated " << (workspace->used() / (1024 * 1024)) << "MB workspace on "
-                                                      << device.toString() << " (" << merged.buffers.size() << " buffers)");
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated " << (workspace->used() / (1024 * 1024)) << "MB workspace on "
+                                                            << device.toString() << " (" << merged.buffers.size() << " buffers)");
 
             // Bind workspace to all consumers on this device
             for (const auto &info : consumers)
@@ -751,7 +751,7 @@ namespace llaminar2
         return true;
     }
 
-    bool GraphOrchestrator::executeAttention(
+    bool DeviceGraphOrchestrator::executeAttention(
         const Qwen2LayerWeights &layer,
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
@@ -790,7 +790,7 @@ namespace llaminar2
             // Check if we have a valid cached graph
             if (cache.attention_decode && cache.cached_seq_len == seq_len && cache.valid)
             {
-                LOG_DEBUG("[GraphOrchestrator] Reusing cached attention graph for layer "
+                LOG_DEBUG("[DeviceGraphOrchestrator] Reusing cached attention graph for layer "
                           << layer_idx << " (pos_offset=" << pos_offset << ")");
 
                 // Update dynamic parameters (position offset)
@@ -800,7 +800,7 @@ namespace llaminar2
                 bool success = executor_.execute(*cache.attention_decode, ctx);
                 if (!success)
                 {
-                    LOG_ERROR("[GraphOrchestrator] Cached attention graph failed at layer " << layer_idx);
+                    LOG_ERROR("[DeviceGraphOrchestrator] Cached attention graph failed at layer " << layer_idx);
                 }
 
                 cache.attention_decode->reset();
@@ -809,7 +809,7 @@ namespace llaminar2
             }
 
             // Build and cache the graph
-            LOG_DEBUG("[GraphOrchestrator] Building and caching attention graph for layer "
+            LOG_DEBUG("[DeviceGraphOrchestrator] Building and caching attention graph for layer "
                       << layer_idx << " (decode mode)");
 
             cache.attention_decode = std::make_unique<ComputeGraph>(
@@ -823,7 +823,7 @@ namespace llaminar2
             bool success = executor_.execute(*cache.attention_decode, ctx);
             if (!success)
             {
-                LOG_ERROR("[GraphOrchestrator] Attention block failed at layer " << layer_idx);
+                LOG_ERROR("[DeviceGraphOrchestrator] Attention block failed at layer " << layer_idx);
             }
 
             cache.attention_decode->reset();
@@ -863,13 +863,13 @@ namespace llaminar2
 
         if (!success)
         {
-            LOG_ERROR("[GraphOrchestrator] Attention block failed at layer " << layer_idx);
+            LOG_ERROR("[DeviceGraphOrchestrator] Attention block failed at layer " << layer_idx);
         }
 
         return success;
     }
 
-    bool GraphOrchestrator::executeFFN(
+    bool DeviceGraphOrchestrator::executeFFN(
         const Qwen2LayerWeights &layer,
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
@@ -895,13 +895,13 @@ namespace llaminar2
             // Check if we have a valid cached FFN graph
             if (cache.ffn_decode && cache.valid)
             {
-                LOG_DEBUG("[GraphOrchestrator] Reusing cached FFN graph for layer " << layer_idx);
+                LOG_DEBUG("[DeviceGraphOrchestrator] Reusing cached FFN graph for layer " << layer_idx);
 
                 // Execute cached graph (no params to update for FFN)
                 bool success = executor_.execute(*cache.ffn_decode, ctx);
                 if (!success)
                 {
-                    LOG_ERROR("[GraphOrchestrator] Cached FFN graph failed at layer " << layer_idx);
+                    LOG_ERROR("[DeviceGraphOrchestrator] Cached FFN graph failed at layer " << layer_idx);
                 }
 
                 cache.ffn_decode->reset();
@@ -910,7 +910,7 @@ namespace llaminar2
             }
 
             // Build and cache the graph
-            LOG_DEBUG("[GraphOrchestrator] Building and caching FFN graph for layer "
+            LOG_DEBUG("[DeviceGraphOrchestrator] Building and caching FFN graph for layer "
                       << layer_idx << " (decode mode)");
 
             cache.ffn_decode = std::make_unique<ComputeGraph>(
@@ -921,7 +921,7 @@ namespace llaminar2
             bool success = executor_.execute(*cache.ffn_decode, ctx);
             if (!success)
             {
-                LOG_ERROR("[GraphOrchestrator] FFN block failed at layer " << layer_idx);
+                LOG_ERROR("[DeviceGraphOrchestrator] FFN block failed at layer " << layer_idx);
             }
 
             cache.ffn_decode->reset();
@@ -939,13 +939,13 @@ namespace llaminar2
 
         if (!success)
         {
-            LOG_ERROR("[GraphOrchestrator] FFN block failed at layer " << layer_idx);
+            LOG_ERROR("[DeviceGraphOrchestrator] FFN block failed at layer " << layer_idx);
         }
 
         return success;
     }
 
-    bool GraphOrchestrator::executeLayer(
+    bool DeviceGraphOrchestrator::executeLayer(
         const Qwen2LayerWeights &layer,
         Qwen2ActivationBuffers &buffers,
         int layer_idx,
@@ -954,7 +954,7 @@ namespace llaminar2
         const int *position_ids,
         DeviceId device)
     {
-        LOG_INFO("[GraphOrchestrator::executeLayer] LAYER_EXEC_ENTERED layer_idx="
+        LOG_INFO("[DeviceGraphOrchestrator::executeLayer] LAYER_EXEC_ENTERED layer_idx="
                  << layer_idx << " seq_len=" << seq_len);
 
         // =====================================================================
@@ -968,7 +968,7 @@ namespace llaminar2
             // Ensure this layer's weights are on the target device
             if (!weight_streamer_->ensureLayerOnDevice(layer_idx, device))
             {
-                LOG_ERROR("[GraphOrchestrator::executeLayer] Failed to stream layer "
+                LOG_ERROR("[DeviceGraphOrchestrator::executeLayer] Failed to stream layer "
                           << layer_idx << " to device " << device.toString());
                 return false;
             }
@@ -978,7 +978,7 @@ namespace llaminar2
             if (layer_idx + 1 < n_layers)
             {
                 weight_streamer_->prefetchLayer(layer_idx + 1, device);
-                LOG_TRACE("[GraphOrchestrator::executeLayer] Prefetching layer " << (layer_idx + 1));
+                LOG_TRACE("[DeviceGraphOrchestrator::executeLayer] Prefetching layer " << (layer_idx + 1));
             }
         }
 
@@ -1008,7 +1008,7 @@ namespace llaminar2
         if (weight_streamer_)
         {
             weight_streamer_->releaseLayer(layer_idx);
-            LOG_TRACE("[GraphOrchestrator::executeLayer] Released layer " << layer_idx);
+            LOG_TRACE("[DeviceGraphOrchestrator::executeLayer] Released layer " << layer_idx);
         }
 
         return true;
@@ -1018,7 +1018,7 @@ namespace llaminar2
     // Cache Management
     // =========================================================================
 
-    void GraphOrchestrator::clearCache()
+    void DeviceGraphOrchestrator::clearCache()
     {
         // Clear graph caches
         for (auto &cache : layer_graph_cache_)
@@ -1035,10 +1035,10 @@ namespace llaminar2
         // Reset stats
         cache_stats_ = CacheStats{};
 
-        LOG_DEBUG("[GraphOrchestrator] All caches cleared");
+        LOG_DEBUG("[DeviceGraphOrchestrator] All caches cleared");
     }
 
-    void GraphOrchestrator::invalidateGraphCache(int layer_idx)
+    void DeviceGraphOrchestrator::invalidateGraphCache(int layer_idx)
     {
         if (layer_idx < 0)
         {
@@ -1048,16 +1048,16 @@ namespace llaminar2
                 cache.invalidate();
             }
             cache_stats_.cached_layers = 0;
-            LOG_DEBUG("[GraphOrchestrator] All layer graph caches invalidated");
+            LOG_DEBUG("[DeviceGraphOrchestrator] All layer graph caches invalidated");
         }
         else if (static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
         {
             layer_graph_cache_[layer_idx].invalidate();
-            LOG_DEBUG("[GraphOrchestrator] Layer " << layer_idx << " graph cache invalidated");
+            LOG_DEBUG("[DeviceGraphOrchestrator] Layer " << layer_idx << " graph cache invalidated");
         }
     }
 
-    bool GraphOrchestrator::hasValidCachedGraph(int layer_idx, bool is_attention) const
+    bool DeviceGraphOrchestrator::hasValidCachedGraph(int layer_idx, bool is_attention) const
     {
         if (!cache_config_.enabled)
             return false;
@@ -1071,7 +1071,7 @@ namespace llaminar2
         return is_attention ? (cache.attention_decode != nullptr) : (cache.ffn_decode != nullptr);
     }
 
-    void GraphOrchestrator::setGraphCachingEnabled(bool enabled)
+    void DeviceGraphOrchestrator::setGraphCachingEnabled(bool enabled)
     {
         if (cache_config_.enabled != enabled)
         {
@@ -1080,23 +1080,23 @@ namespace llaminar2
             {
                 invalidateGraphCache(-1);
             }
-            LOG_INFO("[GraphOrchestrator] Graph caching "
+            LOG_INFO("[DeviceGraphOrchestrator] Graph caching "
                      << (enabled ? "enabled" : "disabled"));
         }
     }
 
-    void GraphOrchestrator::initializeGraphCache(int n_layers)
+    void DeviceGraphOrchestrator::initializeGraphCache(int n_layers)
     {
         layer_graph_cache_.resize(n_layers);
         cache_stats_.cached_layers = n_layers;
-        LOG_DEBUG("[GraphOrchestrator] Graph cache initialized for " << n_layers << " layers");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Graph cache initialized for " << n_layers << " layers");
     }
 
     // =========================================================================
     // Inference State Management (Phase 5)
     // =========================================================================
 
-    bool GraphOrchestrator::initializeInferenceState(
+    bool DeviceGraphOrchestrator::initializeInferenceState(
         int batch_size,
         int max_seq_len,
         DeviceId device,
@@ -1104,7 +1104,7 @@ namespace llaminar2
     {
         if (!graph_builder_)
         {
-            LOG_ERROR("[GraphOrchestrator] Cannot initialize state: no graph builder");
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot initialize state: no graph builder");
             return false;
         }
 
@@ -1123,16 +1123,16 @@ namespace llaminar2
         int buffer_n_kv_heads = config.qkv_column_parallel ? config.local_n_kv_heads : n_kv_heads;
         int buffer_d_ff = config.ffn_column_parallel ? config.d_ff_local : d_ff;
 
-        LOG_DEBUG("[GraphOrchestrator] Initializing inference state: batch_size=" << batch_size
-                                                                                  << " max_seq_len=" << max_seq_len
-                                                                                  << " d_model=" << d_model
-                                                                                  << " vocab_size=" << vocab_size);
+        LOG_DEBUG("[DeviceGraphOrchestrator] Initializing inference state: batch_size=" << batch_size
+                                                                                        << " max_seq_len=" << max_seq_len
+                                                                                        << " d_model=" << d_model
+                                                                                        << " vocab_size=" << vocab_size);
 
         if (config.qkv_column_parallel)
         {
-            LOG_DEBUG("[GraphOrchestrator] Using local buffer sizes for TP: n_heads=" << buffer_n_heads
-                                                                                      << "/" << n_heads << " n_kv_heads=" << buffer_n_kv_heads << "/" << n_kv_heads
-                                                                                      << " d_ff=" << buffer_d_ff << "/" << d_ff);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Using local buffer sizes for TP: n_heads=" << buffer_n_heads
+                                                                                            << "/" << n_heads << " n_kv_heads=" << buffer_n_kv_heads << "/" << n_kv_heads
+                                                                                            << " d_ff=" << buffer_d_ff << "/" << d_ff);
         }
 
         // Create a default MPI context if none was provided
@@ -1141,7 +1141,7 @@ namespace llaminar2
         {
             // Create a single-rank MPI context for non-MPI usage
             local_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
-            LOG_DEBUG("[GraphOrchestrator] Created default single-rank MPI context");
+            LOG_DEBUG("[DeviceGraphOrchestrator] Created default single-rank MPI context");
         }
 
         // Create tensor factory
@@ -1153,12 +1153,12 @@ namespace llaminar2
         if (init_config.use_mapped_memory && device.is_gpu())
         {
             factory.setUseMappedMemoryForGPU(true);
-            LOG_DEBUG("[GraphOrchestrator] Enabling mapped memory for ALL GPU tensors (zero-copy host access)");
+            LOG_DEBUG("[DeviceGraphOrchestrator] Enabling mapped memory for ALL GPU tensors (zero-copy host access)");
         }
 
         // Get activation precision from config
         ActivationPrecision act_prec = config.activation_precision;
-        LOG_DEBUG("[GraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
+        LOG_DEBUG("[DeviceGraphOrchestrator] Activation buffer precision: " << activationPrecisionToString(act_prec));
 
         // Allocate core buffers (always FP32 - interface with embeddings/softmax)
         state_.hidden = factory.createFP32(
@@ -1173,7 +1173,7 @@ namespace llaminar2
             state_.logits = FP32Tensor::createMapped(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(vocab_size)},
                 device);
-            LOG_INFO("[GraphOrchestrator] Allocated logits with mapped memory (zero-copy for sampling)");
+            LOG_INFO("[DeviceGraphOrchestrator] Allocated logits with mapped memory (zero-copy for sampling)");
         }
         else
         {
@@ -1188,7 +1188,7 @@ namespace llaminar2
             state_.logits_local = factory.createFP32(
                 std::vector<size_t>{static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(config.vocab_local)},
                 device);
-            LOG_DEBUG("[GraphOrchestrator] Allocated logits_local buffer: ["
+            LOG_DEBUG("[DeviceGraphOrchestrator] Allocated logits_local buffer: ["
                       << batch_size * max_seq_len << ", " << config.vocab_local << "]");
         }
 
@@ -1201,7 +1201,7 @@ namespace llaminar2
         // HybridQ16 uses Q16_1 for 266× better precision than Q8_1 in the residual stream
         if (act_prec == ActivationPrecision::HybridQ16)
         {
-            LOG_INFO("[GraphOrchestrator] Using Q16_1 residual stream for HybridQ16 mode");
+            LOG_INFO("[DeviceGraphOrchestrator] Using Q16_1 residual stream for HybridQ16 mode");
             state_.residual = factory.createQ16_1(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
                 device);
@@ -1223,9 +1223,9 @@ namespace llaminar2
         ActivationPrecision v_prec = resolveBufferPrecision(
             act_prec, HybridBufferType::V_GEMM_Output, nullptr);
 
-        LOG_DEBUG("[GraphOrchestrator] QKV GEMM output precision: Q=" << activationPrecisionToString(q_prec)
-                                                                      << " K=" << activationPrecisionToString(k_prec)
-                                                                      << " V=" << activationPrecisionToString(v_prec));
+        LOG_DEBUG("[DeviceGraphOrchestrator] QKV GEMM output precision: Q=" << activationPrecisionToString(q_prec)
+                                                                            << " K=" << activationPrecisionToString(k_prec)
+                                                                            << " V=" << activationPrecisionToString(v_prec));
 
         state_.Q = factory.createActivation(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
@@ -1251,16 +1251,16 @@ namespace llaminar2
                 act_prec, HybridBufferType::Q_After_RoPE, nullptr);
             ActivationPrecision k_rope_prec = resolveBufferPrecision(
                 act_prec, HybridBufferType::K_After_RoPE, nullptr);
-            LOG_DEBUG("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                             << " mode: allocating Q_rope buffer ("
-                                             << activationPrecisionToString(q_rope_prec) << ")");
+            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                                   << " mode: allocating Q_rope buffer ("
+                                                   << activationPrecisionToString(q_rope_prec) << ")");
             // Pass head_dim for Q16 block size selection (must match KV cache block size)
             state_.Q_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
                 q_rope_prec, head_dim, device);
-            LOG_DEBUG("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                             << " mode: allocating K_rope buffer ("
-                                             << activationPrecisionToString(k_rope_prec) << ")");
+            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                                   << " mode: allocating K_rope buffer ("
+                                                   << activationPrecisionToString(k_rope_prec) << ")");
             state_.K_rope = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
                 k_rope_prec, head_dim, device);
@@ -1272,9 +1272,9 @@ namespace llaminar2
             state_.V_dequant = factory.createActivation(
                 {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_kv_heads * head_dim)},
                 kv_cache_prec, head_dim, device);
-            LOG_DEBUG("[GraphOrchestrator] " << activationPrecisionToString(act_prec)
-                                             << " mode: allocating V_dequant buffer ("
-                                             << activationPrecisionToString(kv_cache_prec) << ")");
+            LOG_DEBUG("[DeviceGraphOrchestrator] " << activationPrecisionToString(act_prec)
+                                                   << " mode: allocating V_dequant buffer ("
+                                                   << activationPrecisionToString(kv_cache_prec) << ")");
 
             // HybridQ16 K precision fix: allocate per-head K scales buffer
             // This stores dynamic scales from RoPE Q16→Q16 path for attention kernel
@@ -1282,7 +1282,7 @@ namespace llaminar2
             {
                 const size_t k_head_scales_size = static_cast<size_t>(batch_size * max_seq_len * buffer_n_kv_heads);
                 state_.K_head_scales.resize(k_head_scales_size, 1.0f);
-                LOG_DEBUG("[GraphOrchestrator] HybridQ16 K precision fix: allocating K_head_scales buffer ("
+                LOG_DEBUG("[DeviceGraphOrchestrator] HybridQ16 K precision fix: allocating K_head_scales buffer ("
                           << k_head_scales_size << " floats, "
                           << k_head_scales_size * sizeof(float) / 1024 << " KB)");
             }
@@ -1359,7 +1359,7 @@ namespace llaminar2
         state_.context_snapshot = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
             device);
-        LOG_DEBUG("[GraphOrchestrator] Allocated context_snapshot buffer: ["
+        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated context_snapshot buffer: ["
                   << batch_size * max_seq_len << ", " << buffer_n_heads * head_dim << "]");
 
         // Allocate attention output snapshot buffer (Wo projection result, before residual)
@@ -1367,7 +1367,7 @@ namespace llaminar2
         state_.attention_output_snapshot = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device);
-        LOG_DEBUG("[GraphOrchestrator] Allocated attention_output_snapshot buffer: ["
+        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated attention_output_snapshot buffer: ["
                   << batch_size * max_seq_len << ", " << d_model << "]");
 
         // Allocate attention residual snapshot buffer (after residual add)
@@ -1375,7 +1375,7 @@ namespace llaminar2
         state_.attention_residual_snapshot = factory.createFP32(
             {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
             device);
-        LOG_DEBUG("[GraphOrchestrator] Allocated attention_residual_snapshot buffer: ["
+        LOG_DEBUG("[DeviceGraphOrchestrator] Allocated attention_residual_snapshot buffer: ["
                   << batch_size * max_seq_len << ", " << d_model << "]");
 #endif
 
@@ -1384,7 +1384,7 @@ namespace llaminar2
         // For Hybrid mode: KV cache uses BF16 (better than Q8_1, 2x compression)
         ActivationPrecision kv_cache_prec = resolveBufferPrecision(
             act_prec, HybridBufferType::KV_Cache, nullptr);
-        LOG_DEBUG("[GraphOrchestrator] KV cache precision: " << activationPrecisionToString(kv_cache_prec));
+        LOG_DEBUG("[DeviceGraphOrchestrator] KV cache precision: " << activationPrecisionToString(kv_cache_prec));
 
         // Determine KV cache layout mode:
         // - Q16_1 precision requires HEAD_MAJOR layout for Q16IntegerAttention kernel
@@ -1392,7 +1392,7 @@ namespace llaminar2
         KVCacheLayoutMode kv_layout_mode = (kv_cache_prec == ActivationPrecision::Q16_1)
                                                ? KVCacheLayoutMode::HEAD_MAJOR
                                                : KVCacheLayoutMode::POSITION_MAJOR;
-        LOG_DEBUG("[GraphOrchestrator] KV cache layout mode: "
+        LOG_DEBUG("[DeviceGraphOrchestrator] KV cache layout mode: "
                   << (kv_layout_mode == KVCacheLayoutMode::HEAD_MAJOR ? "HEAD_MAJOR" : "POSITION_MAJOR"));
 
         // Build KVCacheConfig for factory
@@ -1414,7 +1414,7 @@ namespace llaminar2
             kv_config.local_n_kv_heads = config.local_n_kv_heads;
             kv_config.kv_head_start = mpi_ctx_->rank() * config.local_n_kv_heads;
 
-            LOG_DEBUG("[GraphOrchestrator] Creating sharded KV cache: "
+            LOG_DEBUG("[DeviceGraphOrchestrator] Creating sharded KV cache: "
                       << n_kv_heads << " total KV heads, "
                       << config.local_n_kv_heads << " local KV heads (start=" << kv_config.kv_head_start << ")"
                       << " precision=" << activationPrecisionToString(kv_cache_prec));
@@ -1434,40 +1434,40 @@ namespace llaminar2
         state_.vocab_size = vocab_size;
         state_.device_id = device;
 
-        LOG_DEBUG("[GraphOrchestrator] Inference state initialized successfully");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state initialized successfully");
         return true;
     }
 
-    const float *GraphOrchestrator::forward(
+    const float *DeviceGraphOrchestrator::forward(
         const int *tokens,
         int seq_len,
         int batch_size)
     {
         if (!state_.isInitialized())
         {
-            LOG_ERROR("[GraphOrchestrator] forward() called without initialized state");
+            LOG_ERROR("[DeviceGraphOrchestrator] forward() called without initialized state");
             return nullptr;
         }
 
         if (!hasGlobalWeights())
         {
-            LOG_ERROR("[GraphOrchestrator] forward() called without global weights set");
+            LOG_ERROR("[DeviceGraphOrchestrator] forward() called without global weights set");
             return nullptr;
         }
 
         if (batch_size > state_.batch_size)
         {
-            LOG_ERROR("[GraphOrchestrator] Batch size " << batch_size
-                                                        << " exceeds initialized batch size " << state_.batch_size);
+            LOG_ERROR("[DeviceGraphOrchestrator] Batch size " << batch_size
+                                                              << " exceeds initialized batch size " << state_.batch_size);
             return nullptr;
         }
 
         int total_tokens = batch_size * seq_len;
         if (total_tokens > state_.batch_size * state_.max_seq_len)
         {
-            LOG_ERROR("[GraphOrchestrator] Total tokens " << total_tokens
-                                                          << " exceeds buffer capacity "
-                                                          << state_.batch_size * state_.max_seq_len);
+            LOG_ERROR("[DeviceGraphOrchestrator] Total tokens " << total_tokens
+                                                                << " exceeds buffer capacity "
+                                                                << state_.batch_size * state_.max_seq_len);
             return nullptr;
         }
 
@@ -1571,7 +1571,7 @@ namespace llaminar2
 
         if (!success)
         {
-            LOG_ERROR("[GraphOrchestrator] forward() execution failed");
+            LOG_ERROR("[DeviceGraphOrchestrator] forward() execution failed");
             return nullptr;
         }
 
@@ -1586,7 +1586,7 @@ namespace llaminar2
         return state_.logits->fp32_data();
     }
 
-    const float *GraphOrchestrator::logits() const
+    const float *DeviceGraphOrchestrator::logits() const
     {
         if (!state_.logits)
         {
@@ -1599,19 +1599,19 @@ namespace llaminar2
     // Batch Interface Implementation
     // =========================================================================
 
-    bool GraphOrchestrator::forward_batch(const std::vector<std::vector<int>> &token_batches)
+    bool DeviceGraphOrchestrator::forward_batch(const std::vector<std::vector<int>> &token_batches)
     {
         if (token_batches.empty())
         {
-            LOG_ERROR("[GraphOrchestrator] forward_batch() called with empty batch");
+            LOG_ERROR("[DeviceGraphOrchestrator] forward_batch() called with empty batch");
             return false;
         }
 
         int batch_size = static_cast<int>(token_batches.size());
         if (batch_size > state_.batch_size)
         {
-            LOG_ERROR("[GraphOrchestrator] Batch size " << batch_size
-                                                        << " exceeds initialized batch size " << state_.batch_size);
+            LOG_ERROR("[DeviceGraphOrchestrator] Batch size " << batch_size
+                                                              << " exceeds initialized batch size " << state_.batch_size);
             return false;
         }
 
@@ -1659,7 +1659,7 @@ namespace llaminar2
         return result != nullptr;
     }
 
-    const float *GraphOrchestrator::getLogits(int seq_idx) const
+    const float *DeviceGraphOrchestrator::getLogits(int seq_idx) const
     {
         if (!state_.logits)
         {
@@ -1668,8 +1668,8 @@ namespace llaminar2
 
         if (seq_idx < 0 || seq_idx >= state_.batch_size)
         {
-            LOG_ERROR("[GraphOrchestrator] Invalid sequence index " << seq_idx
-                                                                    << " (batch_size=" << state_.batch_size << ")");
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid sequence index " << seq_idx
+                                                                          << " (batch_size=" << state_.batch_size << ")");
             return nullptr;
         }
 
@@ -1685,7 +1685,7 @@ namespace llaminar2
         return base + (seq_idx * padded_seq_len_ * state_.vocab_size);
     }
 
-    int GraphOrchestrator::getPosition(int seq_idx) const
+    int DeviceGraphOrchestrator::getPosition(int seq_idx) const
     {
         if (seq_idx < 0 || static_cast<size_t>(seq_idx) >= state_.positions.size())
         {
@@ -1694,17 +1694,17 @@ namespace llaminar2
         return state_.positions[seq_idx];
     }
 
-    void GraphOrchestrator::clearInferenceState()
+    void DeviceGraphOrchestrator::clearInferenceState()
     {
         state_.clear();
-        LOG_DEBUG("[GraphOrchestrator] Inference state cleared");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared");
     }
 
     // =========================================================================
     // Private Helpers
     // =========================================================================
 
-    void GraphOrchestrator::updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len)
+    void DeviceGraphOrchestrator::updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len)
     {
         // Update all stages in the graph that have dynamic parameters
         auto order = graph.getExecutionOrder();
@@ -1720,11 +1720,11 @@ namespace llaminar2
             node->stage->updateDynamicParams(pos_offset, seq_len);
         }
 
-        LOG_TRACE("[GraphOrchestrator] Updated cached graph params: pos_offset="
+        LOG_TRACE("[DeviceGraphOrchestrator] Updated cached graph params: pos_offset="
                   << pos_offset << " seq_len=" << seq_len);
     }
 
-    bool GraphOrchestrator::canUseCachedGraph(int layer_idx, int seq_len) const
+    bool DeviceGraphOrchestrator::canUseCachedGraph(int layer_idx, int seq_len) const
     {
         if (!cache_config_.enabled)
             return false;
@@ -1739,29 +1739,29 @@ namespace llaminar2
     // Phase-Aware Weight Access (Gap 3 - CPU Decode Participation)
     // =========================================================================
 
-    void GraphOrchestrator::setWeightManager(std::shared_ptr<WeightManager> weight_manager)
+    void DeviceGraphOrchestrator::setWeightManager(std::shared_ptr<WeightManager> weight_manager)
     {
         weight_manager_ = std::move(weight_manager);
-        LOG_DEBUG("[GraphOrchestrator] WeightManager set");
+        LOG_DEBUG("[DeviceGraphOrchestrator] WeightManager set");
     }
 
-    void GraphOrchestrator::setWeightPlacementMap(std::shared_ptr<WeightPlacementMap> placement_map)
+    void DeviceGraphOrchestrator::setWeightPlacementMap(std::shared_ptr<WeightPlacementMap> placement_map)
     {
         weight_placement_map_ = std::move(placement_map);
-        LOG_DEBUG("[GraphOrchestrator] WeightPlacementMap set");
+        LOG_DEBUG("[DeviceGraphOrchestrator] WeightPlacementMap set");
     }
 
     // =========================================================================
     // Tensor Parallel Configuration (Phase 1c: Proportional TP)
     // =========================================================================
 
-    void GraphOrchestrator::setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config)
+    void DeviceGraphOrchestrator::setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config)
     {
         tp_config_ = std::move(config);
 
         if (tp_config_)
         {
-            LOG_INFO("[GraphOrchestrator] TensorParallelConfig set: "
+            LOG_INFO("[DeviceGraphOrchestrator] TensorParallelConfig set: "
                      << "world_size=" << tp_config_->worldSize()
                      << ", proportional=" << (tp_config_->isProportional() ? "yes" : "no"));
 
@@ -1770,12 +1770,12 @@ namespace llaminar2
             {
                 // Note: The graph builder's config is read-only after construction,
                 // but we store the tp_config for use in buffer allocation and KV cache creation
-                LOG_DEBUG("[GraphOrchestrator] TensorParallelConfig will be used for buffer sizing");
+                LOG_DEBUG("[DeviceGraphOrchestrator] TensorParallelConfig will be used for buffer sizing");
             }
         }
         else
         {
-            LOG_DEBUG("[GraphOrchestrator] TensorParallelConfig cleared");
+            LOG_DEBUG("[DeviceGraphOrchestrator] TensorParallelConfig cleared");
         }
     }
 
@@ -1783,13 +1783,13 @@ namespace llaminar2
     // Multi-Domain Tensor Parallel Configuration (Phase 6.3: Heterogeneous TP)
     // =========================================================================
 
-    void GraphOrchestrator::setDomainConfig(std::shared_ptr<MultiDomainTPConfig> config)
+    void DeviceGraphOrchestrator::setDomainConfig(std::shared_ptr<MultiDomainTPConfig> config)
     {
         domain_config_ = std::move(config);
 
         if (domain_config_)
         {
-            LOG_INFO("[GraphOrchestrator] MultiDomainTPConfig set: "
+            LOG_INFO("[DeviceGraphOrchestrator] MultiDomainTPConfig set: "
                      << "domains=" << domain_config_->domains().size()
                      << ", has_gpu=" << (domain_config_->gpuDomain() ? "yes" : "no")
                      << ", has_cpu=" << (domain_config_->cpuDomain() ? "yes" : "no")
@@ -1800,16 +1800,16 @@ namespace llaminar2
             {
                 // Graph builder can access domain config through config_.multi_domain_tp_config
                 // Note: The graph builder uses getDomainForLayer() which delegates to this config
-                LOG_DEBUG("[GraphOrchestrator] Domain config available for AllreduceStage routing");
+                LOG_DEBUG("[DeviceGraphOrchestrator] Domain config available for AllreduceStage routing");
             }
         }
         else
         {
-            LOG_DEBUG("[GraphOrchestrator] MultiDomainTPConfig cleared (legacy MPI path)");
+            LOG_DEBUG("[DeviceGraphOrchestrator] MultiDomainTPConfig cleared (legacy MPI path)");
         }
     }
 
-    const TPDomain *GraphOrchestrator::getDomainForLayer(int layer_idx, bool is_attention) const
+    const TPDomain *DeviceGraphOrchestrator::getDomainForLayer(int layer_idx, bool is_attention) const
     {
         if (!domain_config_)
         {
@@ -1818,28 +1818,28 @@ namespace llaminar2
 
         const TPDomain *domain = domain_config_->domainForLayer(layer_idx, is_attention);
 
-        LOG_DEBUG("[GraphOrchestrator] getDomainForLayer: layer=" << layer_idx
-                                                                  << ", is_attention=" << (is_attention ? "true" : "false")
-                                                                  << " -> domain=" << (domain ? domain->name : "nullptr"));
+        LOG_DEBUG("[DeviceGraphOrchestrator] getDomainForLayer: layer=" << layer_idx
+                                                                        << ", is_attention=" << (is_attention ? "true" : "false")
+                                                                        << " -> domain=" << (domain ? domain->name : "nullptr"));
 
         return domain;
     }
 
-    void GraphOrchestrator::transitionToPhase(InferencePhase phase)
+    void DeviceGraphOrchestrator::transitionToPhase(InferencePhase phase)
     {
         if (current_phase_ != phase)
         {
             InferencePhase old_phase = current_phase_;
             current_phase_ = phase;
 
-            LOG_DEBUG("[GraphOrchestrator] Phase transition: " << toString(old_phase)
-                                                               << " -> " << toString(phase));
+            LOG_DEBUG("[DeviceGraphOrchestrator] Phase transition: " << toString(old_phase)
+                                                                     << " -> " << toString(phase));
 
             // Notify weight streamer of phase transition (if streaming is enabled)
             if (weight_streamer_)
             {
                 weight_streamer_->onPhaseTransition(old_phase, phase);
-                LOG_DEBUG("[GraphOrchestrator] Weight streamer notified of phase transition");
+                LOG_DEBUG("[DeviceGraphOrchestrator] Weight streamer notified of phase transition");
             }
         }
     }
@@ -1848,55 +1848,55 @@ namespace llaminar2
     // Weight Streaming (Option B)
     // =========================================================================
 
-    void GraphOrchestrator::setWeightStreamer(std::shared_ptr<IWeightStreamer> streamer)
+    void DeviceGraphOrchestrator::setWeightStreamer(std::shared_ptr<IWeightStreamer> streamer)
     {
         weight_streamer_ = std::move(streamer);
         if (weight_streamer_)
         {
-            LOG_DEBUG("[GraphOrchestrator] Weight streaming enabled");
+            LOG_DEBUG("[DeviceGraphOrchestrator] Weight streaming enabled");
         }
         else
         {
-            LOG_DEBUG("[GraphOrchestrator] Weight streaming disabled");
+            LOG_DEBUG("[DeviceGraphOrchestrator] Weight streaming disabled");
         }
     }
 
-    bool GraphOrchestrator::isWeightStreamingEnabled() const
+    bool DeviceGraphOrchestrator::isWeightStreamingEnabled() const
     {
         return weight_streamer_ != nullptr;
     }
 
-    void GraphOrchestrator::setCollectiveContext(std::shared_ptr<ICollectiveContext> collective_ctx)
+    void DeviceGraphOrchestrator::setCollectiveContext(std::shared_ptr<ICollectiveContext> collective_ctx)
     {
         injected_collective_ctx_ = std::move(collective_ctx);
         if (injected_collective_ctx_)
         {
             // Wire to executor for GPU-native collective interception
             executor_.setCollectiveContext(injected_collective_ctx_.get());
-            LOG_INFO("[GraphOrchestrator] GPU-native collectives enabled via CollectiveContext");
+            LOG_INFO("[DeviceGraphOrchestrator] GPU-native collectives enabled via CollectiveContext");
         }
         else
         {
             executor_.setCollectiveContext(nullptr);
-            LOG_DEBUG("[GraphOrchestrator] CollectiveContext cleared - using CPU MPI fallback");
+            LOG_DEBUG("[DeviceGraphOrchestrator] CollectiveContext cleared - using CPU MPI fallback");
         }
     }
 
-    std::shared_ptr<TensorBase> GraphOrchestrator::getPhaseAwareWeight(
+    std::shared_ptr<TensorBase> DeviceGraphOrchestrator::getPhaseAwareWeight(
         const std::string &name,
         int layer_idx,
         InferencePhase phase) const
     {
         if (!weight_manager_)
         {
-            LOG_ERROR("[GraphOrchestrator::getPhaseAwareWeight] WeightManager not set");
+            LOG_ERROR("[DeviceGraphOrchestrator::getPhaseAwareWeight] WeightManager not set");
             return nullptr;
         }
 
         // PREFILL phase: Always use full weight (GPU is primary, compute-bound)
         if (phase == InferencePhase::PREFILL)
         {
-            LOG_TRACE("[GraphOrchestrator::getPhaseAwareWeight] PREFILL phase - returning full weight for " << name);
+            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] PREFILL phase - returning full weight for " << name);
             return weight_manager_->getWeight(name);
         }
 
@@ -1904,7 +1904,7 @@ namespace llaminar2
         if (!shouldUseCPUDecodeWeight(name, layer_idx))
         {
             // No CPU participation - use full weight (GPU handles it)
-            LOG_TRACE("[GraphOrchestrator::getPhaseAwareWeight] DECODE phase, no CPU participation - returning full weight for " << name);
+            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, no CPU participation - returning full weight for " << name);
             return weight_manager_->getWeight(name);
         }
 
@@ -1912,7 +1912,7 @@ namespace llaminar2
         if (!weight_placement_map_)
         {
             // No placement map - fall back to full weight
-            LOG_WARN("[GraphOrchestrator::getPhaseAwareWeight] CPU decode participation but no placement map - using full weight for " << name);
+            LOG_WARN("[DeviceGraphOrchestrator::getPhaseAwareWeight] CPU decode participation but no placement map - using full weight for " << name);
             return weight_manager_->getWeight(name);
         }
 
@@ -1922,7 +1922,7 @@ namespace llaminar2
         if (!device_info.cpu_decode_participation)
         {
             // This weight doesn't have CPU decode participation
-            LOG_TRACE("[GraphOrchestrator::getPhaseAwareWeight] DECODE phase, weight " << name << " has no CPU participation - returning full weight");
+            LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, weight " << name << " has no CPU participation - returning full weight");
             return weight_manager_->getWeight(name);
         }
 
@@ -1932,18 +1932,18 @@ namespace llaminar2
             if (device_info.decode_devices[i].is_cpu())
             {
                 float fraction = device_info.decode_fractions[i];
-                LOG_DEBUG("[GraphOrchestrator::getPhaseAwareWeight] DECODE phase - returning CPU decode shard for "
+                LOG_DEBUG("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase - returning CPU decode shard for "
                           << name << " (fraction=" << fraction << ")");
                 return weight_manager_->getDecodeWeight(name, DeviceId::cpu(), fraction, layer_idx);
             }
         }
 
         // No CPU in decode devices - use full weight
-        LOG_TRACE("[GraphOrchestrator::getPhaseAwareWeight] DECODE phase, CPU not in decode devices - returning full weight for " << name);
+        LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] DECODE phase, CPU not in decode devices - returning full weight for " << name);
         return weight_manager_->getWeight(name);
     }
 
-    bool GraphOrchestrator::shouldUseCPUDecodeWeight(const std::string &name, int layer_idx) const
+    bool DeviceGraphOrchestrator::shouldUseCPUDecodeWeight(const std::string &name, int layer_idx) const
     {
         // Check phase constraint:
         // - Default (cpu_prefill_participate=false): CPU only participates in DECODE phase

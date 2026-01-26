@@ -1,8 +1,8 @@
 /**
- * @file Test__GraphOrchestratorDomainWiring.cpp
- * @brief Unit tests for GraphOrchestrator MultiDomainTPConfig wiring (Phase 6.3)
+ * @file Test__DeviceGraphOrchestratorDomainWiring.cpp
+ * @brief Unit tests for DeviceGraphOrchestrator MultiDomainTPConfig wiring (Phase 6.3)
  *
- * Tests that GraphOrchestrator correctly wires domain configuration for
+ * Tests that DeviceGraphOrchestrator correctly wires domain configuration for
  * heterogeneous tensor parallelism support.
  *
  * @author David Sanftenberg
@@ -10,7 +10,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "execution/GraphOrchestrator.h"
+#include "execution/DeviceGraphOrchestrator.h"
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"
 #include "utils/MPIContext.h"
@@ -22,9 +22,9 @@ using namespace llaminar2;
 // =============================================================================
 
 /**
- * @brief Test fixture for GraphOrchestrator domain wiring tests
+ * @brief Test fixture for DeviceGraphOrchestrator domain wiring tests
  */
-class Test__GraphOrchestratorDomainWiring : public ::testing::Test
+class Test__DeviceGraphOrchestratorDomainWiring : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -85,9 +85,9 @@ protected:
 /**
  * @brief Test that domain config can be set on orchestrator
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, SetDomainConfigWorks)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigWorks)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // Initially no domain config
     EXPECT_EQ(orchestrator->domainConfig(), nullptr);
@@ -106,9 +106,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, SetDomainConfigWorks)
 /**
  * @brief Test that setting nullptr clears domain config
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, SetDomainConfigToNullClears)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigToNullClears)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // Set domain config
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
@@ -124,9 +124,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, SetDomainConfigToNullClears)
 /**
  * @brief Test that domain config with multiple domains works
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, SetDomainConfigWithMultipleDomains)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, SetDomainConfigWithMultipleDomains)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // Create config with GPU and CPU domains
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
@@ -147,9 +147,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, SetDomainConfigWithMultipleDomains)
 /**
  * @brief Test that getDomainForLayer returns nullptr without config
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerReturnsNullWithoutConfig)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsNullWithoutConfig)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // No domain config set
     EXPECT_EQ(orchestrator->domainConfig(), nullptr);
@@ -163,9 +163,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerReturnsNullWithoutC
 /**
  * @brief Test that getDomainForLayer returns GPU domain for attention
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerReturnsGPUDomainForAttention)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsGPUDomainForAttention)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -181,9 +181,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerReturnsGPUDomainFor
 /**
  * @brief Test that getDomainForLayer returns CPU domain for FFN
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerReturnsCPUDomainForFFN)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerReturnsCPUDomainForFFN)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -199,9 +199,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerReturnsCPUDomainFor
 /**
  * @brief Test that getDomainForLayer returns same domain for all layers
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerConsistentAcrossLayers)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerConsistentAcrossLayers)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain(), createCPUDomain()}));
@@ -229,9 +229,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerConsistentAcrossLay
 /**
  * @brief Test that FFN falls back to GPU domain when no CPU domain
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerFFNFallbackToGPU)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, GetDomainForLayerFFNFallbackToGPU)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // Only GPU domain, no CPU
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
@@ -251,9 +251,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, GetDomainForLayerFFNFallbackToGPU)
 /**
  * @brief Test that domain config persists through multiple orchestrator operations
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, DomainConfigPersistsAcrossOperations)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, DomainConfigPersistsAcrossOperations)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     auto domain_config = std::make_shared<MultiDomainTPConfig>(
         MultiDomainTPConfig::createForTest({createGPUDomain()}));
@@ -276,9 +276,9 @@ TEST_F(Test__GraphOrchestratorDomainWiring, DomainConfigPersistsAcrossOperations
 /**
  * @brief Test that domain config can be updated
  */
-TEST_F(Test__GraphOrchestratorDomainWiring, DomainConfigCanBeUpdated)
+TEST_F(Test__DeviceGraphOrchestratorDomainWiring, DomainConfigCanBeUpdated)
 {
-    auto orchestrator = std::make_unique<GraphOrchestrator>(config_, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
     // Set first config (GPU only)
     auto config1 = std::make_shared<MultiDomainTPConfig>(

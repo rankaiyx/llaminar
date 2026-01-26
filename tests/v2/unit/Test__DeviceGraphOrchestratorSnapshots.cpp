@@ -1,15 +1,15 @@
 /**
- * @file Test__GraphOrchestratorSnapshots.cpp
- * @brief Unit tests for GraphOrchestrator snapshot capture API
+ * @file Test__DeviceGraphOrchestratorSnapshots.cpp
+ * @brief Unit tests for DeviceGraphOrchestrator snapshot capture API
  * @author David Sanftenberg
  * @date December 2025
  *
- * Tests the pipeline-compatible snapshot capture API added to GraphOrchestrator
+ * Tests the pipeline-compatible snapshot capture API added to DeviceGraphOrchestrator
  * for E2E parity testing migration.
  */
 
 #include <gtest/gtest.h>
-#include "execution/GraphOrchestrator.h"
+#include "execution/DeviceGraphOrchestrator.h"
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -26,73 +26,73 @@ using namespace llaminar2;
  * Verifies the static conversion function translates graph-style names
  * to pipeline-style snapshot keys.
  */
-TEST(Test__GraphOrchestratorSnapshots, StageNameConversion_GlobalStages)
+TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_GlobalStages)
 {
     // Global stage mappings
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("embedding"), "EMBEDDING");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("final_norm"), "FINAL_NORM");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("lm_head"), "LM_HEAD");
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("embedding"), "EMBEDDING");
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("final_norm"), "FINAL_NORM");
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("lm_head"), "LM_HEAD");
 }
 
-TEST(Test__GraphOrchestratorSnapshots, StageNameConversion_AttentionStages)
+TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_AttentionStages)
 {
     // Layer 0 attention stages - using actual graph stage names from Qwen2Graph.cpp
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_attn_norm"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_attn_norm"),
               "layer0_ATTENTION_NORM");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_q_proj"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_q_proj"),
               "layer0_Q_PROJECTION");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_k_proj"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_k_proj"),
               "layer0_K_PROJECTION");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_v_proj"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_v_proj"),
               "layer0_V_PROJECTION");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_q_rope"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_q_rope"),
               "layer0_Q_ROPE");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_k_rope"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_k_rope"),
               "layer0_K_ROPE");
     // Graph uses "attention", not "attn_compute"
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_attention"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_attention"),
               "layer0_ATTENTION_CONTEXT");
     // Graph uses "wo_proj", not "attn_proj"
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_wo_proj"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_wo_proj"),
               "layer0_ATTENTION_OUTPUT");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_attn_residual"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_attn_residual"),
               "layer0_ATTENTION_RESIDUAL");
 }
 
-TEST(Test__GraphOrchestratorSnapshots, StageNameConversion_FFNStages)
+TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_FFNStages)
 {
     // Layer 0 FFN stages - using actual graph stage names from Qwen2Graph.cpp
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_norm"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_norm"),
               "layer0_FFN_NORM");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_gate"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_gate"),
               "layer0_FFN_GATE");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_up"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_up"),
               "layer0_FFN_UP");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_swiglu"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_swiglu"),
               "layer0_FFN_SWIGLU");
     // Graph uses "down_proj", not "ffn_down"
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_down_proj"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_down_proj"),
               "layer0_FFN_DOWN");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_residual"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_residual"),
               "layer0_FFN_RESIDUAL");
 }
 
-TEST(Test__GraphOrchestratorSnapshots, StageNameConversion_MultipleLayerIndices)
+TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_MultipleLayerIndices)
 {
     // Different layer indices - using actual graph stage names
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer5_q_proj"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer5_q_proj"),
               "layer5_Q_PROJECTION");
     // Graph uses "down_proj", not "ffn_down"
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer23_down_proj"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer23_down_proj"),
               "layer23_FFN_DOWN");
-    EXPECT_EQ(GraphOrchestrator::convertStageNameToSnapshotKey("layer99_attn_norm"),
+    EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer99_attn_norm"),
               "layer99_ATTENTION_NORM");
 }
 
-TEST(Test__GraphOrchestratorSnapshots, StageNameConversion_UnknownStage)
+TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_UnknownStage)
 {
     // Unknown stages should be uppercased
-    std::string result = GraphOrchestrator::convertStageNameToSnapshotKey("unknown_stage");
+    std::string result = DeviceGraphOrchestrator::convertStageNameToSnapshotKey("unknown_stage");
     EXPECT_EQ(result, "UNKNOWN_STAGE");
 }
 
@@ -103,7 +103,7 @@ TEST(Test__GraphOrchestratorSnapshots, StageNameConversion_UnknownStage)
 /**
  * @brief Test snapshot enable/disable state tracking
  */
-TEST(Test__GraphOrchestratorSnapshots, SnapshotState_InitiallyDisabled)
+TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_InitiallyDisabled)
 {
     // Create minimal config for orchestrator
     Qwen2GraphConfig config;
@@ -115,14 +115,14 @@ TEST(Test__GraphOrchestratorSnapshots, SnapshotState_InitiallyDisabled)
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    GraphOrchestrator orchestrator(config);
+    DeviceGraphOrchestrator orchestrator(config);
 
     // Should be disabled by default
     EXPECT_FALSE(orchestrator.isSnapshotCaptureEnabled());
     EXPECT_TRUE(orchestrator.getSnapshotKeys().empty());
 }
 
-TEST(Test__GraphOrchestratorSnapshots, SnapshotState_EnableDisable)
+TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_EnableDisable)
 {
     Qwen2GraphConfig config;
     config.d_model = 896;
@@ -133,7 +133,7 @@ TEST(Test__GraphOrchestratorSnapshots, SnapshotState_EnableDisable)
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    GraphOrchestrator orchestrator(config);
+    DeviceGraphOrchestrator orchestrator(config);
 
     // Enable
     orchestrator.enableSnapshotCapture();
@@ -144,7 +144,7 @@ TEST(Test__GraphOrchestratorSnapshots, SnapshotState_EnableDisable)
     EXPECT_FALSE(orchestrator.isSnapshotCaptureEnabled());
 }
 
-TEST(Test__GraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKey)
+TEST(Test__DeviceGraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKey)
 {
     Qwen2GraphConfig config;
     config.d_model = 896;
@@ -155,7 +155,7 @@ TEST(Test__GraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKey)
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    GraphOrchestrator orchestrator(config);
+    DeviceGraphOrchestrator orchestrator(config);
     orchestrator.enableSnapshotCapture();
 
     size_t size = 0;
@@ -168,6 +168,6 @@ TEST(Test__GraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKey)
 // =============================================================================
 // Summary
 // =============================================================================
-// These tests verify the pipeline-compatible snapshot API added to GraphOrchestrator.
+// These tests verify the pipeline-compatible snapshot API added to DeviceGraphOrchestrator.
 // Full integration testing with actual graph execution requires model weights and
 // is covered by E2E tests in tests/v2/e2e/.

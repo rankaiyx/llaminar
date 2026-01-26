@@ -229,7 +229,7 @@ namespace llaminar2
         // 3. Execute them in order on the given device context
         //
         // For now, we mark success and track stats. The actual stage execution
-        // is handled by the pipeline/GraphOrchestrator which already calls
+        // is handled by the pipeline/DeviceGraphOrchestrator which already calls
         // GraphExecutor with the appropriate context.
 
         LOG_TRACE("executeLayerStages: layer " << layer_idx

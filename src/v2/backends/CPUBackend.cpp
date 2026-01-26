@@ -315,6 +315,17 @@ namespace llaminar2
         return true;
     }
 
+    bool CPUBackend::streamSynchronize(int device_id)
+    {
+        if (!isValidDeviceId(device_id))
+        {
+            return false;
+        }
+
+        // CPU execution is always synchronous - no-op
+        return true;
+    }
+
     bool CPUBackend::setDevice(int device_id)
     {
         if (!isValidDeviceId(device_id))

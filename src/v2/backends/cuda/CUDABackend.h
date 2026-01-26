@@ -33,6 +33,7 @@ namespace llaminar2
         bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) override;
         bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) override;
         bool synchronize(int device_id) override;
+        bool streamSynchronize(int device_id) override;
         bool setDevice(int device_id) override;
 
         // Event operations (fine-grained synchronization)

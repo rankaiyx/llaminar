@@ -1718,7 +1718,18 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 | Inference interface | `src/v2/execution/IInferenceRunner.h` |
 | Inference factory | `src/v2/execution/InferenceRunnerFactory.h` |
 | Model context interface | `src/v2/interfaces/IModelContext.h` |
-| **Orchestration Layer** | |
+| **Orchestration Layer (Phase 5)** | |
+| IOrchestrationRunner | `src/v2/orchestration/IOrchestrationRunner.h` |
+| OrchestrationRunner | `src/v2/orchestration/OrchestrationRunner.h` |
+| OrchestrationRunnerFactory | `src/v2/orchestration/OrchestrationRunnerFactory.cpp` |
+| OrchestrationConfig | `src/v2/config/OrchestrationConfig.h` |
+| RankExecutionPlan | `src/v2/execution/RankExecutionPlan.h` |
+| ExecutionPlanBuilder | `src/v2/execution/ExecutionPlanBuilder.h` |
+| **Device Management (Phase 6)** | |
+| GlobalDeviceAddress | `src/v2/backends/GlobalDeviceAddress.h` |
+| DeviceRegistry | `src/v2/backends/DeviceRegistry.h` |
+| DeviceAddressAdapter | `src/v2/backends/DeviceAddressAdapter.h` |
+| **Graph Orchestration** | |
 | GraphOrchestrator | `src/v2/execution/GraphOrchestrator.h` |
 | Graph builder interface | `src/v2/execution/IGraphBuilder.h` |
 | Qwen2 graph builder | `src/v2/models/qwen/Qwen2Graph.h` |
@@ -1736,6 +1747,11 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 | Backend interface | `src/v2/collective/ICollectiveBackend.h` |
 | NCCL/RCCL/MPI backends | `src/v2/collective/backends/` |
 | PCIeBAR backend | `src/v2/collective/backends/PCIeBARBackend.h` |
+| **LOCAL Tensor Parallelism (Phase 4)** | |
+| ILocalTPContext | `src/v2/collective/ILocalTPContext.h` |
+| LocalTPContext | `src/v2/collective/LocalTPContext.h` |
+| LocalTPWeightSharder | `src/v2/collective/LocalTPWeightSharder.h` |
+| LocalTPAllreduceStage | `src/v2/execution/compute_stages/stages/LocalTPAllreduceStage.h` |
 | **Hybrid Parallelism** | |
 | TensorParallelConfig | `src/v2/config/TensorParallelConfig.h` |
 | PipelineParallelConfig | `src/v2/config/PipelineParallelConfig.h` |
@@ -1755,7 +1771,7 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 | **Backend Layer** | |
 | Backend manager | `src/v2/backends/BackendManager.h` |
 | Backend interface | `src/v2/backends/IBackend.h` |
-| DeviceId | `src/v2/backends/DeviceId.h` |
+| DeviceId (legacy) | `src/v2/backends/DeviceId.h` |
 | **Tensor Layer** | |
 | ITensor interface | `src/v2/tensors/ITensor.h` |
 | CPU tensors | `src/v2/tensors/TensorClasses.h` |
@@ -1769,10 +1785,11 @@ void GraphExecutor::verifyStageExit(const ComputeNode& node, int layer_idx) {
 
 ### 9.2 Key Design Rules
 
-1. **Use `IInferenceRunner`** for inference – Don't call `GraphOrchestrator` directly from Main/ChatUI
-2. **Keep MPI out of kernels** – MPI sync lives in `AllreduceStage` and `AllGatherStage`
-3. **Use KernelFactory** – Prefer `getOrCreateGemm()` for cached kernel access
-4. **Declarative graphs** – Build computation as DAGs of `ComputeStage` nodes
+1. **Use `IOrchestrationRunner`** for complex multi-device scenarios – Handles TP/PP/heterogeneous automatically
+2. **Use `IInferenceRunner`** for simple single-device inference – Don't call `GraphOrchestrator` directly from Main/ChatUI
+3. **Keep MPI out of kernels** – MPI sync lives in `AllreduceStage` and `AllGatherStage`
+4. **Use KernelFactory** – Prefer `getOrCreateGemm()` for cached kernel access
+5. **Declarative graphs** – Build computation as DAGs of `ComputeStage` nodes
 5. **Graph caching** – Reuse cached graphs in decode mode for performance
 6. **Use StageCoherence** – Let GraphExecutor handle GPU↔CPU sync automatically
 7. **Implement getDumpInfo()** – All stages must support introspection
@@ -2555,4 +2572,452 @@ for (const auto& tp : transitions) {
 
 ---
 
-This architecture is intentionally modular: small, focused abstractions connected by narrow interfaces. The `IInferenceRunner` interface ensures that callers (Main.cpp, ChatUI, tests) remain decoupled from implementation details of the `GraphOrchestrator`.
+## 12. Orchestration Layer
+
+The **Orchestration Layer** provides a unified interface for complex heterogeneous deployment scenarios. This layer sits above the existing `IInferenceRunner` and `GraphOrchestrator` components, adding:
+
+- **GlobalDeviceAddress**: Canonical device identification across nodes
+- **DeviceRegistry**: Centralized device discovery and management
+- **OrchestrationConfig**: Declarative configuration for TP/PP/device mapping
+- **ILocalTPContext**: LOCAL tensor parallelism within a single MPI rank
+- **IOrchestrationRunner**: End-to-end orchestrated inference interface
+
+### 12.1 GlobalDeviceAddress
+
+Location: `src/v2/backends/GlobalDeviceAddress.h`
+
+A fully-qualified device address that includes hostname, NUMA node, device type, and ordinal:
+
+```cpp
+struct GlobalDeviceAddress {
+    std::string hostname = "localhost";   // Node identifier
+    int numa_node = 0;                    // NUMA node for memory affinity
+    DeviceType device_type = DeviceType::CPU;
+    int device_ordinal = 0;               // 0-indexed within type
+    
+    // Factory methods
+    static GlobalDeviceAddress cpu(int numa = 0, const std::string& host = "localhost");
+    static GlobalDeviceAddress cuda(int ordinal, int numa = 0, const std::string& host = "localhost");
+    static GlobalDeviceAddress rocm(int ordinal, int numa = 0, const std::string& host = "localhost");
+    
+    // Parsing (supports shorthand)
+    static GlobalDeviceAddress parse(const std::string& spec);  // "cuda:0", "0:cuda:0", "node1:0:cuda:0"
+    static std::optional<GlobalDeviceAddress> tryParse(const std::string& spec);
+    
+    // Canonical string: "hostname:numa:type:ordinal"
+    std::string toString() const;  // e.g., "localhost:0:cuda:0"
+    
+    // Comparison and hashing
+    bool operator==(const GlobalDeviceAddress& other) const;
+    bool operator<(const GlobalDeviceAddress& other) const;
+};
+
+// Supports std::hash for use in unordered containers
+template<> struct std::hash<GlobalDeviceAddress>;
+```
+
+**Format Examples:**
+| Input | Parsed Result |
+|-------|---------------|
+| `"cuda:0"` | `localhost:0:cuda:0` |
+| `"0:rocm:1"` | `localhost:0:rocm:1` |
+| `"node1:1:cuda:0"` | `node1:1:cuda:0` |
+| `"cpu"` | `localhost:0:cpu:0` |
+
+**Key Design Choice**: `GlobalDeviceAddress` is an **immutable value type** suitable for use as map keys. Unlike the legacy `DeviceId` (which is rank-local), GlobalDeviceAddress provides complete identification across distributed systems.
+
+### 12.2 DeviceRegistry
+
+Location: `src/v2/backends/DeviceRegistry.h`, `IDeviceRegistry.h`
+
+A **singleton** that discovers and manages all compute devices:
+
+```cpp
+class DeviceRegistry : public IDeviceRegistry {
+public:
+    static DeviceRegistry& instance();
+    
+    // Discovery
+    void discover();                                  // Enumerate all devices
+    bool isDiscovered() const;
+    void refresh();                                   // Re-discover (hot-plug)
+    
+    // Device enumeration
+    std::vector<GlobalDeviceAddress> allDevices() const;
+    std::vector<GlobalDeviceAddress> devicesByType(DeviceType type) const;
+    std::vector<GlobalDeviceAddress> devicesByNuma(int numa_node) const;
+    size_t deviceCount(DeviceType type) const;
+    
+    // Device validation
+    bool isValid(const GlobalDeviceAddress& addr) const;   // Known device?
+    bool isAvailable(const GlobalDeviceAddress& addr) const; // Not in error state?
+    
+    // Device properties
+    size_t memoryCapacity(const GlobalDeviceAddress& addr) const;
+    size_t memoryAvailable(const GlobalDeviceAddress& addr) const;
+    std::pair<int, int> computeCapability(const GlobalDeviceAddress& addr) const;
+    std::string deviceName(const GlobalDeviceAddress& addr) const;
+    int numaAffinity(const GlobalDeviceAddress& addr) const;
+    std::string pcieBusId(const GlobalDeviceAddress& addr) const;
+    
+    // Topology queries
+    bool canP2P(const GlobalDeviceAddress& a, const GlobalDeviceAddress& b) const;
+    
+    // Backend access
+    IBackend* backendFor(const GlobalDeviceAddress& addr);
+    
+    // Default device of each type
+    std::optional<GlobalDeviceAddress> defaultDevice(DeviceType type) const;
+};
+```
+
+**Usage Example:**
+```cpp
+auto& registry = DeviceRegistry::instance();
+registry.discover();
+
+// Find best GPU for attention compute
+auto cudas = registry.devicesByType(DeviceType::CUDA);
+for (const auto& addr : cudas) {
+    size_t vram_gb = registry.memoryCapacity(addr) / (1024 * 1024 * 1024);
+    LOG_INFO("Found " << addr.toString() << " with " << vram_gb << " GB VRAM");
+}
+
+// Check P2P capability
+if (registry.canP2P(cudas[0], cudas[1])) {
+    LOG_INFO("GPUs can use NVLink P2P");
+}
+```
+
+**Thread Safety**: All methods are protected by an internal mutex.
+
+### 12.3 DeviceAddressAdapter
+
+Location: `src/v2/backends/DeviceAddressAdapter.h`
+
+Utility for migrating existing code from `DeviceId` to `GlobalDeviceAddress`:
+
+```cpp
+namespace DeviceAddressAdapter {
+    // Legacy → Global conversion
+    GlobalDeviceAddress toGlobalAddress(DeviceId device_id, int numa = 0, 
+                                         const std::string& host = "localhost");
+    
+    // Global → Legacy conversion (may lose information)
+    DeviceId toDeviceId(const GlobalDeviceAddress& addr);
+    
+    // Create DeviceId for GPU ordinal
+    DeviceId createGpuDeviceId(const GlobalDeviceAddress& addr);
+    
+    // Bulk conversion
+    std::vector<DeviceId> toDeviceIds(const std::vector<GlobalDeviceAddress>& addrs);
+    
+    // Check compatibility (whether conversion is lossless)
+    bool isLocalhost(const GlobalDeviceAddress& addr);
+    bool canConvertLosslessly(const GlobalDeviceAddress& addr);
+}
+```
+
+### 12.4 OrchestrationConfig
+
+Location: `src/v2/config/OrchestrationConfig.h`
+
+Declarative configuration for complex multi-device scenarios:
+
+```cpp
+// Enums
+enum class TPScope { AUTO, LOCAL, GLOBAL, HYBRID };
+enum class DeviceAssignmentMode { AUTO, LOCAL_GPU, ROUND_ROBIN, EXPLICIT };
+enum class PPSplitMode { EQUAL, WEIGHTED, MANUAL };
+enum class CollectiveBackendType { AUTO, NCCL, RCCL, PCIE_BAR, UPI, MPI, HOST };
+
+// Named domain definition
+struct DomainDefinition {
+    std::string name;                           // e.g., "gpu_tp", "stage0"
+    std::vector<GlobalDeviceAddress> devices;   // Devices in domain
+    std::vector<float> weights;                 // Optional proportional weights
+    CollectiveBackendType backend = CollectiveBackendType::AUTO;
+    
+    static DomainDefinition parse(const std::string& spec);
+    // Format: "name=device1,device2[;weights=w1,w2][;backend=type]"
+};
+
+// Pipeline stage definition
+struct PPStageDefinition {
+    int stage_index;
+    std::string domain_name;    // References DomainDefinition
+    int first_layer;
+    int last_layer;
+    
+    static PPStageDefinition parse(const std::string& spec);
+    // Format: "stage_index=domain_name:first_layer-last_layer"
+};
+
+// Main configuration struct
+struct OrchestrationConfig {
+    // === Tensor Parallelism ===
+    int tp_degree = 1;
+    TPScope tp_scope = TPScope::AUTO;
+    
+    // === Pipeline Parallelism ===
+    int pp_stages = 1;
+    PPSplitMode pp_split_mode = PPSplitMode::EQUAL;
+    std::vector<PPStageDefinition> pp_stage_definitions;
+    
+    // === Device Assignment ===
+    DeviceAssignmentMode device_assignment = DeviceAssignmentMode::AUTO;
+    std::vector<GlobalDeviceAddress> explicit_devices;  // For EXPLICIT mode
+    
+    // === Named Domains ===
+    std::vector<DomainDefinition> domains;
+    
+    // === Backend Preferences ===
+    CollectiveBackendType collective_backend = CollectiveBackendType::AUTO;
+    
+    // === Validation ===
+    std::vector<std::string> validate() const;
+    
+    // === Domain Lookup ===
+    const DomainDefinition* findDomain(const std::string& name) const;
+};
+```
+
+**CLI Examples:**
+```bash
+# Simple TP across 2 GPUs
+./llaminar2 --tp 2 --device cuda:0 --device cuda:1 -m model.gguf
+
+# Explicit domain with NCCL
+./llaminar2 --define-domain "gpu_tp=cuda:0,cuda:1;backend=nccl" -m model.gguf
+
+# Hybrid PP+TP with named domains
+./llaminar2 --pp 2 \
+  --define-domain "stage0=cuda:0,cuda:1" \
+  --define-domain "stage1=rocm:0,rocm:1" \
+  --pp-stage "0=stage0:0-13" \
+  --pp-stage "1=stage1:14-27" \
+  -m model.gguf
+
+# Proportional split (73%/27%) for mixed NVIDIA+AMD
+./llaminar2 --define-domain "mixed=cuda:0,rocm:0;weights=0.73,0.27;backend=pcie_bar" -m model.gguf
+```
+
+### 12.5 ILocalTPContext
+
+Location: `src/v2/collective/ILocalTPContext.h`
+
+Interface for **LOCAL tensor parallelism** - multiple devices within a single MPI rank:
+
+```cpp
+class ILocalTPContext {
+public:
+    virtual ~ILocalTPContext() = default;
+    
+    // Configuration
+    virtual const std::vector<GlobalDeviceAddress>& devices() const = 0;
+    virtual const std::vector<float>& weights() const = 0;  // Proportional weights
+    virtual CollectiveBackendType backend() const = 0;
+    virtual int degree() const = 0;  // Number of devices
+    
+    // Collective operations (across LOCAL devices, not MPI ranks)
+    virtual bool allreduce(TensorBase* tensor) = 0;
+    virtual bool allgather(TensorBase* local, TensorBase* gathered) = 0;
+    virtual bool allgatherV(TensorBase* local, TensorBase* gathered, 
+                            const std::vector<int>& counts) = 0;
+    
+    // Work distribution
+    virtual WorkRange headRange(int device_idx, int total_heads) const = 0;
+    virtual WorkRange ffnRange(int device_idx, int total_d_ff) const = 0;
+    virtual WorkRange vocabRange(int device_idx, int vocab_size) const = 0;
+    
+    // Synchronization
+    virtual void barrier() = 0;
+};
+```
+
+**Key Concept**: LOCAL TP is **decoupled from MPI world_size**. A single MPI rank can have TP degree > 1 by using multiple local GPUs. This enables:
+- Single-node multi-GPU without MPI overhead
+- Heterogeneous GPU TP (CUDA + ROCm on same rank)
+- Proportional work distribution based on device capability
+
+**Backend Selection:**
+
+| Device Configuration | Selected Backend |
+|----------------------|------------------|
+| All CUDA devices | NCCL |
+| All ROCm devices | RCCL |
+| Mixed CUDA + ROCm | PCIeBAR (direct P2P) |
+| Any CPU involved | HOST (staged through host memory) |
+
+### 12.6 IOrchestrationRunner
+
+Location: `src/v2/orchestration/IOrchestrationRunner.h`
+
+The **end-to-end interface** for orchestrated inference:
+
+```cpp
+struct GenerationResult {
+    std::vector<int32_t> tokens;
+    std::vector<float> logprobs;
+    bool is_complete{false};
+    std::string error;
+    
+    bool success() const { return error.empty(); }
+};
+
+class IOrchestrationRunner {
+public:
+    virtual ~IOrchestrationRunner() = default;
+    
+    // Lifecycle
+    virtual bool initialize() = 0;   // Load model, build graphs, set up devices
+    virtual void shutdown() = 0;     // Clean teardown
+    
+    // Full generation (most common API)
+    virtual GenerationResult generate(const std::vector<int32_t>& prompt_tokens,
+                                      int max_new_tokens,
+                                      const SamplingParams& params = {}) = 0;
+    
+    // Step-by-step generation (for streaming)
+    virtual bool prefill(const std::vector<int32_t>& tokens) = 0;
+    virtual std::pair<int32_t, float> decodeStep(const SamplingParams& params = {}) = 0;
+    virtual void reset() = 0;  // Clear KV cache
+    
+    // Configuration access
+    virtual const OrchestrationConfig& config() const = 0;
+    virtual const RankExecutionPlan& executionPlan() const = 0;
+    virtual ILocalTPContext* localTPContext() = 0;
+    
+    // Diagnostics
+    virtual std::string lastError() const = 0;
+    virtual void dumpState(const std::string& path) const = 0;
+};
+```
+
+### 12.7 OrchestrationRunnerFactory
+
+Location: `src/v2/orchestration/IOrchestrationRunnerFactory.h`, `OrchestrationRunnerFactory.cpp`
+
+Factory for creating `IOrchestrationRunner` instances:
+
+```cpp
+class IOrchestrationRunnerFactory {
+public:
+    virtual ~IOrchestrationRunnerFactory() = default;
+    
+    virtual std::unique_ptr<IOrchestrationRunner> create(
+        const OrchestrationConfig& config,
+        const std::string& model_path,
+        std::shared_ptr<MPIContext> mpi_ctx = nullptr) = 0;
+};
+
+// Default implementation
+class OrchestrationRunnerFactory : public IOrchestrationRunnerFactory {
+public:
+    std::unique_ptr<IOrchestrationRunner> create(
+        const OrchestrationConfig& config,
+        const std::string& model_path,
+        std::shared_ptr<MPIContext> mpi_ctx = nullptr) override;
+};
+```
+
+**Usage:**
+```cpp
+// Parse config from CLI
+OrchestrationConfig config;
+config.tp_degree = 2;
+config.domains.push_back(DomainDefinition::parse("gpu_tp=cuda:0,rocm:0;weights=0.73,0.27"));
+
+// Create runner
+OrchestrationRunnerFactory factory;
+auto runner = factory.create(config, "models/qwen2.5-7b-instruct-q4_0.gguf");
+
+if (!runner->initialize()) {
+    LOG_ERROR("Init failed: " << runner->lastError());
+    return 1;
+}
+
+// Generate
+auto result = runner->generate({1, 2, 3}, 50);  // prompt tokens, max new tokens
+if (result.success()) {
+    for (int32_t tok : result.tokens) {
+        std::cout << tokenizer.decode(tok);
+    }
+}
+
+runner->shutdown();
+```
+
+### 12.8 CollectiveContext Single-Device Optimization
+
+Location: `src/v2/execution/CollectiveContext.cpp`
+
+The `CollectiveContext` now handles single-device scenarios efficiently:
+
+```cpp
+bool CollectiveContext::executeAllreduce(TensorBase* buffer, CollectiveOp op, DeviceId device) {
+    // Single-device optimization: no collective needed
+    if (!requiresCollectives()) {
+        return true;  // No-op success
+    }
+    
+    // ... normal multi-device path
+}
+
+bool CollectiveContext::executeAllreduceInDomain(const std::string& domain, 
+                                                  TensorBase* buffer, ...) {
+    auto* def = getDomain(domain);
+    if (!def) return false;
+    
+    // Trivial domain (1 device): no collective needed
+    if (def->isTrivial()) {
+        return true;  // No-op success
+    }
+    
+    // ... normal multi-device path
+}
+```
+
+This optimization ensures that single-rank unit tests work correctly without requiring a full MPI backend setup.
+
+### 12.9 Orchestration File Locations
+
+| Component | Location |
+|-----------|----------|
+| **Device Layer** | |
+| GlobalDeviceAddress | `src/v2/backends/GlobalDeviceAddress.h` |
+| DeviceRegistry | `src/v2/backends/DeviceRegistry.h` |
+| IDeviceRegistry | `src/v2/backends/IDeviceRegistry.h` |
+| DeviceAddressAdapter | `src/v2/backends/DeviceAddressAdapter.h` |
+| **Configuration** | |
+| OrchestrationConfig | `src/v2/config/OrchestrationConfig.h` |
+| ConfigParser | `src/v2/config/ConfigParser.h` |
+| **Execution Planning** | |
+| RankExecutionPlan | `src/v2/execution/RankExecutionPlan.h` |
+| ExecutionPlanBuilder | `src/v2/execution/ExecutionPlanBuilder.h` |
+| **LOCAL TP** | |
+| ILocalTPContext | `src/v2/collective/ILocalTPContext.h` |
+| LocalTPContext | `src/v2/collective/LocalTPContext.h` |
+| LocalTPWeightSharder | `src/v2/collective/LocalTPWeightSharder.h` |
+| LocalTPAllreduceStage | `src/v2/execution/compute_stages/stages/LocalTPAllreduceStage.h` |
+| **Orchestration Runner** | |
+| IOrchestrationRunner | `src/v2/orchestration/IOrchestrationRunner.h` |
+| OrchestrationRunner | `src/v2/orchestration/OrchestrationRunner.h` |
+| IOrchestrationRunnerFactory | `src/v2/orchestration/IOrchestrationRunnerFactory.h` |
+| OrchestrationRunnerFactory | `src/v2/orchestration/OrchestrationRunnerFactory.cpp` |
+
+---
+
+## 13. Summary
+
+This architecture is intentionally modular: small, focused abstractions connected by narrow interfaces. The hierarchy of interfaces provides flexibility at each layer:
+
+| Layer | Interface | Purpose |
+|-------|-----------|---------|
+| **Application** | `IOrchestrationRunner` | Complex multi-device scenarios |
+| **Inference** | `IInferenceRunner` | Simple single-device inference |
+| **Orchestration** | `GraphOrchestrator` | Graph building and execution |
+| **Collective** | `ILocalTPContext` | LOCAL tensor parallelism |
+| **Backend** | `IDeviceRegistry` | Device discovery and management |
+
+Callers (Main.cpp, ChatUI, tests) can choose the appropriate abstraction level for their use case, while implementation details remain encapsulated.

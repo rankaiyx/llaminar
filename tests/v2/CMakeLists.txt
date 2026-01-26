@@ -317,6 +317,19 @@ add_v2_test(V2_Unit_TensorByteSize
     MPI_PROCS 1
 )
 
+# Test: BARBackedTensor - BAR-backed tensor factory and operations
+add_executable(v2_test_bar_backed_tensor unit/Test__BARBackedTensor.cpp)
+target_link_libraries(v2_test_bar_backed_tensor 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_BARBackedTensor 
+    COMMAND $<TARGET_FILE:v2_test_bar_backed_tensor>
+    LABELS "V2;Unit;TensorOperations;PCIeBAR;Heterogeneous;ZeroCopy"
+    MPI_PROCS 1
+)
+
 # Test: CacheInfo - CPU cache detection and batch size optimization
 add_executable(v2_test_cache_info unit/Test__CacheInfo.cpp)
 target_link_libraries(v2_test_cache_info 
@@ -484,11 +497,19 @@ if(HAVE_CUDA AND HAVE_ROCM)
     target_include_directories(v2_integration_collective_backend PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
     )
+    # Multi-rank collective tests (requires 2 MPI ranks)
     add_v2_test(V2_Integration_CollectiveBackendIntegration 
         COMMAND $<TARGET_FILE:v2_integration_collective_backend>
         LABELS "V2;Integration;Collective;BackendRouter;MPI;NCCL;RCCL;PCIeBAR;TensorParallel;Heterogeneous;AllReduce"
         MPI_PROCS 2
         RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+    # Single-rank collective tests (requires exactly 1 MPI rank)
+    # These tests verify single-rank optimizations like no-op AllReduce
+    add_v2_test(V2_Integration_CollectiveSingleRank
+        COMMAND $<TARGET_FILE:v2_integration_collective_backend> --gtest_filter="Test__CollectiveSingleRank.*"
+        LABELS "V2;Integration;Collective;SingleRank;AllReduce"
+        MPI_PROCS 1
     )
 endif()
 
@@ -3099,6 +3120,24 @@ add_v2_test(V2_Unit_WeightManagerDecodeShards
     LABELS "V2;Unit;TensorParallelism;WeightSharding;DecodeShards;CPUDecode"
 )
 
+# Test: WeightManager Device-Aware Features
+# Tests features folded from WeightPreloader: getWeightForDevice, preloadForDevices,
+# cloneTensorForDevice, packGemmWeights, uploadNonGemmWeights, preloadStats,
+# per-device caching with first_device tracking
+add_executable(v2_test_weight_manager_device_aware unit/loaders/Test__WeightManager_DeviceAware.cpp)
+target_include_directories(v2_test_weight_manager_device_aware PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ and tests/v2/utils/ includes
+)
+target_link_libraries(v2_test_weight_manager_device_aware
+    llaminar2_core
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_WeightManager_DeviceAware
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_device_aware>
+    LABELS "V2;Unit;WeightManager;DeviceManagement;TensorParallelism;LocalTP;MultiDevice"
+    MPI_PROCS 1
+)
+
 # Test: NullWeightStreamer
 # No-op weight streamer for RESIDENT mode (Option B - weights fit in GPU VRAM)
 add_executable(v2_test_null_weight_streamer unit/loaders/Test__NullWeightStreamer.cpp)
@@ -3527,75 +3566,85 @@ if(ZLIB_FOUND)
         MPI_PROCS 2
     )
 
-    # Qwen2 PCIe BAR LOCAL TP (single rank, CUDA+ROCm) vs PyTorch Parity Test
-    # Tests PCIe BAR direct P2P for CUDA↔ROCm LOCAL scope tensor parallelism
-    if(HAVE_CUDA AND HAVE_ROCM)
-        add_executable(v2_integration_parity_qwen2_tp_pciebar_vs_pytorch 
-            integration/parity/qwen2/Test__Qwen2_TP_PCIeBAR_vs_PyTorch.cpp
+    # Qwen2 TRUE LOCAL TP with MultiDeviceOrchestrator (2 CUDA devices via NCCL)
+    # This is the actual LOCAL TP parity test that uses:
+    # - MultiDeviceOrchestrator with per-device DeviceGraphOrchestrator instances
+    # - Real weight sharding with Megatron-style tensor parallelism
+    # - NCCL AllReduce for collective operations
+    if(HAVE_CUDA AND HAVE_NCCL)
+        add_executable(v2_integration_parity_qwen2_localtp_nccl_vs_pytorch 
+            integration/parity/qwen2/Test__Qwen2_LocalTP_NCCL_vs_PyTorch.cpp
             ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
         )
-        target_link_libraries(v2_integration_parity_qwen2_tp_pciebar_vs_pytorch 
+        target_link_libraries(v2_integration_parity_qwen2_localtp_nccl_vs_pytorch 
             llaminar2_core 
             GTest::gtest
             ZLIB::ZLIB
         )
-        target_include_directories(v2_integration_parity_qwen2_tp_pciebar_vs_pytorch PRIVATE 
+        target_include_directories(v2_integration_parity_qwen2_localtp_nccl_vs_pytorch PRIVATE 
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        )
+        add_v2_test(V2_Integration_Parity_Qwen2_LocalTP_NCCL_vs_PyTorch
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_localtp_nccl_vs_pytorch>
+            LABELS "V2;Integration;Parity;Qwen2;NCCL;LOCAL;CUDA;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;MultiDevice;Orchestrator"
+            MPI_PROCS 1
+        )
+    endif()
+
+    # Qwen2 TRUE LOCAL TP with MultiDeviceOrchestrator (2 ROCm devices via RCCL)
+    # This is the actual LOCAL TP parity test that uses:
+    # - MultiDeviceOrchestrator with per-device DeviceGraphOrchestrator instances
+    # - Real weight sharding with Megatron-style tensor parallelism
+    # - RCCL AllReduce for collective operations
+    if(HAVE_ROCM AND HAVE_RCCL)
+        add_executable(v2_integration_parity_qwen2_localtp_rccl_vs_pytorch 
+            integration/parity/qwen2/Test__Qwen2_LocalTP_RCCL_vs_PyTorch.cpp
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+        )
+        target_link_libraries(v2_integration_parity_qwen2_localtp_rccl_vs_pytorch 
+            llaminar2_core 
+            GTest::gtest
+            ZLIB::ZLIB
+        )
+        target_include_directories(v2_integration_parity_qwen2_localtp_rccl_vs_pytorch PRIVATE 
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        )
+        add_v2_test(V2_Integration_Parity_Qwen2_LocalTP_RCCL_vs_PyTorch
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_localtp_rccl_vs_pytorch>
+            LABELS "V2;Integration;Parity;Qwen2;RCCL;LOCAL;ROCm;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;MultiDevice;Orchestrator"
+            MPI_PROCS 1
+        )
+    endif()
+
+    # Qwen2 TRUE LOCAL TP with MultiDeviceOrchestrator (Heterogeneous CUDA+ROCm)
+    # This is the actual LOCAL TP parity test for heterogeneous hardware that uses:
+    # - MultiDeviceOrchestrator with per-device DeviceGraphOrchestrator instances
+    # - Real weight sharding with Megatron-style tensor parallelism
+    # - PCIeBAR for AllReduce (direct CUDA↔ROCm P2P memory mapping)
+    # NOTE: Requires both CUDA and ROCm devices + PCIe BAR P2P support
+    if(HAVE_CUDA AND HAVE_ROCM)
+        add_executable(v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch 
+            integration/parity/qwen2/Test__Qwen2_LocalTP_PCIeBAR_vs_PyTorch.cpp
+            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+        )
+        target_link_libraries(v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch 
+            llaminar2_core 
+            GTest::gtest
+            ZLIB::ZLIB
+        )
+        target_include_directories(v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch PRIVATE 
             ${WORKSPACE_ROOT_PARITY}/external/cnpy
         )
         # Set CAP_SYS_ADMIN for PCIe BAR access
-        add_custom_command(TARGET v2_integration_parity_qwen2_tp_pciebar_vs_pytorch POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_tp_pciebar_vs_pytorch for PCIe BAR P2P"
-            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_tp_pciebar_vs_pytorch> || true
+        add_custom_command(TARGET v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch for PCIe BAR P2P"
+            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch> || true
         )
-        add_v2_test(V2_Integration_Parity_Qwen2_TP_PCIeBAR_vs_PyTorch
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_tp_pciebar_vs_pytorch>
-            LABELS "V2;Integration;Parity;Qwen2;PCIeBAR;LOCAL;CrossVendor;CUDA;ROCm;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;SameNUMA"
+        add_v2_test(V2_Integration_Parity_Qwen2_LocalTP_PCIeBAR_vs_PyTorch
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_localtp_pciebar_vs_pytorch>
+            LABELS "V2;Integration;Parity;Qwen2;PCIeBAR;LOCAL;CrossVendor;CUDA;ROCm;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;MultiDevice;Orchestrator;Heterogeneous"
             MPI_PROCS 1
             RESOURCE_LOCK "PCIeBAR_P2P"
-        )
-    endif()
-
-    # Qwen2 NCCL LOCAL TP (single rank, 2 CUDA devices) vs PyTorch Parity Test
-    # Tests LOCAL scope tensor parallelism with 2 CUDA GPUs using NCCL backend
-    if(HAVE_CUDA AND HAVE_NCCL)
-        add_executable(v2_integration_parity_qwen2_tp_nccl_vs_pytorch 
-            integration/parity/qwen2/Test__Qwen2_TP_NCCL_vs_PyTorch.cpp
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-        )
-        target_link_libraries(v2_integration_parity_qwen2_tp_nccl_vs_pytorch 
-            llaminar2_core 
-            GTest::gtest
-            ZLIB::ZLIB
-        )
-        target_include_directories(v2_integration_parity_qwen2_tp_nccl_vs_pytorch PRIVATE 
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        )
-        add_v2_test(V2_Integration_Parity_Qwen2_TP_NCCL_vs_PyTorch
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_tp_nccl_vs_pytorch>
-            LABELS "V2;Integration;Parity;Qwen2;NCCL;LOCAL;CUDA;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline"
-            MPI_PROCS 1
-        )
-    endif()
-
-    # Qwen2 RCCL LOCAL TP (single rank, 2 ROCm devices) vs PyTorch Parity Test  
-    # Tests LOCAL scope tensor parallelism with 2 ROCm GPUs using RCCL backend
-    if(HAVE_ROCM AND HAVE_RCCL)
-        add_executable(v2_integration_parity_qwen2_tp_rccl_vs_pytorch 
-            integration/parity/qwen2/Test__Qwen2_TP_RCCL_vs_PyTorch.cpp
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-        )
-        target_link_libraries(v2_integration_parity_qwen2_tp_rccl_vs_pytorch 
-            llaminar2_core 
-            GTest::gtest
-            ZLIB::ZLIB
-        )
-        target_include_directories(v2_integration_parity_qwen2_tp_rccl_vs_pytorch PRIVATE 
-            ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        )
-        add_v2_test(V2_Integration_Parity_Qwen2_TP_RCCL_vs_PyTorch
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_tp_rccl_vs_pytorch>
-            LABELS "V2;Integration;Parity;Qwen2;RCCL;LOCAL;ROCm;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline"
-            MPI_PROCS 1
         )
     endif()
 
@@ -3716,14 +3765,14 @@ add_v2_test(V2_Unit_ComputeGraphExecution
     MPI_PROCS 1
 )
 
-# Test: GraphOrchestrator Snapshot API
+# Test: DeviceGraphOrchestrator Snapshot API
 # Tests pipeline-compatible snapshot capture API (enableSnapshotCapture/getSnapshot/getSnapshotKeys)
 # and stage name conversion for E2E test compatibility
-add_executable(v2_test_graph_orchestrator_snapshots unit/Test__GraphOrchestratorSnapshots.cpp)
-target_link_libraries(v2_test_graph_orchestrator_snapshots llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GraphOrchestratorSnapshots
-    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_snapshots>
-    LABELS "V2;Unit;Execution;GraphOrchestrator;Snapshots;StageNameConversion"
+add_executable(v2_test_device_graph_orchestrator_snapshots unit/Test__DeviceGraphOrchestratorSnapshots.cpp)
+target_link_libraries(v2_test_device_graph_orchestrator_snapshots llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceGraphOrchestratorSnapshots
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_snapshots>
+    LABELS "V2;Unit;Execution;DeviceGraphOrchestrator;Snapshots;StageNameConversion"
     MPI_PROCS 1
 )
 
@@ -3871,6 +3920,105 @@ add_v2_test(V2_Unit_TPDomain
     MPI_PROCS 1
 )
 
+# Test: GlobalDeviceAddress (fully-qualified device address across nodes)
+# Tests factory methods, parsing (full/short forms), toString, predicates (isLocal, isGPU, etc.)
+# Part of Phase 0.1: CLI and Configuration Architecture
+add_executable(v2_test_global_device_address unit/Test__GlobalDeviceAddress.cpp)
+target_link_libraries(v2_test_global_device_address llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GlobalDeviceAddress
+    COMMAND $<TARGET_FILE:v2_test_global_device_address>
+    LABELS "V2;Unit;Backends;DeviceAddress;Heterogeneous;MPI"
+    MPI_PROCS 1
+)
+
+# Test: DeviceRegistry (Phase 6 - centralized device discovery and management)
+# Tests discovery of CPU/CUDA/ROCm devices, validation, memory queries, backend access, topology
+add_executable(v2_test_device_registry unit/Test__DeviceRegistry.cpp)
+target_link_libraries(v2_test_device_registry llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceRegistry
+    COMMAND $<TARGET_FILE:v2_test_device_registry>
+    LABELS "V2;Unit;Backends;DeviceRegistry;Heterogeneous;DeviceManagement"
+    MPI_PROCS 1
+)
+
+# Test: DeviceAddressAdapter (Phase 6 - legacy-to-GlobalDeviceAddress bridge)
+# Tests conversion between DeviceId, raw ordinals, and GlobalDeviceAddress
+add_executable(v2_test_device_address_adapter unit/Test__DeviceAddressAdapter.cpp)
+target_link_libraries(v2_test_device_address_adapter llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceAddressAdapter
+    COMMAND $<TARGET_FILE:v2_test_device_address_adapter>
+    LABELS "V2;Unit;Backends;DeviceAddress;Migration;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: OrchestrationConfig (configuration structs for heterogeneous orchestration)
+# Tests enums, DomainDefinition, PPStageDefinition, OrchestrationConfig validation
+# Part of Phase 0.2: CLI and Configuration Architecture
+add_executable(v2_test_orchestration_config unit/Test__OrchestrationConfig.cpp)
+target_link_libraries(v2_test_orchestration_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_OrchestrationConfig
+    COMMAND $<TARGET_FILE:v2_test_orchestration_config>
+    LABELS "V2;Unit;Config;Orchestration;Heterogeneous;DomainDefinition"
+    MPI_PROCS 1
+)
+
+# Test: OrchestrationConfigParser (CLI and YAML parsing for orchestration config)
+# Tests CLI parsing (--tp, --pp, --device, --define-domain, --pp-stage), YAML parsing
+# Part of Phase 0.3: CLI and Configuration Architecture
+add_executable(v2_test_orchestration_config_parser unit/Test__OrchestrationConfigParser.cpp)
+target_link_libraries(v2_test_orchestration_config_parser llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_OrchestrationConfigParser
+    COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
+    LABELS "V2;Unit;Config;CLI;YAML;Orchestration;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: RankExecutionPlan (contract between Layer 2 and Layer 3)
+# Tests validation, convenience methods, toString(), and integration scenarios.
+# Part of Phase 1: Plan-to-Graph Translation
+add_executable(v2_test_rank_execution_plan unit/Test__RankExecutionPlan.cpp)
+target_link_libraries(v2_test_rank_execution_plan llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_RankExecutionPlan
+    COMMAND $<TARGET_FILE:v2_test_rank_execution_plan>
+    LABELS "V2;Unit;Execution;Orchestration;Heterogeneous;PlanGeneration"
+    MPI_PROCS 1
+)
+
+# Test: ExecutionPlanBuilder (builds execution plans from orchestration config)
+# Tests single device, LOCAL TP, GLOBAL TP, PP, named domains, weight sharding.
+# Part of Phase 1: Plan-to-Graph Translation
+add_executable(v2_test_execution_plan_builder unit/Test__ExecutionPlanBuilder.cpp)
+target_link_libraries(v2_test_execution_plan_builder llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ExecutionPlanBuilder
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+    LABELS "V2;Unit;Execution;Orchestration;Heterogeneous;PlanGeneration;TP;PP"
+    MPI_PROCS 1
+)
+
+# Test: LayerDevicePlacement (layer-to-device mapping for multi-device graph building)
+# Tests SingleDevicePlacement, HybridCpuGpuPlacement, PipelineParallelPlacement,
+# LocalTPPlacement, and factory method fromExecutionPlan().
+# Part of Phase 2: Multi-Device Graph Building
+add_executable(v2_test_layer_device_placement unit/Test__LayerDevicePlacement.cpp)
+target_link_libraries(v2_test_layer_device_placement llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LayerDevicePlacement
+    COMMAND $<TARGET_FILE:v2_test_layer_device_placement>
+    LABELS "V2;Unit;Execution;Orchestration;Heterogeneous;LayerPlacement;TP;PP"
+    MPI_PROCS 1
+)
+
+# Test: Qwen2GraphConfigBuilder (builds Qwen2GraphConfig from RankExecutionPlan)
+# Tests config building for single device, PP layer ranges, LOCAL TP head distribution,
+# proportional weights, and combined PP+TP scenarios.
+# Part of Phase 2: Multi-Device Graph Building
+add_executable(v2_test_qwen2_graph_config_builder unit/Test__Qwen2GraphConfigBuilder.cpp)
+target_link_libraries(v2_test_qwen2_graph_config_builder llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Qwen2GraphConfigBuilder
+    COMMAND $<TARGET_FILE:v2_test_qwen2_graph_config_builder>
+    LABELS "V2;Unit;Models;Qwen2;GraphConfig;Orchestration;Heterogeneous;TP;PP"
+    MPI_PROCS 1
+)
+
 # Test: HeterogeneousLayerExecutor (heterogeneous device layer execution)
 # Tests device routing based on LayerPlacementConfig, statistics tracking,
 # cross-domain transfer detection, and layer execution on GPU/CPU.
@@ -3969,7 +4117,39 @@ add_executable(v2_test_multi_domain_orchestrator unit/Test__MultiDomainOrchestra
 target_link_libraries(v2_test_multi_domain_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_MultiDomainOrchestrator
     COMMAND $<TARGET_FILE:v2_test_multi_domain_orchestrator>
-    LABELS "V2;Unit;MultiDomainTP;GraphOrchestrator;TensorParallelism;Execution"
+    LABELS "V2;Unit;MultiDomainTP;DeviceGraphOrchestrator;TensorParallelism;Execution"
+    MPI_PROCS 1
+)
+
+# Test: MultiDeviceOrchestrator (LOCAL tensor parallelism across multiple devices)
+# Tests mock device runner and TP context, configuration validation, device coordination,
+# forward/clear_cache delegation, logits retrieval, and synchronization.
+# Part of LOCAL TP implementation for multi-GPU inference within single MPI rank.
+add_executable(v2_test_multi_device_orchestrator unit/Test__MultiDeviceOrchestrator.cpp)
+target_link_libraries(v2_test_multi_device_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MultiDeviceOrchestrator
+    COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
+    LABELS "V2;Unit;LocalTP;MultiDevice;IMultiDeviceOrchestrator;TensorParallelism;Execution"
+    MPI_PROCS 1
+)
+
+# Test: InferenceRunnerFactory MultiDevice (factory functions for MultiDeviceOrchestrator)
+# Tests createMultiDeviceOrchestrator and createTestableMultiDeviceOrchestrator
+# factory functions with various configurations, validation, and error handling.
+# Part of Phase 5: MultiDeviceOrchestrator integration with InferenceRunnerFactory
+add_executable(v2_unit_inference_runner_factory_multidevice unit/Test__InferenceRunnerFactory_MultiDevice.cpp)
+target_include_directories(v2_unit_inference_runner_factory_multidevice PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_inference_runner_factory_multidevice
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    GTest::gmock
+)
+add_v2_test(V2_Unit_InferenceRunnerFactory_MultiDevice
+    COMMAND $<TARGET_FILE:v2_unit_inference_runner_factory_multidevice>
+    LABELS "V2;Unit;InferenceRunnerFactory;MultiDevice;LocalTP;Factory"
     MPI_PROCS 1
 )
 
@@ -3996,70 +4176,70 @@ add_v2_test(V2_Unit_LivenessAnalyzer
     MPI_PROCS 1
 )
 
-# Test: Qwen2GraphBufferManagement (GraphBufferManager integration with GraphOrchestrator)
+# Test: Qwen2GraphBufferManagement (GraphBufferManager integration with DeviceGraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.
-# Part of Phase 3: Buffer Management moved to GraphOrchestrator
-add_executable(v2_test_graph_orchestrator_buffer_mgmt unit/Test__GraphOrchestratorBufferManagement.cpp)
-target_link_libraries(v2_test_graph_orchestrator_buffer_mgmt llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GraphOrchestratorBufferManagement
-    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_buffer_mgmt>
-    LABELS "V2;Unit;GraphOrchestrator;BufferManagement;GraphBufferManager"
+# Part of Phase 3: Buffer Management moved to DeviceGraphOrchestrator
+add_executable(v2_test_device_graph_orchestrator_buffer_mgmt unit/Test__DeviceGraphOrchestratorBufferManagement.cpp)
+target_link_libraries(v2_test_device_graph_orchestrator_buffer_mgmt llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceGraphOrchestratorBufferManagement
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_buffer_mgmt>
+    LABELS "V2;Unit;DeviceGraphOrchestrator;BufferManagement;GraphBufferManager"
     MPI_PROCS 1
 )
 
-# Test: GraphOrchestrator (clean separation of graph building and execution)
+# Test: DeviceGraphOrchestrator (clean separation of graph building and execution)
 # Tests the orchestrator's execution, caching, and device context management:
 # - Construction with graph builder or config
 # - Cache initialization and management
 # - Device context lazy creation and caching
 # - Cache statistics tracking
-add_executable(v2_test_graph_orchestrator unit/Test__GraphOrchestrator.cpp)
-target_link_libraries(v2_test_graph_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GraphOrchestrator
-    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator>
-    LABELS "V2;Unit;Qwen2;GraphOrchestrator;GraphExecution;DeclarativeDesign"
+add_executable(v2_test_device_graph_orchestrator unit/Test__DeviceGraphOrchestrator.cpp)
+target_link_libraries(v2_test_device_graph_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceGraphOrchestrator
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator>
+    LABELS "V2;Unit;Qwen2;DeviceGraphOrchestrator;GraphExecution;DeclarativeDesign"
     MPI_PROCS 1
 )
 
-# Test: GraphOrchestrator Phase-Aware Weights (Gap 3 - CPU Decode Participation)
+# Test: DeviceGraphOrchestrator Phase-Aware Weights (Gap 3 - CPU Decode Participation)
 # Tests the phase-aware weight selection mechanism for "Option A: Selective Duplication":
 # - Phase tracking (PREFILL vs DECODE)
 # - WeightManager and PlacementMap integration
 # - Phase-aware weight selection logic
 # - CPU decode participation checks
-add_executable(v2_test_graph_orchestrator_phase_aware_weights unit/Test__GraphOrchestratorPhaseAwareWeights.cpp)
-target_link_libraries(v2_test_graph_orchestrator_phase_aware_weights llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GraphOrchestrator_PhaseAwareWeights
-    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_phase_aware_weights>
-    LABELS "V2;Unit;GraphOrchestrator;PhaseAwareWeights;CPUDecodeParticipation;Gap3"
+add_executable(v2_test_device_graph_orchestrator_phase_aware_weights unit/Test__DeviceGraphOrchestratorPhaseAwareWeights.cpp)
+target_link_libraries(v2_test_device_graph_orchestrator_phase_aware_weights llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceGraphOrchestrator_PhaseAwareWeights
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_phase_aware_weights>
+    LABELS "V2;Unit;DeviceGraphOrchestrator;PhaseAwareWeights;CPUDecodeParticipation;Gap3"
     MPI_PROCS 1
 )
 
-# Test: GraphOrchestrator Weight Streaming (Option B - On-Demand Weight Transfer)
-# Tests the IWeightStreamer integration with GraphOrchestrator:
+# Test: DeviceGraphOrchestrator Weight Streaming (Option B - On-Demand Weight Transfer)
+# Tests the IWeightStreamer integration with DeviceGraphOrchestrator:
 # - Phase transition notifications to streamer
 # - Weight streaming hooks (ensure/prefetch/release) during layer execution
 # - Streaming is optional (works without streamer set)
-add_executable(v2_test_graph_orchestrator_weight_streaming unit/Test__GraphOrchestratorWeightStreaming.cpp)
-target_link_libraries(v2_test_graph_orchestrator_weight_streaming llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
-add_v2_test(V2_Unit_GraphOrchestrator_WeightStreaming
-    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_weight_streaming>
-    LABELS "V2;Unit;GraphOrchestrator;WeightStreaming;OptionB;IWeightStreamer"
+add_executable(v2_test_device_graph_orchestrator_weight_streaming unit/Test__DeviceGraphOrchestratorWeightStreaming.cpp)
+target_link_libraries(v2_test_device_graph_orchestrator_weight_streaming llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_v2_test(V2_Unit_DeviceGraphOrchestrator_WeightStreaming
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_weight_streaming>
+    LABELS "V2;Unit;DeviceGraphOrchestrator;WeightStreaming;OptionB;IWeightStreamer"
     MPI_PROCS 1
 )
 
-# Test: GraphOrchestrator Domain Wiring (Phase 6.3 - Heterogeneous TP)
-# Tests the MultiDomainTPConfig wiring in GraphOrchestrator:
+# Test: DeviceGraphOrchestrator Domain Wiring (Phase 6.3 - Heterogeneous TP)
+# Tests the MultiDomainTPConfig wiring in DeviceGraphOrchestrator:
 # - setDomainConfig() and domainConfig() accessor
 # - getDomainForLayer() routing logic
 # - Domain config persistence across operations
 # - Integration with AllreduceStage domain-aware communicator selection
-add_executable(v2_test_graph_orchestrator_domain_wiring unit/Test__GraphOrchestratorDomainWiring.cpp)
-target_link_libraries(v2_test_graph_orchestrator_domain_wiring llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GraphOrchestratorDomainWiring
-    COMMAND $<TARGET_FILE:v2_test_graph_orchestrator_domain_wiring>
-    LABELS "V2;Unit;GraphOrchestrator;MultiDomainTP;HeterogeneousTP;Phase6.3"
+add_executable(v2_test_device_graph_orchestrator_domain_wiring unit/Test__DeviceGraphOrchestratorDomainWiring.cpp)
+target_link_libraries(v2_test_device_graph_orchestrator_domain_wiring llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceGraphOrchestratorDomainWiring
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_domain_wiring>
+    LABELS "V2;Unit;DeviceGraphOrchestrator;MultiDomainTP;HeterogeneousTP;Phase6.3"
     MPI_PROCS 1
 )
 
@@ -4211,6 +4391,49 @@ add_v2_test(V2_Unit_AllreduceStage
     MPI_PROCS 1
 )
 
+# =============================================================================
+# Phase 4: LOCAL Tensor Parallelism Tests
+# =============================================================================
+# LOCAL TP enables sharding computations across multiple devices within a single
+# MPI rank, decoupling TP degree from MPI world_size. This is essential for
+# heterogeneous systems (e.g., 2 CUDA + 2 ROCm GPUs on one node).
+
+# Test: LocalTPContext (LOCAL tensor parallelism context)
+# Phase 4: Tests ILocalTPContext implementation for device management and collectives
+# Validates constructor, auto-detection, proportional weight distribution, head/row/col
+# sharding queries, and collective operation interfaces.
+add_executable(v2_test_local_tp_context unit/Test__LocalTPContext.cpp)
+target_link_libraries(v2_test_local_tp_context llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LocalTPContext
+    COMMAND $<TARGET_FILE:v2_test_local_tp_context>
+    LABELS "V2;Unit;LocalTP;Context;TensorParallel;Heterogeneous;DeviceManagement"
+    MPI_PROCS 1
+)
+
+# Test: LocalTPWeightSharder (weight sharding for LOCAL tensor parallelism)
+# Phase 4: Tests ILocalTPWeightSharder implementation for column/row-parallel sharding
+# Validates proportional weight distribution, equal weight handling, single-device
+# extraction, and correct shard sizing based on device weights.
+add_executable(v2_test_local_tp_weight_sharder unit/Test__LocalTPWeightSharder.cpp)
+target_link_libraries(v2_test_local_tp_weight_sharder llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LocalTPWeightSharder
+    COMMAND $<TARGET_FILE:v2_test_local_tp_weight_sharder>
+    LABELS "V2;Unit;LocalTP;WeightSharder;TensorParallel;ColumnParallel;RowParallel"
+    MPI_PROCS 1
+)
+
+# Test: LocalTPAllreduceStage (all-reduce stage for LOCAL tensor parallelism)
+# Phase 4: Tests LocalTPAllreduceStage for intra-rank collective operations
+# Validates stage type/name, buffer requirements, single-device no-op, multi-device
+# placeholder behavior, and dump info generation.
+add_executable(v2_test_local_tp_allreduce_stage unit/Test__LocalTPAllreduceStage.cpp)
+target_link_libraries(v2_test_local_tp_allreduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LocalTPAllreduceStage
+    COMMAND $<TARGET_FILE:v2_test_local_tp_allreduce_stage>
+    LABELS "V2;Unit;LocalTP;Allreduce;ComputeStage;TensorParallel;Collective"
+    MPI_PROCS 1
+)
+
 # Test: PPActivationStages (Pipeline Parallel activation stages)
 # Phase 6.4: Tests SendActivationsStage and ReceiveActivationsStage interfaces
 # Validates stage type, name generation, buffer requirements, dump info, and async support
@@ -4220,6 +4443,32 @@ target_link_libraries(v2_test_pp_activation_stages llaminar2_core GTest::gtest G
 add_v2_test(V2_Unit_PPActivationStages
     COMMAND $<TARGET_FILE:v2_test_pp_activation_stages>
     LABELS "V2;Unit;ComputeStage;PipelineParallel;SendActivations;ReceiveActivations;MPI;P2P"
+    MPI_PROCS 1
+)
+
+# Test: PipelineParallelGraphBuilder (PP stage insertion into compute graphs)
+# Phase 3: Tests IPipelineParallelGraphBuilder interface for inserting Send/Recv stages
+# Validates receive stage insertion (root node), send stage insertion (leaf node),
+# graph dependency wiring, MPI tag uniqueness, and stage naming conventions.
+# Note: Unit tests only - uses RankExecutionPlan configuration, no actual MPI
+add_executable(v2_test_pipeline_parallel_graph_builder unit/Test__PipelineParallelGraphBuilder.cpp)
+target_link_libraries(v2_test_pipeline_parallel_graph_builder llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PipelineParallelGraphBuilder
+    COMMAND $<TARGET_FILE:v2_test_pipeline_parallel_graph_builder>
+    LABELS "V2;Unit;PipelineParallel;GraphBuilder;SendActivations;ReceiveActivations;ComputeGraph"
+    MPI_PROCS 1
+)
+
+# Test: PartialWeightLoader (layer-specific weight loading for pipeline parallelism)
+# Phase 3: Tests IPartialWeightLoader interface for partial weight loading
+# Validates weight name generation (attention/FFN), memory estimation, embedding/LM head handling,
+# layer range filtering, and weight info construction.
+# Part of memory-efficient PP where each rank loads only its assigned layers.
+add_executable(v2_test_partial_weight_loader unit/Test__PartialWeightLoader.cpp)
+target_link_libraries(v2_test_partial_weight_loader llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PartialWeightLoader
+    COMMAND $<TARGET_FILE:v2_test_partial_weight_loader>
+    LABELS "V2;Unit;PipelineParallel;WeightLoader;Memory;LayerAssignment"
     MPI_PROCS 1
 )
 
@@ -4593,6 +4842,24 @@ add_v2_test(V2_Integration_WeightManagerProportional
     LABELS "V2;Integration;WeightManager;TensorParallel;Proportional;Heterogeneous"
 )
 
+# Test: WeightManager Multi-Device (device-aware features integration)
+# Tests multi-device weight isolation, concurrent access, real GPU packing,
+# and end-to-end preload workflow for LOCAL tensor parallelism
+add_executable(v2_integration_weight_manager_multi_device integration/Test__WeightManager_MultiDevice.cpp)
+target_include_directories(v2_integration_weight_manager_multi_device PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ and tests/v2/utils/ includes
+)
+target_link_libraries(v2_integration_weight_manager_multi_device 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_WeightManager_MultiDevice 
+    COMMAND $<TARGET_FILE:v2_integration_weight_manager_multi_device>
+    MPI_PROCS 1
+    LABELS "V2;Integration;WeightManager;MultiDevice;LocalTP;TensorParallel;GPU;Concurrent"
+)
+
 # Test: Qwen2Graph with TensorParallelConfig (Phase 1c: Proportional TP)
 add_executable(v2_test_qwen2graph_proportional_tp integration/Test__Qwen2GraphProportionalTP.cpp)
 target_link_libraries(v2_test_qwen2graph_proportional_tp 
@@ -4664,7 +4931,7 @@ add_v2_test(V2_Unit_HeterogeneousMultiDomainStrategy
 # End-to-end integration tests for heterogeneous multi-domain parallelism:
 # - Capability exchange (MPITopology)
 # - HeterogeneousMultiDomainStrategy
-# - Domain wiring in GraphOrchestrator
+# - Domain wiring in DeviceGraphOrchestrator
 # - PP Send/Recv stages
 # - Plan broadcast and deterministic computation
 add_executable(v2_integration_phase6_domain integration/Test__Phase6HeterogeneousDomainIntegration.cpp)
@@ -5096,7 +5363,7 @@ add_v2_test(V2_Integration_MPI_ShardedKVCache
 #   - MPITopology: Device capability exchange, work distribution
 #   - WeightManager: Column/row-parallel weight sharding
 #   - Qwen2Graph: Graph building with TP configuration
-#   - GraphOrchestrator: Full forward execution with all stages
+#   - DeviceGraphOrchestrator: Full forward execution with all stages
 #   - Sharded KV Cache: Per-rank cache with local heads
 #   - AllReduceStage: After Wo projection, FFN down projection
 #   - AllGatherStage: After LM head for logits aggregation
@@ -5108,7 +5375,7 @@ target_link_libraries(v2_integration_mpi_e2e_tp_inference
 add_v2_test(V2_Integration_MPI_E2E_TensorParallelInference
     COMMAND $<TARGET_FILE:v2_integration_mpi_e2e_tp_inference>
     MPI_PROCS 2
-    LABELS "V2;Integration;MPI;E2E;TensorParallelism;DistributedArchitecture;Inference;GraphOrchestrator"
+    LABELS "V2;Integration;MPI;E2E;TensorParallelism;DistributedArchitecture;Inference;DeviceGraphOrchestrator"
 )
 
 # Test: FloatingPointGemmKernel Integration Tests (thorough OneDNN FP32/BF16/FP16 GEMM tests)
@@ -6153,7 +6420,7 @@ add_v2_test(V2_Integration_PlacementStrategy_MPI
 #   1. MPITopology::computePlacement() is called during inference setup
 #   2. PlacementStrategyFactory::autoSelect() selects the right strategy
 #   3. HeterogeneousMultiDomainStrategy is used when appropriate
-#   4. PlacementPlan flows through to GraphOrchestrator
+#   4. PlacementPlan flows through to DeviceGraphOrchestrator
 add_executable(v2_integration_orchestrator_wiring integration/Test__OrchestratorWiringIntegration.cpp)
 target_include_directories(v2_integration_orchestrator_wiring PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
@@ -6237,7 +6504,7 @@ add_v2_test(V2_Integration_Qwen2Graph_FusedAttention
 # Tests:
 #   - Basic stage types (RMSNorm, SwiGLU, ResidualAdd)
 #   - Multi-stage graphs
-#   - Full Qwen2 graph with GraphOrchestrator
+#   - Full Qwen2 graph with DeviceGraphOrchestrator
 #   - FusedAttentionWo context/output capture
 #   - Decode phase callback invocation
 add_executable(v2_test_graph_snapshot_callback_invocation integration/Test__GraphSnapshotCallbackInvocation.cpp)
@@ -6699,3 +6966,137 @@ if(HAVE_CUDA OR HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added CollectiveContext GPU integration tests")
 endif()
+
+# =============================================================================
+# LOCAL TP Multi-Device Integration Tests
+# =============================================================================
+# Tests MultiDeviceOrchestrator with real GPU hardware for LOCAL tensor parallelism.
+# Validates:
+# - Hardware detection (CUDA/ROCm device enumeration)
+# - 2-GPU CUDA LOCAL TP (NCCL backend)
+# - 2-GPU ROCm LOCAL TP (RCCL backend)
+# - Heterogeneous CUDA+ROCm LOCAL TP (PCIeBAR backend)
+# - Logit parity between single-device and multi-device execution
+
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_local_tp_multi_device
+        integration/Test__LocalTPMultiDevice.cpp
+    )
+    target_link_libraries(v2_integration_local_tp_multi_device PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    # Conditionally link GPU libraries
+    if(HAVE_CUDA)
+        target_link_libraries(v2_integration_local_tp_multi_device PRIVATE CUDA::cudart)
+    endif()
+    if(HAVE_ROCM)
+        target_link_libraries(v2_integration_local_tp_multi_device PRIVATE hip::host)
+    endif()
+    add_v2_test(V2_Integration_LocalTP_MultiDevice
+        COMMAND $<TARGET_FILE:v2_integration_local_tp_multi_device>
+        LABELS "V2;Integration;LocalTP;MultiDevice;MultiDeviceOrchestrator;TensorParallelism;GPU;NCCL;RCCL;PCIeBAR;CUDA;ROCm;Heterogeneous"
+        MPI_PROCS 1  # LOCAL TP runs within a single MPI rank
+    )
+    message(STATUS "V2 Tests: Added LOCAL TP Multi-Device integration tests")
+endif()
+
+# =============================================================================
+# PCIeBAR CUDA Event Lifecycle Test
+# =============================================================================
+# Minimal test to reproduce CUDA event "context is destroyed" (error 709)
+# when events created on main thread are queried from PCIeBAR worker thread.
+
+if(HAVE_CUDA AND HAVE_ROCM)
+    add_executable(v2_integration_pciebar_cuda_event_lifecycle
+        integration/Test__PCIeBAR_CUDA_EventLifecycle.cpp
+    )
+    target_link_libraries(v2_integration_pciebar_cuda_event_lifecycle PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+        CUDA::cuda_driver
+        hip::host
+    )
+    add_v2_test(V2_Integration_PCIeBAR_CUDA_EventLifecycle
+        COMMAND $<TARGET_FILE:v2_integration_pciebar_cuda_event_lifecycle>
+        LABELS "V2;Integration;PCIeBAR;CUDA;ROCm;EventHandling;Heterogeneous"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added PCIeBAR CUDA event lifecycle tests")
+endif()
+
+# =============================================================================
+# CUDA/HIP Kernel Coexistence Test
+# =============================================================================
+# Minimal test to verify CUDA kernels work after HIP/ROCm operations.
+# Used to diagnose "context is destroyed" (error 709) issues.
+
+if(HAVE_CUDA AND HAVE_ROCM)
+    add_executable(v2_integration_cuda_hip_coexistence
+        diagnostics/Test__CUDAHIPKernelCoexistence.cpp
+    )
+    target_link_libraries(v2_integration_cuda_hip_coexistence PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+        hip::host
+    )
+    add_v2_test(V2_Integration_CUDAHIPCoexistence
+        COMMAND $<TARGET_FILE:v2_integration_cuda_hip_coexistence>
+        LABELS "V2;Integration;CUDA;ROCm;Heterogeneous;Diagnostics"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added CUDA/HIP Kernel Coexistence diagnostic test")
+endif()
+
+# =============================================================================
+# Phase 5: OrchestrationRunner Integration Tests
+# =============================================================================
+# Tests the end-to-end OrchestrationRunner that wires all Phase 0-4 components.
+# Validates factory creation, configuration, execution plan building, and inference lifecycle.
+
+add_executable(v2_integration_orchestration_runner
+    integration/Test__OrchestrationRunner.cpp
+)
+target_include_directories(v2_integration_orchestration_runner PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_integration_orchestration_runner
+    llaminar2_core
+    GTest::gtest
+    GTest::gmock
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_OrchestrationRunner
+    COMMAND $<TARGET_FILE:v2_integration_orchestration_runner>
+    LABELS "V2;Integration;Orchestration;OrchestrationRunner;Phase5;Factory;Lifecycle"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added OrchestrationRunner integration tests")
+
+# Test: Scenario 7 Multi-Domain Pipeline Parallel
+# Validates end-to-end integration for multi-domain PP with heterogeneous devices.
+# Hardware: GPU domain (CUDA) -> GPU domain (ROCm) -> CPU domain (2 sockets)
+add_executable(v2_integration_scenario7_multidomain_pp
+    integration/Test__Scenario7_MultiDomainPP.cpp
+)
+target_include_directories(v2_integration_scenario7_multidomain_pp PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/integration/orchestration  # For OrchestrationTestBase.h
+)
+target_link_libraries(v2_integration_scenario7_multidomain_pp
+    llaminar2_core
+    GTest::gtest
+    GTest::gmock
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_Scenario7_MultiDomainPP
+    COMMAND $<TARGET_FILE:v2_integration_scenario7_multidomain_pp>
+    LABELS "V2;Integration;Orchestration;Scenario7;MultiDomainPP;PipelineParallel;Heterogeneous;CUDA;ROCm;CPU;Phase5"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added Scenario 7 Multi-Domain PP integration tests")

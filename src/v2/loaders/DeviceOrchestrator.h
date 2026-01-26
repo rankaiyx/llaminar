@@ -70,9 +70,10 @@ namespace llaminar2
     };
 
     /**
-     * @brief Configuration for device orchestration
+     * @brief Configuration for device orchestration (legacy)
+     * @deprecated Use config/OrchestrationConfig.h for new CLI-based orchestration
      */
-    struct OrchestrationConfig
+    struct LegacyOrchestrationConfig
     {
         WeightPlacementStrategy strategy = WeightPlacementStrategy::AUTO;
         DeviceId gpu_device = DeviceId::cuda(0); ///< Which GPU to use (if multiple)
@@ -140,7 +141,7 @@ namespace llaminar2
          */
         DeviceOrchestrator(std::shared_ptr<DeviceManager> device_mgr,
                            std::shared_ptr<MPIContext> mpi_ctx,
-                           const OrchestrationConfig &config);
+                           const LegacyOrchestrationConfig &config);
 
         /**
          * @brief Create a placement map for a specific model
@@ -162,7 +163,7 @@ namespace llaminar2
         /**
          * @brief Get configuration
          */
-        const OrchestrationConfig &config() const { return config_; }
+        const LegacyOrchestrationConfig &config() const { return config_; }
 
         // ========================================================================
         // Public Testing Interface (Phase 2)
@@ -278,7 +279,7 @@ namespace llaminar2
 
         std::shared_ptr<DeviceManager> device_mgr_;
         std::shared_ptr<MPIContext> mpi_ctx_;
-        OrchestrationConfig config_;
+        LegacyOrchestrationConfig config_;
     };
 
 } // namespace llaminar2

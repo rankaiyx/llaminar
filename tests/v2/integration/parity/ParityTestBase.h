@@ -79,6 +79,9 @@
 // MPI for tensor-parallel tests
 #include <mpi.h>
 
+// For snapshot cache mutex
+#include <mutex>
+
 namespace llaminar2::test::parity
 {
 
@@ -448,6 +451,13 @@ namespace llaminar2::test::parity
      */
     class ParityTestBase : public ::testing::Test
     {
+    private:
+        // Static set of snapshot directories that have been generated this run.
+        // This prevents regenerating snapshots for every test case in a suite.
+        // Key: snapshot_dir path, Value: true if successfully generated
+        static inline std::set<std::string> s_generated_snapshots_;
+        static inline std::mutex s_snapshot_mutex_;
+
     protected:
         ParityConfig config_;
         std::shared_ptr<ModelContext> model_ctx_;
@@ -574,11 +584,28 @@ namespace llaminar2::test::parity
 
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
+            // OPTIMIZATION: Only regenerate if this snapshot_dir hasn't been done yet.
             if (isRank0())
             {
-                if (!regeneratePyTorchSnapshots())
+                bool need_regen = false;
                 {
-                    FAIL() << "PyTorch snapshot generation failed";
+                    std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
+                    need_regen = (s_generated_snapshots_.find(config_.snapshot_dir) == s_generated_snapshots_.end());
+                }
+
+                if (need_regen)
+                {
+                    if (!regeneratePyTorchSnapshots())
+                    {
+                        FAIL() << "PyTorch snapshot generation failed";
+                    }
+                    // Mark as generated
+                    std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
+                    s_generated_snapshots_.insert(config_.snapshot_dir);
+                }
+                else
+                {
+                    LOG_DEBUG("[" << getBackendName() << " Parity] Reusing cached snapshots from: " << config_.snapshot_dir);
                 }
             }
             mpiBarrier(); // All ranks wait for snapshots to be ready

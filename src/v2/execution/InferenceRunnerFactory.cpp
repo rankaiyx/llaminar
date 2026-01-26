@@ -12,12 +12,14 @@
 #include "DeviceInventory.h"
 #include "../models/qwen/Qwen2Graph.h"
 #include "../models/qwen/Qwen2Schema.h"
-#include "GraphOrchestrator.h"
+#include "DeviceGraphOrchestrator.h"
 #include "../loaders/ModelContext.h"
 #include "../loaders/ModelLoader.h"
 #include "../loaders/WeightManager.h"
-#include "../loaders/WeightPreloader.h"
 #include "../loaders/WeightStreamerFactory.h"
+#include "../collective/ILocalTPContext.h"
+#include "../interfaces/IMultiDeviceOrchestrator.h"
+#include "MultiDeviceOrchestrator.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 
@@ -25,7 +27,7 @@ namespace llaminar2
 {
 
     // Forward declarations of factory helpers
-    static std::unique_ptr<IInferenceRunner> createGraphOrchestratorImpl(
+    static std::unique_ptr<IInferenceRunner> createDeviceGraphOrchestratorImpl(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
         DeviceId device,
@@ -33,7 +35,7 @@ namespace llaminar2
         const std::string &architecture);
 
     static bool configureOrchestratorWeightsImpl(
-        GraphOrchestrator *orchestrator,
+        DeviceGraphOrchestrator *orchestrator,
         std::shared_ptr<ModelContext> model_ctx,
         DeviceId device);
 
@@ -141,14 +143,14 @@ namespace llaminar2
         // Graph is the only execution path (as of January 2025 cleanup)
         std::string architecture = model_ctx->architecture();
         LOG_DEBUG("[InferenceRunner] Using GRAPH path");
-        return createGraphOrchestratorImpl(model_ctx, mpi_ctx, device, config, architecture);
+        return createDeviceGraphOrchestratorImpl(model_ctx, mpi_ctx, device, config, architecture);
     }
 
     // =========================================================================
     // Factory Helper Implementations
     // =========================================================================
 
-    static std::unique_ptr<IInferenceRunner> createGraphOrchestratorImpl(
+    static std::unique_ptr<IInferenceRunner> createDeviceGraphOrchestratorImpl(
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
         DeviceId device,
@@ -257,14 +259,21 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Phase 3+: Tensor-Parallel Configuration (Proportional or Equal Split)
+        // Phase 3+: Tensor-Parallel Configuration
         // =====================================================================
-        // Two modes are supported:
-        // A) TensorParallelConfig (Phase 1c): Proportional head/FFN/vocab assignment
-        //    - Used for heterogeneous GPUs (e.g., NVIDIA 73% + AMD 27%)
-        //    - Assignment comes from DeviceShardingAssignment per rank
-        // B) Equal split (legacy): 1/world_size equal division
-        //    - Used for homogeneous setups
+        // Three modes are supported (in order of precedence):
+        //
+        // A) LOCAL TP (config.local_tp_ctx): Single MPI rank, multiple devices
+        //    - Configured via ILocalTPContext in InferenceRunnerConfig
+        //    - Collectives via NCCL/RCCL/PCIeBAR (high bandwidth, no host staging)
+        //    - Uses ILocalTPContext for proportional head/FFN/vocab assignment
+        //
+        // B) TensorParallelConfig (Phase 1c): Proportional GLOBAL TP
+        //    - Used for heterogeneous GLOBAL TP (e.g., NVIDIA 73% + AMD 27%)
+        //    - Assignment comes from DeviceShardingAssignment per MPI rank
+        //
+        // C) Equal split (legacy): 1/world_size equal GLOBAL TP
+        //    - Used for homogeneous GLOBAL setups
         //
         // IMPORTANT: Only enable tensor parallelism if weights are actually sharded.
         // If weights are REPLICATED, each rank has the full weight and should use
@@ -273,11 +282,92 @@ namespace llaminar2
         const bool weights_sharded = weight_mgr &&
                                      (weight_mgr->strategy() == WeightDistributionStrategy::SHARDED);
 
-        // Check if TensorParallelConfig is available from WeightManager
+        // Check if LOCAL TP context is provided (takes precedence over GLOBAL TP)
+        ILocalTPContext *local_tp_ctx = config.local_tp_ctx;
+        const int local_tp_device_idx = config.local_tp_device_index;
+
+        // Check if TensorParallelConfig is available from WeightManager (for GLOBAL TP)
         const TensorParallelConfig *tp_config = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
         const int current_rank = mpi_ctx ? mpi_ctx->rank() : 0;
 
-        if (tp_config && weights_sharded)
+        if (local_tp_ctx && local_tp_ctx->degree() > 1 && weights_sharded)
+        {
+            // =====================================================================
+            // LOCAL TP: Single rank with multiple devices via ILocalTPContext
+            // =====================================================================
+            const int tp_degree = local_tp_ctx->degree();
+            const auto &devices = local_tp_ctx->devices();
+            const auto &weights = local_tp_ctx->weights();
+
+            if (local_tp_device_idx < 0 || local_tp_device_idx >= tp_degree)
+            {
+                LOG_ERROR("[InferenceRunner] Invalid local_tp_device_index: " << local_tp_device_idx
+                                                                              << " (degree=" << tp_degree << ")");
+                return nullptr;
+            }
+
+            const GlobalDeviceAddress &my_device = devices[local_tp_device_idx];
+            const float my_weight = weights.empty() ? (1.0f / tp_degree) : weights[local_tp_device_idx];
+
+            // Compute head assignment based on weight/index
+            int head_start = 0;
+            int kv_head_start = 0;
+            int d_ff_start = 0;
+            int vocab_start = 0;
+
+            // Accumulate starts from devices before this one
+            for (int i = 0; i < local_tp_device_idx; ++i)
+            {
+                float w = weights.empty() ? (1.0f / tp_degree) : weights[i];
+                head_start += static_cast<int>(std::round(w * graph_config.n_heads));
+                kv_head_start += static_cast<int>(std::round(w * graph_config.n_kv_heads));
+                d_ff_start += static_cast<int>(std::round(w * graph_config.d_ff));
+                vocab_start += static_cast<int>(std::round(w * graph_config.vocab_size));
+            }
+
+            // Compute counts for this device
+            int local_n_heads = static_cast<int>(std::round(my_weight * graph_config.n_heads));
+            int local_n_kv_heads = static_cast<int>(std::round(my_weight * graph_config.n_kv_heads));
+            int d_ff_local = static_cast<int>(std::round(my_weight * graph_config.d_ff));
+            int vocab_local = static_cast<int>(std::round(my_weight * graph_config.vocab_size));
+
+            // Handle rounding: last device gets remainder
+            if (local_tp_device_idx == tp_degree - 1)
+            {
+                local_n_heads = graph_config.n_heads - head_start;
+                local_n_kv_heads = graph_config.n_kv_heads - kv_head_start;
+                d_ff_local = graph_config.d_ff - d_ff_start;
+                vocab_local = graph_config.vocab_size - vocab_start;
+            }
+
+            graph_config.head_start = head_start;
+            graph_config.local_n_heads = local_n_heads;
+            graph_config.local_n_kv_heads = local_n_kv_heads;
+            graph_config.qkv_column_parallel = true;
+            graph_config.local_rank = local_tp_device_idx;
+
+            graph_config.d_ff_local = d_ff_local;
+            graph_config.ffn_column_parallel = true;
+
+            graph_config.vocab_local = vocab_local;
+            graph_config.lm_head_column_parallel = true;
+
+            // Store LOCAL TP context for collective operations
+            graph_config.local_tp_ctx = local_tp_ctx;
+            graph_config.local_tp_device_idx = local_tp_device_idx;
+
+            LOG_INFO("[InferenceRunner] LOCAL TP enabled: degree=" << tp_degree
+                                                                   << " device_idx=" << local_tp_device_idx
+                                                                   << " device=" << my_device.toString()
+                                                                   << " weight=" << (my_weight * 100.0f) << "%"
+                                                                   << " backend=" << static_cast<int>(local_tp_ctx->backend()));
+            LOG_DEBUG("[InferenceRunner] LOCAL TP QKV: head_start=" << head_start
+                                                                    << " local_n_heads=" << local_n_heads << "/" << graph_config.n_heads
+                                                                    << " local_n_kv_heads=" << local_n_kv_heads << "/" << graph_config.n_kv_heads);
+            LOG_DEBUG("[InferenceRunner] LOCAL TP FFN: d_ff_local=" << d_ff_local << "/" << graph_config.d_ff);
+            LOG_DEBUG("[InferenceRunner] LOCAL TP LMHead: vocab_local=" << vocab_local << "/" << graph_config.vocab_size);
+        }
+        else if (tp_config && weights_sharded)
         {
             // =====================================================================
             // Phase 1c: Use TensorParallelConfig for proportional assignment
@@ -396,16 +486,16 @@ namespace llaminar2
                   << ", n_kv_heads=" << graph_config.n_kv_heads
                   << ", d_ff=" << graph_config.d_ff);
 
-        // Create GraphOrchestrator with config
+        // Create DeviceGraphOrchestrator with config
         GraphCacheConfig cache_config;
         cache_config.enabled = true;
         cache_config.decode_seq_len = 1;
 
-        LOG_DEBUG("[InferenceRunner] About to create GraphOrchestrator with mpi_ctx="
+        LOG_DEBUG("[InferenceRunner] About to create DeviceGraphOrchestrator with mpi_ctx="
                   << (mpi_ctx ? "valid" : "nullptr")
                   << " world_size=" << (mpi_ctx ? mpi_ctx->world_size() : -1));
 
-        auto orchestrator = std::make_unique<GraphOrchestrator>(
+        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             graph_config, mpi_ctx, cache_config);
 
         // Initialize graph cache
@@ -486,14 +576,14 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[InferenceRunner] GraphOrchestrator created successfully");
+        LOG_DEBUG("[InferenceRunner] DeviceGraphOrchestrator created successfully");
 
-        // GraphOrchestrator implements IInferenceRunner directly
+        // DeviceGraphOrchestrator implements IInferenceRunner directly
         return orchestrator;
     }
 
     static bool configureOrchestratorWeightsImpl(
-        GraphOrchestrator *orchestrator,
+        DeviceGraphOrchestrator *orchestrator,
         std::shared_ptr<ModelContext> model_ctx,
         DeviceId device)
     {
@@ -523,8 +613,7 @@ namespace llaminar2
         // =====================================================================
         // Preload weights for target device BEFORE accessing them
         // =====================================================================
-        // WeightPreloader creates device-targeted GEMM kernels (CPU, CUDA, or ROCm) and
-        // optionally releases raw tensor data to save memory.
+        // WeightManager packs GEMM weights and uploads non-GEMM weights to GPU.
         // This MUST happen before weights are retrieved, as GEMM kernel creation
         // requires the raw tensor data to still be available for packing.
         // =====================================================================
@@ -566,7 +655,7 @@ namespace llaminar2
         // =====================================================================
         // Eager load ALL layer weights into cache BEFORE preloading
         // =====================================================================
-        // This ensures weights are in cache for WeightPreloader to iterate
+        // This ensures weights are in cache for packGemmWeights to iterate
         int n_layers = model_ctx->blockCount();
         LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
         for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
@@ -592,17 +681,27 @@ namespace llaminar2
         // =====================================================================
         // NOW preload weights for target device (GPU packing/upload)
         // =====================================================================
-        // Use full DeviceId to preserve ordinal for multi-GPU setups
-        WeightPreloader preloader(weight_mgr);
-        if (!preloader.preloadForDevice(device))
+        // Pack GEMM weights (creates kernels and uploads to GPU for GPU targets)
+        if (!weight_mgr->packGemmWeights(device))
         {
-            LOG_WARN("[InferenceRunner] Weight preloading failed for device "
+            LOG_WARN("[InferenceRunner] Weight packing failed for device "
                      << device_name << ", will use lazy kernel creation");
             // Not fatal - kernels will be created lazily on first use
         }
         else
         {
-            LOG_DEBUG("[InferenceRunner] Preloaded weights for " << device_name);
+            LOG_DEBUG("[InferenceRunner] Packed GEMM weights for " << device_name);
+        }
+
+        // Upload non-GEMM weights (norms, embeddings) to GPU
+        if (!weight_mgr->uploadNonGemmWeights(device))
+        {
+            LOG_WARN("[InferenceRunner] Non-GEMM weight upload failed for device "
+                     << device_name);
+        }
+        else
+        {
+            LOG_DEBUG("[InferenceRunner] Uploaded non-GEMM weights for " << device_name);
         }
 
         // Layer weight accessor - capture weight_mgr by value (shared_ptr copy)
@@ -689,19 +788,112 @@ namespace llaminar2
         graph_config.fused_attention_backend = config.fused_attention_backend;
         graph_config.kv_cache_scale = config.kv_cache_scale;
 
-        // Estimate d_ff as ~4x d_model (common SwiGLU ratio) - tests can override
-        // In real usage, IModelContext implementations can provide accurate d_ff
-        graph_config.d_ff = graph_config.d_model * 4;
+        // Get d_ff from model context if available, otherwise estimate as ~4x d_model
+        int d_ff = model_ctx->feedForwardLength();
+        if (d_ff > 0)
+        {
+            graph_config.d_ff = d_ff;
+        }
+        else
+        {
+            graph_config.d_ff = graph_config.d_model * 4;
+            LOG_WARN("[InferenceRunner] feedForwardLength() returned 0, using estimate: " << graph_config.d_ff);
+        }
 
-        // Single rank configuration (testable runner doesn't use MPI by default)
-        graph_config.head_start = 0;
-        graph_config.local_n_heads = graph_config.n_heads;
-        graph_config.local_n_kv_heads = graph_config.n_kv_heads;
-        graph_config.qkv_column_parallel = false;
-        graph_config.d_ff_local = graph_config.d_ff;
-        graph_config.ffn_column_parallel = false;
-        graph_config.vocab_local = graph_config.vocab_size;
-        graph_config.lm_head_column_parallel = false;
+        // Check for LOCAL TP configuration
+        ILocalTPContext *local_tp_ctx = config.local_tp_ctx;
+        const int local_tp_device_idx = config.local_tp_device_index;
+
+        if (local_tp_ctx && local_tp_ctx->degree() > 1)
+        {
+            // =====================================================================
+            // LOCAL TP: Single rank with multiple devices via ILocalTPContext
+            // Mirrors the logic in createDeviceGraphOrchestratorImpl (lines 294-369)
+            // =====================================================================
+            const int tp_degree = local_tp_ctx->degree();
+            const auto &devices = local_tp_ctx->devices();
+            const auto &weights = local_tp_ctx->weights();
+
+            if (local_tp_device_idx < 0 || local_tp_device_idx >= tp_degree)
+            {
+                LOG_ERROR("[InferenceRunner] Invalid local_tp_device_index: " << local_tp_device_idx
+                                                                              << " (degree=" << tp_degree << ")");
+                return nullptr;
+            }
+
+            const GlobalDeviceAddress &my_device = devices[local_tp_device_idx];
+            const float my_weight = weights.empty() ? (1.0f / tp_degree) : weights[local_tp_device_idx];
+
+            // Compute head assignment based on weight/index
+            int head_start = 0;
+            int kv_head_start = 0;
+            int d_ff_start = 0;
+            int vocab_start = 0;
+
+            // Accumulate starts from devices before this one
+            for (int i = 0; i < local_tp_device_idx; ++i)
+            {
+                float w = weights.empty() ? (1.0f / tp_degree) : weights[i];
+                head_start += static_cast<int>(std::round(w * graph_config.n_heads));
+                kv_head_start += static_cast<int>(std::round(w * graph_config.n_kv_heads));
+                d_ff_start += static_cast<int>(std::round(w * graph_config.d_ff));
+                vocab_start += static_cast<int>(std::round(w * graph_config.vocab_size));
+            }
+
+            // Compute counts for this device
+            int local_n_heads = static_cast<int>(std::round(my_weight * graph_config.n_heads));
+            int local_n_kv_heads = static_cast<int>(std::round(my_weight * graph_config.n_kv_heads));
+            int d_ff_local = static_cast<int>(std::round(my_weight * graph_config.d_ff));
+            int vocab_local = static_cast<int>(std::round(my_weight * graph_config.vocab_size));
+
+            // Handle rounding: last device gets remainder
+            if (local_tp_device_idx == tp_degree - 1)
+            {
+                local_n_heads = graph_config.n_heads - head_start;
+                local_n_kv_heads = graph_config.n_kv_heads - kv_head_start;
+                d_ff_local = graph_config.d_ff - d_ff_start;
+                vocab_local = graph_config.vocab_size - vocab_start;
+            }
+
+            graph_config.head_start = head_start;
+            graph_config.local_n_heads = local_n_heads;
+            graph_config.local_n_kv_heads = local_n_kv_heads;
+            graph_config.qkv_column_parallel = true;
+            graph_config.local_rank = local_tp_device_idx;
+
+            graph_config.d_ff_local = d_ff_local;
+            graph_config.ffn_column_parallel = true;
+
+            graph_config.vocab_local = vocab_local;
+            graph_config.lm_head_column_parallel = true;
+
+            // Store LOCAL TP context for collective operations
+            graph_config.local_tp_ctx = local_tp_ctx;
+            graph_config.local_tp_device_idx = local_tp_device_idx;
+
+            LOG_INFO("[InferenceRunner] Testable LOCAL TP enabled: degree=" << tp_degree
+                                                                            << " device_idx=" << local_tp_device_idx
+                                                                            << " device=" << my_device.toString()
+                                                                            << " weight=" << (my_weight * 100.0f) << "%"
+                                                                            << " backend=" << static_cast<int>(local_tp_ctx->backend()));
+            LOG_DEBUG("[InferenceRunner] Testable LOCAL TP QKV: head_start=" << head_start
+                                                                             << " local_n_heads=" << local_n_heads << "/" << graph_config.n_heads
+                                                                             << " local_n_kv_heads=" << local_n_kv_heads << "/" << graph_config.n_kv_heads);
+            LOG_DEBUG("[InferenceRunner] Testable LOCAL TP FFN: d_ff_local=" << d_ff_local << "/" << graph_config.d_ff);
+            LOG_DEBUG("[InferenceRunner] Testable LOCAL TP LMHead: vocab_local=" << vocab_local << "/" << graph_config.vocab_size);
+        }
+        else
+        {
+            // Single rank configuration (testable runner doesn't use MPI by default)
+            graph_config.head_start = 0;
+            graph_config.local_n_heads = graph_config.n_heads;
+            graph_config.local_n_kv_heads = graph_config.n_kv_heads;
+            graph_config.qkv_column_parallel = false;
+            graph_config.d_ff_local = graph_config.d_ff;
+            graph_config.ffn_column_parallel = false;
+            graph_config.vocab_local = graph_config.vocab_size;
+            graph_config.lm_head_column_parallel = false;
+        }
 
         LOG_DEBUG("[InferenceRunner] TestableGraphConfig: "
                   << "vocab=" << graph_config.vocab_size
@@ -712,16 +904,16 @@ namespace llaminar2
                   << ", d_ff=" << graph_config.d_ff);
 
         // Create Dependencies struct
-        GraphOrchestrator::Dependencies deps;
+        DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
         // topology and collective_ctx left as nullptr for single-rank testing
 
-        // Create GraphOrchestrator with injected dependencies
+        // Create DeviceGraphOrchestrator with injected dependencies
         GraphCacheConfig cache_config;
         cache_config.enabled = true;
         cache_config.decode_seq_len = 1;
 
-        auto orchestrator = std::make_unique<GraphOrchestrator>(
+        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(deps), graph_config, cache_config);
 
         // Initialize graph cache
@@ -740,13 +932,19 @@ namespace llaminar2
         }
 
         // Configure weights from IModelContext
-        // Build Qwen2ModelWeights using IModelContext::getWeight
+        // Build Qwen2ModelWeights using IModelContext::getWeightForDevice
+        //
+        // IMPORTANT: Use getWeightForDevice() instead of getWeight() to get
+        // device-specific tensor instances. This is critical for multi-device
+        // scenarios where each device needs its own tensor for coherence tracking.
+        // The WeightManager handles cloning automatically when called from
+        // different devices.
         Qwen2ModelWeights weights;
 
-        // Get global weights via interface
-        auto embedding = model_ctx->getWeight("token_embd.weight");
-        auto final_norm = model_ctx->getWeight("output_norm.weight");
-        auto lm_head = model_ctx->getWeight("output.weight");
+        // Get global weights via interface - use device-specific instances
+        auto embedding = model_ctx->getWeightForDevice("token_embd.weight", device);
+        auto final_norm = model_ctx->getWeightForDevice("output_norm.weight", device);
+        auto lm_head = model_ctx->getWeightForDevice("output.weight", device);
 
         if (!embedding || !final_norm || !lm_head)
         {
@@ -759,40 +957,116 @@ namespace llaminar2
         weights.lm_head = lm_head.get();
 
         // Layer weight accessor using IModelContext interface
-        // Capture model_ctx by value (shared_ptr copy) for lambda lifetime
-        weights.get_layer_weights = [model_ctx](int layer_idx) -> Qwen2LayerWeights
+        // Capture model_ctx AND device by value for lambda lifetime
+        weights.get_layer_weights = [model_ctx, device](int layer_idx) -> Qwen2LayerWeights
         {
             Qwen2LayerWeights layer;
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
-            // Attention weights
-            layer.wq = model_ctx->getWeight(prefix + "attn_q.weight").get();
-            layer.wk = model_ctx->getWeight(prefix + "attn_k.weight").get();
-            layer.wv = model_ctx->getWeight(prefix + "attn_v.weight").get();
-            layer.wo = model_ctx->getWeight(prefix + "attn_output.weight").get();
-            layer.attn_norm = model_ctx->getWeight(prefix + "attn_norm.weight").get();
+            // Attention weights - device-specific instances
+            layer.wq = model_ctx->getWeightForDevice(prefix + "attn_q.weight", device).get();
+            layer.wk = model_ctx->getWeightForDevice(prefix + "attn_k.weight", device).get();
+            layer.wv = model_ctx->getWeightForDevice(prefix + "attn_v.weight", device).get();
+            layer.wo = model_ctx->getWeightForDevice(prefix + "attn_output.weight", device).get();
+            layer.attn_norm = model_ctx->getWeightForDevice(prefix + "attn_norm.weight", device).get();
 
             // Attention biases (may be null)
-            auto q_bias = model_ctx->getWeight(prefix + "attn_q.bias");
-            auto k_bias = model_ctx->getWeight(prefix + "attn_k.bias");
-            auto v_bias = model_ctx->getWeight(prefix + "attn_v.bias");
+            auto q_bias = model_ctx->getWeightForDevice(prefix + "attn_q.bias", device);
+            auto k_bias = model_ctx->getWeightForDevice(prefix + "attn_k.bias", device);
+            auto v_bias = model_ctx->getWeightForDevice(prefix + "attn_v.bias", device);
             layer.q_bias = q_bias ? q_bias.get() : nullptr;
             layer.k_bias = k_bias ? k_bias.get() : nullptr;
             layer.v_bias = v_bias ? v_bias.get() : nullptr;
 
             // FFN weights
-            layer.gate_proj = model_ctx->getWeight(prefix + "ffn_gate.weight").get();
-            layer.up_proj = model_ctx->getWeight(prefix + "ffn_up.weight").get();
-            layer.down_proj = model_ctx->getWeight(prefix + "ffn_down.weight").get();
-            layer.ffn_norm = model_ctx->getWeight(prefix + "ffn_norm.weight").get();
+            layer.gate_proj = model_ctx->getWeightForDevice(prefix + "ffn_gate.weight", device).get();
+            layer.up_proj = model_ctx->getWeightForDevice(prefix + "ffn_up.weight", device).get();
+            layer.down_proj = model_ctx->getWeightForDevice(prefix + "ffn_down.weight", device).get();
+            layer.ffn_norm = model_ctx->getWeightForDevice(prefix + "ffn_norm.weight", device).get();
 
             return layer;
         };
 
         orchestrator->setWeights(weights);
-        LOG_INFO("[InferenceRunner] Testable GraphOrchestrator created successfully");
+        LOG_INFO("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");
 
         return orchestrator;
+    }
+
+    // =========================================================================
+    // Multi-Device Orchestrator Factory Functions
+    // =========================================================================
+
+    std::unique_ptr<IMultiDeviceOrchestrator> createMultiDeviceOrchestrator(
+        std::shared_ptr<IModelContext> model_ctx,
+        std::unique_ptr<ILocalTPContext> tp_ctx,
+        const MultiDeviceOrchestrator::Config &config)
+    {
+        if (!model_ctx)
+        {
+            LOG_ERROR("[InferenceRunner] model_ctx is null for createMultiDeviceOrchestrator");
+            return nullptr;
+        }
+
+        if (!tp_ctx)
+        {
+            LOG_ERROR("[InferenceRunner] tp_ctx is null for createMultiDeviceOrchestrator");
+            return nullptr;
+        }
+
+        if (!config.validate())
+        {
+            LOG_ERROR("[InferenceRunner] Invalid MultiDeviceOrchestrator config");
+            return nullptr;
+        }
+
+        LOG_INFO("[InferenceRunner] Creating MultiDeviceOrchestrator with "
+                 << config.devices.size() << " devices, backend="
+                 << static_cast<int>(config.backend));
+
+        try
+        {
+            return std::make_unique<MultiDeviceOrchestrator>(
+                model_ctx, std::move(tp_ctx), config);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[InferenceRunner] Failed to create MultiDeviceOrchestrator: " << e.what());
+            return nullptr;
+        }
+    }
+
+    std::unique_ptr<IMultiDeviceOrchestrator> createTestableMultiDeviceOrchestrator(
+        std::shared_ptr<IModelContext> model_ctx,
+        std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners,
+        std::unique_ptr<ILocalTPContext> tp_ctx,
+        const MultiDeviceOrchestrator::Config &config)
+    {
+        if (!model_ctx)
+        {
+            LOG_ERROR("[InferenceRunner] model_ctx is null for createTestableMultiDeviceOrchestrator");
+            return nullptr;
+        }
+
+        if (device_runners.empty())
+        {
+            LOG_ERROR("[InferenceRunner] device_runners is empty");
+            return nullptr;
+        }
+
+        LOG_DEBUG("[InferenceRunner] Creating testable MultiDeviceOrchestrator with "
+                  << device_runners.size() << " injected runners");
+
+        try
+        {
+            return MultiDeviceOrchestrator::createForTest(
+                model_ctx, std::move(device_runners), std::move(tp_ctx), config);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[InferenceRunner] Failed to create testable MultiDeviceOrchestrator: " << e.what());
+            return nullptr;
+        }
     }
 
 } // namespace llaminar2

@@ -1,6 +1,6 @@
 /**
- * @file Test__GraphOrchestratorPhaseAwareWeights.cpp
- * @brief Unit tests for GraphOrchestrator phase-aware weight access (Gap 3)
+ * @file Test__DeviceGraphOrchestratorPhaseAwareWeights.cpp
+ * @brief Unit tests for DeviceGraphOrchestrator phase-aware weight access (Gap 3)
  * @author David Sanftenberg
  * @date January 2026
  *
@@ -12,7 +12,7 @@
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/backends/DeviceId.h"
-#include "../../../src/v2/execution/GraphOrchestrator.h"
+#include "../../../src/v2/execution/DeviceGraphOrchestrator.h"
 #include "../../../src/v2/execution/PlacementStrategy.h"
 #include "../../../src/v2/loaders/WeightManager.h"
 #include "../../../src/v2/loaders/WeightPlacementMap.h"
@@ -30,7 +30,7 @@ using namespace llaminar2;
 /**
  * @brief Test fixture for phase-aware weight access tests
  */
-class Test__GraphOrchestratorPhaseAwareWeights : public ::testing::Test
+class Test__DeviceGraphOrchestratorPhaseAwareWeights : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -51,29 +51,29 @@ protected:
         config_.default_device = DeviceId::cpu();
 
         // Create orchestrator
-        orchestrator_ = std::make_unique<GraphOrchestrator>(config_, nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
     }
 
     Qwen2GraphConfig config_;
-    std::unique_ptr<GraphOrchestrator> orchestrator_;
+    std::unique_ptr<DeviceGraphOrchestrator> orchestrator_;
 };
 
 // =============================================================================
 // Phase Tracking Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, DefaultPhaseIsPrefill)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, DefaultPhaseIsPrefill)
 {
     EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::PREFILL);
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, SetPhaseToDecodeSucceeds)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, SetPhaseToDecodeSucceeds)
 {
     orchestrator_->setPhase(InferencePhase::DECODE);
     EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::DECODE);
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, SetPhaseToPrefillSucceeds)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, SetPhaseToPrefillSucceeds)
 {
     orchestrator_->setPhase(InferencePhase::DECODE);
     orchestrator_->setPhase(InferencePhase::PREFILL);
@@ -84,19 +84,19 @@ TEST_F(Test__GraphOrchestratorPhaseAwareWeights, SetPhaseToPrefillSucceeds)
 // Weight Manager Setup Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, WeightManagerInitiallyNull)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, WeightManagerInitiallyNull)
 {
     EXPECT_EQ(orchestrator_->weightManager(), nullptr);
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, SetWeightPlacementMapSucceeds)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, SetWeightPlacementMapSucceeds)
 {
     auto placement_map = std::make_shared<WeightPlacementMap>(DeviceId::cpu());
     orchestrator_->setWeightPlacementMap(placement_map);
     EXPECT_EQ(orchestrator_->weightPlacementMap(), placement_map);
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, PlacementMapInitiallyNull)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, PlacementMapInitiallyNull)
 {
     EXPECT_EQ(orchestrator_->weightPlacementMap(), nullptr);
 }
@@ -105,14 +105,14 @@ TEST_F(Test__GraphOrchestratorPhaseAwareWeights, PlacementMapInitiallyNull)
 // Phase-Aware Weight Selection Tests (without real weights)
 // =============================================================================
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, GetPhaseAwareWeightReturnsNullWithoutWeightManager)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, GetPhaseAwareWeightReturnsNullWithoutWeightManager)
 {
     // Without a WeightManager, getPhaseAwareWeight should return nullptr
     auto weight = orchestrator_->getPhaseAwareWeight("blk.0.attn_q.weight", 0, InferencePhase::PREFILL);
     EXPECT_EQ(weight, nullptr);
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, ShouldUseCPUDecodeWeightFalseInPrefill)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, ShouldUseCPUDecodeWeightFalseInPrefill)
 {
     // In PREFILL phase, should never use CPU decode weight
     orchestrator_->setPhase(InferencePhase::PREFILL);
@@ -125,7 +125,7 @@ TEST_F(Test__GraphOrchestratorPhaseAwareWeights, ShouldUseCPUDecodeWeightFalseIn
     EXPECT_FALSE(orchestrator_->shouldUseCPUDecodeWeight("blk.0.attn_q.weight", 0));
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, ShouldUseCPUDecodeWeightFalseWithoutPlacementMap)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, ShouldUseCPUDecodeWeightFalseWithoutPlacementMap)
 {
     // In DECODE phase but without placement map, should return false
     orchestrator_->setPhase(InferencePhase::DECODE);
@@ -160,7 +160,7 @@ protected:
         config_.rope_theta = 1000000.0f;
         config_.default_device = DeviceId::cpu();
 
-        orchestrator_ = std::make_unique<GraphOrchestrator>(config_, nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
     }
 
     /**
@@ -175,7 +175,7 @@ protected:
     }
 
     Qwen2GraphConfig config_;
-    std::unique_ptr<GraphOrchestrator> orchestrator_;
+    std::unique_ptr<DeviceGraphOrchestrator> orchestrator_;
 };
 
 TEST_F(Test__PhaseAwareWeightSelectionLogic, PrefillPhaseNeverUsesCPUDecode)
@@ -211,7 +211,7 @@ TEST_F(Test__PhaseAwareWeightSelectionLogic, DecodePhaseWithoutCPUParticipationU
 // Phase Transition Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, PhaseTransitionsWorkCorrectly)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, PhaseTransitionsWorkCorrectly)
 {
     // Start in PREFILL (default)
     EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::PREFILL);
@@ -230,7 +230,7 @@ TEST_F(Test__GraphOrchestratorPhaseAwareWeights, PhaseTransitionsWorkCorrectly)
     EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::DECODE);
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, TransitionToPhaseWithLogging)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, TransitionToPhaseWithLogging)
 {
     // Start in PREFILL (default)
     EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::PREFILL);
@@ -244,7 +244,7 @@ TEST_F(Test__GraphOrchestratorPhaseAwareWeights, TransitionToPhaseWithLogging)
     EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::PREFILL);
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, TransitionToSamePhaseNoOp)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, TransitionToSamePhaseNoOp)
 {
     // Start in PREFILL
     EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::PREFILL);
@@ -263,7 +263,7 @@ TEST_F(Test__GraphOrchestratorPhaseAwareWeights, TransitionToSamePhaseNoOp)
     EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::DECODE);
 }
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, ToStringForInferencePhase)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, ToStringForInferencePhase)
 {
     // Test toString() helper function
     EXPECT_STREQ(toString(InferencePhase::PREFILL), "PREFILL");
@@ -274,7 +274,7 @@ TEST_F(Test__GraphOrchestratorPhaseAwareWeights, ToStringForInferencePhase)
 // Convenience Method Tests
 // =============================================================================
 
-TEST_F(Test__GraphOrchestratorPhaseAwareWeights, GetPhaseAwareWeightUsesCurrentPhase)
+TEST_F(Test__DeviceGraphOrchestratorPhaseAwareWeights, GetPhaseAwareWeightUsesCurrentPhase)
 {
     // Set phase
     orchestrator_->setPhase(InferencePhase::DECODE);
@@ -313,7 +313,7 @@ protected:
         config_.rope_theta = 1000000.0f;
         config_.default_device = DeviceId::cpu();
 
-        orchestrator_ = std::make_unique<GraphOrchestrator>(config_, nullptr);
+        orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(config_, nullptr);
 
         // Save original env value
         const char *orig = std::getenv("LLAMINAR_CPU_PREFILL_PARTICIPATE");
@@ -337,7 +337,7 @@ protected:
     }
 
     Qwen2GraphConfig config_;
-    std::unique_ptr<GraphOrchestrator> orchestrator_;
+    std::unique_ptr<DeviceGraphOrchestrator> orchestrator_;
     std::string original_env_value_;
     bool original_env_was_set_ = false;
 };
@@ -435,4 +435,3 @@ TEST_F(Test__CPUPrefillParticipation, EnvVarInvalidValue_DefaultsToDisabled)
     orchestrator_->setPhase(InferencePhase::PREFILL);
     EXPECT_FALSE(orchestrator_->shouldUseCPUDecodeWeight("blk.0.attn_q.weight", 0));
 }
-

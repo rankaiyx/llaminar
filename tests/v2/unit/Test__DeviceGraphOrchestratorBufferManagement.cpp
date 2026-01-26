@@ -1,22 +1,22 @@
 /**
- * @file Test__GraphOrchestratorBufferManagement.cpp
- * @brief Unit tests for GraphOrchestrator buffer management
+ * @file Test__DeviceGraphOrchestratorBufferManagement.cpp
+ * @brief Unit tests for DeviceGraphOrchestrator buffer management
  * @author David Sanftenberg
  * @date January 2025
  *
- * Tests the GraphBufferManager integration with GraphOrchestrator:
+ * Tests the GraphBufferManager integration with DeviceGraphOrchestrator:
  * - setTensorFactory() / initializeBuffers() workflow
  * - Buffer allocation and binding
  * - Statistics tracking
  * - Release cleanup
  *
- * Note: Buffer management was moved from Qwen2Graph to GraphOrchestrator
+ * Note: Buffer management was moved from Qwen2Graph to DeviceGraphOrchestrator
  * as part of the declarative refactor (Phase 3).
  */
 
 #include <gtest/gtest.h>
 #include "../../../src/v2/backends/DeviceId.h"
-#include "../../../src/v2/execution/GraphOrchestrator.h"
+#include "../../../src/v2/execution/DeviceGraphOrchestrator.h"
 #include "../../../src/v2/models/qwen/Qwen2Graph.h"
 #include "../../../src/v2/tensors/TensorFactory.h"
 #include "../../../src/v2/utils/MPIContext.h"
@@ -27,7 +27,7 @@ using namespace llaminar2;
 // Test Fixture
 // ============================================================================
 
-class Test__GraphOrchestratorBufferManagement : public ::testing::Test
+class Test__DeviceGraphOrchestratorBufferManagement : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -67,25 +67,25 @@ protected:
 // Basic Tests
 // ============================================================================
 
-TEST_F(Test__GraphOrchestratorBufferManagement, CreateWithBufferManagementFlag)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, CreateWithBufferManagementFlag)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
 
     EXPECT_TRUE(config.use_graph_buffer_management);
     EXPECT_FALSE(orchestrator.hasGraphManagedBuffers()) << "Should not have buffers until initializeBuffers()";
 }
 
-TEST_F(Test__GraphOrchestratorBufferManagement, InitializeWithoutTensorFactoryFails)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, InitializeWithoutTensorFactoryFails)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     // Don't call setTensorFactory()
 
     // Should fail because TensorFactory not set
@@ -94,13 +94,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, InitializeWithoutTensorFactoryFa
     EXPECT_FALSE(orchestrator.hasGraphManagedBuffers());
 }
 
-TEST_F(Test__GraphOrchestratorBufferManagement, InitializeBuffersSuccess)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, InitializeBuffersSuccess)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     bool result = orchestrator.initializeBuffers(64);
@@ -108,13 +108,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, InitializeBuffersSuccess)
     EXPECT_TRUE(orchestrator.hasGraphManagedBuffers());
 }
 
-TEST_F(Test__GraphOrchestratorBufferManagement, BufferStatsAvailable)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, BufferStatsAvailable)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     EXPECT_EQ(orchestrator.bufferStats(), nullptr) << "No stats before init";
@@ -127,13 +127,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, BufferStatsAvailable)
     EXPECT_GT(stats->total_buffers, 0u) << "Should have allocated buffers";
 }
 
-TEST_F(Test__GraphOrchestratorBufferManagement, ReleaseBuffers)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, ReleaseBuffers)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeBuffers(64));
@@ -144,13 +144,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, ReleaseBuffers)
     EXPECT_EQ(orchestrator.bufferStats(), nullptr);
 }
 
-TEST_F(Test__GraphOrchestratorBufferManagement, ReinitializeAfterRelease)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, ReinitializeAfterRelease)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     // First init
@@ -174,13 +174,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, ReinitializeAfterRelease)
 // Memory Allocation Tests
 // ============================================================================
 
-TEST_F(Test__GraphOrchestratorBufferManagement, AllocatesReasonableMemory)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, AllocatesReasonableMemory)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeBuffers(64));
@@ -204,13 +204,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, AllocatesReasonableMemory)
         << "Should not allocate excessive memory";
 }
 
-TEST_F(Test__GraphOrchestratorBufferManagement, LargerSeqLenUsesMoreMemory)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, LargerSeqLenUsesMoreMemory)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder1 = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator1(graph_builder1, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator1(graph_builder1, mpi_ctx_);
     orchestrator1.setTensorFactory(tensor_factory_.get());
     ASSERT_TRUE(orchestrator1.initializeBuffers(64));
     size_t bytes_64 = orchestrator1.bufferStats()->total_bytes;
@@ -218,7 +218,7 @@ TEST_F(Test__GraphOrchestratorBufferManagement, LargerSeqLenUsesMoreMemory)
     orchestrator1.releaseBuffers();
 
     auto graph_builder2 = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator2(graph_builder2, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator2(graph_builder2, mpi_ctx_);
     orchestrator2.setTensorFactory(tensor_factory_.get());
     ASSERT_TRUE(orchestrator2.initializeBuffers(256));
     size_t bytes_256 = orchestrator2.bufferStats()->total_bytes;
@@ -237,13 +237,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, LargerSeqLenUsesMoreMemory)
 // Edge Cases
 // ============================================================================
 
-TEST_F(Test__GraphOrchestratorBufferManagement, VerySmallSeqLen)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, VerySmallSeqLen)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     ASSERT_TRUE(orchestrator.initializeBuffers(1));
@@ -254,13 +254,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, VerySmallSeqLen)
     EXPECT_GT(stats->total_bytes, 0u);
 }
 
-TEST_F(Test__GraphOrchestratorBufferManagement, WithoutUseGraphBufferManagementFlagFails)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, WithoutUseGraphBufferManagementFlagFails)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = false; // Disabled
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     orchestrator.setTensorFactory(tensor_factory_.get());
 
     // initializeBuffers should fail when flag is false
@@ -269,13 +269,13 @@ TEST_F(Test__GraphOrchestratorBufferManagement, WithoutUseGraphBufferManagementF
     EXPECT_FALSE(orchestrator.hasGraphManagedBuffers());
 }
 
-TEST_F(Test__GraphOrchestratorBufferManagement, ReleaseWithoutInitIsNoOp)
+TEST_F(Test__DeviceGraphOrchestratorBufferManagement, ReleaseWithoutInitIsNoOp)
 {
     auto config = createMinimalConfig();
     config.use_graph_buffer_management = true;
 
     auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-    GraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
+    DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx_);
     // Don't initialize
 
     // Should not crash

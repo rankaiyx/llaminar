@@ -9,15 +9,22 @@
 #include "PCIeBARBackend.h"
 #include "../../utils/Logger.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
+#include "../../backends/BackendManager.h"
 
 #include <algorithm>
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 #include <cuda_runtime.h>
+#include <cuda.h> // For cuCtxSetCurrent, cuDevicePrimaryCtxRetain
 #endif
 
 namespace llaminar2
 {
+
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+    // Static instance pointer for cross-thread CUDA event wait proxying
+    PCIeBARBackend *PCIeBARBackend::s_instance_ = nullptr;
+#endif
 
     // =========================================================================
     // Construction / Destruction
@@ -299,6 +306,78 @@ namespace llaminar2
         bar_total_mapped_size_ = p2p_engine_->getBarMappedSize();
         bar_alloc_offset_ = 0; // Start allocations at beginning of BAR
 
+        // Start the CUDA worker thread BEFORE marking initialized
+        // This thread handles all CUDA operations to avoid HIP runtime contamination
+        if (!startCUDAWorker())
+        {
+            LOG_ERROR("Failed to start CUDA worker thread");
+            return false;
+        }
+
+        // CRITICAL: Warmup the CUDA kernel by launching it once on the worker thread.
+        // This forces CUDA to JIT-compile/load the PTX code BEFORE HIP initializes.
+        // Without this, the first kernel launch after HIP init fails with error 709.
+        {
+            LOG_DEBUG("[PCIeBARBackend] Warming up CUDA VectorAdd kernel...");
+
+            // Allocate small temp buffers for warmup
+            void *warmup_buf1 = nullptr;
+            void *warmup_buf2 = nullptr;
+            cudaError_t alloc_err1 = cudaMalloc(&warmup_buf1, 64);
+            cudaError_t alloc_err2 = cudaMalloc(&warmup_buf2, 64);
+
+            if (alloc_err1 == cudaSuccess && alloc_err2 == cudaSuccess)
+            {
+                // Initialize to zero
+                cudaMemset(warmup_buf1, 0, 64);
+                cudaMemset(warmup_buf2, 0, 64);
+                cudaDeviceSynchronize();
+
+                // Launch kernel once via worker thread to force JIT compilation
+                float *out = static_cast<float *>(warmup_buf1);
+                const float *in2 = static_cast<const float *>(warmup_buf2);
+
+                auto warmup_future = submitCUDAWork([this, out, in2]() -> bool
+                                                    {
+                    cudaError_t err = cudaSetDevice(cuda_device_.ordinal);
+                    if (err != cudaSuccess) return false;
+                    
+                    // Launch kernel with small count
+                    bool success = cuda::launchVectorAddInplace_f32(out, in2, 16, 0);
+                    if (!success)
+                    {
+                        LOG_ERROR("[PCIeBARBackend] CUDA kernel warmup FAILED - kernel may not work");
+                        return false;
+                    }
+                    
+                    err = cudaDeviceSynchronize();
+                    return err == cudaSuccess; });
+
+                if (warmup_future.get())
+                {
+                    LOG_INFO("[PCIeBARBackend] CUDA VectorAdd kernel warmup successful");
+                }
+                else
+                {
+                    LOG_WARN("[PCIeBARBackend] CUDA kernel warmup failed - may have issues later");
+                }
+
+                cudaFree(warmup_buf1);
+                cudaFree(warmup_buf2);
+            }
+            else
+            {
+                if (warmup_buf1)
+                    cudaFree(warmup_buf1);
+                if (warmup_buf2)
+                    cudaFree(warmup_buf2);
+                LOG_WARN("[PCIeBARBackend] Could not allocate warmup buffers");
+            }
+        }
+
+        // Set global instance for cross-thread event wait proxying
+        s_instance_ = this;
+
         initialized_ = true;
         LOG_INFO("PCIeBARBackend initialized for group: " << group.name);
         return true;
@@ -310,6 +389,17 @@ namespace llaminar2
 
     void PCIeBARBackend::shutdown()
     {
+        // Clear global instance first
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+        if (s_instance_ == this)
+        {
+            s_instance_ = nullptr;
+        }
+#endif
+
+        // Stop CUDA worker thread first (before freeing resources it might use)
+        stopCUDAWorker();
+
         freeTempBuffer();
 
         // Clear BAR allocator state
@@ -671,14 +761,22 @@ namespace llaminar2
     bool PCIeBARBackend::synchronize()
     {
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-        // Synchronize CUDA device
-        int prev_device;
-        cudaGetDevice(&prev_device);
-        cudaSetDevice(cuda_device_.ordinal);
-        cudaDeviceSynchronize();
-        cudaSetDevice(prev_device);
+        // Synchronize CUDA device using the backend abstraction
+        IBackend *cuda_backend = getCUDABackend();
+        if (!cuda_backend)
+        {
+            LOG_ERROR("[PCIeBARBackend::synchronize] CUDA backend not available");
+            return false;
+        }
 
-        // Note: ROCm synchronization would be similar with hipSetDevice/hipDeviceSynchronize
+        // Use streamSynchronize for lighter-weight sync (only default stream)
+        if (!cuda_backend->streamSynchronize(cuda_device_.ordinal))
+        {
+            LOG_ERROR("[PCIeBARBackend::synchronize] Stream synchronize failed");
+            return false;
+        }
+
+        // Note: ROCm synchronization would be similar with ROCm backend
         // but we're focusing on CUDA-initiated transfers
         return true;
 #else
@@ -700,19 +798,22 @@ namespace llaminar2
 
         freeTempBuffer();
 
-        // Allocate using CUDA runtime
-        int prev_device;
-        cudaGetDevice(&prev_device);
-        cudaSetDevice(cuda_device_.ordinal);
-
-        if (cudaMalloc(&cuda_temp_buffer_, bytes) == cudaSuccess)
+        // Allocate using the backend abstraction
+        IBackend *cuda_backend = getCUDABackend();
+        if (!cuda_backend)
         {
+            LOG_ERROR("[PCIeBARBackend::ensureTempBuffer] CUDA backend not available");
+            return false;
+        }
+
+        void *buffer = cuda_backend->allocate(bytes, cuda_device_.ordinal);
+        if (buffer)
+        {
+            cuda_temp_buffer_ = buffer;
             cuda_temp_buffer_size_ = bytes;
-            cudaSetDevice(prev_device);
             return true;
         }
 
-        cudaSetDevice(prev_device);
         return false;
 #else
         return false;
@@ -724,11 +825,12 @@ namespace llaminar2
 #if defined(HAVE_CUDA)
         if (cuda_temp_buffer_)
         {
-            int prev_device;
-            cudaGetDevice(&prev_device);
-            cudaSetDevice(cuda_device_.ordinal);
-            cudaFree(cuda_temp_buffer_);
-            cudaSetDevice(prev_device);
+            // Free using the backend abstraction
+            IBackend *cuda_backend = getCUDABackend();
+            if (cuda_backend)
+            {
+                cuda_backend->free(cuda_temp_buffer_, cuda_device_.ordinal);
+            }
             cuda_temp_buffer_ = nullptr;
             cuda_temp_buffer_size_ = 0;
         }
@@ -775,18 +877,159 @@ namespace llaminar2
             return false;
         }
 
-        // Since input1 == output (in-place), we need: output += input2
-        // Use the vectorized CUDA kernel for high performance
-        bool success = cuda::launchVectorAddInplace_f32(
-            static_cast<float *>(output),
-            static_cast<const float *>(input2),
-            count,
-            nullptr // default stream
-        );
+        // CRITICAL: Run CUDA operations on the dedicated worker thread.
+        // This avoids "context is destroyed" (error 709) errors that occur when
+        // CUDA kernel launches are attempted from a HIP-contaminated thread.
+        if (!cuda_worker_running_.load())
+        {
+            LOG_ERROR("[reduceOnCUDA] CUDA worker thread not running");
+            return false;
+        }
+
+        // Capture parameters for the worker thread lambda
+        float *out_ptr = static_cast<float *>(output);
+        const float *in2_ptr = static_cast<const float *>(input2);
+
+        // Submit work to CUDA worker thread and wait for completion
+        int target_device = cuda_device_.ordinal; // Capture device ordinal
+        auto future = submitCUDAWork([this, out_ptr, in2_ptr, count, target_device]() -> bool
+                                     {
+            // This runs on the CUDA worker thread
+            // Check context state on target device
+            CUdevice cu_device;
+            CUresult ctx_err = cuDeviceGet(&cu_device, target_device);
+            if (ctx_err != CUDA_SUCCESS)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] cuDeviceGet(" << target_device << ") failed: " << ctx_err);
+            }
+
+            // Set device
+            cudaError_t err = cudaSetDevice(target_device);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] cudaSetDevice failed: " << cudaGetErrorString(err));
+                return false;
+            }
+
+            // Retain and set primary context to ensure CUDA context is valid
+            CUcontext ctx;
+            ctx_err = cuDevicePrimaryCtxRetain(&ctx, cu_device);
+            if (ctx_err == CUDA_SUCCESS)
+            {
+                ctx_err = cuCtxSetCurrent(ctx);
+                if (ctx_err != CUDA_SUCCESS)
+                {
+                    LOG_ERROR("[reduceOnCUDA worker] cuCtxSetCurrent failed: " << ctx_err);
+                    return false;
+                }
+                
+                // Force synchronization to ensure context is fully active
+                ctx_err = cuCtxSynchronize();
+                if (ctx_err != CUDA_SUCCESS)
+                {
+                    LOG_ERROR("[reduceOnCUDA worker] cuCtxSynchronize failed: " << ctx_err);
+                    // Don't return false, try to continue
+                }
+            }
+            else
+            {
+                LOG_ERROR("[reduceOnCUDA worker] cuDevicePrimaryCtxRetain failed: " << ctx_err);
+                return false;
+            }
+
+            // Check memory pointer attributes to verify they're valid CUDA pointers
+            cudaPointerAttributes out_attrs;
+            err = cudaPointerGetAttributes(&out_attrs, out_ptr);
+            if (err != cudaSuccess || out_attrs.type != cudaMemoryTypeDevice)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] Invalid output pointer: " << cudaGetErrorString(err));
+                return false;
+            }
+
+            cudaPointerAttributes in2_attrs;
+            err = cudaPointerGetAttributes(&in2_attrs, in2_ptr);
+            if (err != cudaSuccess || in2_attrs.type != cudaMemoryTypeDevice)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] Invalid input pointer: " << cudaGetErrorString(err));
+                return false;
+            }
+
+            // ALWAYS use a freshly created stream for maximum reliability
+            // in heterogeneous CUDA+HIP environments. Stream 0 and pre-created 
+            // streams can fail with "context is destroyed" errors.
+            cudaStream_t reduction_stream;
+            err = cudaStreamCreateWithFlags(&reduction_stream, cudaStreamNonBlocking);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] Failed to create reduction stream: " << cudaGetErrorString(err));
+                return false;
+            }
+
+            // WORKAROUND for CUDA/HIP co-existence issue:
+            // After HIP initializes, CUDA kernel launches fail with error 709.
+            // Instead of kernel-based reduction, use cudaMemcpy to host, CPU add, copy back.
+            // This is slower but works reliably.
+            std::vector<float> host_out(count);
+            std::vector<float> host_in2(count);
+            
+            err = cudaMemcpyAsync(host_out.data(), out_ptr, count * sizeof(float), cudaMemcpyDeviceToHost, reduction_stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] cudaMemcpy D2H failed: " << cudaGetErrorString(err));
+                cudaStreamDestroy(reduction_stream);
+                return false;
+            }
+            
+            err = cudaMemcpyAsync(host_in2.data(), in2_ptr, count * sizeof(float), cudaMemcpyDeviceToHost, reduction_stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] cudaMemcpy D2H failed: " << cudaGetErrorString(err));
+                cudaStreamDestroy(reduction_stream);
+                return false;
+            }
+            
+            err = cudaStreamSynchronize(reduction_stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] Stream sync failed: " << cudaGetErrorString(err));
+                cudaStreamDestroy(reduction_stream);
+                return false;
+            }
+
+// CPU reduction (SIMD-friendly loop)
+#pragma omp simd
+            for (size_t i = 0; i < count; ++i)
+            {
+                host_out[i] += host_in2[i];
+            }
+            
+            // Copy result back to GPU
+            err = cudaMemcpyAsync(out_ptr, host_out.data(), count * sizeof(float), cudaMemcpyHostToDevice, reduction_stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] cudaMemcpy H2D failed: " << cudaGetErrorString(err));
+                cudaStreamDestroy(reduction_stream);
+                return false;
+            }
+            
+            // Synchronize and clean up
+            err = cudaStreamSynchronize(reduction_stream);
+            cudaStreamDestroy(reduction_stream);
+
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[reduceOnCUDA worker] Final stream sync failed: " << cudaGetErrorString(err));
+                return false;
+            }
+
+            return true; });
+
+        // Wait for the CUDA work to complete
+        bool success = future.get();
 
         if (!success)
         {
-            LOG_ERROR("CUDA vector add kernel failed");
+            LOG_ERROR("CUDA vector add kernel failed (via worker thread)");
             return false;
         }
 
@@ -813,5 +1056,288 @@ namespace llaminar2
             return 4;
         }
     }
+
+    // =========================================================================
+    // CUDA Worker Thread Implementation
+    // =========================================================================
+    //
+    // The worker thread is necessary because CUDA operations (kernel launches,
+    // event synchronization) fail with "context is destroyed" (error 709) when
+    // called from a thread that has been contaminated by HIP runtime initialization.
+    //
+    // By running CUDA operations on a dedicated thread that never touches HIP,
+    // we ensure clean CUDA context management.
+    // =========================================================================
+
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+
+    bool PCIeBARBackend::startCUDAWorker()
+    {
+        if (cuda_worker_running_.load())
+        {
+            return true; // Already running
+        }
+
+        cuda_worker_stop_.store(false);
+
+        try
+        {
+            cuda_worker_thread_ = std::thread(&PCIeBARBackend::cudaWorkerLoop, this);
+
+            // Wait for worker to signal it's ready
+            std::unique_lock<std::mutex> lock(cuda_work_mutex_);
+            cuda_work_cv_.wait(lock, [this]()
+                               { return cuda_worker_running_.load(); });
+
+            LOG_DEBUG("[PCIeBARBackend] CUDA worker thread started");
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[PCIeBARBackend] Failed to start CUDA worker thread: " << e.what());
+            return false;
+        }
+    }
+
+    void PCIeBARBackend::stopCUDAWorker()
+    {
+        if (!cuda_worker_running_.load())
+        {
+            return; // Not running
+        }
+
+        // Signal worker to stop
+        {
+            std::lock_guard<std::mutex> lock(cuda_work_mutex_);
+            cuda_worker_stop_.store(true);
+        }
+        cuda_work_cv_.notify_one();
+
+        // Wait for worker to finish
+        if (cuda_worker_thread_.joinable())
+        {
+            cuda_worker_thread_.join();
+        }
+
+        cuda_worker_running_.store(false);
+        LOG_DEBUG("[PCIeBARBackend] CUDA worker thread stopped");
+    }
+
+    void PCIeBARBackend::cudaWorkerLoop()
+    {
+        // CRITICAL: This thread must initialize CUDA before any HIP contamination.
+        // Use driver API to retain primary context, ensuring it won't be destroyed.
+
+        // First, set the runtime API device
+        cudaError_t err = cudaSetDevice(cuda_device_.ordinal);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[PCIeBARBackend] CUDA worker failed to set device " << cuda_device_.ordinal
+                                                                           << ": " << cudaGetErrorString(err));
+            cuda_worker_running_.store(true); // Signal ready (will fail operations)
+            cuda_work_cv_.notify_all();
+            return;
+        }
+
+        // Also set the driver API context for robustness
+        CUdevice cu_device;
+        CUresult cu_err = cuDeviceGet(&cu_device, cuda_device_.ordinal);
+        if (cu_err == CUDA_SUCCESS)
+        {
+            CUcontext ctx;
+            cu_err = cuDevicePrimaryCtxRetain(&ctx, cu_device);
+            if (cu_err == CUDA_SUCCESS)
+            {
+                cu_err = cuCtxSetCurrent(ctx);
+                if (cu_err == CUDA_SUCCESS)
+                {
+                    LOG_DEBUG("[PCIeBARBackend] CUDA worker thread retained primary context");
+                }
+                else
+                {
+                    LOG_WARN("[PCIeBARBackend] cuCtxSetCurrent failed: " << cu_err);
+                }
+            }
+            else
+            {
+                LOG_WARN("[PCIeBARBackend] cuDevicePrimaryCtxRetain failed: " << cu_err);
+            }
+        }
+        else
+        {
+            LOG_WARN("[PCIeBARBackend] cuDeviceGet failed: " << cu_err);
+        }
+
+        // Create a dedicated stream for worker operations (non-blocking)
+        cudaStream_t stream;
+        err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[PCIeBARBackend] CUDA worker failed to create stream: " << cudaGetErrorString(err));
+            cuda_worker_stream_ = nullptr;
+        }
+        else
+        {
+            cuda_worker_stream_ = stream;
+        }
+
+        LOG_DEBUG("[PCIeBARBackend] CUDA worker thread initialized on device " << cuda_device_.ordinal);
+
+        // Signal that we're ready
+        cuda_worker_running_.store(true);
+        cuda_work_cv_.notify_all();
+
+        // Main work loop
+        while (true)
+        {
+            std::packaged_task<bool()> task;
+
+            {
+                std::unique_lock<std::mutex> lock(cuda_work_mutex_);
+                cuda_work_cv_.wait(lock, [this]()
+                                   { return cuda_worker_stop_.load() || !cuda_work_queue_.empty(); });
+
+                if (cuda_worker_stop_.load() && cuda_work_queue_.empty())
+                {
+                    break; // Exit loop
+                }
+
+                if (!cuda_work_queue_.empty())
+                {
+                    task = std::move(cuda_work_queue_.front());
+                    cuda_work_queue_.pop();
+                }
+            }
+
+            if (task.valid())
+            {
+                // Execute the task on this CUDA-clean thread
+                task();
+            }
+        }
+
+        // Cleanup
+        if (cuda_worker_stream_)
+        {
+            cudaStreamDestroy(static_cast<cudaStream_t>(cuda_worker_stream_));
+            cuda_worker_stream_ = nullptr;
+        }
+
+        LOG_DEBUG("[PCIeBARBackend] CUDA worker thread exiting");
+    }
+
+    std::future<bool> PCIeBARBackend::submitCUDAWork(std::function<bool()> work)
+    {
+        std::packaged_task<bool()> task(std::move(work));
+        std::future<bool> future = task.get_future();
+
+        {
+            std::lock_guard<std::mutex> lock(cuda_work_mutex_);
+            cuda_work_queue_.push(std::move(task));
+        }
+        cuda_work_cv_.notify_one();
+
+        return future;
+    }
+
+    bool PCIeBARBackend::waitForCUDAEventViaWorker(void *event, int device_id)
+    {
+        if (!cuda_worker_running_.load())
+        {
+            LOG_ERROR("[PCIeBARBackend::waitForCUDAEventViaWorker] CUDA worker thread not running");
+            return false;
+        }
+
+        if (!event)
+        {
+            // No event to wait for - consider this success
+            return true;
+        }
+
+        cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
+
+        // Submit the event wait to the CUDA worker thread
+        auto future = submitCUDAWork([cuda_event, device_id]() -> bool
+                                     {
+            // Query current device state before operations
+            int current_device = -1;
+            cudaError_t err = cudaGetDevice(&current_device);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[waitForCUDAEventViaWorker] cudaGetDevice failed: " << cudaGetErrorString(err));
+            }
+            else
+            {
+                LOG_DEBUG("[waitForCUDAEventViaWorker] Current device before setDevice: " << current_device);
+            }
+
+            // Check current context status via driver API
+            CUcontext current_ctx = nullptr;
+            CUresult ctx_err = cuCtxGetCurrent(&current_ctx);
+            LOG_DEBUG("[waitForCUDAEventViaWorker] cuCtxGetCurrent returned " << ctx_err 
+                      << ", ctx=" << (void*)current_ctx);
+
+            // Set device (re-establish context on this thread after potential changes)
+            err = cudaSetDevice(device_id);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[waitForCUDAEventViaWorker] cudaSetDevice(" << device_id << ") failed: " 
+                          << cudaGetErrorString(err));
+                return false;
+            }
+
+            // Also ensure driver API context is current (belt and suspenders)
+            CUdevice cu_device;
+            CUresult cu_err = cuDeviceGet(&cu_device, device_id);
+            if (cu_err == CUDA_SUCCESS)
+            {
+                CUcontext ctx;
+                cu_err = cuDevicePrimaryCtxRetain(&ctx, cu_device);
+                if (cu_err == CUDA_SUCCESS)
+                {
+                    LOG_DEBUG("[waitForCUDAEventViaWorker] Got primary context: " << (void*)ctx);
+                    cu_err = cuCtxSetCurrent(ctx);
+                    if (cu_err != CUDA_SUCCESS)
+                    {
+                        LOG_WARN("[waitForCUDAEventViaWorker] cuCtxSetCurrent failed: " << cu_err);
+                    }
+                }
+                else
+                {
+                    LOG_WARN("[waitForCUDAEventViaWorker] cuDevicePrimaryCtxRetain failed: " << cu_err);
+                }
+            }
+            else
+            {
+                LOG_WARN("[waitForCUDAEventViaWorker] cuDeviceGet failed: " << cu_err);
+            }
+
+            // Query event status before sync to see if the event is valid
+            err = cudaEventQuery(cuda_event);
+            LOG_DEBUG("[waitForCUDAEventViaWorker] cudaEventQuery returned: " << err 
+                      << " (" << cudaGetErrorString(err) << ")");
+            if (err != cudaSuccess && err != cudaErrorNotReady)
+            {
+                LOG_ERROR("[waitForCUDAEventViaWorker] cudaEventQuery failed: " << cudaGetErrorString(err)
+                          << " (event may have been destroyed or context lost)");
+                return false;
+            }
+
+            // Wait for the event (this is the synchronization point)
+            err = cudaEventSynchronize(cuda_event);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[waitForCUDAEventViaWorker] cudaEventSynchronize failed: " 
+                          << cudaGetErrorString(err));
+                return false;
+            }
+
+            return true; });
+
+        // Wait for the worker to complete the event sync
+        return future.get();
+    }
+
+#endif // HAVE_CUDA && HAVE_ROCM
 
 } // namespace llaminar2

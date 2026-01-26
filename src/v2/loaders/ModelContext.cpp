@@ -18,51 +18,59 @@ namespace llaminar2
      * ModelLoader is owned by value within ModelContext. The wrapper holds a reference
      * and relies on the ModelContext outliving any use of the interface pointer.
      */
-    class ModelLoaderInterfaceWrapper : public IModelLoader {
+    class ModelLoaderInterfaceWrapper : public IModelLoader
+    {
     public:
-        explicit ModelLoaderInterfaceWrapper(ModelLoader& loader) : loader_(loader) {}
+        explicit ModelLoaderInterfaceWrapper(ModelLoader &loader) : loader_(loader) {}
 
         bool isLoaded() const override { return loader_.isLoaded(); }
 
         std::shared_ptr<TensorBase> loadTensor(
-            const std::string& name,
+            const std::string &name,
             DeviceId device,
-            WeightPrecision weight_precision) override {
+            WeightPrecision weight_precision) override
+        {
             return loader_.loadTensor(name, device, weight_precision);
         }
 
         std::shared_ptr<TensorBase> loadTensorRowSlice(
-            const std::string& name,
+            const std::string &name,
             size_t row_start, size_t row_end,
             DeviceId device,
-            WeightPrecision weight_precision) override {
+            WeightPrecision weight_precision) override
+        {
             return loader_.loadTensorRowSlice(name, row_start, row_end, device, weight_precision);
         }
 
         std::shared_ptr<TensorBase> loadTensorColumnSlice(
-            const std::string& name,
+            const std::string &name,
             size_t col_start, size_t col_end,
             DeviceId device,
-            WeightPrecision weight_precision) override {
+            WeightPrecision weight_precision) override
+        {
             return loader_.loadTensorColumnSlice(name, col_start, col_end, device, weight_precision);
         }
 
-        bool hasTensor(const std::string& name) const override { return loader_.hasTensor(name); }
+        bool hasTensor(const std::string &name) const override { return loader_.hasTensor(name); }
         std::vector<std::string> tensorNames() const override { return loader_.tensorNames(); }
         std::string architecture() const override { return loader_.architecture(); }
         size_t tensorCount() const override { return loader_.tensorCount(); }
         size_t totalBytes() const override { return loader_.totalBytes(); }
 
-        int getInt(const std::string& key, int default_val) const override {
+        int getInt(const std::string &key, int default_val) const override
+        {
             return loader_.getInt(key, default_val);
         }
-        uint64_t getUInt64(const std::string& key, uint64_t default_val) const override {
+        uint64_t getUInt64(const std::string &key, uint64_t default_val) const override
+        {
             return loader_.getUInt64(key, default_val);
         }
-        float getFloat(const std::string& key, float default_val) const override {
+        float getFloat(const std::string &key, float default_val) const override
+        {
             return loader_.getFloat(key, default_val);
         }
-        std::string getString(const std::string& key, const std::string& default_val) const override {
+        std::string getString(const std::string &key, const std::string &default_val) const override
+        {
             return loader_.getString(key, default_val);
         }
 
@@ -72,11 +80,12 @@ namespace llaminar2
         uint64_t headCountKV() const override { return loader_.headCountKV(); }
         uint64_t vocabSize() const override { return loader_.vocabSize(); }
         uint64_t contextLength() const override { return loader_.contextLength(); }
+        uint64_t feedForwardLength() const override { return loader_.feedForwardLength(); }
         float ropeTheta() const override { return loader_.ropeTheta(); }
         float rmsNormEps() const override { return loader_.rmsNormEps(); }
 
     private:
-        ModelLoader& loader_;
+        ModelLoader &loader_;
     };
 
     ModelContext::ModelContext(const std::string &model_path,

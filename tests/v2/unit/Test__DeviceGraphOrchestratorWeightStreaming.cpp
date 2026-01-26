@@ -1,10 +1,10 @@
 /**
- * @file Test__GraphOrchestratorWeightStreaming.cpp
- * @brief Unit tests for IWeightStreamer integration with GraphOrchestrator
+ * @file Test__DeviceGraphOrchestratorWeightStreaming.cpp
+ * @brief Unit tests for IWeightStreamer integration with DeviceGraphOrchestrator
  * @author GitHub Copilot
  * @date January 2026
  *
- * Tests that the GraphOrchestrator correctly calls weight streaming hooks:
+ * Tests that the DeviceGraphOrchestrator correctly calls weight streaming hooks:
  * - Phase transition notifications
  * - ensureLayerOnDevice() before layer execution
  * - prefetchLayer() for upcoming layers
@@ -17,7 +17,7 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
-#include "execution/GraphOrchestrator.h"
+#include "execution/DeviceGraphOrchestrator.h"
 #include "loaders/IWeightStreamer.h"
 #include "execution/PlacementStrategy.h"
 #include "backends/DeviceId.h"
@@ -60,7 +60,7 @@ namespace llaminar2
     // Test Fixture
     // =========================================================================
 
-    class Test__GraphOrchestratorWeightStreaming : public ::testing::Test
+    class Test__DeviceGraphOrchestratorWeightStreaming : public ::testing::Test
     {
     protected:
         void SetUp() override
@@ -80,7 +80,7 @@ namespace llaminar2
             config.max_seq_len = 128;
 
             // Create orchestrator (no MPI)
-            orchestrator_ = std::make_unique<GraphOrchestrator>(config, nullptr);
+            orchestrator_ = std::make_unique<DeviceGraphOrchestrator>(config, nullptr);
         }
 
         void TearDown() override
@@ -90,21 +90,21 @@ namespace llaminar2
         }
 
         std::shared_ptr<MockWeightStreamer> mock_streamer_;
-        std::unique_ptr<GraphOrchestrator> orchestrator_;
+        std::unique_ptr<DeviceGraphOrchestrator> orchestrator_;
     };
 
     // =========================================================================
     // Basic Tests
     // =========================================================================
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, StreamingDisabledByDefault)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, StreamingDisabledByDefault)
     {
         // Without setting a streamer, streaming should be disabled
         EXPECT_FALSE(orchestrator_->isWeightStreamingEnabled());
         EXPECT_EQ(orchestrator_->weightStreamer(), nullptr);
     }
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, SetWeightStreamerEnablesStreaming)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, SetWeightStreamerEnablesStreaming)
     {
         orchestrator_->setWeightStreamer(mock_streamer_);
 
@@ -112,7 +112,7 @@ namespace llaminar2
         EXPECT_EQ(orchestrator_->weightStreamer(), mock_streamer_);
     }
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, ClearWeightStreamerDisablesStreaming)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, ClearWeightStreamerDisablesStreaming)
     {
         orchestrator_->setWeightStreamer(mock_streamer_);
         EXPECT_TRUE(orchestrator_->isWeightStreamingEnabled());
@@ -125,7 +125,7 @@ namespace llaminar2
     // Phase Transition Tests
     // =========================================================================
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, PhaseTransitionNotifiesStreamer)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, PhaseTransitionNotifiesStreamer)
     {
         orchestrator_->setWeightStreamer(mock_streamer_);
 
@@ -137,7 +137,7 @@ namespace llaminar2
         orchestrator_->transitionToPhase(InferencePhase::DECODE);
     }
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, PhaseTransitionNoNotifyIfSamePhase)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, PhaseTransitionNoNotifyIfSamePhase)
     {
         orchestrator_->setWeightStreamer(mock_streamer_);
 
@@ -148,14 +148,14 @@ namespace llaminar2
         orchestrator_->transitionToPhase(InferencePhase::PREFILL);
     }
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, PhaseTransitionWithoutStreamerDoesNotCrash)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, PhaseTransitionWithoutStreamerDoesNotCrash)
     {
         // No streamer set - should not crash
         EXPECT_NO_THROW(orchestrator_->transitionToPhase(InferencePhase::DECODE));
         EXPECT_EQ(orchestrator_->getPhase(), InferencePhase::DECODE);
     }
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, PhaseTransitionBackToPrefill)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, PhaseTransitionBackToPrefill)
     {
         orchestrator_->setWeightStreamer(mock_streamer_);
 
@@ -176,7 +176,7 @@ namespace llaminar2
     // Getter Tests
     // =========================================================================
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, WeightStreamerGetterReturnsCorrectPointer)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, WeightStreamerGetterReturnsCorrectPointer)
     {
         auto streamer1 = std::make_shared<MockWeightStreamer>();
         auto streamer2 = std::make_shared<MockWeightStreamer>();
@@ -192,7 +192,7 @@ namespace llaminar2
     // Integration Tests (Phase + Streaming State)
     // =========================================================================
 
-    TEST_F(Test__GraphOrchestratorWeightStreaming, StreamerNotifiedOnMultipleTransitions)
+    TEST_F(Test__DeviceGraphOrchestratorWeightStreaming, StreamerNotifiedOnMultipleTransitions)
     {
         orchestrator_->setWeightStreamer(mock_streamer_);
 

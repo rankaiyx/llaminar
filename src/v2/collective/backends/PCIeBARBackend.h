@@ -32,6 +32,13 @@
 #include <optional>
 #include <unordered_map>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <functional>
+#include <future>
+#include <atomic>
 
 namespace llaminar2
 {
@@ -132,6 +139,30 @@ namespace llaminar2
         // =====================================================================
 
         bool synchronize() override;
+
+        // =====================================================================
+        // Cross-Thread CUDA Event Synchronization
+        // =====================================================================
+
+        /**
+         * @brief Wait for a CUDA event via the worker thread
+         *
+         * This is used when code running on a HIP-contaminated thread needs to
+         * wait for a CUDA event. The wait is proxied through the CUDA worker thread.
+         *
+         * @param event CUDA event to wait for (cudaEvent_t)
+         * @param device_id CUDA device ID
+         * @return true if wait succeeded
+         */
+        bool waitForCUDAEventViaWorker(void *event, int device_id);
+
+        /**
+         * @brief Get the global PCIeBARBackend instance (if any)
+         *
+         * Used by TensorBase to proxy CUDA event waits when running on a
+         * HIP-contaminated thread.
+         */
+        static PCIeBARBackend *getInstance() { return s_instance_; }
 
         // =====================================================================
         // Diagnostics
@@ -319,6 +350,58 @@ namespace llaminar2
             CollectiveOp op);
 
         size_t datatypeSize(CollectiveDataType dtype) const;
+
+        // =====================================================================
+        // CUDA Worker Thread (for cross-vendor interop)
+        // =====================================================================
+        // CUDA operations must run on a thread that was never initialized with HIP.
+        // This worker thread handles all CUDA kernel launches and synchronization.
+
+        /**
+         * @brief Submit work to the CUDA worker thread
+         * @param work Lambda to execute on the CUDA worker thread
+         * @return Future that completes when the work is done
+         */
+        std::future<bool> submitCUDAWork(std::function<bool()> work);
+
+        /**
+         * @brief CUDA worker thread main loop
+         */
+        void cudaWorkerLoop();
+
+        /**
+         * @brief Start the CUDA worker thread
+         */
+        bool startCUDAWorker();
+
+        /**
+         * @brief Stop the CUDA worker thread
+         */
+        void stopCUDAWorker();
+
+        /// Worker thread for CUDA operations
+        std::thread cuda_worker_thread_;
+
+        /// Work queue for CUDA operations
+        std::queue<std::packaged_task<bool()>> cuda_work_queue_;
+
+        /// Mutex for work queue
+        std::mutex cuda_work_mutex_;
+
+        /// Condition variable for work queue
+        std::condition_variable cuda_work_cv_;
+
+        /// Flag to stop worker thread
+        std::atomic<bool> cuda_worker_stop_{false};
+
+        /// Flag indicating worker is running
+        std::atomic<bool> cuda_worker_running_{false};
+
+        /// CUDA stream for worker thread operations (created on worker thread)
+        void *cuda_worker_stream_ = nullptr; // cudaStream_t, void* to avoid header dep
+
+        /// Global instance pointer for cross-thread event wait proxying
+        static PCIeBARBackend *s_instance_;
     };
 
 #else
@@ -353,6 +436,8 @@ namespace llaminar2
 
         double getMeasuredBandwidthGBps() const { return 0.0; }
         bool isPCIeBarActive() const { return false; }
+        bool waitForCUDAEventViaWorker(void *, int) { return false; }
+        static PCIeBARBackend *getInstance() { return nullptr; }
 
         std::optional<std::pair<void *, size_t>> allocateInBarRegion(size_t) { return std::nullopt; }
         void freeBarBuffer(void *) {}

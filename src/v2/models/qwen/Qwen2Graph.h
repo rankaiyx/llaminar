@@ -50,6 +50,9 @@ namespace llaminar2
 {
 
     // Forward declarations
+    class ILocalTPContext;
+
+    // Forward declarations
     class Qwen2Pipeline;
 
     // =========================================================================
@@ -166,6 +169,26 @@ namespace llaminar2
         /// use the domain communicator instead of the global MPI communicator.
         /// This enables heterogeneous TP with separate GPU and CPU domains.
         MultiDomainTPConfig *multi_domain_tp_config = nullptr;
+
+        // =================================================================
+        // LOCAL Tensor Parallelism (Intra-Rank Multi-Device)
+        // =================================================================
+        /// Optional ILocalTPContext for LOCAL tensor parallelism.
+        /// When set, collective operations use LocalTPAllreduceStage instead of
+        /// AllreduceStage. LOCAL TP runs on a single MPI rank with multiple devices,
+        /// using high-bandwidth backends like NCCL, RCCL, or PCIeBAR for collectives.
+        ///
+        /// Distinction from GLOBAL TP:
+        /// - GLOBAL TP: Multiple MPI ranks (world_size > 1), MPI collectives
+        /// - LOCAL TP: Single MPI rank (world_size = 1), ILocalTPContext collectives
+        ///
+        /// Note: Either mpi_ctx (for GLOBAL TP) OR local_tp_ctx (for LOCAL TP) should
+        /// be active, not both. If both are set, LOCAL TP takes precedence for collectives.
+        ILocalTPContext *local_tp_ctx = nullptr;
+
+        /// Device index within the LOCAL TP context (0 to degree-1).
+        /// Each device runs a separate graph instance with sharded weights.
+        int local_tp_device_idx = 0;
 
         /**
          * @brief Helper to get DeviceShardingAssignment for current rank
@@ -462,20 +485,20 @@ namespace llaminar2
         // Buffer Management
         // =====================================================================
         // NOTE: Buffer lifecycle management (initializeBuffers, releaseBuffers, etc.)
-        // has been moved to GraphOrchestrator as part of the declarative refactor.
-        // Use GraphOrchestrator::initializeBuffers() for graph-managed allocation.
+        // has been moved to DeviceGraphOrchestrator as part of the declarative refactor.
+        // Use DeviceGraphOrchestrator::initializeBuffers() for graph-managed allocation.
         // =====================================================================
 
         /**
          * @brief Set snapshot callback for debugging
          *
-         * Note: The callback is stored for use by GraphOrchestrator when it executes
+         * Note: The callback is stored for use by DeviceGraphOrchestrator when it executes
          * graphs built by this Qwen2Graph.
          */
         void setSnapshotCallback(StageSnapshotCallback callback)
         {
             snapshot_callback_ = std::move(callback);
-            // Note: GraphOrchestrator will call its own executor_.setSnapshotCallback()
+            // Note: DeviceGraphOrchestrator will call its own executor_.setSnapshotCallback()
         }
 
         /**
@@ -649,6 +672,35 @@ namespace llaminar2
 
         // Snapshot callback
         StageSnapshotCallback snapshot_callback_;
+
+        // =====================================================================
+        // Helper: TP Allreduce Stage Creation
+        // =====================================================================
+        /**
+         * @brief Check if TP (LOCAL or GLOBAL) requires allreduce collective
+         * @return True if either LOCAL TP (degree > 1) or GLOBAL TP (world_size > 1) is active
+         */
+        bool needsTPAllreduce() const;
+
+        /**
+         * @brief Create an allreduce stage appropriate for the active TP mode
+         *
+         * Creates LocalTPAllreduceStage for LOCAL TP (single rank, multiple devices)
+         * or AllreduceStage for GLOBAL TP (multiple MPI ranks).
+         *
+         * @param buffer Tensor to reduce
+         * @param count Number of elements
+         * @param device Target device
+         * @param layer_idx Layer index for domain routing
+         * @param is_attention True for attention, false for FFN
+         * @return Unique pointer to the allreduce stage
+         */
+        std::unique_ptr<IComputeStage> createTPAllreduceStage(
+            TensorBase *buffer,
+            size_t count,
+            DeviceId device,
+            int layer_idx,
+            bool is_attention) const;
 
     public:
         /**

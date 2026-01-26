@@ -500,8 +500,13 @@ namespace llaminar2
             size_t weight_cols() const { return K_; }
             bool weights_converted() const { return weights_converted_; }
 
-            // Allow WeightPreloader to call ensureWeightsConverted() during preload
-            friend class ::llaminar2::WeightPreloader;
+            /**
+             * @brief Prepare weights for efficient execution (ITensorGemm interface)
+             *
+             * For ROCm: converts weights to INT8 + uploads to device memory.
+             * Call this during weight preloading to avoid first-use overhead.
+             */
+            void prepareWeights() override { ensureWeightsConverted(); }
 
         private:
             // =========================================================================
@@ -593,6 +598,9 @@ namespace llaminar2
             // PIMPL for CK implementation (avoids CK headers in this header)
             struct Impl;
             std::unique_ptr<Impl> impl_;
+
+            // Friend class for WeightPreloader (deprecated, will be removed)
+            friend class llaminar2::WeightPreloader;
         };
 
     } // namespace rocm

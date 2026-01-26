@@ -17,6 +17,7 @@
 #include "../backends/ComputeBackend.h"
 #include "../backends/DeviceId.h"
 #include "../kernels/KernelFactory.h"
+#include "../collective/backends/PCIeBARBackend.h"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -126,14 +127,19 @@ namespace llaminar2
     // Clears the kernel cache entry for this tensor to prevent use-after-free
     // when a new tensor is allocated at the same memory address.
     // Also frees mapped memory if this tensor used zero-copy allocation.
+    // Also frees BAR-backed memory if this tensor used PCIeBAR allocation.
     // Also frees GPU memory and unpins host memory if allocated.
     TensorBase::~TensorBase()
     {
         // Free mapped memory if allocated (must be done first)
         freeMappedMemory();
 
+        // Free BAR-backed memory if allocated
+        freeBARBackedMemory();
+
         // Free GPU memory if allocated (before unpinning host memory)
-        if (gpu_data_ptr_ && gpu_device_.has_value())
+        // Skip if gpu_data_ptr_ was pointing to BAR memory (already freed above)
+        if (gpu_data_ptr_ && gpu_device_.has_value() && !is_bar_backed_)
         {
             IBackend *backend = getBackendForDevice(*gpu_device_);
             if (backend)
@@ -161,7 +167,6 @@ namespace llaminar2
     }
 
     // ===== Zero-Copy Mapped Memory Implementation =====
-
     bool TensorBase::initMappedMemory(size_t bytes, DeviceId target_device)
     {
         // Validate target device - must be a GPU
@@ -234,6 +239,120 @@ namespace llaminar2
         gpu_data_ptr_ = nullptr; // gpu_data_ptr_ was pointing to mapped_device_ptr_
         mapped_device_ptr_ = nullptr;
         is_mapped_ = false;
+    }
+
+    // ===== BAR-Backed Memory Implementation =====
+
+    bool TensorBase::initBARBackedMemory(size_t bytes, DeviceId cuda_device, DeviceId rocm_device,
+                                         PCIeBARBackend *backend)
+    {
+        // Validate inputs
+        if (!cuda_device.is_cuda())
+        {
+            LOG_ERROR("[TensorBase::initBARBackedMemory] cuda_device must be CUDA, got: " << cuda_device.toString());
+            return false;
+        }
+        if (!rocm_device.is_rocm())
+        {
+            LOG_ERROR("[TensorBase::initBARBackedMemory] rocm_device must be ROCm, got: " << rocm_device.toString());
+            return false;
+        }
+        if (!backend)
+        {
+            LOG_ERROR("[TensorBase::initBARBackedMemory] backend must not be null");
+            return false;
+        }
+        if (!backend->isInitialized())
+        {
+            LOG_ERROR("[TensorBase::initBARBackedMemory] backend must be initialized");
+            return false;
+        }
+
+        // Allocate in BAR region
+        auto alloc_result = backend->allocateInBarRegion(bytes);
+        if (!alloc_result.has_value())
+        {
+            LOG_ERROR("[TensorBase::initBARBackedMemory] Failed to allocate " << bytes
+                                                                              << " bytes in BAR region");
+            return false;
+        }
+
+        auto [rocm_ptr, bar_offset] = alloc_result.value();
+
+        // Get the CUDA-accessible pointer for this BAR region
+        // The DirectP2PEngine provides a base CUDA pointer to the BAR;
+        // we need to add our offset to get the pointer for this allocation
+        void *cuda_bar_base = nullptr;
+        if (backend->isPCIeBarActive())
+        {
+            // TODO: Add PCIeBARBackend::getCudaBarPointer() method
+            // For now, we'll need to get this from the underlying DirectP2PEngine
+            // This is a placeholder - actual implementation depends on exposing
+            // the CUDA pointer calculation from PCIeBARBackend
+            LOG_WARN("[TensorBase::initBARBackedMemory] TODO: Get CUDA BAR pointer from backend");
+
+            // Placeholder: In full implementation, would be:
+            // cuda_bar_base = backend->getDirectP2PEngine()->getCudaBarPointer();
+            // bar_cuda_device_ptr_ = static_cast<char*>(cuda_bar_base) + bar_offset;
+
+            // For now, store null - this needs DirectP2PEngine integration
+            bar_cuda_device_ptr_ = nullptr;
+        }
+
+        // Set up BAR-backed memory state
+        is_bar_backed_ = true;
+        bar_offset_ = bar_offset;
+        bar_size_ = bytes;
+        bar_rocm_ptr_ = rocm_ptr;
+        bar_host_device_ = rocm_device;
+        bar_accessor_device_ = cuda_device;
+        bar_backend_ = backend;
+
+        // For CUDA kernel dispatch, use the BAR pointer
+        // (once we have it from DirectP2PEngine integration)
+        // gpu_data_ptr_ = bar_cuda_device_ptr_;
+        // gpu_device_ = cuda_device;
+
+        // Both host and device are always "valid" for BAR-backed tensors
+        // since they share the same physical memory
+        host_valid_ = true;
+        device_valid_ = true;
+
+        LOG_DEBUG("[TensorBase::initBARBackedMemory] Allocated " << bytes << " bytes in BAR region"
+                                                                 << " rocm_ptr=" << rocm_ptr
+                                                                 << " offset=" << bar_offset
+                                                                 << " cuda_device=" << cuda_device.toString()
+                                                                 << " rocm_device=" << rocm_device.toString());
+
+        return true;
+    }
+
+    void TensorBase::freeBARBackedMemory()
+    {
+        if (!is_bar_backed_ || !bar_rocm_ptr_)
+        {
+            return; // Not BAR-backed or already freed
+        }
+
+        if (bar_backend_)
+        {
+            bar_backend_->freeBarBuffer(bar_rocm_ptr_);
+            LOG_DEBUG("[TensorBase::freeBARBackedMemory] Freed BAR buffer at offset " << bar_offset_);
+        }
+
+        // Clear BAR state
+        is_bar_backed_ = false;
+        bar_offset_ = 0;
+        bar_size_ = 0;
+        bar_rocm_ptr_ = nullptr;
+        bar_cuda_device_ptr_ = nullptr;
+        bar_backend_ = nullptr;
+
+        // If gpu_data_ptr_ was pointing to BAR, clear it
+        if (gpu_data_ptr_ == bar_cuda_device_ptr_)
+        {
+            gpu_data_ptr_ = nullptr;
+        }
     }
 
     void TensorBase::to_fp32_via_blocks(float *dst) const
@@ -1115,6 +1234,33 @@ namespace llaminar2
         return true;
     }
 
+    // =========================================================================
+    // Helper: Wait for CUDA event with cross-thread proxy support
+    // =========================================================================
+    // When running in heterogeneous LOCAL TP (CUDA + ROCm), the ROCm executor
+    // thread may need to wait for CUDA events. Direct cudaEventSynchronize()
+    // fails with "context is destroyed" from a HIP-contaminated thread.
+    // This helper routes CUDA event waits through PCIeBARBackend's worker thread.
+
+    static bool waitForEventWithProxy(IBackend *backend, void *event, int device_id,
+                                      const DeviceId &gpu_device)
+    {
+        // If this is a CUDA event and we have a PCIeBAR backend with worker thread,
+        // use the proxy to avoid cross-thread context issues
+        if (gpu_device.is_cuda())
+        {
+            auto *pcie_backend = PCIeBARBackend::getInstance();
+            if (pcie_backend && pcie_backend->isPCIeBarActive())
+            {
+                LOG_TRACE("[waitForEventWithProxy] Routing CUDA event wait through PCIeBAR worker");
+                return pcie_backend->waitForCUDAEventViaWorker(event, device_id);
+            }
+        }
+
+        // Default: use backend directly
+        return backend->waitForEvent(event, device_id);
+    }
+
     bool TensorBase::ensureOnHost()
     {
         // ===== ZERO-COPY MAPPED MEMORY PATH =====
@@ -1141,7 +1287,7 @@ namespace llaminar2
                     if (device_completion_event_)
                     {
                         LOG_TRACE("[TensorBase::ensureOnHost] ZERO-COPY: Waiting on completion event");
-                        if (!backend->waitForEvent(device_completion_event_, backend_device_id))
+                        if (!waitForEventWithProxy(backend, device_completion_event_, backend_device_id, *gpu_device_))
                         {
                             LOG_WARN("[TensorBase::ensureOnHost] Event wait failed for mapped tensor");
                             // Don't fall back to device sync - it's too slow on ROCm
@@ -1210,7 +1356,7 @@ namespace llaminar2
             if (device_completion_event_)
             {
                 LOG_TRACE("[TensorBase::ensureOnHost] Using event-based sync (waiting for specific kernel)");
-                if (!backend->waitForEvent(device_completion_event_, backend_device_id))
+                if (!waitForEventWithProxy(backend, device_completion_event_, backend_device_id, *gpu_device_))
                 {
                     LOG_WARN("[TensorBase::ensureOnHost] Event wait failed, falling back to full sync");
                     // Fall through to deviceToHost which does implicit full sync

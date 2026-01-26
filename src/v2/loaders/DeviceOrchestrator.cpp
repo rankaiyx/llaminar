@@ -17,7 +17,7 @@ namespace llaminar2
     DeviceOrchestrator::DeviceOrchestrator(
         std::shared_ptr<DeviceManager> device_mgr,
         std::shared_ptr<MPIContext> mpi_ctx,
-        const OrchestrationConfig &config)
+        const LegacyOrchestrationConfig &config)
         : device_mgr_(device_mgr), mpi_ctx_(mpi_ctx), config_(config)
     {
         logPlacementDecision("DeviceOrchestrator initialized with strategy: " +
@@ -299,7 +299,7 @@ namespace llaminar2
                              std::to_string(available_gpu_memory_bytes / (1024 * 1024)) + " MB available)");
 
         // Use LAYER_SPLIT strategy with calculated layer count
-        OrchestrationConfig temp_config = config_;
+        LegacyOrchestrationConfig temp_config = config_;
         temp_config.strategy = WeightPlacementStrategy::LAYER_SPLIT;
         temp_config.offload_layers = gpu_layers;
 

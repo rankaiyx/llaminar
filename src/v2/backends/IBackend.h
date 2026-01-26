@@ -102,6 +102,22 @@ namespace llaminar2
          */
         virtual bool synchronize(int device_id) = 0;
 
+        /**
+         * @brief Synchronize the default stream on a device
+         *
+         * @param device_id GPU device ID (0-based)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaStreamSynchronize(nullptr)
+         * - ROCm: hipStreamSynchronize(nullptr)
+         * - CPU: no-op (always synchronous)
+         *
+         * **Performance Note**: This is lighter than synchronize() because it only
+         * waits for the default stream, not all streams on the device.
+         */
+        virtual bool streamSynchronize(int device_id) = 0;
+
         // ====================================================================
         // Event Operations (Fine-grained Synchronization)
         // ====================================================================

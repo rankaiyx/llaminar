@@ -171,6 +171,13 @@ namespace llaminar2
         bool synchronize(int device_id) override;
 
         /**
+         * @brief Stream synchronize (no-op for CPU - always synchronous)
+         * @param device_id Must be 0
+         * @return true
+         */
+        bool streamSynchronize(int device_id) override;
+
+        /**
          * @brief Set active device (no-op if device_id == 0)
          * @param device_id Must be 0
          * @return true if device_id == 0, false otherwise

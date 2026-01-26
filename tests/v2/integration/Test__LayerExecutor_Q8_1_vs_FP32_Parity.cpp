@@ -28,7 +28,7 @@
 
 #include "v2/models/qwen/Qwen2Graph.h"
 #include "v2/backends/DeviceId.h"
-#include "v2/execution/GraphOrchestrator.h"
+#include "v2/execution/DeviceGraphOrchestrator.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/kernels/cpu/CPUKVCache.h"
@@ -198,10 +198,10 @@ protected:
     /**
      * @brief Create executor with specified activation precision
      *
-     * Returns a GraphOrchestrator wrapping a Qwen2Graph, as the Qwen2Graph
+     * Returns a DeviceGraphOrchestrator wrapping a Qwen2Graph, as the Qwen2Graph
      * execute methods are deprecated.
      */
-    std::unique_ptr<GraphOrchestrator> createExecutor(ActivationPrecision precision)
+    std::unique_ptr<DeviceGraphOrchestrator> createExecutor(ActivationPrecision precision)
     {
         Qwen2GraphConfig config;
         config.d_model = d_model_;
@@ -216,7 +216,7 @@ protected:
         // NOTE: Decomposed attention is now always used (Phase 7 cleanup)
 
         auto graph = std::make_shared<Qwen2Graph>(config, mpi_ctx_);
-        return std::make_unique<GraphOrchestrator>(graph, mpi_ctx_);
+        return std::make_unique<DeviceGraphOrchestrator>(graph, mpi_ctx_);
     }
 
     /**
@@ -334,7 +334,7 @@ protected:
         owned.attn_output = factory_->createActivation({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_ * head_dim_)}, precision, device_);
 
         // attn_proj and ffn_output are ALWAYS FP32 - they feed into residual streams
-        // This matches GraphOrchestrator::allocateInternalBuffers which creates these as FP32
+        // This matches DeviceGraphOrchestrator::allocateInternalBuffers which creates these as FP32
         // for numerical stability in residual connections
         owned.attn_proj = factory_->createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model_)}, device_);
 

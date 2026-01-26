@@ -11,6 +11,7 @@
 #include "CUDABackend.h"
 #include "../../utils/Logger.h"
 #include <cuda_runtime.h>
+#include <cuda.h> // For cuCtxSetCurrent, cuDevicePrimaryCtxRetain
 #include <stdexcept>
 #include <sstream>
 
@@ -48,8 +49,8 @@ namespace llaminar2
             return false;
         }
 
-        cudaError_t err_set = cudaSetDevice(device_id);
-        if (err_set != cudaSuccess)
+        // Use setDevice() which handles both runtime and driver API context
+        if (!setDevice(device_id))
         {
             return false;
         }
@@ -65,8 +66,8 @@ namespace llaminar2
             return false;
         }
 
-        cudaError_t err_set = cudaSetDevice(device_id);
-        if (err_set != cudaSuccess)
+        // Use setDevice() which handles both runtime and driver API context
+        if (!setDevice(device_id))
         {
             return false;
         }
@@ -82,13 +83,31 @@ namespace llaminar2
             return false;
         }
 
-        cudaError_t err_set = cudaSetDevice(device_id);
-        if (err_set != cudaSuccess)
+        // Use setDevice() which handles both runtime and driver API context
+        if (!setDevice(device_id))
         {
             return false;
         }
 
         cudaError_t err = cudaDeviceSynchronize();
+        return (err == cudaSuccess);
+    }
+
+    bool CUDABackend::streamSynchronize(int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        // Use setDevice() which handles both runtime and driver API context
+        if (!setDevice(device_id))
+        {
+            return false;
+        }
+
+        // Synchronize only the default stream (nullptr), not all streams
+        cudaError_t err = cudaStreamSynchronize(nullptr);
         return (err == cudaSuccess);
     }
 
@@ -164,17 +183,19 @@ namespace llaminar2
             return false;
         }
 
-        cudaError_t err = cudaSetDevice(device_id);
-        if (err != cudaSuccess)
+        // Use setDevice() which handles both runtime and driver API context
+        if (!setDevice(device_id))
         {
+            LOG_ERROR("[CUDABackend::waitForEvent] setDevice(" << device_id << ") failed");
             return false;
         }
 
         cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
-        err = cudaEventSynchronize(cuda_event);
+        cudaError_t err = cudaEventSynchronize(cuda_event);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend::waitForEvent] cudaEventSynchronize failed: " << cudaGetErrorString(err));
+            LOG_ERROR("[CUDABackend::waitForEvent] cudaEventSynchronize failed: " << cudaGetErrorString(err)
+                                                                                  << " (device=" << device_id << ", event=" << event << ")");
             return false;
         }
 
@@ -188,8 +209,46 @@ namespace llaminar2
             return false;
         }
 
+        // First, set the runtime API device
         cudaError_t err = cudaSetDevice(device_id);
-        return (err == cudaSuccess);
+        if (err != cudaSuccess)
+        {
+            return false;
+        }
+
+        // Also set the driver API context for cross-thread compatibility.
+        // This is crucial when CUDA is called from a thread that primarily
+        // uses another GPU runtime (e.g., HIP/ROCm). The cudaSetDevice alone
+        // may not properly establish the context for driver API operations
+        // or for events created on other threads.
+        CUdevice cu_device;
+        CUresult cu_err = cuDeviceGet(&cu_device, device_id);
+        if (cu_err != CUDA_SUCCESS)
+        {
+            // Fall through - runtime API is set, driver API failed but may work
+            LOG_WARN("[CUDABackend::setDevice] cuDeviceGet failed for device " << device_id << " error=" << cu_err);
+            return true; // cudaSetDevice succeeded, return true
+        }
+
+        CUcontext ctx;
+        cu_err = cuDevicePrimaryCtxRetain(&ctx, cu_device);
+        if (cu_err != CUDA_SUCCESS)
+        {
+            LOG_WARN("[CUDABackend::setDevice] cuDevicePrimaryCtxRetain failed for device " << device_id << " error=" << cu_err);
+            return true; // cudaSetDevice succeeded
+        }
+
+        cu_err = cuCtxSetCurrent(ctx);
+        if (cu_err != CUDA_SUCCESS)
+        {
+            LOG_WARN("[CUDABackend::setDevice] cuCtxSetCurrent failed for device " << device_id << " error=" << cu_err);
+        }
+        else
+        {
+            LOG_DEBUG("[CUDABackend::setDevice] Successfully set context for device " << device_id);
+        }
+
+        return true;
     }
 
     // ====================================================================

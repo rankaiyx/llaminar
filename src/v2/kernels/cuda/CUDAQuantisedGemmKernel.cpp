@@ -1042,8 +1042,40 @@ namespace llaminar2
                         break;
                     }
 
-                    // Coherence handled automatically by GraphExecutor
-                    d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                    // Check if bias is already on the correct CUDA device
+                    // In multi-GPU scenarios, each device should have its own bias tensor clone
+                    // (created during weight preloading via WeightPreloader::uploadNonGemmWeights)
+                    DeviceId target_device = DeviceId::cuda(cuda_device_id_);
+                    auto current_dev = fp32_bias->current_device();
+
+                    if (current_dev.has_value() && current_dev.value() == target_device)
+                    {
+                        // Already on correct device - use directly
+                        d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                    }
+                    else if (current_dev.has_value() && current_dev->is_gpu())
+                    {
+                        // Tensor is on a DIFFERENT GPU - this is a multi-GPU race condition!
+                        // Do NOT call ensureOnDevice() as it would free the other GPU's memory.
+                        // The correct fix is to ensure each device has its own bias tensor clone.
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] MULTI-GPU CONFLICT: Bias tensor is on "
+                                  << current_dev->to_string() << " but we need CUDA:" << cuda_device_id_
+                                  << ". Ensure WeightPreloader::uploadNonGemmWeights() was called for this device.");
+                        all_success = false;
+                        break;
+                    }
+                    else
+                    {
+                        // Tensor is on CPU or not uploaded yet - safe to upload to this device
+                        if (!fp32_bias->ensureOnDevice(target_device))
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to upload bias to CUDA:" << cuda_device_id_);
+                            all_success = false;
+                            break;
+                        }
+                        d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                    }
+
                     if (!d_bias)
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i

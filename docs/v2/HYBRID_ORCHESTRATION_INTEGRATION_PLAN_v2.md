@@ -23,6 +23,46 @@ Llaminar has extensive orchestration infrastructure that is **fully tested but n
 
 ---
 
+## Implementation Status
+
+### Phase 6: GlobalDeviceAddress Migration
+
+| Task ID | Task | Status | Notes |
+|---------|------|--------|-------|
+| 6.1 | Create `GlobalDeviceAddress` class | ✅ COMPLETE | `src/v2/backends/GlobalDeviceAddress.h/cpp` |
+| 6.1a | Create `DeviceRegistry` singleton | ✅ COMPLETE | `src/v2/backends/DeviceRegistry.h/cpp` - Centralized device discovery for CPU/CUDA/ROCm |
+| 6.1b | Create `DeviceAddressAdapter` utilities | ✅ COMPLETE | `src/v2/backends/DeviceAddressAdapter.h/cpp` - Legacy-to-GlobalDeviceAddress bridging |
+| 6.2 | Update `DeviceInfo` to use `GlobalDeviceAddress` | 🔲 PENDING | |
+| 6.3 | Update `RankInventory` and `ClusterInventory` | 🔲 PENDING | |
+| 6.4 | Update `TPDomain` | 🔲 PENDING | |
+| 6.5 | Update `LayerPlacement` and `PlacementPlan` | 🔲 PENDING | |
+| 6.6 | Update `CollectiveContext` and `BackendRouter` | 🔲 PENDING | |
+| 6.7 | Update CLI parser to produce `GlobalDeviceAddress` | 🔲 PENDING | |
+| 6.8 | Update YAML/JSON config parser | 🔲 PENDING | |
+| 6.9 | Update MPI serialization | 🔲 PENDING | |
+| 6.10 | Unit tests | ✅ COMPLETE | 57+ tests: `Test__GlobalDeviceAddress.cpp`, `Test__DeviceRegistry.cpp`, `Test__DeviceAddressAdapter.cpp` |
+| 6.11 | Migration of existing tests | 🔲 PENDING | |
+
+#### Files Created (Phase 6)
+
+| File | Purpose | Tests |
+|------|---------|-------|
+| `src/v2/backends/GlobalDeviceAddress.h` | Canonical device identifier (hostname:numa:type:ordinal) | 27 passing |
+| `src/v2/backends/GlobalDeviceAddress.cpp` | Implementation | |
+| `src/v2/backends/IDeviceRegistry.h` | Abstract interface for mockable testing | |
+| `src/v2/backends/DeviceRegistry.h` | Singleton header for device discovery | 27 passing |
+| `src/v2/backends/DeviceRegistry.cpp` | CPU/CUDA/ROCm device enumeration | |
+| `src/v2/backends/DeviceAddressAdapter.h` | Legacy ↔ GlobalDeviceAddress conversions | 30+ passing |
+| `src/v2/backends/DeviceAddressAdapter.cpp` | Adapter implementation | |
+
+#### Validation Results
+
+- **DeviceRegistry**: Discovers 6 devices (2 CPU NUMA nodes, 2 CUDA GPUs, 2 ROCm GPUs)
+- **All existing backend tests**: Still passing
+- **Hardware verified**: 2x NVIDIA RTX 3090 (23 GB), 2x AMD Instinct MI60 (31 GB)
+
+---
+
 ## Architecture
 
 ### Three-Layer Design

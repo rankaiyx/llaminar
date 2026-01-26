@@ -1092,8 +1092,9 @@ add_library(llaminar2_core STATIC
     execution/LivenessAnalyzer.cpp
     execution/LayerExecutor.cpp
     execution/ModelExecutor.cpp
-    execution/GraphOrchestrator.cpp
+    execution/DeviceGraphOrchestrator.cpp
     execution/MultiDomainOrchestrator.cpp
+    execution/MultiDeviceOrchestrator.cpp
     execution/HeterogeneousLayerExecutor.cpp
     execution/CrossDomainTransfer.cpp
     execution/HybridPrecisionConfig.cpp
@@ -1108,12 +1109,24 @@ add_library(llaminar2_core STATIC
     config/LayerPlacementConfig.cpp
     # TP Domain configuration (multi-domain tensor parallelism for hybrid systems)
     config/TPDomain.cpp
+    # Orchestration configuration (Phase 0 - CLI/Config architecture for heterogeneous orchestration)
+    config/OrchestrationConfig.cpp
+    config/OrchestrationConfigParser.cpp
+    # Global device address (fully-qualified device identification across nodes)
+    backends/GlobalDeviceAddress.cpp
+    # Device registry and adapter (Phase 6 - GlobalDeviceAddress migration)
+    backends/DeviceRegistry.cpp
+    backends/DeviceAddressAdapter.cpp
     # Slab GEMM configuration (for chunked FP16 GEMM workspace management)
     kernels/SlabGemmConfig.cpp
     # Placement strategy (weight/compute distribution)
     execution/PlacementPlan.cpp
     execution/PlacementStrategy.cpp
     execution/placement/HeterogeneousMultiDomainStrategy.cpp
+    # Execution plan builder (Phase 1 - Plan-to-Graph translation)
+    execution/ExecutionPlanBuilder.cpp
+    # Pipeline parallel graph builder (Phase 3 - PP stage insertion)
+    execution/PipelineParallelGraphBuilder.cpp
     # Inference dispatch (InferenceRunner decouples pipeline vs graph paths)
     execution/InferenceRunnerFactory.cpp
     loaders/ModelLoader.cpp
@@ -1124,7 +1137,13 @@ add_library(llaminar2_core STATIC
     loaders/DeviceOrchestrator.cpp
     loaders/LayerWeightStreamer.cpp
     loaders/WeightStreamerFactory.cpp
+    # Partial weight loader (Phase 3 - PP partial weight loading)
+    loaders/PartialWeightLoader.cpp
+    # Layer device placement (Phase 2 - multi-device graph building)
+    execution/LayerDevicePlacement.cpp
+    # Qwen2 model and graph configuration
     models/qwen/Qwen2Graph.cpp
+    models/qwen/Qwen2GraphConfigBuilder.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
@@ -1228,6 +1247,13 @@ add_library(llaminar2_core STATIC
     execution/CollectiveContext.cpp
     # NUMA-aware memory allocation
     memory/NUMAAllocator.cpp
+    # LOCAL tensor parallelism (Phase 4: multi-device within single MPI rank)
+    collective/LocalTPContext.cpp
+    loaders/LocalTPWeightSharder.cpp
+    execution/compute_stages/stages/LocalTPAllreduceStage.cpp
+    # Orchestration runner (Phase 5: end-to-end integration)
+    orchestration/OrchestrationRunner.cpp
+    orchestration/OrchestrationRunnerFactory.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
 )

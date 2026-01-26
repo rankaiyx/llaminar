@@ -1276,9 +1276,43 @@ namespace llaminar2
                     }
 
                     // Use TensorBase interface - works with both FP32Tensor and TensorSlice
-                    // Cast away const to access gpu_data_ptr() (coherence is managed by GraphExecutor)
+                    // Cast away const to access coherence methods
                     auto *bias_tensor = const_cast<TensorBase *>(proj.bias);
-                    d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+
+                    // Check if bias is already on the correct ROCm device
+                    // In multi-GPU scenarios, each device should have its own bias tensor clone
+                    // (created during weight preloading via WeightPreloader::uploadNonGemmWeights)
+                    DeviceId target_device = DeviceId::rocm(rocm_device_id_);
+                    auto current_dev = bias_tensor->current_device();
+
+                    if (current_dev.has_value() && current_dev.value() == target_device)
+                    {
+                        // Already on correct device - use directly
+                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                    }
+                    else if (current_dev.has_value() && current_dev->is_gpu())
+                    {
+                        // Tensor is on a DIFFERENT GPU - this is a multi-GPU race condition!
+                        // Do NOT call ensureOnDevice() as it would free the other GPU's memory.
+                        // The correct fix is to ensure each device has its own bias tensor clone.
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] MULTI-GPU CONFLICT: Bias tensor is on "
+                                  << current_dev->to_string() << " but we need ROCm:" << rocm_device_id_
+                                  << ". Ensure WeightPreloader::uploadNonGemmWeights() was called for this device.");
+                        all_success = false;
+                        break;
+                    }
+                    else
+                    {
+                        // Tensor is on CPU or not uploaded yet - safe to upload to this device
+                        if (!bias_tensor->ensureOnDevice(target_device))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to upload bias to ROCm:" << rocm_device_id_);
+                            all_success = false;
+                            break;
+                        }
+                        d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                    }
+
                     if (!d_bias)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i);

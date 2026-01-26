@@ -195,7 +195,7 @@ namespace llaminar2
      * Provides a controllable mock implementation of IGraphBuilder that:
      * - Records method calls for verification
      * - Returns configurable mock graphs
-     * - Enables testing of GraphOrchestrator without real model weights
+     * - Enables testing of DeviceGraphOrchestrator without real model weights
      *
      * Example usage:
      * @code
@@ -203,7 +203,7 @@ namespace llaminar2
      * mock->setMockForwardGraph(some_graph);
      * mock->setNumLayers(24);
      *
-     * GraphOrchestrator orchestrator(mock);
+     * DeviceGraphOrchestrator orchestrator(mock);
      * orchestrator.executeForward(input, output);
      *
      * EXPECT_EQ(mock->buildForwardGraphCallCount(), 1);

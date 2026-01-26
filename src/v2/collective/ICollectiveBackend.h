@@ -24,6 +24,7 @@
 
 #include "../backends/DeviceId.h"
 #include "../backends/DeviceType.h"
+#include "../config/OrchestrationConfig.h" // For CollectiveBackendType (canonical definition)
 #include "DeviceGroup.h"
 #include "IBufferRegistration.h"
 #include <functional>
@@ -34,18 +35,8 @@
 namespace llaminar2
 {
 
-    /**
-     * @brief Collective communication backend types
-     */
-    enum class CollectiveBackendType
-    {
-        MPI,      ///< MPI_Allreduce, MPI_Allgather (inter-node or CPU-only)
-        NCCL,     ///< ncclAllReduce, ncclAllGather (NVIDIA GPUs, requires HAVE_NCCL)
-        RCCL,     ///< rcclAllReduce, rcclAllGather (AMD GPUs, requires HAVE_RCCL)
-        PCIE_BAR, ///< Direct CUDA↔ROCm via PCIe BAR mapping (requires HAVE_CUDA && HAVE_ROCM)
-        HOST,     ///< CPU↔GPU via staged host buffer (heterogeneous fallback)
-        AUTO      ///< Runtime selection based on device group composition
-    };
+    // CollectiveBackendType is now defined in OrchestrationConfig.h
+    // to avoid duplicate definitions. See config/OrchestrationConfig.h.
 
     /**
      * @brief Collective operation types
@@ -74,43 +65,33 @@ namespace llaminar2
 
     /**
      * @brief Convert string to CollectiveBackendType
+     *
+     * Note: This is a convenience wrapper. Prefer parseCollectiveBackendType()
+     * from OrchestrationConfig.h for new code.
      */
     inline CollectiveBackendType parseBackendType(const std::string &s)
     {
-        if (s == "MPI" || s == "mpi")
-            return CollectiveBackendType::MPI;
-        if (s == "NCCL" || s == "nccl")
-            return CollectiveBackendType::NCCL;
-        if (s == "RCCL" || s == "rccl")
-            return CollectiveBackendType::RCCL;
-        if (s == "PCIE_BAR" || s == "pcie_bar" || s == "PCIe_BAR" || s == "pciebar")
+        // Delegate to the canonical parser
+        auto result = parseCollectiveBackendType(s);
+        if (result)
+            return *result;
+
+        // Fallback: handle PCIE_BAR variations (case-sensitive upper-case)
+        if (s == "PCIE_BAR" || s == "PCIe_BAR")
             return CollectiveBackendType::PCIE_BAR;
-        if (s == "HOST" || s == "host" || s == "Host")
-            return CollectiveBackendType::HOST;
+
         return CollectiveBackendType::AUTO;
     }
 
     /**
      * @brief Convert CollectiveBackendType to string
+     *
+     * Note: This is a convenience wrapper. Prefer collectiveBackendTypeToString()
+     * from OrchestrationConfig.h for new code.
      */
     inline std::string toString(CollectiveBackendType type)
     {
-        switch (type)
-        {
-        case CollectiveBackendType::MPI:
-            return "MPI";
-        case CollectiveBackendType::NCCL:
-            return "NCCL";
-        case CollectiveBackendType::RCCL:
-            return "RCCL";
-        case CollectiveBackendType::PCIE_BAR:
-            return "PCIe_BAR";
-        case CollectiveBackendType::HOST:
-            return "Host";
-        case CollectiveBackendType::AUTO:
-            return "Auto";
-        }
-        return "Unknown";
+        return collectiveBackendTypeToString(type);
     }
 
     /**

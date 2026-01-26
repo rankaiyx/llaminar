@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/MultiDomainOrchestrator.h"
+#include "execution/DeviceGraphOrchestrator.h"
 #include "execution/IInferenceRunner.h"
 #include "config/TPDomain.h"
 #include "backends/DeviceId.h"
@@ -17,19 +18,19 @@
 using namespace llaminar2;
 
 // =============================================================================
-// Mock GraphOrchestrator for Unit Testing
+// Mock DeviceGraphOrchestrator for Unit Testing
 // =============================================================================
 
 /**
- * @brief Minimal mock of GraphOrchestrator for testing MultiDomainOrchestrator
+ * @brief Minimal mock of DeviceGraphOrchestrator for testing MultiDomainOrchestrator
  *
  * This mock allows testing the wrapper without loading actual models.
  * It tracks method calls and provides configurable return values.
  */
-class MockGraphOrchestrator : public IInferenceRunner
+class MockDeviceGraphOrchestrator : public IInferenceRunner
 {
 public:
-    MockGraphOrchestrator()
+    MockDeviceGraphOrchestrator()
         : ready_(true), vocab_size_(32000), position_(0)
     {
         // Initialize with dummy logits
@@ -106,7 +107,7 @@ private:
 TEST(Test__MultiDomainOrchestrator, CreateForTestReturnsValid)
 {
     // Create mock inner orchestrator
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     // Create TP config for testing (no MPI)
     auto tp_config = std::make_unique<MultiDomainTPConfig>();
@@ -135,7 +136,7 @@ TEST(Test__MultiDomainOrchestrator, CreateForTestWithNullInnerFails)
 TEST(Test__MultiDomainOrchestrator, CreateForTestWithNullTPConfigSucceeds)
 {
     // Null TP config is allowed (single-domain operation)
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -152,7 +153,7 @@ TEST(Test__MultiDomainOrchestrator, CreateForTestWithNullTPConfigSucceeds)
 
 TEST(Test__MultiDomainOrchestrator, GetTPConfigReturnsConfig)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
     auto tp_config = std::make_unique<MultiDomainTPConfig>();
     MultiDomainTPConfig *config_ptr = tp_config.get();
 
@@ -166,7 +167,7 @@ TEST(Test__MultiDomainOrchestrator, GetTPConfigReturnsConfig)
 
 TEST(Test__MultiDomainOrchestrator, GetGPUDomainReturnsCorrectDomain)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     // Create TP config with a GPU domain
     std::vector<TPDomain> domains;
@@ -195,7 +196,7 @@ TEST(Test__MultiDomainOrchestrator, GetGPUDomainReturnsCorrectDomain)
 
 TEST(Test__MultiDomainOrchestrator, GetCPUDomainReturnsCorrectDomain)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     // Create TP config with a CPU domain
     std::vector<TPDomain> domains;
@@ -224,7 +225,7 @@ TEST(Test__MultiDomainOrchestrator, GetCPUDomainReturnsCorrectDomain)
 
 TEST(Test__MultiDomainOrchestrator, GetGPUDomainReturnsNullWhenNoGPUDomain)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     // Create TP config with only CPU domain
     std::vector<TPDomain> domains;
@@ -253,7 +254,7 @@ TEST(Test__MultiDomainOrchestrator, GetGPUDomainReturnsNullWhenNoGPUDomain)
 
 TEST(Test__MultiDomainOrchestrator, IsReadyDelegatesToInner)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
     mock_inner->setReady(true);
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
@@ -266,8 +267,8 @@ TEST(Test__MultiDomainOrchestrator, IsReadyDelegatesToInner)
 
 TEST(Test__MultiDomainOrchestrator, ResetDelegatesToInner)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
-    MockGraphOrchestrator *mock_ptr = mock_inner.get();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
+    MockDeviceGraphOrchestrator *mock_ptr = mock_inner.get();
 
     // Simulate some position advancement
     int tokens[] = {1, 2, 3, 4, 5};
@@ -290,8 +291,8 @@ TEST(Test__MultiDomainOrchestrator, ResetDelegatesToInner)
 
 TEST(Test__MultiDomainOrchestrator, ForwardDelegatesToInner)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
-    MockGraphOrchestrator *mock_ptr = mock_inner.get();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
+    MockDeviceGraphOrchestrator *mock_ptr = mock_inner.get();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -309,7 +310,7 @@ TEST(Test__MultiDomainOrchestrator, ForwardDelegatesToInner)
 
 TEST(Test__MultiDomainOrchestrator, VocabSizeDelegatesToInner)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
     mock_inner->setVocabSize(65536);
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
@@ -322,7 +323,7 @@ TEST(Test__MultiDomainOrchestrator, VocabSizeDelegatesToInner)
 
 TEST(Test__MultiDomainOrchestrator, LogitsDelegatesToInner)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -334,7 +335,7 @@ TEST(Test__MultiDomainOrchestrator, LogitsDelegatesToInner)
 
 TEST(Test__MultiDomainOrchestrator, ArchitectureDelegatesToInner)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -346,7 +347,7 @@ TEST(Test__MultiDomainOrchestrator, ArchitectureDelegatesToInner)
 
 TEST(Test__MultiDomainOrchestrator, ExecutionPathReturnsGraph)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -362,7 +363,7 @@ TEST(Test__MultiDomainOrchestrator, ExecutionPathReturnsGraph)
 
 TEST(Test__MultiDomainOrchestrator, DomainStatsInitiallyZero)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -377,7 +378,7 @@ TEST(Test__MultiDomainOrchestrator, DomainStatsInitiallyZero)
 
 TEST(Test__MultiDomainOrchestrator, ResetStatsClearsStats)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -403,7 +404,7 @@ TEST(Test__MultiDomainOrchestrator, ResetStatsClearsStats)
 
 TEST(Test__MultiDomainOrchestrator, GetModelInfoReturnsDescription)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -418,8 +419,8 @@ TEST(Test__MultiDomainOrchestrator, GetModelInfoReturnsDescription)
 
 TEST(Test__MultiDomainOrchestrator, GetInnerRunnerReturnsInner)
 {
-    auto mock_inner = std::make_unique<MockGraphOrchestrator>();
-    MockGraphOrchestrator *mock_ptr = mock_inner.get();
+    auto mock_inner = std::make_unique<MockDeviceGraphOrchestrator>();
+    MockDeviceGraphOrchestrator *mock_ptr = mock_inner.get();
 
     auto orchestrator = MultiDomainOrchestrator::createForTest(
         std::move(mock_inner),
@@ -431,7 +432,7 @@ TEST(Test__MultiDomainOrchestrator, GetInnerRunnerReturnsInner)
     IInferenceRunner *inner = orchestrator->getInnerRunner();
     EXPECT_EQ(inner, mock_ptr);
 
-    // getInnerOrchestrator returns nullptr for mocks (not actual GraphOrchestrator)
-    GraphOrchestrator *inner_orch = orchestrator->getInnerOrchestrator();
+    // getInnerOrchestrator returns nullptr for mocks (not actual DeviceGraphOrchestrator)
+    DeviceGraphOrchestrator *inner_orch = orchestrator->getInnerOrchestrator();
     EXPECT_EQ(inner_orch, nullptr);
 }

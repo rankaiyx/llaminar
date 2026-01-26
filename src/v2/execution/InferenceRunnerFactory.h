@@ -4,22 +4,34 @@
  * @author David Sanftenberg
  * @date December 2025
  *
- * This file provides a factory function for creating inference runners.
+ * This file provides factory functions for creating inference runners.
  * The factory handles:
  * - Building Qwen2GraphConfig from GGUF model metadata
- * - Configuring tensor parallelism (head/FFN/vocab sharding) based on MPI world size
+ * - Configuring tensor parallelism (GLOBAL via MPI or LOCAL via ILocalTPContext)
  * - Loading and wiring up model weights
- * - Initializing GraphOrchestrator with proper state
+ * - Initializing DeviceGraphOrchestrator with proper state
  *
- * The actual interface (IInferenceRunner) is defined in IInferenceRunner.h.
+ * Two TP modes are supported:
+ *
+ * 1. GLOBAL TP (MPI-based): Multiple MPI ranks, each with one device
+ *    - Configured via mpi_ctx with world_size > 1
+ *    - Collectives via MPI with host staging
+ *    - Use: mpirun -np 2 llaminar2 --tp 2 --tp-scope global
+ *
+ * 2. LOCAL TP (single-rank): One MPI rank with multiple devices
+ *    - Configured via ILocalTPContext in InferenceRunnerConfig
+ *    - Collectives via NCCL/RCCL/PCIeBAR (no host staging)
+ *    - Use: llaminar2 --tp 2 --tp-scope local --tp-devices cuda:0,rocm:0
  *
  * @code
- * // Create runner
- * auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_idx, config);
+ * // GLOBAL TP: via MPI world_size
+ * auto runner = createInferenceRunner(model_ctx, mpi_ctx, device, config);
  *
- * // Inference
- * runner->forward(tokens, seq_len);
- * const float* logits = runner->logits();
+ * // LOCAL TP: via ILocalTPContext
+ * auto tp_ctx = createLocalTPContext({DeviceId::cuda(0), DeviceId::rocm(0)}, ...);
+ * InferenceRunnerConfig config;
+ * config.local_tp_ctx = tp_ctx.get();
+ * auto runner = createInferenceRunner(model_ctx, nullptr, DeviceId::cuda(0), config);
  * @endcode
  */
 
@@ -29,6 +41,7 @@
 #include "../loaders/ModelContext.h"
 #include "../interfaces/IModelContext.h"
 #include "RuntimeConfig.h"
+#include "MultiDeviceOrchestrator.h"
 #include "../backends/DeviceId.h"
 #include "../utils/MPIContext.h"
 #include "PlacementPlan.h"
@@ -38,7 +51,9 @@
 namespace llaminar2
 {
     // Forward declarations to avoid pulling in full headers
-    class GraphOrchestrator;
+    class DeviceGraphOrchestrator;
+    class ILocalTPContext;
+    class IMultiDeviceOrchestrator;
 
     /**
      * @brief Configuration for inference runner creation
@@ -76,10 +91,31 @@ namespace llaminar2
         // When set, the inference runner will use this plan to determine which
         // device executes each layer. If not set, defaults to single-device execution.
         std::optional<PlacementPlan> placement_plan;
+
+        // =====================================================================
+        // LOCAL Tensor Parallelism (single MPI rank, multiple devices)
+        // =====================================================================
+        // When local_tp_ctx is set, the factory configures LOCAL TP mode:
+        //   - Weight sharding based on local_tp_ctx->devices() and weights()
+        //   - Collectives via local_tp_ctx (NCCL/RCCL/PCIeBAR, not MPI)
+        //   - The 'device' parameter becomes the "primary" device for this runner
+        //
+        // This is mutually exclusive with GLOBAL TP (mpi_ctx->world_size() > 1).
+        // If both are set, LOCAL TP takes precedence.
+        //
+        // Lifetime: Caller owns the ILocalTPContext and must keep it alive
+        // for the duration of the IInferenceRunner's lifetime.
+        // =====================================================================
+        ILocalTPContext *local_tp_ctx = nullptr;
+
+        /// Device index within the LOCAL TP context (0 to degree-1).
+        /// Determines which portion of sharded weights this runner loads.
+        /// Only used when local_tp_ctx is set.
+        int local_tp_device_index = 0;
     };
 
     /**
-     * @brief Factory function to create GraphOrchestrator inference runner
+     * @brief Factory function to create DeviceGraphOrchestrator inference runner
      *
      * @param model_ctx Model context with weights
      * @param mpi_ctx MPI context (nullptr for single-rank)
@@ -94,7 +130,7 @@ namespace llaminar2
         const InferenceRunnerConfig &config = {});
 
     /**
-     * @brief Factory function to create GraphOrchestrator with injected dependencies
+     * @brief Factory function to create DeviceGraphOrchestrator with injected dependencies
      *
      * This factory function enables unit testing by accepting interface types
      * instead of concrete implementations. Use MockModelContext, MockMPITopology,
@@ -118,5 +154,55 @@ namespace llaminar2
         std::shared_ptr<IModelContext> model_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config = {});
+
+    /**
+     * @brief Factory function to create MultiDeviceOrchestrator for LOCAL TP
+     *
+     * Creates a MultiDeviceOrchestrator that coordinates multiple devices within
+     * a single MPI rank. Use this when LOCAL TP is configured via --tp-scope local.
+     *
+     * @param model_ctx Model context with weights
+     * @param tp_ctx Pre-constructed LOCAL TP context (ownership transferred)
+     * @param config Multi-device configuration
+     * @return Unique pointer to IMultiDeviceOrchestrator (extends IInferenceRunner)
+     *
+     * @code
+     * // Create LOCAL TP context
+     * auto tp_ctx = createLocalTPContext(
+     *     {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+     *     {0.5f, 0.5f},
+     *     CollectiveBackendType::NCCL);
+     *
+     * // Create multi-device config
+     * MultiDeviceOrchestrator::Config config;
+     * config.devices = tp_ctx->devices();
+     * config.weights = tp_ctx->weights();
+     * config.backend = CollectiveBackendType::NCCL;
+     *
+     * // Create orchestrator (returns IInferenceRunner-compatible)
+     * auto runner = createMultiDeviceOrchestrator(model_ctx, std::move(tp_ctx), config);
+     * @endcode
+     */
+    std::unique_ptr<IMultiDeviceOrchestrator> createMultiDeviceOrchestrator(
+        std::shared_ptr<IModelContext> model_ctx,
+        std::unique_ptr<ILocalTPContext> tp_ctx,
+        const MultiDeviceOrchestrator::Config &config);
+
+    /**
+     * @brief Factory function to create MultiDeviceOrchestrator with testable dependencies
+     *
+     * For unit testing: allows injecting mock device runners and TP context.
+     *
+     * @param model_ctx Model context (can be MockModelContext)
+     * @param device_runners Pre-constructed per-device runners (ownership transferred)
+     * @param tp_ctx Pre-constructed LOCAL TP context (can be mock)
+     * @param config Multi-device configuration
+     * @return Unique pointer to IMultiDeviceOrchestrator
+     */
+    std::unique_ptr<IMultiDeviceOrchestrator> createTestableMultiDeviceOrchestrator(
+        std::shared_ptr<IModelContext> model_ctx,
+        std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners,
+        std::unique_ptr<ILocalTPContext> tp_ctx,
+        const MultiDeviceOrchestrator::Config &config);
 
 } // namespace llaminar2

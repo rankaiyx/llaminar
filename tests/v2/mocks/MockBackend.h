@@ -165,6 +165,13 @@ namespace llaminar2
                 return true;
             }
 
+            bool streamSynchronize(int device_id) override
+            {
+                // Mock: nothing to synchronize
+                (void)device_id;
+                return true;
+            }
+
             // =================================================================
             // IBackend Event Operations
             // =================================================================

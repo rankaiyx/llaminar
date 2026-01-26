@@ -28,6 +28,8 @@
 #include "../utils/MPIContext.h"
 #include "../tensors/Tensors.h"
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <set>
@@ -89,10 +91,12 @@ namespace llaminar2
                       WeightPrecision weight_precision = WeightPrecision::CONVERT_TO_FP32);
 
         /**
-         * @brief Get weight tensor by name
+         * @brief Get weight tensor by name (shared instance)
          *
          * Loads from GGUF if not cached, applies distribution strategy.
          * Device placement is determined by placement_map if provided.
+         *
+         * WARNING: For multi-device scenarios, use getWeightForDevice() instead.
          *
          * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
          * @param device Device for tensor placement (default: CPU)
@@ -102,6 +106,77 @@ namespace llaminar2
         std::shared_ptr<TensorBase> getWeight(const std::string &name, DeviceId device = DeviceId::cpu(), int layer_idx = -1) override;
 
         /**
+         * @brief Get weight tensor for a specific device (device-isolated instance)
+         *
+         * For multi-device scenarios (LOCAL TP), each device needs its own tensor
+         * instance to track coherence state independently. This method:
+         * - Returns the original tensor for the first device that requests it
+         * - Creates and caches a clone for subsequent devices
+         * - Clones are uploaded to GPU independently, avoiding race conditions
+         *
+         * @param name GGUF tensor name
+         * @param device Target device for this tensor instance
+         * @param layer_idx Optional layer index for placement map lookup
+         * @return Device-specific tensor instance, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> getWeightForDevice(const std::string &name, DeviceId device, int layer_idx = -1) override;
+
+        /**
+         * @brief Pre-load and upload weights for multiple devices
+         *
+         * For LOCAL tensor parallelism scenarios, this method:
+         * 1. Creates device-specific clones of all cached weights
+         * 2. Uploads each clone to its target device
+         * 3. Caches the device-specific tensors for getWeightForDevice()
+         *
+         * This MUST be called BEFORE creating device runners.
+         *
+         * @param devices List of devices that will use the weights
+         * @return true if all weights were pre-loaded successfully
+         */
+        bool preloadForDevices(const std::vector<DeviceId> &devices) override;
+
+        // =========================================================================
+        // Weight Packing and Preloading (folded from WeightPreloader)
+        // =========================================================================
+
+        /**
+         * @brief Pack all GEMM weights for a target device
+         *
+         * Creates GEMM kernels for all GEMM weights and calls prepareWeights()
+         * on each kernel. For GPU kernels, this uploads weights to device memory.
+         * For CPU kernels, this is typically a no-op (packing is lazy).
+         *
+         * @param target_device Target device for weight packing
+         * @param progress_cb Optional callback for progress reporting
+         * @param release_raw_data If true, release raw tensor data after packing (CPU only)
+         * @return true if all GEMM weights were packed successfully
+         */
+        bool packGemmWeights(
+            DeviceId target_device,
+            PreloadProgressCallback progress_cb = nullptr,
+            bool release_raw_data = false) override;
+
+        /**
+         * @brief Upload all non-GEMM weights to GPU
+         *
+         * Non-GEMM weights (norms, embeddings, biases) don't need GEMM packing
+         * but still need to be uploaded to GPU for kernel access.
+         * This eliminates lazy upload overhead during inference.
+         *
+         * @param target_device Target GPU device
+         * @return true if all non-GEMM weights were uploaded successfully
+         */
+        bool uploadNonGemmWeights(DeviceId target_device) override;
+
+        /**
+         * @brief Get statistics about preloaded weights
+         *
+         * @return Pair of (num_cpu_packed, num_gpu_packed)
+         */
+        std::pair<size_t, size_t> preloadStats() const override { return {num_cpu_packed_, num_gpu_packed_}; }
+
+        /**
          * @brief Get current distribution strategy
          */
         WeightDistributionStrategy strategy() const override { return strategy_; }
@@ -109,12 +184,12 @@ namespace llaminar2
         /**
          * @brief Get number of cached weights
          */
-        size_t cacheSize() const override { return cache_.size(); }
+        size_t cacheSize() const override;
 
         /**
          * @brief Clear weight cache (frees memory)
          */
-        void clearCache() override { cache_.clear(); }
+        void clearCache() override;
 
         /**
          * @brief Set model-specific weight sharding configuration
@@ -246,12 +321,12 @@ namespace llaminar2
         /**
          * @brief Get number of cached decode weight shards
          */
-        size_t decodeCacheSize() const override { return decode_cache_.size(); }
+        size_t decodeCacheSize() const override;
 
         /**
          * @brief Clear decode weight cache (frees decode shard memory)
          */
-        void clearDecodeCache() override { decode_cache_.clear(); }
+        void clearDecodeCache() override;
 
         // =========================================================================
         // Static utility methods for decode shard slicing
@@ -286,8 +361,6 @@ namespace llaminar2
             float fraction);
 
     private:
-        // Allow WeightPreloader to access cache_ directly for iteration
-        friend class WeightPreloader;
         /**
          * @brief Load weight with replicated strategy
          *
@@ -324,6 +397,18 @@ namespace llaminar2
          */
         static ShardingMode toShardingMode(WeightShardingMode mode);
 
+        /**
+         * @brief Pack a single weight tensor for a target device
+         *
+         * Creates a GEMM kernel and calls prepareWeights() on it.
+         *
+         * @param tensor Weight tensor to pack
+         * @param target_device Target device
+         * @param release_raw_data If true, release raw tensor data after packing
+         * @return true on success
+         */
+        bool packWeight(TensorBase *tensor, DeviceId target_device, bool release_raw_data);
+
         ModelLoader &loader_;                                                       ///< GGUF loader
         std::shared_ptr<MPIContext> mpi_ctx_;                                       ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
@@ -331,12 +416,30 @@ namespace llaminar2
         WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
         WeightPrecision weight_precision_;                                          ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_;        ///< Weight cache
+        mutable std::mutex cache_mutex_;                                            ///< Protects cache_ and decode_cache_ access
         mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
         WeightShardingConfig sharding_config_;                                      ///< Model-specific sharding patterns
         bool has_sharding_config_ = false;                                          ///< True if config was set explicitly
 
         // Decode weight shard cache (separate from prefill cache)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache
+
+        // =========================================================================
+        // Per-device tensor cache for multi-device scenarios (LOCAL TP)
+        // =========================================================================
+
+        /// Key: "device_type:ordinal:weight_name" e.g. "cuda:0:token_embd.weight"
+        /// Value: Device-specific tensor clone, uploaded to that device
+        std::unordered_map<std::string, std::shared_ptr<TensorBase>> per_device_cache_;
+
+        /// First device that requested weights - original tensors are used for this device
+        std::optional<DeviceId> first_device_;
+
+        /// Helper to create a clone of a tensor for a different device
+        std::shared_ptr<TensorBase> cloneTensorForDevice(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &original,
+            DeviceId target_device);
 
         // =========================================================================
         // Proportional slicing helpers (used when tp_config_ is set)
@@ -390,6 +493,16 @@ namespace llaminar2
         };
 
         WeightCategory categorizeWeight(const std::string &name) const;
+
+        // =========================================================================
+        // Preload statistics (folded from WeightPreloader)
+        // =========================================================================
+        size_t num_cpu_packed_ = 0;
+        size_t num_gpu_packed_ = 0;
+
+        // Friend class for WeightPreloader (deprecated, will be removed)
+        // WeightPreloader needs access to cache_ and private members until fully removed
+        friend class WeightPreloader;
     };
 
 } // namespace llaminar2
