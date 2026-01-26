@@ -117,6 +117,10 @@ namespace llaminar2
             /// KV cache scale factor
             float kv_cache_scale = 1.0f;
 
+            /// Use mapped memory for GPU tensors (zero-copy host access)
+            /// Required for correct coherence with column-parallel LM head
+            bool use_mapped_memory = false;
+
             /**
              * @brief Validate configuration
              *
@@ -445,9 +449,12 @@ namespace llaminar2
          *
          * Performs AllGather of local logits shards into combined buffer.
          *
+         * @param seq_len The actual sequence length (number of tokens) for this forward pass.
+         *                Required because logits_local buffer is pre-allocated for max_seq_len,
+         *                but for decode we only want to gather 1 row.
          * @return true if gather succeeded
          */
-        bool gatherLogits();
+        bool gatherLogits(size_t seq_len);
 
         /**
          * @brief Aggregate stats from all device runners
@@ -472,6 +479,10 @@ namespace llaminar2
 
         /// Combined logits buffer after AllGather [vocab_size]
         std::unique_ptr<TensorBase> combined_logits_;
+
+        /// Actual size of gathered logits from last gatherLogits() call
+        /// This may be smaller than combined_logits_->numel() for decode (1 token vs max_seq_len)
+        size_t last_gathered_logits_size_ = 0;
 
         /// Aggregated executor stats (mutable for lazy computation)
         mutable std::unique_ptr<GraphExecutorStats> aggregated_stats_;

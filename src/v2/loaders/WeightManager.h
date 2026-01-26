@@ -471,6 +471,55 @@ namespace llaminar2
         std::pair<size_t, size_t> calculateProportionalRowSlice(
             const std::string &name, size_t total_cols) const;
 
+    public:
+        // =========================================================================
+        // Device-aware weight slicing for LOCAL TP (Phase 1)
+        // =========================================================================
+
+        /**
+         * @brief Load weight with device-specific sharding from TensorParallelConfig
+         *
+         * Uses the DeviceShardingAssignment to determine which slice of the weight
+         * this device should receive. Supports proportional slicing for heterogeneous
+         * GPU configurations.
+         *
+         * @param name Weight tensor name
+         * @param device Target device
+         * @param assignment Device's sharding assignment from TensorParallelConfig
+         * @param layer_idx Layer index for logging
+         * @return Shared pointer to sliced weight tensor, or nullptr on error
+         */
+        std::shared_ptr<TensorBase> getShardedWeightForAssignment(
+            const std::string &name,
+            DeviceId device,
+            const DeviceShardingAssignment &assignment,
+            int layer_idx);
+
+        // Weight category detection helpers for LOCAL TP slicing
+        static bool isQKVWeight(const std::string &name);
+        static bool isFFNGateUpWeight(const std::string &name);
+        static bool isFFNDownWeight(const std::string &name);
+        static bool isLMHeadWeight(const std::string &name);
+        static bool isWoWeight(const std::string &name);
+        static bool isEmbeddingWeight(const std::string &name);
+        static bool isOutputNormWeight(const std::string &name);
+
+        /**
+         * @brief Slice a specific row range from tensor
+         *
+         * Creates a new tensor containing only the specified rows.
+         * Supports FP32 tensors (quantized tensors should use GGUF row slice loading).
+         *
+         * @param tensor Source tensor to slice
+         * @param row_start First row index (0-based)
+         * @param row_count Number of rows to extract
+         * @return New tensor with the specified row range, or nullptr on error
+         */
+        static std::shared_ptr<TensorBase> sliceRowRange(
+            const std::shared_ptr<TensorBase> &tensor,
+            size_t row_start,
+            size_t row_count);
+
         /**
          * @brief Determine weight category from name
          *

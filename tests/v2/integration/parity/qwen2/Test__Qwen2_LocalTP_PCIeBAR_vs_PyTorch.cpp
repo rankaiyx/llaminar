@@ -349,6 +349,9 @@ protected:
         config.backend = CollectiveBackendType::PCIE_BAR;
         config.max_seq_len = 4096;
         config.batch_size = 1;
+        // CRITICAL: Enable mapped memory for correct logits_local coherence
+        // Without this, gatherLogits() reads stale host data
+        config.use_mapped_memory = true;
 
         // Create the multi-device orchestrator
         multi_orch_ = std::make_unique<MultiDeviceOrchestrator>(

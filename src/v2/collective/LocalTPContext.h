@@ -16,6 +16,8 @@
 #include "ICollectiveBackend.h"
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <unordered_map>
 
 namespace llaminar2
@@ -132,6 +134,32 @@ namespace llaminar2
         /// Whether PCIeBAR buffers have been registered
         bool pciebar_buffers_registered_ = false;
 
+        // =====================================================================
+        // PCIeBAR Barrier Synchronization State
+        // =====================================================================
+        // For PCIeBAR backend with heterogeneous GPUs (CUDA + ROCm), threads from
+        // different devices call allreduce() concurrently. We need a rendezvous
+        // barrier so all devices have contributed their data before the PCIeBAR
+        // transfer happens (NCCL-style collective semantics).
+
+        /// Mutex for barrier synchronization (separate from mutex_ to avoid deadlock)
+        mutable std::mutex barrier_mutex_;
+
+        /// Condition variable for barrier wait/notify
+        std::condition_variable barrier_cv_;
+
+        /// Number of threads that have arrived at the barrier
+        std::atomic<int> barrier_count_{0};
+
+        /// Generation counter to prevent spurious wakeups and ensure barrier reusability
+        std::atomic<uint64_t> barrier_generation_{0};
+
+        /// Tensor being reduced (set by first arrival, used by executor)
+        TensorBase *barrier_tensor_{nullptr};
+
+        /// Result of allreduce (set by executor, read by all waiters)
+        bool barrier_result_{false};
+
         /**
          * @brief Initialize the collective backend
          *
@@ -184,6 +212,35 @@ namespace llaminar2
          * @return true on success
          */
         bool allreduceImpl(TensorBase *tensor);
+
+        /**
+         * @brief Allreduce with barrier synchronization for PCIeBAR backend
+         *
+         * Implements NCCL-style collective semantics where all devices must
+         * call allreduce before any data transfer happens. This is necessary
+         * for heterogeneous GPU setups where CUDA and ROCm threads run
+         * independently and may be at different pipeline stages.
+         *
+         * The barrier works as follows:
+         * 1. First arrivals wait at the barrier
+         * 2. Last arrival executes the actual PCIeBAR transfer
+         * 3. All devices are released with the same result
+         *
+         * @param tensor Tensor to allreduce in-place
+         * @return true on success (same result for all participants)
+         */
+        bool allreduceWithBarrier(TensorBase *tensor);
+
+        /**
+         * @brief Execute the actual PCIeBAR allreduce operation
+         *
+         * Called by the last arrival in allreduceWithBarrier(). All other
+         * threads are waiting, so we have exclusive access to the barrier_tensor_.
+         *
+         * @param tensor Tensor to allreduce in-place
+         * @return true on success
+         */
+        bool executePCIeBarAllreduce(TensorBase *tensor);
 
         /**
          * @brief Normalize weights to sum to 1.0

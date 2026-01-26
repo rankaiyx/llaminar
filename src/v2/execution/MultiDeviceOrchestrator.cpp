@@ -17,6 +17,7 @@
 #include "DeviceGraphOrchestrator.h"
 #include "InferenceRunnerFactory.h"
 #include "../collective/ILocalTPContext.h"
+#include "../config/TensorParallelConfig.h"
 #include "../interfaces/IModelContext.h"
 #include "../tensors/TensorClasses.h"
 #include "../tensors/TensorFactory.h"
@@ -215,6 +216,42 @@ namespace llaminar2
         LOG_DEBUG("MultiDeviceOrchestrator: Initializing " << devices.size() << " device runners");
 
         // =====================================================================
+        // BUILD TENSORPARALLELCONFIG FOR LOCAL TP WEIGHT SHARDING
+        // =====================================================================
+        // This enables WeightManager to slice weights by DeviceId instead of
+        // falling back to REPLICATED mode for world_size==1.
+        // =====================================================================
+        {
+            auto weight_mgr = model_ctx_->weightManager();
+            if (weight_mgr && tp_ctx_)
+            {
+                // Get model dimensions
+                int n_heads = model_ctx_->headCount();
+                int n_kv_heads = model_ctx_->headCountKV();
+                int d_ff = model_ctx_->feedForwardLength();
+                int vocab_size = model_ctx_->vocabSize();
+
+                // Estimate d_ff if not available (common SwiGLU ratio)
+                if (d_ff <= 0)
+                {
+                    d_ff = model_ctx_->embeddingLength() * 4;
+                    LOG_WARN("MultiDeviceOrchestrator: feedForwardLength() unavailable, using estimate: " << d_ff);
+                }
+
+                auto tp_config = std::make_shared<TensorParallelConfig>(
+                    TensorParallelConfig::fromLocalTPContext(
+                        *tp_ctx_, n_heads, n_kv_heads, d_ff, vocab_size));
+
+                weight_mgr->setTensorParallelConfig(tp_config);
+
+                LOG_INFO("MultiDeviceOrchestrator: Set TensorParallelConfig for LOCAL TP ("
+                         << tp_ctx_->degree() << " devices, "
+                         << "heads=" << n_heads << ", kv_heads=" << n_kv_heads
+                         << ", d_ff=" << d_ff << ", vocab=" << vocab_size << ")");
+            }
+        }
+
+        // =====================================================================
         // PRE-LOAD WEIGHTS FOR ALL DEVICES
         // =====================================================================
         // This is critical for multi-device operation:
@@ -261,6 +298,7 @@ namespace llaminar2
             runner_config.batch_size = config_.batch_size;
             runner_config.activation_precision = config_.activation_precision;
             runner_config.kv_cache_scale = config_.kv_cache_scale;
+            runner_config.use_mapped_memory = config_.use_mapped_memory;
 
             // Set LOCAL TP parameters
             runner_config.local_tp_ctx = tp_ctx_.get();
@@ -291,19 +329,25 @@ namespace llaminar2
         }
 
         // Allocate combined logits buffer if we have vocab size info
+        // For column-parallel LM head, this needs to be [batch_size * max_seq_len, vocab_size]
+        // to hold the gathered logits from all devices
         if (model_ctx_ && device_runners_.size() > 0)
         {
             int vocab = vocab_size();
             if (vocab > 0)
             {
+                // Calculate max tokens = batch_size * max_seq_len
+                size_t max_tokens = static_cast<size_t>(config_.batch_size) *
+                                    static_cast<size_t>(config_.max_seq_len);
                 combined_logits_ = std::make_unique<FP32Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(vocab)});
-                LOG_DEBUG("MultiDeviceOrchestrator: Allocated combined logits buffer [" << vocab << "]");
+                    std::vector<size_t>{max_tokens, static_cast<size_t>(vocab)});
+                LOG_DEBUG("MultiDeviceOrchestrator: Allocated combined logits buffer ["
+                          << max_tokens << ", " << vocab << "]");
             }
         }
     }
 
-    bool MultiDeviceOrchestrator::gatherLogits()
+    bool MultiDeviceOrchestrator::gatherLogits(size_t seq_len)
     {
         if (!combined_logits_ || device_runners_.empty())
         {
@@ -317,8 +361,12 @@ namespace llaminar2
             if (primary_logits)
             {
                 int vocab = vocab_size();
+                // For decode, seq_len=1 so we copy vocab elements
+                // For prefill, seq_len * vocab elements
+                size_t copy_size = seq_len * static_cast<size_t>(vocab);
                 std::memcpy(combined_logits_->mutable_data(), primary_logits,
-                            static_cast<size_t>(vocab) * sizeof(float));
+                            copy_size * sizeof(float));
+                last_gathered_logits_size_ = copy_size;
             }
             return true;
         }
@@ -346,18 +394,25 @@ namespace llaminar2
             if (primary_logits)
             {
                 int vocab = vocab_size();
+                size_t copy_size = seq_len * static_cast<size_t>(vocab);
                 std::memcpy(combined_logits_->mutable_data(), primary_logits,
-                            static_cast<size_t>(vocab) * sizeof(float));
+                            copy_size * sizeof(float));
+                last_gathered_logits_size_ = copy_size;
             }
             return true;
         }
 
-        // Column-parallel LM head: each device has vocab_local logits
-        // Use gatherFromDevices to combine them into full vocab_size logits
+        // Column-parallel LM head: each device has logits_local [seq_len, vocab_local]
+        // We need to gather along the vocab dimension (axis=1), producing [seq_len, vocab_total]
+        //
+        // For each row (token position), concatenate vocab_local slices from all devices:
+        //   output[row, 0:vocab_local_0] = device_0_logits[row, :]
+        //   output[row, vocab_local_0:vocab_local_0+vocab_local_1] = device_1_logits[row, :]
+        //   etc.
 
-        // Collect partial logits tensors from all devices
-        std::vector<const TensorBase *> partial_logits;
-        partial_logits.reserve(device_runners_.size());
+        // Collect info from all devices
+        std::vector<const float *> device_data;
+        std::vector<size_t> vocab_locals;
 
         for (const auto &runner : device_runners_)
         {
@@ -370,28 +425,88 @@ namespace llaminar2
             const auto &state = runner->inferenceState();
             if (!state.logits_local)
             {
-                LOG_ERROR("MultiDeviceOrchestrator::gatherLogits: device missing logits_local "
-                          "but column-parallel LM head is enabled");
+                LOG_ERROR("MultiDeviceOrchestrator::gatherLogits: device missing logits_local");
                 return false;
             }
 
-            partial_logits.push_back(state.logits_local.get());
+            const auto &shape = state.logits_local->shape();
+            if (shape.size() < 2)
+            {
+                LOG_ERROR("MultiDeviceOrchestrator::gatherLogits: logits_local must be 2D");
+                return false;
+            }
+
+            // Use the passed-in seq_len instead of reading from tensor shape
+            // (tensor shape is pre-allocated for max_seq_len, but for decode we only want 1 row)
+            size_t this_vocab_local = shape[1];
+
+            device_data.push_back(state.logits_local->data());
+            vocab_locals.push_back(this_vocab_local);
         }
 
-        // Gather all partial logits into combined_logits_
-        bool success = tp_ctx_->gatherFromDevices(partial_logits, combined_logits_.get());
-
-        if (!success)
+        // Calculate total vocab and validate output buffer
+        size_t total_vocab = 0;
+        for (size_t vl : vocab_locals)
         {
-            LOG_ERROR("MultiDeviceOrchestrator::gatherLogits: gatherFromDevices failed");
-        }
-        else
-        {
-            LOG_DEBUG("MultiDeviceOrchestrator::gatherLogits: gathered "
-                      << partial_logits.size() << " partial logits into combined buffer");
+            total_vocab += vl;
         }
 
-        return success;
+        size_t expected_output_size = seq_len * total_vocab;
+        if (combined_logits_->numel() < expected_output_size)
+        {
+            LOG_ERROR("MultiDeviceOrchestrator::gatherLogits: output buffer too small. "
+                      << "Need " << expected_output_size << ", have " << combined_logits_->numel());
+            return false;
+        }
+
+        // Perform row-by-row column gathering
+        float *output = combined_logits_->mutable_data();
+
+        // Debug: Log first elements from each device for decode debugging
+        if (seq_len == 1 && device_data.size() >= 2)
+        {
+            LOG_DEBUG("MultiDeviceOrchestrator::gatherLogits: DECODE DEBUG" << " device0_first=" << device_data[0][0] << " device0_max_idx=" << [&]()
+                      {
+                          size_t max_idx = 0;
+                          float max_val = device_data[0][0];
+                          for (size_t i = 1; i < vocab_locals[0]; ++i) {
+                              if (device_data[0][i] > max_val) {
+                                  max_val = device_data[0][i];
+                                  max_idx = i;
+                              }
+                          }
+                          return std::to_string(max_idx) + " (val=" + std::to_string(max_val) + ")"; }() << " device1_first=" << device_data[1][0] << " device1_max_idx=" << [&]()
+                      {
+                          size_t max_idx = 0;
+                          float max_val = device_data[1][0];
+                          for (size_t i = 1; i < vocab_locals[1]; ++i) {
+                              if (device_data[1][i] > max_val) {
+                                  max_val = device_data[1][i];
+                                  max_idx = i;
+                              }
+                          }
+                          return std::to_string(max_idx) + " (val=" + std::to_string(max_val) + ")"; }());
+        }
+
+        for (size_t row = 0; row < seq_len; ++row)
+        {
+            size_t col_offset = 0;
+            for (size_t dev = 0; dev < device_data.size(); ++dev)
+            {
+                const float *src = device_data[dev] + row * vocab_locals[dev];
+                float *dst = output + row * total_vocab + col_offset;
+                std::memcpy(dst, src, vocab_locals[dev] * sizeof(float));
+                col_offset += vocab_locals[dev];
+            }
+        }
+
+        // Store the actual gathered size for getSnapshot()
+        last_gathered_logits_size_ = expected_output_size;
+
+        LOG_DEBUG("MultiDeviceOrchestrator::gatherLogits: gathered column-parallel logits "
+                  << "[" << seq_len << ", " << total_vocab << "] from " << device_data.size() << " devices");
+
+        return true;
     }
 
     void MultiDeviceOrchestrator::aggregateStats() const
@@ -569,7 +684,9 @@ namespace llaminar2
         if (all_success)
         {
             // Gather logits from all devices
-            if (!gatherLogits())
+            // Pass seq_len so gatherLogits knows how many rows to gather
+            // (logits_local buffer is pre-allocated for max_seq_len)
+            if (!gatherLogits(static_cast<size_t>(seq_len)))
             {
                 LOG_ERROR("MultiDeviceOrchestrator::forward: Failed to gather logits");
                 all_success = false;
@@ -824,7 +941,41 @@ namespace llaminar2
 
     const float *MultiDeviceOrchestrator::getSnapshot(const std::string &key, size_t &out_size) const
     {
-        // Get from primary device
+        // For LM_HEAD with multi-device TP, return the gathered combined_logits
+        // This is necessary because each device only has logits_local with vocab_local entries,
+        // but tests expect the full vocab_size logits.
+        if (key == "LM_HEAD" && device_runners_.size() > 1 && combined_logits_ && tp_ctx_)
+        {
+            // Check if we have column-parallel LM head
+            bool has_column_parallel_lm_head = false;
+            for (const auto &runner : device_runners_)
+            {
+                if (runner)
+                {
+                    const auto &state = runner->inferenceState();
+                    if (state.logits_local)
+                    {
+                        has_column_parallel_lm_head = true;
+                        break;
+                    }
+                }
+            }
+
+            if (has_column_parallel_lm_head)
+            {
+                // Return the combined logits which have full vocab_size
+                // Use the actual gathered size from last gatherLogits() call,
+                // NOT the buffer capacity (which is pre-allocated for max_seq_len)
+                out_size = last_gathered_logits_size_;
+                const float *ptr = combined_logits_->data();
+                LOG_DEBUG("MultiDeviceOrchestrator::getSnapshot LM_HEAD returning combined_logits with "
+                          << out_size << " elements (column-parallel gathering), ptr=" << (void *)ptr
+                          << " first_element=" << (ptr ? ptr[0] : -999999.0f));
+                return ptr;
+            }
+        }
+
+        // Default: get from primary device
         if (!device_runners_.empty() && device_runners_[0])
         {
             return device_runners_[0]->getSnapshot(key, out_size);

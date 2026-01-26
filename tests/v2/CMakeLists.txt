@@ -3874,6 +3874,30 @@ add_v2_test(V2_Unit_TensorParallelConfig
     MPI_PROCS 1
 )
 
+# Test: TensorParallelConfig_LocalTP (fromLocalTPContext factory method)
+# Tests creation of TensorParallelConfig from ILocalTPContext for LOCAL TP weight sharding.
+# Covers equal splits, proportional splits (73%/27%), 3-way splits, device lookup.
+# Part of Phase 1: LOCAL TP Weight Sharding Infrastructure
+add_executable(v2_test_tensor_parallel_config_localtp unit/Test__TensorParallelConfig_LocalTP.cpp)
+target_link_libraries(v2_test_tensor_parallel_config_localtp llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TensorParallelConfig_LocalTP
+    COMMAND $<TARGET_FILE:v2_test_tensor_parallel_config_localtp>
+    LABELS "V2;Unit;Config;TensorParallelism;LocalTP;WeightSharding"
+    MPI_PROCS 1
+)
+
+# Test: WeightManager_LocalTPSlicing (helper methods for device-aware weight slicing)
+# Tests weight category detection (isQKVWeight, isFFNGateUpWeight, etc.) and sliceRowRange.
+# Part of Phase 1: LOCAL TP Weight Sharding Infrastructure
+add_executable(v2_test_weight_manager_localtp_slicing unit/Test__WeightManager_LocalTPSlicing.cpp)
+target_link_libraries(v2_test_weight_manager_localtp_slicing llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_weight_manager_localtp_slicing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+add_v2_test(V2_Unit_WeightManager_LocalTPSlicing
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_localtp_slicing>
+    LABELS "V2;Unit;Loaders;WeightManager;LocalTP;Slicing;WeightSharding"
+    MPI_PROCS 1
+)
+
 # Test: PipelineParallelConfig (layer range assignment for pipeline parallelism)
 # Tests equal splits, custom splits, topology methods, validation
 # Part of Phase 2.3: Heterogeneous TP - Pipeline Parallelism Layer Assignment
@@ -4431,6 +4455,17 @@ target_link_libraries(v2_test_local_tp_allreduce_stage llaminar2_core GTest::gte
 add_v2_test(V2_Unit_LocalTPAllreduceStage
     COMMAND $<TARGET_FILE:v2_test_local_tp_allreduce_stage>
     LABELS "V2;Unit;LocalTP;Allreduce;ComputeStage;TensorParallel;Collective"
+    MPI_PROCS 1
+)
+
+# Test: LocalTPContext Barrier Synchronization
+# Tests the NCCL-style barrier for PCIeBAR heterogeneous allreduce
+# Validates that multiple device threads rendezvous before data transfer
+add_executable(v2_test_local_tp_context_barrier unit/Test__LocalTPContextBarrier.cpp)
+target_link_libraries(v2_test_local_tp_context_barrier PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_LocalTPContextBarrier
+    COMMAND $<TARGET_FILE:v2_test_local_tp_context_barrier>
+    LABELS "V2;Unit;LocalTP;Barrier;Synchronization;PCIeBAR;Heterogeneous;Collective"
     MPI_PROCS 1
 )
 
@@ -7100,3 +7135,35 @@ add_v2_test(V2_Integration_Scenario7_MultiDomainPP
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added Scenario 7 Multi-Domain PP integration tests")
+
+# =============================================================================
+# Performance: CUDA Vector Add Kernels (used by PCIeBAR reductions)
+# =============================================================================
+# Benchmarks the in-place vector addition kernels that perform GPU-side reductions
+# during PCIeBAR allreduce operations. Tests realistic sizes (hidden_size, intermediate_size,
+# vocab_size) and measures throughput (GB/s), latency, and kernel launch overhead.
+if(HAVE_CUDA)
+add_executable(v2_perf_cuda_vector_add performance/kernels/cuda/ops/Perf__CUDAVectorAddKernels.cpp)
+target_link_libraries(v2_perf_cuda_vector_add llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDAVectorAddKernels
+    COMMAND $<TARGET_FILE:v2_perf_cuda_vector_add>
+    LABELS "V2;Performance;CUDA;Kernels;VectorAdd;PCIeBAR;Allreduce;Throughput;Latency"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added CUDA Vector Add kernel performance benchmarks")
+endif()
+
+# Performance: PCIeBAR Pipelined Allreduce
+# =============================================================================
+# Benchmarks the triple-buffered pipelined allreduce that overlaps BAR transfers
+# with CUDA compute. Compares throughput at various buffer sizes.
+if(HAVE_CUDA AND HAVE_ROCM)
+add_executable(v2_perf_pciebar_pipelined performance/collective/Perf__PCIeBARPipelinedAllreduce.cpp)
+target_link_libraries(v2_perf_pciebar_pipelined llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_PCIeBARPipelinedAllreduce
+    COMMAND $<TARGET_FILE:v2_perf_pciebar_pipelined>
+    LABELS "V2;Performance;CUDA;ROCm;PCIeBAR;Allreduce;Pipelined;Throughput;CrossVendor"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added PCIeBAR pipelined allreduce performance benchmarks")
+endif()

@@ -19,6 +19,7 @@
 #include "models/IGraphConfigBuilder.h"
 #include "execution/RankExecutionPlan.h"
 #include "config/OrchestrationConfig.h"
+#include "config/TensorParallelConfig.h" // For setTensorParallelConfig stub
 #include "backends/GlobalDeviceAddress.h"
 #include "interfaces/IWeightManager.h"
 
@@ -88,6 +89,8 @@ namespace
         void clearDecodeCache() override {}
 
         void setWeightShardingConfig(const WeightShardingConfig & /*config*/) override {}
+
+        void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> /*config*/) override {}
 
         // New methods folded from WeightPreloader
         bool packGemmWeights(DeviceId /*target_device*/,

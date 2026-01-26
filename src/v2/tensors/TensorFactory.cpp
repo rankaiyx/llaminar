@@ -11,10 +11,8 @@
 #include <stdexcept>
 #include <sstream>
 
-#ifdef HAVE_NUMA
 #include <numa.h>
 #include <numaif.h>
-#endif
 
 namespace llaminar2
 {
@@ -280,7 +278,6 @@ namespace llaminar2
 
     bool TensorFactory::isNumaAvailable()
     {
-#ifdef HAVE_NUMA
         if (numa_available() < 0)
         {
             return false;
@@ -289,14 +286,10 @@ namespace llaminar2
         // Check if system has multiple NUMA nodes
         int max_node = numa_max_node();
         return max_node > 0;
-#else
-        return false;
-#endif
     }
 
     void TensorFactory::bindToNumaNode()
     {
-#ifdef HAVE_NUMA
         if (numa_node_ >= 0 && numa_available() >= 0)
         {
             // Bind current thread to NUMA node
@@ -312,12 +305,10 @@ namespace llaminar2
 
             numa_free_nodemask(mask);
         }
-#endif
     }
 
     int TensorFactory::getNumaNodeForRank(int rank)
     {
-#ifdef HAVE_NUMA
         if (numa_available() < 0)
         {
             return -1;
@@ -332,10 +323,6 @@ namespace llaminar2
         // Simple round-robin mapping: rank % (max_node + 1)
         // More sophisticated mapping could query actual CPU topology
         return rank % (max_node + 1);
-#else
-        (void)rank; // Suppress unused parameter warning
-        return -1;
-#endif
     }
 
 } // namespace llaminar2

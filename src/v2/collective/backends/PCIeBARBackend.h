@@ -32,13 +32,13 @@
 #include <optional>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
 #include <thread>
+#include <queue>
+#include <future>
+#include <functional>
 #include <mutex>
 #include <condition_variable>
-#include <queue>
-#include <functional>
-#include <future>
-#include <atomic>
 
 namespace llaminar2
 {
@@ -145,22 +145,20 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Wait for a CUDA event via the worker thread
+         * @brief Wait for a CUDA event (direct call)
          *
-         * This is used when code running on a HIP-contaminated thread needs to
-         * wait for a CUDA event. The wait is proxied through the CUDA worker thread.
+         * This function establishes proper CUDA context and waits for the event.
          *
          * @param event CUDA event to wait for (cudaEvent_t)
          * @param device_id CUDA device ID
          * @return true if wait succeeded
          */
-        bool waitForCUDAEventViaWorker(void *event, int device_id);
+        bool waitForCUDAEvent(void *event, int device_id);
 
         /**
          * @brief Get the global PCIeBARBackend instance (if any)
          *
-         * Used by TensorBase to proxy CUDA event waits when running on a
-         * HIP-contaminated thread.
+         * Used by TensorBase to access CUDA event wait functionality.
          */
         static PCIeBARBackend *getInstance() { return s_instance_; }
 
@@ -282,8 +280,83 @@ namespace llaminar2
         void *cuda_temp_buffer_ = nullptr;
         size_t cuda_temp_buffer_size_ = 0;
 
+        // Persistent CUDA stream for reduction operations (created once in initialize)
+        void *cuda_reduction_stream_ = nullptr;
+
+        // =====================================================================
+        // Pipelined Transfer Infrastructure
+        // =====================================================================
+
+        /// Stream for BAR read operations (ROCm→CUDA)
+        void *cuda_read_stream_ = nullptr;
+
+        /// Stream for BAR write operations (CUDA→ROCm)
+        void *cuda_write_stream_ = nullptr;
+
+        /// Double buffer for pipelined transfers (second temp buffer)
+        void *cuda_temp_buffer2_ = nullptr;
+
+        /// Events for stream synchronization (one per ping-pong buffer)
+        void *cuda_read_complete_event_[2] = {nullptr, nullptr};
+        void *cuda_compute_complete_event_[2] = {nullptr, nullptr};
+
+        /// Minimum size (bytes) to use pipelined allreduce
+        static constexpr size_t PIPELINE_THRESHOLD = 32768; // 32KB
+
+        /// Chunk size for pipelined transfers
+        static constexpr size_t PIPELINE_CHUNK_SIZE = 16384; // 16KB
+
         // Performance metrics
         double measured_bandwidth_gbps_ = 0.0;
+
+        // =====================================================================
+        // CUDA Worker Thread for HIP-safe Event Waits
+        // =====================================================================
+        // When running heterogeneous CUDA+ROCm LOCAL TP, the ROCm executor thread
+        // may need to wait for CUDA events. Direct cudaEventSynchronize() fails
+        // with "context is destroyed" from a HIP-contaminated thread.
+        // This worker thread provides a clean CUDA context for event waits.
+
+        /**
+         * @brief Start the CUDA worker thread
+         */
+        bool startCUDAWorker();
+
+        /**
+         * @brief Stop the CUDA worker thread
+         */
+        void stopCUDAWorker();
+
+        /**
+         * @brief Submit work to the CUDA worker thread
+         */
+        std::future<bool> submitCUDAWork(std::function<bool()> work);
+
+        /**
+         * @brief Main loop for CUDA worker thread
+         */
+        void cudaWorkerLoop();
+
+        /// Worker thread for CUDA operations
+        std::thread cuda_worker_thread_;
+
+        /// Work queue for CUDA operations
+        std::queue<std::packaged_task<bool()>> cuda_work_queue_;
+
+        /// Mutex for work queue
+        std::mutex cuda_work_mutex_;
+
+        /// Condition variable for work queue
+        std::condition_variable cuda_work_cv_;
+
+        /// Flag to stop worker thread
+        std::atomic<bool> cuda_worker_stop_{false};
+
+        /// Flag indicating worker is running
+        std::atomic<bool> cuda_worker_running_{false};
+
+        /// CUDA stream for worker thread operations (created on worker thread)
+        void *cuda_worker_stream_ = nullptr;
 
         // =====================================================================
         // BAR Allocator State
@@ -349,56 +422,56 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op);
 
+        /**
+         * @brief Pipelined allreduce for large buffers
+         *
+         * Uses triple-buffering with overlapped transfers:
+         * - Stream 1: Read from ROCm BAR
+         * - Stream 2: Compute reduction
+         * - Stream 3: Write to ROCm BAR
+         *
+         * @return true on success
+         */
+        bool allreducePipelined(
+            void *buffer,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op);
+
+        /**
+         * @brief Pipelined allreduce with explicit BAR offset
+         *
+         * Version of allreducePipelined that takes the ROCm BAR offset explicitly,
+         * for use with registered buffers that may not be at offset 0.
+         */
+        bool allreducePipelinedWithOffset(
+            void *cuda_buffer,
+            size_t rocm_bar_offset,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op);
+
+        /**
+         * @brief Async reduction kernel launch (no sync)
+         */
+        bool reduceOnCUDAAsync(
+            void *output,
+            const void *input,
+            size_t count,
+            CollectiveDataType dtype,
+            void *stream);
+
+        /**
+         * @brief Async BAR transfer ROCm→CUDA
+         */
+        bool transferROCmtoCUDAAsync(size_t bar_offset, void *cuda_dst, size_t bytes, void *stream);
+
+        /**
+         * @brief Async BAR transfer CUDA→ROCm
+         */
+        bool transferCUDAtoROCmAsync(const void *cuda_src, size_t bar_offset, size_t bytes, void *stream);
+
         size_t datatypeSize(CollectiveDataType dtype) const;
-
-        // =====================================================================
-        // CUDA Worker Thread (for cross-vendor interop)
-        // =====================================================================
-        // CUDA operations must run on a thread that was never initialized with HIP.
-        // This worker thread handles all CUDA kernel launches and synchronization.
-
-        /**
-         * @brief Submit work to the CUDA worker thread
-         * @param work Lambda to execute on the CUDA worker thread
-         * @return Future that completes when the work is done
-         */
-        std::future<bool> submitCUDAWork(std::function<bool()> work);
-
-        /**
-         * @brief CUDA worker thread main loop
-         */
-        void cudaWorkerLoop();
-
-        /**
-         * @brief Start the CUDA worker thread
-         */
-        bool startCUDAWorker();
-
-        /**
-         * @brief Stop the CUDA worker thread
-         */
-        void stopCUDAWorker();
-
-        /// Worker thread for CUDA operations
-        std::thread cuda_worker_thread_;
-
-        /// Work queue for CUDA operations
-        std::queue<std::packaged_task<bool()>> cuda_work_queue_;
-
-        /// Mutex for work queue
-        std::mutex cuda_work_mutex_;
-
-        /// Condition variable for work queue
-        std::condition_variable cuda_work_cv_;
-
-        /// Flag to stop worker thread
-        std::atomic<bool> cuda_worker_stop_{false};
-
-        /// Flag indicating worker is running
-        std::atomic<bool> cuda_worker_running_{false};
-
-        /// CUDA stream for worker thread operations (created on worker thread)
-        void *cuda_worker_stream_ = nullptr; // cudaStream_t, void* to avoid header dep
 
         /// Global instance pointer for cross-thread event wait proxying
         static PCIeBARBackend *s_instance_;
@@ -436,7 +509,7 @@ namespace llaminar2
 
         double getMeasuredBandwidthGBps() const { return 0.0; }
         bool isPCIeBarActive() const { return false; }
-        bool waitForCUDAEventViaWorker(void *, int) { return false; }
+        bool waitForCUDAEvent(void *, int) { return false; }
         static PCIeBARBackend *getInstance() { return nullptr; }
 
         std::optional<std::pair<void *, size_t>> allocateInBarRegion(size_t) { return std::nullopt; }

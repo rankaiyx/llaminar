@@ -430,6 +430,451 @@ namespace llaminar2::test
         freeCUDA(cuda_buf);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Pipelined AllReduce Tests
+    //
+    // These tests verify the pipelined allreduce implementation which overlaps
+    // PCIe BAR transfers with CUDA compute for better throughput.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @brief Test pipelined allreduce at exactly the pipeline threshold (32KB)
+     *
+     * At 32KB, the implementation should use the pipelined path (triple-buffered
+     * with overlapping read/compute/write stages).
+     */
+    TEST_F(Test__PCIeBARBackendIntegration, PipelinedAllReduce_AtThreshold)
+    {
+        REQUIRE_HARDWARE();
+
+        // Exactly at PIPELINE_THRESHOLD (32KB = 8192 floats)
+        const size_t count = 8192;
+        const size_t bytes = count * sizeof(float);
+
+        // Create deterministic test data
+        std::mt19937 gen(12345);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+        std::vector<float> cuda_host(count);
+        std::vector<float> rocm_host(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            cuda_host[i] = dist(gen);
+            rocm_host[i] = dist(gen);
+        }
+
+        // Allocate CUDA buffer
+        void *cuda_buf = cuda_backend_->allocate(bytes, 0);
+        ASSERT_NE(cuda_buf, nullptr);
+
+        // Allocate ROCm buffer from BAR region
+        auto rocm_alloc = backend_->allocateInBarRegion(bytes);
+        ASSERT_TRUE(rocm_alloc.has_value()) << "Failed to allocate in BAR region";
+        auto [rocm_buf, bar_offset] = *rocm_alloc;
+
+        // Initialize GPU buffers
+        cuda_backend_->hostToDevice(cuda_buf, cuda_host.data(), bytes, 0);
+        std::memcpy(rocm_buf, rocm_host.data(), bytes);
+        cuda_backend_->synchronize(0);
+
+        // Register buffers
+        const std::string coll_id = "pipelined_threshold_test";
+        ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::cuda(0), cuda_buf, bytes));
+        ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::rocm(0), rocm_buf, bytes));
+
+        // Perform allreduce (should use pipelined path at 32KB)
+        EXPECT_TRUE(backend_->allreduceRegistered(coll_id, count,
+                                                  CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+
+        // Compute expected result
+        std::vector<float> expected(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            expected[i] = cuda_host[i] + rocm_host[i];
+        }
+
+        // Verify CUDA result
+        auto cuda_result = readFromCUDA(cuda_buf, count);
+        double cuda_mse = computeMSE(cuda_result, expected);
+        float cuda_max_diff = computeMaxAbsDiff(cuda_result, expected);
+
+        LOG_INFO("PipelinedAllReduce_AtThreshold CUDA - MSE: " << cuda_mse << ", max diff: " << cuda_max_diff);
+
+        EXPECT_LT(cuda_mse, 1e-10) << "CUDA MSE should be near zero for pipelined reduction";
+        EXPECT_LT(cuda_max_diff, 1e-5f) << "CUDA max diff should be negligible";
+
+        // Verify ROCm result
+        auto rocm_result = readFromBAR(rocm_buf, count);
+        double rocm_mse = computeMSE(rocm_result, expected);
+        float rocm_max_diff = computeMaxAbsDiff(rocm_result, expected);
+
+        LOG_INFO("PipelinedAllReduce_AtThreshold ROCm - MSE: " << rocm_mse << ", max diff: " << rocm_max_diff);
+
+        EXPECT_LT(rocm_mse, 1e-10) << "ROCm MSE should be near zero for pipelined reduction";
+        EXPECT_LT(rocm_max_diff, 1e-5f) << "ROCm max diff should be negligible";
+
+        // Cleanup
+        backend_->unregisterBuffer(coll_id, DeviceId::cuda(0));
+        backend_->unregisterBuffer(coll_id, DeviceId::rocm(0));
+        backend_->freeBarBuffer(rocm_buf);
+        freeCUDA(cuda_buf);
+    }
+
+    /**
+     * @brief Test pipelined allreduce with multiple chunk sizes
+     *
+     * Tests various buffer sizes to ensure the pipelined implementation handles
+     * different chunk counts correctly (2 chunks, 4 chunks, many chunks).
+     */
+    TEST_F(Test__PCIeBARBackendIntegration, PipelinedAllReduce_MultipleChunks)
+    {
+        REQUIRE_HARDWARE();
+
+        // Test sizes that result in different chunk counts
+        // PIPELINE_CHUNK_SIZE = 16KB, so:
+        // - 64KB = 4 chunks
+        // - 256KB = 16 chunks
+        // - 1MB = 64 chunks
+        std::vector<size_t> test_sizes = {
+            64 * 1024 / sizeof(float),  // 64KB = 16384 floats
+            256 * 1024 / sizeof(float), // 256KB = 65536 floats
+            1024 * 1024 / sizeof(float) // 1MB = 262144 floats
+        };
+
+        for (size_t count : test_sizes)
+        {
+            size_t bytes = count * sizeof(float);
+            LOG_INFO("Testing pipelined allreduce with " << count << " floats (" << bytes << " bytes)");
+
+            // Create deterministic test data
+            std::mt19937 gen(54321 + count);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+            std::vector<float> cuda_host(count);
+            std::vector<float> rocm_host(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                cuda_host[i] = dist(gen);
+                rocm_host[i] = dist(gen);
+            }
+
+            // Allocate CUDA buffer
+            void *cuda_buf = cuda_backend_->allocate(bytes, 0);
+            ASSERT_NE(cuda_buf, nullptr);
+
+            // Allocate ROCm buffer from BAR region
+            auto rocm_alloc = backend_->allocateInBarRegion(bytes);
+            ASSERT_TRUE(rocm_alloc.has_value()) << "Failed to allocate in BAR region for size " << bytes;
+            auto [rocm_buf, bar_offset] = *rocm_alloc;
+
+            // Initialize GPU buffers
+            cuda_backend_->hostToDevice(cuda_buf, cuda_host.data(), bytes, 0);
+            std::memcpy(rocm_buf, rocm_host.data(), bytes);
+            cuda_backend_->synchronize(0);
+
+            // Register buffers
+            std::string coll_id = "pipelined_chunks_" + std::to_string(count);
+            ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::cuda(0), cuda_buf, bytes));
+            ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::rocm(0), rocm_buf, bytes));
+
+            // Perform allreduce
+            EXPECT_TRUE(backend_->allreduceRegistered(coll_id, count,
+                                                      CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+
+            // Compute expected result
+            std::vector<float> expected(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                expected[i] = cuda_host[i] + rocm_host[i];
+            }
+
+            // Verify CUDA result
+            auto cuda_result = readFromCUDA(cuda_buf, count);
+            double cuda_mse = computeMSE(cuda_result, expected);
+            EXPECT_LT(cuda_mse, 1e-10) << "CUDA MSE too high for size " << bytes;
+
+            // Verify ROCm result
+            auto rocm_result = readFromBAR(rocm_buf, count);
+            double rocm_mse = computeMSE(rocm_result, expected);
+            EXPECT_LT(rocm_mse, 1e-10) << "ROCm MSE too high for size " << bytes;
+
+            // Cleanup
+            backend_->unregisterBuffer(coll_id, DeviceId::cuda(0));
+            backend_->unregisterBuffer(coll_id, DeviceId::rocm(0));
+            backend_->freeBarBuffer(rocm_buf);
+            freeCUDA(cuda_buf);
+        }
+    }
+
+    /**
+     * @brief Test that pipelined path correctly handles non-zero BAR offsets
+     *
+     * This test allocates multiple buffers sequentially to ensure the pipelined
+     * implementation correctly handles BAR offsets > 0 (bump allocator behavior).
+     */
+    TEST_F(Test__PCIeBARBackendIntegration, PipelinedAllReduce_NonZeroBarOffset)
+    {
+        REQUIRE_HARDWARE();
+
+        // First allocation to bump the BAR offset
+        const size_t padding_bytes = 64 * 1024; // 64KB padding
+        auto padding_alloc = backend_->allocateInBarRegion(padding_bytes);
+        ASSERT_TRUE(padding_alloc.has_value()) << "Failed to allocate padding";
+        void *padding_ptr = padding_alloc->first;
+        size_t padding_offset = padding_alloc->second;
+
+        LOG_INFO("Padding allocation at BAR offset " << padding_offset);
+
+        // Now allocate the test buffer - it should be at a non-zero offset
+        const size_t count = 32768; // 128KB = 32768 floats
+        const size_t bytes = count * sizeof(float);
+
+        auto test_alloc = backend_->allocateInBarRegion(bytes);
+        ASSERT_TRUE(test_alloc.has_value()) << "Failed to allocate test buffer";
+        auto [rocm_buf, bar_offset] = *test_alloc;
+
+        EXPECT_GT(bar_offset, 0) << "Test buffer should be at non-zero BAR offset";
+        LOG_INFO("Test buffer at BAR offset " << bar_offset);
+
+        // Create deterministic test data
+        std::mt19937 gen(99999);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+        std::vector<float> cuda_host(count);
+        std::vector<float> rocm_host(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            cuda_host[i] = dist(gen);
+            rocm_host[i] = dist(gen);
+        }
+
+        // Allocate CUDA buffer
+        void *cuda_buf = cuda_backend_->allocate(bytes, 0);
+        ASSERT_NE(cuda_buf, nullptr);
+
+        // Initialize GPU buffers
+        cuda_backend_->hostToDevice(cuda_buf, cuda_host.data(), bytes, 0);
+        std::memcpy(rocm_buf, rocm_host.data(), bytes);
+        cuda_backend_->synchronize(0);
+
+        // Register buffers
+        const std::string coll_id = "pipelined_nonzero_offset";
+        ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::cuda(0), cuda_buf, bytes));
+        ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::rocm(0), rocm_buf, bytes));
+
+        // Perform allreduce (should use pipelined path at 128KB)
+        EXPECT_TRUE(backend_->allreduceRegistered(coll_id, count,
+                                                  CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+
+        // Compute expected result
+        std::vector<float> expected(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            expected[i] = cuda_host[i] + rocm_host[i];
+        }
+
+        // Verify CUDA result
+        auto cuda_result = readFromCUDA(cuda_buf, count);
+        double cuda_mse = computeMSE(cuda_result, expected);
+        float cuda_max_diff = computeMaxAbsDiff(cuda_result, expected);
+
+        LOG_INFO("PipelinedAllReduce_NonZeroBarOffset CUDA - MSE: " << cuda_mse
+                                                                    << ", max diff: " << cuda_max_diff);
+
+        EXPECT_LT(cuda_mse, 1e-10) << "CUDA MSE should be near zero";
+        EXPECT_LT(cuda_max_diff, 1e-5f) << "CUDA max diff should be negligible";
+
+        // Verify ROCm result
+        auto rocm_result = readFromBAR(rocm_buf, count);
+        double rocm_mse = computeMSE(rocm_result, expected);
+        float rocm_max_diff = computeMaxAbsDiff(rocm_result, expected);
+
+        LOG_INFO("PipelinedAllReduce_NonZeroBarOffset ROCm - MSE: " << rocm_mse
+                                                                    << ", max diff: " << rocm_max_diff);
+
+        EXPECT_LT(rocm_mse, 1e-10) << "ROCm MSE should be near zero";
+        EXPECT_LT(rocm_max_diff, 1e-5f) << "ROCm max diff should be negligible";
+
+        // Cleanup
+        backend_->unregisterBuffer(coll_id, DeviceId::cuda(0));
+        backend_->unregisterBuffer(coll_id, DeviceId::rocm(0));
+        backend_->freeBarBuffer(rocm_buf);
+        backend_->freeBarBuffer(padding_ptr);
+        freeCUDA(cuda_buf);
+    }
+
+    /**
+     * @brief Test pipelined allreduce with realistic TP dimensions
+     *
+     * Tests with tensor dimensions typical of LLM tensor parallelism:
+     * - FFN output: batch_size * ffn_dim (e.g., 32 * 4864 = 155648 floats = 607KB)
+     * - Attention output: batch_size * d_model (e.g., 32 * 896 = 28672 floats = 112KB)
+     */
+    TEST_F(Test__PCIeBARBackendIntegration, PipelinedAllReduce_RealisticTPDimensions)
+    {
+        REQUIRE_HARDWARE();
+
+        struct TestCase
+        {
+            size_t count;
+            const char *name;
+        };
+
+        std::vector<TestCase> test_cases = {
+            {BATCH_SIZE * D_MODEL, "Attention output (32x896)"},
+            {BATCH_SIZE * FFN_DIM, "FFN output (32x4864)"},
+        };
+
+        for (const auto &tc : test_cases)
+        {
+            size_t bytes = tc.count * sizeof(float);
+            LOG_INFO("Testing pipelined allreduce for " << tc.name << " (" << bytes << " bytes)");
+
+            // Create deterministic test data
+            std::mt19937 gen(42 + tc.count);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+            std::vector<float> cuda_host(tc.count);
+            std::vector<float> rocm_host(tc.count);
+            for (size_t i = 0; i < tc.count; ++i)
+            {
+                cuda_host[i] = dist(gen);
+                rocm_host[i] = dist(gen);
+            }
+
+            // Allocate buffers
+            void *cuda_buf = cuda_backend_->allocate(bytes, 0);
+            ASSERT_NE(cuda_buf, nullptr);
+
+            auto rocm_alloc = backend_->allocateInBarRegion(bytes);
+            ASSERT_TRUE(rocm_alloc.has_value()) << "Failed to allocate in BAR region";
+            auto [rocm_buf, bar_offset] = *rocm_alloc;
+
+            // Initialize
+            cuda_backend_->hostToDevice(cuda_buf, cuda_host.data(), bytes, 0);
+            std::memcpy(rocm_buf, rocm_host.data(), bytes);
+            cuda_backend_->synchronize(0);
+
+            // Register buffers
+            std::string coll_id = std::string("tp_test_") + tc.name;
+            ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::cuda(0), cuda_buf, bytes));
+            ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::rocm(0), rocm_buf, bytes));
+
+            // Perform allreduce
+            auto start = std::chrono::high_resolution_clock::now();
+            EXPECT_TRUE(backend_->allreduceRegistered(coll_id, tc.count,
+                                                      CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+            auto end = std::chrono::high_resolution_clock::now();
+            double us = std::chrono::duration<double, std::micro>(end - start).count();
+
+            // Compute expected result
+            std::vector<float> expected(tc.count);
+            for (size_t i = 0; i < tc.count; ++i)
+            {
+                expected[i] = cuda_host[i] + rocm_host[i];
+            }
+
+            // Verify results
+            auto cuda_result = readFromCUDA(cuda_buf, tc.count);
+            double cuda_mse = computeMSE(cuda_result, expected);
+            EXPECT_LT(cuda_mse, 1e-10) << "CUDA MSE too high for " << tc.name;
+
+            auto rocm_result = readFromBAR(rocm_buf, tc.count);
+            double rocm_mse = computeMSE(rocm_result, expected);
+            EXPECT_LT(rocm_mse, 1e-10) << "ROCm MSE too high for " << tc.name;
+
+            // Report throughput
+            double throughput_gbps = (2.0 * bytes) / (us * 1e3); // read + write
+            LOG_INFO("  " << tc.name << ": " << std::fixed << std::setprecision(1)
+                          << us << " μs, " << std::setprecision(2) << throughput_gbps << " GB/s");
+
+            // Cleanup
+            backend_->unregisterBuffer(coll_id, DeviceId::cuda(0));
+            backend_->unregisterBuffer(coll_id, DeviceId::rocm(0));
+            backend_->freeBarBuffer(rocm_buf);
+            freeCUDA(cuda_buf);
+        }
+    }
+
+    /**
+     * @brief Test sequential vs pipelined path selection
+     *
+     * Verifies that:
+     * - Buffers below PIPELINE_THRESHOLD (32KB) use sequential path
+     * - Buffers at or above threshold use pipelined path
+     *
+     * Both paths should produce identical results.
+     */
+    TEST_F(Test__PCIeBARBackendIntegration, PipelinedAllReduce_PathSelection)
+    {
+        REQUIRE_HARDWARE();
+
+        // Test sizes: below threshold (16KB), at threshold (32KB), above threshold (64KB)
+        std::vector<std::pair<size_t, bool>> test_cases = {
+            {4096, false}, // 16KB - sequential
+            {8192, true},  // 32KB - pipelined (at threshold)
+            {16384, true}, // 64KB - pipelined
+        };
+
+        for (const auto &[count, should_pipeline] : test_cases)
+        {
+            size_t bytes = count * sizeof(float);
+            LOG_INFO("Testing " << bytes << " bytes (expect "
+                                << (should_pipeline ? "PIPELINED" : "SEQUENTIAL") << " path)");
+
+            // Create test data
+            std::mt19937 gen(777 + count);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+            std::vector<float> cuda_host(count);
+            std::vector<float> rocm_host(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                cuda_host[i] = dist(gen);
+                rocm_host[i] = dist(gen);
+            }
+
+            // Allocate buffers
+            void *cuda_buf = cuda_backend_->allocate(bytes, 0);
+            ASSERT_NE(cuda_buf, nullptr);
+
+            auto rocm_alloc = backend_->allocateInBarRegion(bytes);
+            ASSERT_TRUE(rocm_alloc.has_value());
+            auto [rocm_buf, bar_offset] = *rocm_alloc;
+
+            // Initialize
+            cuda_backend_->hostToDevice(cuda_buf, cuda_host.data(), bytes, 0);
+            std::memcpy(rocm_buf, rocm_host.data(), bytes);
+            cuda_backend_->synchronize(0);
+
+            // Register buffers
+            std::string coll_id = "path_test_" + std::to_string(count);
+            ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::cuda(0), cuda_buf, bytes));
+            ASSERT_TRUE(backend_->registerBuffer(coll_id, DeviceId::rocm(0), rocm_buf, bytes));
+
+            // Perform allreduce
+            EXPECT_TRUE(backend_->allreduceRegistered(coll_id, count,
+                                                      CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+
+            // Verify results match expected sum
+            std::vector<float> expected(count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                expected[i] = cuda_host[i] + rocm_host[i];
+            }
+
+            auto cuda_result = readFromCUDA(cuda_buf, count);
+            double cuda_mse = computeMSE(cuda_result, expected);
+            EXPECT_LT(cuda_mse, 1e-10) << "Incorrect result for " << bytes << " byte buffer";
+
+            // Cleanup
+            backend_->unregisterBuffer(coll_id, DeviceId::cuda(0));
+            backend_->unregisterBuffer(coll_id, DeviceId::rocm(0));
+            backend_->freeBarBuffer(rocm_buf);
+            freeCUDA(cuda_buf);
+        }
+    }
+
     TEST_F(Test__PCIeBARBackendIntegration, AllReduceWithMax)
     {
         // NOTE: MAX reduction is not yet implemented in PCIeBARBackend

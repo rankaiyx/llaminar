@@ -15,8 +15,9 @@
 #pragma once
 
 #include "interfaces/IWeightManager.h"
-#include "loaders/WeightManager.h" // For ShardingMode and WeightDistributionStrategy enums
-#include "execution/GraphSchema.h" // For WeightShardingConfig
+#include "loaders/WeightManager.h"       // For ShardingMode and WeightDistributionStrategy enums
+#include "execution/GraphSchema.h"       // For WeightShardingConfig
+#include "config/TensorParallelConfig.h" // For TensorParallelConfig (LOCAL TP support)
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h" // For fp32_to_fp16
 #include "backends/DeviceId.h"
@@ -133,6 +134,15 @@ namespace llaminar2::test
         void setWeightShardingConfig(const WeightShardingConfig &config) override
         {
             sharding_config_ = config;
+        }
+
+        /**
+         * @brief Set tensor parallel configuration for LOCAL TP weight slicing
+         * @param config Tensor parallel config from ILocalTPContext
+         */
+        void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config) override
+        {
+            tp_config_ = std::move(config);
         }
 
         // =========================================================================
@@ -286,6 +296,7 @@ namespace llaminar2::test
         std::unordered_map<std::string, ShardingMode> sharding_modes_;
         std::unordered_set<std::string> non_gemm_weights_;
         std::optional<WeightShardingConfig> sharding_config_;
+        std::shared_ptr<TensorParallelConfig> tp_config_;
 
         // Call tracking
         mutable size_t get_weight_calls_ = 0;

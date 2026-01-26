@@ -1253,7 +1253,7 @@ namespace llaminar2
             if (pcie_backend && pcie_backend->isPCIeBarActive())
             {
                 LOG_TRACE("[waitForEventWithProxy] Routing CUDA event wait through PCIeBAR worker");
-                return pcie_backend->waitForCUDAEventViaWorker(event, device_id);
+                return pcie_backend->waitForCUDAEvent(event, device_id);
             }
         }
 

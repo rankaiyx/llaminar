@@ -167,7 +167,7 @@ TEST_F(Test__PCIeBAR_CUDA_EventLifecycle, EventCreatedOnMainQueriedViaWorker)
 
     // Try to wait via PCIeBAR worker thread - this is where error 709 occurs
     LOG_INFO("[Test] Attempting to wait for event via PCIeBAR worker thread");
-    bool worker_result = pcie_backend->waitForCUDAEventViaWorker(event, 0);
+    bool worker_result = pcie_backend->waitForCUDAEvent(event, 0);
 
     // This is the failing case - document the current behavior
     if (!worker_result)
@@ -245,7 +245,7 @@ TEST_F(Test__PCIeBAR_CUDA_EventLifecycle, SimulateHeterogeneousScenario)
  * context and queryable from the worker.
  *
  * NOTE: This test cannot directly use submitCUDAWork (it's private).
- * Instead, we verify through the public waitForCUDAEventViaWorker API.
+ * Instead, we verify through the public waitForCUDAEvent API.
  */
 TEST_F(Test__PCIeBAR_CUDA_EventLifecycle, DISABLED_EventCreatedByWorkerThread)
 {

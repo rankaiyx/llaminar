@@ -953,27 +953,34 @@ namespace llaminar2
         {
         case WeightCategory::ATTENTION_QKV:
         {
-            // Column-parallel by Q heads
+            // Column-parallel by heads
             // For Q: full head_dim per head, for K/V: use kv_head mapping
-            // Weight shape: [n_heads * head_dim, d_model]
-            // Each rank gets [head_count * head_dim, d_model]
-            int total_heads = tp_config_->totalHeads();
-            if (total_heads <= 0)
+            // Q weight shape: [n_heads * head_dim, d_model]
+            // K/V weight shape: [n_kv_heads * head_dim, d_model]
+            // Each rank gets [local_head_count * head_dim, d_model]
+            const bool is_kv_weight = (name.find("attn_k.") != std::string::npos ||
+                                       name.find("attn_v.") != std::string::npos);
+
+            // CRITICAL: K/V weights use totalKVHeads(), not totalHeads()!
+            const int total_heads_for_weight = is_kv_weight
+                                                   ? tp_config_->totalKVHeads()
+                                                   : tp_config_->totalHeads();
+            if (total_heads_for_weight <= 0)
             {
-                LOG_ERROR("[WeightManager] Invalid total_heads in TensorParallelConfig");
+                LOG_ERROR("[WeightManager] Invalid total_heads/total_kv_heads in TensorParallelConfig");
                 return {0, total_rows};
             }
-            size_t head_dim = total_rows / total_heads;
+            const size_t head_dim = total_rows / static_cast<size_t>(total_heads_for_weight);
 
-            // Check if this is K or V (use KV head assignment)
-            if (name.find("attn_k.") != std::string::npos ||
-                name.find("attn_v.") != std::string::npos)
+            if (is_kv_weight)
             {
                 // K/V use KV heads
                 size_t start = assignment.kv_head_start * head_dim;
                 size_t count = assignment.kv_head_count * head_dim;
                 LOG_TRACE("[WeightManager] Proportional KV slice for " << name
-                                                                       << ": heads [" << assignment.kv_head_start << ", "
+                                                                       << ": total_kv_heads=" << total_heads_for_weight
+                                                                       << " head_dim=" << head_dim
+                                                                       << " kv_heads [" << assignment.kv_head_start << ", "
                                                                        << (assignment.kv_head_start + assignment.kv_head_count) << ")"
                                                                        << " -> rows [" << start << ", " << (start + count) << ")");
                 return {start, count};
@@ -984,7 +991,9 @@ namespace llaminar2
                 size_t start = assignment.head_start * head_dim;
                 size_t count = assignment.head_count * head_dim;
                 LOG_TRACE("[WeightManager] Proportional Q slice for " << name
-                                                                      << ": heads [" << assignment.head_start << ", "
+                                                                      << ": total_heads=" << total_heads_for_weight
+                                                                      << " head_dim=" << head_dim
+                                                                      << " heads [" << assignment.head_start << ", "
                                                                       << (assignment.head_start + assignment.head_count) << ")"
                                                                       << " -> rows [" << start << ", " << (start + count) << ")");
                 return {start, count};
@@ -1258,6 +1267,28 @@ namespace llaminar2
         int layer_idx)
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        // =======================================================================
+        // LOCAL TP support: Check TensorParallelConfig FIRST for device-specific slicing
+        // =======================================================================
+        // When tp_config_ is set and we're using SHARDED strategy, each device gets
+        // a DIFFERENT slice of the weights based on its DeviceShardingAssignment.
+        // This is different from the original code path which gave all devices the
+        // same sharded weight (bug for LOCAL TP with world_size == 1).
+        if (tp_config_ && strategy_ == WeightDistributionStrategy::SHARDED)
+        {
+            try
+            {
+                const auto &assignment = tp_config_->forDevice(device);
+                return getShardedWeightForAssignment(name, device, assignment, layer_idx);
+            }
+            catch (const std::out_of_range &)
+            {
+                // Device not in config - fall through to standard path
+                LOG_TRACE("[WeightManager] Device " << device.to_string()
+                                                    << " not in TensorParallelConfig, using standard path for: " << name);
+            }
+        }
 
         // Track first device - original tensors stay on this device
         if (!first_device_.has_value())
@@ -1671,6 +1702,360 @@ namespace llaminar2
         LOG_INFO("[WeightManager] Uploaded " << uploaded_count << " non-GEMM weights to "
                                              << target_device.to_string());
         return true;
+    }
+
+    // =============================================================================
+    // Device-aware weight slicing for LOCAL TP (Phase 1)
+    // =============================================================================
+
+    bool WeightManager::isQKVWeight(const std::string &name)
+    {
+        return name.find("attn_q.weight") != std::string::npos ||
+               name.find("attn_k.weight") != std::string::npos ||
+               name.find("attn_v.weight") != std::string::npos ||
+               name.find("attn_qkv.weight") != std::string::npos;
+    }
+
+    bool WeightManager::isFFNGateUpWeight(const std::string &name)
+    {
+        return name.find("ffn_gate.weight") != std::string::npos ||
+               name.find("ffn_up.weight") != std::string::npos ||
+               name.find("ffn_gate_up.weight") != std::string::npos;
+    }
+
+    bool WeightManager::isFFNDownWeight(const std::string &name)
+    {
+        return name.find("ffn_down.weight") != std::string::npos;
+    }
+
+    bool WeightManager::isLMHeadWeight(const std::string &name)
+    {
+        return name == "output.weight";
+    }
+
+    bool WeightManager::isWoWeight(const std::string &name)
+    {
+        return name.find("attn_output.weight") != std::string::npos;
+    }
+
+    bool WeightManager::isEmbeddingWeight(const std::string &name)
+    {
+        return name == "token_embd.weight";
+    }
+
+    bool WeightManager::isOutputNormWeight(const std::string &name)
+    {
+        return name == "output_norm.weight";
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::sliceRowRange(
+        const std::shared_ptr<TensorBase> &tensor,
+        size_t row_start,
+        size_t row_count)
+    {
+        if (!tensor)
+        {
+            LOG_ERROR("[WeightManager] sliceRowRange: null tensor");
+            return nullptr;
+        }
+
+        const auto &shape = tensor->shape();
+        if (shape.size() != 2)
+        {
+            LOG_ERROR("[WeightManager] sliceRowRange requires 2D tensor, got " << shape.size() << "D");
+            return nullptr;
+        }
+
+        size_t out_dim = shape[0];
+        size_t in_dim = shape[1];
+
+        if (row_start + row_count > out_dim)
+        {
+            LOG_ERROR("[WeightManager] sliceRowRange: row_start=" << row_start
+                                                                  << " + row_count=" << row_count << " > out_dim=" << out_dim);
+            return nullptr;
+        }
+
+        // Currently only FP32 slicing is supported
+        auto *fp32_tensor = dynamic_cast<FP32Tensor *>(tensor.get());
+        if (!fp32_tensor)
+        {
+            LOG_ERROR("[WeightManager] sliceRowRange currently requires FP32 tensor. "
+                      "For quantized weights, use GGUF loadTensorRowSlice instead.");
+            return nullptr;
+        }
+
+        // Create sliced tensor
+        std::vector<size_t> slice_shape = {row_count, in_dim};
+        auto sliced = std::make_shared<FP32Tensor>(slice_shape);
+
+        // Copy the specified row range
+        const float *src = fp32_tensor->data() + row_start * in_dim;
+        float *dst = sliced->mutable_data();
+        std::memcpy(dst, src, row_count * in_dim * sizeof(float));
+
+        LOG_TRACE("[WeightManager] sliceRowRange: [" << out_dim << ", " << in_dim
+                                                     << "] -> rows [" << row_start << ", " << (row_start + row_count)
+                                                     << ") = [" << row_count << ", " << in_dim << "]");
+
+        return sliced;
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::getShardedWeightForAssignment(
+        const std::string &name,
+        DeviceId device,
+        const DeviceShardingAssignment &assignment,
+        int layer_idx)
+    {
+        // Check per-device cache first
+        std::string cache_key = device.to_string() + ":" + name;
+        auto it = per_device_cache_.find(cache_key);
+        if (it != per_device_cache_.end())
+        {
+            return it->second;
+        }
+
+        // Get sharding mode for this weight
+        ShardingMode mode = getShardingMode(name);
+
+        LOG_TRACE("[WeightManager] getShardedWeightForAssignment: " << name
+                                                                    << " device=" << device.to_string()
+                                                                    << " local_rank=" << assignment.local_rank
+                                                                    << " mode=" << static_cast<int>(mode));
+
+        std::shared_ptr<TensorBase> result;
+
+        if (mode == ShardingMode::REPLICATE)
+        {
+            // Replicated weights: norms, embeddings, biases - full copy for each device
+            result = getReplicatedWeight(name, device);
+            if (result)
+            {
+                LOG_TRACE("[WeightManager] Device " << device.to_string()
+                                                    << " gets REPLICATED weight: " << name);
+            }
+        }
+        else if (mode == ShardingMode::COLUMN_PARALLEL)
+        {
+            // Column-parallel: slice rows (output dimension) based on weight type
+            // Q, K, V, Gate, Up, LM Head are column-parallel
+
+            // Get tensor info to determine dimensions
+            const GGUFTensorInfo *info = loader_.getModel().findTensor(name);
+            if (!info || info->dimensions.size() != 2)
+            {
+                LOG_ERROR("[WeightManager] Invalid tensor for column-parallel: " << name);
+                return nullptr;
+            }
+
+            size_t total_rows = info->dimensions[0];
+            size_t cols = info->dimensions[1];
+            size_t row_start = 0;
+            size_t row_count = 0;
+
+            // Determine row slice based on weight type
+            if (isQKVWeight(name))
+            {
+                const bool is_kv_weight = (name.find("attn_k.") != std::string::npos ||
+                                           name.find("attn_v.") != std::string::npos);
+
+                // Q/K/V: slice by head ranges
+                // CRITICAL: K/V weights use totalKVHeads(), not totalHeads()!
+                // K/V weight shape is [n_kv_heads * head_dim, d_model]
+                // Q weight shape is [n_heads * head_dim, d_model]
+                const int total_heads_for_weight = is_kv_weight
+                                                       ? tp_config_->totalKVHeads()
+                                                       : tp_config_->totalHeads();
+                if (total_heads_for_weight <= 0)
+                {
+                    LOG_ERROR("[WeightManager] Invalid total_heads/total_kv_heads in TensorParallelConfig");
+                    return nullptr;
+                }
+                const size_t head_dim = total_rows / static_cast<size_t>(total_heads_for_weight);
+
+                if (is_kv_weight)
+                {
+                    // K/V use KV head assignment
+                    row_start = assignment.kv_head_start * head_dim;
+                    row_count = assignment.kv_head_count * head_dim;
+                    LOG_TRACE("[WeightManager] KV weight " << name
+                                                           << " total_kv_heads=" << total_heads_for_weight
+                                                           << " head_dim=" << head_dim
+                                                           << " kv_heads=[" << assignment.kv_head_start << ", "
+                                                           << (assignment.kv_head_start + assignment.kv_head_count) << ")"
+                                                           << " -> rows [" << row_start << ", " << (row_start + row_count) << ")");
+                }
+                else
+                {
+                    // Q uses Q head assignment
+                    row_start = assignment.head_start * head_dim;
+                    row_count = assignment.head_count * head_dim;
+                    LOG_TRACE("[WeightManager] Q weight " << name
+                                                          << " total_heads=" << total_heads_for_weight
+                                                          << " head_dim=" << head_dim
+                                                          << " heads=[" << assignment.head_start << ", "
+                                                          << (assignment.head_start + assignment.head_count) << ")"
+                                                          << " -> rows [" << row_start << ", " << (row_start + row_count) << ")");
+                }
+            }
+            else if (isFFNGateUpWeight(name))
+            {
+                // Gate/Up: slice by d_ff
+                row_start = assignment.d_ff_start;
+                row_count = assignment.d_ff_count;
+                LOG_TRACE("[WeightManager] FFN Gate/Up weight " << name
+                                                                << " d_ff=[" << row_start << ", " << (row_start + row_count) << ")");
+            }
+            else if (isLMHeadWeight(name))
+            {
+                // LM head: slice by vocab
+                row_start = assignment.vocab_start;
+                row_count = assignment.vocab_count;
+                LOG_TRACE("[WeightManager] LM head weight " << name
+                                                            << " vocab=[" << row_start << ", " << (row_start + row_count) << ")");
+            }
+            else
+            {
+                LOG_ERROR("[WeightManager] Unknown column-parallel weight type: " << name);
+                return nullptr;
+            }
+
+            // Load only the slice from GGUF file (memory efficient, preserves quantization)
+            auto slice_tensor = loader_.loadTensorRowSlice(
+                name, row_start, row_start + row_count, device, WeightPrecision::NATIVE);
+
+            if (!slice_tensor)
+            {
+                LOG_ERROR("[WeightManager] Failed to load row slice for: " << name);
+                return nullptr;
+            }
+
+            // Wrap in TensorSlice with metadata
+            auto meta = SliceMetadata::forColumnParallel(
+                total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
+                true /* inner_is_presliced */);
+
+            result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+            LOG_INFO("[WeightManager] Device " << device.to_string()
+                                               << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                               << " column-parallel " << name
+                                               << " [" << total_rows << ", " << cols << "]"
+                                               << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
+                                               << " = " << row_count << " rows");
+        }
+        else if (mode == ShardingMode::ROW_PARALLEL)
+        {
+            // Row-parallel: Wo (attn_output) - slice rows based on head assignment
+            // For Wo: shape [d_model, n_heads * head_dim], but we're splitting by input heads
+
+            const GGUFTensorInfo *info = loader_.getModel().findTensor(name);
+            if (!info || info->dimensions.size() != 2)
+            {
+                LOG_ERROR("[WeightManager] Invalid tensor for row-parallel: " << name);
+                return nullptr;
+            }
+
+            size_t total_rows = info->dimensions[0];
+            size_t cols = info->dimensions[1];
+
+            // For Wo, we actually split rows based on the head assignment
+            // because the input to Wo comes from the attention heads output
+            int total_heads = tp_config_->totalHeads();
+            if (total_heads <= 0)
+            {
+                LOG_ERROR("[WeightManager] Invalid total_heads for row-parallel: " << name);
+                return nullptr;
+            }
+            size_t head_dim = total_rows / total_heads;
+
+            size_t row_start = assignment.head_start * head_dim;
+            size_t row_count = assignment.head_count * head_dim;
+
+            LOG_TRACE("[WeightManager] Wo weight " << name
+                                                   << " heads=[" << assignment.head_start << ", "
+                                                   << (assignment.head_start + assignment.head_count) << ")"
+                                                   << " -> rows [" << row_start << ", " << (row_start + row_count) << ")");
+
+            // Load only the slice from GGUF
+            auto slice_tensor = loader_.loadTensorRowSlice(
+                name, row_start, row_start + row_count, device, WeightPrecision::NATIVE);
+
+            if (!slice_tensor)
+            {
+                LOG_ERROR("[WeightManager] Failed to load row slice for row-parallel: " << name);
+                return nullptr;
+            }
+
+            // Wrap in TensorSlice with row-parallel metadata
+            auto meta = SliceMetadata::forRowParallel(
+                total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
+                true /* inner_is_presliced */);
+
+            result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+            LOG_INFO("[WeightManager] Device " << device.to_string()
+                                               << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                               << " row-parallel " << name
+                                               << " [" << total_rows << ", " << cols << "]"
+                                               << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
+                                               << " = " << row_count << " rows (needs allreduce)");
+        }
+        else if (mode == ShardingMode::INPUT_PARALLEL)
+        {
+            // Input-parallel: FFN Down - slice columns (input dimension) based on d_ff assignment
+
+            const GGUFTensorInfo *info = loader_.getModel().findTensor(name);
+            if (!info || info->dimensions.size() != 2)
+            {
+                LOG_ERROR("[WeightManager] Invalid tensor for input-parallel: " << name);
+                return nullptr;
+            }
+
+            size_t rows = info->dimensions[0];
+            size_t total_cols = info->dimensions[1];
+
+            // Slice columns by d_ff assignment
+            size_t col_start = assignment.d_ff_start;
+            size_t col_count = assignment.d_ff_count;
+
+            LOG_TRACE("[WeightManager] FFN Down weight " << name
+                                                         << " d_ff=[" << col_start << ", " << (col_start + col_count) << ")");
+
+            // Load only the column slice from GGUF
+            auto slice_tensor = loader_.loadTensorColumnSlice(
+                name, col_start, col_start + col_count, device, WeightPrecision::NATIVE);
+
+            if (!slice_tensor)
+            {
+                LOG_ERROR("[WeightManager] Failed to load column slice for input-parallel: " << name);
+                return nullptr;
+            }
+
+            // Wrap in TensorSlice with row-parallel metadata
+            // (input-parallel is mathematically like row-parallel but with column slicing)
+            auto meta = SliceMetadata::forRowParallel(
+                rows, total_cols, assignment.local_rank, tp_config_->worldSize(),
+                true /* inner_is_presliced */);
+
+            result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+            LOG_INFO("[WeightManager] Device " << device.to_string()
+                                               << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                               << " input-parallel " << name
+                                               << " [" << rows << ", " << total_cols << "]"
+                                               << " -> cols [" << col_start << ", " << (col_start + col_count) << ")"
+                                               << " = " << col_count << " cols (needs allreduce)");
+        }
+
+        // Cache the result for subsequent requests
+        if (result)
+        {
+            per_device_cache_[cache_key] = result;
+            result->setDebugName(name);
+        }
+
+        return result;
     }
 
 } // namespace llaminar2

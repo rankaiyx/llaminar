@@ -29,6 +29,12 @@
 #include <string>
 #include <cmath>
 
+// Forward declaration for factory method
+namespace llaminar2
+{
+    class ILocalTPContext;
+}
+
 namespace llaminar2
 {
 
@@ -215,6 +221,26 @@ namespace llaminar2
          */
         static TensorParallelConfig singleDevice(
             DeviceId device,
+            int n_heads,
+            int n_kv_heads,
+            int d_ff,
+            int vocab_size);
+
+        /**
+         * @brief Create TensorParallelConfig from LOCAL TP context
+         *
+         * Converts ILocalTPContext device/weight info into DeviceShardingAssignments
+         * for use by WeightManager during weight loading.
+         *
+         * @param local_tp_ctx LOCAL TP context with devices and weights
+         * @param n_heads Total Q attention heads
+         * @param n_kv_heads Total KV heads (for GQA)
+         * @param d_ff FFN intermediate dimension
+         * @param vocab_size Vocabulary size
+         * @return TensorParallelConfig with one assignment per device
+         */
+        static TensorParallelConfig fromLocalTPContext(
+            const ILocalTPContext &local_tp_ctx,
             int n_heads,
             int n_kv_heads,
             int d_ff,

@@ -38,6 +38,7 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+    class TensorParallelConfig;
     enum class ShardingMode;
     enum class WeightDistributionStrategy;
 
@@ -224,6 +225,17 @@ namespace llaminar2
          * @param config Weight sharding configuration from model schema
          */
         virtual void setWeightShardingConfig(const WeightShardingConfig &config) = 0;
+
+        /**
+         * @brief Set tensor parallel configuration for proportional sharding
+         *
+         * Used by LOCAL TP to configure device-aware weight slicing.
+         * When set, getShardedWeightForAssignment() uses this config to
+         * determine slice bounds for each device.
+         *
+         * @param config Tensor parallel config from ILocalTPContext
+         */
+        virtual void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config) = 0;
 
         // =========================================================================
         // Multi-Device Pre-loading

@@ -4,6 +4,7 @@
  */
 
 #include "TensorParallelConfig.h"
+#include "collective/ILocalTPContext.h"
 #include <algorithm>
 #include <numeric>
 #include <sstream>
@@ -371,6 +372,62 @@ namespace llaminar2
         a.vocab_count = vocab_size;
 
         return TensorParallelConfig({a});
+    }
+
+    TensorParallelConfig TensorParallelConfig::fromLocalTPContext(
+        const ILocalTPContext &local_tp_ctx,
+        int n_heads,
+        int n_kv_heads,
+        int d_ff,
+        int vocab_size)
+    {
+        const auto &devices = local_tp_ctx.devices();
+        const auto &weights = local_tp_ctx.weights();
+        int degree = local_tp_ctx.degree();
+
+        if (degree <= 0)
+        {
+            throw std::invalid_argument("LOCAL TP degree must be positive");
+        }
+        if (static_cast<int>(devices.size()) != degree)
+        {
+            throw std::invalid_argument(
+                "Device count (" + std::to_string(devices.size()) +
+                ") does not match degree (" + std::to_string(degree) + ")");
+        }
+        if (n_heads <= 0 || n_kv_heads <= 0 || d_ff <= 0 || vocab_size <= 0)
+        {
+            throw std::invalid_argument("All dimension parameters must be positive");
+        }
+
+        // Convert GlobalDeviceAddress to DeviceId
+        std::vector<DeviceId> device_ids;
+        device_ids.reserve(degree);
+        for (const auto &addr : devices)
+        {
+            device_ids.push_back(addr.toLocalDeviceId());
+        }
+
+        // Use provided weights or create equal weights if empty
+        std::vector<float> work_fractions;
+        if (weights.empty())
+        {
+            // Equal split across all devices
+            work_fractions.assign(degree, 1.0f / static_cast<float>(degree));
+        }
+        else
+        {
+            if (static_cast<int>(weights.size()) != degree)
+            {
+                throw std::invalid_argument(
+                    "Weights count (" + std::to_string(weights.size()) +
+                    ") does not match degree (" + std::to_string(degree) + ")");
+            }
+            work_fractions = weights;
+        }
+
+        // Delegate to proportionalSplit which handles the distribution logic
+        return proportionalSplit(device_ids, work_fractions, n_heads, n_kv_heads, d_ff, vocab_size);
     }
 
     // =========================================================================
