@@ -79,9 +79,15 @@ namespace
             if (d_inv_freq && device_idx >= 0)
             {
                 // Must set correct device before freeing
-                cudaSetDevice(device_idx);
+                cudaError_t set_err = cudaSetDevice(device_idx);
+                if (set_err == cudaErrorCudartUnloading || set_err == cudaErrorNoDevice)
+                {
+                    // CUDA runtime is shutting down or no device available, skip cleanup
+                    // This is normal during static destruction at program exit
+                    return;
+                }
                 cudaError_t err = cudaFree(d_inv_freq);
-                if (err != cudaSuccess)
+                if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
                 {
                     fprintf(stderr, "WARNING: cudaFree(inv_freq) failed: %s\n", cudaGetErrorString(err));
                 }
@@ -979,6 +985,369 @@ __global__ void rope_fp16_contiguous_kernel(
 
 extern "C"
 {
+    // =========================================================================
+    // WORKSPACE-AWARE API (v3)
+    // These functions take external inv_freq buffer allocated from workspace
+    // =========================================================================
+
+    /**
+     * @brief Maximum supported head_dim/2 for workspace allocation
+     * This covers head_dim up to 256 (128 * 4 = 512 bytes)
+     */
+    constexpr int ROPE_MAX_HALF_DIM = 128;
+
+    /**
+     * @brief Populate inverse frequency table in an external buffer
+     * @param d_inv_freq Device buffer (must be at least half_dim * sizeof(float))
+     * @param head_dim The head dimension
+     * @param freq_base The frequency base (rope_theta)
+     * @param device_idx CUDA device index
+     * @return true on success
+     *
+     * Formula: inv_freq[i] = 1.0 / (freq_base^(2i/head_dim))
+     */
+    bool cudaOps_rope_populate_inv_freq(
+        float *d_inv_freq,
+        int head_dim,
+        float freq_base,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        const int half_dim = head_dim / 2;
+
+        // Compute on host
+        std::vector<float> h_inv_freq(half_dim);
+        const float log_base = std::log(freq_base);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float exponent = (2.0f * i) / head_dim;
+            h_inv_freq[i] = std::exp(-log_base * exponent);
+        }
+
+        // Copy to device
+        cudaSetDevice(device_idx);
+        cudaError_t err = cudaMemcpy(d_inv_freq, h_inv_freq.data(),
+                                     half_dim * sizeof(float), cudaMemcpyHostToDevice);
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief FP32 RoPE with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_fp32_v3(
+        float *Q,
+        float *K,
+        const float *d_inv_freq,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        if (K != nullptr)
+        {
+            int total_blocks = seq_len * (n_heads + n_kv_heads);
+            rope_fp32_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+                Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            int num_blocks_q = seq_len * n_heads;
+            rope_fp32_kernel_v3<<<num_blocks_q, threads_per_block, smem_size>>>(
+                Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
+        }
+
+        cudaDeviceSynchronize();
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief FP32 RoPE decode with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_fp32_decode_v3(
+        float *Q,
+        float *K,
+        const float *d_inv_freq,
+        int pos,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        // The decode kernel handles both Q and K in one launch
+        int total_blocks = n_heads + (K ? n_kv_heads : 0);
+        rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief FP32 RoPE contiguous with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_fp32_contiguous_v3(
+        float *Q,
+        float *K,
+        const float *d_inv_freq,
+        int pos_offset,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
+
+        rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief BF16 RoPE with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_bf16_v3(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *d_inv_freq,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        if (K != nullptr)
+        {
+            int total_blocks = seq_len * (n_heads + n_kv_heads);
+            rope_bf16_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+                Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            int num_blocks = seq_len * n_heads;
+            rope_bf16_kernel_v3<<<num_blocks, threads_per_block, smem_size>>>(
+                Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
+        }
+
+        cudaDeviceSynchronize();
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief BF16 RoPE decode with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_bf16_decode_v3(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *d_inv_freq,
+        int pos,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        // The decode kernel handles both Q and K in one launch
+        int total_blocks = n_heads + (K ? n_kv_heads : 0);
+        rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief BF16 RoPE contiguous with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_bf16_contiguous_v3(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *d_inv_freq,
+        int pos_offset,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
+
+        rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief FP16 RoPE with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_fp16_v3(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *d_inv_freq,
+        const int *position_ids,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        if (K != nullptr)
+        {
+            int total_blocks = seq_len * (n_heads + n_kv_heads);
+            rope_fp16_fused_qk_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+                Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim);
+        }
+        else
+        {
+            int num_blocks = seq_len * n_heads;
+            rope_fp16_kernel_v3<<<num_blocks, threads_per_block, smem_size>>>(
+                Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
+        }
+
+        cudaDeviceSynchronize();
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief FP16 RoPE decode with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_fp16_decode_v3(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *d_inv_freq,
+        int pos,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        // The decode kernel handles both Q and K in one launch
+        int total_blocks = n_heads + (K ? n_kv_heads : 0);
+        rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    /**
+     * @brief FP16 RoPE contiguous with external inv_freq buffer (workspace-aware)
+     */
+    bool cudaOps_rope_fp16_contiguous_v3(
+        uint16_t *Q,
+        uint16_t *K,
+        const float *d_inv_freq,
+        int pos_offset,
+        int seq_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        const int half_dim = head_dim / 2;
+        const int threads_per_block = min(256, half_dim);
+        const size_t smem_size = 2 * half_dim * sizeof(float);
+
+        int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
+
+        rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess;
+    }
+
+    // =========================================================================
+    // LEGACY API (uses global cache - still supported for backward compat)
+    // =========================================================================
 
     /**
      * @brief Clear the inv_freq cache (for testing)

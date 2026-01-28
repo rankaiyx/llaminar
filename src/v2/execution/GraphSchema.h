@@ -125,18 +125,30 @@ namespace llaminar2
      * - "weights.wq" → layer weight
      * - "weights.embedding_table" → model weight
      * - "kv_cache" → KV cache reference
+     *
+     * For weight references (names starting with "weights."), the is_optional
+     * flag indicates whether the weight MUST exist in the model file:
+     * - is_optional=false (default): Missing weight is an error
+     * - is_optional=true: Missing weight is acceptable (e.g., QKV biases)
      */
     struct TensorRef
     {
         std::string name;                                ///< Reference name
         BufferSemantic semantic = BufferSemantic::Input; ///< How the tensor is used
+        bool is_optional = false;                        ///< True if weight may not exist in model
 
         TensorRef() = default;
-        TensorRef(std::string n, BufferSemantic s = BufferSemantic::Input)
-            : name(std::move(n)), semantic(s) {}
+        TensorRef(std::string n, BufferSemantic s = BufferSemantic::Input, bool optional = false)
+            : name(std::move(n)), semantic(s), is_optional(optional) {}
 
-        // Convenience constructor from string
-        TensorRef(const char *n) : name(n), semantic(BufferSemantic::Input) {}
+        // Convenience constructor from string (required by default)
+        TensorRef(const char *n) : name(n), semantic(BufferSemantic::Input), is_optional(false) {}
+
+        /// Create an optional tensor reference
+        static TensorRef optional(std::string n, BufferSemantic s = BufferSemantic::Input)
+        {
+            return TensorRef(std::move(n), s, true);
+        }
     };
 
     /**
@@ -282,6 +294,23 @@ namespace llaminar2
     };
 
     /**
+     * @brief Dimension type that a weight operates on for TP sharding
+     *
+     * This tells the weight loader WHICH dimension from TensorParallelConfig
+     * to use when computing slice boundaries. The sharding mode tells HOW
+     * to slice (rows vs columns), but this tells WHAT to slice by.
+     */
+    enum class WeightDimensionType
+    {
+        None,      ///< Not sharded (replicated weights)
+        Heads,     ///< Attention heads (Q projection) - uses head_start/head_count
+        KVHeads,   ///< KV attention heads (K/V projections) - uses kv_head_start/kv_head_count
+        FFNHidden, ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
+        Vocab,     ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
+        Bias1D     ///< 1D bias that follows its weight's dimension type
+    };
+
+    /**
      * @brief Pattern-based weight sharding rule
      *
      * Used to map GGUF tensor names to sharding modes.
@@ -289,9 +318,18 @@ namespace llaminar2
      */
     struct WeightShardingPattern
     {
-        std::string pattern;     ///< Substring pattern to match (e.g., "attn_q.weight")
-        WeightShardingMode mode; ///< Sharding mode for matched weights
-        std::string description; ///< Human-readable explanation
+        std::string pattern;           ///< Substring pattern to match (e.g., "attn_q.weight")
+        WeightShardingMode mode;       ///< Sharding mode for matched weights
+        WeightDimensionType dimension; ///< Which dimension to use for slicing
+        std::string description;       ///< Human-readable explanation
+
+        // Constructor for backward compatibility
+        WeightShardingPattern(std::string p, WeightShardingMode m, std::string d)
+            : pattern(std::move(p)), mode(m), dimension(WeightDimensionType::None), description(std::move(d)) {}
+
+        // Full constructor with dimension type
+        WeightShardingPattern(std::string p, WeightShardingMode m, WeightDimensionType dim, std::string d)
+            : pattern(std::move(p)), mode(m), dimension(dim), description(std::move(d)) {}
     };
 
     /**
@@ -306,8 +344,11 @@ namespace llaminar2
         /// Patterns evaluated in order (first match wins)
         std::vector<WeightShardingPattern> patterns;
 
-        /// Exact-match overrides (checked before patterns)
+        /// Exact-match overrides for mode (checked before patterns)
         std::unordered_map<std::string, WeightShardingMode> exact_matches;
+
+        /// Exact-match overrides for dimension type (checked before patterns)
+        std::unordered_map<std::string, WeightDimensionType> exact_dimension_matches;
 
         /// Default mode for unmatched weights
         WeightShardingMode default_mode = WeightShardingMode::Replicate;
@@ -336,6 +377,62 @@ namespace llaminar2
             }
 
             return default_mode;
+        }
+
+        /**
+         * @brief Determine dimension type for a weight tensor
+         * @param name GGUF tensor name (e.g., "blk.0.attn_q.weight")
+         * @return Dimension type for slicing this weight
+         */
+        WeightDimensionType getDimensionType(const std::string &name) const
+        {
+            // Check exact matches first
+            auto it = exact_dimension_matches.find(name);
+            if (it != exact_dimension_matches.end())
+            {
+                return it->second;
+            }
+
+            // Check patterns in order
+            for (const auto &rule : patterns)
+            {
+                if (name.find(rule.pattern) != std::string::npos)
+                {
+                    return rule.dimension;
+                }
+            }
+
+            return WeightDimensionType::None;
+        }
+
+        /**
+         * @brief Get both mode and dimension for a weight in one lookup
+         * @param name GGUF tensor name
+         * @return Pair of (mode, dimension_type)
+         */
+        std::pair<WeightShardingMode, WeightDimensionType> getModeAndDimension(const std::string &name) const
+        {
+            // Check exact matches first
+            auto mode_it = exact_matches.find(name);
+            auto dim_it = exact_dimension_matches.find(name);
+            if (mode_it != exact_matches.end())
+            {
+                WeightDimensionType dim = (dim_it != exact_dimension_matches.end())
+                                              ? dim_it->second
+                                              : WeightDimensionType::None;
+                return {mode_it->second, dim};
+            }
+
+            // Check patterns in order
+            for (const auto &rule : patterns)
+            {
+                if (name.find(rule.pattern) != std::string::npos)
+                {
+                    return {rule.mode, rule.dimension};
+                }
+            }
+
+            return {default_mode, WeightDimensionType::None};
         }
 
         /**
@@ -508,6 +605,18 @@ namespace llaminar2
 
         /// Get weight sharding configuration for tensor parallelism
         virtual WeightShardingConfig getWeightShardingConfig() const = 0;
+
+        /**
+         * @brief Check if a weight tensor is optional in this architecture
+         *
+         * This allows callers to distinguish between:
+         * - "Weight doesn't exist because it's optional for this architecture"
+         * - "Weight should exist but failed to load (error condition)"
+         *
+         * @param gguf_weight_name The GGUF tensor name (e.g., "blk.0.attn_q.bias")
+         * @return true if the weight is optional, false if it's required
+         */
+        virtual bool isWeightOptional(const std::string &gguf_weight_name) const = 0;
     };
 
 } // namespace llaminar2

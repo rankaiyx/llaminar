@@ -1204,6 +1204,571 @@ TEST_F(WeightManagerInstanceTest, Sharded_ColumnParallel_GateUp)
 }
 
 // =============================================================================
+// categorizeWeight Tests
+// =============================================================================
+
+TEST_F(WeightManagerInstanceTest, CategorizeWeight_AttentionQKV)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    EXPECT_EQ(wm.categorizeWeight("blk.0.attn_q.weight"),
+              WeightManager::WeightCategory::ATTENTION_QKV);
+    EXPECT_EQ(wm.categorizeWeight("blk.0.attn_k.weight"),
+              WeightManager::WeightCategory::ATTENTION_QKV);
+    EXPECT_EQ(wm.categorizeWeight("blk.0.attn_v.weight"),
+              WeightManager::WeightCategory::ATTENTION_QKV);
+    EXPECT_EQ(wm.categorizeWeight("blk.15.attn_q.weight"),
+              WeightManager::WeightCategory::ATTENTION_QKV);
+}
+
+TEST_F(WeightManagerInstanceTest, CategorizeWeight_AttentionWo)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    EXPECT_EQ(wm.categorizeWeight("blk.0.attn_output.weight"),
+              WeightManager::WeightCategory::ATTENTION_WO);
+    EXPECT_EQ(wm.categorizeWeight("blk.23.attn_output.weight"),
+              WeightManager::WeightCategory::ATTENTION_WO);
+}
+
+TEST_F(WeightManagerInstanceTest, CategorizeWeight_FFNGateUp)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    EXPECT_EQ(wm.categorizeWeight("blk.0.ffn_gate.weight"),
+              WeightManager::WeightCategory::FFN_GATE_UP);
+    EXPECT_EQ(wm.categorizeWeight("blk.0.ffn_up.weight"),
+              WeightManager::WeightCategory::FFN_GATE_UP);
+    EXPECT_EQ(wm.categorizeWeight("blk.10.ffn_gate.weight"),
+              WeightManager::WeightCategory::FFN_GATE_UP);
+}
+
+TEST_F(WeightManagerInstanceTest, CategorizeWeight_FFNDown)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    EXPECT_EQ(wm.categorizeWeight("blk.0.ffn_down.weight"),
+              WeightManager::WeightCategory::FFN_DOWN);
+    EXPECT_EQ(wm.categorizeWeight("blk.15.ffn_down.weight"),
+              WeightManager::WeightCategory::FFN_DOWN);
+}
+
+TEST_F(WeightManagerInstanceTest, CategorizeWeight_LMHead)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    EXPECT_EQ(wm.categorizeWeight("output.weight"),
+              WeightManager::WeightCategory::LM_HEAD);
+}
+
+TEST_F(WeightManagerInstanceTest, CategorizeWeight_Replicate)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    // Norms, biases, embeddings should be replicated
+    EXPECT_EQ(wm.categorizeWeight("blk.0.attn_norm.weight"),
+              WeightManager::WeightCategory::REPLICATE);
+    EXPECT_EQ(wm.categorizeWeight("blk.0.ffn_norm.weight"),
+              WeightManager::WeightCategory::REPLICATE);
+    EXPECT_EQ(wm.categorizeWeight("token_embd.weight"),
+              WeightManager::WeightCategory::REPLICATE);
+    EXPECT_EQ(wm.categorizeWeight("output_norm.weight"),
+              WeightManager::WeightCategory::REPLICATE);
+}
+
+// =============================================================================
+// computeSliceBoundaries Tests (via getShardedWeightForAssignment)
+// =============================================================================
+
+/**
+ * @brief Test fixture for device-aware sharding tests
+ *
+ * Sets up a mock loader with appropriate dimensions and a TensorParallelConfig
+ * to test computeSliceBoundaries through getShardedWeightForAssignment.
+ */
+class WeightManagerComputeSliceBoundariesTest : public ::testing::Test
+{
+protected:
+    // Reduced dimensions for fast test setup (still tests sharding logic correctly)
+    // Using divisible values for clean 2-way splits
+    static constexpr size_t HIDDEN_DIM = 896;
+    static constexpr size_t HEAD_DIM = 64;
+    static constexpr size_t N_HEADS = 14;
+    static constexpr size_t N_KV_HEADS = 2;
+    static constexpr size_t D_FF = 4864;
+    static constexpr size_t VOCAB_SIZE = 1536; // Reduced from 151936 for fast setup
+
+    void SetUp() override
+    {
+        // Create mock loader with Qwen2-0.5B-like dimensions
+        mock_loader_ = std::make_shared<MockModelLoader>();
+        mock_loader_->setBlockCount(24);
+        mock_loader_->setEmbeddingLength(HIDDEN_DIM);
+        mock_loader_->setHeadCount(N_HEADS);
+        mock_loader_->setHeadCountKV(N_KV_HEADS);
+        mock_loader_->setVocabSize(VOCAB_SIZE);
+        mock_loader_->setFeedForwardLength(D_FF);
+
+        // Add realistic weight tensors
+        // Q: [n_heads * head_dim, hidden_dim] = [896, 896]
+        mock_loader_->addFP32RandomTensor("blk.0.attn_q.weight",
+                                          {N_HEADS * HEAD_DIM, HIDDEN_DIM}, -1.0f, 1.0f, 42);
+        // K: [n_kv_heads * head_dim, hidden_dim] = [128, 896]
+        mock_loader_->addFP32RandomTensor("blk.0.attn_k.weight",
+                                          {N_KV_HEADS * HEAD_DIM, HIDDEN_DIM}, -1.0f, 1.0f, 43);
+        // V: same as K
+        mock_loader_->addFP32RandomTensor("blk.0.attn_v.weight",
+                                          {N_KV_HEADS * HEAD_DIM, HIDDEN_DIM}, -1.0f, 1.0f, 44);
+        // Wo: [hidden_dim, n_heads * head_dim] = [896, 896]
+        mock_loader_->addFP32RandomTensor("blk.0.attn_output.weight",
+                                          {HIDDEN_DIM, N_HEADS * HEAD_DIM}, -1.0f, 1.0f, 45);
+        // Q bias: [n_heads * head_dim] = [896]
+        mock_loader_->addFP32RandomTensor("blk.0.attn_q.bias",
+                                          {N_HEADS * HEAD_DIM}, -0.1f, 0.1f, 46);
+        // K bias: [n_kv_heads * head_dim] = [128]
+        mock_loader_->addFP32RandomTensor("blk.0.attn_k.bias",
+                                          {N_KV_HEADS * HEAD_DIM}, -0.1f, 0.1f, 47);
+        // V bias: same as K bias
+        mock_loader_->addFP32RandomTensor("blk.0.attn_v.bias",
+                                          {N_KV_HEADS * HEAD_DIM}, -0.1f, 0.1f, 48);
+        // FFN Gate: [d_ff, hidden_dim] = [4864, 896]
+        mock_loader_->addFP32RandomTensor("blk.0.ffn_gate.weight",
+                                          {D_FF, HIDDEN_DIM}, -1.0f, 1.0f, 49);
+        // FFN Up: same as Gate
+        mock_loader_->addFP32RandomTensor("blk.0.ffn_up.weight",
+                                          {D_FF, HIDDEN_DIM}, -1.0f, 1.0f, 50);
+        // FFN Down: [hidden_dim, d_ff] = [896, 4864]
+        mock_loader_->addFP32RandomTensor("blk.0.ffn_down.weight",
+                                          {HIDDEN_DIM, D_FF}, -1.0f, 1.0f, 51);
+        // LM Head: [vocab_size, hidden_dim] = [151936, 896]
+        mock_loader_->addFP32RandomTensor("output.weight",
+                                          {VOCAB_SIZE, HIDDEN_DIM}, -1.0f, 1.0f, 52);
+        // Norms
+        mock_loader_->addFP32RandomTensor("blk.0.attn_norm.weight", {HIDDEN_DIM}, -1.0f, 1.0f, 53);
+        mock_loader_->addFP32RandomTensor("blk.0.ffn_norm.weight", {HIDDEN_DIM}, -1.0f, 1.0f, 54);
+        // Embedding
+        mock_loader_->addFP32RandomTensor("token_embd.weight",
+                                          {VOCAB_SIZE, HIDDEN_DIM}, -1.0f, 1.0f, 55);
+
+        // Create TensorParallelConfig for 2-way TP (LOCAL) using equalSplit factory
+        std::vector<DeviceId> devices = {
+            DeviceId(DeviceType::CUDA, 0),
+            DeviceId(DeviceType::CUDA, 1)};
+        auto config = TensorParallelConfig::equalSplit(
+            2,          // world_size
+            N_HEADS,    // n_heads = 14
+            N_KV_HEADS, // n_kv_heads = 2
+            D_FF,       // d_ff = 4864
+            VOCAB_SIZE, // vocab_size = 151936
+            devices);
+        tp_config_ = std::make_shared<TensorParallelConfig>(std::move(config));
+
+        // Store assignments for use in tests
+        assignment0_ = tp_config_->forDevice(DeviceId(DeviceType::CUDA, 0));
+        assignment1_ = tp_config_->forDevice(DeviceId(DeviceType::CUDA, 1));
+    }
+
+    std::shared_ptr<MockModelLoader> mock_loader_;
+    std::shared_ptr<TensorParallelConfig> tp_config_;
+    DeviceShardingAssignment assignment0_;
+    DeviceShardingAssignment assignment1_;
+};
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, HeadsDimension_QWeight)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // Q weight uses Heads dimension - device 0 gets heads 0-6 (7 heads * 64 dim = 448)
+    auto q_tensor = wm.getShardedWeightForAssignment(
+        "blk.0.attn_q.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(q_tensor, nullptr);
+    // Should get 7 heads worth of rows: 7 * 64 = 448
+    EXPECT_EQ(q_tensor->shape()[0], 448);
+    EXPECT_EQ(q_tensor->shape()[1], HIDDEN_DIM);
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, HeadsDimension_QWeight_Device1)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // Q weight device 1 gets heads 7-13 (7 heads * 64 dim = 448)
+    auto q_tensor = wm.getShardedWeightForAssignment(
+        "blk.0.attn_q.weight", DeviceId(DeviceType::CUDA, 1), assignment1_, 0);
+
+    ASSERT_NE(q_tensor, nullptr);
+    EXPECT_EQ(q_tensor->shape()[0], 448);
+    EXPECT_EQ(q_tensor->shape()[1], HIDDEN_DIM);
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, KVHeadsDimension_KWeight)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // K weight uses KVHeads dimension - device 0 gets kv_head 0 (1 head * 64 dim = 64)
+    auto k_tensor = wm.getShardedWeightForAssignment(
+        "blk.0.attn_k.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(k_tensor, nullptr);
+    // Should get 1 KV head worth: 1 * 64 = 64
+    EXPECT_EQ(k_tensor->shape()[0], 64);
+    EXPECT_EQ(k_tensor->shape()[1], HIDDEN_DIM);
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, FFNHiddenDimension_GateWeight)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // Gate weight uses FFNHidden dimension - device 0 gets d_ff 0-2431 (2432 elements)
+    auto gate_tensor = wm.getShardedWeightForAssignment(
+        "blk.0.ffn_gate.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(gate_tensor, nullptr);
+    EXPECT_EQ(gate_tensor->shape()[0], 2432);
+    EXPECT_EQ(gate_tensor->shape()[1], HIDDEN_DIM);
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, FFNHiddenDimension_DownWeight_InputParallel)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // Down weight is INPUT_PARALLEL - slices COLUMNS by d_ff assignment
+    auto down_tensor = wm.getShardedWeightForAssignment(
+        "blk.0.ffn_down.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(down_tensor, nullptr);
+    // Full rows, sliced columns
+    EXPECT_EQ(down_tensor->shape()[0], HIDDEN_DIM);
+    EXPECT_EQ(down_tensor->shape()[1], 2432); // d_ff_count for device 0
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, HeadsDimension_WoWeight_InputParallel)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // Wo weight is INPUT_PARALLEL - slices COLUMNS by head assignment
+    auto wo_tensor = wm.getShardedWeightForAssignment(
+        "blk.0.attn_output.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(wo_tensor, nullptr);
+    // Full rows, sliced columns by heads
+    EXPECT_EQ(wo_tensor->shape()[0], HIDDEN_DIM);
+    EXPECT_EQ(wo_tensor->shape()[1], 448); // 7 heads * 64 = 448
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, VocabDimension_LMHead)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // LM head uses Vocab dimension
+    auto lm_head = wm.getShardedWeightForAssignment(
+        "output.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(lm_head, nullptr);
+    EXPECT_EQ(lm_head->shape()[0], VOCAB_SIZE / 2); // vocab_count for device 0 (768)
+    EXPECT_EQ(lm_head->shape()[1], HIDDEN_DIM);
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, Replicated_NormWeight)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // Norm weights are replicated - should get full tensor
+    auto norm = wm.getShardedWeightForAssignment(
+        "blk.0.attn_norm.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(norm, nullptr);
+    EXPECT_EQ(norm->shape()[0], HIDDEN_DIM); // Full size
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, Bias1D_QBias)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // Q bias is 1D column-parallel by Heads
+    auto q_bias = wm.getShardedWeightForAssignment(
+        "blk.0.attn_q.bias", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(q_bias, nullptr);
+    // Sliced 1D tensor becomes [N, 1] shape after column slicing
+    EXPECT_EQ(q_bias->rows(), 448); // 7 heads * 64 = 448
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, Bias1D_KVBias)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // K bias is 1D column-parallel by KVHeads
+    auto k_bias = wm.getShardedWeightForAssignment(
+        "blk.0.attn_k.bias", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(k_bias, nullptr);
+    // Sliced 1D tensor becomes [N, 1] shape after column slicing
+    EXPECT_EQ(k_bias->rows(), 64); // 1 kv_head * 64 = 64
+}
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, CachesPerDeviceResults)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // First call should load
+    auto q1 = wm.getShardedWeightForAssignment(
+        "blk.0.attn_q.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    // Second call should hit cache
+    auto q2 = wm.getShardedWeightForAssignment(
+        "blk.0.attn_q.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+
+    ASSERT_NE(q1, nullptr);
+    ASSERT_NE(q2, nullptr);
+    EXPECT_EQ(q1.get(), q2.get()); // Same pointer from cache
+}
+
+// =============================================================================
+// calculateProportionalColumnSlice / calculateProportionalRowSlice Tests
+// =============================================================================
+
+TEST_F(WeightManagerComputeSliceBoundariesTest, ProportionalSlicing_SameAsManuaAssignment)
+{
+    // These tests verify that when we use TensorParallelConfig with assignments,
+    // the slicing is consistent with the assignment's boundaries
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    // Device 0 and Device 1 should get complementary slices
+    auto q0 = wm.getShardedWeightForAssignment(
+        "blk.0.attn_q.weight", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+    auto q1 = wm.getShardedWeightForAssignment(
+        "blk.0.attn_q.weight", DeviceId(DeviceType::CUDA, 1), assignment1_, 0);
+
+    ASSERT_NE(q0, nullptr);
+    ASSERT_NE(q1, nullptr);
+
+    // Sum of slices should equal total
+    EXPECT_EQ(q0->shape()[0] + q1->shape()[0], N_HEADS * HEAD_DIM);
+}
+
+// =============================================================================
+// getWeightForDevice Tests (multi-device cloning)
+// =============================================================================
+
+TEST_F(WeightManagerInstanceTest, GetWeightForDevice_FirstDeviceGetsOriginal)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    DeviceId cpu = DeviceId::cpu();
+
+    auto tensor1 = wm.getWeightForDevice("token_embd.weight", cpu, 0);
+    auto tensor2 = wm.getWeightForDevice("token_embd.weight", cpu, 0);
+
+    ASSERT_NE(tensor1, nullptr);
+    ASSERT_NE(tensor2, nullptr);
+    // Same device should get same tensor
+    EXPECT_EQ(tensor1.get(), tensor2.get());
+}
+
+TEST_F(WeightManagerInstanceTest, GetWeightForDevice_DifferentDevicesGetClones)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    DeviceId cpu = DeviceId::cpu();
+    DeviceId cuda0 = DeviceId(DeviceType::CUDA, 0);
+
+    auto tensor_cpu = wm.getWeightForDevice("token_embd.weight", cpu, 0);
+    auto tensor_cuda = wm.getWeightForDevice("token_embd.weight", cuda0, 0);
+
+    ASSERT_NE(tensor_cpu, nullptr);
+    ASSERT_NE(tensor_cuda, nullptr);
+
+    // Different devices get different tensor instances
+    EXPECT_NE(tensor_cpu.get(), tensor_cuda.get());
+
+    // But same shape
+    EXPECT_EQ(tensor_cpu->shape(), tensor_cuda->shape());
+}
+
+TEST_F(WeightManagerInstanceTest, GetWeightForDevice_SameDeviceSameTensor)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    DeviceId cuda0 = DeviceId(DeviceType::CUDA, 0);
+
+    auto tensor1 = wm.getWeightForDevice("token_embd.weight", cuda0, 0);
+    auto tensor2 = wm.getWeightForDevice("token_embd.weight", cuda0, 0);
+
+    ASSERT_NE(tensor1, nullptr);
+    ASSERT_NE(tensor2, nullptr);
+    // Same device should return cached clone
+    EXPECT_EQ(tensor1.get(), tensor2.get());
+}
+
+// =============================================================================
+// preloadForDevices Tests
+// =============================================================================
+
+TEST_F(WeightManagerInstanceTest, PreloadForDevices_SingleDevice)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    // First load some weights
+    wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+    wm.getWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0);
+
+    // Preload for devices
+    std::vector<DeviceId> devices = {DeviceId::cpu()};
+    bool result = wm.preloadForDevices(devices);
+
+    // preloadForDevices creates clones for each device
+    EXPECT_TRUE(result);
+}
+
+TEST_F(WeightManagerInstanceTest, PreloadForDevices_MultipleDevices)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    // Load a weight first
+    wm.getWeight("token_embd.weight", DeviceId::cpu(), 0);
+
+    // Preload for multiple devices
+    std::vector<DeviceId> devices = {
+        DeviceId::cpu(),
+        DeviceId(DeviceType::CUDA, 0)};
+    bool result = wm.preloadForDevices(devices);
+
+    EXPECT_TRUE(result);
+}
+
+TEST_F(WeightManagerInstanceTest, PreloadForDevices_EmptyDeviceList)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    std::vector<DeviceId> devices;
+    bool result = wm.preloadForDevices(devices);
+
+    // Empty device list should succeed (no-op)
+    EXPECT_TRUE(result);
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 

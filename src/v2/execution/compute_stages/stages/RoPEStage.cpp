@@ -8,8 +8,10 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/BlockStructures.h"
+#include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 
 namespace llaminar2
 {
@@ -100,15 +102,22 @@ namespace llaminar2
                                                   << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false")
                                                   << " k_is_q16_1=" << (k_is_q16_1 ? "true" : "false"));
 
-        // Create kernel via KernelFactory with automatic type dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        auto kernel = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
-        if (!kernel)
+        // Get or create cached kernel via KernelFactory
+        // The kernel is cached in cached_kernel_ and bound to workspace via IWorkspaceConsumerStage
+        if (!cached_kernel_)
+        {
+            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
+        }
+
+        if (!cached_kernel_)
         {
             LOG_ERROR("[RoPEStage] Failed to create RoPE kernel for type "
                       << Q_base->dtype_name());
             return false;
         }
+
+        ITensorRoPE *kernel = cached_kernel_.get();
 
         // Use provided position_ids if available (for batched execution with per-token positions)
         // Otherwise, generate contiguous position_ids from pos_offset
@@ -366,10 +375,10 @@ namespace llaminar2
                                      (params_.Q_out->native_type() == TensorType::Q16_1);
 
         const bool separate_output_mode = hybrid_mode || hybrid_q16_mode;
-        
+
         // OPTIMIZATION: For FP32 in-place RoPE (standard CUDA path), use tensor-based API
         // to avoid GPU->host sync. The sync is deferred to ensureOutputsOnHost().
-        const bool is_fp32_inplace = !separate_output_mode && 
+        const bool is_fp32_inplace = !separate_output_mode &&
                                      params_.Q->native_type() == TensorType::FP32;
 
         if (is_fp32_inplace)
@@ -514,6 +523,42 @@ namespace llaminar2
         }
 
         return reqs;
+    }
+
+    // =============================================================================
+    // IWorkspaceConsumerStage Implementation
+    // =============================================================================
+
+    IWorkspaceConsumer *RoPEStage::getKernelAsWorkspaceConsumer()
+    {
+        // Create kernel if not already cached
+        if (!cached_kernel_)
+        {
+            if (!params_.Q)
+            {
+                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q tensor not set");
+                return nullptr;
+            }
+
+            auto *Q_base = dynamic_cast<TensorBase *>(params_.Q);
+            if (!Q_base)
+            {
+                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q is not TensorBase");
+                return nullptr;
+            }
+
+            auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createRoPE(Q_base, dev_type);
+
+            if (!cached_kernel_)
+            {
+                LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Failed to create RoPE kernel");
+                return nullptr;
+            }
+        }
+
+        // Cast to IWorkspaceConsumer (CUDA/ROCm RoPE kernels implement both ITensorRoPE and IWorkspaceConsumer)
+        return dynamic_cast<IWorkspaceConsumer *>(cached_kernel_.get());
     }
 
 } // namespace llaminar2

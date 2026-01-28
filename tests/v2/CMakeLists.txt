@@ -3161,6 +3161,7 @@ target_include_directories(v2_test_weight_manager_sharding PRIVATE
 )
 add_v2_test(V2_Unit_WeightManagerSharding
     COMMAND $<TARGET_FILE:v2_test_weight_manager_sharding>
+    MPI_PROCS 1
     LABELS "V2;Unit;TensorParallelism;WeightSharding;RowParallel"
 )
 

@@ -1221,8 +1221,8 @@ namespace llaminar2
         // 4. DirectP2PEngine is available from LocalTPContext
         // =====================================================================
         bool use_bar_allocation = false;
-        DeviceId cuda_device_for_bar;  // CUDA device that will read from BAR
-        DeviceId rocm_device_for_bar;  // ROCm device that will own BAR memory
+        DeviceId cuda_device_for_bar; // CUDA device that will read from BAR
+        DeviceId rocm_device_for_bar; // ROCm device that will own BAR memory
 
         if (config.local_tp_ctx &&
             config.local_tp_ctx->degree() > 1 &&
@@ -1245,7 +1245,7 @@ namespace llaminar2
                     }
                 }
 
-                rocm_device_for_bar = device;  // Current device is ROCm
+                rocm_device_for_bar = device; // Current device is ROCm
                 use_bar_allocation = cuda_device_for_bar.is_cuda();
 
                 if (use_bar_allocation)
@@ -2054,7 +2054,12 @@ namespace llaminar2
         if (phase == InferencePhase::PREFILL)
         {
             LOG_TRACE("[DeviceGraphOrchestrator::getPhaseAwareWeight] PREFILL phase - returning full weight for " << name);
-            return weight_manager_->getWeight(name);
+            auto weight = weight_manager_->getWeight(name);
+            if (!weight)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator::getPhaseAwareWeight] Failed to load weight: " << name);
+            }
+            return weight;
         }
 
         // DECODE phase: Check if CPU should participate

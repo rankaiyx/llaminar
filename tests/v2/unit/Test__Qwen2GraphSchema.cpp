@@ -198,6 +198,212 @@ TEST(Test__Qwen2GraphSchema, SchemaFactory_HasLMHeadStages)
 }
 
 // ============================================================================
+// TensorRef Optional Weight Tests
+// ============================================================================
+
+/**
+ * Test TensorRef default construction is required (not optional)
+ */
+TEST(Test__Qwen2GraphSchema, TensorRef_DefaultIsRequired)
+{
+    TensorRef ref;
+    EXPECT_FALSE(ref.is_optional) << "Default TensorRef should be required";
+}
+
+/**
+ * Test TensorRef construction from string is required
+ */
+TEST(Test__Qwen2GraphSchema, TensorRef_StringConstructorIsRequired)
+{
+    TensorRef ref("weights.wq");
+    EXPECT_EQ(ref.name, "weights.wq");
+    EXPECT_FALSE(ref.is_optional) << "String-constructed TensorRef should be required";
+}
+
+/**
+ * Test TensorRef named constructor creates required reference
+ */
+TEST(Test__Qwen2GraphSchema, TensorRef_NamedConstructorIsRequired)
+{
+    TensorRef ref("weights.wq", BufferSemantic::Input);
+    EXPECT_EQ(ref.name, "weights.wq");
+    EXPECT_EQ(ref.semantic, BufferSemantic::Input);
+    EXPECT_FALSE(ref.is_optional) << "Named constructor TensorRef should be required";
+}
+
+/**
+ * Test TensorRef::optional() factory creates optional reference
+ */
+TEST(Test__Qwen2GraphSchema, TensorRef_OptionalFactoryCreatesOptional)
+{
+    TensorRef ref = TensorRef::optional("weights.q_bias", BufferSemantic::Input);
+    EXPECT_EQ(ref.name, "weights.q_bias");
+    EXPECT_EQ(ref.semantic, BufferSemantic::Input);
+    EXPECT_TRUE(ref.is_optional) << "TensorRef::optional() should create optional reference";
+}
+
+/**
+ * Test TensorRef full constructor with explicit optional flag
+ */
+TEST(Test__Qwen2GraphSchema, TensorRef_ExplicitOptionalFlag)
+{
+    TensorRef required_ref("weights.wq", BufferSemantic::Input, false);
+    EXPECT_FALSE(required_ref.is_optional);
+
+    TensorRef optional_ref("weights.q_bias", BufferSemantic::Input, true);
+    EXPECT_TRUE(optional_ref.is_optional);
+}
+
+// ============================================================================
+// isWeightOptional Tests - Qwen2 Architecture
+// ============================================================================
+
+/**
+ * Test that QKV weights are required
+ */
+TEST(Test__Qwen2GraphSchema, IsWeightOptional_QKVWeightsAreRequired)
+{
+    Qwen2SchemaFactory factory;
+
+    // Q/K/V projection weights are required
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.attn_q.weight"))
+        << "attn_q.weight should be required";
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.attn_k.weight"))
+        << "attn_k.weight should be required";
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.attn_v.weight"))
+        << "attn_v.weight should be required";
+
+    // Test different layer indices
+    EXPECT_FALSE(factory.isWeightOptional("blk.15.attn_q.weight"));
+    EXPECT_FALSE(factory.isWeightOptional("blk.23.attn_k.weight"));
+}
+
+/**
+ * Test that QKV biases are optional (not all Qwen2 models have them)
+ */
+TEST(Test__Qwen2GraphSchema, IsWeightOptional_QKVBiasesAreOptional)
+{
+    Qwen2SchemaFactory factory;
+
+    // Q/K/V biases are optional (some Qwen2 variants don't have them)
+    EXPECT_TRUE(factory.isWeightOptional("blk.0.attn_q.bias"))
+        << "attn_q.bias should be optional";
+    EXPECT_TRUE(factory.isWeightOptional("blk.0.attn_k.bias"))
+        << "attn_k.bias should be optional";
+    EXPECT_TRUE(factory.isWeightOptional("blk.0.attn_v.bias"))
+        << "attn_v.bias should be optional";
+
+    // Test different layer indices
+    EXPECT_TRUE(factory.isWeightOptional("blk.15.attn_q.bias"));
+    EXPECT_TRUE(factory.isWeightOptional("blk.23.attn_k.bias"));
+}
+
+/**
+ * Test that Wo (attention output) weight is required
+ */
+TEST(Test__Qwen2GraphSchema, IsWeightOptional_WoWeightIsRequired)
+{
+    Qwen2SchemaFactory factory;
+
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.attn_output.weight"))
+        << "attn_output.weight should be required";
+    EXPECT_FALSE(factory.isWeightOptional("blk.15.attn_output.weight"));
+}
+
+/**
+ * Test that FFN weights are required
+ */
+TEST(Test__Qwen2GraphSchema, IsWeightOptional_FFNWeightsAreRequired)
+{
+    Qwen2SchemaFactory factory;
+
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.ffn_gate.weight"))
+        << "ffn_gate.weight should be required";
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.ffn_up.weight"))
+        << "ffn_up.weight should be required";
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.ffn_down.weight"))
+        << "ffn_down.weight should be required";
+
+    // Test different layer indices
+    EXPECT_FALSE(factory.isWeightOptional("blk.23.ffn_gate.weight"));
+    EXPECT_FALSE(factory.isWeightOptional("blk.23.ffn_up.weight"));
+    EXPECT_FALSE(factory.isWeightOptional("blk.23.ffn_down.weight"));
+}
+
+/**
+ * Test that norm weights are required
+ */
+TEST(Test__Qwen2GraphSchema, IsWeightOptional_NormWeightsAreRequired)
+{
+    Qwen2SchemaFactory factory;
+
+    // Layer norms are required
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.attn_norm.weight"))
+        << "attn_norm.weight should be required";
+    EXPECT_FALSE(factory.isWeightOptional("blk.0.ffn_norm.weight"))
+        << "ffn_norm.weight should be required";
+
+    // Model-level norms are required
+    EXPECT_FALSE(factory.isWeightOptional("output_norm.weight"))
+        << "output_norm.weight should be required";
+}
+
+/**
+ * Test that model-level weights are required
+ */
+TEST(Test__Qwen2GraphSchema, IsWeightOptional_ModelLevelWeightsAreRequired)
+{
+    Qwen2SchemaFactory factory;
+
+    EXPECT_FALSE(factory.isWeightOptional("token_embd.weight"))
+        << "token_embd.weight should be required";
+    EXPECT_FALSE(factory.isWeightOptional("output.weight"))
+        << "output.weight (LM head) should be required";
+}
+
+/**
+ * Test that schema QKV projection has optional bias inputs marked correctly
+ */
+TEST(Test__Qwen2GraphSchema, Schema_QKVBiasInputsMarkedOptional)
+{
+    Qwen2SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    // Find qkv_proj stage
+    auto qkv_it = std::find_if(
+        schema.layer_template.attention_stages.begin(),
+        schema.layer_template.attention_stages.end(),
+        [](const StageSpec &s)
+        { return s.name == "qkv_proj"; });
+
+    ASSERT_NE(qkv_it, schema.layer_template.attention_stages.end())
+        << "Should have qkv_proj stage";
+
+    // Count required and optional inputs
+    int required_count = 0;
+    int optional_count = 0;
+
+    for (const auto &input : qkv_it->inputs)
+    {
+        if (input.is_optional)
+        {
+            optional_count++;
+            // Bias inputs should be optional
+            EXPECT_TRUE(input.name.find("bias") != std::string::npos)
+                << "Optional input " << input.name << " should contain 'bias'";
+        }
+        else
+        {
+            required_count++;
+        }
+    }
+
+    // QKV should have 4 required inputs (normalized, wq, wk, wv) + 3 optional (q_bias, k_bias, v_bias)
+    EXPECT_EQ(required_count, 4) << "Should have 4 required inputs (normalized + 3 weights)";
+    EXPECT_EQ(optional_count, 3) << "Should have 3 optional inputs (Q/K/V biases)";
+}
+
+// ============================================================================
 // TP Annotation Tests
 // ============================================================================
 

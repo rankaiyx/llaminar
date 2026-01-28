@@ -496,13 +496,23 @@ namespace llaminar2
             int layer_idx);
 
         // Weight category detection helpers for LOCAL TP slicing
+        // DEPRECATED: Use WeightShardingConfig::getDimensionType() instead.
+        // These methods hardcode Qwen2 weight name patterns.
+        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
         static bool isQKVWeight(const std::string &name);
+        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
         static bool isQKVBias(const std::string &name);
+        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
         static bool isFFNGateUpWeight(const std::string &name);
+        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
         static bool isFFNDownWeight(const std::string &name);
+        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
         static bool isLMHeadWeight(const std::string &name);
+        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
         static bool isWoWeight(const std::string &name);
+        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
         static bool isEmbeddingWeight(const std::string &name);
+        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
         static bool isOutputNormWeight(const std::string &name);
 
         /**
@@ -525,6 +535,26 @@ namespace llaminar2
         // ========================================================================
         // Sharding helper methods (used by getShardedWeightForAssignment)
         // ========================================================================
+
+        /**
+         * @brief Compute slice boundaries based on dimension type from WeightShardingConfig
+         *
+         * Uses the sharding config to determine which dimension (Heads, KVHeads, FFNHidden, Vocab)
+         * should be used for slicing, then computes the appropriate start/count values.
+         *
+         * @param name Weight tensor name
+         * @param total_size Total size of the dimension to slice
+         * @param assignment Device's sharding assignment
+         * @param out_start Output: start index for slicing
+         * @param out_count Output: count of elements to include
+         * @return true if boundaries computed successfully, false on error
+         */
+        bool computeSliceBoundaries(
+            const std::string &name,
+            size_t total_size,
+            const DeviceShardingAssignment &assignment,
+            size_t &out_start,
+            size_t &out_count) const;
 
         /**
          * @brief Load a column-parallel 1D bias tensor (e.g., Q/K/V biases)

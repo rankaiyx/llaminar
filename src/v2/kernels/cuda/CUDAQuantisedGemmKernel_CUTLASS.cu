@@ -468,12 +468,20 @@ extern "C"
 
     /**
      * @brief Free device memory
+     * @note Handles CUDA runtime shutdown gracefully during static destruction
      */
     void cudaQuantGemm_freeDevice(void *d_ptr)
     {
         if (d_ptr)
         {
-            cudaFree(d_ptr);
+            cudaError_t err = cudaFree(d_ptr);
+            // During static destruction at program exit, CUDA runtime may already
+            // be torn down. These error codes indicate this harmless condition.
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                // Only log actual errors, not shutdown-related ones
+                fprintf(stderr, "WARNING: cudaFree failed: %s\n", cudaGetErrorString(err));
+            }
         }
     }
 

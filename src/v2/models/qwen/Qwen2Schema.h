@@ -105,40 +105,44 @@ namespace llaminar2
 
             // Exact match for LM head (no blk prefix)
             config.exact_matches["output.weight"] = WeightShardingMode::ColumnParallel;
+            config.exact_dimension_matches["output.weight"] = WeightDimensionType::Vocab;
 
             // Pattern rules (evaluated in order, first match wins)
+            // Format: {pattern, mode, dimension_type, description}
             config.patterns = {
                 // ===== Attention Weights =====
                 // Wo (attn_output) uses INPUT_PARALLEL - split input dim to match local heads
-                {"attn_output.weight", WeightShardingMode::InputParallel,
-                 "Wo projection - split input dim, allreduce after"},
+                {"attn_output.weight", WeightShardingMode::InputParallel, WeightDimensionType::Heads,
+                 "Wo projection - split input dim by heads, allreduce after"},
 
-                // QKV use COLUMN_PARALLEL - split output dim (heads)
-                {"attn_q.weight", WeightShardingMode::ColumnParallel,
-                 "Q projection - split by heads"},
-                {"attn_k.weight", WeightShardingMode::ColumnParallel,
-                 "K projection - split by heads"},
-                {"attn_v.weight", WeightShardingMode::ColumnParallel,
-                 "V projection - split by heads"},
+                // Q uses COLUMN_PARALLEL - split output dim (heads)
+                {"attn_q.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
+                 "Q projection - split by attention heads"},
+
+                // K/V use COLUMN_PARALLEL - split output dim (KV heads, may differ from Q heads)
+                {"attn_k.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::KVHeads,
+                 "K projection - split by KV heads"},
+                {"attn_v.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::KVHeads,
+                 "V projection - split by KV heads"},
 
                 // QKV biases follow their weights
-                {"attn_q.bias", WeightShardingMode::ColumnParallel,
-                 "Q bias - matches Q weight sharding"},
-                {"attn_k.bias", WeightShardingMode::ColumnParallel,
-                 "K bias - matches K weight sharding"},
-                {"attn_v.bias", WeightShardingMode::ColumnParallel,
-                 "V bias - matches V weight sharding"},
+                {"attn_q.bias", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
+                 "Q bias - split by attention heads"},
+                {"attn_k.bias", WeightShardingMode::ColumnParallel, WeightDimensionType::KVHeads,
+                 "K bias - split by KV heads"},
+                {"attn_v.bias", WeightShardingMode::ColumnParallel, WeightDimensionType::KVHeads,
+                 "V bias - split by KV heads"},
 
                 // ===== FFN Weights =====
                 // Gate/Up use COLUMN_PARALLEL - split output dim (d_ff)
-                {"ffn_gate.weight", WeightShardingMode::ColumnParallel,
-                 "Gate projection - split d_ff dimension"},
-                {"ffn_up.weight", WeightShardingMode::ColumnParallel,
-                 "Up projection - split d_ff dimension"},
+                {"ffn_gate.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FFNHidden,
+                 "Gate projection - split by d_ff dimension"},
+                {"ffn_up.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FFNHidden,
+                 "Up projection - split by d_ff dimension"},
 
                 // Down uses INPUT_PARALLEL - split input dim to match Gate/Up output
-                {"ffn_down.weight", WeightShardingMode::InputParallel,
-                 "Down projection - split input dim, allreduce after"},
+                {"ffn_down.weight", WeightShardingMode::InputParallel, WeightDimensionType::FFNHidden,
+                 "Down projection - split input dim by d_ff, allreduce after"},
             };
 
             // Default: replicate (norms, embeddings, unmatched weights)
@@ -200,16 +204,7 @@ namespace llaminar2
                     .exec_policy_key = "exec_rmsnorm"},
 
                 // Fused Q/K/V projection
-                StageSpec{.name = "qkv_proj", .type = StageType::FusedQKVGEMM, .inputs = {
-                                                                                   {"normalized", BufferSemantic::Input}, {"weights.wq", BufferSemantic::Input}, {"weights.wk", BufferSemantic::Input}, {"weights.wv", BufferSemantic::Input}, {"weights.q_bias", BufferSemantic::Input}, // Optional
-                                                                                   {"weights.k_bias", BufferSemantic::Input},                                                                                                                                                             // Optional
-                                                                                   {"weights.v_bias", BufferSemantic::Input}                                                                                                                                                              // Optional
-                                                                               },
-                          .outputs = {{"Q", BufferSemantic::Output}, {"K", BufferSemantic::Output}, {"V", BufferSemantic::Output}},
-                          .dependencies = {"attn_norm"},
-                          .tp_mode = TPMode::ColumnParallel,
-                          .is_optional = true,
-                          .exec_policy_key = "exec_gemm"},
+                StageSpec{.name = "qkv_proj", .type = StageType::FusedQKVGEMM, .inputs = {{"normalized", BufferSemantic::Input}, {"weights.wq", BufferSemantic::Input}, {"weights.wk", BufferSemantic::Input}, {"weights.wv", BufferSemantic::Input}, TensorRef::optional("weights.q_bias", BufferSemantic::Input), TensorRef::optional("weights.k_bias", BufferSemantic::Input), TensorRef::optional("weights.v_bias", BufferSemantic::Input)}, .outputs = {{"Q", BufferSemantic::Output}, {"K", BufferSemantic::Output}, {"V", BufferSemantic::Output}}, .dependencies = {"attn_norm"}, .tp_mode = TPMode::ColumnParallel, .is_optional = true, .exec_policy_key = "exec_gemm"},
 
                 // RoPE position encoding
                 StageSpec{.name = "rope", .type = StageType::RoPE, .inputs = {{"Q", BufferSemantic::InOut}, {"K", BufferSemantic::InOut}}, .outputs = {{"Q", BufferSemantic::InOut}, {"K", BufferSemantic::InOut}}, .dependencies = {"qkv_proj"}, .is_optional = true, .exec_policy_key = "exec_rope"},
@@ -364,6 +359,38 @@ namespace llaminar2
                     .estimated_savings_percent = 15.0f}};
 
             return schema;
+        }
+
+        /**
+         * @brief Check if a weight tensor is optional in Qwen2 architecture
+         *
+         * Optional weights in Qwen2:
+         * - attn_q.bias, attn_k.bias, attn_v.bias: QKV biases (some Qwen2 variants don't have them)
+         *
+         * Required weights (any blk.N. layer weight):
+         * - attn_q.weight, attn_k.weight, attn_v.weight, attn_output.weight
+         * - attn_norm.weight, ffn_norm.weight
+         * - ffn_gate.weight, ffn_up.weight, ffn_down.weight
+         *
+         * Model-level required:
+         * - token_embd.weight, output_norm.weight, output.weight
+         *
+         * @param gguf_weight_name The GGUF tensor name (e.g., "blk.0.attn_q.bias")
+         * @return true if the weight is optional, false if it's required
+         */
+        bool isWeightOptional(const std::string &gguf_weight_name) const override
+        {
+            // QKV biases are the only optional weights in Qwen2
+            // Pattern: blk.N.attn_q.bias, blk.N.attn_k.bias, blk.N.attn_v.bias
+            if (gguf_weight_name.find("attn_q.bias") != std::string::npos ||
+                gguf_weight_name.find("attn_k.bias") != std::string::npos ||
+                gguf_weight_name.find("attn_v.bias") != std::string::npos)
+            {
+                return true; // Optional
+            }
+
+            // All other weights are required
+            return false;
         }
     };
 

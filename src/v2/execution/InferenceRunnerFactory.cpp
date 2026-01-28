@@ -655,26 +655,55 @@ namespace llaminar2
         // =====================================================================
         // Eager load ALL layer weights into cache BEFORE preloading
         // =====================================================================
-        // This ensures weights are in cache for packGemmWeights to iterate
+        // Use schema factory to determine which weights are required vs optional.
+        // This ensures consistent handling: required weights fail if missing,
+        // optional weights (like QKV biases) silently skip.
+        Qwen2SchemaFactory schema_factory;
+
         int n_layers = model_ctx->blockCount();
         LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
         for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
         {
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
-            // Load all layer weights into cache
-            weight_mgr->getWeight(prefix + "attn_q.weight");
-            weight_mgr->getWeight(prefix + "attn_k.weight");
-            weight_mgr->getWeight(prefix + "attn_v.weight");
-            weight_mgr->getWeight(prefix + "attn_output.weight");
-            weight_mgr->getWeight(prefix + "attn_norm.weight");
-            weight_mgr->getWeight(prefix + "ffn_gate.weight");
-            weight_mgr->getWeight(prefix + "ffn_up.weight");
-            weight_mgr->getWeight(prefix + "ffn_down.weight");
-            weight_mgr->getWeight(prefix + "ffn_norm.weight");
-            // Biases (may not exist)
-            weight_mgr->getWeight(prefix + "attn_q.bias");
-            weight_mgr->getWeight(prefix + "attn_k.bias");
-            weight_mgr->getWeight(prefix + "attn_v.bias");
+
+            // All possible layer weights (schema determines which are required)
+            const std::vector<std::string> layer_weights = {
+                // Attention weights (required)
+                prefix + "attn_q.weight",
+                prefix + "attn_k.weight",
+                prefix + "attn_v.weight",
+                prefix + "attn_output.weight",
+                prefix + "attn_norm.weight",
+                // Attention biases (optional per schema)
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+                // FFN weights (required)
+                prefix + "ffn_gate.weight",
+                prefix + "ffn_up.weight",
+                prefix + "ffn_down.weight",
+                prefix + "ffn_norm.weight"};
+
+            for (const auto &weight_name : layer_weights)
+            {
+                auto weight = weight_mgr->getWeight(weight_name);
+                bool is_optional = schema_factory.isWeightOptional(weight_name);
+
+                if (!weight)
+                {
+                    if (is_optional)
+                    {
+                        // Optional weight missing - this is fine (e.g., model without QKV biases)
+                        LOG_TRACE("[InferenceRunner] Optional weight not present: " << weight_name);
+                    }
+                    else
+                    {
+                        // Required weight missing - this is an error
+                        LOG_ERROR("[InferenceRunner] Failed to load required weight: " << weight_name);
+                        return false;
+                    }
+                }
+            }
         }
         LOG_DEBUG("[InferenceRunner] All layer weights loaded into cache");
 
@@ -711,12 +740,26 @@ namespace llaminar2
             Qwen2LayerWeights layer;
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
 
-            // Attention weights
-            layer.wq = weight_mgr->getWeight(prefix + "attn_q.weight").get();
-            layer.wk = weight_mgr->getWeight(prefix + "attn_k.weight").get();
-            layer.wv = weight_mgr->getWeight(prefix + "attn_v.weight").get();
-            layer.wo = weight_mgr->getWeight(prefix + "attn_output.weight").get();
-            layer.attn_norm = weight_mgr->getWeight(prefix + "attn_norm.weight").get();
+            // Attention weights - all required (should be in cache from eager load)
+            auto wq = weight_mgr->getWeight(prefix + "attn_q.weight");
+            auto wk = weight_mgr->getWeight(prefix + "attn_k.weight");
+            auto wv = weight_mgr->getWeight(prefix + "attn_v.weight");
+            auto wo = weight_mgr->getWeight(prefix + "attn_output.weight");
+            auto attn_norm = weight_mgr->getWeight(prefix + "attn_norm.weight");
+
+            // Validate required attention weights
+            if (!wq || !wk || !wv || !wo || !attn_norm)
+            {
+                LOG_ERROR("[InferenceRunner] Missing required attention weight for layer " << layer_idx);
+                // Return empty layer - caller should check for nullptr members
+                return layer;
+            }
+
+            layer.wq = wq.get();
+            layer.wk = wk.get();
+            layer.wv = wv.get();
+            layer.wo = wo.get();
+            layer.attn_norm = attn_norm.get();
 
             // Attention biases (may be null)
             auto q_bias = weight_mgr->getWeight(prefix + "attn_q.bias");
@@ -726,11 +769,23 @@ namespace llaminar2
             layer.k_bias = k_bias ? k_bias.get() : nullptr;
             layer.v_bias = v_bias ? v_bias.get() : nullptr;
 
-            // FFN weights
-            layer.gate_proj = weight_mgr->getWeight(prefix + "ffn_gate.weight").get();
-            layer.up_proj = weight_mgr->getWeight(prefix + "ffn_up.weight").get();
-            layer.down_proj = weight_mgr->getWeight(prefix + "ffn_down.weight").get();
-            layer.ffn_norm = weight_mgr->getWeight(prefix + "ffn_norm.weight").get();
+            // FFN weights - all required
+            auto gate_proj = weight_mgr->getWeight(prefix + "ffn_gate.weight");
+            auto up_proj = weight_mgr->getWeight(prefix + "ffn_up.weight");
+            auto down_proj = weight_mgr->getWeight(prefix + "ffn_down.weight");
+            auto ffn_norm = weight_mgr->getWeight(prefix + "ffn_norm.weight");
+
+            if (!gate_proj || !up_proj || !down_proj || !ffn_norm)
+            {
+                LOG_ERROR("[InferenceRunner] Missing required FFN weight for layer " << layer_idx);
+                // Return partially filled layer - caller should check for nullptr members
+                return layer;
+            }
+
+            layer.gate_proj = gate_proj.get();
+            layer.up_proj = up_proj.get();
+            layer.down_proj = down_proj.get();
+            layer.ffn_norm = ffn_norm.get();
 
             return layer;
         };

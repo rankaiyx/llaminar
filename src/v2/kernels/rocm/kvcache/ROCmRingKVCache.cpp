@@ -207,7 +207,13 @@ namespace llaminar2
     template <ActivationPrecision Precision>
     ROCmRingKVCache<Precision>::~ROCmRingKVCache()
     {
-        hipSetDevice(device_id_);
+        // Check if HIP runtime is shutting down
+        hipError_t set_err = hipSetDevice(device_id_);
+        if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
+        {
+            // Runtime is shutting down, skip cleanup
+            return;
+        }
 
         for (auto &layer_entries : entries_)
         {
@@ -241,13 +247,37 @@ namespace llaminar2
     void ROCmRingKVCache<Precision>::free_entry(EntryT &entry)
     {
         if (entry.d_K)
-            hipFree(entry.d_K);
+        {
+            hipError_t err = hipFree(entry.d_K);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_K) failed: %s\n", hipGetErrorString(err));
+            }
+        }
         if (entry.d_V)
-            hipFree(entry.d_V);
+        {
+            hipError_t err = hipFree(entry.d_V);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_V) failed: %s\n", hipGetErrorString(err));
+            }
+        }
         if (entry.d_K_scratch)
-            hipFree(entry.d_K_scratch);
+        {
+            hipError_t err = hipFree(entry.d_K_scratch);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_K_scratch) failed: %s\n", hipGetErrorString(err));
+            }
+        }
         if (entry.d_V_scratch)
-            hipFree(entry.d_V_scratch);
+        {
+            hipError_t err = hipFree(entry.d_V_scratch);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_V_scratch) failed: %s\n", hipGetErrorString(err));
+            }
+        }
 
         entry.d_K = nullptr;
         entry.d_V = nullptr;

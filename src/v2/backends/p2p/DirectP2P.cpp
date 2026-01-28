@@ -374,11 +374,13 @@ namespace llaminar2
             // The engine lives for the entire process lifetime
             s_shared_engine = std::shared_ptr<DirectP2PEngine>(
                 new DirectP2PEngine(),
-                [](DirectP2PEngine *) {
+                [](DirectP2PEngine *)
+                {
                     // No-op deleter - the singleton persists until process exit
                     // This is intentional to avoid re-initialization issues with
                     // CUDA IOMEMORY registrations and BAR mappings
-                    LOG_DEBUG("[DirectP2PEngine] Singleton instance preserved (no-op deleter)");
+                    // NOTE: Do NOT log here - Logger singleton may already be destroyed
+                    // during static destruction, causing use-after-free crash
                 });
             LOG_INFO("[DirectP2PEngine] Singleton instance created");
         }

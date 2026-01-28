@@ -1893,6 +1893,88 @@ namespace llaminar2
     // Sharding helper methods
     // ========================================================================
 
+    // ========================================================================
+    // Helper: Compute slice boundaries based on dimension type from config
+    // ========================================================================
+
+    bool WeightManager::computeSliceBoundaries(
+        const std::string &name,
+        size_t total_size,
+        const DeviceShardingAssignment &assignment,
+        size_t &out_start,
+        size_t &out_count) const
+    {
+        if (!has_sharding_config_)
+        {
+            LOG_ERROR("[WeightManager] No sharding config set - cannot compute slice boundaries");
+            return false;
+        }
+
+        WeightDimensionType dim_type = sharding_config_.getDimensionType(name);
+
+        switch (dim_type)
+        {
+        case WeightDimensionType::Heads:
+        {
+            const int total_heads = tp_config_->totalHeads();
+            if (total_heads <= 0)
+            {
+                LOG_ERROR("[WeightManager] Invalid total_heads in TensorParallelConfig");
+                return false;
+            }
+            const size_t head_dim = total_size / static_cast<size_t>(total_heads);
+            out_start = assignment.head_start * head_dim;
+            out_count = assignment.head_count * head_dim;
+            LOG_TRACE("[WeightManager] " << name << " (Heads): total_heads=" << total_heads
+                                         << " head_dim=" << head_dim
+                                         << " -> [" << out_start << ", " << (out_start + out_count) << ")");
+            return true;
+        }
+
+        case WeightDimensionType::KVHeads:
+        {
+            const int total_kv_heads = tp_config_->totalKVHeads();
+            if (total_kv_heads <= 0)
+            {
+                LOG_ERROR("[WeightManager] Invalid total_kv_heads in TensorParallelConfig");
+                return false;
+            }
+            const size_t head_dim = total_size / static_cast<size_t>(total_kv_heads);
+            out_start = assignment.kv_head_start * head_dim;
+            out_count = assignment.kv_head_count * head_dim;
+            LOG_TRACE("[WeightManager] " << name << " (KVHeads): total_kv_heads=" << total_kv_heads
+                                         << " head_dim=" << head_dim
+                                         << " -> [" << out_start << ", " << (out_start + out_count) << ")");
+            return true;
+        }
+
+        case WeightDimensionType::FFNHidden:
+        {
+            out_start = assignment.d_ff_start;
+            out_count = assignment.d_ff_count;
+            LOG_TRACE("[WeightManager] " << name << " (FFNHidden): d_ff=["
+                                         << out_start << ", " << (out_start + out_count) << ")");
+            return true;
+        }
+
+        case WeightDimensionType::Vocab:
+        {
+            out_start = assignment.vocab_start;
+            out_count = assignment.vocab_count;
+            LOG_TRACE("[WeightManager] " << name << " (Vocab): vocab=["
+                                         << out_start << ", " << (out_start + out_count) << ")");
+            return true;
+        }
+
+        case WeightDimensionType::Bias1D:
+        case WeightDimensionType::None:
+        default:
+            LOG_ERROR("[WeightManager] Cannot compute slice boundaries for dimension type "
+                      << static_cast<int>(dim_type) << " on weight: " << name);
+            return false;
+        }
+    }
+
     std::shared_ptr<TensorBase> WeightManager::loadColumnParallel1DBias(
         const std::string &name,
         DeviceId device,
@@ -1904,35 +1986,11 @@ namespace llaminar2
         size_t slice_start = 0;
         size_t slice_count = 0;
 
-        // For QKV biases, use head-based slicing (same as corresponding weight)
-        if (!isQKVBias(name))
+        // Use config to determine dimension type for slicing
+        if (!computeSliceBoundaries(name, total_size, assignment, slice_start, slice_count))
         {
-            LOG_ERROR("[WeightManager] Unknown 1D column-parallel tensor: " << name);
+            LOG_ERROR("[WeightManager] Failed to compute slice boundaries for 1D tensor: " << name);
             return nullptr;
-        }
-
-        const bool is_kv_bias = (name.find("attn_k.") != std::string::npos ||
-                                 name.find("attn_v.") != std::string::npos);
-
-        const int total_heads_for_bias = is_kv_bias
-                                             ? tp_config_->totalKVHeads()
-                                             : tp_config_->totalHeads();
-        if (total_heads_for_bias <= 0)
-        {
-            LOG_ERROR("[WeightManager] Invalid total_heads/total_kv_heads for bias slicing");
-            return nullptr;
-        }
-        const size_t head_dim = total_size / static_cast<size_t>(total_heads_for_bias);
-
-        if (is_kv_bias)
-        {
-            slice_start = assignment.kv_head_start * head_dim;
-            slice_count = assignment.kv_head_count * head_dim;
-        }
-        else
-        {
-            slice_start = assignment.head_start * head_dim;
-            slice_count = assignment.head_count * head_dim;
         }
 
         // Load full tensor and slice in memory (biases are small)
@@ -1978,64 +2036,10 @@ namespace llaminar2
         size_t row_start = 0;
         size_t row_count = 0;
 
-        // Determine row slice based on weight type
-        if (isQKVWeight(name))
+        // Use config-based dimension type to determine slicing
+        if (!computeSliceBoundaries(name, total_rows, assignment, row_start, row_count))
         {
-            const bool is_kv_weight = (name.find("attn_k.") != std::string::npos ||
-                                       name.find("attn_v.") != std::string::npos);
-
-            // Q/K/V: slice by head ranges
-            // CRITICAL: K/V weights use totalKVHeads(), not totalHeads()!
-            const int total_heads_for_weight = is_kv_weight
-                                                   ? tp_config_->totalKVHeads()
-                                                   : tp_config_->totalHeads();
-            if (total_heads_for_weight <= 0)
-            {
-                LOG_ERROR("[WeightManager] Invalid total_heads/total_kv_heads in TensorParallelConfig");
-                return nullptr;
-            }
-            const size_t head_dim = total_rows / static_cast<size_t>(total_heads_for_weight);
-
-            if (is_kv_weight)
-            {
-                row_start = assignment.kv_head_start * head_dim;
-                row_count = assignment.kv_head_count * head_dim;
-                LOG_TRACE("[WeightManager] KV weight " << name
-                                                       << " total_kv_heads=" << total_heads_for_weight
-                                                       << " head_dim=" << head_dim
-                                                       << " kv_heads=[" << assignment.kv_head_start << ", "
-                                                       << (assignment.kv_head_start + assignment.kv_head_count) << ")"
-                                                       << " -> rows [" << row_start << ", " << (row_start + row_count) << ")");
-            }
-            else
-            {
-                row_start = assignment.head_start * head_dim;
-                row_count = assignment.head_count * head_dim;
-                LOG_TRACE("[WeightManager] Q weight " << name
-                                                      << " total_heads=" << total_heads_for_weight
-                                                      << " head_dim=" << head_dim
-                                                      << " heads=[" << assignment.head_start << ", "
-                                                      << (assignment.head_start + assignment.head_count) << ")"
-                                                      << " -> rows [" << row_start << ", " << (row_start + row_count) << ")");
-            }
-        }
-        else if (isFFNGateUpWeight(name))
-        {
-            row_start = assignment.d_ff_start;
-            row_count = assignment.d_ff_count;
-            LOG_TRACE("[WeightManager] FFN Gate/Up weight " << name
-                                                            << " d_ff=[" << row_start << ", " << (row_start + row_count) << ")");
-        }
-        else if (isLMHeadWeight(name))
-        {
-            row_start = assignment.vocab_start;
-            row_count = assignment.vocab_count;
-            LOG_TRACE("[WeightManager] LM head weight " << name
-                                                        << " vocab=[" << row_start << ", " << (row_start + row_count) << ")");
-        }
-        else
-        {
-            LOG_ERROR("[WeightManager] Unknown column-parallel weight type: " << name);
+            LOG_ERROR("[WeightManager] Failed to compute slice boundaries for 2D column-parallel: " << name);
             return nullptr;
         }
 
@@ -2074,23 +2078,15 @@ namespace llaminar2
     {
         size_t total_rows = dimensions[0];
         size_t cols = dimensions[1];
+        size_t row_start = 0;
+        size_t row_count = 0;
 
-        // For Wo, split rows based on head assignment
-        int total_heads = tp_config_->totalHeads();
-        if (total_heads <= 0)
+        // Use config-based dimension type to determine row slicing
+        if (!computeSliceBoundaries(name, total_rows, assignment, row_start, row_count))
         {
-            LOG_ERROR("[WeightManager] Invalid total_heads for row-parallel: " << name);
+            LOG_ERROR("[WeightManager] Failed to compute slice boundaries for row-parallel: " << name);
             return nullptr;
         }
-        size_t head_dim = total_rows / total_heads;
-
-        size_t row_start = assignment.head_start * head_dim;
-        size_t row_count = assignment.head_count * head_dim;
-
-        LOG_TRACE("[WeightManager] Wo weight " << name
-                                               << " heads=[" << assignment.head_start << ", "
-                                               << (assignment.head_start + assignment.head_count) << ")"
-                                               << " -> rows [" << row_start << ", " << (row_start + row_count) << ")");
 
         auto slice_tensor = loader_.loadTensorRowSlice(
             name, row_start, row_start + row_count, device, WeightPrecision::NATIVE);
@@ -2126,36 +2122,14 @@ namespace llaminar2
         size_t rows = dimensions[0];
         size_t total_cols = dimensions[1];
 
-        // Determine column slice based on weight type
+        // Use config-based dimension type to determine column slicing
         size_t col_start = 0;
         size_t col_count = 0;
 
-        if (isWoWeight(name))
+        if (!computeSliceBoundaries(name, total_cols, assignment, col_start, col_count))
         {
-            // Wo (attn_output): slice by heads to match column-parallel Q/K/V output
-            const int total_heads = tp_config_->totalHeads();
-            if (total_heads <= 0)
-            {
-                LOG_ERROR("[WeightManager] Invalid total_heads for input-parallel Wo: " << name);
-                return nullptr;
-            }
-            const size_t head_dim = total_cols / static_cast<size_t>(total_heads);
-            col_start = assignment.head_start * head_dim;
-            col_count = assignment.head_count * head_dim;
-
-            LOG_TRACE("[WeightManager] Wo weight " << name
-                                                   << " heads=[" << assignment.head_start << ", "
-                                                   << (assignment.head_start + assignment.head_count) << ")"
-                                                   << " cols=[" << col_start << ", " << (col_start + col_count) << ")");
-        }
-        else
-        {
-            // FFN Down: slice by d_ff to match column-parallel Gate/Up output
-            col_start = assignment.d_ff_start;
-            col_count = assignment.d_ff_count;
-
-            LOG_TRACE("[WeightManager] FFN Down weight " << name
-                                                         << " d_ff=[" << col_start << ", " << (col_start + col_count) << ")");
+            LOG_ERROR("[WeightManager] Failed to compute slice boundaries for input-parallel: " << name);
+            return nullptr;
         }
 
         auto slice_tensor = loader_.loadTensorColumnSlice(

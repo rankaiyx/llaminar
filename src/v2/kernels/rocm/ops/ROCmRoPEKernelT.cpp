@@ -125,6 +125,13 @@ extern "C"
         int n_kv_heads,
         int head_dim,
         int device_idx);
+
+    // Workspace-aware inverse frequency population
+    bool hipOps_rope_populate_inv_freq(
+        float *d_inv_freq,
+        int head_dim,
+        float freq_base,
+        int device_idx);
 }
 
 // =========================================================================
@@ -216,8 +223,17 @@ namespace
         {
             if (entry.d_inv_freq)
             {
-                hipSetDevice(key.device_idx);
-                hipFree(entry.d_inv_freq);
+                hipError_t set_err = hipSetDevice(key.device_idx);
+                if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
+                {
+                    // HIP runtime is shutting down, skip cleanup
+                    continue;
+                }
+                hipError_t err = hipFree(entry.d_inv_freq);
+                if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+                {
+                    LOG_WARN("[ROCmRoPE] hipFree(inv_freq) failed: " << hipGetErrorString(err));
+                }
             }
         }
         g_inv_freq_cache.clear();
@@ -252,6 +268,13 @@ namespace llaminar2
                 256, // HIP alignment
                 true // Required
             });
+            // Inverse frequency table - allocated for worst-case head_dim
+            reqs.buffers.push_back({
+                RoPEWorkspaceBuffers::INV_FREQ,
+                static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                256, // HIP alignment
+                true // Required
+            });
 
             return reqs;
         }
@@ -259,6 +282,8 @@ namespace llaminar2
         void ROCmRoPEKernelT<ActivationPrecision::FP32>::bindWorkspace(DeviceWorkspaceManager *ws)
         {
             workspace_ = ws;
+            // Reset inv_freq state when workspace changes
+            inv_freq_initialized_ = false;
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP32>::hasWorkspace() const
@@ -295,12 +320,31 @@ namespace llaminar2
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Get cached inverse frequency table
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, theta_base, dev);
+            // Require workspace to be bound
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Workspace not bound. Call bindWorkspace() first.");
+                return false;
+            }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] INV_FREQ buffer not allocated in workspace");
                 return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != theta_base)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, theta_base, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = theta_base;
             }
 
             return hipOps_rope_fp32_v2(data, nullptr, d_inv_freq, pos_ids, seq_len, num_heads, num_heads, head_dim, dev);
@@ -319,12 +363,31 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            // Get cached inverse frequency table
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, rope_theta, dev);
+            // Require workspace to be bound
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Workspace not bound. Call bindWorkspace() first.");
+                return false;
+            }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] INV_FREQ buffer not allocated in workspace");
                 return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = rope_theta;
             }
 
             return hipOps_rope_fp32_v2(Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
@@ -377,12 +440,31 @@ namespace llaminar2
                 return false;
             }
 
-            // Get cached inverse frequency table
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, rope_theta, dev);
+            // Require workspace to be bound
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Workspace not bound. Call bindWorkspace() first.");
+                return false;
+            }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] INV_FREQ buffer not allocated in workspace");
                 return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = rope_theta;
             }
 
             // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
@@ -400,50 +482,24 @@ namespace llaminar2
             }
 
             // NON-CONTIGUOUS PATH: Need to copy position_ids array (rare: batched with padding)
-            int *d_position_ids = nullptr;
-            size_t pos_bytes = seq_len * sizeof(int);
-            bool using_workspace = false;
-
-            if (workspace_)
-            {
-                d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
-                if (d_position_ids)
-                {
-                    using_workspace = true;
-                }
-            }
-
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
             if (!d_position_ids)
             {
-                // Fallback: allocate temporary (slower path)
-                hipError_t err = hipMalloc(&d_position_ids, pos_bytes);
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to allocate position_ids on GPU: " << hipGetErrorString(err));
-                    return false;
-                }
+                LOG_ERROR("[ROCmRoPEKernelT<FP32>] POSITION_IDS buffer not allocated in workspace");
+                return false;
             }
 
             // Copy position_ids to device
+            size_t pos_bytes = seq_len * sizeof(int);
             hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                if (!using_workspace)
-                    hipFree(d_position_ids);
                 return false;
             }
 
             // Call the optimized kernel
-            bool ok = hipOps_rope_fp32_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
-
-            // Free temporary allocation if not using workspace
-            if (!using_workspace && d_position_ids)
-            {
-                hipFree(d_position_ids);
-            }
-
-            return ok;
+            return hipOps_rope_fp32_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
         }
 
         // =========================================================================
@@ -464,6 +520,11 @@ namespace llaminar2
                                     pos_ids_bytes,
                                     256,
                                     true});
+            // Inverse frequency table - allocated for worst-case head_dim
+            reqs.buffers.push_back({RoPEWorkspaceBuffers::INV_FREQ,
+                                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                                    256,
+                                    true});
 
             return reqs;
         }
@@ -471,6 +532,8 @@ namespace llaminar2
         void ROCmRoPEKernelT<ActivationPrecision::BF16>::bindWorkspace(DeviceWorkspaceManager *ws)
         {
             workspace_ = ws;
+            // Reset inv_freq state when workspace changes
+            inv_freq_initialized_ = false;
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::BF16>::hasWorkspace() const
@@ -503,11 +566,31 @@ namespace llaminar2
             (void)batch_size;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, theta_base, dev);
+            // Require workspace to be bound
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Workspace not bound. Call bindWorkspace() first.");
+                return false;
+            }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] INV_FREQ buffer not allocated in workspace");
                 return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != theta_base)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, theta_base, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = theta_base;
             }
 
             return hipOps_rope_bf16_v2(data, nullptr, d_inv_freq, pos_ids, seq_len, num_heads, num_heads, head_dim, dev);
@@ -526,12 +609,34 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, rope_theta, dev);
-            if (!d_inv_freq)
+            // Require workspace to be bound
+            if (!workspace_)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Workspace not bound. Call bindWorkspace() first.");
                 return false;
             }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
+            if (!d_inv_freq)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] INV_FREQ buffer not allocated in workspace");
+                return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = rope_theta;
+            }
+
+            return hipOps_rope_bf16_v2(Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
 
             return hipOps_rope_bf16_v2(Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
         }
@@ -582,11 +687,31 @@ namespace llaminar2
                 return false;
             }
 
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, rope_theta, dev);
+            // Require workspace to be bound
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Workspace not bound. Call bindWorkspace() first.");
+                return false;
+            }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] INV_FREQ buffer not allocated in workspace");
                 return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = rope_theta;
             }
 
             // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
@@ -603,46 +728,23 @@ namespace llaminar2
             }
 
             // NON-CONTIGUOUS PATH: Need to copy position_ids array
-            int *d_position_ids = nullptr;
-            size_t pos_bytes = seq_len * sizeof(int);
-            bool using_workspace = false;
-
-            if (workspace_)
-            {
-                d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
-                if (d_position_ids)
-                {
-                    using_workspace = true;
-                }
-            }
-
+            // Workspace is already verified above, just get the buffer
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
             if (!d_position_ids)
             {
-                hipError_t err = hipMalloc(&d_position_ids, pos_bytes);
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to allocate position_ids on GPU: " << hipGetErrorString(err));
-                    return false;
-                }
+                LOG_ERROR("[ROCmRoPEKernelT<BF16>] POSITION_IDS buffer not allocated in workspace");
+                return false;
             }
 
+            size_t pos_bytes = seq_len * sizeof(int);
             hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                if (!using_workspace)
-                    hipFree(d_position_ids);
                 return false;
             }
 
-            bool ok = hipOps_rope_bf16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
-
-            if (!using_workspace && d_position_ids)
-            {
-                hipFree(d_position_ids);
-            }
-
-            return ok;
+            return hipOps_rope_bf16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
         }
 
         // =========================================================================
@@ -663,6 +765,11 @@ namespace llaminar2
                                     pos_ids_bytes,
                                     256,
                                     true});
+            // Inverse frequency table - allocated for worst-case head_dim
+            reqs.buffers.push_back({RoPEWorkspaceBuffers::INV_FREQ,
+                                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                                    256,
+                                    true});
 
             return reqs;
         }
@@ -670,6 +777,8 @@ namespace llaminar2
         void ROCmRoPEKernelT<ActivationPrecision::FP16>::bindWorkspace(DeviceWorkspaceManager *ws)
         {
             workspace_ = ws;
+            // Reset inv_freq state when workspace changes
+            inv_freq_initialized_ = false;
         }
 
         bool ROCmRoPEKernelT<ActivationPrecision::FP16>::hasWorkspace() const
@@ -702,11 +811,31 @@ namespace llaminar2
             (void)batch_size;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, theta_base, dev);
+            // Require workspace to be bound
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Workspace not bound. Call bindWorkspace() first.");
+                return false;
+            }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] INV_FREQ buffer not allocated in workspace");
                 return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != theta_base)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, theta_base, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = theta_base;
             }
 
             return hipOps_rope_fp16_v2(data, nullptr, d_inv_freq, pos_ids, seq_len, num_heads, num_heads, head_dim, dev);
@@ -725,11 +854,31 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, rope_theta, dev);
+            // Require workspace to be bound
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Workspace not bound. Call bindWorkspace() first.");
+                return false;
+            }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] INV_FREQ buffer not allocated in workspace");
                 return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = rope_theta;
             }
 
             return hipOps_rope_fp16_v2(Q, K, d_inv_freq, position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
@@ -781,11 +930,31 @@ namespace llaminar2
                 return false;
             }
 
-            float *d_inv_freq = getOrCreateInvFreq(head_dim, rope_theta, dev);
+            // Require workspace to be bound
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Workspace not bound. Call bindWorkspace() first.");
+                return false;
+            }
+
+            float *d_inv_freq = static_cast<float *>(workspace_->getBuffer(RoPEWorkspaceBuffers::INV_FREQ));
             if (!d_inv_freq)
             {
-                LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to get inverse frequency table");
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] INV_FREQ buffer not allocated in workspace");
                 return false;
+            }
+
+            // Initialize inv_freq if needed
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            {
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
+                {
+                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to populate inv_freq");
+                    return false;
+                }
+                inv_freq_initialized_ = true;
+                inv_freq_head_dim_ = head_dim;
+                inv_freq_theta_ = rope_theta;
             }
 
             // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
@@ -802,46 +971,23 @@ namespace llaminar2
             }
 
             // NON-CONTIGUOUS PATH: Need to copy position_ids array
-            int *d_position_ids = nullptr;
-            size_t pos_bytes = seq_len * sizeof(int);
-            bool using_workspace = false;
-
-            if (workspace_)
-            {
-                d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
-                if (d_position_ids)
-                {
-                    using_workspace = true;
-                }
-            }
-
+            // Workspace is already verified above, just get the buffer
+            int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
             if (!d_position_ids)
             {
-                hipError_t err = hipMalloc(&d_position_ids, pos_bytes);
-                if (err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to allocate position_ids on GPU: " << hipGetErrorString(err));
-                    return false;
-                }
+                LOG_ERROR("[ROCmRoPEKernelT<FP16>] POSITION_IDS buffer not allocated in workspace");
+                return false;
             }
 
+            size_t pos_bytes = seq_len * sizeof(int);
             hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
-                if (!using_workspace)
-                    hipFree(d_position_ids);
                 return false;
             }
 
-            bool ok = hipOps_rope_fp16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
-
-            if (!using_workspace && d_position_ids)
-            {
-                hipFree(d_position_ids);
-            }
-
-            return ok;
+            return hipOps_rope_fp16_v2(d_Q, d_K, d_inv_freq, d_position_ids, seq_len, n_heads, n_kv_heads, head_dim, dev);
         }
 
     } // namespace rocm

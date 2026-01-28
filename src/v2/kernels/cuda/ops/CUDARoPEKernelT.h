@@ -56,8 +56,12 @@ namespace llaminar2
         public:
             using StorageType = float;
 
+            /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
+            static constexpr int MAX_HALF_DIM = 128;
+
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
             ~CUDARoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -68,16 +72,29 @@ namespace llaminar2
                 (void)n;
                 (void)k;
                 WorkspaceRequirements reqs;
+                // Position IDs buffer - m is max sequence length
                 reqs.buffers.push_back({
                     RoPEWorkspaceBuffers::POSITION_IDS,
                     static_cast<size_t>(m) * sizeof(int),
                     256, // CUDA alignment
                     true // Required
                 });
+                // Inverse frequency table - allocated for worst-case head_dim
+                reqs.buffers.push_back({
+                    RoPEWorkspaceBuffers::INV_FREQ,
+                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                    256, // CUDA alignment
+                    true // Required
+                });
                 return reqs;
             }
 
-            void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override
+            {
+                workspace_ = workspace;
+                // Reset inv_freq state when workspace changes
+                inv_freq_initialized_ = false;
+            }
             bool hasWorkspace() const override { return workspace_ != nullptr; }
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
@@ -245,6 +262,11 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
+
+            // Inverse frequency cache state (for workspace-based allocation)
+            mutable bool inv_freq_initialized_;
+            mutable int inv_freq_head_dim_;
+            mutable float inv_freq_theta_;
         };
 
         // =========================================================================
@@ -257,8 +279,12 @@ namespace llaminar2
         public:
             using StorageType = uint16_t;
 
+            /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
+            static constexpr int MAX_HALF_DIM = 128;
+
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
             ~CUDARoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -269,16 +295,29 @@ namespace llaminar2
                 (void)n;
                 (void)k;
                 WorkspaceRequirements reqs;
+                // Position IDs buffer - m is max sequence length
                 reqs.buffers.push_back({
                     RoPEWorkspaceBuffers::POSITION_IDS,
                     static_cast<size_t>(m) * sizeof(int),
                     256, // CUDA alignment
                     true // Required
                 });
+                // Inverse frequency table - allocated for worst-case head_dim
+                reqs.buffers.push_back({
+                    RoPEWorkspaceBuffers::INV_FREQ,
+                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                    256, // CUDA alignment
+                    true // Required
+                });
                 return reqs;
             }
 
-            void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override
+            {
+                workspace_ = workspace;
+                // Reset inv_freq state when workspace changes
+                inv_freq_initialized_ = false;
+            }
             bool hasWorkspace() const override { return workspace_ != nullptr; }
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
@@ -444,6 +483,11 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
+
+            // Inverse frequency cache state (for workspace-based allocation)
+            mutable bool inv_freq_initialized_;
+            mutable int inv_freq_head_dim_;
+            mutable float inv_freq_theta_;
         };
 
         // =========================================================================
@@ -456,8 +500,12 @@ namespace llaminar2
         public:
             using StorageType = uint16_t;
 
+            /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
+            static constexpr int MAX_HALF_DIM = 128;
+
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
             ~CUDARoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -468,16 +516,29 @@ namespace llaminar2
                 (void)n;
                 (void)k;
                 WorkspaceRequirements reqs;
+                // Position IDs buffer - m is max sequence length
                 reqs.buffers.push_back({
                     RoPEWorkspaceBuffers::POSITION_IDS,
                     static_cast<size_t>(m) * sizeof(int),
                     256, // CUDA alignment
                     true // Required
                 });
+                // Inverse frequency table - allocated for worst-case head_dim
+                reqs.buffers.push_back({
+                    RoPEWorkspaceBuffers::INV_FREQ,
+                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                    256, // CUDA alignment
+                    true // Required
+                });
                 return reqs;
             }
 
-            void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override
+            {
+                workspace_ = workspace;
+                // Reset inv_freq state when workspace changes
+                inv_freq_initialized_ = false;
+            }
             bool hasWorkspace() const override { return workspace_ != nullptr; }
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
@@ -643,6 +704,11 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_;
+
+            // Inverse frequency cache state (for workspace-based allocation)
+            mutable bool inv_freq_initialized_;
+            mutable int inv_freq_head_dim_;
+            mutable float inv_freq_theta_;
         };
 
     } // namespace cuda

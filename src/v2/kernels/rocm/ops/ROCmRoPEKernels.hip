@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <vector>
 
 namespace
 {
@@ -1386,6 +1387,48 @@ extern "C"
             return false;
         }
         return true;
+    }
+
+    /**
+     * @brief Populate inverse frequency table in device memory (workspace-aware)
+     *
+     * This function computes the inverse frequency table on the host and copies
+     * it to the provided device buffer. Used for workspace-based allocation where
+     * the caller owns the device memory.
+     *
+     * @param d_inv_freq Device pointer to store inverse frequencies [head_dim/2 floats]
+     * @param head_dim Head dimension
+     * @param freq_base RoPE frequency base (typically 10000.0)
+     * @param device_idx HIP device index
+     * @return true on success
+     *
+     * Formula: inv_freq[i] = 1.0 / (freq_base^(2i/head_dim))
+     */
+    bool hipOps_rope_populate_inv_freq(
+        float *d_inv_freq,
+        int head_dim,
+        float freq_base,
+        int device_idx)
+    {
+        if (!d_inv_freq)
+            return false;
+
+        const int half_dim = head_dim / 2;
+
+        // Compute on host
+        std::vector<float> h_inv_freq(half_dim);
+        const float log_base = std::log(freq_base);
+        for (int i = 0; i < half_dim; ++i)
+        {
+            float exponent = (2.0f * i) / head_dim;
+            h_inv_freq[i] = std::exp(-log_base * exponent);
+        }
+
+        // Copy to device
+        hipSetDevice(device_idx);
+        hipError_t err = hipMemcpy(d_inv_freq, h_inv_freq.data(),
+                                   half_dim * sizeof(float), hipMemcpyHostToDevice);
+        return err == hipSuccess;
     }
 
 } // extern "C"

@@ -1869,8 +1869,19 @@ extern "C"
         if (d_ptr)
         {
             // Set device before freeing - required by HIP/CUDA
-            hipSetDevice(rocm_device_id);
-            hipFree(d_ptr);
+            hipError_t set_err = hipSetDevice(rocm_device_id);
+            if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
+            {
+                // HIP runtime is shutting down, skip cleanup
+                // This is normal during static destruction at program exit
+                return;
+            }
+            hipError_t err = hipFree(d_ptr);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                // Only log actual errors, not shutdown-related ones
+                fprintf(stderr, "WARNING: hipFree failed: %s\n", hipGetErrorString(err));
+            }
         }
     }
 

@@ -6,11 +6,15 @@
 #pragma once
 
 #include "../IComputeStage.h"
+#include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include <vector>
+#include <memory>
 
 namespace llaminar2
 {
+    // Forward declarations
+    class ITensorRoPE;
 
     /**
      * @brief Rotary position encoding stage
@@ -19,7 +23,7 @@ namespace llaminar2
      * The tensor's native_type() determines precision dispatch.
      * Uses IActivationTensor::applyRoPE() for polymorphic device dispatch.
      */
-    class RoPEStage : public IComputeStage
+    class RoPEStage : public IComputeStage, public IWorkspaceConsumerStage
     {
     public:
         struct Params
@@ -74,8 +78,14 @@ namespace llaminar2
 
         const Params &getParams() const { return params_; }
 
+        // IWorkspaceConsumerStage implementation
+        IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+
     private:
         Params params_;
+
+        // Cached RoPE kernel for workspace binding
+        mutable std::unique_ptr<ITensorRoPE> cached_kernel_;
 
         // Mutable cache for getDumpInfo() to store transposed Q16 output
         // HybridQ16 RoPE outputs HEAD_MAJOR layout, but snapshot comparison expects SEQ_MAJOR

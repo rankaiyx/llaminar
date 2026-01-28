@@ -342,7 +342,13 @@ namespace llaminar2
     template <ActivationPrecision Precision>
     CUDARingKVCache<Precision>::~CUDARingKVCache()
     {
-        cudaSetDevice(device_id_);
+        // Check if CUDA runtime is shutting down
+        cudaError_t set_err = cudaSetDevice(device_id_);
+        if (set_err == cudaErrorCudartUnloading || set_err == cudaErrorNoDevice)
+        {
+            // Runtime is shutting down, skip cleanup
+            return;
+        }
 
         for (auto &layer_entries : entries_)
         {
@@ -376,13 +382,37 @@ namespace llaminar2
     void CUDARingKVCache<Precision>::free_entry(EntryT &entry)
     {
         if (entry.d_K)
-            cudaFree(entry.d_K);
+        {
+            cudaError_t err = cudaFree(entry.d_K);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: cudaFree(d_K) failed: %s\n", cudaGetErrorString(err));
+            }
+        }
         if (entry.d_V)
-            cudaFree(entry.d_V);
+        {
+            cudaError_t err = cudaFree(entry.d_V);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: cudaFree(d_V) failed: %s\n", cudaGetErrorString(err));
+            }
+        }
         if (entry.d_K_scratch)
-            cudaFree(entry.d_K_scratch);
+        {
+            cudaError_t err = cudaFree(entry.d_K_scratch);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: cudaFree(d_K_scratch) failed: %s\n", cudaGetErrorString(err));
+            }
+        }
         if (entry.d_V_scratch)
-            cudaFree(entry.d_V_scratch);
+        {
+            cudaError_t err = cudaFree(entry.d_V_scratch);
+            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: cudaFree(d_V_scratch) failed: %s\n", cudaGetErrorString(err));
+            }
+        }
 
         entry.d_K = nullptr;
         entry.d_V = nullptr;

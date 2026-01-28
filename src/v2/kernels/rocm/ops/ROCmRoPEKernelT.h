@@ -58,8 +58,12 @@ namespace llaminar2
         public:
             using StorageType = float;
 
+            /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
+            static constexpr int MAX_HALF_DIM = 128;
+
             explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
             ~ROCmRoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -196,7 +200,12 @@ namespace llaminar2
             // Workspace state
             DeviceWorkspaceManager *workspace_ = nullptr;
 
-            // Inverse frequency cache (shared across all instances for same config)
+            // Workspace-based inverse frequency state (v3: tracked per instance)
+            mutable bool inv_freq_initialized_ = false;
+            mutable int inv_freq_head_dim_ = 0;
+            mutable float inv_freq_theta_ = 0.0f;
+
+            // Legacy inverse frequency cache (shared across all instances for same config)
             // Key: (head_dim << 32) | device_idx, Value: device pointer
             static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
         };
@@ -211,8 +220,12 @@ namespace llaminar2
         public:
             using StorageType = uint16_t;
 
+            /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
+            static constexpr int MAX_HALF_DIM = 128;
+
             explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
             ~ROCmRoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -324,6 +337,11 @@ namespace llaminar2
             float rope_theta_;
             DeviceWorkspaceManager *workspace_ = nullptr;
 
+            // Workspace-based inverse frequency state (v3: tracked per instance)
+            mutable bool inv_freq_initialized_ = false;
+            mutable int inv_freq_head_dim_ = 0;
+            mutable float inv_freq_theta_ = 0.0f;
+
             static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
         };
 
@@ -337,8 +355,12 @@ namespace llaminar2
         public:
             using StorageType = uint16_t;
 
+            /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
+            static constexpr int MAX_HALF_DIM = 128;
+
             explicit ROCmRoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
+                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
             ~ROCmRoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -449,6 +471,11 @@ namespace llaminar2
             int device_idx_;
             float rope_theta_;
             DeviceWorkspaceManager *workspace_ = nullptr;
+
+            // Workspace-based inverse frequency state (v3: tracked per instance)
+            mutable bool inv_freq_initialized_ = false;
+            mutable int inv_freq_head_dim_ = 0;
+            mutable float inv_freq_theta_ = 0.0f;
 
             static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
         };
