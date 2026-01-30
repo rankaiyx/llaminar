@@ -337,7 +337,8 @@ namespace llaminar2
                 vectorAddInplaceKernel_f32<<<blocks, threadsPerBlock, 0, stream>>>(output, input, count);
             }
 
-            cudaError_t err = cudaGetLastError();
+            (void)cudaGetLastError();  // Clear stale errors
+        cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
                 fprintf(stderr, "[CUDAVectorAdd] Kernel launch error: %s (code %d)\n",

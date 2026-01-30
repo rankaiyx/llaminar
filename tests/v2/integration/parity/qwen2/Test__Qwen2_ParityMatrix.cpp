@@ -178,8 +178,9 @@ TEST_P(Qwen2ParityMatrixTest, DecodeParity)
 {
     if (cfg().is_local_tp())
     {
-        // LocalTP decode parity not yet implemented
-        GTEST_SKIP() << "LocalTP decode parity not yet implemented";
+        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
+        auto summary = runTPDecodeParity();
+        assertDecodeParity(summary);
     }
     else
     {

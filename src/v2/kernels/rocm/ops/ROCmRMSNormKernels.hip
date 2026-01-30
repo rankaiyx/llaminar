@@ -247,6 +247,9 @@ extern "C" bool hipOps_rmsnorm_fp32(
     dim3 block(threads_per_block);
     size_t shared_mem_size = threads_per_block * sizeof(float);
 
+    // Clear any stale error from previous operations (e.g., heterogeneous backend tests)
+    (void)hipGetLastError();
+
     rocm_rmsnorm_fp32_kernel<<<grid, block, shared_mem_size>>>(
         input, gamma, output, cols, epsilon);
 
@@ -288,6 +291,9 @@ extern "C" bool hipOps_rmsnorm_bf16(
     dim3 block(threads_per_block);
     size_t shared_mem_size = threads_per_block * sizeof(float);
 
+    // Clear any stale error from previous operations
+    (void)hipGetLastError();
+
     rocm_rmsnorm_bf16_kernel<<<grid, block, shared_mem_size>>>(
         input, gamma, output, cols, epsilon);
 
@@ -328,6 +334,9 @@ extern "C" bool hipOps_rmsnorm_fp16(
     dim3 grid(rows);
     dim3 block(threads_per_block);
     size_t shared_mem_size = threads_per_block * sizeof(float);
+
+    // Clear any stale error from previous operations
+    (void)hipGetLastError();
 
     rocm_rmsnorm_fp16_kernel<<<grid, block, shared_mem_size>>>(
         input, gamma, output, cols, epsilon);

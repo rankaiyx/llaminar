@@ -87,6 +87,7 @@ extern "C"
 
         residual_add_fp32_kernel<<<num_blocks, threads_per_block>>>(input, residual, output, size);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -110,6 +111,7 @@ extern "C"
 
         residual_add_bf16_kernel<<<num_blocks, threads_per_block>>>(input, residual, output, size);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -133,6 +135,7 @@ extern "C"
 
         residual_add_fp16_kernel<<<num_blocks, threads_per_block>>>(input, residual, output, size);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

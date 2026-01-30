@@ -1070,6 +1070,7 @@ extern "C"
         }
 
         cudaDeviceSynchronize();
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1101,6 +1102,7 @@ extern "C"
         rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1133,6 +1135,7 @@ extern "C"
         rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1174,6 +1177,7 @@ extern "C"
         }
 
         cudaDeviceSynchronize();
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1205,6 +1209,7 @@ extern "C"
         rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1237,6 +1242,7 @@ extern "C"
         rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1278,6 +1284,7 @@ extern "C"
         }
 
         cudaDeviceSynchronize();
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1309,6 +1316,7 @@ extern "C"
         rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1341,6 +1349,7 @@ extern "C"
         rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1462,6 +1471,7 @@ extern "C"
         // Synchronize to ensure kernel completes before returning
         cudaDeviceSynchronize();
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1556,6 +1566,7 @@ extern "C"
                 Q, d_inv_freq, d_position_ids, seq_len, n_heads, head_dim);
         }
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1648,6 +1659,7 @@ extern "C"
                 Q, d_inv_freq, d_position_ids, seq_len, n_heads, head_dim);
         }
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1699,6 +1711,7 @@ extern "C"
         rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1734,6 +1747,7 @@ extern "C"
         rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1769,6 +1783,7 @@ extern "C"
         rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1809,6 +1824,7 @@ extern "C"
         rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1845,6 +1861,7 @@ extern "C"
         rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1881,6 +1898,7 @@ extern "C"
         rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

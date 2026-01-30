@@ -147,6 +147,9 @@ extern "C"
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
 
+        // Clear any stale error from previous operations
+        (void)hipGetLastError();
+
         hipLaunchKernelGGL(rocm_swiglu_fp32_kernel, dim3(num_blocks), dim3(threads_per_block), 0, 0,
                            gate, up, output, size);
 
@@ -171,6 +174,9 @@ extern "C"
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
 
+        // Clear any stale error from previous operations
+        (void)hipGetLastError();
+
         hipLaunchKernelGGL(rocm_swiglu_bf16_kernel, dim3(num_blocks), dim3(threads_per_block), 0, 0,
                            gate, up, output, size);
 
@@ -194,6 +200,9 @@ extern "C"
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
+
+        // Clear any stale error from previous operations
+        (void)hipGetLastError();
 
         hipLaunchKernelGGL(rocm_swiglu_fp16_kernel, dim3(num_blocks), dim3(threads_per_block), 0, 0,
                            gate, up, output, size);

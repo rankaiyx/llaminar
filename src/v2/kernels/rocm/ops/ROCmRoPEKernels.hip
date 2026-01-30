@@ -1045,6 +1045,7 @@ extern "C"
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1086,6 +1087,7 @@ extern "C"
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1127,6 +1129,7 @@ extern "C"
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1175,6 +1178,7 @@ extern "C"
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1211,6 +1215,7 @@ extern "C"
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1247,6 +1252,7 @@ extern "C"
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1298,6 +1304,7 @@ extern "C"
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1339,6 +1346,7 @@ extern "C"
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1380,6 +1388,7 @@ extern "C"
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {

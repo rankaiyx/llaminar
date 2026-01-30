@@ -1434,6 +1434,7 @@ extern "C"
             dim3(grid_size), dim3(block_size), 0, 0,
             d_C_int32, d_E_fp32, d_scale_A, d_scale_B, M, N);
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1876,6 +1877,7 @@ extern "C"
             d_A_fp32, d_A_int8, d_scales_A, M, K);
 
         // Check for launch errors
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -2188,6 +2190,7 @@ extern "C"
             d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
             M, N, alpha, beta, d_C_existing, d_bias);
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -2243,6 +2246,7 @@ extern "C"
             dim3(grid_size), dim3(block_size), 0, 0,
             d_output, d_bias, M, N);
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {

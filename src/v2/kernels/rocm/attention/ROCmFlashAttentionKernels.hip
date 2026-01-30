@@ -914,6 +914,7 @@ extern "C"
             softmax_scale, causal, window_size, position_offset,
             tile_q, tile_kv);
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -970,6 +971,7 @@ extern "C"
             O_partial, m_partial, l_partial, O,
             n_heads, head_dim, num_splits);
 
+        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {

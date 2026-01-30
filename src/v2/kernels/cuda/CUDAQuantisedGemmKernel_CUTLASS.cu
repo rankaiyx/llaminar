@@ -410,6 +410,7 @@ extern "C"
             d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
             M, N, alpha, beta, d_C_existing, d_bias);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -452,6 +453,7 @@ extern "C"
 
         quantize_activations_kernel<<<grid, block>>>(d_A_fp32, d_A_int8, d_scales_A, M, K);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

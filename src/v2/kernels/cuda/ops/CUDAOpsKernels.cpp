@@ -799,7 +799,15 @@ namespace llaminar2
     {
         (void)mpi_ctx;
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
-        (void)dev; // Device selection handled by caller setting active device
+
+        // Set device context before kernel launch
+        cudaError_t set_err = cudaSetDevice(dev);
+        if (set_err != cudaSuccess)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] cudaSetDevice(%d) failed: %s\n",
+                    dev, cudaGetErrorString(set_err));
+            return false;
+        }
 
         CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
         cudaError_t err = launch_embedding_lookup(embed_data, token_ids, output,
@@ -906,9 +914,15 @@ namespace llaminar2
             return false;
         }
 
-        // Determine target CUDA device
+        // Determine target CUDA device and set context
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
-        (void)dev; // Used below for device selection if needed
+        cudaError_t set_err = cudaSetDevice(dev);
+        if (set_err != cudaSuccess)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] cudaSetDevice(%d) failed: %s\n",
+                    dev, cudaGetErrorString(set_err));
+            return false;
+        }
 
         // =====================================================================
         // Step 1: Get token_ids buffer from workspace and copy data

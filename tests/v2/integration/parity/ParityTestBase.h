@@ -73,6 +73,13 @@
 #include "execution/TPSnapshot.h"
 #include "execution/MultiDeviceOrchestrator.h"
 #include "kernels/KernelFactory.h"
+#include "backends/BackendManager.h"
+#ifdef HAVE_CUDA
+#include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
+#endif
+#ifdef HAVE_ROCM
+#include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
+#endif
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
 #include "backends/DeviceId.h"
@@ -983,9 +990,37 @@ namespace llaminar2::test::parity
             // clearCache() would be accessing freed memory (use-after-free).
             llaminar::v2::kernels::KernelFactory::clearCache();
 
+            // CRITICAL: Clear embedding caches to prevent test pollution!
+            // The embedding kernels cache workspace-to-tensor mappings statically.
+            // Without clearing, subsequent tests may use stale cached pointers.
+#ifdef HAVE_CUDA
+            llaminar2::CUDAEmbeddingKernelT::clearGlobalEmbeddingCache();
+#endif
+#ifdef HAVE_ROCM
+            llaminar2::ROCmEmbeddingKernelT::clearGlobalEmbeddingCache();
+#endif
+
             model_ctx_.reset();
             runner_.reset();
             pytorch_snapshots_.clear();
+
+            // CRITICAL: Synchronize and clear error state on all GPU devices!
+            // After heterogeneous tests (CUDA+ROCm), the HIP runtime can be left
+            // in a bad state that causes subsequent ROCm-only tests to fail with
+            // "invalid argument" on kernel launch. Synchronizing each backend
+            // cleans up any lingering issues.
+#ifdef HAVE_CUDA
+            if (auto *cuda_backend = llaminar2::getCUDABackend())
+            {
+                cuda_backend->synchronize(0);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (auto *rocm_backend = llaminar2::getROCmBackend())
+            {
+                rocm_backend->synchronize(0);
+            }
+#endif
         }
 
         /**

@@ -196,6 +196,7 @@ extern "C"
         rmsnorm_fp32_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(
             input, gamma, output, cols, epsilon);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -222,6 +223,7 @@ extern "C"
         rmsnorm_bf16_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(
             input, gamma, output, cols, epsilon);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -248,6 +250,7 @@ extern "C"
         rmsnorm_fp16_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(
             input, gamma, output, cols, epsilon);
 
+        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

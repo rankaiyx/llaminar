@@ -237,6 +237,9 @@ extern "C"
         int d_model,
         hipStream_t stream)
     {
+        // Clear any stale error from previous operations (e.g., heterogeneous backend tests)
+        (void)hipGetLastError();
+
         int total_elements = num_tokens * d_model;
         int block_size = 256;
         int grid_size = (total_elements + block_size - 1) / block_size;
@@ -259,6 +262,9 @@ extern "C"
         int d_model,
         hipStream_t stream)
     {
+        // Clear any stale error from previous operations
+        (void)hipGetLastError();
+
         int total_elements = num_tokens * d_model;
         int block_size = 256;
         int grid_size = (total_elements + block_size - 1) / block_size;
@@ -281,6 +287,9 @@ extern "C"
         int d_model,
         hipStream_t stream)
     {
+        // Clear any stale error from previous operations
+        (void)hipGetLastError();
+
         int total_elements = num_tokens * d_model;
         int block_size = 256;
         int grid_size = (total_elements + block_size - 1) / block_size;
@@ -310,6 +319,9 @@ extern "C"
             fprintf(stderr, "[ROCm] Embedding Q8_1 requires d_model to be multiple of 32, got %d\n", d_model);
             return hipErrorInvalidValue;
         }
+
+        // Clear any stale error from previous operations
+        (void)hipGetLastError();
 
         int blocks_per_row = d_model / 32;
         // One block per token, one thread per Q8_1 block

@@ -130,6 +130,7 @@ bool rocmOps_residual_add_fp32(
         dim3(num_blocks), dim3(threads_per_block), 0, 0,
         input, residual, output, size);
 
+    (void)hipGetLastError();  // Clear stale errors
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
@@ -156,6 +157,7 @@ bool rocmOps_residual_add_bf16(
         dim3(num_blocks), dim3(threads_per_block), 0, 0,
         input, residual, output, size);
 
+    (void)hipGetLastError();  // Clear stale errors
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
@@ -182,6 +184,7 @@ bool rocmOps_residual_add_fp16(
         dim3(num_blocks), dim3(threads_per_block), 0, 0,
         input, residual, output, size);
 
+    (void)hipGetLastError();  // Clear stale errors
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
