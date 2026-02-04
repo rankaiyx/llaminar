@@ -13,15 +13,23 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
 #include "../../backends/ComputeBackend.h"
-#include "../../execution/InferenceMode.h"
+#include "../../execution/config/InferenceMode.h"
 #include "../../tensors/TensorSlice.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/MPIStrategy.h"
-#include "../../execution/GraphBuildUtils.h"
-#include "../../execution/RuntimeConfig.h"
+#include "../../execution/local_execution/graph/GraphBuildUtils.h"
+#include "../../execution/config/RuntimeConfig.h"
+#include "../../collective/ILocalTPContext.h"
+#include "../../collective/ILocalPPContext.h"
+#include "../../collective/ITPContext.h"
+#include "../../collective/BackendRouter.h"
+#include "../../execution/compute_stages/stages/TPAllreduceStage.h"
+#include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
+#include "../../config/PipelineConfig.h"
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <stdexcept>
 
 namespace llaminar2
@@ -71,6 +79,24 @@ namespace llaminar2
                                                                      << " default_device=" << config_.default_device.to_string());
 
         LOG_DEBUG("[Qwen2Graph] Initialized (layer-only)");
+    }
+
+    // =============================================================================
+    // Qwen2GraphConfig Helper Methods
+    // =============================================================================
+
+    bool Qwen2GraphConfig::hasUnifiedPP() const
+    {
+        return pipeline_config != nullptr && pipeline_config->hasPP();
+    }
+
+    DeviceId Qwen2GraphConfig::getDeviceForLayer(int layer_idx) const
+    {
+        if (pipeline_config)
+        {
+            return pipeline_config->getDeviceForLayer(layer_idx);
+        }
+        return default_device;
     }
 
     // =============================================================================
@@ -346,6 +372,9 @@ namespace llaminar2
             allgather_params.full_output = buffers_.logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+            // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
+            // Multi-domain TP typically doesn't route LM head to a specific domain
+            allgather_params.domain = nullptr;
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -358,6 +387,763 @@ namespace llaminar2
 
         LOG_DEBUG("[Qwen2Graph] Built full forward graph with "
                   << graph.size() << " nodes");
+
+        return graph;
+    }
+
+    // =========================================================================
+    // Partial Forward Graph Building (Pipeline Parallelism)
+    // =========================================================================
+
+    ComputeGraph Qwen2Graph::buildPartialForwardGraph(
+        const Qwen2ForwardInput &input,
+        Qwen2ForwardOutput &output,
+        int first_layer,
+        int last_layer,
+        bool has_embedding,
+        bool has_lm_head)
+    {
+        LOG_DEBUG("[Qwen2Graph] Building partial forward graph: "
+                  << "batch_size=" << input.batch_size
+                  << ", seq_len=" << input.seq_len
+                  << ", layers=[" << first_layer << ", " << last_layer << ")"
+                  << ", has_embedding=" << has_embedding
+                  << ", has_lm_head=" << has_lm_head);
+
+        // Validate layer range
+        if (first_layer < 0 || last_layer > config_.n_layers || first_layer >= last_layer)
+        {
+            LOG_ERROR("[Qwen2Graph] Invalid layer range: [" << first_layer << ", " << last_layer
+                                                            << ") for model with " << config_.n_layers << " layers");
+            throw std::invalid_argument("Invalid layer range for partial forward graph");
+        }
+
+        // Validate required weights based on configuration
+        if (has_embedding && !weights_.embedding_table)
+        {
+            LOG_ERROR("[Qwen2Graph] Embedding weights required but not set");
+            throw std::runtime_error("Qwen2Graph embedding weights not initialized");
+        }
+        if (has_lm_head && (!weights_.final_norm || !weights_.lm_head))
+        {
+            LOG_ERROR("[Qwen2Graph] LM head weights required but not set");
+            throw std::runtime_error("Qwen2Graph LM head weights not initialized");
+        }
+        if (!weights_.get_layer_weights)
+        {
+            LOG_ERROR("[Qwen2Graph] Layer weight accessor not set");
+            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+        }
+
+        // Validate buffers
+        if (has_embedding && !buffers_.current_hidden && !buffers_.layer_buffers.residual)
+        {
+            LOG_ERROR("[Qwen2Graph] Hidden buffer required for embedding output");
+            throw std::runtime_error("Qwen2Graph hidden buffer not initialized");
+        }
+        if (has_lm_head && !buffers_.logits)
+        {
+            LOG_ERROR("[Qwen2Graph] Logits buffer required for LM head output");
+            throw std::runtime_error("Qwen2Graph logits buffer not initialized");
+        }
+
+        DeviceId device = config_.default_device;
+        int total_tokens = input.batch_size * input.seq_len;
+
+        ComputeGraph graph;
+        std::string prev_node;
+
+        // -------------------------------------------------------------------------
+        // Stage 1: Embedding Lookup (optional - only for first PP stage)
+        // -------------------------------------------------------------------------
+        if (has_embedding)
+        {
+            // For HybridQ16 mode: output to Q16_1 residual buffer (the residual stream)
+            // For other modes: output to FP32 current_hidden
+            InferenceMode full_pass_inference_mode(config_.activation_precision);
+            TensorBase *embed_output = buffers_.layer_buffers.residual &&
+                                               full_pass_inference_mode.isHybridQ16()
+                                           ? buffers_.layer_buffers.residual
+                                           : buffers_.current_hidden;
+
+            EmbeddingStage::Params embed_params;
+            embed_params.embed_table = weights_.embedding_table;
+            embed_params.token_ids = input.token_ids;
+            embed_params.output = embed_output;
+            embed_params.num_tokens = total_tokens;
+            embed_params.d_model = config_.d_model;
+            embed_params.vocab_size = config_.vocab_size;
+            embed_params.device_id = config_.default_device;
+
+            graph.addNode("embedding",
+                          ComputeStageFactory::createEmbedding(embed_params),
+                          device);
+            prev_node = "embedding";
+        }
+        else if (input.external_hidden_state)
+        {
+            // -----------------------------------------------------------------
+            // PP middle/final stage: Use external hidden state as starting point
+            // The external_hidden_state tensor contains activations from the
+            // previous PP stage. We need to copy it to our working buffer if
+            // they're different.
+            // -----------------------------------------------------------------
+            InferenceMode full_pass_inference_mode(config_.activation_precision);
+            TensorBase *working_buffer = buffers_.layer_buffers.residual &&
+                                                 full_pass_inference_mode.isHybridQ16()
+                                             ? buffers_.layer_buffers.residual
+                                             : buffers_.current_hidden;
+
+            // Check if external buffer differs from working buffer
+            if (input.external_hidden_state != working_buffer)
+            {
+                LOG_DEBUG("[Qwen2Graph] PP middle stage: copying external hidden state to working buffer");
+
+                // NOTE: TensorCopyStage is not yet implemented. For now, we perform
+                // the copy inline. In Phase 3, we should add TensorCopyStage for
+                // proper graph-based memory transfer with device awareness.
+
+                size_t copy_bytes = static_cast<size_t>(total_tokens * config_.d_model);
+                if (full_pass_inference_mode.isHybridQ16())
+                {
+                    // Q16_1: copy the raw Q16_1 blocks
+                    // Block size = 32 elements, so num_blocks = copy_elements / 32
+                    size_t num_blocks = (copy_bytes + 31) / 32;
+                    copy_bytes = num_blocks * sizeof(Q16_1Block);
+                }
+                else
+                {
+                    // FP32: copy floats
+                    copy_bytes *= sizeof(float);
+                }
+
+                // Device-aware copy: handle GPU coherence for PP decode
+                // The external_hidden_state may be GPU-authoritative from previous PP stage
+                if (config_.default_device.is_gpu())
+                {
+                    // GPU execution path: handle coherence properly
+                    // For PP transfers, the external_hidden_state may be:
+                    // 1. BAR-backed (transferred via PCIe BAR) - already accessible from target
+                    // 2. Regular GPU tensor - need ensureOnDevice()
+
+                    DeviceId target_device = config_.default_device;
+                    const void *src_ptr = nullptr;
+
+                    // Check if source is BAR-backed (from PCIe BAR transfer)
+                    if (input.external_hidden_state->isBARBacked())
+                    {
+                        // BAR-backed tensor: get the appropriate pointer for the target device
+                        if (target_device.is_rocm())
+                        {
+                            // For ROCm target, use the BAR address directly (for D2D copy)
+                            // The rocm_data_ptr() might not be available (HIP staging not allocated)
+                            // but bar_address() gives us the BAR mmap address usable with hipMemcpy
+                            src_ptr = input.external_hidden_state->bar_address();
+                            if (!src_ptr)
+                            {
+                                // Fallback to gpu_data_ptr() which might be the CUDA-accessible pointer
+                                src_ptr = input.external_hidden_state->gpu_data_ptr();
+                            }
+                        }
+                        else
+                        {
+                            // For CUDA target, use the regular gpu_data_ptr()
+                            src_ptr = input.external_hidden_state->gpu_data_ptr();
+                        }
+                        LOG_DEBUG("[Qwen2Graph] PP copy: source is BAR-backed, src_ptr=" << src_ptr);
+                    }
+                    else
+                    {
+                        // Regular GPU tensor: ensure it's on the target device
+                        if (!input.external_hidden_state->ensureOnDevice(target_device))
+                        {
+                            LOG_ERROR("[Qwen2Graph] Failed to ensure external_hidden_state on "
+                                      << target_device.toString());
+                            throw std::runtime_error("Failed to upload external_hidden_state to device");
+                        }
+                        src_ptr = input.external_hidden_state->gpu_data_ptr();
+                    }
+
+                    if (!src_ptr)
+                    {
+                        LOG_ERROR("[Qwen2Graph] Source pointer null for PP copy");
+                        throw std::runtime_error("Source pointer not available for PP copy");
+                    }
+
+                    // Allocate destination on device (don't upload stale host data)
+                    if (!working_buffer->allocateOnDevice(target_device))
+                    {
+                        LOG_ERROR("[Qwen2Graph] Failed to allocate working_buffer on "
+                                  << target_device.toString());
+                        throw std::runtime_error("Failed to allocate working_buffer on device");
+                    }
+
+                    void *dst_ptr = working_buffer->gpu_data_ptr();
+                    if (!dst_ptr)
+                    {
+                        LOG_ERROR("[Qwen2Graph] Destination pointer null for PP copy");
+                        throw std::runtime_error("Destination pointer not available for PP copy");
+                    }
+
+                    // Use GlobalBackendRouter for device-agnostic copy
+                    auto *router = GlobalBackendRouter::get();
+                    if (!router)
+                    {
+                        LOG_ERROR("[Qwen2Graph] GlobalBackendRouter not initialized");
+                        throw std::runtime_error("Backend router not available for PP copy");
+                    }
+
+                    // For BAR-backed source, we need to use the PCIeBAR backend or same-device copy
+                    // The source device is effectively the target device since BAR provides cross-device access
+                    ICollectiveBackend *backend = router->getBackendForCopy(target_device, target_device);
+                    if (!backend)
+                    {
+                        LOG_ERROR("[Qwen2Graph] No backend for " << target_device.toString());
+                        throw std::runtime_error("No backend available for PP copy");
+                    }
+
+                    // Perform device copy using backend API
+                    if (!backend->copy(dst_ptr, target_device, src_ptr, target_device, copy_bytes))
+                    {
+                        LOG_ERROR("[Qwen2Graph] Backend copy failed for PP hidden state");
+                        throw std::runtime_error("Backend copy failed for PP hidden state");
+                    }
+
+                    // Mark destination as device-authoritative (GPU has latest data)
+                    working_buffer->mark_device_dirty();
+
+                    LOG_DEBUG("[Qwen2Graph] PP GPU copy: " << copy_bytes << " bytes on "
+                                                           << target_device.toString());
+                }
+                else
+                {
+                    // CPU execution path: direct memcpy between host buffers
+                    std::memcpy(working_buffer->mutable_data(),
+                                input.external_hidden_state->data(),
+                                copy_bytes);
+                    LOG_DEBUG("[Qwen2Graph] PP CPU copy: " << copy_bytes << " bytes");
+                }
+            }
+            else
+            {
+                LOG_DEBUG("[Qwen2Graph] PP middle stage: external hidden state IS working buffer, no copy needed");
+            }
+            // No prev_node set - first layer will have no dependencies
+        }
+        else if (!has_embedding)
+        {
+            LOG_ERROR("[Qwen2Graph] PP stage without embedding requires external_hidden_state input");
+            throw std::runtime_error("PP stage without embedding requires external_hidden_state");
+        }
+
+        // -------------------------------------------------------------------------
+        // Stage 2: Transformer Layers (subset for this PP stage)
+        // -------------------------------------------------------------------------
+        // Position IDs must be provided externally (or use fallback for backward compat)
+        const int *position_ids = input.position_ids;
+        std::vector<int> local_position_ids;
+        if (!position_ids)
+        {
+            // Fallback: build position IDs internally (deprecated path)
+            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
+            position_ids = local_position_ids.data();
+            LOG_DEBUG("[Qwen2Graph] Position IDs built internally (deprecated - prefer external input)");
+        }
+
+        // Build graphs for assigned layer range [first_layer, last_layer)
+        for (int layer = first_layer; layer < last_layer; ++layer)
+        {
+            // Get layer weights
+            Qwen2LayerWeights layer_weights = weights_.get_layer_weights(layer);
+
+            // Build attention graph for this layer
+            ComputeGraph attn_graph = buildAttentionGraph(
+                layer_weights, buffers_.layer_buffers, layer, input.seq_len,
+                input.batch_size, input.kv_cache, position_ids, device,
+                input.sequence_lengths);
+
+            // Get the leaf node(s) of attention graph before merging
+            auto attn_leaves = attn_graph.getLeafNodes();
+            std::string attn_last;
+            if (!attn_leaves.empty())
+            {
+                std::string prefix = "layer" + std::to_string(layer) + "_";
+                attn_last = prefix + "attn_residual";
+                if (std::find(attn_leaves.begin(), attn_leaves.end(), attn_last) == attn_leaves.end())
+                {
+                    attn_last = attn_leaves.front();
+                }
+            }
+            else
+            {
+                // Fallback: use previous node if attention graph is empty
+                attn_last = prev_node;
+            }
+
+            // Merge attention graph, connecting to previous node
+            if (!prev_node.empty())
+            {
+                graph.merge(std::move(attn_graph), prev_node);
+            }
+            else
+            {
+                // First layer without embedding: merge directly
+                // The attention graph root nodes have no dependencies initially
+                for (const auto &root : attn_graph.getRootNodes())
+                {
+                    // Move all nodes from attn_graph to main graph
+                }
+                graph.merge(std::move(attn_graph), "");
+            }
+
+            // Build FFN graph for this layer
+            ComputeGraph ffn_graph = buildFFNGraph(
+                layer_weights, buffers_.layer_buffers, layer, input.seq_len,
+                input.batch_size, device);
+
+            // Get the leaf node(s) of FFN graph before merging
+            auto ffn_leaves = ffn_graph.getLeafNodes();
+            std::string ffn_last;
+            if (!ffn_leaves.empty())
+            {
+                std::string prefix = "layer" + std::to_string(layer) + "_";
+                ffn_last = prefix + "ffn_residual";
+                if (std::find(ffn_leaves.begin(), ffn_leaves.end(), ffn_last) == ffn_leaves.end())
+                {
+                    ffn_last = ffn_leaves.front();
+                }
+            }
+            else
+            {
+                // Fallback: use attention residual if FFN graph is empty
+                ffn_last = attn_last;
+            }
+
+            // Merge FFN graph, connecting to attention residual
+            graph.merge(std::move(ffn_graph), attn_last);
+
+            // Use the determined FFN leaf as the prev node for next layer
+            prev_node = ffn_last;
+        }
+
+        // -------------------------------------------------------------------------
+        // Stage 3: Final RMSNorm + LM Head (optional - only for final PP stage)
+        // -------------------------------------------------------------------------
+        if (has_lm_head)
+        {
+            // Final RMSNorm
+            InferenceMode final_norm_mode(config_.activation_precision);
+            TensorBase *final_norm_input = (final_norm_mode.isHybridQ16() && buffers_.layer_buffers.residual)
+                                               ? buffers_.layer_buffers.residual
+                                               : buffers_.current_hidden;
+
+            addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
+                                prev_node, total_tokens, device);
+            prev_node = "final_norm";
+
+            // LM Head (with optional Column-Parallel + AllGather)
+            bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+
+            TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
+            int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
+
+            LOG_DEBUG("[Qwen2Graph] LM head in buildPartialForwardGraph: use_column_parallel="
+                      << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
+
+            LMHeadStage::Params lm_params;
+            lm_params.hidden_states = buffers_.layer_buffers.normalized;
+            lm_params.lm_head_weight = weights_.lm_head;
+            lm_params.logits = lm_head_output;
+            lm_params.seq_len = total_tokens;
+            lm_params.d_model = config_.d_model;
+            lm_params.vocab_size = lm_head_vocab_size;
+            lm_params.bias_tensor = nullptr;
+            lm_params.device_id = config_.default_device;
+
+            graph.addNode("lm_head",
+                          ComputeStageFactory::createLMHead(lm_params),
+                          device);
+            graph.addDependency("lm_head", prev_node);
+            prev_node = "lm_head";
+
+            // AllGather stage for column-parallel LM head
+            if (use_column_parallel && mpi_ctx_)
+            {
+                LOG_DEBUG("[Qwen2Graph] Adding lm_head_allgather in buildPartialForwardGraph: world_size="
+                          << mpi_ctx_->world_size() << " total_tokens=" << total_tokens);
+
+                AllGatherStage::Params allgather_params;
+                allgather_params.local_input = buffers_.logits_local;
+                allgather_params.full_output = buffers_.logits;
+                allgather_params.mpi_ctx = mpi_ctx_.get();
+                allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+                allgather_params.domain = nullptr;
+
+                graph.addNode("lm_head_allgather",
+                              ComputeStageFactory::createAllGather(allgather_params),
+                              device);
+                graph.addDependency("lm_head_allgather", prev_node);
+            }
+
+            // Set output logits
+            output.logits = buffers_.logits;
+        }
+        else
+        {
+            // Non-final PP stage: output hidden states directly
+            // The residual buffer contains the hidden states after the last layer
+            InferenceMode mode(config_.activation_precision);
+            output.hidden = (mode.isHybridQ16() && buffers_.layer_buffers.residual)
+                                ? buffers_.layer_buffers.residual
+                                : buffers_.current_hidden;
+            output.logits = nullptr;
+        }
+
+        LOG_DEBUG("[Qwen2Graph] Built partial forward graph with "
+                  << graph.size() << " nodes for layers [" << first_layer << ", " << last_layer << ")");
+
+        return graph;
+    }
+
+    // =========================================================================
+    // Unified Pipeline Graph Building (PP + TP Composition)
+    // =========================================================================
+
+    ComputeGraph Qwen2Graph::buildUnifiedPipelineGraph(
+        const Qwen2ForwardInput &input,
+        Qwen2ForwardOutput &output)
+    {
+        // =====================================================================
+        // 1. Validate prerequisites
+        // =====================================================================
+        if (!config_.pipeline_config)
+        {
+            LOG_ERROR("[Qwen2Graph] buildUnifiedPipelineGraph called without pipeline_config");
+            throw std::runtime_error("pipeline_config required for unified PP graph");
+        }
+
+        std::string validation_error;
+        if (!config_.pipeline_config->validate(&validation_error))
+        {
+            LOG_ERROR("[Qwen2Graph] Invalid pipeline_config: " << validation_error);
+            throw std::runtime_error("Invalid pipeline_config: " + validation_error);
+        }
+
+        LOG_DEBUG("[Qwen2Graph] Building unified pipeline graph: "
+                  << config_.pipeline_config->numStages() << " PP stages, "
+                  << "batch_size=" << input.batch_size
+                  << ", seq_len=" << input.seq_len);
+
+        // Validate weights
+        if (!weights_.get_layer_weights)
+        {
+            LOG_ERROR("[Qwen2Graph] Layer weight accessor not set");
+            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+        }
+
+        // =====================================================================
+        // 2. Prepare execution context
+        // =====================================================================
+        ComputeGraph graph;
+        std::string prev_node;
+        int total_tokens = input.batch_size * input.seq_len;
+
+        // Position IDs
+        const int *position_ids = input.position_ids;
+        std::vector<int> local_position_ids;
+        if (!position_ids)
+        {
+            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
+            position_ids = local_position_ids.data();
+            LOG_DEBUG("[Qwen2Graph] Position IDs built internally for unified PP graph");
+        }
+
+        // Inference mode for buffer selection
+        InferenceMode inference_mode(config_.activation_precision);
+
+        // =====================================================================
+        // 3. Iterate over PP stages
+        // =====================================================================
+        for (const auto &pp_stage : config_.pipeline_config->pp_stages)
+        {
+            LOG_DEBUG("[Qwen2Graph] Building PP stage " << pp_stage.stage_id
+                                                        << " (" << pp_stage.domain_name << "): layers ["
+                                                        << pp_stage.first_layer << ", " << pp_stage.last_layer << ")"
+                                                        << " has_embedding=" << pp_stage.has_embedding
+                                                        << " has_lm_head=" << pp_stage.has_lm_head);
+
+            // -----------------------------------------------------------------
+            // 3a. Get domain config for this stage
+            // -----------------------------------------------------------------
+            const TPDomainConfig *domain = config_.pipeline_config->getDomainForStage(pp_stage.stage_id);
+            if (!domain)
+            {
+                LOG_ERROR("[Qwen2Graph] Domain not found for stage " << pp_stage.stage_id
+                                                                     << " (domain_name=" << pp_stage.domain_name << ")");
+                throw std::runtime_error("Domain not found for PP stage " +
+                                         std::to_string(pp_stage.stage_id));
+            }
+
+            // Get device and TP context for this stage
+            DeviceId stage_device = domain->primaryDevice();
+            ILocalTPContext *stage_tp_ctx = nullptr;
+            auto tp_it = config_.domain_tp_contexts.find(pp_stage.domain_name);
+            if (tp_it != config_.domain_tp_contexts.end())
+            {
+                stage_tp_ctx = tp_it->second;
+            }
+
+            LOG_DEBUG("[Qwen2Graph] Stage " << pp_stage.stage_id
+                                            << " device=" << stage_device.to_string()
+                                            << " has_tp_ctx=" << (stage_tp_ctx != nullptr));
+
+            // -----------------------------------------------------------------
+            // 3b. Build embedding if this is the first stage
+            // -----------------------------------------------------------------
+            if (pp_stage.has_embedding)
+            {
+                if (!weights_.embedding_table)
+                {
+                    LOG_ERROR("[Qwen2Graph] Embedding weights required but not set");
+                    throw std::runtime_error("Embedding weights not initialized for unified PP graph");
+                }
+
+                // For HybridQ16 mode: output to Q16_1 residual buffer
+                // For other modes: output to FP32 current_hidden
+                TensorBase *embed_output = buffers_.layer_buffers.residual &&
+                                                   inference_mode.isHybridQ16()
+                                               ? buffers_.layer_buffers.residual
+                                               : buffers_.current_hidden;
+
+                EmbeddingStage::Params embed_params;
+                embed_params.embed_table = weights_.embedding_table;
+                embed_params.token_ids = input.token_ids;
+                embed_params.output = embed_output;
+                embed_params.num_tokens = total_tokens;
+                embed_params.d_model = config_.d_model;
+                embed_params.vocab_size = config_.vocab_size;
+                embed_params.device_id = stage_device;
+
+                graph.addNode("embedding",
+                              ComputeStageFactory::createEmbedding(embed_params),
+                              stage_device);
+                prev_node = "embedding";
+
+                LOG_DEBUG("[Qwen2Graph] Added embedding stage on device " << stage_device.to_string());
+            }
+
+            // -----------------------------------------------------------------
+            // 3c. Build layers for this PP stage
+            // -----------------------------------------------------------------
+            // Temporarily override config_.default_device for layer building
+            // This ensures all stages in the layer use the correct device
+            DeviceId original_device = config_.default_device;
+            ILocalTPContext *original_tp_ctx = config_.local_tp_ctx;
+
+            config_.default_device = stage_device;
+            if (stage_tp_ctx)
+            {
+                config_.local_tp_ctx = stage_tp_ctx;
+            }
+
+            for (int layer = pp_stage.first_layer; layer < pp_stage.last_layer; ++layer)
+            {
+                // Get layer weights
+                Qwen2LayerWeights layer_weights = weights_.get_layer_weights(layer);
+
+                // Get KV cache for this stage's device (PP-aware)
+                IKVCache *layer_kv_cache = input.getKVCacheForDevice(stage_device);
+
+                // Build attention graph with stage_device
+                ComputeGraph attn_graph = buildAttentionGraph(
+                    layer_weights, buffers_.layer_buffers, layer, input.seq_len,
+                    input.batch_size, layer_kv_cache, position_ids, stage_device,
+                    input.sequence_lengths);
+
+                // Get the leaf node of attention graph
+                auto attn_leaves = attn_graph.getLeafNodes();
+                std::string attn_last;
+                if (!attn_leaves.empty())
+                {
+                    std::string prefix = "layer" + std::to_string(layer) + "_";
+                    attn_last = prefix + "attn_residual";
+                    if (std::find(attn_leaves.begin(), attn_leaves.end(), attn_last) == attn_leaves.end())
+                    {
+                        attn_last = attn_leaves.front();
+                    }
+                }
+                else
+                {
+                    attn_last = prev_node;
+                }
+
+                // Merge attention graph
+                if (!prev_node.empty())
+                {
+                    graph.merge(std::move(attn_graph), prev_node);
+                }
+                else
+                {
+                    graph.merge(std::move(attn_graph), "");
+                }
+
+                // Build FFN graph
+                ComputeGraph ffn_graph = buildFFNGraph(
+                    layer_weights, buffers_.layer_buffers, layer, input.seq_len,
+                    input.batch_size, stage_device);
+
+                // Get the leaf node of FFN graph
+                auto ffn_leaves = ffn_graph.getLeafNodes();
+                std::string ffn_last;
+                if (!ffn_leaves.empty())
+                {
+                    std::string prefix = "layer" + std::to_string(layer) + "_";
+                    ffn_last = prefix + "ffn_residual";
+                    if (std::find(ffn_leaves.begin(), ffn_leaves.end(), ffn_last) == ffn_leaves.end())
+                    {
+                        ffn_last = ffn_leaves.front();
+                    }
+                }
+                else
+                {
+                    ffn_last = attn_last;
+                }
+
+                // Merge FFN graph
+                graph.merge(std::move(ffn_graph), attn_last);
+
+                prev_node = ffn_last;
+            }
+
+            // Restore original config
+            config_.default_device = original_device;
+            config_.local_tp_ctx = original_tp_ctx;
+
+            // -----------------------------------------------------------------
+            // 3d. Insert PP transfer stage if not the last PP stage
+            // -----------------------------------------------------------------
+            int next_stage_id = pp_stage.stage_id + 1;
+            if (next_stage_id < config_.pipeline_config->numStages())
+            {
+                // Get PP context for this transfer
+                auto pp_key = std::make_pair(pp_stage.stage_id, next_stage_id);
+                ILocalPPContext *pp_ctx = nullptr;
+                auto pp_it = config_.pp_contexts.find(pp_key);
+                if (pp_it != config_.pp_contexts.end())
+                {
+                    pp_ctx = pp_it->second;
+                }
+
+                if (!pp_ctx)
+                {
+                    LOG_ERROR("[Qwen2Graph] PP context not found for transfer "
+                              << pp_stage.stage_id << " -> " << next_stage_id);
+                    throw std::runtime_error("PP context not found for stage transfer " +
+                                             std::to_string(pp_stage.stage_id) + " -> " +
+                                             std::to_string(next_stage_id));
+                }
+
+                // Get the hidden state buffer for transfer
+                TensorBase *hidden_state = (inference_mode.isHybridQ16() && buffers_.layer_buffers.residual)
+                                               ? buffers_.layer_buffers.residual
+                                               : buffers_.current_hidden;
+
+                // Create LocalPPTransferStage
+                LocalPPTransferStage::Params transfer_params;
+                transfer_params.pp_ctx = pp_ctx;
+                transfer_params.tensor = hidden_state;
+                transfer_params.stage_from = pp_stage.stage_id;
+                transfer_params.stage_to = next_stage_id;
+                transfer_params.stage_name = "pp_transfer_" +
+                                             std::to_string(pp_stage.stage_id) + "_to_" +
+                                             std::to_string(next_stage_id);
+                transfer_params.device_id = stage_device;
+                transfer_params.mpi_ctx = mpi_ctx_.get();
+
+                std::string transfer_name = transfer_params.stage_name;
+
+                graph.addNode(transfer_name,
+                              std::make_unique<LocalPPTransferStage>(transfer_params),
+                              stage_device); // Transfer stage starts on source device
+                graph.addDependency(transfer_name, prev_node);
+
+                prev_node = transfer_name;
+
+                LOG_DEBUG("[Qwen2Graph] Added PP transfer: " << transfer_name
+                                                             << " (source device=" << stage_device.to_string() << ")");
+            }
+
+            // -----------------------------------------------------------------
+            // 3e. Build LM head if this is the last stage
+            // -----------------------------------------------------------------
+            if (pp_stage.has_lm_head)
+            {
+                if (!weights_.final_norm || !weights_.lm_head)
+                {
+                    LOG_ERROR("[Qwen2Graph] LM head weights required but not set");
+                    throw std::runtime_error("LM head weights not initialized for unified PP graph");
+                }
+
+                // Final RMSNorm
+                TensorBase *final_norm_input = (inference_mode.isHybridQ16() && buffers_.layer_buffers.residual)
+                                                   ? buffers_.layer_buffers.residual
+                                                   : buffers_.current_hidden;
+
+                addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
+                                    prev_node, total_tokens, stage_device);
+                prev_node = "final_norm";
+
+                // LM Head
+                bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+                TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
+                int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
+
+                LOG_DEBUG("[Qwen2Graph] LM head in unified PP: use_column_parallel="
+                          << use_column_parallel << " vocab_size=" << lm_head_vocab_size);
+
+                LMHeadStage::Params lm_params;
+                lm_params.hidden_states = buffers_.layer_buffers.normalized;
+                lm_params.lm_head_weight = weights_.lm_head;
+                lm_params.logits = lm_head_output;
+                lm_params.seq_len = total_tokens;
+                lm_params.d_model = config_.d_model;
+                lm_params.vocab_size = lm_head_vocab_size;
+                lm_params.bias_tensor = nullptr;
+                lm_params.device_id = stage_device;
+
+                graph.addNode("lm_head",
+                              ComputeStageFactory::createLMHead(lm_params),
+                              stage_device);
+                graph.addDependency("lm_head", prev_node);
+                prev_node = "lm_head";
+
+                // AllGather stage for column-parallel LM head
+                if (use_column_parallel && mpi_ctx_)
+                {
+                    LOG_DEBUG("[Qwen2Graph] Adding lm_head_allgather in unified PP: world_size="
+                              << mpi_ctx_->world_size());
+
+                    AllGatherStage::Params allgather_params;
+                    allgather_params.local_input = buffers_.logits_local;
+                    allgather_params.full_output = buffers_.logits;
+                    allgather_params.mpi_ctx = mpi_ctx_.get();
+                    allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+                    allgather_params.domain = nullptr;
+
+                    graph.addNode("lm_head_allgather",
+                                  ComputeStageFactory::createAllGather(allgather_params),
+                                  stage_device);
+                    graph.addDependency("lm_head_allgather", prev_node);
+                }
+
+                output.logits = buffers_.logits;
+
+                LOG_DEBUG("[Qwen2Graph] Added LM head stage on device " << stage_device.to_string());
+            }
+        }
+
+        LOG_DEBUG("[Qwen2Graph] Built unified pipeline graph with " << graph.size()
+                                                                    << " nodes across " << config_.pipeline_config->numStages() << " PP stages");
 
         return graph;
     }
@@ -658,6 +1444,8 @@ namespace llaminar2
             allgather_params.full_output = output_logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
             allgather_params.actual_seq_len = static_cast<size_t>(total_tokens);
+            // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
+            allgather_params.domain = nullptr;
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -812,6 +1600,7 @@ namespace llaminar2
             int pos_offset = position_ids ? position_ids[0] : 0;
 
             RoPEStage::Params rope_params;
+            rope_params.device_id = device; // Use graph's target device for kernel dispatch
             rope_params.Q = buffers.Q;
             rope_params.K = buffers.K;
             rope_params.n_heads = local_n_heads;       // Use local head count for TP
@@ -834,7 +1623,7 @@ namespace llaminar2
 
                 // HybridQ16 K precision fix: K from GEMM is Q16_1 (not Q8_1)
                 // RoPE will use Q16→Q16 dynamic scale path and output per-head scales
-                // Note: buffers.K is already Q16_1 for HybridQ16 (allocated by GraphOrchestrator)
+                // Note: buffers.K is already Q16_1 for HybridQ16 (allocated by DeviceGraphOrchestrator)
                 if (inference_mode.isHybridQ16() && buffers.K_head_scales)
                 {
                     rope_params.K_head_scales = buffers.K_head_scales;
@@ -1241,9 +2030,8 @@ namespace llaminar2
             if (env.execution.exec_gemm && layer.wo && !wo_producer_node.empty())
             {
                 bool wo_is_sharded = isRowParallelSharded(layer.wo);
-                bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
-                if (wo_is_sharded && has_multi_rank)
+                if (wo_is_sharded && needsTPAllreduce())
                 {
                     // AllReduce the actual data, not full buffer capacity
                     size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
@@ -1254,21 +2042,20 @@ namespace llaminar2
                                                        ? buffers.residual
                                                        : buffers.attn_proj;
 
-                    graph.addNode(prefix + "wo_allreduce",
-                                  ComputeStageFactory::createAllreduce(
-                                      AllreduceStage::Params{
-                                          .device_id = device,
-                                          .mpi_ctx = mpi_ctx_.get(),
-                                          .buffer = allreduce_buffer,
-                                          .count = allreduce_count}),
-                                  device);
+                    std::string stage_name = prefix + "wo_allreduce";
+                    auto allreduce_stage = createTPAllreduceStage(
+                        allreduce_buffer, allreduce_count, device, layer_idx, /*is_attention=*/true, stage_name);
 
-                    graph.addDependency(prefix + "wo_allreduce", wo_producer_node);
-                    wo_producer_node = prefix + "wo_allreduce";
+                    if (allreduce_stage)
+                    {
+                        graph.addNode(stage_name, std::move(allreduce_stage), device);
+                        graph.addDependency(stage_name, wo_producer_node);
+                        wo_producer_node = stage_name;
 
-                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
-                                                    << " Wo: row-parallel sharded, adding allreduce"
-                                                    << (inference_mode.isHybridQ16() ? " (Q16_1 residual)" : " (FP32 proj)"));
+                        LOG_TRACE("[Qwen2Graph] Layer " << layer_idx
+                                                        << " Wo: row-parallel sharded, adding allreduce"
+                                                        << (inference_mode.isHybridQ16() ? " (Q16_1 residual)" : " (FP32 proj)"));
+                    }
                 }
             }
         }
@@ -1278,6 +2065,7 @@ namespace llaminar2
         if (env.execution.exec_residual && !inference_mode.isHybridQ16())
         {
             ResidualAddStage::Params res_params;
+            res_params.device_id = device; // Use graph's target device for kernel dispatch
             res_params.input = buffers.attn_proj;
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
@@ -1423,25 +2211,23 @@ namespace llaminar2
 
             bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
             bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
-            bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
-            if (needs_allreduce && has_multi_rank)
+            if (needs_allreduce && needsTPAllreduce())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * down_n;
                 LOG_DEBUG("[buildFFNGraph] Adding down_allreduce: ffn_column_parallel="
                           << config_.ffn_column_parallel << " down_is_row_sharded=" << down_is_row_sharded
                           << " count=" << allreduce_count);
 
-                graph.addNode(prefix + "down_allreduce",
-                              ComputeStageFactory::createAllreduce(
-                                  AllreduceStage::Params{
-                                      .device_id = device,
-                                      .mpi_ctx = mpi_ctx_.get(),
-                                      .buffer = buffers.attn_proj,
-                                      .count = allreduce_count}),
-                              device);
+                std::string stage_name = prefix + "down_allreduce";
+                auto allreduce_stage = createTPAllreduceStage(
+                    buffers.attn_proj, allreduce_count, device, layer_idx, /*is_attention=*/false, stage_name);
 
-                graph.addDependency(prefix + "down_allreduce", prefix + "down_proj");
+                if (allreduce_stage)
+                {
+                    graph.addNode(stage_name, std::move(allreduce_stage), device);
+                    graph.addDependency(stage_name, prefix + "down_proj");
+                }
             }
         }
 
@@ -1452,6 +2238,7 @@ namespace llaminar2
             InferenceMode inference_mode_ffn_res(config_.activation_precision);
 
             ResidualAddStage::Params res_params;
+            res_params.device_id = device; // Use graph's target device for kernel dispatch
             res_params.input = buffers.attn_proj;
             res_params.residual = (inference_mode_ffn_res.isHybridQ16() && buffers.residual)
                                       ? buffers.residual
@@ -1469,9 +2256,8 @@ namespace llaminar2
             {
                 bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
                 bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
-                bool has_multi_rank = hasMultipleRanks(mpi_ctx_.get());
 
-                if (needs_allreduce && has_multi_rank)
+                if (needs_allreduce && needsTPAllreduce())
                 {
                     graph.addDependency(prefix + "ffn_residual", prefix + "down_allreduce");
                 }
@@ -1606,6 +2392,109 @@ namespace llaminar2
         {
             graph.addDependency("final_norm", prev_node);
         }
+    }
+
+    const TPDomain *Qwen2Graph::getDomainForLayer(int layer_idx, bool is_attention) const
+    {
+        if (!config_.multi_domain_tp_config)
+        {
+            return nullptr; // No domain config - use legacy MPI path
+        }
+        return config_.multi_domain_tp_config->domainForLayer(layer_idx, is_attention);
+    }
+
+    // =========================================================================
+    // TP Allreduce Helpers
+    // =========================================================================
+
+    bool Qwen2Graph::needsTPAllreduce() const
+    {
+        // Check LOCAL TP first (takes precedence)
+        if (config_.local_tp_ctx && config_.local_tp_ctx->degree() > 1)
+        {
+            return true;
+        }
+        // Check GLOBAL TP
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    std::unique_ptr<IComputeStage> Qwen2Graph::createTPAllreduceStage(
+        TensorBase *buffer,
+        size_t count,
+        DeviceId device,
+        int layer_idx,
+        bool is_attention,
+        const std::string &stage_name) const
+    {
+        // LOCAL TP takes precedence if configured
+        if (config_.local_tp_ctx && config_.local_tp_ctx->degree() > 1)
+        {
+            LOG_DEBUG("[Qwen2Graph] Creating TPAllreduceStage (LOCAL): degree="
+                      << config_.local_tp_ctx->degree()
+                      << " device_idx=" << config_.local_tp_device_idx
+                      << " count=" << count
+                      << " backend=" << static_cast<int>(config_.local_tp_ctx->backend())
+                      << " stage_name=" << stage_name);
+
+            // =========================================================
+            // Register BAR-backed tensor for PCIeBAR allreduce
+            // =========================================================
+            // For PCIeBAR backend, row-parallel output tensors need to be
+            // registered with LocalTPContext so executePCIeBarAllreduce()
+            // can find them by stage name. The tensor was allocated as
+            // BAR-backed by GraphBufferManager if conditions were met.
+            //
+            // This registration is called for EACH device orchestrator,
+            // so each device registers its own tensor for this stage.
+            // =========================================================
+            if (config_.local_tp_ctx->backend() == CollectiveBackendType::PCIE_BAR &&
+                config_.local_tp_device_idx >= 0 &&
+                static_cast<size_t>(config_.local_tp_device_idx) < config_.local_tp_ctx->devices().size())
+            {
+                const GlobalDeviceAddress &device_addr =
+                    config_.local_tp_ctx->devices()[config_.local_tp_device_idx];
+
+                // Register the tensor with the stage name
+                // registerBARBackedOutput checks if tensor is BAR-backed and handles accordingly
+                config_.local_tp_ctx->registerBARBackedOutput(stage_name, device_addr, buffer);
+            }
+
+            TPAllreduceStage::Params params;
+            params.device_id = device;
+            params.tp_ctx = config_.local_tp_ctx; // ILocalTPContext* -> ITPContext* (inheritance)
+            params.tensor = buffer;
+            params.count = count;
+            params.stage_name = stage_name;
+
+            return std::make_unique<TPAllreduceStage>(params);
+        }
+
+        // Fall back to GLOBAL TP (MPI-based)
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            LOG_DEBUG("[Qwen2Graph] Creating AllreduceStage (MPI): world_size="
+                      << mpi_ctx_->world_size()
+                      << " rank=" << mpi_ctx_->rank()
+                      << " count=" << count);
+
+            AllreduceStage::Params params;
+            params.device_id = device;
+            params.mpi_ctx = mpi_ctx_.get();
+            params.buffer = buffer;
+            params.count = count;
+            params.collective_ctx = nullptr;
+            params.domain = getDomainForLayer(layer_idx, is_attention);
+
+            return ComputeStageFactory::createAllreduce(params);
+        }
+
+        // No TP active - should not reach here (caller should check needsTPAllreduce())
+        LOG_WARN("[Qwen2Graph] createTPAllreduceStage called but no TP active");
+        return nullptr;
     }
 
 } // namespace llaminar2

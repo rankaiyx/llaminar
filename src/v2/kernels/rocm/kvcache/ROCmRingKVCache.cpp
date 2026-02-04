@@ -16,9 +16,10 @@
 #include "ROCmRingKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/GpuTensorView.h"
-#include "../../../execution/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -128,11 +129,64 @@ namespace llaminar2
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
           head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(device_id),
-          is_sharded_(false)
+          is_sharded_(false), device_ctx_(nullptr)
     {
         LOG_DEBUG("[ROCmRingKVCache] Creating cache: "
                   << n_layers << " layers, batch=" << batch_size
                   << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                  << ", precision=" << static_cast<int>(Precision));
+
+        hipSetDevice(device_id_);
+
+        // Allocate entries
+        entries_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer].resize(batch_size_);
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                allocate_entry(entries_[layer][seq]);
+            }
+        }
+
+        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
+        tensor_views_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            tensor_views_[layer].resize(batch_size_);
+            // Views are created lazily in get_k()/get_v()
+        }
+
+        LOG_DEBUG("[ROCmRingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
+    }
+
+    template <ActivationPrecision Precision>
+    ROCmRingKVCache<Precision>::ROCmRingKVCache(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int head_dim, IWorkerGPUContext *ctx)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
+          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim), device_id_(0),
+          is_sharded_(false), device_ctx_(nullptr)
+    {
+        if (!ctx)
+        {
+            throw std::runtime_error("[ROCmRingKVCache] Device context is null");
+        }
+        if (!ctx->isInitialized())
+        {
+            throw std::runtime_error("[ROCmRingKVCache] Device context is not initialized");
+        }
+
+        device_ctx_ = ctx;
+        device_id_ = ctx->deviceOrdinal();
+
+        LOG_DEBUG("[ROCmRingKVCache] Creating cache with device context: "
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                  << ", device=" << device_id_
                   << ", precision=" << static_cast<int>(Precision));
 
         hipSetDevice(device_id_);
@@ -169,7 +223,7 @@ namespace llaminar2
         : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
           head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(device_id),
-          is_sharded_(local_n_kv_heads != n_kv_heads)
+          is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         LOG_DEBUG("[ROCmRingKVCache] Creating sharded cache: "
                   << n_layers << " layers, batch=" << batch_size
@@ -205,9 +259,71 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
+    ROCmRingKVCache<Precision>::ROCmRingKVCache(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, IWorkerGPUContext *ctx)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+          n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
+          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), device_id_(0),
+          is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
+    {
+        if (!ctx)
+        {
+            throw std::runtime_error("[ROCmRingKVCache] Device context is null");
+        }
+        if (!ctx->isInitialized())
+        {
+            throw std::runtime_error("[ROCmRingKVCache] Device context is not initialized");
+        }
+
+        device_ctx_ = ctx;
+        device_id_ = ctx->deviceOrdinal();
+
+        LOG_DEBUG("[ROCmRingKVCache] Creating sharded cache with device context: "
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
+                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
+                  << ", local_kv_dim=" << kv_dim_
+                  << ", device=" << device_id_
+                  << ", precision=" << static_cast<int>(Precision));
+
+        hipSetDevice(device_id_);
+
+        // Allocate entries
+        entries_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer].resize(batch_size_);
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                allocate_entry(entries_[layer][seq]);
+            }
+        }
+
+        // Initialize tensor_views_ storage for get_k()/get_v() wrappers
+        tensor_views_.resize(n_layers_);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            tensor_views_[layer].resize(batch_size_);
+            // Views are created lazily in get_k()/get_v()
+        }
+
+        LOG_DEBUG("[ROCmRingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
+    }
+
+    template <ActivationPrecision Precision>
     ROCmRingKVCache<Precision>::~ROCmRingKVCache()
     {
-        hipSetDevice(device_id_);
+        // Check if HIP runtime is shutting down
+        hipError_t set_err = hipSetDevice(device_id_);
+        if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
+        {
+            // Runtime is shutting down, skip cleanup
+            return;
+        }
 
         for (auto &layer_entries : entries_)
         {
@@ -241,13 +357,37 @@ namespace llaminar2
     void ROCmRingKVCache<Precision>::free_entry(EntryT &entry)
     {
         if (entry.d_K)
-            hipFree(entry.d_K);
+        {
+            hipError_t err = hipFree(entry.d_K);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_K) failed: %s\n", hipGetErrorString(err));
+            }
+        }
         if (entry.d_V)
-            hipFree(entry.d_V);
+        {
+            hipError_t err = hipFree(entry.d_V);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_V) failed: %s\n", hipGetErrorString(err));
+            }
+        }
         if (entry.d_K_scratch)
-            hipFree(entry.d_K_scratch);
+        {
+            hipError_t err = hipFree(entry.d_K_scratch);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_K_scratch) failed: %s\n", hipGetErrorString(err));
+            }
+        }
         if (entry.d_V_scratch)
-            hipFree(entry.d_V_scratch);
+        {
+            hipError_t err = hipFree(entry.d_V_scratch);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                fprintf(stderr, "WARNING: hipFree(d_V_scratch) failed: %s\n", hipGetErrorString(err));
+            }
+        }
 
         entry.d_K = nullptr;
         entry.d_V = nullptr;

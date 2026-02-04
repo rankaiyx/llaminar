@@ -287,6 +287,37 @@ namespace llaminar2
         bool is_view() const override { return true; } // TensorSlice is always a view/wrapper
 
         // =======================================================================
+        // GPU Coherence Methods (delegate to inner)
+        // =======================================================================
+        // TensorSlice must delegate coherence operations to its wrapped inner
+        // tensor for proper device memory management in MPI tensor parallelism.
+
+        bool ensureOnDevice(DeviceId target_device) override
+        {
+            return inner()->ensureOnDevice(target_device);
+        }
+
+        bool ensureOnHost() override
+        {
+            return inner()->ensureOnHost();
+        }
+
+        void mark_device_dirty() override
+        {
+            inner()->mark_device_dirty();
+        }
+
+        void mark_host_dirty() override
+        {
+            inner()->mark_host_dirty();
+        }
+
+        bool isHostValid() const override
+        {
+            return inner()->isHostValid();
+        }
+
+        // =======================================================================
         // Type Conversion (delegate to inner)
         // =======================================================================
 

@@ -2,11 +2,11 @@
  * @file Main.cpp
  * @brief Llaminar v2 entry point
  *
- * Clean greenfield implementation with:
+ * Clean implementation using OrchestrationRunner for:
  * - Device manager initialization
  * - Multi-GPU heterogeneous support
+ * - Pipeline and tensor parallelism
  * - Direct kernel orchestration
- * - Architecture-agnostic pipeline creation via InferenceRunner factory
  * - Self-bootstrap MPI support (auto-launches mpirun if not in MPI context)
  *
  * @author David Sanftenberg
@@ -15,20 +15,15 @@
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
 #include "utils/MPIBootstrap.h"
-#include "utils/ArgParser.h"
 #include "utils/NUMATopology.h"
-#include "utils/Tokenizer.h"
 #include "utils/Sampler.h"
 #include "utils/ChatUI.h"
 #include "utils/ChatTemplate.h"
 #include "utils/BenchmarkRunner.h"
 #include "backends/ComputeBackend.h"
-#include "execution/InferenceRunnerFactory.h"
-#include "execution/IInferenceRunner.h"
-#include "execution/RuntimeConfig.h"
-#include "loaders/ModelLoader.h"
-#include "loaders/ModelContext.h"
-#include "loaders/DeviceOrchestrator.h"
+#include "config/OrchestrationConfigParser.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include <mpi.h>
 #include <iostream>
 #include <climits>
@@ -36,6 +31,7 @@
 #include <string>
 #include <algorithm>
 #include <cctype>
+#include <sstream>
 
 using namespace llaminar2;
 
@@ -85,92 +81,6 @@ void list_devices()
     LOG_DEBUG("\n");
 }
 
-DeviceId parse_device(const std::string &device_str, DeviceManager &dm)
-{
-    if (device_str == "auto")
-    {
-        // DeviceManager returns 1-based indices for GPUs (0 = CPU)
-        int dm_idx = dm.select_device();
-        if (dm_idx == 0)
-        {
-            return DeviceId::cpu();
-        }
-        return DeviceId::cuda(dm_idx - 1);
-    }
-
-    if (device_str == "cpu")
-    {
-        return DeviceId::cpu();
-    }
-
-    if (device_str.substr(0, 5) == "cuda:")
-    {
-        int local_index = std::stoi(device_str.substr(5));
-
-        // Validate CUDA device exists in the NUMA-filtered list
-        int cuda_count = dm.cuda_device_count();
-        if (cuda_count == 0)
-        {
-            LOG_ERROR("Error: No CUDA devices found. Cannot use --device " << device_str);
-            LOG_ERROR("Available backends: " << dm.device_count() << " total (use --list-devices to see)");
-            return DeviceId(); // Invalid
-        }
-        if (local_index >= cuda_count)
-        {
-            LOG_ERROR("Error: CUDA device " << local_index << " does not exist. Found " << cuda_count << " CUDA device(s) on this NUMA node.");
-            return DeviceId(); // Invalid
-        }
-
-        // Get the actual CUDA device ordinal for the N-th NUMA-local CUDA device
-        int actual_device_id = dm.get_device_id_for_type(ComputeBackendType::GPU_CUDA, local_index);
-        if (actual_device_id < 0)
-        {
-            LOG_ERROR("Error: Failed to get device ID for CUDA device " << local_index);
-            return DeviceId(); // Invalid
-        }
-
-        LOG_DEBUG("Mapping cuda:" << local_index << " to CUDA device " << actual_device_id
-                                  << " (NUMA-aware)");
-        return DeviceId::cuda(actual_device_id);
-    }
-
-    if (device_str.substr(0, 5) == "rocm:")
-    {
-        int local_index = std::stoi(device_str.substr(5));
-
-        // Validate ROCm device exists in the NUMA-filtered list
-        int rocm_count = dm.rocm_device_count();
-        if (rocm_count == 0)
-        {
-            LOG_ERROR("Error: No ROCm devices found. Cannot use --device " << device_str);
-            LOG_ERROR("Hint: Check that ROCm is installed and devices are accessible (try 'rocm-smi')");
-            LOG_ERROR("Hint: You may need to be in the 'video' or 'render' group for device access");
-            LOG_ERROR("Available backends: " << dm.device_count() << " total (use --list-devices to see)");
-            return DeviceId(); // Invalid
-        }
-        if (local_index >= rocm_count)
-        {
-            LOG_ERROR("Error: ROCm device " << local_index << " does not exist. Found " << rocm_count << " ROCm device(s) on this NUMA node.");
-            return DeviceId(); // Invalid
-        }
-
-        // Get the actual HIP device ordinal for the N-th NUMA-local ROCm device
-        int actual_device_id = dm.get_device_id_for_type(ComputeBackendType::GPU_ROCM, local_index);
-        if (actual_device_id < 0)
-        {
-            LOG_ERROR("Error: Failed to get device ID for ROCm device " << local_index);
-            return DeviceId(); // Invalid
-        }
-
-        LOG_DEBUG("Mapping rocm:" << local_index << " to HIP device " << actual_device_id
-                                  << " (NUMA-aware)");
-        return DeviceId::rocm(actual_device_id);
-    }
-
-    LOG_ERROR("Error: Unknown device format: " << device_str);
-    return DeviceId(); // Invalid device
-}
-
 /**
  * @brief Main entry point with MPI self-bootstrap support
  *
@@ -186,26 +96,19 @@ int main(int argc, char *argv[])
     // This happens before MPI so we can log bootstrap info
     initializeLogging();
 
-    // Parse command-line arguments (before MPI init for bootstrap decisions)
-    ArgContext args = ArgParser::parse(argc, argv);
-
-    // Handle parse errors early
-    if (!args.error.empty())
-    {
-        std::cerr << "Error: " << args.error << std::endl;
-        ArgParser::printUsage(argv[0]);
-        return 1;
-    }
+    // Parse command-line arguments using OrchestrationConfigParser
+    OrchestrationConfigParser parser;
+    OrchestrationConfig config = parser.parseArgs(argc, argv);
 
     // Handle help early (no MPI needed)
-    if (args.show_help)
+    if (config.show_help)
     {
-        ArgParser::printUsage(argv[0]);
+        std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
         return 0;
     }
 
     // Handle list-devices early (no MPI needed)
-    if (args.list_devices)
+    if (config.list_devices)
     {
         list_devices();
         return 0;
@@ -222,26 +125,26 @@ int main(int argc, char *argv[])
     MPIEnvironmentInfo mpi_env = MPIBootstrap::detectMPIEnvironment();
 
     // If NOT running under MPI and bootstrap is not disabled, self-launch via mpirun
-    if (!mpi_env.is_mpi_process && !args.mpi_no_bootstrap)
+    if (!mpi_env.is_mpi_process && !config.mpi_no_bootstrap)
     {
-        // Build launch configuration from args and topology
+        // Build launch configuration from config and topology
         MPILaunchConfig launch_config = MPIBootstrap::getDefaultConfig(cpu_topology);
 
         // Override with user-specified values
-        if (args.mpi_procs > 0)
+        if (config.mpi_procs > 0)
         {
-            launch_config.num_procs = args.mpi_procs;
+            launch_config.num_procs = config.mpi_procs;
         }
-        if (!args.hostfile.empty())
+        if (!config.hostfile.empty())
         {
-            launch_config.hostfile = args.hostfile;
+            launch_config.hostfile = config.hostfile;
         }
-        launch_config.report_bindings = args.mpi_verbose || args.verbose;
-        launch_config.verbose = args.mpi_verbose;
-        launch_config.oversubscribe = args.mpi_oversubscribe;
+        launch_config.report_bindings = config.mpi_verbose || (config.verbose_level > 0);
+        launch_config.verbose = config.mpi_verbose;
+        launch_config.oversubscribe = config.mpi_oversubscribe;
 
         // Handle dry-run: print config and exit
-        if (args.mpi_dry_run)
+        if (config.mpi_dry_run)
         {
             MPIBootstrap::printConfigurationSummary(cpu_topology, launch_config, mpi_env);
             std::cout << "Dry run requested - exiting without launching MPI.\n";
@@ -269,22 +172,13 @@ int main(int argc, char *argv[])
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
     // Re-parse arguments (MPI_Init may modify argc/argv)
-    args = ArgParser::parse(argc, argv);
-
-    // Handle parse errors (shouldn't happen if first parse succeeded, but be safe)
-    if (!args.error.empty())
-    {
-        std::cerr << "Error: " << args.error << std::endl;
-        MPI_Finalize();
-        return 1;
-    }
+    config = parser.parseArgs(argc, argv);
 
     // Configure OpenMP environment for this rank
-    // (In self-launch case, this was done before exec; here we do it post-MPI init)
     MPILaunchConfig mpi_launch_config = MPIBootstrap::getDefaultConfig(cpu_topology);
-    if (args.mpi_procs > 0)
+    if (config.mpi_procs > 0)
     {
-        mpi_launch_config.num_procs = args.mpi_procs;
+        mpi_launch_config.num_procs = config.mpi_procs;
     }
     MPIBootstrap::configureOpenMPEnvironment(cpu_topology, mpi_launch_config);
 
@@ -313,359 +207,62 @@ int main(int argc, char *argv[])
     dm.initialize(numa_info.local_numa_node);
 
     // Validate required arguments
-    if (args.model_path.empty())
+    if (config.model_path.empty())
     {
         if (mpi_ctx->rank() == 0)
         {
             LOG_ERROR("Error: Model path required (-m)\n\n");
-            ArgParser::printUsage(argv[0]);
+            std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
         }
         MPI_Finalize();
         return 1;
     }
 
-    // Parse device
-    DeviceId device_id = parse_device(args.device, dm);
-    if (!device_id.is_valid())
-    {
-        MPI_Finalize();
-        return 1;
-    }
+    // ========================================================================
+    // Create and Initialize OrchestrationRunner
+    // ========================================================================
 
-    // Parse placement strategy
-    PlacementStrategy strategy = PlacementStrategy::AUTO;
-    if (args.strategy == "all-gpu")
-    {
-        strategy = PlacementStrategy::ALL_GPU;
-    }
-    else if (args.strategy == "all-cpu")
-    {
-        strategy = PlacementStrategy::ALL_CPU;
-    }
-    else if (args.strategy == "layer-split")
-    {
-        strategy = PlacementStrategy::LAYER_SPLIT;
-    }
-    else if (args.strategy == "memory-aware")
-    {
-        strategy = PlacementStrategy::MEMORY_AWARE;
-    }
-    else if (args.strategy == "moe-optimized")
-    {
-        strategy = PlacementStrategy::MOE_OPTIMIZED;
-    }
-    else if (args.strategy == "custom")
-    {
-        strategy = PlacementStrategy::CUSTOM;
-    }
-    else if (args.strategy == "multi-gpu")
-    {
-        strategy = PlacementStrategy::MULTI_GPU;
-    }
-    else if (args.strategy != "auto")
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_ERROR("Warning: Unknown strategy '" << args.strategy << "', using AUTO\n");
-        }
-    }
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
 
-    // Auto-enable multi-gpu strategy if --multi-gpu or --gpus specified
-    if (args.multi_gpu && strategy == PlacementStrategy::AUTO)
-    {
-        strategy = PlacementStrategy::MULTI_GPU;
-    }
-
-    // Create orchestration config from ArgContext
-    OrchestrationConfig orch_config;
-    orch_config.strategy = strategy;
-    orch_config.gpu_device = device_id;
-    orch_config.offload_layers = args.offload_layers;
-    orch_config.verbose = args.verbose;
-    orch_config.device_map = args.device_map;
-    orch_config.max_gpu_memory_mb = args.max_gpu_memory_mb;
-    orch_config.max_cpu_memory_mb = args.max_cpu_memory_mb;
-    orch_config.moe_shared_experts_gpu = args.moe_shared_experts_gpu;
-    orch_config.moe_sparse_experts_cpu = args.moe_sparse_experts_cpu;
-    orch_config.multi_gpu = args.multi_gpu;
-    orch_config.gpu_split = args.gpu_split;
-    // Convert vector<int> to vector<DeviceId>
-    for (int gpu_idx : args.gpu_devices)
-    {
-        orch_config.gpu_devices.push_back(DeviceId::cuda(gpu_idx));
-    }
-
-    // Create device orchestrator
-    auto device_mgr_shared = std::shared_ptr<DeviceManager>(&dm, [](DeviceManager *) {});
-    auto orchestrator = std::make_shared<DeviceOrchestrator>(
-        device_mgr_shared, mpi_ctx, orch_config);
-
-    // Create runtime configuration from parsed arguments
-    RuntimeConfig runtime_config;
-    runtime_config.max_seq_len = args.max_seq_len;
-    runtime_config.n_threads = args.n_threads;
-    runtime_config.batch_size = args.batch_size;
-    runtime_config.use_mmap = args.use_mmap;
-    runtime_config.seed = args.seed;
-
-    // Parse weight precision mode
-    if (args.weight_precision == "native")
-    {
-        runtime_config.weight_precision = WeightPrecision::NATIVE;
-    }
-    else if (args.weight_precision == "fp32")
-    {
-        runtime_config.weight_precision = WeightPrecision::CONVERT_TO_FP32;
-    }
-    else if (args.weight_precision == "bf16")
-    {
-        runtime_config.weight_precision = WeightPrecision::CONVERT_TO_BF16;
-    }
-    else if (args.weight_precision == "fp16")
-    {
-        runtime_config.weight_precision = WeightPrecision::CONVERT_TO_FP16;
-    }
-    else if (args.weight_precision == "int8")
-    {
-        runtime_config.weight_precision = WeightPrecision::CONVERT_TO_INT8;
-    }
-    else
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_WARN("Unknown weight precision mode '" << args.weight_precision << "', defaulting to NATIVE");
-        }
-        runtime_config.weight_precision = WeightPrecision::NATIVE;
-    }
-
-    // Parse activation precision mode
-    if (args.activation_precision == "fp32")
-    {
-        runtime_config.activation_precision = ActivationPrecision::FP32;
-    }
-    else if (args.activation_precision == "bf16")
-    {
-        runtime_config.activation_precision = ActivationPrecision::BF16;
-    }
-    else if (args.activation_precision == "fp16")
-    {
-        runtime_config.activation_precision = ActivationPrecision::FP16;
-    }
-    else if (args.activation_precision == "q8_1")
-    {
-        runtime_config.activation_precision = ActivationPrecision::Q8_1;
-    }
-    else
-    {
-        // This branch should never be reached due to ArgParser validation,
-        // but keep as defensive fallback
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_ERROR("Invalid activation precision mode '" << args.activation_precision
-                                                            << "' - this should have been caught by ArgParser");
-        }
-        runtime_config.activation_precision = ActivationPrecision::FP32; // Use default
-    }
-
-    // Fused attention + Wo kernel
-    runtime_config.use_fused_attention = args.use_fused_attention;
-    if (!args.fused_attention_backend_str.empty())
-    {
-        runtime_config.fused_attention_backend = parseFusedAttentionBackend(args.fused_attention_backend_str);
-    }
-    if (args.use_fused_attention && mpi_ctx->rank() == 0)
-    {
-        LOG_INFO("Fused attention+Wo kernel enabled (backend="
-                 << fusedAttentionBackendToString(runtime_config.fused_attention_backend) << ")");
-        // Fused attention supports Q8_1 mode
-        if (runtime_config.activation_precision != ActivationPrecision::Q8_1)
-        {
-            LOG_WARN("Fused attention requires Q8_1 activation precision, current: "
-                     << args.activation_precision << ". Will use unfused path.");
-        }
-    }
-
-    // Determine weight distribution strategy
-    // Default: sharding enabled when world_size > 1 (unless explicitly disabled)
-    WeightDistributionStrategy weight_strategy = WeightDistributionStrategy::REPLICATED;
-    bool use_sharding = args.shard_weights ||
-                        (mpi_ctx->world_size() > 1 && !args.disable_weight_sharding);
-
-    if (use_sharding)
-    {
-        weight_strategy = WeightDistributionStrategy::SHARDED;
-
-        // Row-parallel sharding now uses TensorSlice which preserves quantized format!
-        // Column-parallel still requires FP32 for slicing (TODO: implement column-parallel TensorSlice)
-        if (mpi_ctx->rank() == 0)
-        {
-            if (args.shard_weights)
-            {
-                LOG_INFO("Weight sharding enabled (--shard-weights) - row-parallel weights use TensorSlice");
-            }
-            else
-            {
-                LOG_INFO("Weight sharding auto-enabled for " << mpi_ctx->world_size()
-                                                             << " MPI ranks (use --no-shard to disable)");
-            }
-        }
-    }
-    else if (mpi_ctx->world_size() > 1 && args.disable_weight_sharding)
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_INFO("Weight sharding disabled (--no-shard) - using replicated weights across "
-                     << mpi_ctx->world_size() << " ranks");
-        }
-    }
-
-    // Create model context (loads metadata but not weights yet)
-    auto model_ctx = ModelContext::create(args.model_path, mpi_ctx, nullptr, nullptr,
-                                          weight_strategy,
-                                          runtime_config.weight_precision);
-    if (!model_ctx)
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_ERROR("Error: Failed to load model: " << args.model_path);
-        }
-        MPI_Finalize();
-        return 1;
-    }
-
-    // Create placement map from orchestrator
-    auto placement_map = orchestrator->createPlacementMap(model_ctx);
-
-    // Re-create model context with placement map (this creates WeightManager)
-    model_ctx = ModelContext::create(args.model_path, mpi_ctx, placement_map, nullptr,
-                                     weight_strategy,
-                                     runtime_config.weight_precision);
-    if (!model_ctx)
-    {
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_ERROR("Error: Failed to load model with placement map: " << args.model_path);
-        }
-        MPI_Finalize();
-        return 1;
-    }
-
-    const auto &model = model_ctx->model();
-    std::string architecture = model_ctx->architecture();
-
-    // Validate max_seq_len against model's context length
-    if (model.context_length > 0)
-    {
-        if (runtime_config.max_seq_len > static_cast<int>(model.context_length))
-        {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_WARN("Requested max_seq_len (" << runtime_config.max_seq_len
-                                                   << ") exceeds model's context_length ("
-                                                   << model.context_length << "). Clamping to model limit.");
-            }
-            runtime_config.max_seq_len = static_cast<int>(model.context_length);
-        }
-
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_INFO("KV cache size: " << runtime_config.max_seq_len
-                                       << " tokens (model max: " << model.context_length << ")");
-        }
-    }
-
-    // Log selected precision modes
-    if (mpi_ctx->rank() == 0)
-    {
-        const char *weight_prec_name = "Unknown";
-        switch (runtime_config.weight_precision)
-        {
-        case WeightPrecision::NATIVE:
-            weight_prec_name = "NATIVE (keep in GGUF format)";
-            break;
-        case WeightPrecision::CONVERT_TO_FP32:
-            weight_prec_name = "FP32 (dequantize to FP32 at load)";
-            break;
-        case WeightPrecision::CONVERT_TO_BF16:
-            weight_prec_name = "BF16 (dequantize to BF16 at load)";
-            break;
-        case WeightPrecision::CONVERT_TO_FP16:
-            weight_prec_name = "FP16 (dequantize to FP16 at load)";
-            break;
-        case WeightPrecision::CONVERT_TO_INT8:
-            weight_prec_name = "INT8 (dequantize to INT8 at load)";
-            break;
-        }
-
-        const char *activation_prec_name = "Unknown";
-        switch (runtime_config.activation_precision)
-        {
-        case ActivationPrecision::FP32:
-            activation_prec_name = "FP32 (32-bit float)";
-            break;
-        case ActivationPrecision::BF16:
-            activation_prec_name = "BF16 (bfloat16)";
-            break;
-        case ActivationPrecision::FP16:
-            activation_prec_name = "FP16 (16-bit float)";
-            break;
-        case ActivationPrecision::Q8_1:
-            activation_prec_name = "Q8_1 (quantized 8-bit with per-block scaling)";
-            break;
-        }
-
-        LOG_DEBUG("Weight precision: " << weight_prec_name);
-        LOG_DEBUG("Activation precision: " << activation_prec_name);
-    }
-
-    // Create inference runner using factory (auto-selects graph path by default)
-    InferenceRunnerConfig runner_config;
-    runner_config.max_seq_len = runtime_config.max_seq_len;
-    runner_config.activation_precision = runtime_config.activation_precision;
-    runner_config.fused_attention_backend = runtime_config.fused_attention_backend;
-
-    auto runner = createInferenceRunner(model_ctx, mpi_ctx, device_id, runner_config);
     if (!runner)
     {
         if (mpi_ctx->rank() == 0)
         {
-            LOG_ERROR("Error: Failed to create inference runner for architecture: " << architecture);
+            LOG_ERROR("Error: Failed to create orchestration runner");
         }
         MPI_Finalize();
         return 1;
     }
 
-    // Create tokenizer from model context (avoids re-loading the model file)
-    std::shared_ptr<ITokenizer> tokenizer;
-    try
-    {
-        tokenizer = createTokenizer(model_ctx);
-        if (!tokenizer)
-        {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Failed to create tokenizer from model context");
-            }
-            MPI_Finalize();
-            return 1;
-        }
-    }
-    catch (const std::exception &e)
+    if (!runner->initialize())
     {
         if (mpi_ctx->rank() == 0)
         {
-            LOG_ERROR("Error creating tokenizer: " << e.what());
+            LOG_ERROR("Failed to initialize: " << runner->lastError());
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    // Get tokenizer from runner
+    auto tokenizer = runner->tokenizer();
+    if (!tokenizer)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_ERROR("Failed to get tokenizer from runner");
         }
         MPI_Finalize();
         return 1;
     }
 
     // Handle chat template override if specified
-    if (!args.chat_template.empty())
+    if (!config.chat_template_override.empty())
     {
         // Parse template type from string
         ChatTemplateType override_type = ChatTemplateType::UNKNOWN;
-        std::string tmpl_lower = args.chat_template;
+        std::string tmpl_lower = config.chat_template_override;
         std::transform(tmpl_lower.begin(), tmpl_lower.end(), tmpl_lower.begin(), ::tolower);
 
         if (tmpl_lower == "chatml")
@@ -702,7 +299,7 @@ int main(int argc, char *argv[])
         {
             if (mpi_ctx->rank() == 0)
             {
-                LOG_WARN("Unknown chat template '" << args.chat_template << "', using model's template");
+                LOG_WARN("Unknown chat template '" << config.chat_template_override << "', using model's template");
             }
         }
 
@@ -711,7 +308,7 @@ int main(int argc, char *argv[])
             tokenizer->setChatTemplate(ChatTemplate::create(override_type));
             if (mpi_ctx->rank() == 0)
             {
-                LOG_DEBUG("Using chat template override: " << args.chat_template);
+                LOG_DEBUG("Using chat template override: " << config.chat_template_override);
             }
         }
     }
@@ -721,7 +318,7 @@ int main(int argc, char *argv[])
     // ========================================================================
 
     // Interactive chat mode (--chat)
-    if (args.chat_mode)
+    if (config.chat_mode)
     {
         if (mpi_ctx->rank() == 0)
         {
@@ -736,18 +333,70 @@ int main(int argc, char *argv[])
             LOG_INFO("Starting interactive chat mode...");
 
             ChatUIConfig chat_config;
-            chat_config.system_prompt = args.system_prompt;
-            chat_config.max_tokens = args.n_predict;
-            chat_config.temperature = args.temperature;
-            chat_config.top_k = args.top_k;
-            chat_config.top_p = args.top_p;
+            chat_config.system_prompt = config.system_prompt;
+            chat_config.max_tokens = config.n_predict;
+            chat_config.temperature = config.temperature;
+            chat_config.top_k = config.top_k;
+            chat_config.top_p = config.top_p;
 
-            // Convert unique_ptr to shared_ptr for ChatUI
-            std::shared_ptr<IInferenceRunner> shared_runner(std::move(runner));
+            // Create an adapter to use OrchestrationRunner with ChatUI
+            // ChatUI needs IInferenceRunner, so we wrap the runner calls
+            class OrchestrationRunnerAdapter : public IInferenceRunner
+            {
+            public:
+                OrchestrationRunnerAdapter(IOrchestrationRunner *orch_runner)
+                    : orch_runner_(orch_runner), position_(0) {}
 
-            ChatUI chat_ui(tokenizer, shared_runner, chat_config);
+                bool forward(const int *tokens, int seq_len) override
+                {
+                    std::vector<int32_t> token_vec(tokens, tokens + seq_len);
+                    bool result = orch_runner_->prefill(token_vec);
+                    if (result)
+                        position_ += seq_len;
+                    return result;
+                }
+
+                const float *logits() const override
+                {
+                    return orch_runner_->lastLogits();
+                }
+
+                int vocab_size() const override
+                {
+                    return orch_runner_->vocabSize();
+                }
+
+                void clear_cache() override
+                {
+                    orch_runner_->clearCache();
+                    position_ = 0;
+                }
+
+                int get_position() const override
+                {
+                    return position_;
+                }
+
+                ExecutionPath executionPath() const override
+                {
+                    return ExecutionPath::GRAPH;
+                }
+
+                const char *architecture() const override
+                {
+                    return "orchestrated";
+                }
+
+            private:
+                IOrchestrationRunner *orch_runner_;
+                int position_;
+            };
+
+            auto adapter = std::make_shared<OrchestrationRunnerAdapter>(runner.get());
+            ChatUI chat_ui(tokenizer, adapter, chat_config);
             int result = chat_ui.run();
 
+            runner->shutdown();
             MPI_Finalize();
             return result;
         }
@@ -756,6 +405,7 @@ int main(int argc, char *argv[])
             // Non-rank-0 processes wait for chat to complete
             // TODO: Implement proper multi-rank chat support
             MPI_Barrier(MPI_COMM_WORLD);
+            runner->shutdown();
             MPI_Finalize();
             return 0;
         }
@@ -764,7 +414,7 @@ int main(int argc, char *argv[])
     // Single-shot chat mode (--chat-single)
     // This mode applies the chat template to the prompt and generates a response.
     // All MPI ranks must participate in forward passes to avoid deadlocks.
-    if (args.single_shot_chat)
+    if (config.single_shot_chat)
     {
         if (!tokenizer->hasChatTemplate())
         {
@@ -774,6 +424,7 @@ int main(int argc, char *argv[])
                 LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
             }
             MPI_Barrier(MPI_COMM_WORLD);
+            runner->shutdown();
             MPI_Finalize();
             return 1;
         }
@@ -784,19 +435,20 @@ int main(int argc, char *argv[])
         }
 
         // Build conversation and encode with chat template (rank 0 only, then broadcast)
-        std::vector<int> token_ids;
+        std::vector<int32_t> token_ids;
         int token_count = 0;
 
         if (mpi_ctx->rank() == 0)
         {
             std::vector<ChatMessage> conversation;
-            if (!args.system_prompt.empty())
+            if (!config.system_prompt.empty())
             {
-                conversation.push_back(ChatMessage("system", args.system_prompt));
+                conversation.push_back(ChatMessage("system", config.system_prompt));
             }
-            conversation.push_back(ChatMessage("user", args.prompt));
+            conversation.push_back(ChatMessage("user", config.prompt));
 
-            token_ids = tokenizer->encodeChat(conversation, /*add_generation_prompt=*/true);
+            auto encoded = tokenizer->encodeChat(conversation, /*add_generation_prompt=*/true);
+            token_ids.assign(encoded.begin(), encoded.end());
             token_count = static_cast<int>(token_ids.size());
 
             if (token_ids.empty())
@@ -815,6 +467,7 @@ int main(int argc, char *argv[])
 
         if (token_count <= 0)
         {
+            runner->shutdown();
             MPI_Finalize();
             return 1;
         }
@@ -832,30 +485,22 @@ int main(int argc, char *argv[])
             LOG_DEBUG("Running prefill (" << token_count << " tokens)...");
         }
 
-        if (!runner->forward(token_ids.data(), token_count))
+        if (!runner->prefill(token_ids))
         {
             if (mpi_ctx->rank() == 0)
             {
-                LOG_ERROR("Chat prefill failed");
+                LOG_ERROR("Chat prefill failed: " << runner->lastError());
             }
+            runner->shutdown();
             MPI_Finalize();
             return 1;
         }
 
-        // Set up sampling
-        int eos_token_id = tokenizer->eos_token();
-        Sampler sampler(args.seed);
-        SamplingParams sampling_params;
-        sampling_params.temperature = args.temperature;
-        sampling_params.top_k = args.top_k;
-        sampling_params.top_p = args.top_p;
-        sampling_params.seed = args.seed;
-
-        // Determine max tokens: -1 means unlimited (use context size as practical limit)
-        int max_tokens = args.n_predict;
+        // Determine max tokens: -1 means unlimited (use max_seq_len as practical limit)
+        int max_tokens = config.n_predict;
         if (max_tokens < 0)
         {
-            max_tokens = args.max_seq_len - token_count;
+            max_tokens = config.max_seq_len - token_count;
         }
 
         if (mpi_ctx->rank() == 0)
@@ -863,58 +508,46 @@ int main(int argc, char *argv[])
             LOG_INFO("Generating response (max " << max_tokens << " tokens)...\n");
         }
 
-        // Decode loop - all ranks participate in forward, rank 0 samples and outputs
+        // Decode loop - use decodeStep() which returns sampled token
         for (int i = 0; i < max_tokens; ++i)
         {
-            int next_token = -1;
+            // decodeStep() handles sampling internally based on config
+            GenerationResult result = runner->decodeStep();
 
-            // Rank 0: sample next token
-            if (mpi_ctx->rank() == 0)
+            if (!result.success())
             {
-                const float *logits = runner->logits();
-                size_t vocab_size = tokenizer->vocab_size();
-                std::vector<float> logits_vec(logits, logits + vocab_size);
-
-                // Sample
-                if (sampling_params.temperature < 0.01f)
+                if (mpi_ctx->rank() == 0)
                 {
-                    next_token = sampler.sample_greedy(logits_vec);
+                    LOG_ERROR("Decode step failed: " << result.error);
                 }
-                else
-                {
-                    next_token = sampler.sample(logits_vec, sampling_params);
-                }
-
-                // Output token text (streaming) - don't print stop tokens
-                if (!tokenizer->is_stop_token(next_token))
-                {
-                    std::string token_text = tokenizer->decode_token(next_token);
-                    std::cout << token_text << std::flush;
-                }
+                runner->shutdown();
+                MPI_Finalize();
+                return 1;
             }
 
-            // Broadcast next token to all ranks
-            MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            if (result.tokens.empty())
+            {
+                // No token generated - shouldn't happen
+                break;
+            }
 
-            // Check for stop tokens (EOS, <|im_end|>, etc.)
-            if (tokenizer->is_stop_token(next_token))
+            int32_t next_token = result.tokens[0];
+
+            // Output token text (streaming) on rank 0 - don't print stop tokens
+            if (mpi_ctx->rank() == 0 && !tokenizer->is_stop_token(next_token))
+            {
+                std::string token_text = tokenizer->decode_token(next_token);
+                std::cout << token_text << std::flush;
+            }
+
+            // Check for completion (EOS or stop token)
+            if (result.is_complete || tokenizer->is_stop_token(next_token))
             {
                 if (mpi_ctx->rank() == 0)
                 {
                     LOG_DEBUG("Stop token encountered (" << next_token << "), stopping generation");
                 }
                 break;
-            }
-
-            // All ranks forward the next token
-            if (!runner->forward(&next_token, 1))
-            {
-                if (mpi_ctx->rank() == 0)
-                {
-                    LOG_ERROR("Decode forward failed at token " << i);
-                }
-                MPI_Finalize();
-                return 1;
             }
         }
 
@@ -924,6 +557,7 @@ int main(int argc, char *argv[])
             LOG_INFO("Chat generation complete.");
         }
 
+        runner->shutdown();
         MPI_Finalize();
         return 0;
     }
@@ -931,34 +565,87 @@ int main(int argc, char *argv[])
     // ========================================================================
     // Benchmark Mode
     // ========================================================================
-    if (args.benchmark_mode)
+    if (config.benchmark_mode)
     {
         if (mpi_ctx->rank() == 0)
         {
             LOG_INFO("Running benchmark mode...");
         }
 
-        // Convert unique_ptr to shared_ptr for BenchmarkRunner
-        std::shared_ptr<IInferenceRunner> shared_runner(std::move(runner));
+        // Create an adapter to use OrchestrationRunner with BenchmarkRunner
+        class BenchmarkRunnerAdapter : public IInferenceRunner
+        {
+        public:
+            BenchmarkRunnerAdapter(IOrchestrationRunner *orch_runner)
+                : orch_runner_(orch_runner), position_(0) {}
 
-        BenchmarkRunner benchmark(shared_runner, tokenizer, mpi_ctx);
-        BenchmarkResult result = benchmark.run(args);
+            bool forward(const int *tokens, int seq_len) override
+            {
+                std::vector<int32_t> token_vec(tokens, tokens + seq_len);
+                bool result = orch_runner_->prefill(token_vec);
+                if (result)
+                    position_ += seq_len;
+                return result;
+            }
+
+            const float *logits() const override
+            {
+                return orch_runner_->lastLogits();
+            }
+
+            int vocab_size() const override
+            {
+                return orch_runner_->vocabSize();
+            }
+
+            void clear_cache() override
+            {
+                orch_runner_->clearCache();
+                position_ = 0;
+            }
+
+            int get_position() const override
+            {
+                return position_;
+            }
+
+            ExecutionPath executionPath() const override
+            {
+                return ExecutionPath::GRAPH;
+            }
+
+            const char *architecture() const override
+            {
+                return "orchestrated";
+            }
+
+        private:
+            IOrchestrationRunner *orch_runner_;
+            int position_;
+        };
+
+        auto adapter = std::make_shared<BenchmarkRunnerAdapter>(runner.get());
+
+        BenchmarkRunner benchmark(adapter, tokenizer, mpi_ctx);
+        BenchmarkResult result = benchmark.run(config);
         benchmark.printResults(result);
 
+        runner->shutdown();
         MPI_Finalize();
         return result.success ? 0 : 1;
     }
 
     // ========================================================================
-    // Standard Inference Mode (original code path)
+    // Standard Inference Mode
     // ========================================================================
 
     // Tokenize prompt
-    std::vector<int> tokens;
+    std::vector<int32_t> tokens;
     try
     {
         // Encode WITHOUT BOS token (E2E tests don't use BOS)
-        tokens = tokenizer->encode(args.prompt, /*add_bos=*/false, /*add_eos=*/false);
+        auto encoded = tokenizer->encode(config.prompt, /*add_bos=*/false, /*add_eos=*/false);
+        tokens.assign(encoded.begin(), encoded.end());
 
         if (tokens.empty())
         {
@@ -966,6 +653,7 @@ int main(int argc, char *argv[])
             {
                 LOG_ERROR("Tokenization resulted in empty token sequence");
             }
+            runner->shutdown();
             MPI_Finalize();
             return 1;
         }
@@ -991,17 +679,17 @@ int main(int argc, char *argv[])
         {
             LOG_ERROR("Error tokenizing prompt: " << e.what());
         }
+        runner->shutdown();
         MPI_Finalize();
         return 1;
     }
 
-    // Create sampler with seed for reproducibility
-    Sampler sampler(args.seed);
+    // Set up sampling parameters for logging
     SamplingParams sampling_params;
-    sampling_params.temperature = args.temperature;
-    sampling_params.top_k = args.top_k;
-    sampling_params.top_p = args.top_p;
-    sampling_params.seed = args.seed;
+    sampling_params.temperature = config.temperature;
+    sampling_params.top_k = config.top_k;
+    sampling_params.top_p = config.top_p;
+    sampling_params.seed = config.seed;
 
     if (mpi_ctx->rank() == 0)
     {
@@ -1018,109 +706,76 @@ int main(int argc, char *argv[])
         LOG_INFO("Running prefill (" << tokens.size() << " tokens)...");
     }
 
-    if (!runner->forward(tokens.data(), tokens.size()))
+    if (!runner->prefill(tokens))
     {
         if (mpi_ctx->rank() == 0)
         {
-            LOG_ERROR("Error: Prefill forward pass failed");
+            LOG_ERROR("Error: Prefill forward pass failed: " << runner->lastError());
         }
+        runner->shutdown();
         MPI_Finalize();
         return 1;
     }
 
     if (mpi_ctx->rank() == 0)
     {
-        if (args.n_predict == -1)
+        if (config.n_predict == -1)
         {
             LOG_DEBUG("Prefill complete. Generating tokens until EOS...\n");
         }
         else
         {
-            LOG_DEBUG("Prefill complete. Generating " << args.n_predict << " tokens...\n");
+            LOG_DEBUG("Prefill complete. Generating " << config.n_predict << " tokens...\n");
         }
     }
 
-    // Get EOS token ID for early stopping
-    int eos_token_id = tokenizer->eos_token();
-
-    // Generate tokens autoregressively
+    // Generate tokens autoregressively using decodeStep()
     // n_predict = -1 means unlimited (generate until EOS)
-    int max_tokens = (args.n_predict == -1) ? INT_MAX : args.n_predict;
+    int max_tokens = (config.n_predict == -1) ? INT_MAX : config.n_predict;
     for (int i = 0; i < max_tokens; ++i)
     {
         LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Starting decode iteration " << i);
 
-        // Get logits from last forward pass
-        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Getting logits...");
-        const float *logits = runner->logits();
-        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Logits retrieved");
+        // decodeStep() returns the sampled token
+        GenerationResult result = runner->decodeStep();
 
-        // Get vocabulary size from tokenizer
-        size_t vocab_size = tokenizer->vocab_size();
-
-        // Convert logits to vector for sampling (only on rank 0)
-        int next_token = -1;
-        if (mpi_ctx->rank() == 0)
+        if (!result.success())
         {
-            LOG_DEBUG("[Rank 0] Sampling token...");
-            std::vector<float> logits_vec(logits, logits + vocab_size);
-
-            // Sample next token
-            try
-            {
-                next_token = sampler.sample(logits_vec, sampling_params);
-                LOG_DEBUG("[Rank 0] Sampled token: " << next_token);
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR("Error sampling next token: " << e.what());
-                MPI_Finalize();
-                return 1;
-            }
-
-            // Decode and print the token immediately (streaming output)
-            // Don't print stop tokens
-            if (!tokenizer->is_stop_token(next_token))
-            {
-                std::string token_text = tokenizer->decode_token(next_token);
-                std::cout << token_text << std::flush;
-            }
-
-            // Check for early stopping (EOS, <|im_end|>, etc.)
-            if (tokenizer->is_stop_token(next_token))
-            {
-                if (args.verbose)
-                {
-                    LOG_DEBUG("\nGeneration stopped: stop token " << next_token << " encountered");
-                }
-                break;
-            }
-        }
-
-        // Broadcast next_token to all ranks for synchronized decode
-        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Broadcasting token...");
-        MPI_Bcast(&next_token, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Token broadcast complete: " << next_token);
-
-        // Check if rank 0 hit stop token
-        if (tokenizer->is_stop_token(next_token))
-        {
-            break;
-        }
-
-        // Forward next token through pipeline (single token decode)
-        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Entering decode forward...");
-        if (!runner->forward(&next_token, 1))
-        {
-            LOG_ERROR("[Rank " << mpi_ctx->rank() << "] Decode forward FAILED at token " << (i + 1));
             if (mpi_ctx->rank() == 0)
             {
-                LOG_ERROR("\nError: Decode forward pass failed at token " << (i + 1));
+                LOG_ERROR("\nError: Decode step failed at token " << (i + 1) << ": " << result.error);
             }
+            runner->shutdown();
             MPI_Finalize();
             return 1;
         }
-        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Decode forward SUCCESS");
+
+        if (result.tokens.empty())
+        {
+            // No token generated - shouldn't happen
+            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] No token generated at iteration " << i);
+            break;
+        }
+
+        int32_t next_token = result.tokens[0];
+        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Generated token: " << next_token);
+
+        // Output on rank 0 (streaming) - don't print stop tokens
+        if (mpi_ctx->rank() == 0 && !tokenizer->is_stop_token(next_token))
+        {
+            std::string token_text = tokenizer->decode_token(next_token);
+            std::cout << token_text << std::flush;
+        }
+
+        // Check for stop tokens (EOS, <|im_end|>, etc.)
+        if (result.is_complete || tokenizer->is_stop_token(next_token))
+        {
+            if (mpi_ctx->rank() == 0 && config.verbose_level > 0)
+            {
+                LOG_DEBUG("\nGeneration stopped: stop token " << next_token << " encountered");
+            }
+            break;
+        }
     }
 
     if (mpi_ctx->rank() == 0)
@@ -1130,6 +785,7 @@ int main(int argc, char *argv[])
         LOG_DEBUG("Generation complete.");
     }
 
+    runner->shutdown();
     MPI_Finalize();
     return 0;
 }

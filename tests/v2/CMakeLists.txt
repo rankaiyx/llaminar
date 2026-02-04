@@ -7438,6 +7438,24 @@ add_v2_test(V2_Integration_TPAllreduceStage_MPI
     LABELS "V2;Integration;TPAllreduce;GlobalTP;MPI;TensorParallel;ComputeStage;Phase4"
 )
 
+# Test: TPAllreduceStage Local NCCL Integration
+# Tests TPAllreduceStage with LocalTPContext using NCCL backend:
+# - NCCL device validation (tensor must be on TP device)
+# - Multi-GPU allreduce within single process
+# Requires at least 2 CUDA GPUs
+add_executable(v2_integration_tp_allreduce_stage_local_nccl
+    integration/execution/compute_stages/stages/Test__TPAllreduceStage_LocalNCCL.cpp
+)
+target_link_libraries(v2_integration_tp_allreduce_stage_local_nccl
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_TPAllreduceStage_LocalNCCL
+    COMMAND $<TARGET_FILE:v2_integration_tp_allreduce_stage_local_nccl>
+    LABELS "V2;Integration;TPAllreduce;LocalTP;NCCL;CUDA;TensorParallel;ComputeStage"
+)
+
 # Test: Qwen2Graph Fused Attention Integration
 # Verifies that the graph builder correctly switches between fused and decomposed paths
 add_executable(v2_test_qwen2_graph_fused_attention integration/models/qwen/Test__Qwen2Graph_FusedAttention.cpp)

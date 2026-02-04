@@ -9,6 +9,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../../kernels/KernelFactory.h"
 #include <cstring>
 
 namespace llaminar2
@@ -31,7 +32,9 @@ namespace llaminar2
             return cached_kernel_.get();
         }
 
-        // Create kernel from output tensor's type
+        // Create kernel using stage's device_id (NOT output tensor's device_ member)
+        // This ensures GPU kernels are created when the stage is assigned to GPU,
+        // even if the output tensor was allocated with a CPU device initially.
         auto *output_base = dynamic_cast<TensorBase *>(params_.output);
         if (!output_base)
         {
@@ -39,14 +42,39 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto *activation = dynamic_cast<IActivationTensor *>(output_base);
-        if (!activation)
+        // Get device type from stage's device_id (set by GraphOrchestrator based on placement)
+        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+
+        // Dispatch based on output tensor type
+        if (auto *fp32 = dynamic_cast<FP32Tensor *>(output_base))
         {
-            LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Output not IActivationTensor");
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createEmbedding(fp32, dev_type);
+        }
+        else if (auto *bf16 = dynamic_cast<BF16Tensor *>(output_base))
+        {
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createEmbedding(bf16, dev_type);
+        }
+        else if (auto *fp16 = dynamic_cast<FP16Tensor *>(output_base))
+        {
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createEmbedding(fp16, dev_type);
+        }
+        else if (auto *q8_1 = dynamic_cast<Q8_1Tensor *>(output_base))
+        {
+            cached_kernel_ = llaminar::v2::kernels::KernelFactory::createEmbedding(q8_1, dev_type);
+        }
+        else
+        {
+            LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Unsupported output tensor type: "
+                      << output_base->dtype_name());
             return nullptr;
         }
 
-        cached_kernel_ = activation->createEmbedding();
+        LOG_DEBUG("[EmbeddingStage::getOrCreateKernel] Created "
+                  << (dev_type == DeviceType::CUDA   ? "CUDA"
+                      : dev_type == DeviceType::ROCm ? "ROCm"
+                                                     : "CPU")
+                  << " embedding kernel for " << output_base->dtype_name() << " output");
+
         return cached_kernel_.get();
     }
 
@@ -174,6 +202,19 @@ namespace llaminar2
             {
                 LOG_ERROR("[EmbeddingStage] Kernel apply_tensor failed");
                 return false;
+            }
+        }
+
+        // Mark output as device-dirty WITH EVENT immediately after GPU kernel launch.
+        // This ensures any subsequent read (e.g., DEBUG logging below) will properly
+        // sync via event wait rather than reading stale data. The GraphExecutor's
+        // markOutputsDirty() call is too late for reads inside execute().
+        if (params_.device_id.type != DeviceType::CPU)
+        {
+            auto *output_base_tb = dynamic_cast<TensorBase *>(params_.output);
+            if (output_base_tb)
+            {
+                output_base_tb->mark_device_dirty_with_event();
             }
         }
 
@@ -380,9 +421,15 @@ namespace llaminar2
         }
     }
 
-    StageDumpInfo EmbeddingStage::getDumpInfo() const
+    StageDumpInfo EmbeddingStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
+
+        // Weight: embedding table (must be added for coherence to upload to GPU!)
+        if (params_.embed_table)
+        {
+            info.addWeight("embed_table", params_.embed_table);
+        }
 
         if (params_.output)
         {

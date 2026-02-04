@@ -77,11 +77,12 @@
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
-#include "execution/DeviceWorkspaceManager.h"
-#include "execution/WorkspaceDescriptor.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/SlabGemmConfig.h"
 #include "utils/Logger.h"
+#include "utils/KernelProfiler.h"
 
 #include <stdexcept>
 #include <vector>
@@ -200,8 +201,8 @@ namespace llaminar2
             int rocmQuantGemm_getMinN();
             int rocmQuantGemm_getMinK();
 
-            // Free device memory
-            void rocmQuantGemm_freeDevice(void *d_ptr);
+            // Free device memory (must set device before freeing)
+            void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id);
 
             // Memory management helpers
             bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id);
@@ -287,37 +288,33 @@ namespace llaminar2
             int8_t *d_weights_int8 = nullptr; // [K x N] ColumnMajor
             float *d_scales_B = nullptr;      // [N] per-column scales
 
-            // Work buffers for activation quantization
-            int8_t *d_A_int8 = nullptr;   // [M x K]
-            float *d_scales_A = nullptr;  // [M]
-            int32_t *d_C_int32 = nullptr; // [M x N]
-            int work_buffer_M = 0;
+            // Work buffer pointers - obtained from workspace at execution time
+            // These are NOT owned by the kernel - they point into workspace-managed memory
+            int8_t *d_A_int8 = nullptr;   // [M x K] quantized activations
+            float *d_scales_A = nullptr;  // [M] per-row scales
+            int32_t *d_C_int32 = nullptr; // [M x N] INT32 accumulator
 
-            // Cached INT32 accumulator for CK two-kernel path (avoids hot-path allocations)
-            int32_t *d_CK_int32 = nullptr;  // [M x N] accumulator for CK NoScale + applyScales
-            size_t d_CK_int32_capacity = 0; // Current allocation size (elements)
+            // CK-specific work buffers - also from workspace
+            int32_t *d_CK_int32 = nullptr;     // [M x N] CK accumulator
+            float *d_A_fp32 = nullptr;         // [M x K] input FP32
+            float *d_C_fp32 = nullptr;         // [M x N] output FP32
+            int8_t *d_A_padded = nullptr;      // [padded_m x K] padded activations
+            float *d_scale_A_padded = nullptr; // [padded_m] padded scales
+            float *d_E_padded = nullptr;       // [padded_m x N] padded output
 
-            // Cached temporary buffers (to avoid hipMalloc/hipFree per call)
-            float *d_A_fp32 = nullptr;    // [M x K] input activations FP32
-            float *d_C_fp32 = nullptr;    // [M x N] output FP32
-            size_t d_A_fp32_capacity = 0; // Current allocation size (elements)
-            size_t d_C_fp32_capacity = 0; // Current allocation size (elements)
-
-            // Cached padding buffers for M-padding path (avoids hipMalloc/hipFree per call)
-            // These are sized for the maximum padding case (padded_m=8, max K, max N)
-            int8_t *d_A_padded = nullptr;         // [padded_m x K] padded activations
-            float *d_scale_A_padded = nullptr;    // [padded_m] padded scales
-            float *d_E_padded = nullptr;          // [padded_m x N] padded output
-            size_t d_A_padded_capacity = 0;       // Current allocation: padded_m * K
-            size_t d_scale_A_padded_capacity = 0; // Current allocation: padded_m
-            size_t d_E_padded_capacity = 0;       // Current allocation: padded_m * N
+            // Capacity tracking for workspace buffers (set during validateWorkspace)
+            size_t d_CK_int32_capacity = 0;
+            size_t d_A_fp32_capacity = 0;
+            size_t d_C_fp32_capacity = 0;
+            size_t d_A_padded_capacity = 0;
+            size_t d_scale_A_padded_capacity = 0;
+            size_t d_E_padded_capacity = 0;
 
             // Flag to track if we own weight memory
             bool owns_weight_memory = false;
 
-            // Flag to track if work buffers come from workspace (vs self-allocated)
-            // When true, destructor must NOT free these buffers (workspace owns them)
-            bool using_workspace_buffers = false;
+            // ROCm device ID for proper cleanup
+            int rocm_device_id = 0;
 
             ~Impl()
             {
@@ -325,38 +322,11 @@ namespace llaminar2
                 if (owns_weight_memory)
                 {
                     if (d_weights_int8)
-                        rocmQuantGemm_freeDevice(d_weights_int8);
+                        rocmQuantGemm_freeDevice(d_weights_int8, rocm_device_id);
                     if (d_scales_B)
-                        rocmQuantGemm_freeDevice(d_scales_B);
+                        rocmQuantGemm_freeDevice(d_scales_B, rocm_device_id);
                 }
-
-                // Only free work buffers if we allocated them ourselves (not from workspace)
-                // When using_workspace_buffers is true, these pointers reference workspace-owned memory
-                if (!using_workspace_buffers)
-                {
-                    // Free work buffers for activation quantization
-                    if (d_A_int8)
-                        rocmQuantGemm_freeDevice(d_A_int8);
-                    if (d_scales_A)
-                        rocmQuantGemm_freeDevice(d_scales_A);
-                    if (d_C_int32)
-                        rocmQuantGemm_freeDevice(d_C_int32);
-                    // Free cached CK INT32 buffer
-                    if (d_CK_int32)
-                        rocmQuantGemm_freeDevice(d_CK_int32);
-                    // Free cached temporary buffers
-                    if (d_A_fp32)
-                        rocmQuantGemm_freeDevice(d_A_fp32);
-                    if (d_C_fp32)
-                        rocmQuantGemm_freeDevice(d_C_fp32);
-                    // Free cached padding buffers
-                    if (d_A_padded)
-                        rocmQuantGemm_freeDevice(d_A_padded);
-                    if (d_scale_A_padded)
-                        rocmQuantGemm_freeDevice(d_scale_A_padded);
-                    if (d_E_padded)
-                        rocmQuantGemm_freeDevice(d_E_padded);
-                }
+                // Work buffers are NOT freed - they are owned by workspace
             }
         };
 
@@ -368,15 +338,15 @@ namespace llaminar2
         {
             if (d_int8_data || d_scales)
             {
-                LOG_DEBUG("[ROCmPackedWeights::~] Freeing device memory: "
+                LOG_TRACE("[ROCmPackedWeights::~] Freeing device memory: "
                           << "d_int8_data=" << (void *)d_int8_data
                           << " d_scales=" << (void *)d_scales
                           << " rocm_device_id=" << rocm_device_id);
             }
             if (d_int8_data)
-                rocmQuantGemm_freeDevice(d_int8_data);
+                rocmQuantGemm_freeDevice(d_int8_data, rocm_device_id);
             if (d_scales)
-                rocmQuantGemm_freeDevice(d_scales);
+                rocmQuantGemm_freeDevice(d_scales, rocm_device_id);
         }
 
         // =====================================================================
@@ -533,7 +503,8 @@ namespace llaminar2
                     std::to_string(static_cast<int>(wt)));
             }
 
-            impl_->owns_weight_memory = true; // Legacy constructor owns weight memory
+            impl_->owns_weight_memory = true;        // Legacy constructor owns weight memory
+            impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
@@ -558,7 +529,8 @@ namespace llaminar2
             N_ = static_cast<size_t>(packed->N);
             K_ = static_cast<size_t>(packed->K);
 
-            impl_->owns_weight_memory = false; // Pre-packed path doesn't own weight memory
+            impl_->owns_weight_memory = false;       // Pre-packed path doesn't own weight memory
+            impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on ROCm device " << rocm_device_id_);
@@ -616,6 +588,7 @@ namespace llaminar2
             int device_idx,
             DeviceWorkspaceManager *workspace)
         {
+            KERNEL_PROFILE_SCOPE(KernelType::GEMM_Q8);
             (void)mpi_ctx;
             (void)device_idx;
             (void)transpose_B;
@@ -657,8 +630,32 @@ namespace llaminar2
             }
 
             // Check if tensors are on GPU
-            const float *d_input = static_cast<const float *>(A_fp32->gpu_data_ptr());
-            float *d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
+            // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer) instead of
+            // gpu_data_ptr() (which returns CUDA pointer for BAR-backed). This enables zero-copy
+            // where ROCm kernels write directly to BAR memory that CUDA can then read.
+            const float *d_input = nullptr;
+            float *d_output = nullptr;
+
+            if (A_fp32->isBARBacked() && A_fp32->rocm_data_ptr() != nullptr)
+            {
+                d_input = static_cast<const float *>(A_fp32->rocm_data_ptr());
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using BAR rocm_data_ptr for input A: " << d_input);
+            }
+            else
+            {
+                d_input = static_cast<const float *>(A_fp32->gpu_data_ptr());
+            }
+
+            if (C_fp32->isBARBacked() && C_fp32->rocm_data_ptr() != nullptr)
+            {
+                d_output = static_cast<float *>(C_fp32->rocm_data_ptr());
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using BAR rocm_data_ptr for output C: " << d_output);
+            }
+            else
+            {
+                d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
+            }
+
             const bool use_gpu_path = (d_input != nullptr) && (d_output != nullptr);
 
             auto phase_start = std::chrono::high_resolution_clock::now();
@@ -667,7 +664,17 @@ namespace llaminar2
             // Fast path: if bias is present and we're on GPU, use multiply_fp32_to_fp32_with_bias
             if (bias && use_gpu_path)
             {
-                const float *d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                // Get bias device pointer - check BAR-backed status
+                const float *d_bias = nullptr;
+                if (bias->isBARBacked())
+                {
+                    d_bias = static_cast<const float *>(bias->rocm_data_ptr());
+                }
+                else
+                {
+                    d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                }
+
                 if (d_bias)
                 {
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using bias path (d_input="
@@ -719,13 +726,13 @@ namespace llaminar2
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Weight ptrs: int8=" << (void *)d_weights_int8 << " scales=" << (void *)d_scales_B);
 
-            // Ensure work buffers are allocated
+            // Validate and populate workspace pointers
             phase_start = std::chrono::high_resolution_clock::now();
-            ensureWorkBuffers(m);
+            validateWorkspace();
             phase_end = std::chrono::high_resolution_clock::now();
             double workbuf_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             if (workbuf_ms > 1.0)
-                LOG_TRACE("[ROCmGEMM::PHASES] ensureWorkBuffers: " << workbuf_ms << "ms");
+                LOG_TRACE("[ROCmGEMM::PHASES] validateWorkspace: " << workbuf_ms << "ms");
 
             int8_t *d_A_int8 = impl_->d_A_int8;
             float *d_scales_A = impl_->d_scales_A;
@@ -748,29 +755,14 @@ namespace llaminar2
                 // CPU path: Copy from host to device
                 phase_start = std::chrono::high_resolution_clock::now();
 
-                // In managed mode, ensureWorkBuffers() already set up d_A_fp32 from workspace
-                // Only allocate if not using workspace AND capacity is insufficient
-                if (!impl_->using_workspace_buffers && a_fp32_size > impl_->d_A_fp32_capacity)
-                {
-                    if (impl_->d_A_fp32)
-                        rocmQuantGemm_freeDevice(impl_->d_A_fp32);
-                    impl_->d_A_fp32 = nullptr;
-                    impl_->d_A_fp32_capacity = 0;
-
-                    if (!rocmQuantGemm_allocFloat(&impl_->d_A_fp32, a_fp32_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to allocate activation buffer");
-                        return false;
-                    }
-                    impl_->d_A_fp32_capacity = a_fp32_size;
-                }
+                // Workspace is required - d_A_fp32 buffer is pre-allocated
                 d_A_fp32_src = impl_->d_A_fp32;
                 phase_end = std::chrono::high_resolution_clock::now();
                 double alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 if (alloc_ms > 1.0)
-                    LOG_TRACE("[ROCmGEMM::PHASES] d_A_fp32 alloc: " << alloc_ms << "ms");
+                    LOG_TRACE("[ROCmGEMM::PHASES] d_A_fp32 setup: " << alloc_ms << "ms");
 
-                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using cached d_A_fp32=" << (void *)d_A_fp32_src);
+                LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using workspace d_A_fp32=" << (void *)d_A_fp32_src);
 
                 phase_start = std::chrono::high_resolution_clock::now();
                 if (!rocmQuantGemm_copyHostToDevice(d_A_fp32_src, A_fp32->data(), a_fp32_size, rocm_device_id_))
@@ -874,23 +866,7 @@ namespace llaminar2
             }
             else
             {
-                // CPU path: Use temp buffer, will copy to host later
-                // In managed mode, ensureWorkBuffers() already set up d_C_fp32 from workspace
-                // Only allocate if not using workspace AND capacity is insufficient
-                if (!impl_->using_workspace_buffers && c_fp32_size > impl_->d_C_fp32_capacity)
-                {
-                    if (impl_->d_C_fp32)
-                        rocmQuantGemm_freeDevice(impl_->d_C_fp32);
-                    impl_->d_C_fp32 = nullptr;
-                    impl_->d_C_fp32_capacity = 0;
-
-                    if (!rocmQuantGemm_allocFloat(&impl_->d_C_fp32, c_fp32_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to allocate output buffer");
-                        return false;
-                    }
-                    impl_->d_C_fp32_capacity = c_fp32_size;
-                }
+                // CPU path: Use temp buffer from workspace, will copy to host later
                 d_C_fp32_dst = impl_->d_C_fp32;
             }
 
@@ -917,73 +893,12 @@ namespace llaminar2
                 LOG_DEBUG("[ROCmQuantisedGemmKernel] Using CK TWO-KERNEL (M=" << m << ", N=" << n << ", K=" << k << ")");
             }
 
-            // Ensure cached INT32 accumulator buffer is large enough (use padded size)
-            // In managed mode, ensureWorkBuffers() already set up d_CK_int32 from workspace
-            const size_t ck_int32_size = static_cast<size_t>(padded_m) * n;
-            if (!impl_->using_workspace_buffers && ck_int32_size > impl_->d_CK_int32_capacity)
-            {
-                if (impl_->d_CK_int32)
-                    rocmQuantGemm_freeDevice(impl_->d_CK_int32);
-                impl_->d_CK_int32 = nullptr;
-                impl_->d_CK_int32_capacity = 0;
-
-                if (!rocmQuantGemm_allocInt32(&impl_->d_CK_int32, ck_int32_size, rocm_device_id_))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate CK INT32 buffer");
-                    return false;
-                }
-                impl_->d_CK_int32_capacity = ck_int32_size;
-            }
+            // Use workspace INT32 accumulator buffer (pre-allocated for padded size)
+            // No allocation needed - workspace provides all buffers
 
             if (needs_padding)
             {
-                // Ensure padding buffers are large enough
-                // In managed mode, ensureWorkBuffers() already set up all padding buffers from workspace
-                const size_t padded_a_size = static_cast<size_t>(padded_m) * k;
-                if (!impl_->using_workspace_buffers && padded_a_size > impl_->d_A_padded_capacity)
-                {
-                    if (impl_->d_A_padded)
-                        rocmQuantGemm_freeDevice(impl_->d_A_padded);
-                    impl_->d_A_padded = nullptr;
-                    impl_->d_A_padded_capacity = 0;
-                    if (!rocmQuantGemm_allocInt8(&impl_->d_A_padded, padded_a_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate padded A buffer");
-                        return false;
-                    }
-                    impl_->d_A_padded_capacity = padded_a_size;
-                }
-
-                const size_t padded_scale_size = static_cast<size_t>(padded_m);
-                if (!impl_->using_workspace_buffers && padded_scale_size > impl_->d_scale_A_padded_capacity)
-                {
-                    if (impl_->d_scale_A_padded)
-                        rocmQuantGemm_freeDevice(impl_->d_scale_A_padded);
-                    impl_->d_scale_A_padded = nullptr;
-                    impl_->d_scale_A_padded_capacity = 0;
-                    if (!rocmQuantGemm_allocFloat(&impl_->d_scale_A_padded, padded_scale_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate padded scale buffer");
-                        return false;
-                    }
-                    impl_->d_scale_A_padded_capacity = padded_scale_size;
-                }
-
-                const size_t padded_e_size = static_cast<size_t>(padded_m) * n;
-                if (!impl_->using_workspace_buffers && padded_e_size > impl_->d_E_padded_capacity)
-                {
-                    if (impl_->d_E_padded)
-                        rocmQuantGemm_freeDevice(impl_->d_E_padded);
-                    impl_->d_E_padded = nullptr;
-                    impl_->d_E_padded_capacity = 0;
-                    if (!rocmQuantGemm_allocFloat(&impl_->d_E_padded, padded_e_size, rocm_device_id_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate padded E buffer");
-                        return false;
-                    }
-                    impl_->d_E_padded_capacity = padded_e_size;
-                }
-
+                // Padding buffers come from workspace - no allocation needed
                 // Padded execution with cached buffers (no hot-path allocations!)
                 auto gemm_start = std::chrono::high_resolution_clock::now();
                 success = rocmQuantGemm_executeTwoKernel_padded_cached(
@@ -1023,9 +938,7 @@ namespace llaminar2
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] CPU path: copying to host"
                           << " d_C_fp32_dst=" << d_C_fp32_dst
                           << " h_dst=" << (void *)C_fp32->mutable_data()
-                          << " c_fp32_size=" << c_fp32_size
-                          << " using_workspace=" << impl_->using_workspace_buffers
-                          << " d_C_fp32_capacity=" << impl_->d_C_fp32_capacity);
+                          << " c_fp32_size=" << c_fp32_size);
                 if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), d_C_fp32_dst, c_fp32_size, rocm_device_id_))
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to copy output to host");
@@ -1082,29 +995,17 @@ namespace llaminar2
                 return false;
             }
 
-            // Ensure work buffers
-            ensureWorkBuffers(m);
+            // Validate and populate workspace pointers
+            validateWorkspace();
 
             int8_t *d_A_int8 = impl_->d_A_int8;
             float *d_scales_A = impl_->d_scales_A;
-            int32_t *d_C_int32 = impl_->d_C_int32;
-
-            // Ensure FP32 activation buffer
-            const size_t a_fp32_size = static_cast<size_t>(m) * k;
-            if (a_fp32_size > impl_->d_A_fp32_capacity)
-            {
-                if (impl_->d_A_fp32)
-                    rocmQuantGemm_freeDevice(impl_->d_A_fp32);
-                if (!rocmQuantGemm_allocFloat(&impl_->d_A_fp32, a_fp32_size, rocm_device_id_))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to allocate A buffer");
-                    return false;
-                }
-                impl_->d_A_fp32_capacity = a_fp32_size;
-            }
             float *d_A_fp32 = impl_->d_A_fp32;
+            float *d_C_fp32 = impl_->d_C_fp32;
 
             // Copy activations H2D and quantize (OUTSIDE timing)
+            const size_t a_fp32_size = static_cast<size_t>(m) * k;
+            const size_t c_fp32_size = static_cast<size_t>(m) * n;
             if (!rocmQuantGemm_copyHostToDevice(d_A_fp32, A_fp32->data(), a_fp32_size, rocm_device_id_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to copy A");
@@ -1116,39 +1017,9 @@ namespace llaminar2
                 return false;
             }
 
-            // Ensure output buffer
-            const size_t c_fp32_size = static_cast<size_t>(m) * n;
-            if (c_fp32_size > impl_->d_C_fp32_capacity)
-            {
-                if (impl_->d_C_fp32)
-                    rocmQuantGemm_freeDevice(impl_->d_C_fp32);
-                if (!rocmQuantGemm_allocFloat(&impl_->d_C_fp32, c_fp32_size, rocm_device_id_))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to allocate C buffer");
-                    return false;
-                }
-                impl_->d_C_fp32_capacity = c_fp32_size;
-            }
-            float *d_C_fp32 = impl_->d_C_fp32;
-
             // Calculate padding
             int padded_m = getPaddedM(m);
             bool needs_padding = (padded_m > m);
-
-            // Ensure INT32 accumulator buffer
-            const size_t ck_int32_size = static_cast<size_t>(padded_m) * n;
-            if (ck_int32_size > impl_->d_CK_int32_capacity)
-            {
-                if (impl_->d_CK_int32)
-                    rocmQuantGemm_freeDevice(impl_->d_CK_int32);
-                impl_->d_CK_int32 = nullptr;
-                if (!rocmQuantGemm_allocInt32(&impl_->d_CK_int32, ck_int32_size, rocm_device_id_))
-                {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_timed] Failed to allocate INT32 buffer");
-                    return false;
-                }
-                impl_->d_CK_int32_capacity = ck_int32_size;
-            }
 
             // Execute GEMM with HIP event timing (ONLY this is timed)
             bool success = false;
@@ -1296,7 +1167,16 @@ namespace llaminar2
                     return false;
                 }
                 // Coherence handled automatically by GraphExecutor
-                d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
+                // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
+                if (fp32_input->isBARBacked() && fp32_input->rocm_data_ptr() != nullptr)
+                {
+                    d_input = static_cast<const float *>(fp32_input->rocm_data_ptr());
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for input: " << d_input);
+                }
+                else
+                {
+                    d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
+                }
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input << " cpu_ptr=" << fp32_input->data());
             }
             else
@@ -1312,8 +1192,8 @@ namespace llaminar2
                 return false;
             }
 
-            // Step 2: Allocate activation quantization buffers (shared across all projections)
-            ensureWorkBuffers(m);
+            // Step 2: Validate and populate workspace pointers (shared across all projections)
+            validateWorkspace();
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
@@ -1358,8 +1238,8 @@ namespace llaminar2
                 // Ensure the projection's weights are converted
                 rocm_kernel->ensureWeightsConverted();
 
-                // Ensure this projection has enough work buffer capacity
-                rocm_kernel->ensureWorkBuffers(m);
+                // Validate this projection's workspace is bound and populated
+                rocm_kernel->validateWorkspace();
 
                 // Ensure output tensor is on device
                 if (proj.output->native_type() != TensorType::FP32)
@@ -1379,7 +1259,17 @@ namespace llaminar2
                 }
 
                 // Coherence handled automatically by GraphExecutor
-                float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr() (HIP pointer)
+                float *d_output = nullptr;
+                if (fp32_output->isBARBacked() && fp32_output->rocm_data_ptr() != nullptr)
+                {
+                    d_output = static_cast<float *>(fp32_output->rocm_data_ptr());
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for output: " << d_output);
+                }
+                else
+                {
+                    d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                }
                 if (!d_output)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Output has no GPU data for projection " << i);
@@ -1418,7 +1308,7 @@ namespace llaminar2
                 if (ck_int32_size > rocm_kernel->impl_->d_CK_int32_capacity)
                 {
                     if (rocm_kernel->impl_->d_CK_int32)
-                        rocmQuantGemm_freeDevice(rocm_kernel->impl_->d_CK_int32);
+                        rocmQuantGemm_freeDevice(rocm_kernel->impl_->d_CK_int32, rocm_device_id_);
                     rocm_kernel->impl_->d_CK_int32 = nullptr;
                     rocm_kernel->impl_->d_CK_int32_capacity = 0;
 
@@ -1444,9 +1334,67 @@ namespace llaminar2
                     }
 
                     // Use TensorBase interface - works with both FP32Tensor and TensorSlice
-                    // Cast away const to access gpu_data_ptr() (coherence is managed by GraphExecutor)
+                    // Cast away const to access coherence methods
                     auto *bias_tensor = const_cast<TensorBase *>(proj.bias);
-                    d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+
+                    // Check if bias is already on the correct ROCm device
+                    // In multi-GPU scenarios, each device should have its own bias tensor clone
+                    // (created during weight preloading via WeightPreloader::uploadNonGemmWeights)
+                    DeviceId target_device = DeviceId::rocm(rocm_device_id_);
+                    auto current_dev = bias_tensor->current_device();
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Proj " << i
+                                                                                       << " bias tensor=" << bias_tensor
+                                                                                       << " current_dev=" << (current_dev.has_value() ? current_dev->to_string() : "(none)")
+                                                                                       << " target_device=" << target_device.to_string()
+                                                                                       << " gpu_data_ptr=" << bias_tensor->gpu_data_ptr()
+                                                                                       << " rocm_device_id_=" << rocm_device_id_);
+
+                    if (current_dev.has_value() && current_dev.value() == target_device)
+                    {
+                        // Already on correct device - use directly
+                        // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr()
+                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for bias: " << d_bias);
+                        }
+                        else
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        }
+                    }
+                    else if (current_dev.has_value() && current_dev->is_gpu())
+                    {
+                        // Tensor is on a DIFFERENT GPU - this is a multi-GPU race condition!
+                        // Do NOT call ensureOnDevice() as it would free the other GPU's memory.
+                        // The correct fix is to ensure each device has its own bias tensor clone.
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] MULTI-GPU CONFLICT: Bias tensor is on "
+                                  << current_dev->to_string() << " but we need ROCm:" << rocm_device_id_
+                                  << ". Ensure WeightPreloader::uploadNonGemmWeights() was called for this device.");
+                        all_success = false;
+                        break;
+                    }
+                    else
+                    {
+                        // Tensor is on CPU or not uploaded yet - safe to upload to this device
+                        if (!bias_tensor->ensureOnDevice(target_device))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to upload bias to ROCm:" << rocm_device_id_);
+                            all_success = false;
+                            break;
+                        }
+                        // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr()
+                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
+                        }
+                        else
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        }
+                    }
+
                     if (!d_bias)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i);
@@ -1468,57 +1416,7 @@ namespace llaminar2
 
                     if (needs_padding)
                     {
-                        // Use CACHED padded buffers (from this kernel's impl_) to avoid
-                        // hipMalloc/hipFree per call which is extremely slow on ROCm!
-                        // Ensure padding buffers are large enough
-                        const size_t padded_a_size = static_cast<size_t>(padded_m) * k;
-                        if (!impl_->using_workspace_buffers && padded_a_size > impl_->d_A_padded_capacity)
-                        {
-                            if (impl_->d_A_padded)
-                                rocmQuantGemm_freeDevice(impl_->d_A_padded);
-                            impl_->d_A_padded = nullptr;
-                            impl_->d_A_padded_capacity = 0;
-                            if (!rocmQuantGemm_allocInt8(&impl_->d_A_padded, padded_a_size, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate padded A buffer");
-                                all_success = false;
-                                break;
-                            }
-                            impl_->d_A_padded_capacity = padded_a_size;
-                        }
-
-                        const size_t padded_scale_size = static_cast<size_t>(padded_m);
-                        if (!impl_->using_workspace_buffers && padded_scale_size > impl_->d_scale_A_padded_capacity)
-                        {
-                            if (impl_->d_scale_A_padded)
-                                rocmQuantGemm_freeDevice(impl_->d_scale_A_padded);
-                            impl_->d_scale_A_padded = nullptr;
-                            impl_->d_scale_A_padded_capacity = 0;
-                            if (!rocmQuantGemm_allocFloat(&impl_->d_scale_A_padded, padded_scale_size, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate padded scale buffer");
-                                all_success = false;
-                                break;
-                            }
-                            impl_->d_scale_A_padded_capacity = padded_scale_size;
-                        }
-
-                        const size_t padded_e_size = static_cast<size_t>(padded_m) * n;
-                        if (!impl_->using_workspace_buffers && padded_e_size > impl_->d_E_padded_capacity)
-                        {
-                            if (impl_->d_E_padded)
-                                rocmQuantGemm_freeDevice(impl_->d_E_padded);
-                            impl_->d_E_padded = nullptr;
-                            impl_->d_E_padded_capacity = 0;
-                            if (!rocmQuantGemm_allocFloat(&impl_->d_E_padded, padded_e_size, rocm_device_id_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate padded E buffer");
-                                all_success = false;
-                                break;
-                            }
-                            impl_->d_E_padded_capacity = padded_e_size;
-                        }
-
+                        // Padding buffers come from workspace - no allocation needed
                         // Use CACHED version to avoid hipMalloc/hipFree per call!
                         success = rocmQuantGemm_executeTwoKernel_padded_cached(
                             impl_->d_A_int8,
@@ -1543,15 +1441,22 @@ namespace llaminar2
                     else
                     {
                         // Non-padded case: use executeNoScale + applyScaling with bias
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " BEFORE executeNoScale m=" << m << " n=" << n << " k=" << k
+                                                                                                 << " device=" << rocm_device_id_);
                         success = rocmQuantGemm_executeNoScale(
                             impl_->d_A_int8,
                             d_weights_int8,
                             rocm_kernel->impl_->d_CK_int32,
                             m, n, k, rocm_device_id_);
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " AFTER executeNoScale success=" << success);
 
                         if (success)
                         {
                             // Apply scaling with bias: output = C_int32 * scale_A * scale_B + bias
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                     << " BEFORE applyScaling device=" << rocm_device_id_);
                             success = rocmQuantGemm_applyScaling(
                                 rocm_kernel->impl_->d_CK_int32,
                                 d_output,
@@ -1562,6 +1467,8 @@ namespace llaminar2
                                 nullptr, // No existing C
                                 d_bias,  // Add bias
                                 rocm_device_id_);
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                     << " AFTER applyScaling success=" << success);
                         }
                     }
                 }
@@ -1819,54 +1726,90 @@ namespace llaminar2
                       << N_ << "x" << K_);
         }
 
-        void ROCmQuantisedGemmKernel::ensureWorkBuffers(int m)
+        void ROCmQuantisedGemmKernel::validateWorkspace() const
         {
             // =========================================================================
-            // MANAGED MODE: Use pre-allocated workspace buffers (ZERO hot-path allocs!)
+            // Workspace is REQUIRED - no fallback allocation
             // =========================================================================
-            if (hasWorkspace())
+            if (!hasWorkspace())
             {
-                // Get pointers from workspace (these are pre-allocated by GraphBufferManager)
-                impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
-                impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-                impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
-                impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
-                impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
-
-                // Also get padding buffers and CK INT32 accumulator from workspace
-                impl_->d_CK_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_CK_INT32));
-                impl_->d_A_padded = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_A_PADDED));
-                impl_->d_scale_A_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED));
-                impl_->d_E_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_E_PADDED));
-
-                // Mark workspace as having capacity for this M (workspace is pre-sized for max M)
-                impl_->work_buffer_M = m;
-                impl_->using_workspace_buffers = true;
-
-                // Set capacity values to max so reallocation checks pass
-                // (workspace buffers are pre-allocated for the maximum dimensions)
-                int k = static_cast<int>(K_);
-                int n = static_cast<int>(N_);
-                int padded_m = getPaddedM(m);
-                impl_->d_A_fp32_capacity = static_cast<size_t>(m) * k;
-                impl_->d_C_fp32_capacity = static_cast<size_t>(m) * n;
-                impl_->d_CK_int32_capacity = static_cast<size_t>(padded_m) * n;
-                impl_->d_A_padded_capacity = static_cast<size_t>(padded_m) * k;
-                impl_->d_scale_A_padded_capacity = static_cast<size_t>(padded_m);
-                impl_->d_E_padded_capacity = static_cast<size_t>(padded_m) * n;
-
-                LOG_TRACE("[ROCmQuantisedGemmKernel::ensureWorkBuffers] Using workspace buffers (managed mode)"
-                          << " A_int8=" << (void *)impl_->d_A_int8
-                          << " scales_A=" << (void *)impl_->d_scales_A
-                          << " C_int32=" << (void *)impl_->d_C_int32);
-                return;
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace not bound. Kernels require pre-allocated "
+                    "workspace buffers via bindWorkspace(). This is not optional.");
             }
 
-            // =========================================================================
-            // NO LEGACY MODE: Workspace is now REQUIRED
-            // =========================================================================
-            LOG_ERROR("[ROCmQuantisedGemmKernel::ensureWorkBuffers] Workspace not bound - hot-path allocation disabled. "
-                      "Call bindWorkspace() before multiply()");
+            // Validate required buffers exist
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::QUANT_A))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: QUANT_A");
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::SCALES_A))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: SCALES_A");
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ACC_INT32))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ACC_INT32");
+            }
+            // ROCm-specific buffers
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::TEMP_A_FP32))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: TEMP_A_FP32");
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::TEMP_C_FP32))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: TEMP_C_FP32");
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_CK_INT32))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_CK_INT32");
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_A_PADDED))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_A_PADDED");
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_SCALE_A_PADDED");
+            }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_E_PADDED))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_E_PADDED");
+            }
+
+            // Populate impl_ pointers from workspace
+            impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+            impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+            impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
+            impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
+            impl_->d_CK_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_CK_INT32));
+            impl_->d_A_padded = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_A_PADDED));
+            impl_->d_scale_A_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCALE_A_PADDED));
+            impl_->d_E_padded = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_E_PADDED));
+
+            // Set capacity values to max (workspace is pre-sized for maximum dimensions)
+            // These are used by code paths that check capacity before use
+            impl_->d_A_fp32_capacity = SIZE_MAX;
+            impl_->d_C_fp32_capacity = SIZE_MAX;
+            impl_->d_CK_int32_capacity = SIZE_MAX;
+            impl_->d_A_padded_capacity = SIZE_MAX;
+            impl_->d_scale_A_padded_capacity = SIZE_MAX;
+            impl_->d_E_padded_capacity = SIZE_MAX;
+
+            LOG_TRACE("[ROCmQuantisedGemmKernel::validateWorkspace] Workspace validated, pointers populated"
+                      << " A_int8=" << (void *)impl_->d_A_int8
+                      << " scales_A=" << (void *)impl_->d_scales_A
+                      << " C_int32=" << (void *)impl_->d_C_int32);
         }
 
         bool ROCmQuantisedGemmKernel::multiply_q8_to_fp32(
@@ -1896,9 +1839,9 @@ namespace llaminar2
                                                                             << " d_A=" << static_cast<const void *>(d_A)
                                                                             << " d_C=" << static_cast<void *>(d_C));
 
-            // Ensure weights converted and work buffers allocated
+            // Ensure weights converted and validate workspace
             ensureWeightsConverted();
-            ensureWorkBuffers(m);
+            validateWorkspace();
 
             // Step 1: Quantize FP32 activations to INT8
             if (!rocmQuantGemm_quantizeActivations(
@@ -1946,9 +1889,9 @@ namespace llaminar2
                                                                                       << " d_C=" << static_cast<void *>(d_C)
                                                                                       << " d_bias=" << static_cast<const void *>(d_bias));
 
-            // Ensure weights converted and work buffers allocated
+            // Ensure weights converted and validate workspace
             ensureWeightsConverted();
-            ensureWorkBuffers(m);
+            validateWorkspace();
 
             // Step 1: Quantize FP32 activations to INT8
             if (!rocmQuantGemm_quantizeActivations(

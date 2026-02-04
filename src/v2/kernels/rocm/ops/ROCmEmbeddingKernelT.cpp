@@ -5,8 +5,9 @@
 
 #include "ROCmEmbeddingKernelT.h"
 #include "utils/Logger.h"
-#include "../../../tensors/cpu/CPUTensors.h"
-#include "../../../execution/DeviceWorkspaceManager.h"
+#include "utils/KernelProfiler.h"
+#include "../../../tensors/TensorClasses.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 
 #include <hip/hip_runtime.h>
 
@@ -180,6 +181,7 @@ namespace llaminar2
         const MPIContext *mpi_ctx,
         int device_idx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::EMBEDDING);
         (void)mpi_ctx;
 
         if (!embed_table || !output)
@@ -273,7 +275,9 @@ namespace llaminar2
         }
         else
         {
-            // Slow path: Need to copy dequantized embedding data to GPU
+            // Workspace-cached path: Upload dequantized embedding table once, reuse across calls
+            // This is critical for performance with quantized embeddings (Q4_0, etc.)
+            // The embedding table (~500MB) should only be uploaded once per model load
             size_t vocab_size = embed_table->rows();
             size_t embed_dim = static_cast<size_t>(d_model);
             size_t embed_bytes = vocab_size * embed_dim * sizeof(float);
@@ -286,12 +290,25 @@ namespace llaminar2
                 return false;
             }
 
-            err = hipMemcpy(d_embed, embed_data, embed_bytes, hipMemcpyHostToDevice);
-            if (err != hipSuccess)
+            // Check if we need to upload (first call or different embedding table for THIS workspace)
+            auto it = s_workspace_embed_cache_.find(workspace_);
+            bool needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
+            if (needs_upload)
             {
-                LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy embeddings to GPU: " << hipGetErrorString(err));
-                return false;
+                err = hipMemcpy(d_embed, embed_data, embed_bytes, hipMemcpyHostToDevice);
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy embeddings to GPU: " << hipGetErrorString(err));
+                    return false;
+                }
+
+                // Cache the tensor pointer for THIS workspace to avoid re-upload on subsequent calls
+                s_workspace_embed_cache_[workspace_] = embed_table;
+                LOG_INFO("[ROCmEmbeddingKernelT] Uploaded dequantized embedding table: "
+                         << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024 * 1024) << " MB)"
+                         << " workspace=" << static_cast<void *>(workspace_));
             }
+            // else: embedding already uploaded to workspace buffer, reuse d_embed
         }
 
         // =====================================================================

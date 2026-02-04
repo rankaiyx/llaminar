@@ -155,7 +155,8 @@ TEST_F(Test__TPAllreduceStage, SupportsAllBackends)
  */
 TEST_F(Test__TPAllreduceStage, GetTPContextReturnsLocalContext)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    // Use HOST backend for unit tests - no GPU initialization needed
+    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::HOST);
 
     TPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -194,7 +195,7 @@ TEST_F(Test__TPAllreduceStage, GetTensorReturnsCorrect)
 TEST_F(Test__TPAllreduceStage, WorksWithLocalTPContextViaInterface)
 {
     auto local_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
-    ITPContext* tp_ctx = local_ctx.get(); // Upcast to base interface
+    ITPContext *tp_ctx = local_ctx.get(); // Upcast to base interface
 
     TPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx;
@@ -205,7 +206,7 @@ TEST_F(Test__TPAllreduceStage, WorksWithLocalTPContextViaInterface)
     EXPECT_FALSE(stage->getTPContext()->isGlobal());
     // Note: AUTO gets resolved to NCCL for CUDA devices
     EXPECT_NE(stage->getTPContext()->backend(), CollectiveBackendType::UPI);
-    
+
     // Single device no-op should succeed
     EXPECT_TRUE(stage->execute(ctx_.get()));
 }
@@ -278,7 +279,8 @@ TEST_F(Test__TPAllreduceStage, ExecuteFailsWithNullContext)
  */
 TEST_F(Test__TPAllreduceStage, ExecuteFailsWithNullTensor)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    // Use HOST backend for unit tests - no GPU initialization needed
+    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::HOST);
 
     TPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -320,34 +322,21 @@ TEST_F(Test__TPAllreduceStage, ExecuteSucceedsSingleDeviceLocalTP)
     }
 }
 
-/**
- * @test Execute with multi-device LOCAL context fails when tensor not on any TP device
- */
-TEST_F(Test__TPAllreduceStage, ExecuteLocalMultiDeviceFailsWhenTensorNotOnTPDevice)
-{
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
-    auto *tensor = test_tensor_.get(); // tensor is on CPU, not cuda0_ or cuda1_
-
-    TPAllreduceStage::Params params;
-    params.tp_ctx = tp_ctx.get();
-    params.tensor = tensor;
-
-    auto stage = std::make_unique<TPAllreduceStage>(params);
-
-    // Should fail: tensor device (CPU) not found in LocalTPContext devices
-    EXPECT_FALSE(stage->execute(ctx_.get()));
-}
-
 // =============================================================================
 // Dump Info Tests
 // =============================================================================
+
+// Note: The test "ExecuteLocalMultiDeviceFailsWhenTensorNotOnTPDevice" has been
+// moved to integration tests (Test__TPAllreduceStage_LocalNCCL.cpp) because it
+// requires NCCL backend initialization which touches real GPUs.
 
 /**
  * @test buildDumpInfoImpl includes tensor info
  */
 TEST_F(Test__TPAllreduceStage, DumpInfoIncludesTensor)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    // Use HOST backend for unit tests - no GPU initialization needed
+    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::HOST);
     auto *tensor = test_tensor_.get();
 
     TPAllreduceStage::Params params;
@@ -368,7 +357,8 @@ TEST_F(Test__TPAllreduceStage, DumpInfoIncludesTensor)
  */
 TEST_F(Test__TPAllreduceStage, DumpInfoIncludesScalarsLocalTP)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    // Use HOST backend for unit tests - no GPU initialization needed
+    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::HOST);
     auto *tensor = test_tensor_.get();
 
     TPAllreduceStage::Params params;
@@ -381,10 +371,10 @@ TEST_F(Test__TPAllreduceStage, DumpInfoIncludesScalarsLocalTP)
 
     // Should have tp_degree, backend, and is_global scalars
     EXPECT_GE(dump_info.scalars.size(), 3);
-    
+
     // Find is_global scalar and verify it's 0 (false)
     bool found_is_global = false;
-    for (const auto& scalar : dump_info.scalars)
+    for (const auto &scalar : dump_info.scalars)
     {
         if (scalar.name == std::string_view("is_global"))
         {
@@ -439,16 +429,16 @@ TEST_F(Test__TPAllreduceStage, BackwardCompatibilityAliasCompiles)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
-    
-    LocalTPAllreduceParams params;  // Using deprecated alias
+
+    LocalTPAllreduceParams params; // Using deprecated alias
     params.tp_ctx = tp_ctx.get();
     params.tensor = test_tensor_.get();
 
     // LocalTPAllreduceStage should resolve to TPAllreduceStage
     auto stage = std::make_unique<LocalTPAllreduceStage>(params);
-    
+
     // Stage should work normally
-    EXPECT_EQ(stage->name(), "TPAllreduce");  // Name is now TPAllreduce, not LocalTPAllreduce
+    EXPECT_EQ(stage->name(), "TPAllreduce"); // Name is now TPAllreduce, not LocalTPAllreduce
     EXPECT_TRUE(stage->execute(ctx_.get()));
 #pragma GCC diagnostic pop
 }
@@ -476,11 +466,11 @@ TEST_F(Test__TPAllreduceStage, CustomCountIsRespected)
     // Single device - no-op, but count should still be set correctly
     // We can verify via dump info
     auto dump_info = stage->buildDumpInfoImpl();
-    
+
     // Input/output rows should be calculated based on custom count
     // With 128 cols and 256 count, rows = 256 / 128 = 2
     ASSERT_GE(dump_info.inputs.size(), 1);
-    EXPECT_EQ(dump_info.inputs[0].rows, 2);  // 256 / 128 cols
+    EXPECT_EQ(dump_info.inputs[0].rows, 2); // 256 / 128 cols
 }
 
 /**

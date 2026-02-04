@@ -78,6 +78,14 @@ namespace llaminar2
             return "ALLREDUCE";
         case ComputeStageType::ALLGATHER:
             return "ALLGATHER";
+        case ComputeStageType::ALLGATHER_V:
+            return "ALLGATHER_V";
+        case ComputeStageType::SEND_ACTIVATIONS:
+            return "SEND_ACTIVATIONS";
+        case ComputeStageType::RECV_ACTIVATIONS:
+            return "RECV_ACTIVATIONS";
+        case ComputeStageType::LOCAL_PP_TRANSFER:
+            return "LOCAL_PP_TRANSFER";
         case ComputeStageType::COPY:
             return "COPY";
         case ComputeStageType::DEQUANTIZE:
@@ -533,7 +541,7 @@ namespace llaminar2
         return *this;
     }
 
-    void StageDumpInfo::ensureOutputsOnHost()
+    void StageDumpInfo::ensureOutputsOnHost() const
     {
         // Sync all output tensors from GPU to host.
         // Call this BEFORE reading output.data for verification/dumping.
@@ -541,7 +549,7 @@ namespace llaminar2
         {
             if (output.tensor)
             {
-                if (auto *cpu_tensor = dynamic_cast<CPUTensorBase *>(output.tensor))
+                if (auto *cpu_tensor = dynamic_cast<TensorBase *>(output.tensor))
                 {
                     auto t0 = std::chrono::high_resolution_clock::now();
                     cpu_tensor->ensureOnHost();
