@@ -7,6 +7,7 @@
  */
 
 #include "OrchestrationConfig.h"
+#include "execution/parallelism_tree/ParallelismTree.h"
 #include "utils/Logger.h"
 #include <sstream>
 #include <algorithm>
@@ -72,30 +73,7 @@ namespace llaminar2
         }
     }
 
-    const char *collectiveBackendTypeToString(CollectiveBackendType type)
-    {
-        switch (type)
-        {
-        case CollectiveBackendType::AUTO:
-            return "auto";
-        case CollectiveBackendType::NCCL:
-            return "nccl";
-        case CollectiveBackendType::RCCL:
-            return "rccl";
-        case CollectiveBackendType::PCIE_BAR:
-            return "pcie_bar";
-        case CollectiveBackendType::HETEROGENEOUS:
-            return "heterogeneous";
-        case CollectiveBackendType::UPI:
-            return "upi";
-        case CollectiveBackendType::MPI:
-            return "mpi";
-        case CollectiveBackendType::HOST:
-            return "host";
-        default:
-            return "unknown";
-        }
-    }
+    // collectiveBackendTypeToString - now in CollectiveBackendType.cpp
 
     // =========================================================================
     // String to Enum Parsing
@@ -171,27 +149,7 @@ namespace llaminar2
         return std::nullopt;
     }
 
-    std::optional<CollectiveBackendType> parseCollectiveBackendType(const std::string &str)
-    {
-        std::string lower = toLower(str);
-        if (lower == "auto")
-            return CollectiveBackendType::AUTO;
-        if (lower == "nccl")
-            return CollectiveBackendType::NCCL;
-        if (lower == "rccl")
-            return CollectiveBackendType::RCCL;
-        if (lower == "pciebar" || lower == "pcie_bar" || lower == "pcie-bar" || lower == "bar")
-            return CollectiveBackendType::PCIE_BAR;
-        if (lower == "heterogeneous" || lower == "hetero")
-            return CollectiveBackendType::HETEROGENEOUS;
-        if (lower == "upi")
-            return CollectiveBackendType::UPI;
-        if (lower == "mpi")
-            return CollectiveBackendType::MPI;
-        if (lower == "host")
-            return CollectiveBackendType::HOST;
-        return std::nullopt;
-    }
+    // parseCollectiveBackendType - now in CollectiveBackendType.cpp
 
     // =========================================================================
     // DomainDefinition Implementation
@@ -502,6 +460,16 @@ namespace llaminar2
     std::vector<std::string> OrchestrationConfig::validate() const
     {
         std::vector<std::string> errors;
+
+        // Validate topology tree if present
+        if (topology_tree)
+        {
+            auto tree_errors = topology_tree->validate();
+            for (const auto &e : tree_errors)
+            {
+                errors.push_back("topology: " + e);
+            }
+        }
 
         // Validate domain definitions
         std::unordered_set<std::string> domain_names;

@@ -2066,12 +2066,12 @@ namespace llaminar2
                     fp32_full->data() + slice_start,
                     slice_count * sizeof(float));
 
-        LOG_INFO("[WeightManager] Device " << device.to_string()
-                                           << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
-                                           << " column-parallel 1D " << name
-                                           << " [" << total_size << "]"
-                                           << " -> [" << slice_start << ", " << (slice_start + slice_count) << ")"
-                                           << " = " << slice_count << " elements");
+        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " column-parallel 1D " << name
+                                            << " [" << total_size << "]"
+                                            << " -> [" << slice_start << ", " << (slice_start + slice_count) << ")"
+                                            << " = " << slice_count << " elements");
 
         return sliced;
     }
@@ -2111,12 +2111,12 @@ namespace llaminar2
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
 
-        LOG_INFO("[WeightManager] Device " << device.to_string()
-                                           << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
-                                           << " column-parallel " << name
-                                           << " [" << total_rows << ", " << cols << "]"
-                                           << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
-                                           << " = " << row_count << " rows");
+        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " column-parallel " << name
+                                            << " [" << total_rows << ", " << cols << "]"
+                                            << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
+                                            << " = " << row_count << " rows");
 
         return result;
     }
@@ -2154,12 +2154,12 @@ namespace llaminar2
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
 
-        LOG_INFO("[WeightManager] Device " << device.to_string()
-                                           << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
-                                           << " row-parallel " << name
-                                           << " [" << total_rows << ", " << cols << "]"
-                                           << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
-                                           << " = " << row_count << " rows (needs allreduce)");
+        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " row-parallel " << name
+                                            << " [" << total_rows << ", " << cols << "]"
+                                            << " -> rows [" << row_start << ", " << (row_start + row_count) << ")"
+                                            << " = " << row_count << " rows (needs allreduce)");
 
         return result;
     }
@@ -2199,12 +2199,12 @@ namespace llaminar2
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
 
-        LOG_INFO("[WeightManager] Device " << device.to_string()
-                                           << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
-                                           << " input-parallel " << name
-                                           << " [" << rows << ", " << total_cols << "]"
-                                           << " -> cols [" << col_start << ", " << (col_start + col_count) << ")"
-                                           << " = " << col_count << " cols (needs allreduce)");
+        LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                            << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
+                                            << " input-parallel " << name
+                                            << " [" << rows << ", " << total_cols << "]"
+                                            << " -> cols [" << col_start << ", " << (col_start + col_count) << ")"
+                                            << " = " << col_count << " cols (needs allreduce)");
 
         return result;
     }

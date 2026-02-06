@@ -20,6 +20,7 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
+#include "../../common/EmbedQ8Repack.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -125,13 +126,23 @@ extern "C"
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos_offset, int seq_len,
         int n_heads, int n_kv_heads, int head_dim, int device_idx);
 
-    // Embedding lookup
+    // Embedding lookup - FP32
     cudaError_t launch_embedding_lookup(
         const float *embed_data,
         const int *token_ids,
         float *output,
         int num_tokens,
         int d_model,
+        cudaStream_t stream);
+
+    // Embedding lookup - EmbedQ8 (universal quantized format)
+    cudaError_t launch_embedding_lookup_q8(
+        const void *embed_q8,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int blocks_per_row,
         cudaStream_t stream);
 }
 
@@ -905,15 +916,6 @@ namespace llaminar2
             return false;
         }
 
-        // Get dequantized FP32 data from any tensor type via data()
-        // This handles Q4_0, Q8_0, FP32, etc. automatically
-        const float *embed_data = embed_table->data();
-        if (!embed_data)
-        {
-            fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to get embedding data\n");
-            return false;
-        }
-
         // Determine target CUDA device and set context
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
         cudaError_t set_err = cudaSetDevice(dev);
@@ -927,9 +929,6 @@ namespace llaminar2
         // =====================================================================
         // Step 1: Get token_ids buffer from workspace and copy data
         // =====================================================================
-        int *d_token_ids = nullptr;
-        size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
-
         if (!hasWorkspace())
         {
             fprintf(stderr, "[CUDAEmbeddingKernelT] Workspace not bound - hot-path allocation disabled. "
@@ -937,8 +936,7 @@ namespace llaminar2
             return false;
         }
 
-        // Use pre-allocated workspace buffer (workspace is required)
-        d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        int *d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
         if (!d_token_ids)
         {
             fprintf(stderr, "[CUDAEmbeddingKernelT] Workspace buffer '%s' not found\n",
@@ -946,6 +944,7 @@ namespace llaminar2
             return false;
         }
 
+        size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
         cudaError_t err = cudaMemcpy(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice);
         if (err != cudaSuccess)
         {
@@ -965,66 +964,75 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Step 3: Get or upload embedding table to GPU
+        // Step 3: Route by embedding table format
         // =====================================================================
-        float *d_embed = nullptr;
 
-        // Check if embed_table is FP32 and on GPU
+        // --- Fast path: FP32 tensor already on GPU (no upload needed) ---
         auto *embed_fp32 = dynamic_cast<const FP32Tensor *>(embed_table);
         if (embed_fp32 && embed_fp32->isOnGPU())
         {
-            // Fast path: FP32 tensor already on GPU
-            d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
+            float *d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
+            return apply(d_embed, d_token_ids, num_tokens, d_model, d_output, mpi_ctx, device_idx);
         }
-        else
-        {
-            // Workspace-cached path: Upload dequantized embedding table once, reuse across calls
-            // This is critical for performance with quantized embeddings (Q4_0, etc.)
-            // The embedding table (~500MB) should only be uploaded once per model load
 
-            // Use pre-allocated workspace buffer (workspace is required)
-            d_embed = static_cast<float *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE));
-            if (!d_embed)
+        // --- Quantized path: repack to EmbedQ8 via IINT8Unpackable ---
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
+        if (unpackable)
+        {
+            void *d_embed_q8 = workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE);
+            if (!d_embed_q8)
             {
                 fprintf(stderr, "[CUDAEmbeddingKernelT] Workspace buffer '%s' not found\n",
                         EmbeddingWorkspaceBuffers::EMBED_TABLE);
                 return false;
             }
 
-            // Check if we need to upload (first call or different embedding table for THIS workspace)
+            // Check if we need to repack + upload (first call or different tensor for THIS workspace)
             auto it = s_workspace_embed_cache_.find(workspace_);
             bool needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
             if (needs_upload)
             {
-                size_t vocab_size = embed_table->rows();
-                size_t embed_dim = static_cast<size_t>(d_model);
-                size_t embed_bytes = vocab_size * embed_dim * sizeof(float);
+                // CPU-side repack: any quant format → EmbedQ8Block via IINT8Unpackable
+                auto repacked = repackEmbeddingToQ8(embed_table, d_model);
 
-                err = cudaMemcpy(d_embed, embed_data, embed_bytes, cudaMemcpyHostToDevice);
+                err = cudaMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
+                                 cudaMemcpyHostToDevice);
                 if (err != cudaSuccess)
                 {
-                    fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy embeddings to GPU: %s\n",
+                    fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to upload EmbedQ8 data: %s\n",
                             cudaGetErrorString(err));
                     return false;
                 }
 
-                // Cache the tensor pointer for THIS workspace to avoid re-upload on subsequent calls
                 s_workspace_embed_cache_[workspace_] = embed_table;
-                LOG_INFO("[CUDAEmbeddingKernelT] Uploaded dequantized embedding table: "
-                         << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024 * 1024) << " MB)"
+                LOG_INFO("[CUDAEmbeddingKernelT] Uploaded EmbedQ8 embedding: "
+                         << tensorTypeName(embed_table->native_type()) << " "
+                         << repacked.vocab_size << "x" << d_model
+                         << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                         << " (" << repacked.blocks_per_row << " blocks/row)"
                          << " workspace=" << static_cast<void *>(workspace_));
             }
-            // else: embedding already uploaded to workspace buffer, reuse d_embed
+
+            // Launch EmbedQ8 kernel
+            size_t blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
+            err = launch_embedding_lookup_q8(d_embed_q8, d_token_ids, d_output,
+                                             num_tokens, d_model,
+                                             static_cast<int>(blocks_per_row), nullptr);
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] EmbedQ8 kernel failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
+            return true;
         }
 
-        // =====================================================================
-        // Step 4: Execute kernel with all GPU pointers
-        // =====================================================================
-        bool result = apply(d_embed, d_token_ids, num_tokens, d_model, d_output, mpi_ctx, device_idx);
-
-        // No cleanup needed - workspace buffers are managed by DeviceWorkspaceManager
-
-        return result;
+        // No FP32 fallback — embedding table must be either FP32-on-GPU or IINT8Unpackable
+        fprintf(stderr, "[CUDAEmbeddingKernelT] Embedding table type %s is not FP32-on-GPU "
+                        "and does not implement IINT8Unpackable\n",
+                tensorTypeName(embed_table->native_type()));
+        return false;
     }
 
     // =============================================================================
@@ -1048,13 +1056,14 @@ namespace llaminar2
             true // Required
         });
 
-        // Buffer 2: Embedding table temp [vocab_size × d_model × sizeof(float)]
-        // Used when embedding table is not already on GPU (quantized tables)
+        // Buffer 2: Embedding table temp [vocab_size × blocks_per_row × sizeof(EmbedQ8Block)]
+        // Used when embedding table is not already on GPU (quantized → EmbedQ8 repack)
         // Use conservative estimates: vocab_size = 151936 (Qwen2), d_model = k
         // If k not provided, use 896 (Qwen2.5-0.5B d_model)
         constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
         size_t d_model_size = (k > 0) ? static_cast<size_t>(k) : 896;
-        size_t embed_table_bytes = DEFAULT_VOCAB_SIZE * d_model_size * sizeof(float);
+        size_t blocks_per_row = (d_model_size + 31) / 32;
+        size_t embed_table_bytes = DEFAULT_VOCAB_SIZE * blocks_per_row * sizeof(EmbedQ8Block);
         reqs.buffers.push_back({
             EmbeddingWorkspaceBuffers::EMBED_TABLE,
             embed_table_bytes,

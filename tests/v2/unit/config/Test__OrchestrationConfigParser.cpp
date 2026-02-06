@@ -1046,30 +1046,6 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_ShowHelp_LongForm)
 }
 
 // ============================================================================
-// CLI Parsing - Placement Strategy
-// ============================================================================
-
-TEST(Test__OrchestrationConfigParser, ParseArgs_Strategy)
-{
-    ArgvHelper args{"llaminar2", "--strategy", "all-gpu"};
-    OrchestrationConfigParser parser;
-
-    auto config = parser.parseArgs(args.argc(), args.argv());
-
-    EXPECT_EQ(config.strategy, "all-gpu");
-}
-
-TEST(Test__OrchestrationConfigParser, ParseArgs_OffloadLayers)
-{
-    ArgvHelper args{"llaminar2", "--offload-layers", "10"};
-    OrchestrationConfigParser parser;
-
-    auto config = parser.parseArgs(args.argc(), args.argv());
-
-    EXPECT_EQ(config.offload_layers, 10);
-}
-
-// ============================================================================
 // CLI Parsing - Memory Constraints
 // ============================================================================
 
@@ -1137,43 +1113,6 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoESparseCPU)
     auto config = parser.parseArgs(args.argc(), args.argv());
 
     EXPECT_TRUE(config.moe_sparse_experts_cpu);
-}
-
-// ============================================================================
-// CLI Parsing - Multi-GPU Legacy
-// ============================================================================
-
-TEST(Test__OrchestrationConfigParser, ParseArgs_MultiGPU)
-{
-    ArgvHelper args{"llaminar2", "--multi-gpu"};
-    OrchestrationConfigParser parser;
-
-    auto config = parser.parseArgs(args.argc(), args.argv());
-
-    EXPECT_TRUE(config.multi_gpu);
-}
-
-TEST(Test__OrchestrationConfigParser, ParseArgs_GPUSplit)
-{
-    ArgvHelper args{"llaminar2", "--gpu-split", "weighted"};
-    OrchestrationConfigParser parser;
-
-    auto config = parser.parseArgs(args.argc(), args.argv());
-
-    EXPECT_EQ(config.gpu_split, "weighted");
-}
-
-TEST(Test__OrchestrationConfigParser, ParseArgs_GPUs)
-{
-    ArgvHelper args{"llaminar2", "--gpus", "0,1,2"};
-    OrchestrationConfigParser parser;
-
-    auto config = parser.parseArgs(args.argc(), args.argv());
-
-    EXPECT_EQ(config.gpu_devices.size(), 3u);
-    EXPECT_EQ(config.gpu_devices[0], 0);
-    EXPECT_EQ(config.gpu_devices[1], 1);
-    EXPECT_EQ(config.gpu_devices[2], 2);
 }
 
 // ============================================================================

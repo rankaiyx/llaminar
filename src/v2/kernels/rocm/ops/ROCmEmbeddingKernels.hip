@@ -2,7 +2,7 @@
  * @file ROCmEmbeddingKernels.hip
  * @brief ROCm/HIP kernels for embedding lookup operations
  *
- * Implements FP32, BF16, FP16, and Q8_1 embedding lookups using HIP.
+ * Implements FP32, BF16, FP16, Q8_1, and EmbedQ8 (universal quantized) embedding lookups.
  */
 
 #include <hip/hip_runtime.h>
@@ -10,6 +10,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+
+#include "../../common/EmbedQ8Block.h"
+
+using llaminar2::EmbedQ8Block;
 
 // BF16 type support
 #if defined(__HIP_PLATFORM_AMD__)
@@ -221,6 +225,57 @@ __global__ void rocm_embedding_q8_1_kernel(
 }
 
 // ============================================================================
+// EmbedQ8 Universal Quantized Embedding Lookup Kernel
+// ============================================================================
+
+/**
+ * @brief EmbedQ8 quantized embedding lookup kernel (universal format)
+ *
+ * Handles ALL quantized embedding formats (Q4_0, Q8_0, Q6_K, IQ4_NL, etc.)
+ * after CPU-side repacking via IINT8Unpackable → EmbedQ8Block.
+ *
+ * Dequant: value = qs[i] * half_to_float(d) + half_to_float(m)
+ *
+ * @param embed_q8       EmbedQ8 blocks [vocab_size * blocks_per_row]
+ * @param token_ids      Token IDs [num_tokens]
+ * @param output         FP32 output [num_tokens, d_model]
+ * @param num_tokens     Number of tokens
+ * @param d_model        Embedding dimension
+ * @param blocks_per_row Number of EmbedQ8 blocks per row (= ceil(d_model/32))
+ */
+__global__ void rocm_embedding_q8_kernel(
+    const EmbedQ8Block *__restrict__ embed_q8,
+    const int *__restrict__ token_ids,
+    float *__restrict__ output,
+    int num_tokens,
+    int d_model,
+    int blocks_per_row)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = num_tokens * d_model;
+
+    if (idx < total_elements)
+    {
+        int token_idx = idx / d_model;
+        int dim_idx = idx % d_model;
+        int token_id = token_ids[token_idx];
+
+        // Locate the EmbedQ8Block containing this element
+        int block_idx = dim_idx / 32;
+        int elem_in_block = dim_idx % 32;
+
+        const EmbedQ8Block &block = embed_q8[token_id * blocks_per_row + block_idx];
+
+        // Dequantize: value = qs[i] * scale + min
+        float scale = __half2float(*reinterpret_cast<const __half *>(&block.d));
+        float min_val = __half2float(*reinterpret_cast<const __half *>(&block.m));
+        float q_val = static_cast<float>(block.qs[elem_in_block]);
+
+        output[idx] = q_val * scale + min_val;
+    }
+}
+
+// ============================================================================
 // Host Launch Wrappers (extern "C" for linking from C++ code)
 // ============================================================================
 
@@ -332,6 +387,40 @@ extern "C"
             embed_data, token_ids, static_cast<Q8_1Block *>(output), num_tokens, d_model);
 
         // Removed hipDeviceSynchronize() - caller manages coherence via events
+        return hipGetLastError();
+    }
+
+    /**
+     * @brief Launch EmbedQ8 universal quantized embedding lookup kernel
+     *
+     * @param embed_q8       EmbedQ8 blocks on GPU [vocab_size * blocks_per_row]
+     * @param token_ids      Token IDs on GPU [num_tokens]
+     * @param output         FP32 output on GPU [num_tokens, d_model]
+     * @param num_tokens     Number of tokens
+     * @param d_model        Embedding dimension
+     * @param blocks_per_row Number of EmbedQ8 blocks per row (ceil(d_model / 32))
+     * @param stream         HIP stream (0 for default)
+     * @return hipError_t
+     */
+    hipError_t hipOps_embedding_q8(
+        const void *embed_q8,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int blocks_per_row,
+        hipStream_t stream)
+    {
+        (void)hipGetLastError();
+
+        int total_elements = num_tokens * d_model;
+        int block_size = 256;
+        int grid_size = (total_elements + block_size - 1) / block_size;
+
+        rocm_embedding_q8_kernel<<<grid_size, block_size, 0, stream>>>(
+            reinterpret_cast<const EmbedQ8Block *>(embed_q8),
+            token_ids, output, num_tokens, d_model, blocks_per_row);
+
         return hipGetLastError();
     }
 

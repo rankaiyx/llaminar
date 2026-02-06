@@ -87,7 +87,7 @@ namespace llaminar2
          * @return Runner instance, or nullptr on validation failure
          */
         virtual std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
-            const OrchestrationConfig &config) = 0;
+            OrchestrationConfig config) = 0;
 
         /**
          * @brief Create runner with injected model path

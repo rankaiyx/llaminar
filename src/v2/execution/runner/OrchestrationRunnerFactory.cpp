@@ -9,8 +9,11 @@
 #include "IOrchestrationRunnerFactory.h"
 #include "OrchestrationRunner.h"
 #include "../../config/OrchestrationConfigParser.h"
+#include "../../config/ParallelismTreeParser.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
+#include "../parallelism_tree/TreeToRunnerCompiler.h"
 #include "../../utils/Logger.h"
+#include "../../utils/MPIContext.h"
 #include <fstream>
 
 namespace llaminar2
@@ -83,7 +86,7 @@ namespace llaminar2
                     return nullptr;
                 }
 
-                return createFromOrchestrationConfig(config);
+                return createFromOrchestrationConfig(std::move(config));
             }
             catch (const std::exception &e)
             {
@@ -121,7 +124,7 @@ namespace llaminar2
                     return nullptr;
                 }
 
-                return createFromOrchestrationConfig(config);
+                return createFromOrchestrationConfig(std::move(config));
             }
             catch (const std::exception &e)
             {
@@ -131,14 +134,46 @@ namespace llaminar2
         }
 
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
-            const OrchestrationConfig &config) override
+            OrchestrationConfig config) override
         {
+            // ================================================================
+            // Handle topology tree if present (Phase 8: Global PP integration)
+            // ================================================================
+            if (config.topology_tree)
+            {
+                LOG_INFO("Using ParallelismTree topology for runner creation");
+                
+                // Get MPI context for world size and rank
+                auto mpi_ctx = MPIContextFactory::global();
+                
+                // Build compile context
+                TreeToRunnerCompiler::CompileContext compile_ctx;
+                compile_ctx.my_rank = mpi_ctx->rank();
+                compile_ctx.world_size = mpi_ctx->world_size();
+                compile_ctx.max_seq_len = static_cast<size_t>(config.max_seq_len);
+                compile_ctx.batch_size = config.batch_size;
+                // Note: hidden_dim and vocab_size will be set from model once loaded
+                compile_ctx.hidden_dim = 896;  // Qwen2.5 default
+                compile_ctx.vocab_size = 151936;  // Qwen2.5 default
+                
+                // For now, log tree structure and fall back to standard path
+                // Full tree-to-runner compilation requires model loading first
+                LOG_DEBUG("Topology tree structure:\n" << config.topology_tree->toString());
+                LOG_INFO("Note: Full tree compilation requires loaded model context");
+                LOG_INFO("Falling back to standard OrchestrationRunner path");
+                
+                // The actual tree compilation would be:
+                // auto runner = TreeToRunnerCompiler::compile(*config.topology_tree, compile_ctx);
+                // But we need model context first, so fall through to standard path
+            }
+            
+            // Standard path: Create OrchestrationRunner with ExecutionPlanBuilder
             // Create a copy of plan builder for the runner
             // (each runner needs its own instance)
             auto runner_plan_builder = createExecutionPlanBuilder();
 
             auto runner = std::make_unique<OrchestrationRunner>(
-                config,
+                std::move(config),
                 std::move(runner_plan_builder));
 
             return runner;
@@ -165,7 +200,7 @@ namespace llaminar2
             // Note: model_path would typically be stored in config
             // For now, the runner will need to be configured separately
 
-            return createFromOrchestrationConfig(config);
+            return createFromOrchestrationConfig(std::move(config));
         }
 
     private:

@@ -8,6 +8,7 @@
 #include "utils/KernelProfiler.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../common/EmbedQ8Repack.h"
 
 #include <hip/hip_runtime.h>
 
@@ -44,6 +45,15 @@ extern "C"
         void *output,
         int num_tokens,
         int d_model,
+        hipStream_t stream);
+
+    hipError_t hipOps_embedding_q8(
+        const void *embed_q8,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int blocks_per_row,
         hipStream_t stream);
 }
 
@@ -190,7 +200,7 @@ namespace llaminar2
             return false;
         }
 
-        // Output must be FP32 for now
+        // Output must be FP32
         if (output->native_type() != TensorType::FP32)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Output must be FP32 tensor, got " << static_cast<int>(output->native_type()));
@@ -204,18 +214,8 @@ namespace llaminar2
             return false;
         }
 
-        // Get dequantized FP32 data from any tensor type via data()
-        // This handles Q4_0, Q8_0, FP32, etc. automatically
-        const float *embed_data = embed_table->data();
-        if (!embed_data)
-        {
-            LOG_ERROR("[ROCmEmbeddingKernelT] Failed to get embedding data");
-            return false;
-        }
-
-        // Determine target ROCm device
+        // Set target ROCm device
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
-
         hipError_t set_err = hipSetDevice(dev);
         if (set_err != hipSuccess)
         {
@@ -226,24 +226,20 @@ namespace llaminar2
         // =====================================================================
         // Step 1: Get token_ids buffer from workspace and copy data
         // =====================================================================
-        int *d_token_ids = nullptr;
-        size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
-
         if (!hasWorkspace())
         {
-            LOG_ERROR("[ROCmEmbeddingKernelT] Workspace not bound - hot-path allocation disabled. "
-                      "Call bindWorkspace() before apply_tensor()");
+            LOG_ERROR("[ROCmEmbeddingKernelT] Workspace not bound - call bindWorkspace() before apply_tensor()");
             return false;
         }
 
-        // Use pre-allocated workspace buffer (workspace is required)
-        d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        int *d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
         if (!d_token_ids)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Workspace buffer '" << EmbeddingWorkspaceBuffers::TOKEN_IDS << "' not found");
             return false;
         }
 
+        size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
         hipError_t err = hipMemcpy(d_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice);
         if (err != hipSuccess)
         {
@@ -252,7 +248,7 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Step 2: Get GPU pointer for output (coherence handled by GraphExecutor)
+        // Step 2: Get GPU pointer for output
         // =====================================================================
         float *d_output = static_cast<float *>(output_fp32->gpu_data_ptr());
         if (!d_output)
@@ -262,77 +258,76 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Step 3: Get or upload embedding table to GPU
+        // Step 3: Route by embedding table format
         // =====================================================================
-        float *d_embed = nullptr;
 
-        // Check if embed_table is FP32 and on GPU
+        // --- Fast path: FP32 tensor already on GPU ---
         auto *embed_fp32 = dynamic_cast<const FP32Tensor *>(embed_table);
         if (embed_fp32 && embed_fp32->isOnGPU())
         {
-            // Fast path: FP32 tensor already on GPU
-            d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
+            float *d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
+            LOG_DEBUG("[ROCmEmbeddingKernelT] FP32 fast path: d_embed=" << static_cast<void *>(d_embed)
+                                                                        << " num_tokens=" << num_tokens << " d_model=" << d_model);
+            err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model, nullptr);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
+                return false;
+            }
+            return true;
         }
-        else
-        {
-            // Workspace-cached path: Upload dequantized embedding table once, reuse across calls
-            // This is critical for performance with quantized embeddings (Q4_0, etc.)
-            // The embedding table (~500MB) should only be uploaded once per model load
-            size_t vocab_size = embed_table->rows();
-            size_t embed_dim = static_cast<size_t>(d_model);
-            size_t embed_bytes = vocab_size * embed_dim * sizeof(float);
 
-            // Use pre-allocated workspace buffer (workspace is required)
-            d_embed = static_cast<float *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE));
-            if (!d_embed)
+        // --- Quantized path: repack to EmbedQ8 via IINT8Unpackable ---
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
+        if (unpackable)
+        {
+            void *d_embed_q8 = workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE);
+            if (!d_embed_q8)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] Workspace buffer '" << EmbeddingWorkspaceBuffers::EMBED_TABLE << "' not found");
                 return false;
             }
 
-            // Check if we need to upload (first call or different embedding table for THIS workspace)
             auto it = s_workspace_embed_cache_.find(workspace_);
             bool needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
             if (needs_upload)
             {
-                err = hipMemcpy(d_embed, embed_data, embed_bytes, hipMemcpyHostToDevice);
+                auto repacked = repackEmbeddingToQ8(embed_table, d_model);
+
+                err = hipMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
+                                hipMemcpyHostToDevice);
                 if (err != hipSuccess)
                 {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy embeddings to GPU: " << hipGetErrorString(err));
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to upload EmbedQ8 data: " << hipGetErrorString(err));
                     return false;
                 }
 
-                // Cache the tensor pointer for THIS workspace to avoid re-upload on subsequent calls
                 s_workspace_embed_cache_[workspace_] = embed_table;
-                LOG_INFO("[ROCmEmbeddingKernelT] Uploaded dequantized embedding table: "
-                         << vocab_size << "x" << embed_dim << " (" << embed_bytes / (1024 * 1024) << " MB)"
+                LOG_INFO("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding: "
+                         << tensorTypeName(embed_table->native_type()) << " "
+                         << repacked.vocab_size << "x" << d_model
+                         << " \u2192 " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                         << " (" << repacked.blocks_per_row << " blocks/row)"
                          << " workspace=" << static_cast<void *>(workspace_));
             }
-            // else: embedding already uploaded to workspace buffer, reuse d_embed
+
+            size_t blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+            err = hipOps_embedding_q8(d_embed_q8, d_token_ids, d_output,
+                                      num_tokens, d_model,
+                                      static_cast<int>(blocks_per_row), nullptr);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] EmbedQ8 kernel failed: " << hipGetErrorString(err));
+                return false;
+            }
+            return true;
         }
 
-        // =====================================================================
-        // Step 4: Launch kernel with GPU pointers
-        // =====================================================================
-        LOG_DEBUG("[ROCmEmbeddingKernelT] Launching kernel: d_embed=" << static_cast<void *>(d_embed)
-                                                                      << " d_token_ids=" << static_cast<void *>(d_token_ids)
-                                                                      << " d_output=" << static_cast<void *>(d_output)
-                                                                      << " num_tokens=" << num_tokens << " d_model=" << d_model
-                                                                      << " dev=" << dev);
-
-        err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model, nullptr);
-
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err)
-                                                                    << " (d_embed=" << static_cast<void *>(d_embed)
-                                                                    << " d_token_ids=" << static_cast<void *>(d_token_ids)
-                                                                    << " d_output=" << static_cast<void *>(d_output)
-                                                                    << " num_tokens=" << num_tokens << " d_model=" << d_model << ")");
-            return false;
-        }
-
-        return true;
+        // No FP32 fallback — embedding table must be either FP32-on-GPU or IINT8Unpackable
+        LOG_ERROR("[ROCmEmbeddingKernelT] Embedding table type "
+                  << tensorTypeName(embed_table->native_type())
+                  << " is not FP32-on-GPU and does not implement IINT8Unpackable");
+        return false;
     }
 
     // =============================================================================
@@ -356,13 +351,14 @@ namespace llaminar2
             true // Required
         });
 
-        // Buffer 2: Embedding table temp [vocab_size × d_model × sizeof(float)]
-        // Used when embedding table is not already on GPU (quantized tables)
+        // Buffer 2: Embedding table temp [vocab_size × blocks_per_row × sizeof(EmbedQ8Block)]
+        // Used when embedding table is not already on GPU (quantized → EmbedQ8 repack)
         // Use conservative estimates: vocab_size = 151936 (Qwen2), d_model = k
         // If k not provided, use 896 (Qwen2.5-0.5B d_model)
         constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
         size_t d_model = (k > 0) ? static_cast<size_t>(k) : 896;
-        size_t embed_table_bytes = DEFAULT_VOCAB_SIZE * d_model * sizeof(float);
+        size_t blocks_per_row = (d_model + 31) / 32;
+        size_t embed_table_bytes = DEFAULT_VOCAB_SIZE * blocks_per_row * sizeof(EmbedQ8Block);
         reqs.buffers.push_back({
             EmbeddingWorkspaceBuffers::EMBED_TABLE,
             embed_table_bytes,

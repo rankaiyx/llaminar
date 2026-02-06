@@ -1178,9 +1178,13 @@ add_library(llaminar2_core STATIC
     config/PPStageConfig.cpp
     # Pipeline Config (Phase 1.3 - Unified PP Graph Architecture)
     config/PipelineConfig.cpp
+    # Collective backend type (extracted to avoid circular dependency)
+    config/CollectiveBackendType.cpp
     # Orchestration configuration (Phase 0 - CLI/Config architecture for heterogeneous orchestration)
     config/OrchestrationConfig.cpp
     config/OrchestrationConfigParser.cpp
+    # ParallelismTree parser (Phase 7 - CLI/YAML parser for ParallelismTree)
+    config/ParallelismTreeParser.cpp
     # Backend selector (Part 2 - automatic backend selection for PP/TP)
     config/BackendSelector.cpp
     # Global device address (fully-qualified device identification across nodes)
@@ -1336,6 +1340,17 @@ add_library(llaminar2_core STATIC
     # Legacy LOCAL TP allreduce stage (deprecated, use TPAllreduceStage)
     execution/compute_stages/stages/LocalTPAllreduceStage.cpp
     execution/compute_stages/stages/LocalPPTransferStage.cpp
+    execution/compute_stages/stages/GlobalPPTransferStage.cpp
+    # Global Pipeline Parallelism topology and planning
+    execution/global_pp/GlobalPPTopology.cpp
+    execution/global_pp/GlobalPPRankPlanBuilder.cpp
+    # Parallelism tree (recursive PP/TP composition)
+    execution/parallelism_tree/ParallelismTree.cpp
+    execution/parallelism_tree/TransferSpec.cpp
+    execution/parallelism_tree/CompoundShardInfo.cpp
+    execution/parallelism_tree/HierarchicalCommBuilder.cpp
+    execution/parallelism_tree/PipelineRunner.cpp
+    execution/parallelism_tree/TreeToRunnerCompiler.cpp
     # Orchestration runner (Phase 5: end-to-end integration)
     execution/runner/OrchestrationRunner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp

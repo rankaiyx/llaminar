@@ -1741,17 +1741,20 @@ namespace llaminar2
             // - Decode (cached_tokens > 0 and batch_size == 1): Use cache (single-sequence only)
             //   In Hybrid mode: KV cache is FP32
             // - Batched decode (cached_tokens > 0 and batch_size > 1): Gather K/V from multiple cache slots
+            // Map global layer index to local KV cache index for PP stages
+            int kv_local_layer = layer_idx - config_.pp_layer_offset;
+
             if (kv_cache)
             {
-                int cached_tokens = kv_cache->get_cached_tokens(layer_idx, 0);
+                int cached_tokens = kv_cache->get_cached_tokens(kv_local_layer, 0);
                 if (cached_tokens > 0 && batch_size == 1)
                 {
                     // Single-sequence decode: read K/V from cache
                     // Use ITensor* directly (works for both CPU and GPU caches)
-                    K_for_attn = kv_cache->get_k(layer_idx, 0);
-                    V_for_attn = kv_cache->get_v(layer_idx, 0);
+                    K_for_attn = kv_cache->get_k(kv_local_layer, 0);
+                    V_for_attn = kv_cache->get_v(kv_local_layer, 0);
                     kv_len = cached_tokens;
-                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " using cached K/V (decode mode)");
+                    LOG_TRACE("[Qwen2Graph] Layer " << layer_idx << " (local=" << kv_local_layer << ") using cached K/V (decode mode)");
                 }
                 else if (cached_tokens > 0 && batch_size > 1)
                 {
@@ -1851,7 +1854,7 @@ namespace llaminar2
                 // Check decode mode - need to get K/V from cache
                 if (kv_cache)
                 {
-                    int cached_tokens = kv_cache->get_cached_tokens(layer_idx, 0);
+                    int cached_tokens = kv_cache->get_cached_tokens(kv_local_layer, 0);
                     if (cached_tokens > 0 && batch_size == 1)
                     {
                         // Decode mode: use cached K/V
@@ -1859,8 +1862,8 @@ namespace llaminar2
                         // This is a known limitation - Hybrid decode will fail until we add
                         // FP32 K/V support to FusedAttentionWoKernel
                         // Use ITensor* directly (works for both CPU and GPU caches)
-                        K_for_fused = kv_cache->get_k(layer_idx, 0);
-                        V_for_fused = kv_cache->get_v(layer_idx, 0);
+                        K_for_fused = kv_cache->get_k(kv_local_layer, 0);
+                        V_for_fused = kv_cache->get_v(kv_local_layer, 0);
                     }
                 }
 

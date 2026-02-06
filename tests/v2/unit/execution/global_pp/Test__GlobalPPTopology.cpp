@@ -1,0 +1,678 @@
+/**
+ * @file Test__GlobalPPTopology.cpp
+ * @brief Unit tests for GlobalPPTopology and GlobalPPRankPlanBuilder
+ * @author David Sanftenberg
+ * @date February 2026
+ *
+ * Tests for Global PP topology and rank plan building:
+ * - Topology validation (layer coverage, contiguity, embedding/lm_head)
+ * - Transfer derivation (single-rank to single-rank, single-rank to global TP)
+ * - Rank plan building (correct step ordering, transfer matching)
+ * - Edge cases (single stage, all-global-TP, 2-stage minimal)
+ *
+ * All tests are pure data-structure tests — no MPI, no GPU, no model loading.
+ */
+
+#include <gtest/gtest.h>
+#include <algorithm>
+
+#include "execution/global_pp/GlobalPPTopology.h"
+#include "execution/global_pp/GlobalPPRankPlan.h"
+#include "execution/global_pp/GlobalPPRankPlanBuilder.h"
+
+using namespace llaminar2;
+
+// =============================================================================
+// Helper: Build a standard 3-stage topology
+// =============================================================================
+
+/**
+ * Creates the canonical test topology:
+ *   Stage 0: rank=0, layers 0-9,   2x CUDA (LocalTP), +embedding
+ *   Stage 1: rank=1, layers 10-19, 2x ROCm (LocalTP)
+ *   Stage 2: global TP (ranks 0,1), layers 20-23, CPU, +lm_head
+ */
+static GlobalPPTopology buildCanonical3Stage()
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 9;
+    s0.has_embedding = true;
+    s0.is_global_tp = false;
+    s0.owning_rank = 0;
+    s0.inner_mode = InnerParallelism::LOCAL_TP;
+    s0.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 10;
+    s1.last_layer = 19;
+    s1.is_global_tp = false;
+    s1.owning_rank = 1;
+    s1.inner_mode = InnerParallelism::LOCAL_TP;
+    s1.devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+
+    GlobalPPStageSpec s2;
+    s2.stage_id = 2;
+    s2.first_layer = 20;
+    s2.last_layer = 23;
+    s2.has_lm_head = true;
+    s2.is_global_tp = true;
+    s2.participating_ranks = {0, 1};
+    s2.per_rank_device = GlobalDeviceAddress::cpu(0);
+
+    return GlobalPPTopology::build({s0, s1, s2}, 24, 2);
+}
+
+// =============================================================================
+// Topology Validation Tests
+// =============================================================================
+
+class Test__GlobalPPTopology : public ::testing::Test
+{
+};
+
+/**
+ * @test Valid 3-stage topology passes validation
+ */
+TEST_F(Test__GlobalPPTopology, ValidTopologyPasses)
+{
+    auto topo = buildCanonical3Stage();
+    auto errors = topo.validate();
+
+    EXPECT_TRUE(errors.empty()) << "Errors: ";
+    for (const auto &e : errors)
+    {
+        std::cerr << "  " << e << "\n";
+    }
+}
+
+/**
+ * @test Topology has correct number of stages and total layers
+ */
+TEST_F(Test__GlobalPPTopology, BasicProperties)
+{
+    auto topo = buildCanonical3Stage();
+
+    EXPECT_EQ(topo.numStages(), 3);
+    EXPECT_EQ(topo.total_layers, 24);
+    EXPECT_EQ(topo.world_size, 2);
+}
+
+/**
+ * @test Layer coverage: each layer is in exactly one stage
+ */
+TEST_F(Test__GlobalPPTopology, LayerCoverage)
+{
+    auto topo = buildCanonical3Stage();
+
+    for (int l = 0; l < 24; ++l)
+    {
+        auto *stage = topo.stageForLayer(l);
+        ASSERT_NE(stage, nullptr) << "Layer " << l << " not found in any stage";
+
+        if (l <= 9)
+            EXPECT_EQ(stage->stage_id, 0);
+        else if (l <= 19)
+            EXPECT_EQ(stage->stage_id, 1);
+        else
+            EXPECT_EQ(stage->stage_id, 2);
+    }
+
+    // Layer outside range
+    EXPECT_EQ(topo.stageForLayer(24), nullptr);
+    EXPECT_EQ(topo.stageForLayer(-1), nullptr);
+}
+
+/**
+ * @test Stages for rank: rank 0 participates in stages 0 and 2
+ */
+TEST_F(Test__GlobalPPTopology, StagesForRank0)
+{
+    auto topo = buildCanonical3Stage();
+    auto stages = topo.stagesForRank(0);
+
+    ASSERT_EQ(stages.size(), 2u);
+    EXPECT_EQ(stages[0], 0);
+    EXPECT_EQ(stages[1], 2);
+}
+
+/**
+ * @test Stages for rank: rank 1 participates in stages 1 and 2
+ */
+TEST_F(Test__GlobalPPTopology, StagesForRank1)
+{
+    auto topo = buildCanonical3Stage();
+    auto stages = topo.stagesForRank(1);
+
+    ASSERT_EQ(stages.size(), 2u);
+    EXPECT_EQ(stages[0], 1);
+    EXPECT_EQ(stages[1], 2);
+}
+
+/**
+ * @test Rank participation query
+ */
+TEST_F(Test__GlobalPPTopology, RankParticipation)
+{
+    auto topo = buildCanonical3Stage();
+
+    EXPECT_TRUE(topo.rankParticipatesInStage(0, 0));
+    EXPECT_FALSE(topo.rankParticipatesInStage(1, 0));
+    EXPECT_FALSE(topo.rankParticipatesInStage(0, 1));
+    EXPECT_TRUE(topo.rankParticipatesInStage(1, 1));
+    EXPECT_TRUE(topo.rankParticipatesInStage(0, 2));
+    EXPECT_TRUE(topo.rankParticipatesInStage(1, 2));
+}
+
+/**
+ * @test Embedding is on first stage, LM head on last
+ */
+TEST_F(Test__GlobalPPTopology, EmbeddingAndLMHead)
+{
+    auto topo = buildCanonical3Stage();
+
+    EXPECT_TRUE(topo.stages[0].has_embedding);
+    EXPECT_FALSE(topo.stages[0].has_lm_head);
+    EXPECT_FALSE(topo.stages[1].has_embedding);
+    EXPECT_FALSE(topo.stages[1].has_lm_head);
+    EXPECT_FALSE(topo.stages[2].has_embedding);
+    EXPECT_TRUE(topo.stages[2].has_lm_head);
+}
+
+/**
+ * @test toString produces non-empty output
+ */
+TEST_F(Test__GlobalPPTopology, ToStringNotEmpty)
+{
+    auto topo = buildCanonical3Stage();
+    auto str = topo.toString();
+
+    EXPECT_FALSE(str.empty());
+    EXPECT_NE(str.find("GlobalPPTopology"), std::string::npos);
+    EXPECT_NE(str.find("total_layers=24"), std::string::npos);
+}
+
+// =============================================================================
+// Validation Error Tests
+// =============================================================================
+
+/**
+ * @test Validation catches missing embedding on first stage
+ */
+TEST_F(Test__GlobalPPTopology, ValidationCatchesMissingEmbedding)
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 3;
+    s0.has_embedding = false; // Missing!
+    s0.has_lm_head = true;
+    s0.owning_rank = 0;
+
+    auto topo = GlobalPPTopology::build({s0}, 4, 1);
+    auto errors = topo.validate();
+
+    bool found_embedding_error = false;
+    for (const auto &e : errors)
+    {
+        if (e.find("has_embedding") != std::string::npos)
+        {
+            found_embedding_error = true;
+        }
+    }
+    EXPECT_TRUE(found_embedding_error);
+}
+
+/**
+ * @test Validation catches layer gap between stages
+ */
+TEST_F(Test__GlobalPPTopology, ValidationCatchesLayerGap)
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 3;
+    s0.has_embedding = true;
+    s0.owning_rank = 0;
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 5; // Gap: layer 4 is missing!
+    s1.last_layer = 7;
+    s1.has_lm_head = true;
+    s1.owning_rank = 1;
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 8, 2);
+    auto errors = topo.validate();
+
+    EXPECT_FALSE(errors.empty());
+}
+
+/**
+ * @test Validation catches global TP with < 2 ranks
+ */
+TEST_F(Test__GlobalPPTopology, ValidationCatchesGlobalTPTooFewRanks)
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 3;
+    s0.has_embedding = true;
+    s0.has_lm_head = true;
+    s0.is_global_tp = true;
+    s0.participating_ranks = {0}; // Only 1 rank!
+    s0.per_rank_device = GlobalDeviceAddress::cpu(0);
+
+    auto topo = GlobalPPTopology::build({s0}, 4, 2);
+    auto errors = topo.validate();
+
+    bool found_tp_error = false;
+    for (const auto &e : errors)
+    {
+        if (e.find("participating ranks") != std::string::npos)
+        {
+            found_tp_error = true;
+        }
+    }
+    EXPECT_TRUE(found_tp_error);
+}
+
+/**
+ * @test Validation catches owning_rank >= world_size
+ */
+TEST_F(Test__GlobalPPTopology, ValidationCatchesRankOutOfRange)
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 3;
+    s0.has_embedding = true;
+    s0.has_lm_head = true;
+    s0.owning_rank = 5; // world_size is only 2!
+
+    auto topo = GlobalPPTopology::build({s0}, 4, 2);
+    auto errors = topo.validate();
+
+    bool found_rank_error = false;
+    for (const auto &e : errors)
+    {
+        if (e.find("world_size") != std::string::npos)
+        {
+            found_rank_error = true;
+        }
+    }
+    EXPECT_TRUE(found_rank_error);
+}
+
+// =============================================================================
+// Transfer Derivation Tests
+// =============================================================================
+
+/**
+ * @test Transfers are derived for single-rank → single-rank transitions
+ */
+TEST_F(Test__GlobalPPTopology, TransferSingleToSingle)
+{
+    // 2 stages: rank 0 → rank 1
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.owning_rank = 0;
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.owning_rank = 1;
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2);
+
+    ASSERT_EQ(topo.transfers.size(), 1u);
+    EXPECT_EQ(topo.transfers[0].sender_rank, 0);
+    EXPECT_EQ(topo.transfers[0].receiver_rank, 1);
+    EXPECT_FALSE(topo.transfers[0].isNoop());
+}
+
+/**
+ * @test Same-rank transfer is a no-op
+ */
+TEST_F(Test__GlobalPPTopology, TransferSameRankIsNoop)
+{
+    // 2 stages both owned by rank 0 — no MPI transfer needed
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.owning_rank = 0;
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.owning_rank = 0;
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 1);
+
+    ASSERT_EQ(topo.transfers.size(), 1u);
+    EXPECT_TRUE(topo.transfers[0].isNoop());
+}
+
+/**
+ * @test Transfers: single-rank → global TP creates fan-out
+ */
+TEST_F(Test__GlobalPPTopology, TransferSingleToGlobalTP)
+{
+    auto topo = buildCanonical3Stage();
+
+    // Stage 0 (rank 0) → Stage 1 (rank 1): 1 transfer
+    // Stage 1 (rank 1) → Stage 2 (global TP, ranks 0,1): fan-out from rank 1 to rank 0
+    // Total: at least 2 non-noop transfers
+
+    int non_noop = 0;
+    for (const auto &t : topo.transfers)
+    {
+        if (!t.isNoop())
+        {
+            non_noop++;
+        }
+    }
+    EXPECT_GE(non_noop, 2);
+}
+
+// =============================================================================
+// GlobalPPStageSpec Tests
+// =============================================================================
+
+/**
+ * @test Stage layer count
+ */
+TEST(Test__GlobalPPStageSpec, LayerCount)
+{
+    GlobalPPStageSpec spec;
+    spec.first_layer = 5;
+    spec.last_layer = 14;
+
+    EXPECT_EQ(spec.layerCount(), 10);
+}
+
+/**
+ * @test Stage hasLayer
+ */
+TEST(Test__GlobalPPStageSpec, HasLayer)
+{
+    GlobalPPStageSpec spec;
+    spec.first_layer = 5;
+    spec.last_layer = 14;
+
+    EXPECT_FALSE(spec.hasLayer(4));
+    EXPECT_TRUE(spec.hasLayer(5));
+    EXPECT_TRUE(spec.hasLayer(10));
+    EXPECT_TRUE(spec.hasLayer(14));
+    EXPECT_FALSE(spec.hasLayer(15));
+}
+
+/**
+ * @test innerParallelismName returns correct strings
+ */
+TEST(Test__GlobalPPStageSpec, InnerParallelismName)
+{
+    EXPECT_STREQ(innerParallelismName(InnerParallelism::SINGLE_DEVICE), "SINGLE_DEVICE");
+    EXPECT_STREQ(innerParallelismName(InnerParallelism::LOCAL_TP), "LOCAL_TP");
+    EXPECT_STREQ(innerParallelismName(InnerParallelism::LOCAL_PP), "LOCAL_PP");
+}
+
+// =============================================================================
+// Rank Plan Builder Tests
+// =============================================================================
+
+class Test__GlobalPPRankPlanBuilder : public ::testing::Test
+{
+};
+
+/**
+ * @test Rank 0 plan for canonical 3-stage topology
+ *
+ * Expected:
+ *   1. EXECUTE stage 0 (layers 0-9, +embedding)
+ *   2. SEND to rank 1 (stage 0 → stage 1)
+ *   3. RECV from rank 1 (stage 1 → stage 2, if rank 0 doesn't have data)
+ *   4. EXECUTE stage 2 (layers 20-23, global TP, +lm_head)
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, Rank0Plan)
+{
+    auto topo = buildCanonical3Stage();
+    auto plan = GlobalPPRankPlanBuilder::build(topo, 0);
+
+    EXPECT_EQ(plan.rank, 0);
+    EXPECT_TRUE(plan.hasWork());
+
+    // Should have at least 2 execute stages (stage 0 and stage 2)
+    auto exec_stages = plan.executeStages();
+    ASSERT_GE(exec_stages.size(), 2u);
+
+    // First execute: stage 0 with embedding
+    EXPECT_EQ(exec_stages[0]->stage_id, 0);
+    EXPECT_EQ(exec_stages[0]->first_layer, 0);
+    EXPECT_EQ(exec_stages[0]->last_layer, 9);
+    EXPECT_TRUE(exec_stages[0]->has_embedding);
+    EXPECT_FALSE(exec_stages[0]->is_global_tp);
+
+    // Last execute: stage 2 with lm_head, global TP
+    EXPECT_EQ(exec_stages.back()->stage_id, 2);
+    EXPECT_EQ(exec_stages.back()->first_layer, 20);
+    EXPECT_EQ(exec_stages.back()->last_layer, 23);
+    EXPECT_TRUE(exec_stages.back()->has_lm_head);
+    EXPECT_TRUE(exec_stages.back()->is_global_tp);
+    EXPECT_EQ(exec_stages.back()->tp_rank_in_domain, 0);
+    EXPECT_EQ(exec_stages.back()->tp_domain_size, 2);
+}
+
+/**
+ * @test Rank 1 plan for canonical 3-stage topology
+ *
+ * Expected:
+ *   1. RECV from rank 0 (stage 0 → stage 1)
+ *   2. EXECUTE stage 1 (layers 10-19)
+ *   3. SEND to rank 0 (stage 1 → stage 2, fan-out since stage 2 is global TP)
+ *   4. EXECUTE stage 2 (layers 20-23, global TP)
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, Rank1Plan)
+{
+    auto topo = buildCanonical3Stage();
+    auto plan = GlobalPPRankPlanBuilder::build(topo, 1);
+
+    EXPECT_EQ(plan.rank, 1);
+    EXPECT_TRUE(plan.hasWork());
+
+    // Should have 2 execute stages (stage 1 and stage 2)
+    auto exec_stages = plan.executeStages();
+    ASSERT_GE(exec_stages.size(), 2u);
+
+    // First execute: stage 1
+    EXPECT_EQ(exec_stages[0]->stage_id, 1);
+    EXPECT_EQ(exec_stages[0]->first_layer, 10);
+    EXPECT_EQ(exec_stages[0]->last_layer, 19);
+    EXPECT_FALSE(exec_stages[0]->has_embedding);
+    EXPECT_FALSE(exec_stages[0]->has_lm_head);
+
+    // Second execute: stage 2 (global TP)
+    EXPECT_EQ(exec_stages[1]->stage_id, 2);
+    EXPECT_TRUE(exec_stages[1]->is_global_tp);
+    EXPECT_EQ(exec_stages[1]->tp_rank_in_domain, 1); // rank 1 is second in TP
+}
+
+/**
+ * @test Transfer actions: rank 0 sends before stage 1, rank 1 receives
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, TransferMatching)
+{
+    auto topo = buildCanonical3Stage();
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+    auto plan1 = GlobalPPRankPlanBuilder::build(topo, 1);
+
+    auto transfers0 = plan0.transferActions();
+    auto transfers1 = plan1.transferActions();
+
+    // Rank 0 should have at least one SEND (stage 0 → stage 1)
+    bool rank0_sends = false;
+    for (auto *t : transfers0)
+    {
+        if (t->direction == RankTransferAction::Direction::SEND && t->peer_rank == 1)
+        {
+            rank0_sends = true;
+        }
+    }
+    EXPECT_TRUE(rank0_sends) << "Rank 0 should send to rank 1";
+
+    // Rank 1 should have at least one RECV (from rank 0, stage 0 → stage 1)
+    bool rank1_recvs = false;
+    for (auto *t : transfers1)
+    {
+        if (t->direction == RankTransferAction::Direction::RECV && t->peer_rank == 0)
+        {
+            rank1_recvs = true;
+        }
+    }
+    EXPECT_TRUE(rank1_recvs) << "Rank 1 should receive from rank 0";
+}
+
+/**
+ * @test Weight shard info for global TP stages
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, WeightShardForGlobalTP)
+{
+    auto topo = buildCanonical3Stage();
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+    auto plan1 = GlobalPPRankPlanBuilder::build(topo, 1);
+
+    auto exec0 = plan0.executeStages();
+    auto exec1 = plan1.executeStages();
+
+    // Find stage 2 in each plan
+    const RankStageAction *gtp0 = nullptr;
+    const RankStageAction *gtp1 = nullptr;
+    for (auto *s : exec0) if (s->stage_id == 2) gtp0 = s;
+    for (auto *s : exec1) if (s->stage_id == 2) gtp1 = s;
+
+    ASSERT_NE(gtp0, nullptr);
+    ASSERT_NE(gtp1, nullptr);
+
+    // Rank 0: shard 0 of 2
+    EXPECT_EQ(gtp0->weight_shard.shard_index, 0);
+    EXPECT_EQ(gtp0->weight_shard.total_shards, 2);
+    EXPECT_NEAR(gtp0->weight_shard.work_fraction, 0.5f, 0.01f);
+
+    // Rank 1: shard 1 of 2
+    EXPECT_EQ(gtp1->weight_shard.shard_index, 1);
+    EXPECT_EQ(gtp1->weight_shard.total_shards, 2);
+    EXPECT_NEAR(gtp1->weight_shard.work_fraction, 0.5f, 0.01f);
+}
+
+/**
+ * @test Single-rank stages have no weight sharding
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, NoShardForSingleRankStage)
+{
+    auto topo = buildCanonical3Stage();
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+
+    auto exec = plan0.executeStages();
+    ASSERT_GE(exec.size(), 1u);
+
+    // Stage 0 is single-rank
+    EXPECT_EQ(exec[0]->weight_shard.shard_index, 0);
+    EXPECT_EQ(exec[0]->weight_shard.total_shards, 1);
+    EXPECT_NEAR(exec[0]->weight_shard.work_fraction, 1.0f, 0.01f);
+}
+
+/**
+ * @test Plan toString produces non-empty output
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, ToStringNotEmpty)
+{
+    auto topo = buildCanonical3Stage();
+    auto plan = GlobalPPRankPlanBuilder::build(topo, 0);
+
+    auto str = plan.toString();
+    EXPECT_FALSE(str.empty());
+    EXPECT_NE(str.find("GlobalPPRankPlan"), std::string::npos);
+}
+
+// =============================================================================
+// Edge Cases
+// =============================================================================
+
+/**
+ * @test Simple 2-stage pipeline (rank 0 → rank 1), no global TP
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, TwoStagePipeline)
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 11;
+    s0.has_embedding = true;
+    s0.owning_rank = 0;
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.first_layer = 12;
+    s1.last_layer = 23;
+    s1.has_lm_head = true;
+    s1.owning_rank = 1;
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2);
+    EXPECT_TRUE(topo.validate().empty());
+
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+    auto plan1 = GlobalPPRankPlanBuilder::build(topo, 1);
+
+    // Rank 0: execute stage 0, then send
+    EXPECT_EQ(plan0.executeStages().size(), 1u);
+    EXPECT_EQ(plan0.executeStages()[0]->stage_id, 0);
+
+    // Rank 1: recv, then execute stage 1
+    EXPECT_EQ(plan1.executeStages().size(), 1u);
+    EXPECT_EQ(plan1.executeStages()[0]->stage_id, 1);
+
+    // Verify transfer matching
+    auto t0 = plan0.transferActions();
+    auto t1 = plan1.transferActions();
+    EXPECT_GE(t0.size(), 1u); // rank 0 sends
+    EXPECT_GE(t1.size(), 1u); // rank 1 receives
+}
+
+/**
+ * @test All-global-TP: single stage with all ranks
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, AllGlobalTP)
+{
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.first_layer = 0;
+    s0.last_layer = 23;
+    s0.has_embedding = true;
+    s0.has_lm_head = true;
+    s0.is_global_tp = true;
+    s0.participating_ranks = {0, 1};
+    s0.per_rank_device = GlobalDeviceAddress::cpu(0);
+
+    auto topo = GlobalPPTopology::build({s0}, 24, 2);
+    EXPECT_TRUE(topo.validate().empty());
+
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+    auto plan1 = GlobalPPRankPlanBuilder::build(topo, 1);
+
+    // Both ranks execute all layers, no transfers needed
+    EXPECT_EQ(plan0.executeStages().size(), 1u);
+    EXPECT_EQ(plan1.executeStages().size(), 1u);
+    EXPECT_TRUE(plan0.transferActions().empty());
+    EXPECT_TRUE(plan1.transferActions().empty());
+}

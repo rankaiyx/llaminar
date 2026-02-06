@@ -7,6 +7,7 @@
  */
 
 #include "OrchestrationConfigParser.h"
+#include "ParallelismTreeParser.h" // For --topology parsing
 #include "execution/config/RuntimeConfig.h" // For parseFusedAttentionBackend
 #include "utils/Logger.h"
 #include <fstream>
@@ -740,32 +741,31 @@ namespace llaminar2
                 // (A more sophisticated merge would track which CLI flags were set)
             }
 
-            // ===== Placement Strategy (legacy compatibility) =====
-            else if (matchesFlag(arg, "", "--strategy"))
+            // ===== Topology Tree (Global PP Phase 8) =====
+            else if (matchesFlag(arg, "", "--topology"))
             {
                 std::string value = getFlagValue(args, i);
                 if (value.empty())
                 {
-                    throw std::invalid_argument("--strategy requires a value");
+                    throw std::invalid_argument("--topology requires an inline topology specification");
                 }
-                static const std::set<std::string> valid_strategies = {
-                    "auto", "all-gpu", "all-cpu", "layer-split", "memory-aware", "moe-optimized", "custom", "multi-gpu"
-                };
-                if (valid_strategies.find(value) == valid_strategies.end())
-                {
-                    throw std::invalid_argument("Invalid strategy: '" + value + "'. Valid: auto, all-gpu, all-cpu, layer-split, memory-aware, moe-optimized, custom, multi-gpu");
-                }
-                config.strategy = value;
+                config.topology_string = value;
+                // Note: Tree parsing deferred until we know model n_layers
+                // The factory will parse when n_layers is available from model
             }
-            else if (matchesFlag(arg, "", "--offload-layers"))
+            else if (matchesFlag(arg, "", "--topology-file"))
             {
                 std::string value = getFlagValue(args, i);
                 if (value.empty())
                 {
-                    throw std::invalid_argument("--offload-layers requires a value");
+                    throw std::invalid_argument("--topology-file requires a file path");
                 }
-                config.offload_layers = std::stoi(value);
+                config.topology_file_path = value;
+                // Note: Tree parsing deferred until we know model n_layers
+                // The factory will parse when n_layers is available from model
             }
+
+
 
             // ===== Memory Constraints =====
             else if (matchesFlag(arg, "", "--max-gpu-memory"))
@@ -805,39 +805,7 @@ namespace llaminar2
                 config.moe_sparse_experts_cpu = true;
             }
 
-            // ===== Multi-GPU Legacy =====
-            else if (arg == "--multi-gpu")
-            {
-                config.multi_gpu = true;
-            }
-            else if (matchesFlag(arg, "", "--gpu-split"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--gpu-split requires a value");
-                }
-                config.gpu_split = value;
-                config.multi_gpu = true;
-            }
-            else if (matchesFlag(arg, "", "--gpus"))
-            {
-                std::string value = getFlagValue(args, i);
-                if (value.empty())
-                {
-                    throw std::invalid_argument("--gpus requires comma-separated indices");
-                }
-                std::stringstream ss(value);
-                std::string token;
-                while (std::getline(ss, token, ','))
-                {
-                    config.gpu_devices.push_back(std::stoi(token));
-                }
-                if (!config.gpu_devices.empty())
-                {
-                    config.multi_gpu = true;
-                }
-            }
+
 
             // ===== Activation Precision =====
             else if (arg == "--activation-precision" || arg == "--activation-prec" || arg == "--act-prec")
@@ -1101,7 +1069,7 @@ namespace llaminar2
 
     std::string OrchestrationConfigParser::getHelpText()
     {
-        return R"(
+        return R"HELPTEXT(
 Llaminar V2 LLM Inference Engine
 
 Usage: llaminar2 [OPTIONS]
@@ -1184,10 +1152,9 @@ Introspection:
 Config File:
   --config <path>        Load configuration from YAML file
 
-Placement Strategy:
-  --strategy <mode>      Placement strategy: auto, all-gpu, all-cpu, layer-split,
-                         memory-aware, moe-optimized, custom, multi-gpu
-  --offload-layers <n>   Layers to offload (for layer-split strategy)
+Topology Tree (Global PP):
+  --topology <spec>      Inline topology: "PP(name, Device(cpu,0), Device(cpu,0))"
+  --topology-file <path> Load topology from YAML file
 
 Memory Constraints:
   --max-gpu-memory <mb>  Maximum GPU memory in MB
@@ -1198,11 +1165,6 @@ MoE Configuration:
   --moe-shared-cpu       Place shared experts on CPU
   --moe-sparse-gpu       Place sparse experts on GPU
   --moe-sparse-cpu       Place sparse experts on CPU (default)
-
-Multi-GPU Legacy:
-  --multi-gpu            Enable multi-GPU mode
-  --gpu-split <mode>     GPU split strategy
-  --gpus <indices>       Comma-separated GPU indices (e.g., "0,1,2")
 
 Precision:
   --activation-precision <type>  Activation precision: fp32, bf16, fp16, q8_1
@@ -1230,7 +1192,7 @@ Examples:
   llaminar2 -m model.gguf --benchmark -n 100
   llaminar2 -m model.gguf --tp 2 --tp-devices "cuda:0,cuda:1"
   llaminar2 -m model.gguf -d cuda:0 --fused-attention
-)";
+)HELPTEXT";
     }
 
 } // namespace llaminar2

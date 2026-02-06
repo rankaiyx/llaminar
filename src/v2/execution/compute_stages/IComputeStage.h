@@ -295,7 +295,8 @@ namespace llaminar2
         // Point-to-Point (Pipeline Parallelism)
         SEND_ACTIVATIONS,
         RECV_ACTIVATIONS,
-        LOCAL_PP_TRANSFER, ///< Local PP activation transfer (intra-node GPU-to-GPU)
+        LOCAL_PP_TRANSFER,  ///< Local PP activation transfer (intra-node GPU-to-GPU)
+        GLOBAL_PP_TRANSFER, ///< Global PP activation transfer (cross-rank MPI send/recv)
 
         // Utility
         COPY,

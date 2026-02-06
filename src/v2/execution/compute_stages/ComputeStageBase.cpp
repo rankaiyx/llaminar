@@ -86,6 +86,8 @@ namespace llaminar2
             return "RECV_ACTIVATIONS";
         case ComputeStageType::LOCAL_PP_TRANSFER:
             return "LOCAL_PP_TRANSFER";
+        case ComputeStageType::GLOBAL_PP_TRANSFER:
+            return "GLOBAL_PP_TRANSFER";
         case ComputeStageType::COPY:
             return "COPY";
         case ComputeStageType::DEQUANTIZE:

@@ -18,6 +18,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../CPUKernelBase.h"
+#include "../../common/EmbedQ8Repack.h"
 
 namespace llaminar2
 {
@@ -108,6 +109,11 @@ namespace llaminar2
                 .withScalar("num_tokens", "number of tokens", KernelBufferDtype::INT32)
                 .withScalar("d_model", "embedding dimension", KernelBufferDtype::INT32);
         }
+
+    private:
+        /// Cached EmbedQ8 repack of quantized embedding table (avoids full FP32 dequant)
+        mutable const TensorBase *cached_embed_table_ = nullptr;
+        mutable EmbedQ8RepackResult cached_repack_;
     };
 
     // Backward compatibility alias

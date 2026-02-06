@@ -30,6 +30,10 @@
 #include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/runner/OrchestrationRunner.h"
+// Tree-based pipeline compilation (dogfooding ParallelismTree + TreeToRunnerCompiler)
+#include "execution/parallelism_tree/ParallelismTree.h"
+#include "execution/parallelism_tree/TreeToRunnerCompiler.h"
+#include "execution/factory/FactoryPPStageConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/local_execution/graph/GraphExecutor.h"
 #include "execution/local_execution/graph/GraphBufferManager.h"
@@ -143,6 +147,355 @@ namespace llaminar2::test::parity::qwen2
     }
 
     // =============================================================================
+    // Tree-Based Pipeline Construction (dogfooding ParallelismTree)
+    // =============================================================================
+
+    /**
+     * @brief Build a ParallelismTree from a TestConfig
+     *
+     * Converts the declarative TestConfig (devices, parallelism, collective, pp_stage_sizes)
+     * into a ParallelismTree suitable for compilation via TreeToRunnerCompiler.
+     *
+     * Mapping:
+     *   - Parallelism::None      → Single DEVICE leaf
+     *   - Parallelism::LocalTP   → TP root with DEVICE children (one per device)
+     *   - Parallelism::LocalPP   → PP root with DEVICE/TP children per stage
+     *   - Parallelism::GlobalTP  → TP root with DEVICE children across MPI ranks
+     *
+     * @param cfg Test configuration
+     * @param n_layers Total transformer layers (from model_ctx->blockCount())
+     * @return ParallelismTree with layers assigned
+     */
+    inline ParallelismTree buildTreeFromTestConfig(const TestConfig &cfg, int n_layers)
+    {
+        // Build GlobalDeviceAddress list from TestConfig devices
+        auto buildDeviceAddresses = [](const std::vector<ParityDeviceType> &devices)
+        {
+            std::vector<GlobalDeviceAddress> addrs;
+            int cuda_idx = 0, rocm_idx = 0;
+            for (auto dt : devices)
+            {
+                switch (dt)
+                {
+                case ParityDeviceType::CPU:
+                    addrs.push_back(GlobalDeviceAddress::cpu());
+                    break;
+                case ParityDeviceType::CUDA:
+                    addrs.push_back(GlobalDeviceAddress::cuda(cuda_idx++));
+                    break;
+                case ParityDeviceType::ROCm:
+                    addrs.push_back(GlobalDeviceAddress::rocm(rocm_idx++));
+                    break;
+                }
+            }
+            return addrs;
+        };
+
+        auto all_devices = buildDeviceAddresses(cfg.devices);
+        const int owning_rank = 0; // Parity tests are single-rank (rank 0)
+
+        ParallelismTree tree;
+        tree.world_size = 1;
+
+        switch (cfg.parallelism)
+        {
+        case Parallelism::None:
+        {
+            // Single DEVICE leaf
+            tree.root = Device(all_devices[0], owning_rank);
+            break;
+        }
+
+        case Parallelism::LocalTP:
+        {
+            // TP root with DEVICE children
+            tree.root = TP("local_tp", all_devices, owning_rank,
+                           toCollectiveBackend(cfg.collective));
+            break;
+        }
+
+        case Parallelism::LocalPP:
+        {
+            if (cfg.is_hybrid_pp_tp())
+            {
+                // Hybrid PP+TP: PP root with mixed TP/DEVICE children
+                std::vector<ParallelismNode> pp_children;
+                size_t device_offset = 0;
+
+                for (size_t s = 0; s < cfg.pp_stage_sizes.size(); ++s)
+                {
+                    int stage_device_count = cfg.pp_stage_sizes[s];
+
+                    if (stage_device_count > 1)
+                    {
+                        // This stage is a TP domain
+                        std::vector<GlobalDeviceAddress> stage_devices;
+                        for (int d = 0; d < stage_device_count && device_offset < all_devices.size(); ++d)
+                        {
+                            stage_devices.push_back(all_devices[device_offset++]);
+                        }
+
+                        // Use tp_collective for intra-stage TP, fallback to main collective
+                        CollectiveBackendType tp_backend = cfg.tp_collective != Collective::None
+                                                               ? toCollectiveBackend(cfg.tp_collective)
+                                                               : toCollectiveBackend(cfg.collective);
+
+                        pp_children.push_back(
+                            TP("stage" + std::to_string(s) + "_tp",
+                               stage_devices, owning_rank, tp_backend));
+                    }
+                    else
+                    {
+                        // Single device stage
+                        if (device_offset < all_devices.size())
+                        {
+                            pp_children.push_back(
+                                Device(all_devices[device_offset++], owning_rank));
+                        }
+                    }
+                }
+
+                tree.root = PP("local_pp", std::move(pp_children));
+            }
+            else
+            {
+                // Pure PP: one device per stage
+                std::vector<ParallelismNode> pp_children;
+                for (size_t i = 0; i < all_devices.size(); ++i)
+                {
+                    pp_children.push_back(Device(all_devices[i], owning_rank));
+                }
+                tree.root = PP("local_pp", std::move(pp_children));
+            }
+            break;
+        }
+
+        case Parallelism::GlobalTP:
+        {
+            // GlobalTP: TP root with DEVICE children across MPI ranks
+            // Each rank gets one device
+            std::vector<ParallelismNode> tp_children;
+            for (int r = 0; r < cfg.mpi_ranks; ++r)
+            {
+                GlobalDeviceAddress addr = (r < static_cast<int>(all_devices.size()))
+                                               ? all_devices[r]
+                                               : GlobalDeviceAddress::cpu();
+                tp_children.push_back(Device(addr, r));
+            }
+            tree.root = TP("global_tp", std::move(tp_children),
+                           toCollectiveBackend(cfg.collective));
+            tree.world_size = cfg.mpi_ranks;
+            break;
+        }
+        }
+
+        // Assign layers
+        tree.assignLayers(n_layers);
+
+        // Validate
+        auto errors = tree.validate();
+        if (!errors.empty())
+        {
+            std::string msg = "Tree validation failed:\n";
+            for (const auto &e : errors)
+                msg += "  - " + e + "\n";
+            LOG_ERROR("[Parity] " << msg);
+        }
+
+        LOG_INFO("[Parity] Built parallelism tree:\n"
+                 << tree.toString());
+
+        return tree;
+    }
+
+    /**
+     * @brief Create real runner factories for TreeToRunnerCompiler
+     *
+     * These factories bridge the tree compiler to the existing InferenceRunnerFactory
+     * and MultiDeviceOrchestrator infrastructure. They are the "real implementation"
+     * that the compiler calls when it encounters DEVICE/TP/PP nodes.
+     */
+    namespace tree_factories
+    {
+
+        /**
+         * @brief Factory that creates a DeviceGraphOrchestrator from a DEVICE node
+         *
+         * Uses the existing createInferenceRunner() factory which handles all the
+         * Qwen2GraphConfig setup, weight loading, and graph construction.
+         */
+        inline TreeToRunnerCompiler::DeviceRunnerFactory makeDeviceFactory(
+            std::shared_ptr<MPIContext> mpi_ctx,
+            const InferenceRunnerConfig &base_config)
+        {
+            return [mpi_ctx, base_config](
+                       const ParallelismNode &node,
+                       const std::shared_ptr<IModelContext> &model_ctx) -> std::unique_ptr<IInferenceRunner>
+            {
+                // Convert GlobalDeviceAddress → DeviceId for existing factory
+                DeviceId device = node.device.toLocalDeviceId();
+
+                // Build runner config with PP stage info from tree node
+                InferenceRunnerConfig config = base_config;
+
+                // Tree uses inclusive last_layer, FactoryPPStageConfig uses exclusive
+                FactoryPPStageConfig pp_cfg;
+                pp_cfg.first_layer = node.first_layer;
+                pp_cfg.last_layer = node.last_layer + 1;
+                pp_cfg.has_embedding = node.has_embedding;
+                pp_cfg.has_lm_head = node.has_lm_head;
+
+                auto concrete_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx);
+                if (!concrete_ctx)
+                {
+                    LOG_ERROR("[TreeFactory] model_ctx is not a concrete ModelContext");
+                    return nullptr;
+                }
+
+                return createPPStageRunner(concrete_ctx, device, pp_cfg, config);
+            };
+        }
+
+        /**
+         * @brief Factory that creates a MultiDeviceOrchestrator(TP) from a TP node
+         *
+         * The child_runners are already compiled DeviceGraphOrchestrators.
+         * We wrap them in a MultiDeviceOrchestrator for TP coordination.
+         */
+        inline TreeToRunnerCompiler::TPRunnerFactory makeTPFactory()
+        {
+            return [](const ParallelismNode &node,
+                      std::vector<std::unique_ptr<IInferenceRunner>> child_runners,
+                      const std::shared_ptr<IModelContext> &model_ctx) -> std::unique_ptr<IInferenceRunner>
+            {
+                // Build device list and weights from tree node children
+                std::vector<GlobalDeviceAddress> devices;
+                std::vector<float> weights;
+                for (const auto &child : node.children)
+                {
+                    auto leaves = child.leafDevices();
+                    for (const auto *leaf : leaves)
+                    {
+                        devices.push_back(leaf->device);
+                    }
+                }
+
+                // Equal weights if not specified
+                if (node.tp_weights.empty())
+                {
+                    float w = 1.0f / static_cast<float>(devices.size());
+                    weights.assign(devices.size(), w);
+                }
+                else
+                {
+                    weights = node.tp_weights;
+                }
+
+                // Create LocalTPContext
+                auto tp_ctx = createLocalTPContext(devices, weights, node.backend);
+                if (!tp_ctx)
+                {
+                    LOG_ERROR("[TreeFactory] Failed to create LocalTPContext");
+                    return nullptr;
+                }
+
+                // Build MDO config for TP mode
+                MultiDeviceOrchestrator::Config mdo_config;
+                mdo_config.mode = MultiDeviceOrchestrator::ParallelismMode::TP;
+                mdo_config.devices = devices;
+                mdo_config.weights = weights;
+                mdo_config.backend = node.backend;
+                mdo_config.max_seq_len = 4096;
+                mdo_config.batch_size = 1;
+
+                // If this TP node handles a subset of layers (inside PP), configure nested PP stage
+                int total_layers = model_ctx->blockCount();
+                if (node.first_layer > 0 || node.last_layer < total_layers - 1)
+                {
+                    // Tree uses inclusive last_layer, FactoryPPStageConfig uses exclusive
+                    FactoryPPStageConfig pp_cfg;
+                    pp_cfg.first_layer = node.first_layer;
+                    pp_cfg.last_layer = node.last_layer + 1;
+                    pp_cfg.has_embedding = node.has_embedding;
+                    pp_cfg.has_lm_head = node.has_lm_head;
+                    mdo_config.nested_pp_stage_config = pp_cfg;
+                }
+
+                auto orch = std::make_unique<MultiDeviceOrchestrator>(
+                    model_ctx, std::move(tp_ctx), mdo_config);
+
+                return orch;
+            };
+        }
+
+        /**
+         * @brief Factory that creates a MultiDeviceOrchestrator(PP) from a PP node
+         *
+         * Builds PP stage configs from the tree node's children and creates
+         * a MultiDeviceOrchestrator in PP mode (or TP_PP for hybrid).
+         */
+        inline TreeToRunnerCompiler::LocalPPRunnerFactory makeLocalPPFactory()
+        {
+            return [](const ParallelismNode &node,
+                      std::vector<std::unique_ptr<IInferenceRunner>> child_runners,
+                      const std::shared_ptr<IModelContext> &model_ctx) -> std::unique_ptr<IInferenceRunner>
+            {
+                // Build PP stage configs from tree children
+                bool has_tp_stages = false;
+                MultiDeviceOrchestrator::Config mdo_config;
+                mdo_config.max_seq_len = 4096;
+                mdo_config.batch_size = 1;
+
+                for (const auto &child : node.children)
+                {
+                    // Tree uses inclusive last_layer, PPStageConfig uses exclusive
+                    MultiDeviceOrchestrator::PPStageConfig stage_cfg;
+                    stage_cfg.first_layer = child.first_layer;
+                    stage_cfg.last_layer = child.last_layer + 1;
+                    stage_cfg.has_embedding = child.has_embedding;
+                    stage_cfg.has_lm_head = child.has_lm_head;
+
+                    // Collect devices for this stage
+                    auto leaves = child.leafDevices();
+                    for (const auto *leaf : leaves)
+                    {
+                        stage_cfg.stage_devices.push_back(leaf->device);
+                    }
+
+                    // If child is a TP node, configure TP within this PP stage
+                    if (child.type == ParallelismNodeType::TENSOR_PARALLEL)
+                    {
+                        has_tp_stages = true;
+                        stage_cfg.tp_backend = child.backend;
+                        float w = 1.0f / static_cast<float>(stage_cfg.stage_devices.size());
+                        for (size_t d = 0; d < stage_cfg.stage_devices.size(); ++d)
+                        {
+                            stage_cfg.tp_weights.push_back(
+                                child.tp_weights.empty() ? w : child.tp_weights[d]);
+                        }
+                    }
+
+                    mdo_config.pp_stages.push_back(std::move(stage_cfg));
+                }
+
+                mdo_config.mode = has_tp_stages
+                                      ? MultiDeviceOrchestrator::ParallelismMode::TP_PP
+                                      : MultiDeviceOrchestrator::ParallelismMode::PP;
+
+                if (!mdo_config.validate())
+                {
+                    LOG_ERROR("[TreeFactory] Invalid PP config from tree");
+                    return nullptr;
+                }
+
+                auto orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx, mdo_config);
+                return orch;
+            };
+        }
+
+    } // namespace tree_factories
+
+    // =============================================================================
     // Base Test Class
     // =============================================================================
 
@@ -229,7 +582,9 @@ namespace llaminar2::test::parity::qwen2
         WeightDistributionStrategy getWeightStrategy() override
         {
             // LocalTP shards weights across devices
-            // LocalPP uses LAYER_PARTITIONED - each stage loads only its assigned layers
+            // LocalPP: LAYER_PARTITIONED is semantically correct (PP = layer split),
+            // but MDO creates per-stage ModelContexts internally via createForPPStage(),
+            // so top-level strategy is actually irrelevant for PP.
             // GlobalTP shards weights across MPI ranks
             if (cfg().is_local_tp())
                 return WeightDistributionStrategy::SHARDED;
@@ -314,20 +669,125 @@ namespace llaminar2::test::parity::qwen2
         }
 
         // ==========================================================================
-        // Pipeline Setup
+        // Pipeline Setup — Tree-based (dogfooding ParallelismTree + Compiler)
         // ==========================================================================
 
+        /**
+         * @brief Setup pipeline by building a ParallelismTree and compiling it
+         *
+         * This is the tree-based alternative to the old imperative setup methods.
+         * It dogfoods the ParallelismTree builder + TreeToRunnerCompiler infrastructure
+         * that the production OrchestrationRunner uses, giving us confidence that
+         * the tree→runner compilation produces correct inference results.
+         *
+         * Flow:
+         *   1. Load model (ModelContext::create)
+         *   2. Build ParallelismTree from TestConfig via buildTreeFromTestConfig()
+         *   3. Create real runner factories (DEVICE, TP, PP)
+         *   4. Compile tree → IInferenceRunner via TreeToRunnerCompiler::compile()
+         *   5. Enable snapshot capture
+         */
         bool setupPipeline()
         {
-            if (cfg().is_local_tp())
-                return setupLocalTPPipeline();
-            else if (cfg().is_local_pp())
-                return setupLocalPPPipeline();
-            else if (cfg().is_global_tp())
+            // GlobalTP still uses the old path (requires multi-rank MPI wiring)
+            if (cfg().is_global_tp())
                 return setupGlobalTPPipeline();
-            else
+
+            // Single device also uses old path (no tree needed)
+            if (cfg().is_single_device())
                 return ParityTestBase::setupPipeline();
+
+            // ============================================================
+            // Tree-based path: LocalTP, LocalPP, HybridPP+TP
+            // ============================================================
+            return setupTreePipeline();
         }
+
+        /**
+         * @brief Tree-based pipeline setup for LocalTP, LocalPP, and HybridPP+TP
+         *
+         * Builds a ParallelismTree from TestConfig, creates real factories
+         * that produce DeviceGraphOrchestrators and MultiDeviceOrchestrators,
+         * then compiles the tree into a nested IInferenceRunner hierarchy.
+         */
+        bool setupTreePipeline()
+        {
+            DeviceManager::instance().initialize(-1);
+
+            // For PP, initialize GlobalBackendRouter for activation transfers
+            if (cfg().is_local_pp())
+            {
+                GlobalBackendRouter::initForTests();
+            }
+
+            // Determine weight strategy
+            WeightDistributionStrategy weight_strategy = getWeightStrategy();
+
+            // Load model
+            model_ctx_ = ModelContext::create(
+                config_.model_path,
+                mpi_ctx_,
+                nullptr,
+                nullptr,
+                weight_strategy);
+
+            if (!model_ctx_)
+            {
+                LOG_ERROR("[Parity/Tree] Failed to load model");
+                return false;
+            }
+
+            // Configure model (weight sharding schema for TP)
+            configureModel(model_ctx_);
+
+            int n_layers = model_ctx_->blockCount();
+
+            // Step 1: Build the parallelism tree from TestConfig
+            auto tree = buildTreeFromTestConfig(cfg(), n_layers);
+
+            // Step 2: Build the compile context with real factories
+            InferenceRunnerConfig base_runner_config;
+            base_runner_config.max_seq_len = 4096;
+            base_runner_config.batch_size = 1;
+            base_runner_config.force_graph = true;
+            base_runner_config.use_mapped_memory = true; // For GPU snapshot capture
+
+            TreeToRunnerCompiler::CompileContext compile_ctx;
+            compile_ctx.model_ctx = model_ctx_;
+            compile_ctx.my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+            compile_ctx.world_size = mpi_ctx_ ? mpi_ctx_->world_size() : 1;
+            compile_ctx.max_seq_len = 4096;
+            compile_ctx.batch_size = 1;
+            compile_ctx.hidden_dim = model_ctx_->concreteLoader().getModel().embedding_length;
+            compile_ctx.vocab_size = model_ctx_->concreteLoader().getModel().vocab_size;
+
+            // Step 3: Wire up real factories
+            compile_ctx.device_runner_factory = tree_factories::makeDeviceFactory(
+                mpi_ctx_, base_runner_config);
+            compile_ctx.tp_runner_factory = tree_factories::makeTPFactory();
+            compile_ctx.local_pp_runner_factory = tree_factories::makeLocalPPFactory();
+
+            // Step 4: Compile tree → runner
+            LOG_INFO("[Parity/Tree] Compiling parallelism tree for " << cfg().name);
+
+            runner_ = TreeToRunnerCompiler::compile(tree, compile_ctx);
+            if (!runner_)
+            {
+                LOG_ERROR("[Parity/Tree] TreeToRunnerCompiler::compile() returned nullptr");
+                return false;
+            }
+
+            // Step 5: Enable snapshot capture
+            runner_->enableSnapshotCapture();
+
+            LOG_INFO("[Parity/Tree] Pipeline created via tree compilation for " << cfg().name);
+            return true;
+        }
+
+        // ==========================================================================
+        // Legacy imperative setup methods (kept for GlobalTP and fallback)
+        // These are superseded by setupTreePipeline() for LocalTP and LocalPP.
+        // ==========================================================================
 
         bool setupLocalTPPipeline()
         {

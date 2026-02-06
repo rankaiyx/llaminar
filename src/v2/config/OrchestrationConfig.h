@@ -28,11 +28,14 @@
 #pragma once
 
 #include "backends/GlobalDeviceAddress.h"
+#include "CollectiveBackendType.h"
 #include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend
+#include "execution/parallelism_tree/ParallelismTree.h"
 #include <string>
 #include <vector>
 #include <optional>
 #include <utility>
+#include <memory>
 
 namespace llaminar2
 {
@@ -73,20 +76,7 @@ namespace llaminar2
         MANUAL    ///< Manual layer assignment via --pp-stage
     };
 
-    /**
-     * @brief Backend type for collective operations
-     */
-    enum class CollectiveBackendType
-    {
-        AUTO,          ///< Automatically select based on device types
-        NCCL,          ///< NVIDIA NCCL (CUDA only)
-        RCCL,          ///< AMD RCCL (ROCm only)
-        PCIE_BAR,      ///< PCIe BAR direct P2P (heterogeneous GPU, 2-device)
-        HETEROGENEOUS, ///< Multi-GPU heterogeneous (orchestrates NCCL+RCCL+PCIeBAR)
-        UPI,           ///< Intel UPI interconnect (CPU cross-socket)
-        MPI,           ///< Fallback MPI_Allreduce
-        HOST           ///< Host-staged (copy to CPU, reduce, copy back)
-    };
+    // CollectiveBackendType is defined in CollectiveBackendType.h
 
     // =========================================================================
     // Conversion functions
@@ -95,12 +85,11 @@ namespace llaminar2
     const char *tpScopeToString(TPScope scope);
     const char *deviceAssignmentModeToString(DeviceAssignmentMode mode);
     const char *ppSplitModeToString(PPSplitMode mode);
-    const char *collectiveBackendTypeToString(CollectiveBackendType type);
+    // collectiveBackendTypeToString and parseCollectiveBackendType declared in CollectiveBackendType.h
 
     std::optional<TPScope> parseTpScope(const std::string &str);
     std::optional<DeviceAssignmentMode> parseDeviceAssignmentMode(const std::string &str);
     std::optional<PPSplitMode> parsePpSplitMode(const std::string &str);
-    std::optional<CollectiveBackendType> parseCollectiveBackendType(const std::string &str);
 
     // =========================================================================
     // DomainDefinition
@@ -299,6 +288,19 @@ namespace llaminar2
         std::string config_file_path; ///< Path to YAML config file (--config)
 
         // =========================================================================
+        // Recursive Topology Tree (Global PP Phase 8)
+        // =========================================================================
+
+        /// Inline topology specification (--topology "PP(...)") 
+        std::string topology_string;
+
+        /// Path to topology YAML file (--topology-file)
+        std::string topology_file_path;
+
+        /// Parsed topology tree (populated by parser if --topology or --topology-file specified)
+        std::optional<ParallelismTree> topology_tree;
+
+        // =========================================================================
         // Model Configuration
         // =========================================================================
 
@@ -367,13 +369,6 @@ namespace llaminar2
         bool show_help = false;    ///< Show help and exit
 
         // =========================================================================
-        // Placement Strategy (legacy compatibility)
-        // =========================================================================
-
-        std::string strategy = "auto";  ///< "auto", "all-gpu", "all-cpu", "layer-split", "memory-aware", "moe-optimized", "custom"
-        int offload_layers = 0;         ///< Number of layers to offload for layer-split strategy
-
-        // =========================================================================
         // Memory Constraints
         // =========================================================================
 
@@ -386,14 +381,6 @@ namespace llaminar2
 
         bool moe_shared_experts_gpu = true;   ///< Place shared experts on GPU
         bool moe_sparse_experts_cpu = true;   ///< Place sparse experts on CPU
-
-        // =========================================================================
-        // Multi-GPU Legacy Mode
-        // =========================================================================
-
-        bool multi_gpu = false;           ///< Enable multi-GPU mode
-        std::string gpu_split;            ///< GPU split strategy
-        std::vector<int> gpu_devices;     ///< Specific GPU device indices
 
         // =========================================================================
         // Precision

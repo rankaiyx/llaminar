@@ -362,31 +362,11 @@ add_v2_test(V2_Unit_TensorByteSize
     MPI_PROCS 1
 )
 
-# Test: TensorBase Authoritative Device tracking - Multi-device coherence API
-add_executable(v2_unit_tensor_authoritative_device unit/tensors/Test__TensorBase_AuthoritativeDevice.cpp)
-target_link_libraries(v2_unit_tensor_authoritative_device 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_TensorBase_AuthoritativeDevice 
-    COMMAND $<TARGET_FILE:v2_unit_tensor_authoritative_device>
-    LABELS "V2;Unit;Tensors;Coherence;AuthoritativeDevice"
-    MPI_PROCS 1
-)
-
 # Test: TensorBase TransferTo - Direct GPU-to-GPU transfer (Phase 2 GPU-Native Coherence)
-add_executable(v2_unit_tensor_transfer_to unit/tensors/Test__TensorBase_TransferTo.cpp)
-target_link_libraries(v2_unit_tensor_transfer_to 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_TensorBase_TransferTo 
-    COMMAND $<TARGET_FILE:v2_unit_tensor_transfer_to>
-    LABELS "V2;Unit;Tensors;Coherence;TransferTo;GPU"
-    MPI_PROCS 1
-)
+# Test: TensorBase Authoritative Device tracking - Multi-device coherence API
+# NOTE: These tests have been moved to the integration test suite (integration/tensors/)
+#       because they require GPU allocation and fail with OOM when run in parallel
+#       with other GPU-heavy unit tests.
 
 # Test: BARBackedTensor - BAR-backed tensor factory and operations
 add_executable(v2_test_bar_backed_tensor unit/tensors/Test__BARBackedTensor.cpp)
@@ -1909,6 +1889,32 @@ target_link_libraries(v2_test_iq4_nl_integration
 add_v2_test(V2_Integration_IQ4_NLTensor 
     COMMAND $<TARGET_FILE:v2_test_iq4_nl_integration>
     LABELS "V2;Integration;TensorOperations;Quantization;IQ4_NL;GEMM"
+)
+
+# Test: TensorBase Authoritative Device tracking - Multi-device coherence API (requires GPU)
+add_executable(v2_integration_tensor_authoritative_device integration/tensors/Test__TensorBase_AuthoritativeDevice.cpp)
+target_link_libraries(v2_integration_tensor_authoritative_device 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_TensorBase_AuthoritativeDevice 
+    COMMAND $<TARGET_FILE:v2_integration_tensor_authoritative_device>
+    LABELS "V2;Integration;Tensors;Coherence;AuthoritativeDevice;GPU"
+    MPI_PROCS 1
+)
+
+# Test: TensorBase TransferTo - Direct GPU-to-GPU transfer (requires GPU)
+add_executable(v2_integration_tensor_transfer_to integration/tensors/Test__TensorBase_TransferTo.cpp)
+target_link_libraries(v2_integration_tensor_transfer_to 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_TensorBase_TransferTo 
+    COMMAND $<TARGET_FILE:v2_integration_tensor_transfer_to>
+    LABELS "V2;Integration;Tensors;Coherence;TransferTo;GPU"
+    MPI_PROCS 1
 )
 
 # Test: FusedGEMM kernel (generic N-projection fused GEMM)
@@ -4072,41 +4078,99 @@ if(ZLIB_FOUND)
     # =========================================================================
     # Qwen2 Parity Test Matrix (integration/parity/qwen2/)
     # =========================================================================
-    # 
-    # Single parameterized test file that covers all configurations:
-    #   - Single device: CPU, CUDA, ROCm
-    #   - LOCAL TP: NCCL (2xCUDA), RCCL (2xROCm, 3xROCm), PCIeBAR (CUDA+ROCm)
-    #
-    # Tests skip at runtime if required hardware/backends are unavailable.
+    # Split parity matrix: each category gets its own executable for faster
+    # feedback, independent failure isolation, and cleaner CTest filtering.
     # =========================================================================
 
-    add_executable(v2_integration_parity_qwen2_matrix 
-        integration/parity/qwen2/Test__Qwen2_ParityMatrix.cpp
+    # ---- Single-Device Parity (CPU, CUDA, ROCm) ----
+    add_executable(v2_integration_parity_qwen2_single_device
+        integration/parity/qwen2/Test__Qwen2_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    # Note: No gtest_main - test provides custom main() with MPI_Init
-    target_link_libraries(v2_integration_parity_qwen2_matrix 
-        llaminar2_core 
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
+    target_link_libraries(v2_integration_parity_qwen2_single_device
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen2_matrix PRIVATE 
+    target_include_directories(v2_integration_parity_qwen2_single_device PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes
+        ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    
-    # Set CAP_SYS_ADMIN for PCIeBAR tests (heterogeneous CUDA+ROCm P2P)
+    add_v2_test(V2_Integration_Parity_Qwen2_SingleDevice
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_single_device>
+        LABELS "V2;Integration;Parity;Qwen2;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
+        MPI_PROCS 1
+    )
+
+    # ---- Local Tensor Parallelism (NCCL, RCCL, PCIeBAR) ----
+    add_executable(v2_integration_parity_qwen2_local_tp
+        integration/parity/qwen2/Test__Qwen2_LocalTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen2_local_tp
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen2_local_tp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
     if(HAVE_CUDA AND HAVE_ROCM)
-        add_custom_command(TARGET v2_integration_parity_qwen2_matrix POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_matrix for PCIe BAR P2P"
-            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_matrix> || true
+        add_custom_command(TARGET v2_integration_parity_qwen2_local_tp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_local_tp for PCIe BAR P2P"
+            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_local_tp> || true
         )
     endif()
+    add_v2_test(V2_Integration_Parity_Qwen2_LocalTP
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_local_tp>
+        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;NCCL;RCCL;PCIeBAR;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
 
-    add_v2_test(V2_Integration_Parity_Qwen2_Matrix
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_matrix>
-        LABELS "V2;Integration;Parity;Qwen2;CPU;CUDA;ROCm;NCCL;RCCL;PCIeBAR;LOCAL;TensorParallel;PyTorch;GoldenReference;FullModel;Pipeline;MultiDevice;Orchestrator"
+    # ---- Local Pipeline Parallelism (NCCL, RCCL, PCIeBAR, HOST) ----
+    add_executable(v2_integration_parity_qwen2_local_pp
+        integration/parity/qwen2/Test__Qwen2_LocalPP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen2_local_pp
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen2_local_pp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    if(HAVE_CUDA AND HAVE_ROCM)
+        add_custom_command(TARGET v2_integration_parity_qwen2_local_pp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_local_pp for PCIe BAR P2P"
+            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_local_pp> || true
+        )
+    endif()
+    add_v2_test(V2_Integration_Parity_Qwen2_LocalPP
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_local_pp>
+        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;PCIeBAR;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
+    # ---- Hybrid PP+TP (nested TP domains within PP stages) ----
+    add_executable(v2_integration_parity_qwen2_hybrid_pptp
+        integration/parity/qwen2/Test__Qwen2_HybridPPTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen2_hybrid_pptp
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen2_hybrid_pptp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    if(HAVE_CUDA AND HAVE_ROCM)
+        add_custom_command(TARGET v2_integration_parity_qwen2_hybrid_pptp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo "Setting CAP_SYS_ADMIN on v2_integration_parity_qwen2_hybrid_pptp for PCIe BAR P2P"
+            COMMAND sudo setcap cap_sys_admin+ep $<TARGET_FILE:v2_integration_parity_qwen2_hybrid_pptp> || true
+        )
+    endif()
+    add_v2_test(V2_Integration_Parity_Qwen2_HybridPPTP
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_hybrid_pptp>
+        LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;PCIeBAR;LOCAL;TensorParallel;PipelineParallel;Hybrid;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
         RESOURCE_LOCK "PCIeBAR_P2P"
     )
@@ -4134,12 +4198,35 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
     )
 
+    # =========================================================================
+    # Test: TopologyTreeParity (Phase 8 Global PP Integration)
+    # Verifies ParallelismTree construction, parsing, and compilation
+    # =========================================================================
+    add_executable(v2_integration_topology_tree_parity
+        integration/parity/topology/Test__TopologyTreeParity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_topology_tree_parity
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_topology_tree_parity PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+    )
+    add_v2_test(V2_Integration_TopologyTreeParity
+        COMMAND $<TARGET_FILE:v2_integration_topology_tree_parity>
+        LABELS "V2;Integration;PipelineParallel;Topology;TreePP;ParallelismTree"
+        MPI_PROCS 1
+    )
+
     # NOTE: LocalPP Multi-Stage Parity and Unified PP vs Orchestrator tests removed
     # as part of Phase 6 (LocalPPOrchestrator sunset). LocalPP tests now use unified
     # graph approach via Qwen2ParityTestBase::setupLocalPPPipeline().
     # See: docs/v2/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
 
-    message(STATUS "V2: Qwen2 parity test matrix enabled (single file, all configurations)")
+    message(STATUS "V2: Qwen2 parity tests enabled (SingleDevice, LocalTP, LocalPP, HybridPPTP)")
     message(STATUS "V2: LocalPP layer-partitioned weights test enabled")
 
     # =========================================================================
@@ -4624,6 +4711,17 @@ target_link_libraries(v2_test_orchestration_config_parser llaminar2_core GTest::
 add_v2_test(V2_Unit_OrchestrationConfigParser
     COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
     LABELS "V2;Unit;Config;CLI;YAML;Orchestration;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: ParallelismTreeParser (YAML and CLI parsing for ParallelismTree construction)
+# Tests YAML parsing, CLI inline format, error handling, round-trip serialization.
+# Part of Phase 7: Global PP Implementation - ParallelismTree Configuration
+add_executable(v2_test_parallelism_tree_parser unit/config/Test__ParallelismTreeParser.cpp)
+target_link_libraries(v2_test_parallelism_tree_parser llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ParallelismTreeParser
+    COMMAND $<TARGET_FILE:v2_test_parallelism_tree_parser>
+    LABELS "V2;Unit;Config;CLI;YAML;Topology;ParallelismTree;Parser"
     MPI_PROCS 1
 )
 
@@ -5794,6 +5892,19 @@ add_v2_test(V2_Unit_Qwen2Graph_PP
     COMMAND $<TARGET_FILE:v2_test_qwen2graph_pp>
     MPI_PROCS 1
     LABELS "V2;Unit;Models;Qwen2;Qwen2Graph;PipelineParallelism;UnifiedPPGraph"
+)
+
+# Test: KV cache layer index mapping in Pipeline Parallel mode (regression test)
+add_executable(v2_test_qwen2graph_kvcache_pp unit/models/qwen/Test__Qwen2Graph_KVCachePP.cpp)
+target_link_libraries(v2_test_qwen2graph_kvcache_pp 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Qwen2Graph_KVCachePP 
+    COMMAND $<TARGET_FILE:v2_test_qwen2graph_kvcache_pp>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Models;Qwen2;Qwen2Graph;PipelineParallelism;KVCache;Regression"
 )
 
 # Test: PlacementStrategy and PlacementPlan (weight/compute placement algorithms)
@@ -8366,4 +8477,138 @@ add_v2_test(V2_Perf_HeterogeneousBackend_Pipeline
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added HeterogeneousBackend pipeline performance benchmarks")
+
+# =============================================================================
+# Global Pipeline Parallelism (Global PP) Tests
+# =============================================================================
+
+# Test: GlobalPPTransferStage
+# Unit tests for the MPI send/recv compute stage used for cross-rank activation
+# transfer in Global PP. Validates stage type, naming, coherence policy,
+# buffer requirements, dump info, parameter validation. No MPI required (mock context).
+add_executable(v2_test_global_pp_transfer_stage unit/execution/compute_stages/stages/Test__GlobalPPTransferStage.cpp)
+target_link_libraries(v2_test_global_pp_transfer_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GlobalPPTransferStage
+    COMMAND $<TARGET_FILE:v2_test_global_pp_transfer_stage>
+    LABELS "V2;Unit;GlobalPP;Transfer;ComputeStage;PipelineParallel;MPI"
+    MPI_PROCS 1
+)
+
+# Test: GlobalPPTopology + GlobalPPRankPlanBuilder
+# Unit tests for topology data structures, validation (layer coverage, contiguity,
+# embedding/lm_head placement, rank bounds), transfer derivation (single→single,
+# single→globalTP fan-out, same-rank no-op), rank plan building (step ordering,
+# weight shard info, transfer direction matching). Pure data-structure tests.
+add_executable(v2_test_global_pp_topology unit/execution/global_pp/Test__GlobalPPTopology.cpp)
+target_link_libraries(v2_test_global_pp_topology llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GlobalPPTopology
+    COMMAND $<TARGET_FILE:v2_test_global_pp_topology>
+    LABELS "V2;Unit;GlobalPP;Topology;RankPlan;PipelineParallel;TensorParallel"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added Global PP unit tests")
+
+# Test: ParallelismTree
+# Unit tests for recursive parallelism tree data structure:
+# - Fluent builder construction (PP, TP, Device)
+# - Layer assignment (equal split, odd split, nested PP/TP)
+# - Validation (TP child count, rank bounds, zero layers, empty children)
+# - Query methods (leafRanks, leafDevices, isCrossRank, leafCount)
+# - toString visualization
+# - Edge cases (single device, pure TP, deep nesting, equality)
+add_executable(v2_test_parallelism_tree unit/execution/parallelism_tree/Test__ParallelismTree.cpp)
+target_link_libraries(v2_test_parallelism_tree llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ParallelismTree
+    COMMAND $<TARGET_FILE:v2_test_parallelism_tree>
+    LABELS "V2;Unit;ParallelismTree;PipelineParallel;TensorParallel;Topology"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added ParallelismTree unit tests")
+
+# Test: TransferSpec
+# Unit tests for transfer mechanism derivation between adjacent PP stages:
+# - LOCAL_PP: Same-rank transfer (NCCL/PCIeBAR/host-staged)
+# - MPI_INTRAHOST: Cross-rank on same machine
+# - MPI_INTERHOST: Cross-rank on different machines
+# - Tag assignment and rank selection
+add_executable(v2_test_transfer_spec unit/execution/parallelism_tree/Test__TransferSpec.cpp)
+target_link_libraries(v2_test_transfer_spec llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TransferSpec
+    COMMAND $<TARGET_FILE:v2_test_transfer_spec>
+    LABELS "V2;Unit;Topology;PipelineParallel;TensorParallel;TransferSpec"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added TransferSpec unit tests")
+
+# Test: CompoundShardInfo
+# Unit tests for multi-level shard descriptor:
+# - Layer range from PP assignment
+# - TP shard index and total (compound for nested TP)
+# - Work fraction (for proportional TP)
+# - Validation of shard info consistency
+add_executable(v2_test_compound_shard_info unit/execution/parallelism_tree/Test__CompoundShardInfo.cpp)
+target_link_libraries(v2_test_compound_shard_info llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CompoundShardInfo
+    COMMAND $<TARGET_FILE:v2_test_compound_shard_info>
+    LABELS "V2;Unit;Topology;PipelineParallel;TensorParallel;ShardInfo"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added CompoundShardInfo unit tests")
+
+# Test: HierarchicalCommBuilder
+# Unit tests for MPI communicator hierarchy construction:
+# - needsCommunicator() for device/TP/PP nodes
+# - calculateTPColor() for domain membership
+# - CommHierarchy RAII wrapper (add, get, move, toString)
+# - Hierarchy building for various topologies
+# - Edge cases (rank not in domain, PP-only, mixed local+cross-rank)
+add_executable(v2_test_hierarchical_comm_builder unit/execution/parallelism_tree/Test__HierarchicalCommBuilder.cpp)
+target_link_libraries(v2_test_hierarchical_comm_builder llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_HierarchicalCommBuilder
+    COMMAND $<TARGET_FILE:v2_test_hierarchical_comm_builder>
+    LABELS "V2;Unit;Topology;PipelineParallel;TensorParallel;MPI"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added HierarchicalCommBuilder unit tests")
+
+# Test: PipelineRunner
+# Unit tests for cross-rank pipeline runner:
+# - Construction with valid/invalid parameters
+# - myStageIndex() for various rank configurations
+# - vocab_size(), executionPath(), architecture() accessors
+# - clear_cache() propagation to owned stages
+# - forward() updates position and calls stage forward
+# - hasEmbedding() / hasLMHead() reflect stage config
+add_executable(v2_test_pipeline_runner unit/execution/parallelism_tree/Test__PipelineRunner.cpp)
+target_link_libraries(v2_test_pipeline_runner llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PipelineRunner
+    COMMAND $<TARGET_FILE:v2_test_pipeline_runner>
+    LABELS "V2;Unit;Topology;PipelineParallel"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added PipelineRunner unit tests")
+
+# Test: TreeToRunnerCompiler
+# Unit tests for tree-to-runner compilation:
+# - shouldCompile() logic for DEVICE/TP/PP nodes
+# - isCrossRankPP() detection
+# - Compile with mock factories (device, TP, PP)
+# - Cross-rank PP → PipelineRunner creation
+# - Nested TP+PP compilation
+# - Layer range propagation to runner configs
+add_executable(v2_test_tree_to_runner_compiler unit/execution/parallelism_tree/Test__TreeToRunnerCompiler.cpp)
+target_link_libraries(v2_test_tree_to_runner_compiler llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TreeToRunnerCompiler
+    COMMAND $<TARGET_FILE:v2_test_tree_to_runner_compiler>
+    LABELS "V2;Unit;Topology;PipelineParallel;TensorParallel"
+    MPI_PROCS 1
+)
+
+message(STATUS "V2 Tests: Added TreeToRunnerCompiler unit tests")
 endif()

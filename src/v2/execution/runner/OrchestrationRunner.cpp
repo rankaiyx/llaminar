@@ -12,6 +12,7 @@
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
 #include "../factory/InferenceRunnerFactory.h"
 #include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "../parallelism_tree/ParallelismTree.h"
 #include "../../collective/LocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"

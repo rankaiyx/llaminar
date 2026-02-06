@@ -196,67 +196,196 @@ namespace llaminar2
             return false;
         }
 
-        // Get embedding table data (always FP32)
-        const float *embed_data = embed_table->data();
-        if (!embed_data)
+        // =====================================================================
+        // Fast path: FP32 embedding table — no dequantization needed
+        // =====================================================================
+        if (embed_table->native_type() == TensorType::FP32)
         {
+            const float *embed_data = embed_table->data();
+            if (!embed_data)
+                return false;
+
+            if constexpr (std::is_same_v<TensorT, FP32Tensor>)
+            {
+                if (output->native_type() != TensorType::FP32)
+                    return false;
+                return apply(embed_data, token_ids, num_tokens, d_model,
+                             output->mutable_data(), mpi_ctx, device_idx);
+            }
+            else if constexpr (std::is_same_v<TensorT, BF16Tensor>)
+            {
+                if (output->native_type() != TensorType::BF16)
+                    return false;
+                auto *bf16_output = dynamic_cast<BF16Tensor *>(output);
+                if (!bf16_output)
+                    return false;
+                return apply_bf16(embed_data, token_ids, num_tokens, d_model,
+                                  bf16_output->mutable_typed_data(), mpi_ctx, device_idx);
+            }
+            else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
+            {
+                if (output->native_type() != TensorType::FP16)
+                    return false;
+                auto *fp16_output = dynamic_cast<FP16Tensor *>(output);
+                if (!fp16_output)
+                    return false;
+                return apply_fp16(embed_data, token_ids, num_tokens, d_model,
+                                  fp16_output->mutable_typed_data(), mpi_ctx, device_idx);
+            }
+            else if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
+            {
+                if (output->native_type() != TensorType::Q8_1)
+                    return false;
+                auto *q8_output = dynamic_cast<Q8_1Tensor *>(output);
+                if (!q8_output)
+                    return false;
+                return apply_q8_1(embed_data, token_ids, num_tokens, d_model,
+                                  q8_output->mutable_typed_data(), mpi_ctx, device_idx);
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        // =====================================================================
+        // Quantized path: repack to EmbedQ8 via IINT8Unpackable, dequant per-row
+        // =====================================================================
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
+        if (!unpackable)
+        {
+            LOG_ERROR("[CPUEmbeddingKernelT] Embedding table type "
+                      << tensorTypeName(embed_table->native_type())
+                      << " is not FP32 and does not implement IINT8Unpackable");
             return false;
         }
 
+        // Cache the repacked EmbedQ8 data (one-time cost per embedding table)
+        if (cached_embed_table_ != embed_table)
+        {
+            cached_repack_ = repackEmbeddingToQ8(embed_table, d_model);
+            cached_embed_table_ = embed_table;
+        }
+
+        const EmbedQ8Block *blocks = reinterpret_cast<const EmbedQ8Block *>(cached_repack_.data.data());
+        const size_t blocks_per_row = cached_repack_.blocks_per_row;
+
         if constexpr (std::is_same_v<TensorT, FP32Tensor>)
         {
-            // FP32: Validate types and call typed method
             if (output->native_type() != TensorType::FP32)
-            {
                 return false;
+            float *out = output->mutable_data();
+
+            for (int i = 0; i < num_tokens; ++i)
+            {
+                int token_id = token_ids[i];
+                float *out_row = out + static_cast<size_t>(i) * d_model;
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const EmbedQ8Block &blk = blocks[token_id * blocks_per_row + b];
+                    float scale = fp16_to_fp32(blk.d);
+                    float min_val = fp16_to_fp32(blk.m);
+                    int base = static_cast<int>(b) * 32;
+                    int count = std::min(32, d_model - base);
+                    for (int j = 0; j < count; ++j)
+                        out_row[base + j] = static_cast<float>(blk.qs[j]) * scale + min_val;
+                }
             }
-            return apply(embed_data, token_ids, num_tokens, d_model,
-                         output->mutable_data(), mpi_ctx, device_idx);
+            return true;
         }
         else if constexpr (std::is_same_v<TensorT, BF16Tensor>)
         {
-            // BF16: Validate types and call typed method
             if (output->native_type() != TensorType::BF16)
-            {
                 return false;
-            }
             auto *bf16_output = dynamic_cast<BF16Tensor *>(output);
             if (!bf16_output)
-            {
                 return false;
+            uint16_t *out = bf16_output->mutable_typed_data();
+
+            for (int i = 0; i < num_tokens; ++i)
+            {
+                int token_id = token_ids[i];
+                uint16_t *out_row = out + static_cast<size_t>(i) * d_model;
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const EmbedQ8Block &blk = blocks[token_id * blocks_per_row + b];
+                    float scale = fp16_to_fp32(blk.d);
+                    float min_val = fp16_to_fp32(blk.m);
+                    int base = static_cast<int>(b) * 32;
+                    int count = std::min(32, d_model - base);
+                    for (int j = 0; j < count; ++j)
+                    {
+                        float val = static_cast<float>(blk.qs[j]) * scale + min_val;
+                        out_row[base + j] = simd::fp32_to_bf16(val);
+                    }
+                }
             }
-            return apply_bf16(embed_data, token_ids, num_tokens, d_model,
-                              bf16_output->mutable_typed_data(), mpi_ctx, device_idx);
+            return true;
         }
         else if constexpr (std::is_same_v<TensorT, FP16Tensor>)
         {
-            // FP16: Validate types and call typed method
             if (output->native_type() != TensorType::FP16)
-            {
                 return false;
-            }
             auto *fp16_output = dynamic_cast<FP16Tensor *>(output);
             if (!fp16_output)
-            {
                 return false;
+            uint16_t *out = fp16_output->mutable_typed_data();
+
+            for (int i = 0; i < num_tokens; ++i)
+            {
+                int token_id = token_ids[i];
+                uint16_t *out_row = out + static_cast<size_t>(i) * d_model;
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const EmbedQ8Block &blk = blocks[token_id * blocks_per_row + b];
+                    float scale = fp16_to_fp32(blk.d);
+                    float min_val = fp16_to_fp32(blk.m);
+                    int base = static_cast<int>(b) * 32;
+                    int count = std::min(32, d_model - base);
+                    for (int j = 0; j < count; ++j)
+                    {
+                        float val = static_cast<float>(blk.qs[j]) * scale + min_val;
+                        out_row[base + j] = simd::fp32_to_fp16(val);
+                    }
+                }
             }
-            return apply_fp16(embed_data, token_ids, num_tokens, d_model,
-                              fp16_output->mutable_typed_data(), mpi_ctx, device_idx);
+            return true;
         }
         else if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
         {
-            // Q8_1: Validate types and call typed method
             if (output->native_type() != TensorType::Q8_1)
-            {
                 return false;
-            }
             auto *q8_output = dynamic_cast<Q8_1Tensor *>(output);
             if (!q8_output)
-            {
                 return false;
+
+            // Dequant each token row to FP32 temp, then quantize to Q8_1
+            const int q8_blocks_per_row = d_model / 32;
+            if (d_model % 32 != 0)
+                return false;
+
+            Q8_1Block *output_blocks = q8_output->mutable_typed_data();
+            alignas(64) float row_buf[8192]; // d_model ≤ 8192 for all current models
+
+            for (int i = 0; i < num_tokens; ++i)
+            {
+                int token_id = token_ids[i];
+                // Dequant from EmbedQ8 to FP32 temp
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    const EmbedQ8Block &blk = blocks[token_id * blocks_per_row + b];
+                    float scale = fp16_to_fp32(blk.d);
+                    float min_val = fp16_to_fp32(blk.m);
+                    int base = static_cast<int>(b) * 32;
+                    int count = std::min(32, d_model - base);
+                    for (int j = 0; j < count; ++j)
+                        row_buf[base + j] = static_cast<float>(blk.qs[j]) * scale + min_val;
+                }
+                // Quantize FP32 row → Q8_1 blocks
+                simd::quantize_fp32_to_q8_1_blocks(
+                    row_buf, output_blocks + i * q8_blocks_per_row, d_model);
             }
-            return apply_q8_1(embed_data, token_ids, num_tokens, d_model,
-                              q8_output->mutable_typed_data(), mpi_ctx, device_idx);
+            return true;
         }
         else
         {
