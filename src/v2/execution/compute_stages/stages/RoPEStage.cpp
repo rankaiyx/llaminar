@@ -120,21 +120,12 @@ namespace llaminar2
         ITensorRoPE *kernel = cached_kernel_.get();
 
         // Use provided position_ids if available (for batched execution with per-token positions)
-        // Otherwise, generate contiguous position_ids from pos_offset
+        // Otherwise, pass nullptr to the kernel to enable zero-copy contiguous path.
+        // The kernel computes positions on-the-fly on GPU: pos = pos_offset + seq_idx.
+        // This avoids a synchronous hipMemcpy that forces a full GPU pipeline drain.
         const int *position_ids_ptr = params_.position_ids;
-        std::vector<int> generated_position_ids;
-
-        if (!position_ids_ptr)
-        {
-            // Fallback: Generate contiguous position_ids [pos_offset, pos_offset+1, ..., pos_offset+seq_len-1]
-            // This path is used for single-sequence execution or when position_ids not provided
-            generated_position_ids.resize(seq_len);
-            for (int i = 0; i < seq_len; ++i)
-            {
-                generated_position_ids[i] = params_.pos_offset + i;
-            }
-            position_ids_ptr = generated_position_ids.data();
-        }
+        // NOTE: When position_ids_ptr is nullptr, the kernel MUST use pos_offset
+        // to compute contiguous positions. Do NOT generate a host array here.
 
         const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
 
@@ -298,13 +289,11 @@ namespace llaminar2
 
         // Standard path: Apply RoPE via kernel's apply_tensor method (in-place)
         //
-        // NOTE: On GPU, the non-contiguous path uses hipMemcpy to upload position_ids,
-        // which is synchronous and drains the GPU pipeline. This inflates RoPE's
-        // wall-clock profiling time by ~100ms during prefill (capturing pending GEMM
-        // execution time). This is a PROFILING ARTIFACT — actual RoPE GPU compute is
-        // negligible (~3.6µs per decode call). Do NOT try to "fix" this by switching
-        // to the contiguous kernel path (nullptr position_ids) — removing the hipMemcpy
-        // sync point changes GPU pipeline scheduling and causes a ~28% prefill regression.
+        // When position_ids is nullptr (contiguous positions), the kernel computes
+        // positions on-the-fly on GPU (pos = pos_offset + seq_idx), avoiding a
+        // synchronous hipMemcpy that would drain the entire GPU pipeline at every
+        // layer during prefill. The contiguous path also fuses Q+K into a single
+        // kernel launch for better launch efficiency.
         return kernel->apply_tensor(
             Q_base,
             K_base, // May be nullptr
@@ -315,7 +304,8 @@ namespace llaminar2
             params_.head_dim,
             params_.theta_base,
             params_.mpi_ctx,
-            params_.device_id.toKernelDeviceIndex());
+            params_.device_id.toKernelDeviceIndex(),
+            params_.pos_offset);
     }
 
     size_t RoPEStage::estimatedFlops() const

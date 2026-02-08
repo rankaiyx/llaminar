@@ -1452,9 +1452,7 @@ namespace llaminar2
                     break;
                 }
 
-                // Get weight device pointers from this projection's kernel
-                // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
-                int8_t *d_weights_int8 = nullptr;
+                // Get weight scales from this projection's kernel
                 float *d_scales_B = nullptr;
 
                 if (rocm_kernel->packed_)
@@ -1466,7 +1464,167 @@ namespace llaminar2
                     d_scales_B = rocm_kernel->impl_->d_scales_B;
                 }
 
-                // Repack VNNI→row-major into this kernel's workspace scratch
+                if (!d_scales_B)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " weight scales not on device");
+                    all_success = false;
+                    break;
+                }
+
+                // Resolve bias pointer early (needed by both GEMV and CK paths)
+                const float *d_bias = nullptr;
+                if (proj.bias)
+                {
+                    if (proj.bias->native_type() != TensorType::FP32)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                                 << " bias must be FP32, got " << static_cast<int>(proj.bias->native_type()));
+                        all_success = false;
+                        break;
+                    }
+
+                    auto *bias_tensor = const_cast<TensorBase *>(proj.bias);
+                    DeviceId target_device = DeviceId::rocm(rocm_device_id_);
+                    auto current_dev = bias_tensor->current_device();
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Proj " << i
+                                                                                       << " bias tensor=" << bias_tensor
+                                                                                       << " current_dev=" << (current_dev.has_value() ? current_dev->to_string() : "(none)")
+                                                                                       << " target_device=" << target_device.to_string()
+                                                                                       << " gpu_data_ptr=" << bias_tensor->gpu_data_ptr()
+                                                                                       << " rocm_device_id_=" << rocm_device_id_);
+
+                    if (current_dev.has_value() && current_dev.value() == target_device)
+                    {
+                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
+                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for bias: " << d_bias);
+                        }
+                        else
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        }
+                    }
+                    else if (current_dev.has_value() && current_dev->is_gpu())
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] MULTI-GPU CONFLICT: Bias tensor is on "
+                                  << current_dev->to_string() << " but we need ROCm:" << rocm_device_id_
+                                  << ". Ensure WeightPreloader::uploadNonGemmWeights() was called for this device.");
+                        all_success = false;
+                        break;
+                    }
+                    else
+                    {
+                        if (!bias_tensor->ensureOnDevice(target_device))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to upload bias to ROCm:" << rocm_device_id_);
+                            all_success = false;
+                            break;
+                        }
+                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
+                        }
+                        else
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        }
+                    }
+
+                    if (!d_bias)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i);
+                        all_success = false;
+                        break;
+                    }
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                             << " using bias ptr=" << static_cast<const void *>(d_bias));
+                }
+
+                // =========================================================================
+                // DECODE FAST PATH: M=1 GEMV (skips CK GEMM entirely)
+                //
+                // For M=1 (single-token decode), the CK INT8 GEMM is catastrophically
+                // inefficient because decode is bandwidth-bound, not compute-bound.
+                // Our custom GEMV kernel reads VNNI weights directly, eliminating:
+                //   1. VNNI→row-major repack kernel
+                //   2. M-padding (hipMemset + hipMemcpy)
+                //   3. CK 32×32 tile overhead (wastes 31 of 32 rows)
+                //   4. Separate biasAdd kernel
+                //
+                // Instead: GEMV → applyScaling (with fused bias) = 2 kernels total.
+                // Shared quantized activations are reused across all projections.
+                // =========================================================================
+                if (m == 1)
+                {
+                    int8_t *d_vnni = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_int8_vnni : nullptr;
+                    if (!d_vnni)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " VNNI weights not on device");
+                        all_success = false;
+                        break;
+                    }
+
+                    // Ensure INT32 accumulator for GEMV output
+                    const size_t gemv_int32_size = static_cast<size_t>(n);
+                    if (gemv_int32_size > rocm_kernel->impl_->d_CK_int32_capacity)
+                    {
+                        if (rocm_kernel->impl_->d_CK_int32)
+                            rocmQuantGemm_freeDevice(rocm_kernel->impl_->d_CK_int32, rocm_device_id_);
+                        rocm_kernel->impl_->d_CK_int32 = nullptr;
+                        rocm_kernel->impl_->d_CK_int32_capacity = 0;
+
+                        if (!rocmQuantGemm_allocInt32(&rocm_kernel->impl_->d_CK_int32, gemv_int32_size, rocm_device_id_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to allocate GEMV INT32 buffer for projection " << i);
+                            all_success = false;
+                            break;
+                        }
+                        rocm_kernel->impl_->d_CK_int32_capacity = gemv_int32_size;
+                    }
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                             << " GEMV fast path M=1 N=" << n << " K=" << k
+                                                                                             << (d_bias ? " +bias" : ""));
+
+                    // INT8 VNNI GEMV: uses shared d_A_int8 from step 3
+                    if (!rocmGemv_int8_int8_int32_vnni(
+                            impl_->d_A_int8, d_vnni, rocm_kernel->impl_->d_CK_int32,
+                            n, k, rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] GEMV failed for projection " << i);
+                        all_success = false;
+                        break;
+                    }
+
+                    // Apply scaling with fused bias: output = C_int32 * scale_A * scale_B [+ bias]
+                    if (!rocmQuantGemm_applyScaling(
+                            rocm_kernel->impl_->d_CK_int32,
+                            d_output,
+                            impl_->d_scales_A,
+                            d_scales_B,
+                            m, n,
+                            1.0f, 0.0f,
+                            nullptr, // No existing C
+                            d_bias,  // Fused bias (nullptr if no bias)
+                            rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] GEMV scaling failed for projection " << i);
+                        all_success = false;
+                        break;
+                    }
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " GEMV complete");
+                    continue; // Skip CK path below
+                }
+
+                // =========================================================================
+                // PREFILL PATH: M>1 CK GEMM
+                // =========================================================================
+
+                // Repack VNNI→row-major into this kernel's workspace scratch for CK
+                int8_t *d_weights_int8 = nullptr;
                 int8_t *d_vnni = rocm_kernel->impl_ ? rocm_kernel->impl_->d_weights_int8_vnni : nullptr;
                 int8_t *d_scratch = rocm_kernel->impl_ ? rocm_kernel->impl_->d_B_rowmajor_scratch : nullptr;
 
@@ -1481,7 +1639,7 @@ namespace llaminar2
                     d_weights_int8 = d_scratch;
                 }
 
-                if (!d_weights_int8 || !d_scales_B)
+                if (!d_weights_int8)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i << " weights not on device");
                     all_success = false;
@@ -1510,91 +1668,7 @@ namespace llaminar2
                     rocm_kernel->impl_->d_CK_int32_capacity = ck_int32_size;
                 }
 
-                // Get bias pointer if present
-                const float *d_bias = nullptr;
-                if (proj.bias)
-                {
-                    if (proj.bias->native_type() != TensorType::FP32)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                                 << " bias must be FP32, got " << static_cast<int>(proj.bias->native_type()));
-                        all_success = false;
-                        break;
-                    }
-
-                    // Use TensorBase interface - works with both FP32Tensor and TensorSlice
-                    // Cast away const to access coherence methods
-                    auto *bias_tensor = const_cast<TensorBase *>(proj.bias);
-
-                    // Check if bias is already on the correct ROCm device
-                    // In multi-GPU scenarios, each device should have its own bias tensor clone
-                    // (created during weight preloading via WeightPreloader::uploadNonGemmWeights)
-                    DeviceId target_device = DeviceId::rocm(rocm_device_id_);
-                    auto current_dev = bias_tensor->current_device();
-
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Proj " << i
-                                                                                       << " bias tensor=" << bias_tensor
-                                                                                       << " current_dev=" << (current_dev.has_value() ? current_dev->to_string() : "(none)")
-                                                                                       << " target_device=" << target_device.to_string()
-                                                                                       << " gpu_data_ptr=" << bias_tensor->gpu_data_ptr()
-                                                                                       << " rocm_device_id_=" << rocm_device_id_);
-
-                    if (current_dev.has_value() && current_dev.value() == target_device)
-                    {
-                        // Already on correct device - use directly
-                        // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr()
-                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
-                            LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Using BAR rocm_data_ptr for bias: " << d_bias);
-                        }
-                        else
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
-                        }
-                    }
-                    else if (current_dev.has_value() && current_dev->is_gpu())
-                    {
-                        // Tensor is on a DIFFERENT GPU - this is a multi-GPU race condition!
-                        // Do NOT call ensureOnDevice() as it would free the other GPU's memory.
-                        // The correct fix is to ensure each device has its own bias tensor clone.
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] MULTI-GPU CONFLICT: Bias tensor is on "
-                                  << current_dev->to_string() << " but we need ROCm:" << rocm_device_id_
-                                  << ". Ensure WeightPreloader::uploadNonGemmWeights() was called for this device.");
-                        all_success = false;
-                        break;
-                    }
-                    else
-                    {
-                        // Tensor is on CPU or not uploaded yet - safe to upload to this device
-                        if (!bias_tensor->ensureOnDevice(target_device))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Failed to upload bias to ROCm:" << rocm_device_id_);
-                            all_success = false;
-                            break;
-                        }
-                        // IMPORTANT: For BAR-backed tensors, use rocm_data_ptr()
-                        if (bias_tensor->isBARBacked() && bias_tensor->rocm_data_ptr() != nullptr)
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->rocm_data_ptr());
-                        }
-                        else
-                        {
-                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
-                        }
-                    }
-
-                    if (!d_bias)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Bias has no GPU data for projection " << i);
-                        all_success = false;
-                        break;
-                    }
-                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                             << " using bias ptr=" << static_cast<const void *>(d_bias));
-                }
-
-                // Execute CK GEMM using SHARED quantized activations
+                // Execute CK GEMM using SHARED quantized activations (M>1 only)
                 bool success = false;
 
                 if (d_bias)

@@ -2246,7 +2246,6 @@ extern "C"
             dim3(grid_size), dim3(block_size), 0, 0,
             d_output, d_bias, M, N);
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {

@@ -1920,6 +1920,19 @@ namespace llaminar2
         void updateCachedGraphParams(ComputeGraph &graph, int pos_offset, int seq_len);
 
         /**
+         * @brief Synchronize the GPU stream and mark logits as synced at forward
+         *        pass boundary.
+         *
+         * This ensures the caller receives logits without any per-access
+         * coherence or device synchronization.  The stream sync happens once
+         * here; subsequent data()/fp32_data() calls on the logits tensor
+         * return the mapped pointer immediately.
+         *
+         * @param ctx Device context whose stream to synchronize
+         */
+        void syncLogitsAtBoundary(IDeviceContext *ctx);
+
+        /**
          * @brief Check if we can use cached graph for current execution
          *
          * @param layer_idx Layer index

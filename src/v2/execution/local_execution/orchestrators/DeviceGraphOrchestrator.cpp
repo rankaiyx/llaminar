@@ -610,6 +610,16 @@ namespace llaminar2
 
             bool success = executor_.execute(*forward_cache_.graph, ctx);
 
+            // Sync the stream at the forward pass boundary so logits are
+            // immediately available to the caller without per-access event waits.
+            // This moves the synchronization point from the lazy data() call
+            // (inside ensureOnHost) to here, eliminating coherence overhead
+            // when the sampler reads logits.
+            if (success)
+            {
+                syncLogitsAtBoundary(ctx);
+            }
+
             auto end = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
 
@@ -773,6 +783,16 @@ namespace llaminar2
             success = executor_.execute(graph, ctx);
         }
 
+        // Sync the stream at the forward pass boundary (same as cached path above)
+        if (success)
+        {
+            IDeviceContext *sync_ctx = getDeviceContext(input.device);
+            if (sync_ctx)
+            {
+                syncLogitsAtBoundary(sync_ctx);
+            }
+        }
+
         // Cache the graph for future decode steps (first decode step only)
         if (should_cache_after_build && success)
         {
@@ -789,6 +809,26 @@ namespace llaminar2
         LOG_DEBUG("[DeviceGraphOrchestrator] Forward completed in " << ms << "ms, success=" << success);
 
         return success;
+    }
+
+    void DeviceGraphOrchestrator::syncLogitsAtBoundary(IDeviceContext *ctx)
+    {
+        if (!ctx || !ctx->isGPU())
+        {
+            return; // CPU execution is synchronous — nothing to sync
+        }
+
+        // Single stream sync ensures ALL GPU work (all stages) is complete.
+        // This replaces the lazy per-tensor hipEventSynchronize that would
+        // otherwise fire inside ensureOnHost() when logits->data() is called.
+        ctx->synchronize();
+
+        // Clear the mapped sync flag so data()/fp32_data() return the mapped
+        // pointer immediately without any further synchronization.
+        if (state_.logits && state_.logits->isMapped())
+        {
+            state_.logits->markMappedSynced();
+        }
     }
 
     bool DeviceGraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)

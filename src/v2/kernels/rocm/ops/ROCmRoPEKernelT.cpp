@@ -461,7 +461,7 @@ namespace llaminar2
                 return false;
             }
 
-            // Initialize inv_freq if needed
+            // Initialize inv_freq if needed (GPU-compute, fully async — no pipeline drain)
             if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
             {
                 if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev))
@@ -474,21 +474,36 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
-            // Positions computed on-the-fly on GPU: pos = pos_offset + seq_idx
-            if (position_ids == nullptr)
-            {
-                return hipOps_rope_fp32_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev);
-            }
-
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
             if (seq_len == 1)
             {
-                int pos = position_ids[0];
+                int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_fp32_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev);
             }
 
-            // NON-CONTIGUOUS PATH: Need to copy position_ids array (rare: batched with padding)
+            // CONTIGUOUS DETECTION: Check if positions are sequential (pos_offset, pos_offset+1, ...)
+            // If so, use the zero-copy contiguous kernel which computes positions on-the-fly on GPU.
+            {
+                bool is_contiguous = (position_ids == nullptr);
+                if (!is_contiguous && position_ids)
+                {
+                    is_contiguous = true;
+                    for (int i = 0; i < seq_len; ++i)
+                    {
+                        if (position_ids[i] != pos_offset + i)
+                        {
+                            is_contiguous = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_contiguous)
+                {
+                    return hipOps_rope_fp32_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev);
+                }
+            }
+
+            // NON-CONTIGUOUS PATH: Need to copy position_ids array (rare: batched with padding/reordering)
             int *d_position_ids = static_cast<int *>(workspace_->getBuffer(RoPEWorkspaceBuffers::POSITION_IDS));
             if (!d_position_ids)
             {
@@ -496,9 +511,9 @@ namespace llaminar2
                 return false;
             }
 
-            // Copy position_ids to device
+            // Copy position_ids to device (async to avoid pipeline drain)
             size_t pos_bytes = seq_len * sizeof(int);
-            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice, 0);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
@@ -725,17 +740,32 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
-            if (position_ids == nullptr)
-            {
-                return hipOps_rope_bf16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev);
-            }
-
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
             if (seq_len == 1)
             {
-                int pos = position_ids[0];
+                int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_bf16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev);
+            }
+
+            // CONTIGUOUS DETECTION: Avoid synchronous hipMemcpy pipeline drain
+            {
+                bool is_contiguous = (position_ids == nullptr);
+                if (!is_contiguous && position_ids)
+                {
+                    is_contiguous = true;
+                    for (int i = 0; i < seq_len; ++i)
+                    {
+                        if (position_ids[i] != pos_offset + i)
+                        {
+                            is_contiguous = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_contiguous)
+                {
+                    return hipOps_rope_bf16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev);
+                }
             }
 
             // NON-CONTIGUOUS PATH: Need to copy position_ids array
@@ -748,7 +778,7 @@ namespace llaminar2
             }
 
             size_t pos_bytes = seq_len * sizeof(int);
-            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice, 0);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));
@@ -972,17 +1002,32 @@ namespace llaminar2
                 inv_freq_theta_ = rope_theta;
             }
 
-            // ZERO-COPY PATH: If position_ids is nullptr, use contiguous kernel
-            if (position_ids == nullptr)
-            {
-                return hipOps_rope_fp16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev);
-            }
-
             // DECODE OPTIMIZATION: For seq_len=1, use scalar position to avoid H2D copy
             if (seq_len == 1)
             {
-                int pos = position_ids[0];
+                int pos = position_ids ? position_ids[0] : pos_offset;
                 return hipOps_rope_fp16_decode(d_Q, d_K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim, dev);
+            }
+
+            // CONTIGUOUS DETECTION: Avoid synchronous hipMemcpy pipeline drain
+            {
+                bool is_contiguous = (position_ids == nullptr);
+                if (!is_contiguous && position_ids)
+                {
+                    is_contiguous = true;
+                    for (int i = 0; i < seq_len; ++i)
+                    {
+                        if (position_ids[i] != pos_offset + i)
+                        {
+                            is_contiguous = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_contiguous)
+                {
+                    return hipOps_rope_fp16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev);
+                }
             }
 
             // NON-CONTIGUOUS PATH: Need to copy position_ids array
@@ -995,7 +1040,7 @@ namespace llaminar2
             }
 
             size_t pos_bytes = seq_len * sizeof(int);
-            hipError_t err = hipMemcpy(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice);
+            hipError_t err = hipMemcpyAsync(d_position_ids, position_ids, pos_bytes, hipMemcpyHostToDevice, 0);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to copy position_ids to GPU: " << hipGetErrorString(err));

@@ -1045,7 +1045,6 @@ extern "C"
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1087,7 +1086,6 @@ extern "C"
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1129,7 +1127,6 @@ extern "C"
                                Q, inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1178,7 +1175,6 @@ extern "C"
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1215,7 +1211,6 @@ extern "C"
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1252,7 +1247,6 @@ extern "C"
                                K, inv_freq, pos, n_kv_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1304,7 +1298,6 @@ extern "C"
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1346,7 +1339,6 @@ extern "C"
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1388,7 +1380,6 @@ extern "C"
                                Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
         }
 
-        (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -1413,6 +1404,31 @@ extern "C"
      *
      * Formula: inv_freq[i] = 1.0 / (freq_base^(2i/head_dim))
      */
+    /**
+     * @brief GPU kernel to compute inverse frequency table directly on device.
+     *
+     * Replaces the host-compute + synchronous hipMemcpy path. By computing
+     * inv_freq on the GPU, we avoid an implicit full pipeline drain that blocks
+     * the host for ~11ms per layer during prefill (hipMemcpy synchronizes all
+     * pending GPU work on the default stream before the copy can begin).
+     *
+     * Formula: inv_freq[i] = exp(-log(freq_base) * 2*i / head_dim)
+     *                      = 1.0 / (freq_base^(2i/head_dim))
+     */
+    __global__ void rope_populate_inv_freq_kernel(
+        float *d_inv_freq,
+        int half_dim,
+        float neg_log_base,
+        int head_dim)
+    {
+        int i = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+        if (i < half_dim)
+        {
+            float exponent = (2.0f * i) / head_dim;
+            d_inv_freq[i] = expf(neg_log_base * exponent);
+        }
+    }
+
     bool hipOps_rope_populate_inv_freq(
         float *d_inv_freq,
         int head_dim,
@@ -1423,21 +1439,27 @@ extern "C"
             return false;
 
         const int half_dim = head_dim / 2;
+        const float neg_log_base = -std::log(freq_base);
 
-        // Compute on host
-        std::vector<float> h_inv_freq(half_dim);
-        const float log_base = std::log(freq_base);
-        for (int i = 0; i < half_dim; ++i)
-        {
-            float exponent = (2.0f * i) / head_dim;
-            h_inv_freq[i] = std::exp(-log_base * exponent);
-        }
-
-        // Copy to device
         hipSetDevice(device_idx);
-        hipError_t err = hipMemcpy(d_inv_freq, h_inv_freq.data(),
-                                   half_dim * sizeof(float), hipMemcpyHostToDevice);
-        return err == hipSuccess;
+
+        // Compute inv_freq directly on GPU — fully async, no pipeline drain.
+        // The kernel runs on the same default stream as subsequent RoPE kernels,
+        // so ordering is guaranteed without explicit synchronization.
+        constexpr int kBlockSize = 64;
+        int grid_size = (half_dim + kBlockSize - 1) / kBlockSize;
+        hipLaunchKernelGGL(rope_populate_inv_freq_kernel,
+                           dim3(grid_size), dim3(kBlockSize), 0, 0,
+                           d_inv_freq, half_dim, neg_log_base, head_dim);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[ROCm RoPE] Failed to launch inv_freq kernel: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+        return true;
     }
 
 } // extern "C"

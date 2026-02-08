@@ -958,6 +958,29 @@ namespace llaminar2
         bool isMapped() const { return is_mapped_; }
 
         /**
+         * @brief Notify a mapped tensor that the GPU stream has been externally
+         *        synchronized, so no per-access event wait is needed.
+         *
+         * Call this after performing a stream-level synchronization (e.g.,
+         * hipStreamSynchronize) to avoid redundant hipEventSynchronize calls
+         * when the host subsequently reads the mapped pointer via data().
+         *
+         * This is the preferred pattern for forward pass boundaries: the
+         * orchestrator syncs the stream once, then marks logits as synced,
+         * so the sampler receives logits without any coherence overhead.
+         *
+         * @note Only meaningful for mapped tensors (is_mapped_ == true).
+         *       No-op for non-mapped tensors.
+         */
+        void markMappedSynced()
+        {
+            if (is_mapped_)
+            {
+                mapped_needs_sync_ = false;
+            }
+        }
+
+        /**
          * @brief Check if tensor uses BAR-backed memory (PCIeBAR cross-vendor zero-copy)
          * @return true if tensor data resides in AMD VRAM accessed via PCIe BAR
          *
