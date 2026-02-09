@@ -581,7 +581,7 @@ namespace
     }
 
     // =========================================================================
-    // Flash Decoding - Split-K Kernel for MI50
+    // Flash Decoding - Split-K Kernel for MI50 (v3: wavefront-cooperative)
     // =========================================================================
     //
     // For single-token decode (seq_len=1), we parallelize over the KV cache
@@ -589,43 +589,32 @@ namespace
     // partial (m, l, O) that are merged in a reduction kernel.
     //
     // Grid: (n_heads, num_splits, batch_size)
-    // Block: (256,) threads
+    // Block: (256,) threads = 4 wavefronts
     //
-    // Optimizations v2 (2026-02-09):
-    //   - float4 vectorized K/V loads (4x fewer memory transactions)
-    //   - Deferred O_local rescale (avoid per-KV-position 128-element rescale)
-    //   - Efficient wavefront reduction (reduce only m,l; rescale O locally)
-    //   - Parallel output write (all threads, not just thread 0)
-    //   - __launch_bounds__ for register hint
+    // v3 architecture (2026-02-09):
+    //   LANES OWN OUTPUT DIMS, NOT KV POSITIONS.
+    //
+    //   Each wavefront cooperates on one KV position at a time:
+    //     1. All 64 lanes load contiguous K elements (coalesced!)
+    //     2. Partial dot product → wavefrontReduceSum → full score
+    //     3. Online softmax update (score is uniform across lanes)
+    //     4. All 64 lanes load contiguous V elements (coalesced!)
+    //     5. Each lane updates only its 2 output dims of O
+    //
+    //   Benefits vs v2:
+    //     - Coalesced K/V memory access (adjacent lanes → adjacent addresses)
+    //     - 2-4 VGPRs for O per lane instead of 128 → 4x occupancy potential
+    //     - Zero cross-lane O reduction (no shuffles for O at all)
+    //     - Only 6 shuffles per KV position (dot product reduce)
+    //     - v2 had 128 × wavefrontReduceSum = 768 shuffles TOTAL for O
     //
     // =========================================================================
 
     /**
-     * @brief Wavefront reduction of softmax state — m and l ONLY.
-     *
-     * Returns the converged (m, l) across all 64 lanes.
-     * O_local is NOT shuffled — caller must rescale locally afterwards.
+     * @brief Flash Decoding kernel for single-query decode on MI50
+     *        v3: wavefront-cooperative KV processing
      */
-    __device__ __forceinline__ void wavefrontReduceML(float &m, float &l)
-    {
-        for (int offset = WAVEFRONT_SIZE / 2; offset > 0; offset /= 2)
-        {
-            float other_m = __shfl_xor(m, offset);
-            float other_l = __shfl_xor(l, offset);
-
-            float m_new = fmaxf(m, other_m);
-            float scale_self = expf(m - m_new);
-            float scale_other = expf(other_m - m_new);
-
-            l = scale_self * l + scale_other * other_l;
-            m = m_new;
-        }
-    }
-
-    /**
-     * @brief Flash Decoding kernel for single-query decode on MI50 (v2 optimised)
-     */
-    __global__ __launch_bounds__(256, 2)
+    __global__ __launch_bounds__(256, 4)
     void flash_decoding_mi50_kernel(
         const float *__restrict__ Q,
         const float *__restrict__ K_cache,
@@ -654,26 +643,29 @@ namespace
 
         const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
 
+        const int tid = threadIdx.x;
+        const int num_threads = blockDim.x;
+        const int wavefront_id = tid / WAVEFRONT_SIZE;
+        const int lane_id = tid % WAVEFRONT_SIZE;
+        const int num_wavefronts = num_threads / WAVEFRONT_SIZE;
+
         // Handle empty splits
         if (kv_start >= kv_len)
         {
-            if (threadIdx.x == 0)
+            if (tid == 0)
             {
                 m_partial[partial_idx] = -FLT_MAX;
                 l_partial[partial_idx] = 0.0f;
             }
             float *O_out = O_partial + partial_idx * head_dim;
-            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            for (int d = tid; d < head_dim; d += num_threads)
             {
                 O_out[d] = 0.0f;
             }
             return;
         }
 
-        const int tid = threadIdx.x;
-        const int num_threads = blockDim.x;
-
-        // Load Q into LDS (vectorized)
+        // Load Q into LDS (all threads cooperate)
         extern __shared__ char smem[];
         float *Q_shared = reinterpret_cast<float *>(smem);
 
@@ -684,185 +676,129 @@ namespace
         }
         __syncthreads();
 
-        // Thread-local accumulators
-        // O_local stores UN-NORMALISED weighted V accumulation (not yet rescaled by current m)
-        // We track m_local (running max) and defer the O rescale to after the KV loop
-        float O_local[128] = {0};
+        // =====================================================================
+        // Thread-local O accumulators — only this lane's output dimensions
+        //
+        // For head_dim=128, WAVEFRONT_SIZE=64: each lane owns 2 dims
+        // Lane i owns dims: i, i+64 (i.e., strided by WAVEFRONT_SIZE)
+        //
+        // This reduces VGPR usage from 128 to 2-4 floats per lane.
+        // =====================================================================
+        float O_lane[4] = {0, 0, 0, 0}; // Supports head_dim up to 256
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
         const float *K_batch = K_cache + batch_idx * kv_len * n_kv_heads * head_dim;
         const float *V_batch = V_cache + batch_idx * kv_len * n_kv_heads * head_dim;
 
-        // Precompute head offset for KV
         const int kv_head_offset = kv_head_idx * head_dim;
         const int kv_stride = n_kv_heads * head_dim;
 
-        // Number of float4 groups (head_dim must be divisible by 4 for vectorisation)
-        const int head_dim_vec4 = head_dim / 4;
-        const bool can_vectorize = (head_dim % 4 == 0);
-
-        // Each thread processes a strided subset of KV positions
-        for (int kv_pos = kv_start + tid; kv_pos < kv_end; kv_pos += num_threads)
+        // =====================================================================
+        // Main loop: wavefront-cooperative KV processing
+        //
+        // Each wavefront processes a strided subset of KV positions.
+        // Within each position, all 64 lanes cooperate on loads and dot product.
+        // K/V loads are fully coalesced (adjacent lanes → adjacent addresses).
+        // =====================================================================
+        for (int kv_pos = kv_start + wavefront_id; kv_pos < kv_end; kv_pos += num_wavefronts)
         {
             const float *K_ptr = K_batch + kv_pos * kv_stride + kv_head_offset;
 
-            // Compute Q @ K^T for this position — float4 vectorized
-            float score = 0.0f;
-            if (can_vectorize)
+            // Cooperative dot product: each lane loads its dims of Q and K
+            // Lane i loads Q[i], Q[i+64], ... and K[i], K[i+64], ...
+            // This is fully coalesced — adjacent lanes access adjacent floats
+            float partial_dot = 0.0f;
+            for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
             {
-                const float4 *K_vec = reinterpret_cast<const float4 *>(K_ptr);
-                const float4 *Q_vec = reinterpret_cast<const float4 *>(Q_shared);
-                for (int dv = 0; dv < head_dim_vec4; dv++)
-                {
-                    float4 k4 = K_vec[dv];
-                    float4 q4 = Q_vec[dv];
-                    score += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
-                }
+                partial_dot += Q_shared[d] * K_ptr[d];
             }
-            else
-            {
-                for (int d = 0; d < head_dim; d++)
-                {
-                    score += Q_shared[d] * K_ptr[d];
-                }
-            }
-            score *= softmax_scale;
 
-            // Online softmax update
+            // Reduce across wavefront → full dot product (6 shuffles)
+            // After this, ALL lanes have the same score value
+            float score = wavefrontReduceSum(partial_dot) * softmax_scale;
+
+            // Online softmax — score is uniform across all lanes,
+            // so m_local and l_local stay wavefront-uniform too
             float m_new = fmaxf(m_local, score);
             float scale_old = expf(m_local - m_new);
             float p = expf(score - m_new);
 
             l_local = l_local * scale_old + p;
 
-            // Rescale existing O_local and accumulate V — float4 vectorized
+            // Cooperative V load + O accumulation
+            // Each lane updates only its own output dims (2 for head_dim=128)
             const float *V_ptr = V_batch + kv_pos * kv_stride + kv_head_offset;
-            if (can_vectorize)
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
             {
-                const float4 *V_vec = reinterpret_cast<const float4 *>(V_ptr);
-                float4 *O_vec = reinterpret_cast<float4 *>(O_local);
-                for (int dv = 0; dv < head_dim_vec4; dv++)
-                {
-                    float4 o4 = O_vec[dv];
-                    float4 v4 = V_vec[dv];
-                    o4.x = o4.x * scale_old + p * v4.x;
-                    o4.y = o4.y * scale_old + p * v4.y;
-                    o4.z = o4.z * scale_old + p * v4.z;
-                    o4.w = o4.w * scale_old + p * v4.w;
-                    O_vec[dv] = o4;
-                }
-            }
-            else
-            {
-                for (int d = 0; d < head_dim; d++)
-                {
-                    O_local[d] = O_local[d] * scale_old + p * V_ptr[d];
-                }
+                O_lane[o_idx] = O_lane[o_idx] * scale_old + p * V_ptr[d];
             }
 
             m_local = m_new;
         }
 
         // =====================================================================
-        // Wavefront reduction — reduce ONLY m and l (avoid shuffling 128 O vals)
-        // =====================================================================
-
-        // Save pre-reduction m for local rescaling
-        float my_m_before = m_local;
-        wavefrontReduceML(m_local, l_local);
-
-        // Rescale this thread's O_local to the wavefront-converged m
-        {
-            float rescale = expf(my_m_before - m_local);
-            if (can_vectorize)
-            {
-                float4 *O_vec = reinterpret_cast<float4 *>(O_local);
-                float4 scale4 = make_float4(rescale, rescale, rescale, rescale);
-                for (int dv = 0; dv < head_dim_vec4; dv++)
-                {
-                    float4 o4 = O_vec[dv];
-                    o4.x *= scale4.x;
-                    o4.y *= scale4.y;
-                    o4.z *= scale4.z;
-                    o4.w *= scale4.w;
-                    O_vec[dv] = o4;
-                }
-            }
-            else
-            {
-                for (int d = 0; d < head_dim; d++)
-                    O_local[d] *= rescale;
-            }
-        }
-
-        // Now sum O_local across the wavefront (all at the same m now, just add)
-        for (int d = 0; d < head_dim; d++)
-        {
-            O_local[d] = wavefrontReduceSum(O_local[d]);
-        }
-
-        // =====================================================================
         // Inter-wavefront reduction using LDS
+        //
+        // Each wavefront has:
+        //   - (m_local, l_local) — uniform across its lanes
+        //   - O distributed across lanes (each lane owns 2 dims)
+        //
+        // We merge 4 wavefronts' results, then write the final partial output.
         // =====================================================================
-        const int wavefront_id = tid / WAVEFRONT_SIZE;
-        const int lane_id = tid % WAVEFRONT_SIZE;
-        const int num_wavefronts = num_threads / WAVEFRONT_SIZE;
-
         __shared__ float block_m[4];
         __shared__ float block_l[4];
-        __shared__ float block_O[4 * 128];
+        __shared__ float block_O[4 * 128]; // 4 wavefronts × max head_dim
 
+        // Write this wavefront's results to LDS
         if (lane_id == 0)
         {
             block_m[wavefront_id] = m_local;
             block_l[wavefront_id] = l_local;
         }
-
-        // All lanes of wavefront contribute O to LDS (strided)
-        for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
         {
-            block_O[wavefront_id * head_dim + d] = O_local[d];
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
+            {
+                block_O[wavefront_id * head_dim + d] = O_lane[o_idx];
+            }
         }
         __syncthreads();
 
-        // Final inter-wavefront reduction and output write — parallel across head_dim
+        // Thread 0 computes per-wavefront rescaling factors
+        __shared__ float wf_scales[4];
+        if (tid == 0)
+        {
+            float final_m = block_m[0];
+            float final_l = block_l[0];
+            wf_scales[0] = 1.0f;
+
+            for (int w = 1; w < num_wavefronts; w++)
+            {
+                float other_m = block_m[w];
+                float other_l = block_l[w];
+
+                float m_new = fmaxf(final_m, other_m);
+                float scale_self = expf(final_m - m_new);
+                float scale_other = expf(other_m - m_new);
+
+                for (int prev = 0; prev < w; prev++)
+                    wf_scales[prev] *= scale_self;
+                wf_scales[w] = scale_other;
+
+                final_l = scale_self * final_l + scale_other * other_l;
+                final_m = m_new;
+            }
+
+            m_partial[partial_idx] = final_m;
+            l_partial[partial_idx] = final_l;
+        }
+        __syncthreads(); // All threads hit this — wf_scales now visible
+
+        // Parallel output write — wavefront 0 lanes each handle their output dims
         if (wavefront_id == 0)
         {
-            // Thread 0 computes final m, l and per-wavefront scales
-            __shared__ float wf_scales[4];
-            float final_m, final_l;
-
-            if (lane_id == 0)
-            {
-                final_m = block_m[0];
-                final_l = block_l[0];
-                wf_scales[0] = 1.0f; // Will be updated below
-
-                for (int w = 1; w < num_wavefronts; w++)
-                {
-                    float other_m = block_m[w];
-                    float other_l = block_l[w];
-
-                    float m_new = fmaxf(final_m, other_m);
-                    float scale_self = expf(final_m - m_new);
-                    float scale_other = expf(other_m - m_new);
-
-                    // Update scales for all previous wavefronts
-                    for (int prev = 0; prev < w; prev++)
-                        wf_scales[prev] *= scale_self;
-                    wf_scales[w] = scale_other;
-
-                    final_l = scale_self * final_l + scale_other * other_l;
-                    final_m = m_new;
-                }
-
-                m_partial[partial_idx] = final_m;
-                l_partial[partial_idx] = final_l;
-            }
-            __syncthreads(); // Ensure wf_scales visible to all threads in wavefront 0
-
-            // Parallel output write — each lane handles a subset of head_dim
             float *O_out = O_partial + partial_idx * head_dim;
             for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
             {

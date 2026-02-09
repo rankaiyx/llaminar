@@ -67,10 +67,15 @@
 
 ## Tuning Roadmap
 
-### Phase 1: ROCm Kernel Tuning
-- [ ] **GEMM prefill repack overhead** — VNNI→row-major repack runs PER CK GEMM call (~65-200µs each, ~168 per prefill). Store dual layout on device to eliminate.
-- [x] **Flash Attention decode** — ~~1,116 µs/call avg~~ → **382 µs/call** (2.92x speedup, 40% decode throughput gain)
-- [ ] **GEMM decode** — CK INT8 GEMV tuning, tile sizes, occupancy (300 µs/call avg)
+### Phase 1: ROCm Flash Attention Decode (COMPLETED)
+- [x] **v2: float4 + parallel output** — 1,116 → 382 µs/call (2.92x, +40% decode tok/s)
+- [x] **v3: wavefront-cooperative KV** — 382 → 57.6 µs/call (6.6x, +71% decode tok/s from baseline)
+- [~] **GQA-aware blocks** — deprioritised: attention is now 2.7% of decode (diminishing returns)
+- [~] **Fast exp2 path** — deprioritised: ~2% decode improvement, not worth the complexity
+
+### Phase 2: ROCm GEMM Decode (NEXT — 89% of decode time)
+- [ ] **GEMM decode** — CK INT8 GEMV tuning, tile sizes, occupancy (303.5 µs/call avg, 10,954 ms total)
+- [ ] **GEMM prefill repack overhead** — VNNI→row-major repack runs PER CK GEMM call (~65-200µs each)
 - [ ] Ops kernels (RMS Norm, RoPE, SwiGLU) — low priority, <3% of time
 
 ### Phase 2: CUDA Kernel Tuning  
@@ -125,6 +130,44 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 ---
 
 ## Tuning Log
+
+### Entry 3: Flash Attention Decode v3 — Wavefront-Cooperative (2026-02-09)
+
+**Target**: `flash_decoding_mi50_kernel` in `ROCmFlashAttentionKernels.hip`
+
+**Architecture change**: Complete repartitioning — lanes own output dims, not KV positions.
+
+**Changes**:
+1. **Wavefront-cooperative KV processing** — each wavefront cooperates on one KV position at a time (all 64 lanes load contiguous K/V elements). Was: each thread independently loaded from separate KV positions (uncoalesced)
+2. **Lanes own output dims** — each lane holds only 2 floats of O (for head_dim=128), down from 128 floats per thread. Drops VGPR usage from ~140 to ~15
+3. **Zero O reduction within wavefront** — since all lanes process the same KV positions cooperatively, no cross-lane O shuffling is needed. Was: 128 × wavefrontReduceSum = 768 `__shfl_xor` per lane
+4. **Dot product via wavefront reduce** — only 6 shuffles per KV position (one `wavefrontReduceSum` for the partial dot)
+5. **Coalesced memory access** — adjacent lanes load adjacent floats from K and V. Perfect coalescing vs the old strided-KV-position pattern
+6. **`__launch_bounds__(256, 4)`** — higher occupancy hint (was 2) since register pressure dropped dramatically
+7. **Correct `__syncthreads` placement** — barriers moved outside `if` blocks (old v2 had UB with sync inside `if (wavefront_id == 0)`)
+
+**Results**:
+
+| Metric | Baseline (v1) | v2 | v3 | v1→v3 |
+|---|---|---|---|---|
+| **Decode throughput** | 14.2 tok/s | 19.86 tok/s | **~24.3 tok/s** | **+71%** |
+| **Flash Attn Decode total** | 12,003 ms | 4,107 ms | **619 ms** | **-94.8%** |
+| **Flash Attn Decode avg** | 1,116 µs | 382 µs | **57.6 µs** | **19.4x** |
+| **Flash Attn % of decode** | 51% | 15% | **2.7%** | Eliminated as bottleneck |
+| **Decode wall-clock** | ~9,014 ms | ~6,446 ms | **~5,273 ms** | **-41.5%** |
+
+**Post-v3 decode breakdown**:
+
+| Kernel | Time (ms) | % of decode |
+|---|---|---|
+| GEMM_CK | 10,954 | 89% |
+| Flash Attn Decode | 619 | 5% |
+| RMS Norm | 412 | 3% |
+| Residual Add | 158 | 1% |
+| RoPE | 124 | 1% |
+| SwiGLU | 80 | <1% |
+
+**Conclusion**: Flash attention is no longer a meaningful optimisation target. GEMM is 89% of decode. Further attention work (GQA-aware blocks, exp2f) deprioritised — combined they'd yield <6% decode improvement.
 
 ### Entry 2: Flash Attention Decode Optimisation — ROCm (2026-02-09)
 
