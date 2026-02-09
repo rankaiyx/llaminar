@@ -70,8 +70,8 @@
 ### Phase 1: ROCm Flash Attention Decode (COMPLETED)
 - [x] **v2: float4 + parallel output** — 1,116 → 382 µs/call (2.92x, +40% decode tok/s)
 - [x] **v3: wavefront-cooperative KV** — 382 → 57.6 µs/call (6.6x, +71% decode tok/s from baseline)
-- [~] **GQA-aware blocks** — deprioritised: attention is now 2.7% of decode (diminishing returns)
-- [~] **Fast exp2 path** — deprioritised: ~2% decode improvement, not worth the complexity
+- [x] **exp2f hardware intrinsic** — 57.6 → 56.2 µs/call (2.4% kernel improvement, negligible end-to-end)
+- [x] **GQA-aware blocks** — ATTEMPTED & REVERTED: 5.1× regression due to CU starvation (32 vs 224 blocks on 60 CUs)
 
 ### Phase 2: ROCm GEMM Decode (NEXT — 89% of decode time)
 - [ ] **GEMM decode** — CK INT8 GEMV tuning, tile sizes, occupancy (303.5 µs/call avg, 10,954 ms total)
@@ -130,6 +130,50 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 ---
 
 ## Tuning Log
+
+### Entry 5: exp2f Hardware Intrinsic (2026-02-09)
+
+**Target**: `flash_decoding_mi50_kernel` in `ROCmFlashAttentionKernels.hip`
+
+**Changes**:
+1. **`fast_expf()` inline helper** — `exp2f(x * 1.4426950408889634f)` replaces all `expf()` calls
+2. On GCN ISA, `exp2f` maps to `v_exp_f32` (single-cycle transcendental ALU instruction), vs `expf` which requires a multi-step polynomial (~50+ cycles)
+3. Applied to: main loop softmax (2 calls/KV pos), inter-wavefront reduction (2 calls/wavefront pair)
+4. Accuracy: ~2 ULP vs ~1 ULP for `expf`, acceptable for attention softmax
+
+**Results**:
+
+| Metric | v3 (expf) | v3+exp2f | Change |
+|---|---|---|---|
+| **Flash Attn Decode avg** | 57.6 µs | **56.2 µs** | **-2.4%** |
+| **Flash Attn Decode total** | 619 ms | **604 ms** | -15 ms |
+| **Decode throughput** | ~24.3 tok/s | ~24.3 tok/s | within noise |
+
+**Conclusion**: Measurable 2.4% per-call improvement to the kernel. End-to-end impact negligible since flash attention is only ~2% of decode time. Kept as a zero-risk improvement.
+
+### Entry 4: GQA-Aware Blocks — ATTEMPTED & REVERTED (2026-02-09)
+
+**Target**: `flash_decoding_mi50_kernel` in `ROCmFlashAttentionKernels.hip`
+
+**Architecture change**: Grid indexed by KV heads instead of Q heads. Each block processes all 7 Q heads that share a KV head, loading K/V once.
+
+**Changes attempted**:
+1. Grid changed from `(n_heads=28, num_splits=8, batch=1)` = 224 blocks to `(n_kv_heads=4, num_splits=8, batch=1)` = 32 blocks
+2. All 7 Q vectors loaded into shared memory (3.5KB vs 512B)
+3. K/V cached in lane-local registers, reused across 7 Q heads
+4. 7× wavefrontReduceSum per KV position (dot product for each Q head)
+5. Inter-wavefront reduction processed one Q head at a time (3 syncs × 7 heads)
+
+**Results**: **5.1× regression — REVERTED**
+
+| Metric | v3 | GQA (reverted) | Change |
+|---|---|---|---|
+| **Flash Attn Decode avg** | 57.6 µs | **296.1 µs** | **5.1× slower** |
+| **Decode throughput** | ~24.3 tok/s | **20.29 tok/s** | **-16.5%** |
+
+**Root cause**: CU starvation. MI50 has 60 CUs. With 32 blocks, only 53% of CUs are active (vs 224/60 = 3.7 blocks/CU in v3). The 7× K/V bandwidth savings cannot compensate for the massive parallelism loss. Additionally, `FD_MAX_GQA_RATIO=16` array sizes (64+16+16 = 96 VGPRs for arrays alone) likely caused register spilling, further degrading performance.
+
+**Lesson**: For short kernels on wide GPUs (60 CUs), grid occupancy dominates bandwidth savings. GQA-aware blocking only wins when: (a) the kernel is bandwidth-bound AND (b) there are enough blocks to fill the GPU. With 4 KV heads × 8 splits = 32 blocks, MI50 is fundamentally under-utilised. Would need num_splits ≈ 56 to maintain 224 blocks, but at kv_len=600 that's only ~11 KV positions per split — too small for efficient wavefront-cooperative processing.
 
 ### Entry 3: Flash Attention Decode v3 — Wavefront-Cooperative (2026-02-09)
 

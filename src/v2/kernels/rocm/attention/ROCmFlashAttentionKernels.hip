@@ -608,11 +608,21 @@ namespace
     //     - Only 6 shuffles per KV position (dot product reduce)
     //     - v2 had 128 × wavefrontReduceSum = 768 shuffles TOTAL for O
     //
+    //   v3+ optimization: exp2f hardware intrinsic
+    //     - All expf() replaced with exp2f(x * LOG2E) for single-cycle v_exp_f32
+    //     - GCN ISA: v_exp_f32 is a transcendental ALU op (~4 cycles vs ~50+ for expf)
+    //
     // =========================================================================
+
+    // exp2f(x * LOG2E) maps to hardware v_exp_f32 on GCN (single-cycle transcendental)
+    __device__ __forceinline__ float fast_expf(float x)
+    {
+        return exp2f(x * 1.4426950408889634f); // log2(e) = 1/ln(2)
+    }
 
     /**
      * @brief Flash Decoding kernel for single-query decode on MI50
-     *        v3: wavefront-cooperative KV processing
+     *        v3: wavefront-cooperative KV processing + exp2f intrinsic
      */
     __global__ __launch_bounds__(256, 4)
     void flash_decoding_mi50_kernel(
@@ -720,9 +730,10 @@ namespace
 
             // Online softmax — score is uniform across all lanes,
             // so m_local and l_local stay wavefront-uniform too
+            // Uses fast_expf (exp2f hardware intrinsic) for ~10x faster exp
             float m_new = fmaxf(m_local, score);
-            float scale_old = expf(m_local - m_new);
-            float p = expf(score - m_new);
+            float scale_old = fast_expf(m_local - m_new);
+            float p = fast_expf(score - m_new);
 
             l_local = l_local * scale_old + p;
 
@@ -780,8 +791,8 @@ namespace
                 float other_l = block_l[w];
 
                 float m_new = fmaxf(final_m, other_m);
-                float scale_self = expf(final_m - m_new);
-                float scale_other = expf(other_m - m_new);
+                float scale_self = fast_expf(final_m - m_new);
+                float scale_other = fast_expf(other_m - m_new);
 
                 for (int prev = 0; prev < w; prev++)
                     wf_scales[prev] *= scale_self;
