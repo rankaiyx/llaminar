@@ -73,10 +73,14 @@
 - [x] **exp2f hardware intrinsic** — 57.6 → 56.2 µs/call (2.4% kernel improvement, negligible end-to-end)
 - [x] **GQA-aware blocks** — ATTEMPTED & REVERTED: 5.1× regression due to CU starvation (32 vs 224 blocks on 60 CUs)
 
-### Phase 2: ROCm GEMM Decode (NEXT — 89% of decode time)
-- [ ] **GEMM decode** — CK INT8 GEMV tuning, tile sizes, occupancy (303.5 µs/call avg, 10,954 ms total)
+### Phase 2: ROCm GEMM Decode (IN PROGRESS — 89% of decode time)
+- [x] **Fused FP32×INT8 GEMV** — ATTEMPTED & REVERTED: 9.8% regression due to gfx906 float atomicAdd CAS loop + no v_dot4 in FP32 path
+- [x] **v_dot4_i32_i8 intrinsic** — 303 → 286 µs/call avg (-5.6%), decode 30.31 → 32.10 tok/s (+5.9%)
+- [ ] **GEMV tile/occupancy tuning** — tune kb K-parallelism, CPT, TILE_N per shape
+- [ ] **Multi-projection GEMV** — batch Q+K+V in one kernel launch to reduce launch overhead
 - [ ] **GEMM prefill repack overhead** — VNNI→row-major repack runs PER CK GEMM call (~65-200µs each)
-- [ ] Ops kernels (RMS Norm, RoPE, SwiGLU) — low priority, <3% of time
+- [x] **Assembly sweep (rsqrtf, rintf)** — RMS Norm rsqrtf + Quantize rintf, +0.6% decode (32.10→32.30 tok/s)
+- [ ] Ops kernels (RoPE, SwiGLU) — low priority, <2% of time
 
 ### Phase 2: CUDA Kernel Tuning  
 - [ ] CUTLASS GEMM tile configuration
@@ -130,6 +134,133 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 ---
 
 ## Tuning Log
+
+### Entry 8: Assembly Sweep — rsqrtf + rintf Intrinsics (2026-02-10)
+
+**Target**: All 9 ROCm HIP kernel files, compiled to assembly for systematic analysis
+
+**Approach**: Compiled every `.hip` kernel to GCN assembly (`-S -O3 --offload-arch=gfx906`) and searched for suboptimal instruction patterns where the compiler failed to use available hardware instructions.
+
+**Files analyzed**:
+| File | Assembly Size | Status |
+|---|---|---|
+| ROCmGemvKernel.hip | 2.4K lines | Already optimized (Entry 7) |
+| ROCmQuantisedGemmKernel_CK.hip | 60K lines | **FIX: rintf** |
+| ROCmRMSNormKernels.hip | 1.2K lines | **FIX: rsqrtf** |
+| ROCmSwiGLUKernels.hip | 800 lines | Clean — v_exp_f32 used |
+| ROCmFlashAttentionKernels.hip | 3K lines | Clean — v_exp_f32 used |
+| ROCmRoPEKernels.hip | 12K lines | Low priority — sin/cos in loading phase |
+| ROCmResidualAddKernels.hip | 300 lines | Trivial — no opportunities |
+| ROCmEmbeddingKernels.hip | 400 lines | Clean — v_rcp_f32 expected |
+
+**Finding 1: RMS Norm `sqrtf()` + `1/rms` → `rsqrtf()`**
+
+Three RMS Norm kernels (FP32, BF16, FP16) computed `float rms = sqrtf(x); float inv_rms = 1.0f / rms;` which compiled to:
+- `v_sqrt_f32` (25 cycles) + `v_rcp_f32` (4 cycles + Newton-Raphson refinement) = ~35 cycles
+
+Replaced with `float inv_rms = rsqrtf(x)` → single `v_rsq_f32` (4 cycles). Assembly verified: `v_sqrt: 3→0`, `v_rsq: 0→3`, `v_rcp: 6→3`.
+
+Applied to both ROCm (3 kernels) and CUDA (3 kernels, maps to MUFU.RSQ).
+
+**Finding 2: Quantize `roundf()` → `rintf()`**
+
+The Q8 activation quantize kernel used `roundf(scaled)` which decomposed into 6 scalar instructions:
+```
+v_trunc_f32    ; truncate to integer
+v_sub_f32      ; compute fraction = x - trunc(x)
+v_cmp_ge_f32   ; compare |fraction| >= 0.5
+v_cndmask_b32  ; select rounding direction
+v_bfi_b32      ; copy sign bit
+v_add_f32      ; add rounding correction
+```
+
+Replaced with `rintf(scaled)` → single `v_rndne_f32` (1 cycle). Loop body reduced from 8 to 4 compute instructions.
+
+For INT8 quantization, the difference between round-half-away-from-zero (`roundf`) and round-to-nearest-even (`rintf`) affects only exact x.5 tie points — negligible quality impact. CUDA quantize already used `rintf`.
+
+**Finding 3: Flash Attention `1/sqrtf(head_dim)` — NOT applicable**
+
+Identified `1.0f / sqrtf(head_dim)` in flash attention, but this is in **host-side** launch functions (computed once per kernel launch, not per-thread). `rsqrtf()` is not available in HIP host compilation. No performance impact since this runs once on CPU.
+
+**Results**:
+
+| Metric | Baseline (v_dot4) | Assembly Sweep | Change |
+|---|---|---|---|
+| **Decode (non-profiled)** | 32.10 tok/s | **32.30 tok/s** | **+0.6%** |
+| **GEMM_CK decode avg** | 286 µs | **285.3 µs** | -0.2% (noise) |
+| **RMS Norm decode total** | ~425 ms | **413 ms** | **-2.8%** |
+| **Parity** | ✓ | ✓ | Identical output |
+
+**Conclusion**: Small but correct improvements. RMS Norm and Quantize are <4% of decode time combined, so even significant per-kernel speedups translate to minimal end-to-end gains. The sweep confirmed that the compiler is already doing a good job on the hot-path kernels (GEMV, SwiGLU, Flash Attention). No further assembly-level intrinsic opportunities remain in the current kernel set.
+
+### Entry 7: v_dot4_i32_i8 Hardware Intrinsic for GEMV (2026-02-10)
+
+**Target**: All 5 GEMV kernel variants in `ROCmGemvKernel.hip`
+
+**Discovery**: `llvm-objdump` confirmed **zero** `v_dot4_i32_i8` instructions in the entire binary. The compiler was generating individual `v_mul_i32_i24` (24-bit multiply) instructions (~7 cycles per 4-element dot product) instead of using the gfx906 hardware `v_dot4_i32_i8` instruction (1 cycle for 4 multiply-adds).
+
+**Root cause**: The compiler doesn't auto-generate `v_dot4_i32_i8` from manual INT8 unpack + multiply-add C++ code. The code was:
+```cpp
+const int32_t a0 = static_cast<int32_t>(d_A_int8[k_base + 0]);
+// ... 4 individual byte loads, manual unpacking, 8 multiplies + adds
+acc += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+```
+
+**Fix**: Replace with `__builtin_amdgcn_sdot4` intrinsic in all 5 GEMV kernels:
+```cpp
+const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+const int32_t b_packed = *reinterpret_cast<const int32_t*>(d_B_int8_vnni + ...);
+acc = __builtin_amdgcn_sdot4(a_packed, b_packed, acc, false);
+```
+
+**Kernels modified**: `gemv_int8_int8_vnni_kernel` (scalar), `wide_vec4`, `wide2`, `square`, `grid_kpar_t` — all use the same packed dot-product pattern now.
+
+**Verification**: Compiled assembly confirms 16 `v_dot4_i32_i8` instructions (was 0).
+
+**Results**:
+
+| Metric | Baseline | v_dot4 | Change |
+|---|---|---|---|
+| **Decode (non-profiled)** | 30.31 tok/s | **32.10 tok/s** | **+5.9%** |
+| **Decode (profiled)** | 24.29 tok/s | **25.55 tok/s** | **+5.2%** |
+| **GEMM_CK avg** | 303 µs | **286 µs** | **-5.6%** |
+| **GEMM_CK decode total (3 runs)** | ~10,944 ms | **10,224 ms** | **-6.6%** |
+| **Parity** | ✓ | ✓ | Identical output |
+
+**Post-v_dot4 decode breakdown** (profiled):
+
+| Kernel | Time (ms, 3 runs) | % of decode |
+|---|---|---|
+| GEMM_CK | 10,224 | 88% |
+| Flash Attn Decode | 605 | 5% |
+| RMS Norm | 425 | 3% |
+| Residual Add | 165 | 1% |
+| RoPE | 128 | 1% |
+
+**Conclusion**: Clean 5-6% decode improvement with zero risk — same math, same data types, same output. The hardware INT8 dot product instruction was available on gfx906 but the compiler never auto-vectorized to use it. Explicit intrinsic forces the optimal instruction.
+
+### Entry 6: Fused FP32×INT8→FP32 GEMV — ATTEMPTED & REVERTED (2026-02-10)
+
+**Target**: `ROCmGemvKernel.hip` + `ROCmQuantisedGemmKernel.cpp`
+
+**Hypothesis**: Eliminating the 3-kernel quantize→GEMV→scale pipeline into a single fused kernel would save ~308 kernel launches per decode step and remove intermediate INT8/INT32 buffers from the memory path.
+
+**Implementation**: Two new kernels (`gemv_fp32xi8_fused_kpar_vnni_kernel_t`, `gemv_fp32xi8_fused_wide2_vnni_kernel`) + dispatch wrapper + wired into all 3 M=1 decode paths.
+
+**Results**: **9.8% regression — REVERTED**
+
+| Metric | Baseline | Fused (reverted) | Change |
+|---|---|---|---|
+| **Decode (non-profiled)** | 30.31 tok/s | **27.35 tok/s** | **-9.8%** |
+| **Decode (profiled)** | 24.29 tok/s | **22.44 tok/s** | **-7.6%** |
+| **Parity** | ✓ | ✓ | Correct output |
+
+**Root cause analysis**:
+1. **gfx906 lacks native `global_atomic_add_f32`** — float `atomicAdd` uses a CAS loop, catastrophically slow with 56-way K-block contention per output element. The INT32 path uses native `atomicAdd` which is 10-50× faster.
+2. **FP32×INT8 cannot use `v_dot4_i32_i8`** — needs individual int8→float conversions + FP32 FMA (~12 cycles) vs INT8×INT8 manual multiply-add (~7 cycles) or `v_dot4_i32_i8` (1 cycle).
+3. **4× larger activation loads** — FP32 activations are 14KB vs 3.6KB INT8 for K=3584, causing L1 cache pressure.
+
+**Lesson**: On gfx906, the separate quantize+INT8_GEMV+scale pipeline is optimal because: (a) INT32 atomicAdd is native, (b) INT8×INT8 can use v_dot4, (c) INT8 activations are 4× smaller. The quantize+scale kernel overhead (~2-3% of GEMM time) is much less than the compute regression from FP32 operations.
 
 ### Entry 5: exp2f Hardware Intrinsic (2026-02-09)
 

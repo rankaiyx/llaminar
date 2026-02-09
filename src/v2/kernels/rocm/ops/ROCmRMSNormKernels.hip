@@ -99,9 +99,10 @@ __global__ void rocm_rmsnorm_fp32_kernel(
         __syncthreads();
     }
 
-    // Compute RMS scale factor
-    float rms = sqrtf(sdata[0] / cols + epsilon);
-    float inv_rms = 1.0f / rms;
+    // Compute inverse RMS scale factor
+    // rsqrtf() maps to v_rsq_f32 (4 cycles) instead of
+    // v_sqrt_f32 (25 cycles) + v_rcp_f32 (4 cycles + Newton-Raphson)
+    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
 
     // Step 2: Normalize and scale by gamma
     for (int i = tid; i < cols; i += stride)
@@ -149,9 +150,8 @@ __global__ void rocm_rmsnorm_bf16_kernel(
         __syncthreads();
     }
 
-    // Compute RMS scale factor
-    float rms = sqrtf(sdata[0] / cols + epsilon);
-    float inv_rms = 1.0f / rms;
+    // Compute inverse RMS scale factor (rsqrtf → v_rsq_f32, 4 cycles)
+    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
 
     // Step 2: Normalize and scale by gamma, convert back to BF16
     for (int i = tid; i < cols; i += stride)
@@ -201,9 +201,8 @@ __global__ void rocm_rmsnorm_fp16_kernel(
         __syncthreads();
     }
 
-    // Compute RMS scale factor
-    float rms = sqrtf(sdata[0] / cols + epsilon);
-    float inv_rms = 1.0f / rms;
+    // Compute inverse RMS scale factor (rsqrtf → v_rsq_f32, 4 cycles)
+    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
 
     // Step 2: Normalize and scale by gamma, convert back to FP16
     for (int i = tid; i < cols; i += stride)

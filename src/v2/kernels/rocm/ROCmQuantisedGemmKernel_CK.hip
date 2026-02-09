@@ -776,8 +776,11 @@ __global__ void quantizeActivationsQ8_kernel(
         float val = row_ptr[k];
         float scaled = val * inv_scale;
 
-        // Round to nearest, clamp to [-127, 127]
-        int q = static_cast<int>(roundf(scaled));
+        // rintf() maps to v_rndne_f32 (1 instruction) instead of
+        // roundf() which decomposes to trunc+sub+cmp+cndmask+bfi+add (6 instructions).
+        // For int8 quantization, round-to-nearest-even vs round-half-away-from-zero
+        // has negligible quality impact (differs only at exact x.5 tie points).
+        int q = static_cast<int>(rintf(scaled));
         q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
 
         out_row[k] = static_cast<int8_t>(q);

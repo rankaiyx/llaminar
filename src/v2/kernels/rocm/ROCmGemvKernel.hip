@@ -83,23 +83,14 @@ __global__ void gemv_int8_int8_vnni_kernel(
     const int k_groups = K / 4;
     for (int kg = 0; kg < k_groups; ++kg)
     {
-        const int k_base = kg * 4;
-        const int32_t a0 = static_cast<int32_t>(d_A_int8[k_base + 0]);
-        const int32_t a1 = static_cast<int32_t>(d_A_int8[k_base + 1]);
-        const int32_t a2 = static_cast<int32_t>(d_A_int8[k_base + 2]);
-        const int32_t a3 = static_cast<int32_t>(d_A_int8[k_base + 3]);
+        // Load 4 INT8 activations as packed int32 for v_dot4_i32_i8
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
 
-        const uint32_t packed = *reinterpret_cast<const uint32_t*>(
+        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + n) * 4);
-        const int8_t b0 = static_cast<int8_t>(packed & 0xFF);
-        const int8_t b1 = static_cast<int8_t>((packed >> 8) & 0xFF);
-        const int8_t b2 = static_cast<int8_t>((packed >> 16) & 0xFF);
-        const int8_t b3 = static_cast<int8_t>((packed >> 24) & 0xFF);
 
-        acc += a0 * static_cast<int32_t>(b0)
-             + a1 * static_cast<int32_t>(b1)
-             + a2 * static_cast<int32_t>(b2)
-             + a3 * static_cast<int32_t>(b3);
+        // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
+        acc = __builtin_amdgcn_sdot4(a_packed, b_packed, acc, false);
     }
 
     d_C_int32[n] = acc;
@@ -121,49 +112,24 @@ __global__ void gemv_int8_int8_wide_vec4_vnni_kernel(
     const int k_groups = K / 4;
     for (int kg = 0; kg < k_groups; ++kg)
     {
-        const int k_base = kg * 4;
-        const int32_t a0 = static_cast<int32_t>(d_A_int8[k_base + 0]);
-        const int32_t a1 = static_cast<int32_t>(d_A_int8[k_base + 1]);
-        const int32_t a2 = static_cast<int32_t>(d_A_int8[k_base + 2]);
-        const int32_t a3 = static_cast<int32_t>(d_A_int8[k_base + 3]);
+        // Load 4 INT8 activations as packed int32 for v_dot4_i32_i8
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
 
-        const uint32_t p0 = *reinterpret_cast<const uint32_t*>(
+        // Load 4 INT8 weights for each of 4 columns (VNNI = already packed)
+        const int32_t p0 = *reinterpret_cast<const int32_t*>(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 0)) * 4);
-        const uint32_t p1 = *reinterpret_cast<const uint32_t*>(
+        const int32_t p1 = *reinterpret_cast<const int32_t*>(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 1)) * 4);
-        const uint32_t p2 = *reinterpret_cast<const uint32_t*>(
+        const int32_t p2 = *reinterpret_cast<const int32_t*>(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 2)) * 4);
-        const uint32_t p3 = *reinterpret_cast<const uint32_t*>(
+        const int32_t p3 = *reinterpret_cast<const int32_t*>(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 3)) * 4);
 
-        const int8_t b00 = static_cast<int8_t>(p0 & 0xFF);
-        const int8_t b01 = static_cast<int8_t>((p0 >> 8) & 0xFF);
-        const int8_t b02 = static_cast<int8_t>((p0 >> 16) & 0xFF);
-        const int8_t b03 = static_cast<int8_t>((p0 >> 24) & 0xFF);
-
-        const int8_t b10 = static_cast<int8_t>(p1 & 0xFF);
-        const int8_t b11 = static_cast<int8_t>((p1 >> 8) & 0xFF);
-        const int8_t b12 = static_cast<int8_t>((p1 >> 16) & 0xFF);
-        const int8_t b13 = static_cast<int8_t>((p1 >> 24) & 0xFF);
-
-        const int8_t b20 = static_cast<int8_t>(p2 & 0xFF);
-        const int8_t b21 = static_cast<int8_t>((p2 >> 8) & 0xFF);
-        const int8_t b22 = static_cast<int8_t>((p2 >> 16) & 0xFF);
-        const int8_t b23 = static_cast<int8_t>((p2 >> 24) & 0xFF);
-
-        const int8_t b30 = static_cast<int8_t>(p3 & 0xFF);
-        const int8_t b31 = static_cast<int8_t>((p3 >> 8) & 0xFF);
-        const int8_t b32 = static_cast<int8_t>((p3 >> 16) & 0xFF);
-        const int8_t b33 = static_cast<int8_t>((p3 >> 24) & 0xFF);
-
-        acc.x += a0 * static_cast<int32_t>(b00) + a1 * static_cast<int32_t>(b01)
-               + a2 * static_cast<int32_t>(b02) + a3 * static_cast<int32_t>(b03);
-        acc.y += a0 * static_cast<int32_t>(b10) + a1 * static_cast<int32_t>(b11)
-               + a2 * static_cast<int32_t>(b12) + a3 * static_cast<int32_t>(b13);
-        acc.z += a0 * static_cast<int32_t>(b20) + a1 * static_cast<int32_t>(b21)
-               + a2 * static_cast<int32_t>(b22) + a3 * static_cast<int32_t>(b23);
-        acc.w += a0 * static_cast<int32_t>(b30) + a1 * static_cast<int32_t>(b31)
-               + a2 * static_cast<int32_t>(b32) + a3 * static_cast<int32_t>(b33);
+        // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
+        acc.x = __builtin_amdgcn_sdot4(a_packed, p0, acc.x, false);
+        acc.y = __builtin_amdgcn_sdot4(a_packed, p1, acc.y, false);
+        acc.z = __builtin_amdgcn_sdot4(a_packed, p2, acc.z, false);
+        acc.w = __builtin_amdgcn_sdot4(a_packed, p3, acc.w, false);
     }
 
     d_C_int32[n4 + 0] = acc.x;
@@ -188,31 +154,18 @@ __global__ void gemv_int8_int8_wide2_vnni_kernel(
     const int k_groups = K / 4;
     for (int kg = 0; kg < k_groups; ++kg)
     {
-        const int k_base = kg * 4;
-        const int32_t a0 = static_cast<int32_t>(d_A_int8[k_base + 0]);
-        const int32_t a1 = static_cast<int32_t>(d_A_int8[k_base + 1]);
-        const int32_t a2 = static_cast<int32_t>(d_A_int8[k_base + 2]);
-        const int32_t a3 = static_cast<int32_t>(d_A_int8[k_base + 3]);
+        // Load 4 INT8 activations as packed int32 for v_dot4_i32_i8
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
 
-        const uint32_t p0 = *reinterpret_cast<const uint32_t*>(
+        // Load 4 INT8 weights for each of 2 columns (VNNI = already packed)
+        const int32_t p0 = *reinterpret_cast<const int32_t*>(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n2 + 0)) * 4);
-        const uint32_t p1 = *reinterpret_cast<const uint32_t*>(
+        const int32_t p1 = *reinterpret_cast<const int32_t*>(
             d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n2 + 1)) * 4);
 
-        const int8_t b00 = static_cast<int8_t>(p0 & 0xFF);
-        const int8_t b01 = static_cast<int8_t>((p0 >> 8) & 0xFF);
-        const int8_t b02 = static_cast<int8_t>((p0 >> 16) & 0xFF);
-        const int8_t b03 = static_cast<int8_t>((p0 >> 24) & 0xFF);
-
-        const int8_t b10 = static_cast<int8_t>(p1 & 0xFF);
-        const int8_t b11 = static_cast<int8_t>((p1 >> 8) & 0xFF);
-        const int8_t b12 = static_cast<int8_t>((p1 >> 16) & 0xFF);
-        const int8_t b13 = static_cast<int8_t>((p1 >> 24) & 0xFF);
-
-        acc0 += a0 * static_cast<int32_t>(b00) + a1 * static_cast<int32_t>(b01)
-              + a2 * static_cast<int32_t>(b02) + a3 * static_cast<int32_t>(b03);
-        acc1 += a0 * static_cast<int32_t>(b10) + a1 * static_cast<int32_t>(b11)
-              + a2 * static_cast<int32_t>(b12) + a3 * static_cast<int32_t>(b13);
+        // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
+        acc0 = __builtin_amdgcn_sdot4(a_packed, p0, acc0, false);
+        acc1 = __builtin_amdgcn_sdot4(a_packed, p1, acc1, false);
     }
 
     d_C_int32[n2 + 0] = acc0;
@@ -246,24 +199,15 @@ __global__ void gemv_int8_int8_square_vnni_kernel(
         const int k_group_base = k_base / 4;
         for (int kg = 0; kg < tile_groups; ++kg)
         {
-            const int k_local = kg * 4;
-            const int32_t a0 = static_cast<int32_t>(sA[k_local + 0]);
-            const int32_t a1 = static_cast<int32_t>(sA[k_local + 1]);
-            const int32_t a2 = static_cast<int32_t>(sA[k_local + 2]);
-            const int32_t a3 = static_cast<int32_t>(sA[k_local + 3]);
+            // Load 4 INT8 activations from shared memory as packed int32
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + kg * 4);
 
             const int global_kg = k_group_base + kg;
-            const uint32_t packed = *reinterpret_cast<const uint32_t*>(
+            const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                 d_B_int8_vnni + (static_cast<size_t>(global_kg) * N + n) * 4);
-            const int8_t b0 = static_cast<int8_t>(packed & 0xFF);
-            const int8_t b1 = static_cast<int8_t>((packed >> 8) & 0xFF);
-            const int8_t b2 = static_cast<int8_t>((packed >> 16) & 0xFF);
-            const int8_t b3 = static_cast<int8_t>((packed >> 24) & 0xFF);
 
-            acc += a0 * static_cast<int32_t>(b0)
-                 + a1 * static_cast<int32_t>(b1)
-                 + a2 * static_cast<int32_t>(b2)
-                 + a3 * static_cast<int32_t>(b3);
+            // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
+            acc = __builtin_amdgcn_sdot4(a_packed, b_packed, acc, false);
         }
         __syncthreads();
     }
@@ -315,26 +259,18 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_kernel_t(
 
         for (int kg = kg_start; kg < kg_end; ++kg)
         {
-            const int kb = kg * 4;
-            const int32_t a0 = static_cast<int32_t>(d_A_int8[kb + 0]);
-            const int32_t a1 = static_cast<int32_t>(d_A_int8[kb + 1]);
-            const int32_t a2 = static_cast<int32_t>(d_A_int8[kb + 2]);
-            const int32_t a3 = static_cast<int32_t>(d_A_int8[kb + 3]);
+            // Load 4 INT8 activations as packed int32 for v_dot4_i32_i8
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
 
             #pragma unroll
             for (int c = 0; c < CPT; ++c)
             {
-                const uint32_t packed = *reinterpret_cast<const uint32_t*>(
+                // Load 4 INT8 weights as packed int32 (VNNI layout = already packed)
+                const int32_t b_packed = *reinterpret_cast<const int32_t*>(
                     d_B_int8_vnni + (static_cast<size_t>(kg) * N + n_base + c) * 4);
-                const int8_t b0 = static_cast<int8_t>(packed & 0xFF);
-                const int8_t b1 = static_cast<int8_t>((packed >> 8) & 0xFF);
-                const int8_t b2 = static_cast<int8_t>((packed >> 16) & 0xFF);
-                const int8_t b3 = static_cast<int8_t>((packed >> 24) & 0xFF);
 
-                acc[c] += a0 * static_cast<int32_t>(b0)
-                        + a1 * static_cast<int32_t>(b1)
-                        + a2 * static_cast<int32_t>(b2)
-                        + a3 * static_cast<int32_t>(b3);
+                // Hardware INT8 dot product: 4 multiply-adds in 1 cycle (v_dot4_i32_i8)
+                acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
             }
         }
 
@@ -407,7 +343,7 @@ bool rocmGemv_int8_int8_int32_vnni(
         const int grid_n = (N + TN - 1) / TN;
         const int kb = max(2, min(64, (K + 63) / 64));
 
-        hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));
+        hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));  // NOLINT(clang-diagnostic-unused-result)
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_vnni_kernel_t<TN, CPT>),
             dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),

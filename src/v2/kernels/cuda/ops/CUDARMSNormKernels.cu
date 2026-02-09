@@ -59,9 +59,10 @@ __global__ void rmsnorm_fp32_kernel(
         __syncthreads();
     }
 
-    // Compute RMS scale factor
-    float rms = sqrtf(sdata[0] / cols + epsilon);
-    float inv_rms = 1.0f / rms;
+    // Compute inverse RMS scale factor
+    // rsqrtf() maps to MUFU.RSQ (single instruction) instead of
+    // sqrtf() (MUFU.SQRT) + rcp (MUFU.RCP)
+    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
 
     // Step 2: Normalize and scale by gamma
     for (int i = tid; i < cols; i += stride)
@@ -109,8 +110,7 @@ __global__ void rmsnorm_bf16_kernel(
         __syncthreads();
     }
 
-    float rms = sqrtf(sdata[0] / cols + epsilon);
-    float inv_rms = 1.0f / rms;
+    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
 
     // Step 2: Normalize, scale, and convert back to BF16
     for (int i = tid; i < cols; i += stride)
@@ -160,8 +160,7 @@ __global__ void rmsnorm_fp16_kernel(
         __syncthreads();
     }
 
-    float rms = sqrtf(sdata[0] / cols + epsilon);
-    float inv_rms = 1.0f / rms;
+    float inv_rms = rsqrtf(sdata[0] / cols + epsilon);
 
     // Step 2: Normalize, scale, and convert back to FP16
     for (int i = tid; i < cols; i += stride)
