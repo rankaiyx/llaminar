@@ -19,9 +19,9 @@
 // Forward declarations for CUDA kernels
 extern "C"
 {
-    bool cudaOps_residual_add_fp32(const float *input, const float *residual, float *output, int size, int device_idx);
-    bool cudaOps_residual_add_bf16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx);
-    bool cudaOps_residual_add_fp16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx);
+    bool cudaOps_residual_add_fp32(const float *input, const float *residual, float *output, int size, int device_idx, void *stream);
+    bool cudaOps_residual_add_bf16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx, void *stream);
+    bool cudaOps_residual_add_fp16(const uint16_t *input, const uint16_t *residual, uint16_t *output, int size, int device_idx, void *stream);
 }
 
 namespace llaminar2::cuda
@@ -66,6 +66,9 @@ namespace llaminar2::cuda
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
         void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
+        // GPU stream for graph capture support
+        void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
         bool apply(
             const float *input, const float *residual, float *output,
             size_t num_elements,
@@ -76,7 +79,7 @@ namespace llaminar2::cuda
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::FP32] Executing on device " << dev);
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
-            return cudaOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev);
+            return cudaOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
         }
 
         bool apply_tensor(
@@ -106,6 +109,7 @@ namespace llaminar2::cuda
     private:
         int device_idx_ = 0;
         IWorkerGPUContext *device_ctx_ = nullptr;
+        void *gpu_stream_ = nullptr;
     };
 
     // ==========================================================================
@@ -140,6 +144,9 @@ namespace llaminar2::cuda
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
         void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
+        // GPU stream for graph capture support
+        void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
         bool apply(
             const float *input, const float *residual, float *output,
             size_t num_elements,
@@ -165,7 +172,7 @@ namespace llaminar2::cuda
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::BF16] Executing on device " << dev);
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
-            return cudaOps_residual_add_bf16(input, residual, output, static_cast<int>(num_elements), dev);
+            return cudaOps_residual_add_bf16(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
         }
 
         bool apply_tensor(
@@ -194,6 +201,7 @@ namespace llaminar2::cuda
     private:
         int device_idx_ = 0;
         IWorkerGPUContext *device_ctx_ = nullptr;
+        void *gpu_stream_ = nullptr;
     };
 
     // ==========================================================================
@@ -228,6 +236,9 @@ namespace llaminar2::cuda
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
         void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
+        // GPU stream for graph capture support
+        void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
         bool apply(
             const float *input, const float *residual, float *output,
             size_t num_elements,
@@ -253,7 +264,7 @@ namespace llaminar2::cuda
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::FP16] Executing on device " << dev);
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
-            return cudaOps_residual_add_fp16(input, residual, output, static_cast<int>(num_elements), dev);
+            return cudaOps_residual_add_fp16(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
         }
 
         bool apply_tensor(
@@ -282,6 +293,7 @@ namespace llaminar2::cuda
     private:
         int device_idx_ = 0;
         IWorkerGPUContext *device_ctx_ = nullptr;
+        void *gpu_stream_ = nullptr;
     };
 
 } // namespace llaminar2::cuda

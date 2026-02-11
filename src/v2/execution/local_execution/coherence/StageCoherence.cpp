@@ -237,14 +237,15 @@ namespace llaminar2
         return true;
     }
 
-    void markOutputsDirty(const std::vector<CoherenceBuffer> &outputs)
+    void markOutputsDirty(const std::vector<CoherenceBuffer> &outputs, void *stream)
     {
         if (outputs.empty())
         {
             return;
         }
 
-        LOG_DEBUG("[StageCoherence] Marking " << outputs.size() << " outputs as device-dirty (with events)");
+        LOG_DEBUG("[StageCoherence] Marking " << outputs.size() << " outputs as device-dirty (with events)"
+                                              << " stream=" << stream);
 
         for (const auto &buf : outputs)
         {
@@ -266,10 +267,11 @@ namespace llaminar2
 
             // Mark as device-dirty WITH EVENT for fine-grained synchronization
             // This records a completion event so ensureOnHost() can wait on just
-            // this kernel rather than doing a full device sync
+            // this kernel rather than doing a full device sync.
+            // Pass the compute stream so the event is recorded on the correct stream.
             LOG_DEBUG("[StageCoherence] Marking output '" << (buf.name ? buf.name : "unknown")
                                                           << "' as device-dirty (with event)");
-            tensor_base->mark_device_dirty_with_event();
+            tensor_base->mark_device_dirty_with_event(stream);
         }
     }
 

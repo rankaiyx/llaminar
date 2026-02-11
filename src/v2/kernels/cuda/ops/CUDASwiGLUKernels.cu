@@ -80,16 +80,18 @@ extern "C"
         const float *up,
         float *output,
         int size,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        cudaSetDevice(device_idx);
+        if (!stream)
+            cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
 
-        swiglu_fp32_kernel<<<num_blocks, threads_per_block>>>(gate, up, output, size);
+        swiglu_fp32_kernel<<<num_blocks, threads_per_block, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, output, size);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -104,16 +106,18 @@ extern "C"
         const uint16_t *up,
         uint16_t *output,
         int size,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        cudaSetDevice(device_idx);
+        if (!stream)
+            cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
 
-        swiglu_bf16_kernel<<<num_blocks, threads_per_block>>>(gate, up, output, size);
+        swiglu_bf16_kernel<<<num_blocks, threads_per_block, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, output, size);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -128,16 +132,18 @@ extern "C"
         const uint16_t *up,
         uint16_t *output,
         int size,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        cudaSetDevice(device_idx);
+        if (!stream)
+            cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = (size + threads_per_block - 1) / threads_per_block;
 
-        swiglu_fp16_kernel<<<num_blocks, threads_per_block>>>(gate, up, output, size);
+        swiglu_fp16_kernel<<<num_blocks, threads_per_block, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, output, size);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

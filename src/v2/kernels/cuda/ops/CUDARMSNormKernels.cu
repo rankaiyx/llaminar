@@ -184,18 +184,20 @@ extern "C"
         float *output,
         int rows, int cols,
         float epsilon,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        cudaSetDevice(device_idx);
+        if (!stream)
+            cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = rows;
         size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        rmsnorm_fp32_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(
+        rmsnorm_fp32_kernel<<<num_blocks, threads_per_block, shared_mem_size, static_cast<cudaStream_t>(stream)>>>(
             input, gamma, output, cols, epsilon);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -211,18 +213,20 @@ extern "C"
         uint16_t *output,
         int rows, int cols,
         float epsilon,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        cudaSetDevice(device_idx);
+        if (!stream)
+            cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = rows;
         size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        rmsnorm_bf16_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(
+        rmsnorm_bf16_kernel<<<num_blocks, threads_per_block, shared_mem_size, static_cast<cudaStream_t>(stream)>>>(
             input, gamma, output, cols, epsilon);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -238,18 +242,20 @@ extern "C"
         uint16_t *output,
         int rows, int cols,
         float epsilon,
-        int device_idx)
+        int device_idx,
+        void *stream)
     {
-        cudaSetDevice(device_idx);
+        if (!stream)
+            cudaSetDevice(device_idx);
 
         int threads_per_block = 256;
         int num_blocks = rows;
         size_t shared_mem_size = threads_per_block * sizeof(float);
 
-        rmsnorm_fp16_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(
+        rmsnorm_fp16_kernel<<<num_blocks, threads_per_block, shared_mem_size, static_cast<cudaStream_t>(stream)>>>(
             input, gamma, output, cols, epsilon);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

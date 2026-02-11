@@ -21,6 +21,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
 #include "../../common/EmbedQ8Repack.h"
+#include "../../rope/RoPEDeviceParams.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -34,24 +35,24 @@ extern "C"
     // RMSNorm
     bool cudaOps_rmsnorm_fp32(
         const float *input, const float *gamma, float *output,
-        int rows, int cols, float epsilon, int device_idx);
+        int rows, int cols, float epsilon, int device_idx, void *stream);
     bool cudaOps_rmsnorm_bf16(
         const uint16_t *input, const float *gamma, uint16_t *output,
-        int rows, int cols, float epsilon, int device_idx);
+        int rows, int cols, float epsilon, int device_idx, void *stream);
     bool cudaOps_rmsnorm_fp16(
         const uint16_t *input, const float *gamma, uint16_t *output,
-        int rows, int cols, float epsilon, int device_idx);
+        int rows, int cols, float epsilon, int device_idx, void *stream);
 
     // SwiGLU
     bool cudaOps_swiglu_fp32(
         const float *gate, const float *up, float *output,
-        int size, int device_idx);
+        int size, int device_idx, void *stream);
     bool cudaOps_swiglu_bf16(
         const uint16_t *gate, const uint16_t *up, uint16_t *output,
-        int size, int device_idx);
+        int size, int device_idx, void *stream);
     bool cudaOps_swiglu_fp16(
         const uint16_t *gate, const uint16_t *up, uint16_t *output,
-        int size, int device_idx);
+        int size, int device_idx, void *stream);
 
     // RoPE (legacy - requires position_ids array copy)
     bool cudaOps_rope_fp32(
@@ -85,15 +86,21 @@ extern "C"
     bool cudaOps_rope_fp32_contiguous(
         float *Q, float *K, int pos_offset, int seq_len,
         int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
+        float rope_theta, int device_idx,
+        void *stream = nullptr,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
     bool cudaOps_rope_bf16_contiguous(
         uint16_t *Q, uint16_t *K, int pos_offset, int seq_len,
         int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
+        float rope_theta, int device_idx,
+        void *stream = nullptr,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
     bool cudaOps_rope_fp16_contiguous(
         uint16_t *Q, uint16_t *K, int pos_offset, int seq_len,
         int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
+        float rope_theta, int device_idx,
+        void *stream = nullptr,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
     // RoPE WORKSPACE-AWARE (v3 - external inv_freq buffer)
     bool cudaOps_rope_populate_inv_freq(
@@ -106,7 +113,8 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp32_contiguous_v3(
         float *Q, float *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
     bool cudaOps_rope_bf16_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, const int *position_ids,
         int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
@@ -115,7 +123,8 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_bf16_contiguous_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
     bool cudaOps_rope_fp16_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, const int *position_ids,
         int seq_len, int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
@@ -124,7 +133,8 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
     bool cudaOps_rope_fp16_contiguous_v3(
         uint16_t *Q, uint16_t *K, const float *d_inv_freq, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream);
+        int n_heads, int n_kv_heads, int head_dim, int device_idx, cudaStream_t stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
     // Embedding lookup - FP32
     cudaError_t launch_embedding_lookup(
@@ -204,7 +214,7 @@ namespace llaminar2
             // Launch kernel asynchronously - no sync needed since all ops are on default stream
             // Stream ordering guarantees subsequent kernels wait for this one
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RMS_NORM);
-            return cudaOps_rmsnorm_fp32(d_input, d_weight, d_output, rows, cols, epsilon, dev);
+            return cudaOps_rmsnorm_fp32(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -216,7 +226,7 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rmsnorm_fp32(input, gamma, output, rows, cols, epsilon, dev);
+            bool ok = cudaOps_rmsnorm_fp32(input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
             if (ok)
                 cudaDeviceSynchronize();
             return ok;
@@ -268,7 +278,7 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_bf16->gpu_data_ptr());
 
             // No sync needed - GraphExecutor handles async execution via stream ordering
-            return cudaOps_rmsnorm_bf16(d_input, d_weight, d_output, rows, cols, epsilon, dev);
+            return cudaOps_rmsnorm_bf16(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -280,7 +290,7 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rmsnorm_bf16(input, gamma, output, rows, cols, epsilon, dev);
+            bool ok = cudaOps_rmsnorm_bf16(input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
             if (ok)
                 cudaDeviceSynchronize();
             return ok;
@@ -332,7 +342,7 @@ namespace llaminar2
             uint16_t *d_output = static_cast<uint16_t *>(out_fp16->gpu_data_ptr());
 
             // No sync needed - GraphExecutor handles async execution via stream ordering
-            return cudaOps_rmsnorm_fp16(d_input, d_weight, d_output, rows, cols, epsilon, dev);
+            return cudaOps_rmsnorm_fp16(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
         bool CUDARMSNormKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -344,7 +354,7 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_rmsnorm_fp16(input, gamma, output, rows, cols, epsilon, dev);
+            bool ok = cudaOps_rmsnorm_fp16(input, gamma, output, rows, cols, epsilon, dev, gpu_stream_);
             if (ok)
                 cudaDeviceSynchronize();
             return ok;
@@ -405,7 +415,7 @@ namespace llaminar2
             int size = rows * cols;
             // Launch kernel asynchronously - stream ordering handles dependencies
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::SWIGLU);
-            return cudaOps_swiglu_fp32(d_gate, d_up, d_output, size, dev);
+            return cudaOps_swiglu_fp32(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::FP32>::apply_typed(
@@ -417,7 +427,7 @@ namespace llaminar2
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             // Launch kernel asynchronously
-            return cudaOps_swiglu_fp32(gate, up, output, size, dev);
+            return cudaOps_swiglu_fp32(gate, up, output, size, dev, gpu_stream_);
         }
 
         // =========================================================================
@@ -473,7 +483,7 @@ namespace llaminar2
 
             int size = rows * cols;
             // No sync needed - GraphExecutor handles async execution via stream ordering
-            return cudaOps_swiglu_bf16(d_gate, d_up, d_output, size, dev);
+            return cudaOps_swiglu_bf16(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -484,7 +494,7 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_swiglu_bf16(gate, up, output, size, dev);
+            bool ok = cudaOps_swiglu_bf16(gate, up, output, size, dev, gpu_stream_);
             if (ok)
                 cudaDeviceSynchronize();
             return ok;
@@ -543,7 +553,7 @@ namespace llaminar2
 
             int size = rows * cols;
             // No sync needed - GraphExecutor handles async execution via stream ordering
-            return cudaOps_swiglu_fp16(d_gate, d_up, d_output, size, dev);
+            return cudaOps_swiglu_fp16(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
         bool CUDASwiGLUKernelT<ActivationPrecision::FP16>::apply_typed(
@@ -554,7 +564,7 @@ namespace llaminar2
             int device_idx)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            bool ok = cudaOps_swiglu_fp16(gate, up, output, size, dev);
+            bool ok = cudaOps_swiglu_fp16(gate, up, output, size, dev, gpu_stream_);
             if (ok)
                 cudaDeviceSynchronize();
             return ok;
@@ -563,6 +573,45 @@ namespace llaminar2
         // =========================================================================
         // CUDARoPEKernelT<FP32> Implementation
         // =========================================================================
+
+        CUDARoPEKernelT<ActivationPrecision::FP32>::~CUDARoPEKernelT()
+        {
+            if (h_device_params_)
+            {
+                cudaFreeHost(h_device_params_);
+                h_device_params_ = nullptr;
+            }
+        }
+
+        void CUDARoPEKernelT<ActivationPrecision::FP32>::setDynamicPosOffset(int pos_offset)
+        {
+            // Lazy-allocate pinned host buffer if not yet created.
+            // This can happen when setDynamicPosOffset is called before the first
+            // execute() with gpu_stream_ set (e.g., graph param update before Phase 2).
+            if (!h_device_params_)
+            {
+                cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
+            }
+            if (h_device_params_)
+            {
+                h_device_params_->pos_offset = pos_offset;
+
+                // Issue explicit H2D copy on the kernel's current stream.
+                // During graph replay, this updates the device buffer BEFORE
+                // the captured graph's own H2D (which also reads from h_device_params_).
+                if (gpu_stream_ && workspace_)
+                {
+                    auto *d_params = workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS);
+                    if (d_params)
+                    {
+                        cudaMemcpyAsync(d_params, h_device_params_,
+                                        sizeof(rope::RoPEDeviceParams),
+                                        cudaMemcpyHostToDevice,
+                                        static_cast<cudaStream_t>(gpu_stream_));
+                    }
+                }
+            }
+        }
 
         bool CUDARoPEKernelT<ActivationPrecision::FP32>::apply(
             float *data, float *output,
@@ -631,7 +680,7 @@ namespace llaminar2
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_fp32_decode_v3(Q, K, d_inv_freq, pos,
-                                                     n_heads, n_kv_heads, head_dim, dev, stream);
+                                                      n_heads, n_kv_heads, head_dim, dev, stream);
                 if (ok && sync_after)
                     cudaDeviceSynchronize();
                 return ok;
@@ -653,8 +702,31 @@ namespace llaminar2
                 }
                 if (is_contiguous)
                 {
+                    // For graph capture: use device params buffer so pos_offset can change between replays.
+                    // The H2D memcpy is captured in the graph; on replay it re-reads from pinned h_device_params_.
+                    const rope::RoPEDeviceParams *d_params = nullptr;
+                    if (gpu_stream_ && workspace_)
+                    {
+                        // Lazy-allocate pinned host buffer for graph-captured H2D
+                        if (!h_device_params_)
+                        {
+                            cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
+                        }
+                        h_device_params_->pos_offset = pos_offset;
+
+                        d_params = static_cast<const rope::RoPEDeviceParams *>(
+                            workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS));
+                        if (d_params)
+                        {
+                            cudaMemcpyAsync(const_cast<rope::RoPEDeviceParams *>(d_params),
+                                            h_device_params_,
+                                            sizeof(rope::RoPEDeviceParams),
+                                            cudaMemcpyHostToDevice,
+                                            stream);
+                        }
+                    }
                     bool ok = cudaOps_rope_fp32_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                             n_heads, n_kv_heads, head_dim, dev, stream);
+                                                              n_heads, n_kv_heads, head_dim, dev, stream, d_params);
                     if (ok && sync_after)
                         cudaDeviceSynchronize();
                     return ok;
@@ -688,6 +760,39 @@ namespace llaminar2
         // =========================================================================
         // CUDARoPEKernelT<BF16> Implementation
         // =========================================================================
+
+        CUDARoPEKernelT<ActivationPrecision::BF16>::~CUDARoPEKernelT()
+        {
+            if (h_device_params_)
+            {
+                cudaFreeHost(h_device_params_);
+                h_device_params_ = nullptr;
+            }
+        }
+
+        void CUDARoPEKernelT<ActivationPrecision::BF16>::setDynamicPosOffset(int pos_offset)
+        {
+            if (!h_device_params_)
+            {
+                cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
+            }
+            if (h_device_params_)
+            {
+                h_device_params_->pos_offset = pos_offset;
+
+                if (gpu_stream_ && workspace_)
+                {
+                    auto *d_params = workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS);
+                    if (d_params)
+                    {
+                        cudaMemcpyAsync(d_params, h_device_params_,
+                                        sizeof(rope::RoPEDeviceParams),
+                                        cudaMemcpyHostToDevice,
+                                        static_cast<cudaStream_t>(gpu_stream_));
+                    }
+                }
+            }
+        }
 
         bool CUDARoPEKernelT<ActivationPrecision::BF16>::apply_bf16(
             uint16_t *data, uint16_t *output,
@@ -750,7 +855,7 @@ namespace llaminar2
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_bf16_decode_v3(Q, K, d_inv_freq, pos,
-                                                     n_heads, n_kv_heads, head_dim, dev, stream);
+                                                      n_heads, n_kv_heads, head_dim, dev, stream);
                 if (ok && sync_after)
                     cudaDeviceSynchronize();
                 return ok;
@@ -772,8 +877,29 @@ namespace llaminar2
                 }
                 if (is_contiguous)
                 {
+                    // For graph capture: use device params buffer so pos_offset can change between replays.
+                    const rope::RoPEDeviceParams *d_params = nullptr;
+                    if (gpu_stream_ && workspace_)
+                    {
+                        if (!h_device_params_)
+                        {
+                            cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
+                        }
+                        h_device_params_->pos_offset = pos_offset;
+
+                        d_params = static_cast<const rope::RoPEDeviceParams *>(
+                            workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS));
+                        if (d_params)
+                        {
+                            cudaMemcpyAsync(const_cast<rope::RoPEDeviceParams *>(d_params),
+                                            h_device_params_,
+                                            sizeof(rope::RoPEDeviceParams),
+                                            cudaMemcpyHostToDevice,
+                                            stream);
+                        }
+                    }
                     bool ok = cudaOps_rope_bf16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                             n_heads, n_kv_heads, head_dim, dev, stream);
+                                                              n_heads, n_kv_heads, head_dim, dev, stream, d_params);
                     if (ok && sync_after)
                         cudaDeviceSynchronize();
                     return ok;
@@ -807,6 +933,39 @@ namespace llaminar2
         // =========================================================================
         // CUDARoPEKernelT<FP16> Implementation
         // =========================================================================
+
+        CUDARoPEKernelT<ActivationPrecision::FP16>::~CUDARoPEKernelT()
+        {
+            if (h_device_params_)
+            {
+                cudaFreeHost(h_device_params_);
+                h_device_params_ = nullptr;
+            }
+        }
+
+        void CUDARoPEKernelT<ActivationPrecision::FP16>::setDynamicPosOffset(int pos_offset)
+        {
+            if (!h_device_params_)
+            {
+                cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
+            }
+            if (h_device_params_)
+            {
+                h_device_params_->pos_offset = pos_offset;
+
+                if (gpu_stream_ && workspace_)
+                {
+                    auto *d_params = workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS);
+                    if (d_params)
+                    {
+                        cudaMemcpyAsync(d_params, h_device_params_,
+                                        sizeof(rope::RoPEDeviceParams),
+                                        cudaMemcpyHostToDevice,
+                                        static_cast<cudaStream_t>(gpu_stream_));
+                    }
+                }
+            }
+        }
 
         bool CUDARoPEKernelT<ActivationPrecision::FP16>::apply_fp16(
             uint16_t *data, uint16_t *output,
@@ -869,7 +1028,7 @@ namespace llaminar2
             {
                 int pos = position_ids ? position_ids[0] : pos_offset;
                 bool ok = cudaOps_rope_fp16_decode_v3(Q, K, d_inv_freq, pos,
-                                                     n_heads, n_kv_heads, head_dim, dev, stream);
+                                                      n_heads, n_kv_heads, head_dim, dev, stream);
                 if (ok && sync_after)
                     cudaDeviceSynchronize();
                 return ok;
@@ -891,8 +1050,29 @@ namespace llaminar2
                 }
                 if (is_contiguous)
                 {
+                    // For graph capture: use device params buffer so pos_offset can change between replays.
+                    const rope::RoPEDeviceParams *d_params = nullptr;
+                    if (gpu_stream_ && workspace_)
+                    {
+                        if (!h_device_params_)
+                        {
+                            cudaMallocHost(reinterpret_cast<void **>(&h_device_params_), sizeof(rope::RoPEDeviceParams));
+                        }
+                        h_device_params_->pos_offset = pos_offset;
+
+                        d_params = static_cast<const rope::RoPEDeviceParams *>(
+                            workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS));
+                        if (d_params)
+                        {
+                            cudaMemcpyAsync(const_cast<rope::RoPEDeviceParams *>(d_params),
+                                            h_device_params_,
+                                            sizeof(rope::RoPEDeviceParams),
+                                            cudaMemcpyHostToDevice,
+                                            stream);
+                        }
+                    }
                     bool ok = cudaOps_rope_fp16_contiguous_v3(Q, K, d_inv_freq, pos_offset, seq_len,
-                                                             n_heads, n_kv_heads, head_dim, dev, stream);
+                                                              n_heads, n_kv_heads, head_dim, dev, stream, d_params);
                     if (ok && sync_after)
                         cudaDeviceSynchronize();
                     return ok;
@@ -941,18 +1121,21 @@ namespace llaminar2
         (void)mpi_ctx;
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
 
-        // Set device context before kernel launch
-        cudaError_t set_err = cudaSetDevice(dev);
-        if (set_err != cudaSuccess)
+        // Set device context before kernel launch (not capturable in CUDA graphs)
+        if (!gpu_stream_)
         {
-            fprintf(stderr, "[CUDAEmbeddingKernelT] cudaSetDevice(%d) failed: %s\n",
-                    dev, cudaGetErrorString(set_err));
-            return false;
+            cudaError_t set_err = cudaSetDevice(dev);
+            if (set_err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] cudaSetDevice(%d) failed: %s\n",
+                        dev, cudaGetErrorString(set_err));
+                return false;
+            }
         }
 
         CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
         cudaError_t err = launch_embedding_lookup(embed_data, token_ids, output,
-                                                  num_tokens, d_model, nullptr);
+                                                  num_tokens, d_model, static_cast<cudaStream_t>(gpu_stream_));
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[CUDAEmbeddingKernelT] Kernel launch failed: %s\n",
@@ -1048,12 +1231,15 @@ namespace llaminar2
 
         // Determine target CUDA device and set context
         int dev = (device_idx >= 0) ? device_idx : device_idx_;
-        cudaError_t set_err = cudaSetDevice(dev);
-        if (set_err != cudaSuccess)
+        if (!gpu_stream_)
         {
-            fprintf(stderr, "[CUDAEmbeddingKernelT] cudaSetDevice(%d) failed: %s\n",
-                    dev, cudaGetErrorString(set_err));
-            return false;
+            cudaError_t set_err = cudaSetDevice(dev);
+            if (set_err != cudaSuccess)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] cudaSetDevice(%d) failed: %s\n",
+                        dev, cudaGetErrorString(set_err));
+                return false;
+            }
         }
 
         // =====================================================================
@@ -1075,7 +1261,8 @@ namespace llaminar2
         }
 
         size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
-        cudaError_t err = cudaMemcpy(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice);
+        cudaError_t err = cudaMemcpyAsync(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice,
+                                          static_cast<cudaStream_t>(gpu_stream_));
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to copy token_ids to GPU: %s\n",
@@ -1148,7 +1335,7 @@ namespace llaminar2
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
             err = launch_embedding_lookup_q8(d_embed_q8, d_token_ids, d_output,
                                              num_tokens, d_model,
-                                             static_cast<int>(blocks_per_row), nullptr);
+                                             static_cast<int>(blocks_per_row), static_cast<cudaStream_t>(gpu_stream_));
             if (err != cudaSuccess)
             {
                 fprintf(stderr, "[CUDAEmbeddingKernelT] EmbedQ8 kernel failed: %s\n",

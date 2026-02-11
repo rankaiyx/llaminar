@@ -174,6 +174,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
+            void setGPUStream(void *stream) override;
+
             // =========================================================================
             // IKernelSnapshotCapable interface
             // =========================================================================
@@ -199,6 +201,9 @@ namespace llaminar2
 
             // cuBLAS kernel (created at construction)
             std::unique_ptr<CuBLASGemmKernel> cublas_kernel_;
+
+            // GPU stream for graph capture (nullptr = default stream)
+            void *gpu_stream_ = nullptr;
         };
 
     } // namespace cuda

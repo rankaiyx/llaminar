@@ -590,6 +590,22 @@ namespace llaminar2
             forward_cache_.token_ids[0] = effective_input.token_ids[0];
             forward_cache_.position_ids[0] = effective_input.position_ids[0];
 
+            // For GPU graph replay: set the capture stream on all stages BEFORE
+            // updating dynamic params. This allows setDynamicPosOffset() and
+            // setDynamicAttnParams() to issue H2D copies on the capture stream,
+            // ensuring device buffers have current values before graph launch.
+            void *replay_stream = forward_cache_.segment_cache.capture_stream;
+            if (replay_stream)
+            {
+                auto order = forward_cache_.graph->getExecutionOrder();
+                for (const auto &node_name : order)
+                {
+                    ComputeNode *node = forward_cache_.graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->setGPUStream(replay_stream);
+                }
+            }
+
             // Update position-dependent params in all cached stages
             // (RoPEStage.pos_offset, AttentionComputeStage.position_offset, etc.)
             updateCachedGraphParams(*forward_cache_.graph,

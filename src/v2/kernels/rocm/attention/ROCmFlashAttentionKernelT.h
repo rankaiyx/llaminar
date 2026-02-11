@@ -392,6 +392,9 @@ namespace llaminar2
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1) override;
 
+            /// Update device-side attention params for graph-capture replay
+            void setDynamicAttnParams(int kv_len, int position_offset) override;
+
             // =========================================================================
             // IWorkspaceConsumer Interface
             // =========================================================================
@@ -468,6 +471,9 @@ namespace llaminar2
 
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
+
+            /// Pinned host memory for graph-captured H2D copy of attention device params
+            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();

@@ -316,6 +316,15 @@ namespace llaminar2
             return (dev.type == ComputeBackendType::GPU_CUDA && dev.device_id == cuda_device_id_);
         }
 
+        void CUDAFloatingPointGemmKernel::setGPUStream(void *stream)
+        {
+            gpu_stream_ = stream;
+            if (cublas_kernel_)
+            {
+                cublas_kernel_->setStream(stream);
+            }
+        }
+
         // =====================================================================
         // Activation-activation GEMM (not supported)
         // =====================================================================

@@ -196,6 +196,12 @@ namespace llaminar2
              */
             bool ownsHandle() const { return owns_handle_; }
 
+            /**
+             * @brief Set the stream on the underlying cuBLAS handle
+             * @param stream CUDA stream (cast to cudaStream_t internally)
+             */
+            void setStream(void *stream);
+
         private:
 #ifdef HAVE_CUDA
             cublasHandle_t handle_ = nullptr;
@@ -205,6 +211,7 @@ namespace llaminar2
             Precision precision_ = Precision::FP32;
             bool owns_handle_ = true;    ///< false when using context's cuBLAS handle
             bool owns_lt_handle_ = true; ///< false when using context's cuBLASLt handle
+            void *gpu_stream_ = nullptr; ///< GPU stream for graph capture (nullptr = default stream)
         };
 
         /**

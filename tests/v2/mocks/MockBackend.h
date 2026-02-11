@@ -193,10 +193,11 @@ namespace llaminar2
                 // No-op for mock
             }
 
-            bool recordEvent(void *event, int device_id) override
+            bool recordEvent(void *event, int device_id, void *stream = nullptr) override
             {
                 (void)event;
                 (void)device_id;
+                (void)stream;
                 return true;
             }
 

@@ -66,15 +66,24 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
-        bool isGraphCapturable() const override { return false; } // pos_offset changes each step
+        bool isGraphCapturable() const override { return true; }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
 
-        /// Update position offset for cached graph reuse
+        /// Update position offset for cached graph reuse.
+        /// Also updates the kernel's pinned host device-params so the next
+        /// graph replay picks up the new pos_offset via the captured H2D memcpy.
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.pos_offset = pos_offset;
             params_.seq_len = seq_len;
+            if (cached_kernel_)
+            {
+                // Propagate current stage stream to kernel so setDynamicPosOffset
+                // can issue H2D copies on the correct (capture/replay) stream.
+                cached_kernel_->setGPUStream(gpuStream());
+                cached_kernel_->setDynamicPosOffset(pos_offset);
+            }
         }
 
         const Params &getParams() const { return params_; }

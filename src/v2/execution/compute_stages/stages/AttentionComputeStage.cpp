@@ -158,33 +158,45 @@ namespace llaminar2
 
         if (params_.causal && is_decode_mode)
         {
-            // Build decode-specific causal mask
-            // For decode: seq_len=1 (or small), kv_len = full cache length
-            // Query at position i (within seq_len) corresponds to global position (base_pos + i)
-            // where base_pos = position_offset if provided, else (kv_len - seq_len)
-            const int base_pos = (params_.position_offset > 0)
-                                     ? params_.position_offset
-                                     : (effective_kv_len - params_.seq_len);
-
-            decode_mask = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(params_.seq_len * effective_kv_len)});
-            float *mask_data = decode_mask->mutable_data();
-
-            for (int q = 0; q < params_.seq_len; ++q)
+            if (gpuStream() == nullptr)
             {
-                const int q_pos = base_pos + q; // Global position of this query
-                for (int k = 0; k < effective_kv_len; ++k)
-                {
-                    // Causal: Query at position q_pos can attend to K positions [0, q_pos]
-                    mask_data[q * effective_kv_len + k] = (k <= q_pos)
-                                                              ? 0.0f
-                                                              : -std::numeric_limits<float>::infinity();
-                }
-            }
+                // Direct execution on default stream: safe to use temporary CPU mask
+                // (will survive until kernel returns synchronously)
+                const int base_pos = (params_.position_offset > 0)
+                                         ? params_.position_offset
+                                         : (effective_kv_len - params_.seq_len);
 
-            mask_to_use = decode_mask.get();
-            LOG_DEBUG("[AttentionComputeStage] Built decode causal mask: base_pos=" << base_pos
-                                                                                    << " seq_len=" << params_.seq_len << " kv_len=" << effective_kv_len);
+                decode_mask = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{static_cast<size_t>(params_.seq_len * effective_kv_len)});
+                float *mask_data = decode_mask->mutable_data();
+
+                for (int q = 0; q < params_.seq_len; ++q)
+                {
+                    const int q_pos = base_pos + q; // Global position of this query
+                    for (int k = 0; k < effective_kv_len; ++k)
+                    {
+                        // Causal: Query at position q_pos can attend to K positions [0, q_pos]
+                        mask_data[q * effective_kv_len + k] = (k <= q_pos)
+                                                                  ? 0.0f
+                                                                  : -std::numeric_limits<float>::infinity();
+                    }
+                }
+
+                mask_to_use = decode_mask.get();
+                LOG_DEBUG("[AttentionComputeStage] Built decode causal mask: base_pos=" << base_pos
+                                                                                        << " seq_len=" << params_.seq_len << " kv_len=" << effective_kv_len);
+            }
+            else
+            {
+                // Non-default stream (graph capture or manual replay on capture stream):
+                // Cannot use temporary CPU mask — it would be destroyed after execute(),
+                // leaving captured graph with a dangling pointer.
+                // For decode (seq_len=1), causal=false + mask=nullptr = attend to all
+                // positions, which is correct since the single query token should
+                // attend to the entire KV cache.
+                mask_to_use = nullptr;
+                LOG_DEBUG("[AttentionComputeStage] Decode on non-default stream: using nullptr mask (attend-to-all)");
+            }
         }
 
         // Dispatch to kernel's compute method

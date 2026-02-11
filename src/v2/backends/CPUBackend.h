@@ -243,7 +243,7 @@ namespace llaminar2
          * @param device_id Must be 0
          * @return true
          */
-        bool recordEvent(void *event, int device_id) override;
+        bool recordEvent(void *event, int device_id, void *stream = nullptr) override;
 
         /**
          * @brief Wait for event (no-op for CPU - always synchronous)

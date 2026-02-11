@@ -217,7 +217,7 @@ namespace llaminar2
             auto *output_base_tb = dynamic_cast<TensorBase *>(params_.output);
             if (output_base_tb)
             {
-                output_base_tb->mark_device_dirty_with_event();
+                output_base_tb->mark_device_dirty_with_event(gpuStream());
             }
         }
 

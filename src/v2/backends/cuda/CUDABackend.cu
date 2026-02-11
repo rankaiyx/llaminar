@@ -155,7 +155,7 @@ namespace llaminar2
         cudaEventDestroy(cuda_event);
     }
 
-    bool CUDABackend::recordEvent(void *event, int device_id)
+    bool CUDABackend::recordEvent(void *event, int device_id, void *stream)
     {
         if (!event || device_id >= device_count_ || device_id < 0)
         {
@@ -169,8 +169,8 @@ namespace llaminar2
         }
 
         cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
-        // Record on default stream (0)
-        err = cudaEventRecord(cuda_event, 0);
+        cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream); // nullptr = default stream
+        err = cudaEventRecord(cuda_event, cuda_stream);
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::recordEvent] cudaEventRecord failed: " << cudaGetErrorString(err));

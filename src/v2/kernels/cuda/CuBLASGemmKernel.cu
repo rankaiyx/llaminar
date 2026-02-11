@@ -137,14 +137,15 @@ namespace llaminar2
             // blasHandle() must be called from the worker thread per thread-safety model
             void *blas_handle = nullptr;
             std::exception_ptr eptr = nullptr;
-            ctx->submitAndWait([&]() {
+            ctx->submitAndWait([&]()
+                               {
                 try {
                     blas_handle = ctx->blasHandle();
                 } catch (...) {
                     eptr = std::current_exception();
-                }
-            });
-            if (eptr) {
+                } });
+            if (eptr)
+            {
                 std::rethrow_exception(eptr);
             }
             if (!blas_handle)
@@ -156,9 +157,8 @@ namespace llaminar2
 
             // Get cuBLASLt handle from context (required for fused operations)
             void *lt_handle_ptr = nullptr;
-            ctx->submitAndWait([&]() {
-                lt_handle_ptr = ctx->blasLtHandle();
-            });
+            ctx->submitAndWait([&]()
+                               { lt_handle_ptr = ctx->blasLtHandle(); });
             if (!lt_handle_ptr)
             {
                 throw std::runtime_error(
@@ -197,12 +197,14 @@ namespace llaminar2
               device_id_(other.device_id_),
               precision_(other.precision_),
               owns_handle_(other.owns_handle_),
-              owns_lt_handle_(other.owns_lt_handle_)
+              owns_lt_handle_(other.owns_lt_handle_),
+              gpu_stream_(other.gpu_stream_)
         {
             other.handle_ = nullptr;
             other.lt_handle_ = nullptr;
             other.owns_handle_ = false;    // Moved-from object shouldn't destroy anything
             other.owns_lt_handle_ = false; // Moved-from object shouldn't destroy anything
+            other.gpu_stream_ = nullptr;
         }
 
         // Move assignment
@@ -219,10 +221,10 @@ namespace llaminar2
                 {
                     cublasDestroy(handle_);
                 }
-                
+
                 // Move base class
                 CUDAKernelBase::operator=(std::move(other));
-                
+
                 // Take ownership of other's resources
                 handle_ = other.handle_;
                 lt_handle_ = other.lt_handle_;
@@ -230,11 +232,13 @@ namespace llaminar2
                 precision_ = other.precision_;
                 owns_handle_ = other.owns_handle_;
                 owns_lt_handle_ = other.owns_lt_handle_;
-                
+                gpu_stream_ = other.gpu_stream_;
+
                 other.handle_ = nullptr;
                 other.lt_handle_ = nullptr;
                 other.owns_handle_ = false;
                 other.owns_lt_handle_ = false;
+                other.gpu_stream_ = nullptr;
             }
             return *this;
         }
@@ -255,8 +259,11 @@ namespace llaminar2
                 return false;
             }
 
-            // Ensure we're on the correct device
-            CUDA_CHECK(cudaSetDevice(device_id_));
+            // Ensure we're on the correct device (not during graph capture)
+            if (!gpu_stream_)
+            {
+                CUDA_CHECK(cudaSetDevice(device_id_));
+            }
 
             // cuBLAS expects column-major. We have row-major data.
             // To compute C = A @ B in row-major:
@@ -350,8 +357,11 @@ namespace llaminar2
                 return false;
             }
 
-            // Ensure we're on the correct device
-            CUDA_CHECK(cudaSetDevice(device_id_));
+            // Ensure we're on the correct device (not during graph capture)
+            if (!gpu_stream_)
+            {
+                CUDA_CHECK(cudaSetDevice(device_id_));
+            }
 
             // Create operation descriptors
             cublasLtMatmulDesc_t operationDesc = nullptr;
@@ -478,7 +488,7 @@ namespace llaminar2
                                                    d_C, Cdesc, // D (output, same as C)
                                                    &heuristicResult.algo,
                                                    workspace, workspaceSize,
-                                                   0); // stream = 0 (default)
+                                                   static_cast<cudaStream_t>(gpu_stream_)); // Use configured stream
 
             // Cleanup
             cudaFree(workspace);
@@ -513,6 +523,15 @@ namespace llaminar2
             IWorkerGPUContext *ctx, CuBLASGemmKernel::Precision precision)
         {
             return std::make_unique<CuBLASGemmKernel>(ctx, precision);
+        }
+
+        void CuBLASGemmKernel::setStream(void *stream)
+        {
+            gpu_stream_ = stream;
+            if (handle_)
+            {
+                cublasSetStream(handle_, static_cast<cudaStream_t>(stream));
+            }
         }
 
 #else // !HAVE_CUDA
@@ -562,6 +581,8 @@ namespace llaminar2
         {
             return nullptr;
         }
+
+        void CuBLASGemmKernel::setStream(void *) {}
 
 #endif // HAVE_CUDA
 

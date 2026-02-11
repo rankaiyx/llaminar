@@ -157,7 +157,7 @@ namespace llaminar2
         hipEventDestroy(hip_event);
     }
 
-    bool ROCmBackend::recordEvent(void *event, int device_id)
+    bool ROCmBackend::recordEvent(void *event, int device_id, void *stream)
     {
         if (!event || device_id >= device_count_ || device_id < 0)
         {
@@ -171,8 +171,8 @@ namespace llaminar2
         }
 
         hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
-        // Record on default stream (0)
-        err = hipEventRecord(hip_event, 0);
+        hipStream_t hip_stream = reinterpret_cast<hipStream_t>(stream); // nullptr = default stream
+        err = hipEventRecord(hip_event, hip_stream);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend::recordEvent] hipEventRecord failed: " << hipGetErrorString(err));
@@ -265,8 +265,8 @@ namespace llaminar2
         }
 
         // TRACE: Log allocation with device and pointer for debugging multi-GPU memory issues
-        LOG_TRACE("[ROCmBackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes 
-                  << " device_id=" << device_id << " (ROCm ordinal)");
+        LOG_TRACE("[ROCmBackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes
+                                                       << " device_id=" << device_id << " (ROCm ordinal)");
 
         return ptr;
     }
@@ -605,21 +605,25 @@ namespace llaminar2
     // Async Operations (via AMDDeviceContext worker thread)
     // ====================================================================
 
-    std::future<bool> ROCmBackend::deviceToHostAsync(void* dst, const void* src, size_t bytes, int device_id) {
-        try {
-            AMDDeviceContext& ctx = static_cast<AMDDeviceContext&>(
+    std::future<bool> ROCmBackend::deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id)
+    {
+        try
+        {
+            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
                 GPUDeviceContextPool::instance().getAMDContext(device_id));
-            
+
             auto promise = std::make_shared<std::promise<bool>>();
             auto future = promise->get_future();
-            
-            ctx.submitAsync([this, dst, src, bytes, device_id, promise]() {
+
+            ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
+                            {
                 bool result = deviceToHost(dst, src, bytes, device_id);
-                promise->set_value(result);
-            });
-            
+                promise->set_value(result); });
+
             return future;
-        } catch (...) {
+        }
+        catch (...)
+        {
             // Fall back to synchronous execution
             std::promise<bool> promise;
             promise.set_value(deviceToHost(dst, src, bytes, device_id));
@@ -627,21 +631,25 @@ namespace llaminar2
         }
     }
 
-    std::future<bool> ROCmBackend::hostToDeviceAsync(void* dst, const void* src, size_t bytes, int device_id) {
-        try {
-            AMDDeviceContext& ctx = static_cast<AMDDeviceContext&>(
+    std::future<bool> ROCmBackend::hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id)
+    {
+        try
+        {
+            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
                 GPUDeviceContextPool::instance().getAMDContext(device_id));
-            
+
             auto promise = std::make_shared<std::promise<bool>>();
             auto future = promise->get_future();
-            
-            ctx.submitAsync([this, dst, src, bytes, device_id, promise]() {
+
+            ctx.submitAsync([this, dst, src, bytes, device_id, promise]()
+                            {
                 bool result = hostToDevice(dst, src, bytes, device_id);
-                promise->set_value(result);
-            });
-            
+                promise->set_value(result); });
+
             return future;
-        } catch (...) {
+        }
+        catch (...)
+        {
             // Fall back to synchronous execution
             std::promise<bool> promise;
             promise.set_value(hostToDevice(dst, src, bytes, device_id));
@@ -649,21 +657,25 @@ namespace llaminar2
         }
     }
 
-    std::future<bool> ROCmBackend::synchronizeAsync(int device_id) {
-        try {
-            AMDDeviceContext& ctx = static_cast<AMDDeviceContext&>(
+    std::future<bool> ROCmBackend::synchronizeAsync(int device_id)
+    {
+        try
+        {
+            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
                 GPUDeviceContextPool::instance().getAMDContext(device_id));
-            
+
             auto promise = std::make_shared<std::promise<bool>>();
             auto future = promise->get_future();
-            
-            ctx.submitAsync([this, device_id, promise]() {
+
+            ctx.submitAsync([this, device_id, promise]()
+                            {
                 bool result = synchronize(device_id);
-                promise->set_value(result);
-            });
-            
+                promise->set_value(result); });
+
             return future;
-        } catch (...) {
+        }
+        catch (...)
+        {
             // Fall back to synchronous execution
             std::promise<bool> promise;
             promise.set_value(synchronize(device_id));
@@ -671,43 +683,51 @@ namespace llaminar2
         }
     }
 
-    std::future<void*> ROCmBackend::allocateAsync(size_t bytes, int device_id) {
-        try {
-            AMDDeviceContext& ctx = static_cast<AMDDeviceContext&>(
+    std::future<void *> ROCmBackend::allocateAsync(size_t bytes, int device_id)
+    {
+        try
+        {
+            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
                 GPUDeviceContextPool::instance().getAMDContext(device_id));
-            
-            auto promise = std::make_shared<std::promise<void*>>();
+
+            auto promise = std::make_shared<std::promise<void *>>();
             auto future = promise->get_future();
-            
-            ctx.submitAsync([this, bytes, device_id, promise]() {
+
+            ctx.submitAsync([this, bytes, device_id, promise]()
+                            {
                 void* result = allocate(bytes, device_id);
-                promise->set_value(result);
-            });
-            
+                promise->set_value(result); });
+
             return future;
-        } catch (...) {
+        }
+        catch (...)
+        {
             // Fall back to synchronous execution
-            std::promise<void*> promise;
+            std::promise<void *> promise;
             promise.set_value(allocate(bytes, device_id));
             return promise.get_future();
         }
     }
 
-    std::future<void> ROCmBackend::freeAsync(void* ptr, int device_id) {
-        try {
-            AMDDeviceContext& ctx = static_cast<AMDDeviceContext&>(
+    std::future<void> ROCmBackend::freeAsync(void *ptr, int device_id)
+    {
+        try
+        {
+            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
                 GPUDeviceContextPool::instance().getAMDContext(device_id));
-            
+
             auto promise = std::make_shared<std::promise<void>>();
             auto future = promise->get_future();
-            
-            ctx.submitAsync([this, ptr, device_id, promise]() {
+
+            ctx.submitAsync([this, ptr, device_id, promise]()
+                            {
                 free(ptr, device_id);
-                promise->set_value();
-            });
-            
+                promise->set_value(); });
+
             return future;
-        } catch (...) {
+        }
+        catch (...)
+        {
             // Fall back to synchronous execution
             free(ptr, device_id);
             std::promise<void> promise;
@@ -716,21 +736,25 @@ namespace llaminar2
         }
     }
 
-    std::future<bool> ROCmBackend::memsetAsync(void* ptr, int value, size_t bytes, int device_id) {
-        try {
-            AMDDeviceContext& ctx = static_cast<AMDDeviceContext&>(
+    std::future<bool> ROCmBackend::memsetAsync(void *ptr, int value, size_t bytes, int device_id)
+    {
+        try
+        {
+            AMDDeviceContext &ctx = static_cast<AMDDeviceContext &>(
                 GPUDeviceContextPool::instance().getAMDContext(device_id));
-            
+
             auto promise = std::make_shared<std::promise<bool>>();
             auto future = promise->get_future();
-            
-            ctx.submitAsync([this, ptr, value, bytes, device_id, promise]() {
+
+            ctx.submitAsync([this, ptr, value, bytes, device_id, promise]()
+                            {
                 bool result = memset(ptr, value, bytes, device_id);
-                promise->set_value(result);
-            });
-            
+                promise->set_value(result); });
+
             return future;
-        } catch (...) {
+        }
+        catch (...)
+        {
             // Fall back to synchronous execution
             std::promise<bool> promise;
             promise.set_value(memset(ptr, value, bytes, device_id));

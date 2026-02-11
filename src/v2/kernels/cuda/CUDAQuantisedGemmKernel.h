@@ -309,6 +309,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // =========================================================================
             // IKernelSnapshotCapable interface
             // =========================================================================
@@ -490,6 +492,9 @@ namespace llaminar2
             // IWorkspaceConsumer state - REQUIRED for execution
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
+
+            // GPU stream for graph capture (nullptr = default stream)
+            void *gpu_stream_ = nullptr;
 
             // PIMPL for CUTLASS implementation (avoids CUTLASS in header)
             struct Impl;

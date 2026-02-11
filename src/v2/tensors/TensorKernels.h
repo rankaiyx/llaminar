@@ -1867,6 +1867,23 @@ namespace llaminar2
             (void)local_n_kv_heads;
             return false; // Subclasses override with type-aware dispatch
         }
+
+        /**
+         * @brief Update attention device params stored in pinned host memory for graph replay
+         *
+         * During GPU graph capture, the kernel records an H2D memcpy of AttentionDeviceParams
+         * from pinned host memory to a device buffer. On graph replay, the memcpy re-reads
+         * from the same pinned address. This method updates the pinned values so the next
+         * replay picks up the new kv_len and position_offset.
+         *
+         * @param kv_len Number of cached tokens (including tokens to be appended this step)
+         * @param position_offset Position offset for the current decode step
+         */
+        virtual void setDynamicAttnParams(int kv_len, int position_offset)
+        {
+            (void)kv_len;
+            (void)position_offset;
+        }
     };
 
     // =========================================================================
@@ -2853,6 +2870,21 @@ namespace llaminar2
             (void)device_idx;
             (void)pos_offset;
             return false; // Subclasses override with type-aware dispatch
+        }
+
+        /**
+         * @brief Update the pos_offset stored in pinned host memory for graph replay
+         *
+         * During GPU graph capture, the kernel records an H2D memcpy from a pinned
+         * host buffer to a device buffer. On graph replay, the memcpy re-reads
+         * from the same pinned address. This method updates that pinned value
+         * so the next replay picks up the new pos_offset.
+         *
+         * @param pos_offset New position offset for the next decode step
+         */
+        virtual void setDynamicPosOffset(int pos_offset)
+        {
+            (void)pos_offset;
         }
     };
 

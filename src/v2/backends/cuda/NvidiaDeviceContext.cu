@@ -394,6 +394,17 @@ namespace llaminar2
         // because CUTLASS/cuBLAS may internally dispatch to the legacy default stream.
         // A blocking stream would create illegal cross-stream dependencies during capture
         // (the blocking stream implicitly syncs with stream 0, violating capture mode).
+
+        // Ensure we're on the correct device — createStream() may be called from
+        // any thread, and the caller's active device may differ from device_ordinal_.
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in createStream: " << cudaGetErrorString(set_err));
+            return nullptr;
+        }
+
         cudaStream_t stream;
         cudaError_t err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
         if (err != cudaSuccess)

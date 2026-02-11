@@ -109,7 +109,7 @@ namespace llaminar2
      * @note Skips nullptr tensors gracefully
      * @note Logs at DEBUG level when coherence operations are performed
      */
-    void markOutputsDirty(const std::vector<CoherenceBuffer> &outputs);
+    void markOutputsDirty(const std::vector<CoherenceBuffer> &outputs, void *stream = nullptr);
 
     /**
      * @brief Extract CoherenceBuffer list from StageDumpInfo inputs

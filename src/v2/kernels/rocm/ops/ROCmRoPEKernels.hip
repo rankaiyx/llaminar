@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../kernels/rope/RoPEDeviceParams.h"
 
 namespace
 {
@@ -225,8 +226,10 @@ __global__ void rocm_rope_fp32_contiguous_kernel(
     int pos_offset,  // Starting position (positions are pos_offset + seq_idx)
     int seq_len,
     int n_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
     const int half_dim = head_dim / 2;
 
     extern __shared__ float smem[];
@@ -241,7 +244,7 @@ __global__ void rocm_rope_fp32_contiguous_kernel(
         return;
 
     // Compute position on-the-fly (no memory access!)
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     // Compute sin/cos table
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
@@ -279,8 +282,10 @@ __global__ void rocm_rope_fp32_fused_qk_contiguous_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
     const int half_dim = head_dim / 2;
 
     extern __shared__ float smem[];
@@ -315,7 +320,7 @@ __global__ void rocm_rope_fp32_fused_qk_contiguous_kernel(
     if (seq_idx >= seq_len)
         return;
 
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
@@ -349,8 +354,10 @@ __global__ void rocm_rope_bf16_contiguous_kernel(
     int pos_offset,
     int seq_len,
     int n_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
     const int half_dim = head_dim / 2;
 
     extern __shared__ float smem[];
@@ -364,7 +371,7 @@ __global__ void rocm_rope_bf16_contiguous_kernel(
     if (seq_idx >= seq_len)
         return;
 
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
@@ -400,8 +407,10 @@ __global__ void rocm_rope_bf16_fused_qk_contiguous_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
     const int half_dim = head_dim / 2;
 
     extern __shared__ float smem[];
@@ -436,7 +445,7 @@ __global__ void rocm_rope_bf16_fused_qk_contiguous_kernel(
     if (seq_idx >= seq_len)
         return;
 
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
@@ -470,8 +479,10 @@ __global__ void rocm_rope_fp16_contiguous_kernel(
     int pos_offset,
     int seq_len,
     int n_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
     const int half_dim = head_dim / 2;
 
     extern __shared__ float smem[];
@@ -485,7 +496,7 @@ __global__ void rocm_rope_fp16_contiguous_kernel(
     if (seq_idx >= seq_len)
         return;
 
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
@@ -521,8 +532,10 @@ __global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams* __restrict__ device_params)
 {
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
     const int half_dim = head_dim / 2;
 
     extern __shared__ float smem[];
@@ -557,7 +570,7 @@ __global__ void rocm_rope_fp16_fused_qk_contiguous_kernel(
     if (seq_idx >= seq_len)
         return;
 
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
@@ -1283,7 +1296,8 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx, void* stream)
+        int device_idx, void* stream,
+        const llaminar2::rope::RoPEDeviceParams* device_params = nullptr)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
@@ -1297,14 +1311,14 @@ extern "C"
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp32_fused_qk_contiguous_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, device_params);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_fp32_contiguous_kernel, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, device_params);
         }
 
         hipError_t err = hipGetLastError();
@@ -1325,7 +1339,8 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx, void* stream)
+        int device_idx, void* stream,
+        const llaminar2::rope::RoPEDeviceParams* device_params = nullptr)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
@@ -1339,14 +1354,14 @@ extern "C"
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_bf16_fused_qk_contiguous_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, device_params);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_bf16_contiguous_kernel, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, device_params);
         }
 
         hipError_t err = hipGetLastError();
@@ -1367,7 +1382,8 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx, void* stream)
+        int device_idx, void* stream,
+        const llaminar2::rope::RoPEDeviceParams* device_params = nullptr)
     {
         llaminar2::HipDeviceGuard::setDevice(device_idx);
 
@@ -1381,14 +1397,14 @@ extern "C"
             int total_blocks = seq_len * (n_q_heads + n_kv_heads);
             hipLaunchKernelGGL(rocm_rope_fp16_fused_qk_contiguous_kernel, 
                                dim3(total_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim);
+                               Q, K, inv_freq, pos_offset, seq_len, n_q_heads, n_kv_heads, head_dim, device_params);
         }
         else
         {
             int num_blocks = seq_len * n_q_heads;
             hipLaunchKernelGGL(rocm_rope_fp16_contiguous_kernel, 
                                dim3(num_blocks), dim3(threads_per_block), smem_size, hip_stream,
-                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim);
+                               Q, inv_freq, pos_offset, seq_len, n_q_heads, head_dim, device_params);
         }
 
         hipError_t err = hipGetLastError();

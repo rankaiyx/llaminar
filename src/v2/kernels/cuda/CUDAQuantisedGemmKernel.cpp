@@ -76,7 +76,8 @@ namespace llaminar2
                 const int8_t *d_weights_int8, // [K x N] ColumnMajor
                 int32_t *d_C_int32,           // [M x N] RowMajor
                 int M, int N, int K,
-                int cuda_device_id);
+                int cuda_device_id,
+                void *stream = nullptr);
 
             // Apply output scaling: C_fp32 = C_int32 * scales_A * scales_B + bias
             bool cudaQuantGemm_applyScaling(
@@ -88,7 +89,8 @@ namespace llaminar2
                 float alpha, float beta,
                 const float *d_C_existing, // For beta != 0
                 const float *d_bias,       // [N] optional bias
-                int cuda_device_id);
+                int cuda_device_id,
+                void *stream = nullptr);
 
             // Quantize FP32 activations to INT8
             bool cudaQuantGemm_quantizeActivations(
@@ -96,7 +98,8 @@ namespace llaminar2
                 int8_t *d_A_int8,      // [M x K] output
                 float *d_scales_A,     // [M] output
                 int M, int K,
-                int cuda_device_id);
+                int cuda_device_id,
+                void *stream = nullptr);
 
             // Free device memory
             void cudaQuantGemm_freeDevice(void *d_ptr);
@@ -751,7 +754,8 @@ namespace llaminar2
                 return false;
             }
 
-            cudaQuantGemm_setDevice(cuda_device_id_);
+            if (!gpu_stream_)
+                cudaQuantGemm_setDevice(cuda_device_id_);
 
             // Step 1: Copy input from host to device
             const size_t input_count = static_cast<size_t>(m) * k;
@@ -896,7 +900,8 @@ namespace llaminar2
                 return false;
             }
 
-            cudaQuantGemm_setDevice(cuda_device_id_);
+            if (!gpu_stream_)
+                cudaQuantGemm_setDevice(cuda_device_id_);
             DeviceId target_device = DeviceId::cuda(cuda_device_id_);
 
             // Step 1: Ensure input is on the GPU
@@ -937,7 +942,7 @@ namespace llaminar2
 
             // Step 3: Quantize activations ONCE (shared across all projections)
             if (!cudaQuantGemm_quantizeActivations(
-                    d_input, d_A_int8, d_scales_A, m, k, cuda_device_id_))
+                    d_input, d_A_int8, d_scales_A, m, k, cuda_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
                 return false;
@@ -1010,7 +1015,7 @@ namespace llaminar2
                             d_A_int8,                           // SHARED quantized activations (from this kernel's workspace)
                             cuda_kernel->impl_->d_weights_int8, // This projection's weights
                             proj_d_C_int32,                     // This projection's INT32 work buffer (from its workspace)
-                            m, n, k, cuda_device_id_))
+                            m, n, k, cuda_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] CUTLASS GEMM failed for projection " << i);
                         all_success = false;
@@ -1110,14 +1115,16 @@ namespace llaminar2
                         d_output,                       // Output FP32
                         d_scales_A,                     // SHARED activation scales (from this kernel's workspace)
                         cuda_kernel->impl_->d_scales_B, // This projection's weight scales
-                        m, n, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_))
+                        m, n, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_, gpu_stream_))
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Scaling failed for projection " << i);
                     all_success = false;
                     break;
                 }
 
-                // Debug: Log output values after scaling
+#ifdef LLAMINAR_DEBUG_GEMM_VALUES
+                // Debug: Log output values after scaling - EXPENSIVE, guarded by compile flag
+                // CRITICAL: cudaMemcpy(D2H) on default stream is illegal during graph capture
                 if (d_output && m > 0 && n > 0)
                 {
                     size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
@@ -1127,6 +1134,7 @@ namespace llaminar2
                                                                                   << " output[0:4]=" << h_output[0] << "," << (h_output.size() > 1 ? h_output[1] : 0.f) << ","
                                                                                   << (h_output.size() > 2 ? h_output[2] : 0.f) << "," << (h_output.size() > 3 ? h_output[3] : 0.f));
                 }
+#endif
             }
 
             return all_success;
@@ -1194,7 +1202,7 @@ namespace llaminar2
 
             // Step 1: Quantize activations
             if (!cudaQuantGemm_quantizeActivations(
-                    d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_))
+                    d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
                 return false;
@@ -1217,7 +1225,7 @@ namespace llaminar2
                 CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUTLASS);
                 if (!cudaQuantGemm_execute(
                         d_A_int8, impl_->d_weights_int8, d_C_int32,
-                        m, n, k, cuda_device_id_))
+                        m, n, k, cuda_device_id_, gpu_stream_))
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
                     return false;
@@ -1251,7 +1259,7 @@ namespace llaminar2
             const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
             if (!cudaQuantGemm_applyScaling(
                     d_C_int32, d_C, d_scales_A, impl_->d_scales_B,
-                    m, n, alpha, beta, d_C_existing, nullptr, cuda_device_id_))
+                    m, n, alpha, beta, d_C_existing, nullptr, cuda_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling failed");
                 return false;
@@ -1304,7 +1312,7 @@ namespace llaminar2
             {
                 CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::QUANTIZE_ACTIVATIONS);
                 if (!cudaQuantGemm_quantizeActivations(
-                        d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_))
+                        d_A, d_A_int8, d_scales_A, m, k, cuda_device_id_, gpu_stream_))
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] Activation quantization failed");
                     return false;
@@ -1316,7 +1324,7 @@ namespace llaminar2
                 CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUTLASS);
                 if (!cudaQuantGemm_execute(
                         d_A_int8, impl_->d_weights_int8, d_C_int32,
-                        m, n, k, cuda_device_id_))
+                        m, n, k, cuda_device_id_, gpu_stream_))
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] CUTLASS GEMM failed");
                     return false;
@@ -1329,7 +1337,7 @@ namespace llaminar2
                 CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_SCALE_OUTPUT);
                 if (!cudaQuantGemm_applyScaling(
                         d_C_int32, d_C, d_scales_A, impl_->d_scales_B,
-                        m, n, alpha, beta, d_C_existing, d_bias, cuda_device_id_))
+                        m, n, alpha, beta, d_C_existing, d_bias, cuda_device_id_, gpu_stream_))
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] Scaling with bias failed");
                     return false;

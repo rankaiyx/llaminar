@@ -198,21 +198,23 @@ namespace llaminar2
         virtual void destroyEvent(void *event, int device_id) = 0;
 
         /**
-         * @brief Record an event on the current stream
+         * @brief Record an event on the specified stream
          *
-         * Marks the current point in the default stream. All operations
-         * submitted before this call will complete before the event is signaled.
+         * Marks the current point in the given stream. All operations
+         * submitted before this call on that stream will complete before
+         * the event is signaled.
          *
          * @param event Opaque event handle from createEvent()
          * @param device_id GPU device ID (0-based)
+         * @param stream Opaque stream handle (nullptr = default stream)
          * @return true on success, false on error
          *
          * **Semantics**:
-         * - CUDA: cudaEventRecord(event, 0) on default stream
-         * - ROCm: hipEventRecord(event, 0) on default stream
+         * - CUDA: cudaEventRecord(event, stream)
+         * - ROCm: hipEventRecord(event, stream)
          * - CPU: no-op (returns true)
          */
-        virtual bool recordEvent(void *event, int device_id) = 0;
+        virtual bool recordEvent(void *event, int device_id, void *stream = nullptr) = 0;
 
         /**
          * @brief Wait for an event to complete

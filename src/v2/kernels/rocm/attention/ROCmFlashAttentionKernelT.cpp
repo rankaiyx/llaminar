@@ -17,6 +17,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/ROCmKernelProfiler.h"
 #include "../../attention/AttentionDeviceParams.h"
+#include <hip/hip_runtime.h>
 #include <cstring>
 #include <stdexcept>
 
@@ -103,6 +104,11 @@ namespace llaminar2
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::~ROCmFlashAttentionKernelT()
         {
             freeWorkspace();
+            if (h_attn_params_)
+            {
+                hipHostFree(h_attn_params_);
+                h_attn_params_ = nullptr;
+            }
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::ROCmFlashAttentionKernelT(
@@ -114,7 +120,8 @@ namespace llaminar2
               workspace_size_(other.workspace_size_),
               max_splits_(other.max_splits_),
               workspace_(other.workspace_),
-              device_ctx_(other.device_ctx_)
+              device_ctx_(other.device_ctx_),
+              h_attn_params_(other.h_attn_params_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -124,6 +131,7 @@ namespace llaminar2
             other.max_splits_ = 0;
             other.workspace_ = nullptr;
             other.device_ctx_ = nullptr;
+            other.h_attn_params_ = nullptr;
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32> &
@@ -133,6 +141,11 @@ namespace llaminar2
             if (this != &other)
             {
                 freeWorkspace();
+                if (h_attn_params_)
+                {
+                    hipHostFree(h_attn_params_);
+                    h_attn_params_ = nullptr;
+                }
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
                 partial_output_buf_ = other.partial_output_buf_;
@@ -142,6 +155,7 @@ namespace llaminar2
                 max_splits_ = other.max_splits_;
                 workspace_ = other.workspace_;
                 device_ctx_ = other.device_ctx_;
+                h_attn_params_ = other.h_attn_params_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -151,6 +165,7 @@ namespace llaminar2
                 other.max_splits_ = 0;
                 other.workspace_ = nullptr;
                 other.device_ctx_ = nullptr;
+                other.h_attn_params_ = nullptr;
             }
             return *this;
         }
@@ -372,6 +387,25 @@ namespace llaminar2
             return true;
         }
 
+        void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(
+            int kv_len, int position_offset)
+        {
+            if (!h_attn_params_)
+            {
+                hipError_t err = hipHostMalloc(&h_attn_params_,
+                                               sizeof(attention::AttentionDeviceParams),
+                                               hipHostMallocDefault);
+                if (err != hipSuccess)
+                    h_attn_params_ = nullptr;
+            }
+            if (h_attn_params_)
+            {
+                h_attn_params_->kv_len = kv_len;
+                h_attn_params_->position_offset = position_offset;
+                h_attn_params_->mask_stride = kv_len;
+            }
+        }
+
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_tensor(
             const ITensor *Q,
             const ITensor *K,
@@ -436,12 +470,43 @@ namespace llaminar2
                                                                                  << " head_dim=" << head_dim << " causal=" << causal
                                                                                  << " device_idx=" << dev);
 
-            // NOTE: device_params is intentionally nullptr. The device_params
-            // mechanism was designed for future graph-capture replay where kernel
-            // args are baked in and kv_len must be read from GPU memory. Currently
-            // no code uploads AttentionDeviceParams to the workspace buffer, so
-            // reading it would give stale/garbage kv_len. Function arguments are
-            // authoritative for non-captured stages.
+            // Wire device_params for graph-capture replay: H2D memcpy from pinned host
+            // memory is captured as a graph node. On replay, the memcpy re-reads
+            // the updated pinned values (kv_len, position_offset, mask_stride).
+            const attention::AttentionDeviceParams *d_attn_params = nullptr;
+            if (stream_ && workspace_)
+            {
+                // Lazy-allocate pinned host buffer
+                if (!h_attn_params_)
+                {
+                    hipError_t err = hipHostMalloc(&h_attn_params_,
+                                                   sizeof(attention::AttentionDeviceParams),
+                                                   hipHostMallocDefault);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
+                                  "hipHostMalloc failed for h_attn_params_: "
+                                  << hipGetErrorString(err));
+                        h_attn_params_ = nullptr;
+                    }
+                }
+                if (h_attn_params_)
+                {
+                    h_attn_params_->kv_len = kv_len;
+                    h_attn_params_->position_offset = 0;
+                    h_attn_params_->mask_stride = kv_len;
+
+                    void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+                    if (d_buf)
+                    {
+                        hipMemcpyAsync(d_buf, h_attn_params_,
+                                       sizeof(attention::AttentionDeviceParams),
+                                       hipMemcpyHostToDevice, static_cast<hipStream_t>(stream_));
+                        d_attn_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
+                    }
+                }
+            }
+
             const float *mask_ptr = nullptr;
             if (workspace_mask)
             {
@@ -452,7 +517,7 @@ namespace llaminar2
                                batch_size, seq_len, kv_len,
                                n_heads, n_kv_heads, head_dim,
                                causal, window_size, 0, dev,
-                               nullptr, mask_ptr);
+                               d_attn_params, mask_ptr);
         }
         WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspaceRequirements(
             int m, int n, int k) const

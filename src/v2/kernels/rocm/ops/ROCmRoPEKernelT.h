@@ -23,6 +23,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../../kernels/rope/RoPEDeviceParams.h"
 #include <cstdint>
 #include <stdexcept>
 
@@ -84,7 +85,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~ROCmRoPEKernelT() override = default;
+            ~ROCmRoPEKernelT() override;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -96,6 +97,9 @@ namespace llaminar2
             void setGPUStream(void *stream) override { gpu_stream_ = stream; }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            /// Update the pos_offset in pinned host memory for graph replay
+            void setDynamicPosOffset(int pos_offset) override;
 
             // ===== ITensorRoPE interface =====
             bool apply(
@@ -239,6 +243,9 @@ namespace llaminar2
             // Legacy inverse frequency cache (shared across all instances for same config)
             // Key: (head_dim << 32) | device_idx, Value: device pointer
             static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
+
+            /// Pinned host memory for graph-captured H2D copy of device params
+            rope::RoPEDeviceParams *h_device_params_ = nullptr;
         };
 
         // =========================================================================
@@ -275,7 +282,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~ROCmRoPEKernelT() override = default;
+            ~ROCmRoPEKernelT() override;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -286,6 +293,9 @@ namespace llaminar2
             // ===== GPU Stream Support (Graph Capture) =====
             void setGPUStream(void *stream) override { gpu_stream_ = stream; }
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            /// Update the pos_offset in pinned host memory for graph replay
+            void setDynamicPosOffset(int pos_offset) override;
 
             // ===== ITensorRoPE interface =====
             bool apply(
@@ -402,6 +412,9 @@ namespace llaminar2
             mutable float inv_freq_theta_ = 0.0f;
 
             static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
+
+            /// Pinned host memory for graph-captured H2D copy of device params
+            rope::RoPEDeviceParams *h_device_params_ = nullptr;
         };
 
         // =========================================================================
@@ -438,7 +451,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~ROCmRoPEKernelT() override = default;
+            ~ROCmRoPEKernelT() override;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -449,6 +462,9 @@ namespace llaminar2
             // ===== GPU Stream Support (Graph Capture) =====
             void setGPUStream(void *stream) override { gpu_stream_ = stream; }
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            /// Update the pos_offset in pinned host memory for graph replay
+            void setDynamicPosOffset(int pos_offset) override;
 
             // ===== ITensorRoPE interface =====
             bool apply(
@@ -565,6 +581,9 @@ namespace llaminar2
             mutable float inv_freq_theta_ = 0.0f;
 
             static float *getOrCreateInvFreq(int head_dim, float rope_theta, int device_idx);
+
+            /// Pinned host memory for graph-captured H2D copy of device params
+            rope::RoPEDeviceParams *h_device_params_ = nullptr;
         };
 
     } // namespace rocm

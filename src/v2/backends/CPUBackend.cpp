@@ -362,13 +362,14 @@ namespace llaminar2
         (void)device_id;
     }
 
-    bool CPUBackend::recordEvent(void *event, int device_id)
+    bool CPUBackend::recordEvent(void *event, int device_id, void *stream)
     {
         if (!event || !isValidDeviceId(device_id))
         {
             return false;
         }
 
+        (void)stream; // CPU has no streams
         // No-op for CPU - always synchronous
         return true;
     }

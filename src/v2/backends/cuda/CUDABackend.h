@@ -45,7 +45,7 @@ namespace llaminar2
         // Event operations (fine-grained synchronization)
         void *createEvent(int device_id) override;
         void destroyEvent(void *event, int device_id) override;
-        bool recordEvent(void *event, int device_id) override;
+        bool recordEvent(void *event, int device_id, void *stream = nullptr) override;
         bool waitForEvent(void *event, int device_id) override;
 
         // Memory allocation operations

@@ -273,6 +273,9 @@ namespace llaminar2
 
             void setGPUStream(void *stream) override { stream_ = stream; }
 
+            /// Update attention params in pinned host memory for graph replay
+            void setDynamicAttnParams(int kv_len, int position_offset) override;
+
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
                 int seq_len, int n_heads, int n_kv_heads, int head_dim,
@@ -418,6 +421,9 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
+            /// Pinned host memory for graph-captured H2D copy of attention device params
+            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
+
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
         };
@@ -452,6 +458,9 @@ namespace llaminar2
             CUDAFlashAttentionKernelT &operator=(CUDAFlashAttentionKernelT &&) noexcept;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            /// Update attention params in pinned host memory for graph replay
+            void setDynamicAttnParams(int kv_len, int position_offset) override;
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -551,6 +560,9 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
+            /// Pinned host memory for graph-captured H2D copy of attention device params
+            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
+
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
         };
@@ -585,6 +597,9 @@ namespace llaminar2
             CUDAFlashAttentionKernelT &operator=(CUDAFlashAttentionKernelT &&) noexcept;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
+
+            /// Update attention params in pinned host memory for graph replay
+            void setDynamicAttnParams(int kv_len, int position_offset) override;
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -683,6 +698,9 @@ namespace llaminar2
 
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
+
+            /// Pinned host memory for graph-captured H2D copy of attention device params
+            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();

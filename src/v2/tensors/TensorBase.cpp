@@ -1878,11 +1878,12 @@ namespace llaminar2
         return true;
     }
 
-    void TensorBase::mark_device_dirty_with_event()
+    void TensorBase::mark_device_dirty_with_event(void *stream)
     {
         LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] ENTRY: tensor=" << static_cast<void *>(this)
                                                                               << " name=" << (debug_name_.empty() ? "(unnamed)" : debug_name_)
-                                                                              << " gpu_device_=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none"));
+                                                                              << " gpu_device_=" << (gpu_device_.has_value() ? gpu_device_->toString() : "none")
+                                                                              << " stream=" << stream);
 
         // Mark as device dirty (standard behavior)
         // For mapped memory, both host and device stay valid
@@ -1945,7 +1946,7 @@ namespace llaminar2
                 if (device_completion_event_)
                 {
                     LOG_DEBUG("[TensorBase::mark_device_dirty_with_event] Recording event...");
-                    if (!backend->recordEvent(device_completion_event_, backend_device_id))
+                    if (!backend->recordEvent(device_completion_event_, backend_device_id, stream))
                     {
                         LOG_WARN("[TensorBase::mark_device_dirty_with_event] Failed to record event");
                     }

@@ -47,10 +47,12 @@ namespace llaminar2
          * @brief Construct with device context (Phase 4 pattern)
          * @param ctx Device context for shared handles/streams
          */
-        explicit CUDAEmbeddingKernelT(IWorkerGPUContext* ctx)
+        explicit CUDAEmbeddingKernelT(IWorkerGPUContext *ctx)
         {
-            if (!ctx) throw std::runtime_error("CUDAEmbeddingKernelT: Device context is null");
-            if (!ctx->isInitialized()) throw std::runtime_error("CUDAEmbeddingKernelT: Device context not initialized");
+            if (!ctx)
+                throw std::runtime_error("CUDAEmbeddingKernelT: Device context is null");
+            if (!ctx->isInitialized())
+                throw std::runtime_error("CUDAEmbeddingKernelT: Device context not initialized");
             device_ctx_ = ctx;
             device_idx_ = ctx->deviceOrdinal();
         }
@@ -58,10 +60,13 @@ namespace llaminar2
         ~CUDAEmbeddingKernelT() override = default;
 
         // ===== Device Context Support (Phase 4) =====
-        void setDeviceContext(IWorkerGPUContext* ctx) { device_ctx_ = ctx; }
-        IWorkerGPUContext* deviceContext() const { return device_ctx_; }
+        void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
+        IWorkerGPUContext *deviceContext() const { return device_ctx_; }
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-        void* getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+        void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+
+        // GPU stream for graph capture support
+        void setGPUStream(void *stream) override { gpu_stream_ = stream; }
 
         bool supports_device(int device_idx) const override
         {
@@ -201,7 +206,8 @@ namespace llaminar2
 
     private:
         int device_idx_ = 0;
-        IWorkerGPUContext* device_ctx_ = nullptr;
+        IWorkerGPUContext *device_ctx_ = nullptr;
+        void *gpu_stream_ = nullptr;
 
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)

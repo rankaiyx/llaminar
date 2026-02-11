@@ -27,6 +27,7 @@
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, FP16Tensor
 #include "../../../tensors/BlockStructures.h"
 #include "../../../utils/Logger.h"
+#include "../../rope/RoPEDeviceParams.h"
 #include <cstdint>
 
 namespace llaminar2
@@ -63,7 +64,7 @@ namespace llaminar2
             explicit CUDARoPEKernelT(int device_idx = 0, float rope_theta = 10000.0f)
                 : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
                   inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
-            ~CUDARoPEKernelT() override = default;
+            ~CUDARoPEKernelT() override;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -87,6 +88,9 @@ namespace llaminar2
                     256, // CUDA alignment
                     true // Required
                 });
+                // Device params buffer for graph capture
+                reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
+                                        sizeof(rope::RoPEDeviceParams), 256, true});
                 return reqs;
             }
 
@@ -105,6 +109,9 @@ namespace llaminar2
 
             // ===== GPU Stream Support (Graph Capture) =====
             void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
+            /// Update the pos_offset in pinned host memory for graph replay
+            void setDynamicPosOffset(int pos_offset) override;
 
             // ===== ITensorRoPE interface =====
             bool apply(
@@ -277,6 +284,9 @@ namespace llaminar2
             mutable bool inv_freq_initialized_;
             mutable int inv_freq_head_dim_;
             mutable float inv_freq_theta_;
+
+            /// Pinned host memory for graph-captured H2D copy of device params
+            rope::RoPEDeviceParams *h_device_params_ = nullptr;
         };
 
         // =========================================================================
@@ -313,7 +323,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~CUDARoPEKernelT() override = default;
+            ~CUDARoPEKernelT() override;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -323,6 +333,9 @@ namespace llaminar2
 
             // ===== GPU Stream Support (Graph Capture) =====
             void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
+            /// Update the pos_offset in pinned host memory for graph replay
+            void setDynamicPosOffset(int pos_offset) override;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -346,6 +359,9 @@ namespace llaminar2
                     256, // CUDA alignment
                     true // Required
                 });
+                // Device params buffer for graph capture
+                reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
+                                        sizeof(rope::RoPEDeviceParams), 256, true});
                 return reqs;
             }
 
@@ -531,6 +547,9 @@ namespace llaminar2
             mutable bool inv_freq_initialized_;
             mutable int inv_freq_head_dim_;
             mutable float inv_freq_theta_;
+
+            /// Pinned host memory for graph-captured H2D copy of device params
+            rope::RoPEDeviceParams *h_device_params_ = nullptr;
         };
 
         // =========================================================================
@@ -567,7 +586,7 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~CUDARoPEKernelT() override = default;
+            ~CUDARoPEKernelT() override;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
@@ -577,6 +596,9 @@ namespace llaminar2
 
             // ===== GPU Stream Support (Graph Capture) =====
             void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
+            /// Update pos_offset in pinned host memory for graph replay
+            void setDynamicPosOffset(int pos_offset) override;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -597,6 +619,13 @@ namespace llaminar2
                 reqs.buffers.push_back({
                     RoPEWorkspaceBuffers::INV_FREQ,
                     static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
+                    256, // CUDA alignment
+                    true // Required
+                });
+                // Device params for graph-captured H2D copy
+                reqs.buffers.push_back({
+                    RoPEWorkspaceBuffers::DEVICE_PARAMS,
+                    sizeof(rope::RoPEDeviceParams),
                     256, // CUDA alignment
                     true // Required
                 });
@@ -785,6 +814,9 @@ namespace llaminar2
             mutable bool inv_freq_initialized_;
             mutable int inv_freq_head_dim_;
             mutable float inv_freq_theta_;
+
+            /// Pinned host memory for graph-captured H2D copy of device params
+            rope::RoPEDeviceParams *h_device_params_ = nullptr;
         };
 
     } // namespace cuda

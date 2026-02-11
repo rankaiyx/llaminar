@@ -319,7 +319,8 @@ extern "C"
         const int8_t *d_weights_int8,
         int32_t *d_C_int32,
         int M, int N, int K,
-        int cuda_device_id)
+        int cuda_device_id,
+        void *stream)
     {
         // Validate pointers
         if (!d_A_int8 || !d_weights_int8 || !d_C_int32)
@@ -332,7 +333,10 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+        if (!stream)
+        {
+            CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+        }
 
         CutlassInt8Gemm gemm_op;
 
@@ -359,7 +363,11 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        cutlass::Status status = gemm_op(args);
+        // CRITICAL: CUTLASS operator() signature is (args, workspace, stream).
+        // workspace is void*, stream is cudaStream_t (also a pointer).
+        // Passing stream as 2nd arg would silently bind it as workspace!
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        cutlass::Status status = gemm_op(args, nullptr, cuda_stream);
 
         if (status != cutlass::Status::kSuccess)
         {
@@ -387,7 +395,8 @@ extern "C"
         float alpha, float beta,
         const float *d_C_existing,
         const float *d_bias,
-        int cuda_device_id)
+        int cuda_device_id,
+        void *stream)
     {
         // Validate pointers before launching kernel
         if (!d_C_int32 || !d_C_fp32 || !d_scales_A || !d_scales_B)
@@ -401,16 +410,19 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+        if (!stream)
+        {
+            CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+        }
 
         dim3 block(16, 16);
         dim3 grid((N + 15) / 16, (M + 15) / 16);
 
-        apply_scaling_kernel<<<grid, block>>>(
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        apply_scaling_kernel<<<grid, block, 0, cuda_stream>>>(
             d_C_int32, d_C_fp32, d_scales_A, d_scales_B,
             M, N, alpha, beta, d_C_existing, d_bias);
 
-        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -433,7 +445,8 @@ extern "C"
         int8_t *d_A_int8,
         float *d_scales_A,
         int M, int K,
-        int cuda_device_id)
+        int cuda_device_id,
+        void *stream)
     {
         // Validate pointers
         if (!d_A_fp32 || !d_A_int8 || !d_scales_A)
@@ -446,14 +459,17 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+        if (!stream)
+        {
+            CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+        }
 
         dim3 grid(M);
         dim3 block(std::min(K, 256));
 
-        quantize_activations_kernel<<<grid, block>>>(d_A_fp32, d_A_int8, d_scales_A, M, K);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        quantize_activations_kernel<<<grid, block, 0, cuda_stream>>>(d_A_fp32, d_A_int8, d_scales_A, M, K);
 
-        (void)cudaGetLastError();  // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

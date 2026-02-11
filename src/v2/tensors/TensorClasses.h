@@ -894,11 +894,13 @@ namespace llaminar2
          * Records an event after kernel execution so ensureOnHost() can wait on
          * just this kernel rather than doing a full device synchronization.
          *
+         * @param stream Opaque GPU stream handle where the kernel ran.
+         *               Pass the compute stream so the event is recorded on the
+         *               correct stream. nullptr = default stream (stream 0).
          * @note Call this after GPU kernels write to the tensor via gpu_data_ptr()
-         * @note The event is recorded on the default stream (stream 0)
          * @note If event recording fails, falls back to eventless behavior
          */
-        virtual void mark_device_dirty_with_event();
+        virtual void mark_device_dirty_with_event(void *stream = nullptr);
 
         /**
          * @brief Clear the device completion event without destroying it through the backend

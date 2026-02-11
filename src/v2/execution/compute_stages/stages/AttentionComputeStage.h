@@ -8,6 +8,7 @@
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
+#include "kernels/IKVCache.h"
 #include <memory>
 
 namespace llaminar2
@@ -79,16 +80,31 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
-        bool isGraphCapturable() const override { return false; }
+        bool isGraphCapturable() const override { return true; } // Device-side params buffer handles dynamic kv_len/position
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
 
         /// Target device for coherence management
 
+        /// Update position offset for cached graph reuse.
+        /// Also updates the kernel's pinned host device-params so the next
+        /// graph replay picks up the new kv_len and position_offset via
+        /// the captured H2D memcpy.
+        /// Note: updateDynamicParams is called BEFORE KVCacheAppend runs for
+        /// this step, so get_cached_tokens() returns previous step's count.
+        /// We add seq_len to get the count after appending.
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.position_offset = pos_offset;
-            (void)seq_len;
+            if (cached_kernel_ && params_.kv_cache && params_.layer_idx >= 0)
+            {
+                // Propagate current stage stream to kernel so setDynamicAttnParams
+                // can issue H2D copies on the correct (capture/replay) stream.
+                cached_kernel_->setGPUStream(gpuStream());
+                int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+                kv_len += seq_len; // This step will append seq_len tokens
+                cached_kernel_->setDynamicAttnParams(kv_len, pos_offset);
+            }
         }
 
         const Params &getParams() const { return params_; }

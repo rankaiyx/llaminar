@@ -26,6 +26,7 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include "fort.hpp"
@@ -1033,7 +1034,7 @@ namespace llaminar2
                             node->stage->setGPUStream(nullptr);
                     }
                 }
-                else
+                else if (!seg.capturable)
                 {
                     // Manual segment — execute stages on default stream (nullptr)
                     gpu_ctx->synchronize(); // Sync prior graph segment
@@ -1076,6 +1077,35 @@ namespace llaminar2
         const auto &exec_cfg = debugEnv().execution;
         const bool verify_mode = exec_cfg.gpu_graph_verify;
         const bool recapture_mode = exec_cfg.gpu_graph_recapture;
+        const bool needs_segment_sync = ctx->deviceId().is_cuda(); // CUDA needs explicit stream sync between segments
+
+        // Stream-only mode: execute all stages on capture_stream WITHOUT graph capture.
+        // Tests whether the non-default stream itself causes issues.
+        static const bool stream_only_mode = (std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY") &&
+                                              std::atoi(std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY")) != 0);
+        // Sub-mode: use default stream instead of capture_stream (control test)
+        static const bool stream_only_default = (std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT") &&
+                                                 std::atoi(std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT")) != 0);
+        if (stream_only_mode)
+        {
+            void *use_stream = stream_only_default ? nullptr : capture_stream;
+            for (auto &seg : segment_cache.segments)
+            {
+                for (const auto &stage_name : seg.stage_names)
+                {
+                    auto *node = graph.getNode(stage_name);
+                    node->stage->setGPUStream(use_stream);
+                    if (!node->stage->execute(ctx))
+                    {
+                        LOG_ERROR("[GraphExecutor] Stream-only stage failed: " << stage_name);
+                        return false;
+                    }
+                    graph.markCompleted(stage_name);
+                }
+            }
+            gpu_ctx->synchronize();
+            return true;
+        }
 
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
@@ -1199,12 +1229,9 @@ namespace llaminar2
                                         if (gpu_ptr)
                                         {
                                             graph_outputs[s].count = std::min<size_t>(8, out.rows * out.cols);
-                                            graph_outputs[s].has_gpu_ptr = true;
-#ifdef HAVE_ROCM
-                                            hipMemcpy(graph_outputs[s].values, gpu_ptr,
-                                                      graph_outputs[s].count * sizeof(float),
-                                                      hipMemcpyDeviceToHost);
-#endif
+                                            graph_outputs[s].has_gpu_ptr =
+                                                ctx->copyToHost(graph_outputs[s].values, gpu_ptr,
+                                                                graph_outputs[s].count * sizeof(float));
                                         }
                                     }
                                 }
@@ -1246,12 +1273,9 @@ namespace llaminar2
                                         if (gpu_ptr)
                                         {
                                             direct_outputs[s].count = std::min<size_t>(8, out.rows * out.cols);
-                                            direct_outputs[s].has_gpu_ptr = true;
-#ifdef HAVE_ROCM
-                                            hipMemcpy(direct_outputs[s].values, gpu_ptr,
-                                                      direct_outputs[s].count * sizeof(float),
-                                                      hipMemcpyDeviceToHost);
-#endif
+                                            direct_outputs[s].has_gpu_ptr =
+                                                ctx->copyToHost(direct_outputs[s].values, gpu_ptr,
+                                                                direct_outputs[s].count * sizeof(float));
                                         }
                                     }
                                 }
@@ -1303,6 +1327,7 @@ namespace llaminar2
                                  "[GRAPH_VERIFY] seg %d (%zu stages, %zu nodes, last=%s) seg_max_diff=%.6e",
                                  seg_idx, seg.stage_names.size(), seg.capture->nodeCount(),
                                  seg.stage_names.back().c_str(), seg_max_diff);
+                        fprintf(stderr, "%s\n", buf);
                         if (f)
                         {
                             fprintf(f, "%s\n\n", buf);
@@ -1335,6 +1360,19 @@ namespace llaminar2
                     // Mark stages completed for graph bookkeeping
                     for (const auto &stage_name : seg.stage_names)
                         graph.markCompleted(stage_name);
+
+                    // CUDA workaround: Unlike ROCm/HIP graphs which properly
+                    // order graph launches w.r.t. subsequent kernel launches on the
+                    // same stream, CUDA requires an explicit stream sync between
+                    // the last manual segment and the next graph launch. Without this,
+                    // the replayed graph may read stale data from manual stage outputs.
+                    //
+                    // Use stream-level sync (not device-wide) for minimal overhead.
+                    // ROCm doesn't need this — stream ordering alone works.
+                    if (needs_segment_sync)
+                    {
+                        gpu_ctx->synchronizeStream(capture_stream);
+                    }
                 }
             }
             else
@@ -1351,7 +1389,11 @@ namespace llaminar2
                     }
                     graph.markCompleted(stage_name);
                 }
-                // No end-of-segment sync — manual→graph transition sync handles it
+                // CUDA workaround: sync stream after manual segment before next graph
+                if (needs_segment_sync)
+                {
+                    gpu_ctx->synchronizeStream(capture_stream);
+                }
             }
 
             seg_idx++;
@@ -1784,7 +1826,7 @@ namespace llaminar2
                     phase_start = phase_end;
                 }
 
-                markOutputsDirty(outputs);
+                markOutputsDirty(outputs, node.stage->gpuStream());
                 if (profiling)
                 {
                     phase_end = std::chrono::high_resolution_clock::now();

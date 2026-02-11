@@ -21,6 +21,7 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../kernels/rope/RoPEDeviceParams.h"
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <mutex>
@@ -103,7 +104,8 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
     bool hipOps_rope_bf16_contiguous(
         uint16_t *Q,
@@ -114,7 +116,8 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
     bool hipOps_rope_fp16_contiguous(
         uint16_t *Q,
@@ -125,7 +128,8 @@ extern "C"
         int n_q_heads,
         int n_kv_heads,
         int head_dim,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
 
     // Workspace-aware inverse frequency population
     bool hipOps_rope_populate_inv_freq(
@@ -252,6 +256,27 @@ namespace llaminar2
         // ROCmRoPEKernelT<FP32> Implementation
         // =========================================================================
 
+        ROCmRoPEKernelT<ActivationPrecision::FP32>::~ROCmRoPEKernelT()
+        {
+            if (h_device_params_)
+            {
+                hipHostFree(h_device_params_);
+                h_device_params_ = nullptr;
+            }
+        }
+
+        void ROCmRoPEKernelT<ActivationPrecision::FP32>::setDynamicPosOffset(int pos_offset)
+        {
+            if (!h_device_params_)
+            {
+                hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+            }
+            if (h_device_params_)
+            {
+                h_device_params_->pos_offset = pos_offset;
+            }
+        }
+
         // IWorkspaceConsumer implementation
         WorkspaceRequirements ROCmRoPEKernelT<ActivationPrecision::FP32>::getWorkspaceRequirements(
             int m, int n, int k) const
@@ -276,6 +301,9 @@ namespace llaminar2
                 256, // HIP alignment
                 true // Required
             });
+            // Device params buffer for graph capture
+            reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
+                                    sizeof(rope::RoPEDeviceParams), 256, true});
 
             return reqs;
         }
@@ -503,7 +531,31 @@ namespace llaminar2
                 }
                 if (is_contiguous)
                 {
-                    return hipOps_rope_fp32_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+                    // For graph capture: use device params buffer so pos_offset can change between replays.
+                    // The H2D memcpy is captured in the graph; on replay it re-reads from pinned h_device_params_.
+                    const rope::RoPEDeviceParams *d_params = nullptr;
+                    if (gpu_stream_ && workspace_)
+                    {
+                        // Lazy-allocate pinned host buffer for graph-captured H2D
+                        if (!h_device_params_)
+                        {
+                            hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+                        }
+                        h_device_params_->pos_offset = pos_offset;
+
+                        d_params = static_cast<const rope::RoPEDeviceParams *>(
+                            workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS));
+                        if (d_params)
+                        {
+                            hipMemcpyAsync(const_cast<rope::RoPEDeviceParams *>(d_params),
+                                           h_device_params_,
+                                           sizeof(rope::RoPEDeviceParams),
+                                           hipMemcpyHostToDevice,
+                                           static_cast<hipStream_t>(gpu_stream_));
+                        }
+                    }
+                    return hipOps_rope_fp32_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len,
+                                                       n_heads, n_kv_heads, head_dim, dev, gpu_stream_, d_params);
                 }
             }
 
@@ -532,6 +584,27 @@ namespace llaminar2
         // ROCmRoPEKernelT<BF16> Implementation
         // =========================================================================
 
+        ROCmRoPEKernelT<ActivationPrecision::BF16>::~ROCmRoPEKernelT()
+        {
+            if (h_device_params_)
+            {
+                hipHostFree(h_device_params_);
+                h_device_params_ = nullptr;
+            }
+        }
+
+        void ROCmRoPEKernelT<ActivationPrecision::BF16>::setDynamicPosOffset(int pos_offset)
+        {
+            if (!h_device_params_)
+            {
+                hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+            }
+            if (h_device_params_)
+            {
+                h_device_params_->pos_offset = pos_offset;
+            }
+        }
+
         // IWorkspaceConsumer implementation
         WorkspaceRequirements ROCmRoPEKernelT<ActivationPrecision::BF16>::getWorkspaceRequirements(
             int m, int n, int k) const
@@ -551,6 +624,9 @@ namespace llaminar2
                                     static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
                                     256,
                                     true});
+            // Device params buffer for graph capture
+            reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
+                                    sizeof(rope::RoPEDeviceParams), 256, true});
 
             return reqs;
         }
@@ -770,7 +846,29 @@ namespace llaminar2
                 }
                 if (is_contiguous)
                 {
-                    return hipOps_rope_bf16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+                    // For graph capture: use device params buffer so pos_offset can change between replays.
+                    const rope::RoPEDeviceParams *d_params = nullptr;
+                    if (gpu_stream_ && workspace_)
+                    {
+                        if (!h_device_params_)
+                        {
+                            hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+                        }
+                        h_device_params_->pos_offset = pos_offset;
+
+                        d_params = static_cast<const rope::RoPEDeviceParams *>(
+                            workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS));
+                        if (d_params)
+                        {
+                            hipMemcpyAsync(const_cast<rope::RoPEDeviceParams *>(d_params),
+                                           h_device_params_,
+                                           sizeof(rope::RoPEDeviceParams),
+                                           hipMemcpyHostToDevice,
+                                           static_cast<hipStream_t>(gpu_stream_));
+                        }
+                    }
+                    return hipOps_rope_bf16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len,
+                                                       n_heads, n_kv_heads, head_dim, dev, gpu_stream_, d_params);
                 }
             }
 
@@ -798,6 +896,27 @@ namespace llaminar2
         // ROCmRoPEKernelT<FP16> Implementation
         // =========================================================================
 
+        ROCmRoPEKernelT<ActivationPrecision::FP16>::~ROCmRoPEKernelT()
+        {
+            if (h_device_params_)
+            {
+                hipHostFree(h_device_params_);
+                h_device_params_ = nullptr;
+            }
+        }
+
+        void ROCmRoPEKernelT<ActivationPrecision::FP16>::setDynamicPosOffset(int pos_offset)
+        {
+            if (!h_device_params_)
+            {
+                hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+            }
+            if (h_device_params_)
+            {
+                h_device_params_->pos_offset = pos_offset;
+            }
+        }
+
         // IWorkspaceConsumer implementation
         WorkspaceRequirements ROCmRoPEKernelT<ActivationPrecision::FP16>::getWorkspaceRequirements(
             int m, int n, int k) const
@@ -817,6 +936,9 @@ namespace llaminar2
                                     static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
                                     256,
                                     true});
+            // Device params buffer for graph capture
+            reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
+                                    sizeof(rope::RoPEDeviceParams), 256, true});
 
             return reqs;
         }
@@ -1034,7 +1156,29 @@ namespace llaminar2
                 }
                 if (is_contiguous)
                 {
-                    return hipOps_rope_fp16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, dev, gpu_stream_);
+                    // For graph capture: use device params buffer so pos_offset can change between replays.
+                    const rope::RoPEDeviceParams *d_params = nullptr;
+                    if (gpu_stream_ && workspace_)
+                    {
+                        if (!h_device_params_)
+                        {
+                            hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+                        }
+                        h_device_params_->pos_offset = pos_offset;
+
+                        d_params = static_cast<const rope::RoPEDeviceParams *>(
+                            workspace_->getBuffer(RoPEWorkspaceBuffers::DEVICE_PARAMS));
+                        if (d_params)
+                        {
+                            hipMemcpyAsync(const_cast<rope::RoPEDeviceParams *>(d_params),
+                                           h_device_params_,
+                                           sizeof(rope::RoPEDeviceParams),
+                                           hipMemcpyHostToDevice,
+                                           static_cast<hipStream_t>(gpu_stream_));
+                        }
+                    }
+                    return hipOps_rope_fp16_contiguous(d_Q, d_K, d_inv_freq, pos_offset, seq_len,
+                                                       n_heads, n_kv_heads, head_dim, dev, gpu_stream_, d_params);
                 }
             }
 

@@ -17,6 +17,7 @@
  */
 
 #include "CUDAHelpers.cuh"
+#include "kernels/rope/RoPEDeviceParams.h"
 #include <cmath>
 #include <cstdio>
 #include <unordered_map>
@@ -776,9 +777,11 @@ __global__ void rope_fp32_contiguous_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams *__restrict__ device_params)
 {
     const int half_dim = head_dim / 2;
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
@@ -813,7 +816,7 @@ __global__ void rope_fp32_contiguous_kernel(
         return;
 
     // ZERO COPY: Position computed on GPU
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
@@ -848,9 +851,11 @@ __global__ void rope_bf16_contiguous_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams *__restrict__ device_params)
 {
     const int half_dim = head_dim / 2;
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
@@ -884,7 +889,7 @@ __global__ void rope_bf16_contiguous_kernel(
     if (seq_idx >= seq_len)
         return;
 
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
@@ -919,9 +924,11 @@ __global__ void rope_fp16_contiguous_kernel(
     int seq_len,
     int n_q_heads,
     int n_kv_heads,
-    int head_dim)
+    int head_dim,
+    const llaminar2::rope::RoPEDeviceParams *__restrict__ device_params)
 {
     const int half_dim = head_dim / 2;
+    const int effective_pos_offset = (device_params) ? device_params->pos_offset : pos_offset;
 
     extern __shared__ float smem[];
     float *s_cos = smem;
@@ -955,7 +962,7 @@ __global__ void rope_fp16_contiguous_kernel(
     if (seq_idx >= seq_len)
         return;
 
-    int pos = pos_offset + seq_idx;
+    int pos = effective_pos_offset + seq_idx;
 
     for (int i = threadIdx.x; i < half_dim; i += blockDim.x)
     {
@@ -1071,7 +1078,7 @@ extern "C"
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1104,7 +1111,7 @@ extern "C"
         rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1122,7 +1129,8 @@ extern "C"
         int n_kv_heads,
         int head_dim,
         int device_idx,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params)
     {
         if (!d_inv_freq)
             return false;
@@ -1136,9 +1144,9 @@ extern "C"
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
         rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
-            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, device_params);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1179,7 +1187,7 @@ extern "C"
             rope_bf16_kernel_v3<<<num_blocks, threads_per_block, smem_size, stream>>>(
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1212,7 +1220,7 @@ extern "C"
         rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1230,7 +1238,8 @@ extern "C"
         int n_kv_heads,
         int head_dim,
         int device_idx,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params)
     {
         if (!d_inv_freq)
             return false;
@@ -1244,9 +1253,9 @@ extern "C"
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
         rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
-            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, device_params);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1287,7 +1296,7 @@ extern "C"
             rope_fp16_kernel_v3<<<num_blocks, threads_per_block, smem_size, stream>>>(
                 Q, d_inv_freq, position_ids, seq_len, n_heads, head_dim);
         }
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1320,7 +1329,7 @@ extern "C"
         rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1338,7 +1347,8 @@ extern "C"
         int n_kv_heads,
         int head_dim,
         int device_idx,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params)
     {
         if (!d_inv_freq)
             return false;
@@ -1352,9 +1362,9 @@ extern "C"
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
         rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, stream>>>(
-            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, device_params);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         return err == cudaSuccess;
     }
@@ -1476,7 +1486,7 @@ extern "C"
         // Synchronize to ensure kernel completes before returning
         cudaDeviceSynchronize();
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1571,7 +1581,7 @@ extern "C"
                 Q, d_inv_freq, d_position_ids, seq_len, n_heads, head_dim);
         }
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1664,7 +1674,7 @@ extern "C"
                 Q, d_inv_freq, d_position_ids, seq_len, n_heads, head_dim);
         }
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1716,7 +1726,7 @@ extern "C"
         rope_fp32_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1752,7 +1762,7 @@ extern "C"
         rope_bf16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1788,7 +1798,7 @@ extern "C"
         rope_fp16_decode_kernel<<<total_blocks, threads_per_block, smem_size>>>(
             Q, K, d_inv_freq, pos, n_heads, n_kv_heads, head_dim);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1812,7 +1822,9 @@ extern "C"
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        void *stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params)
     {
         cudaSetDevice(device_idx);
 
@@ -1826,10 +1838,11 @@ extern "C"
 
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
-        rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
-            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        rope_fp32_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, cuda_stream>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, device_params);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1849,7 +1862,9 @@ extern "C"
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        void *stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params)
     {
         cudaSetDevice(device_idx);
 
@@ -1863,10 +1878,11 @@ extern "C"
 
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
-        rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
-            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        rope_bf16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, cuda_stream>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, device_params);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1886,7 +1902,9 @@ extern "C"
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        int device_idx)
+        int device_idx,
+        void *stream,
+        const llaminar2::rope::RoPEDeviceParams *device_params)
     {
         cudaSetDevice(device_idx);
 
@@ -1900,10 +1918,11 @@ extern "C"
 
         int total_blocks = seq_len * (n_heads + (K ? n_kv_heads : 0));
 
-        rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size>>>(
-            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        rope_fp16_contiguous_kernel<<<total_blocks, threads_per_block, smem_size, cuda_stream>>>(
+            Q, K, d_inv_freq, pos_offset, seq_len, n_heads, n_kv_heads, head_dim, device_params);
 
-        (void)cudaGetLastError();  // Clear stale errors
+        (void)cudaGetLastError(); // Clear stale errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

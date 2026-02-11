@@ -80,6 +80,9 @@ namespace llaminar2
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+
             // ===== ITensorRMSNorm interface =====
             bool apply(
                 const float *input, const float *weight, float *output,
@@ -155,6 +158,7 @@ namespace llaminar2
         private:
             int device_idx_ = 0;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
         // =========================================================================
@@ -187,6 +191,9 @@ namespace llaminar2
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
 
             // ===== ITensorRMSNorm interface =====
             bool apply(
@@ -265,6 +272,7 @@ namespace llaminar2
         private:
             int device_idx_ = 0;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
         // =========================================================================
@@ -297,6 +305,9 @@ namespace llaminar2
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+
+            // GPU stream for graph capture support
+            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
 
             // ===== ITensorRMSNorm interface =====
             bool apply(
@@ -375,6 +386,7 @@ namespace llaminar2
         private:
             int device_idx_ = 0;
             IWorkerGPUContext *device_ctx_ = nullptr;
+            void *gpu_stream_ = nullptr;
         };
 
     } // namespace cuda
