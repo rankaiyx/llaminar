@@ -590,12 +590,11 @@ namespace llaminar2
             forward_cache_.token_ids[0] = effective_input.token_ids[0];
             forward_cache_.position_ids[0] = effective_input.position_ids[0];
 
-            // For GPU graph replay: set the capture stream on all stages BEFORE
-            // updating dynamic params. This allows setDynamicPosOffset() and
-            // setDynamicAttnParams() to issue H2D copies on the capture stream,
-            // ensuring device buffers have current values before graph launch.
+            // For GPU graph replay: set the capture stream on all stages ONCE.
+            // The capture_stream never changes between decode steps, so after the
+            // first pass we skip this 339-stage loop entirely.
             void *replay_stream = forward_cache_.segment_cache.capture_stream;
-            if (replay_stream)
+            if (replay_stream && !forward_cache_.gpu_stream_applied)
             {
                 const auto &order = forward_cache_.graph->getExecutionOrder();
                 for (const auto &node_name : order)
@@ -604,16 +603,36 @@ namespace llaminar2
                     if (node && node->stage)
                         node->stage->setGPUStream(replay_stream);
                 }
+                forward_cache_.gpu_stream_applied = true;
             }
 
-            // Update position-dependent params in all cached stages
-            // (RoPEStage.pos_offset, AttentionComputeStage.position_offset, etc.)
-            updateCachedGraphParams(*forward_cache_.graph,
-                                    effective_input.position_offset,
-                                    effective_input.seq_len);
+            // Update position-dependent params using cached stage pointers.
+            // Only ~4 stages override updateDynamicParams() — avoids iterating
+            // all ~339 stages with hash lookups on every decode step.
+            if (!forward_cache_.dynamic_param_stages_cached)
+            {
+                forward_cache_.dynamic_param_stages.clear();
+                const auto &order = forward_cache_.graph->getExecutionOrder();
+                for (const auto &node_name : order)
+                {
+                    ComputeNode *node = forward_cache_.graph->getNode(node_name);
+                    if (node && node->stage && node->stage->hasDynamicParams())
+                        forward_cache_.dynamic_param_stages.push_back(node->stage.get());
+                }
+                forward_cache_.dynamic_param_stages_cached = true;
+            }
+            for (auto *stage : forward_cache_.dynamic_param_stages)
+            {
+                stage->updateDynamicParams(effective_input.position_offset,
+                                           effective_input.seq_len);
+            }
 
-            // Reset execution state (clear completion flags, preserve stages)
-            forward_cache_.graph->reset();
+            // Skip graph reset when Phase 3 replay is active — Phase 3 doesn't
+            // call markCompleted(), so all flags are already false from last reset.
+            if (!forward_cache_.phase3_active)
+            {
+                forward_cache_.graph->reset();
+            }
 
             output = forward_cache_.output;
 
@@ -676,8 +695,17 @@ namespace llaminar2
                             forward_cache_.gpu_stream,
                             forward_cache_.gpu_ctx);
 
+                        // Phase 3 replay doesn't call markCompleted(), so we can
+                        // skip graph.reset() on subsequent steps.
+                        if (success && forward_cache_.segment_cache.initialized &&
+                            !forward_cache_.segment_cache.needs_capture)
+                        {
+                            forward_cache_.phase3_active = true;
+                        }
+
                         if (!success)
                         {
+                            forward_cache_.phase3_active = false;
                             LOG_WARN("[DeviceGraphOrchestrator] Segmented graph failed, falling back to fast decode");
                             forward_cache_.graph->reset();
                             success = executor_.executeFastDecode(

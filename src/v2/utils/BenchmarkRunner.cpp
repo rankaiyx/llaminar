@@ -113,6 +113,7 @@ namespace llaminar2
     {
         Sampler sampler(42); // Fixed seed for reproducibility
         std::string generated_text;
+        generated_text.reserve(n_tokens * 4); // Pre-allocate ~4 bytes/token to avoid reallocs
         int tokens_generated = 0;
 
         // Sampler profiling (enabled when LLAMINAR_PROFILING=1)

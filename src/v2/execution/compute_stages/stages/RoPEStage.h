@@ -73,6 +73,7 @@ namespace llaminar2
         /// Update position offset for cached graph reuse.
         /// Also updates the kernel's pinned host device-params so the next
         /// graph replay picks up the new pos_offset via the captured H2D memcpy.
+        bool hasDynamicParams() const override { return true; }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.pos_offset = pos_offset;

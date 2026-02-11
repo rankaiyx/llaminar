@@ -109,6 +109,7 @@ namespace llaminar2
             params_.position_offset = pos_offset;
             (void)seq_len;
         }
+        bool hasDynamicParams() const override { return true; }
 
         const Params &getParams() const { return params_; }
 

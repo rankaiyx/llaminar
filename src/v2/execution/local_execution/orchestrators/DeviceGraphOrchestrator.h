@@ -2002,6 +2002,21 @@ namespace llaminar2
             // Pre-computed collective stage names for fast decode intercept
             std::unordered_set<std::string> collective_nodes;
 
+            // Pre-cached pointers to stages that override updateDynamicParams().
+            // Only ~4 stages (RoPE, Attention, FusedAttention, KVCacheAppend) need
+            // updating — avoids iterating all ~339 stages with hash lookups each step.
+            std::vector<IComputeStage *> dynamic_param_stages;
+            bool dynamic_param_stages_cached = false;
+
+            // Tracks whether setGPUStream has been applied to all stages.
+            // The capture_stream never changes once set, so we skip the
+            // 339-stage loop on subsequent decode steps.
+            bool gpu_stream_applied = false;
+
+            // Tracks whether Phase 3 graph replay is active (no markCompleted calls),
+            // allowing us to skip the 339-node graph.reset() since flags are already clear.
+            bool phase3_active = false;
+
             /// GPU graph capture/replay for eliminating per-kernel launch overhead
             std::unique_ptr<IGPUGraphCapture> gpu_graph;
 
@@ -2038,6 +2053,10 @@ namespace llaminar2
                 token_ids.clear();
                 position_ids.clear();
                 collective_nodes.clear();
+                dynamic_param_stages.clear();
+                dynamic_param_stages_cached = false;
+                gpu_stream_applied = false;
+                phase3_active = false;
             }
         };
 

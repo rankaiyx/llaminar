@@ -580,6 +580,15 @@ namespace llaminar2
         }
 
         /**
+         * @brief Returns true if this stage overrides updateDynamicParams().
+         *
+         * Used by DeviceGraphOrchestrator to precompute a list of stages
+         * needing per-step parameter updates, avoiding iteration over all
+         * ~339 stages with hash lookups on every decode step.
+         */
+        virtual bool hasDynamicParams() const { return false; }
+
+        /**
          * @brief Called after a captured GPU graph segment is replayed.
          *
          * This method is invoked by GraphExecutor after launching a graph segment

@@ -76,6 +76,7 @@ namespace llaminar2
         {
             return params_.kv_cache && params_.kv_cache->isGraphCaptureReady();
         }
+        bool hasDynamicParams() const override { return true; }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.seq_len = seq_len;

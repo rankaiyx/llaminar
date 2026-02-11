@@ -93,6 +93,7 @@ namespace llaminar2
         /// Note: updateDynamicParams is called BEFORE KVCacheAppend runs for
         /// this step, so get_cached_tokens() returns previous step's count.
         /// We add seq_len to get the count after appending.
+        bool hasDynamicParams() const override { return true; }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.position_offset = pos_offset;
