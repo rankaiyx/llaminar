@@ -1,0 +1,687 @@
+# VNNI-Quant Kernel Proposal
+
+## Overview
+
+This document describes a new VNNI-style compact-weight kernel and repacker that:
+- Preserves VNNI-style coalesced access patterns.
+- Preserves the existing grid-level K-parallel reduction (int32 atomicAdd).
+- Avoids expanding weights to full INT8 size for <= 4-bit formats.
+- Supports Q4*, IQ4*, Q3*, IQ3*, Q2*, IQ2*, Q1*, IQ1*.
+
+The main idea is to retain compact payload bits (1-4 bits per weight) and add a
+per-block int8 ratio so that on-the-fly reconstructed int8 weights can be used
+with sdot4 and int32 accumulation. The per-column floating scale is applied via
+existing epilogue logic (applyScaling), exactly like the current INT8 VNNI path.
+
+**Initial scope**: Phase 1 targets IQ4_NL and Q4_0 only (simple 32-element
+blocks with a single FP16 scale). K-quant formats (Q4_K, Q6_K) and
+lower-bitwidth formats (3/2/1-bit) are deferred to Phase 2 after the 4-bit path
+is validated end-to-end.
+
+
+### Relationship to existing compact IQ4_NL GEMV
+
+The codebase already has `gemv_int8_iq4nl_fp32_kernel_t` which operates on
+compact IQ4_NL blocks without INT8 expansion, using FP32 accumulation. The
+ratio-VNNI kernel **supersedes** this path for decode because it provides:
+
+- VNNI-interleaved coalescing (vs sequential block access)
+- Grid-level K-parallelism via `blockIdx.y` (vs single-block)
+- INT8 sdot4 accumulation (vs FP32 FMA)
+
+Once ratio-VNNI is validated via parity tests, the existing
+`gemv_int8_iq4nl_fp32_kernel_t` will be deprecated for M=1 decode. The compact
+IQ4_NL block upload (`d_weights_native`) can also be removed from
+`ROCmPackedWeights`, reducing device memory further.
+
+
+### Bandwidth and memory savings
+
+| Format | Current INT8 VNNI | Ratio-VNNI | VRAM Savings |
+|--------|-------------------|------------|--------------|
+| 4-bit (IQ4_NL, Q4_0) | 8 bits/weight | ~4.25 bits/weight (16B payload + 1B ratio / 32 elts) | **1.88×** |
+| 3-bit | 8 bits/weight | ~3.25 bits/weight (12B + 1B / 32) | **2.46×** |
+| 2-bit | 8 bits/weight | ~2.25 bits/weight (8B + 1B / 32) | **3.56×** |
+| 1-bit | 8 bits/weight | ~1.25 bits/weight (4B + 1B / 32) | **6.40×** |
+
+For a 7B IQ4_NL model on MI50 (16GB VRAM), weight VRAM drops from ~6.2GB
+(INT8 VNNI) to ~3.3GB, freeing ~2.9GB for KV cache or larger models.
+
+
+### Compute vs bandwidth analysis (MI50 gfx906)
+
+Decode GEMV is bandwidth-bound. The ratio-VNNI kernel shifts the balance:
+
+**Per sdot4 group (4 weights)**:
+- INT8 VNNI: ~1 cycle (load → sdot4)
+- Ratio-VNNI: ~8-10 cycles (decode nibbles + ratio multiply + pack + sdot4)
+
+**3584×3584 projection (Wo/Q) at M=1**:
+- Compute at ~8 cycles/4MADs: `3584 × 3584 / 4 × 8 / 1.5GHz ≈ 17μs`
+- Bandwidth (ratio-VNNI): `~6.8MB / 480 GB/s ≈ 14μs`
+- **Balanced** — ideal GPU utilization, not compute-bottlenecked
+
+**18944×3584 projection (FFN Down) at M=1**:
+- Compute: `~90μs`
+- Bandwidth: `~73μs`
+- Still bandwidth-dominated for large matrices
+
+**Expected decode speedup**: ~1.8-1.9× for 4-bit formats (bandwidth reduction
+translates nearly linearly since the kernel remains bandwidth-bound or balanced).
+
+
+## Diagrams
+
+### Dataflow (repacker + kernel)
+
+```
+Quantized weights
+    (Q4/Q3/Q2/Q1, IQ*)
+                    |
+                    |  repack_ratio_vnni()
+                    v
+    +---------------------------+
+    | Ratio-VNNI container      |
+    | - payload[block][N][..]   |
+    | - ratio[block][N] (int8)  |
+    | - col_scale[N] (float)    |
+    +---------------------------+
+                    |
+                    |  decode GEMV (M=1)
+                    v
+    +---------------------------+
+    | grid_kpar kernel          |
+    | - sdot4 -> int32 acc      |
+    | - atomicAdd(int32)        |
+    +---------------------------+
+                    |
+                    |  applyScaling
+                    v
+    +---------------------------+
+    | FP32 output               |
+    +---------------------------+
+```
+
+### VNNI-style interleave by N (coalesced reads)
+
+```
+payload layout (4-bit example, 32 weights per block)
+
+    block b = 0
+    +------------------------------------------------------------+
+    | N=0 | N=1 | N=2 | ... | N=63 | N=64 | N=65 | ...           |
+    | 16B | 16B | 16B |     | 16B  | 16B  | 16B  |               |
+    +------------------------------------------------------------+
+
+    ratio layout
+    +------------------------------------------------------------+
+    | N=0 | N=1 | N=2 | ... | N=63 | N=64 | N=65 | ...           |
+    | 1B  | 1B  | 1B  |     | 1B   | 1B   | 1B   |               |
+    +------------------------------------------------------------+
+
+Each wavefront reads consecutive N values, producing coalesced loads.
+```
+
+### Kernel equivalence to INT8 VNNI grid_kpar
+
+```
+Existing INT8 VNNI grid_kpar:
+    a_int8 + b_int8_vnni -> sdot4 -> int32 acc -> atomicAdd
+
+Ratio-VNNI grid_kpar:
+    a_int8 + (payload + ratio + LUT)
+                    -> reconstructed int8 -> sdot4 -> int32 acc -> atomicAdd
+
+Epilogue (both): applyScaling(d_C_int32, scaleA, col_scale)
+```
+
+
+## Part 1: Repacker
+
+### 1a) Support for 4-bit quantized formats (Q4*, IQ4*)
+
+Target block size is 32 weights. All 4-bit formats can be normalized to the same
+payload layout: 16 bytes per block (two 4-bit values per byte). The repacker
+will:
+
+1) Extract the 16 nibble bytes for each 32-weight block, without expanding to
+   INT8.
+2) Compute a per-column scale S_col[n] and a per-block ratio r_b (int8).
+3) Store payload and ratio in a VNNI-style interleaved layout by N.
+
+Output layout:
+- payload: [blocks][N][16]
+- ratio:   [blocks][N]
+- col_scale: [N]
+
+Examples:
+- Q4_0: payload is already nibble-packed (symmetric). Ratio is derived from
+  block scale and S_col[n].
+- IQ4_NL: payload is nibble indices into the IQ4 LUT. Ratio uses the block
+  scale and S_col[n].
+- Q4_1 (asymmetric): see Section 1e for zero-point handling.
+- IQ4_XS, Q4_K: deferred to Phase 2 (K-quant sub-block scale extraction).
+
+
+### 1b) Support for 3-bit quantized formats (Q3*, IQ3*)
+
+3-bit formats are supported by packing 32 values into 12 bytes (96 bits) per
+block. The repacker keeps the payload in compact 3-bit form and uses a ratio
+byte to scale the decoded int8 values.
+
+Output layout:
+- payload: [blocks][N][12]
+- ratio:   [blocks][N]
+- col_scale: [N]
+
+Format handling:
+- Q3*: decode bits to signed integer levels (format-specific), then apply ratio
+  and sdot4.
+- IQ3*: decode bits to IQ3 LUT indices, then apply ratio and sdot4.
+
+
+### 1c) Support for 2-bit quantized formats (Q2*, IQ2*)
+
+2-bit formats use 8 bytes per 32-weight block. These can be stored as a compact
+payload without expansion.
+
+Output layout:
+- payload: [blocks][N][8]
+- ratio:   [blocks][N]
+- col_scale: [N]
+
+Format handling:
+- Q2*: decode 2-bit levels to signed values (format-specific), then apply ratio.
+- IQ2*: decode indices with IQ2 LUT and optional sign tables. Ratio then applies.
+
+Some Q2_K/IQ2 formats use sub-block scale/mins. In that case, the repacker
+stores per-subblock ratio and uses the correct sub-block during reconstruction.
+This is still compact because the ratio is 1 byte per sub-block.
+
+
+### 1d) Support for 1-bit quantized formats (Q1*, IQ1*)
+
+1-bit formats pack 32 values into 4 bytes. The repacker keeps the payload in
+compact form, and uses a ratio byte per block.
+
+Output layout:
+- payload: [blocks][N][4]
+- ratio:   [blocks][N]
+- col_scale: [N]
+
+Format handling:
+- Q1*: decode 1-bit to {-1,+1} or format-specific levels.
+- IQ1*: decode with IQ1 LUT and sign rules. Ratio applies after decode.
+
+
+### 1e) Asymmetric format handling (Q4_1, Q5_1)
+
+Asymmetric formats like Q4_1 have a per-block `min` (zero-point) in addition to
+`scale`. The weight reconstruction is:
+
+$w[k] = scale_b \cdot decoded_k + min_b$
+
+The ratio factorization handles the scale term as usual. The `min` term requires
+a separate per-block int8 value `min_ratio` and a per-column `col_min`:
+
+- `col_min[n] = max_b(|min_b|)` over blocks in column n
+- `min_ratio_b = round(clamp(min_b / col_min[n], -1, 1) * 127)`
+
+The kernel reconstructs `min` as `col_min[n] * min_ratio_b / 127` and adds it
+to each decoded element before sdot4. This adds one extra int8 load per block
+and one FP32 multiply in the epilogue.
+
+**Extended container for asymmetric formats:**
+- payload: `[blocks][N][payload_bytes]`
+- ratio: `[blocks][N]` (scale ratio)
+- min_ratio: `[blocks][N]` (zero-point ratio, only when `has_min=1`)
+- col_scale: `[N]`
+- col_min: `[N]` (only when `has_min=1`)
+
+The `RatioVNNIHeader.has_min` flag gates the extra loads and epilogue cost. For
+symmetric formats (Q4_0, IQ4_NL), `min_ratio` and `col_min` are not allocated.
+
+**Note**: Asymmetric format support is deferred to Phase 2. Phase 1 targets
+only symmetric formats (Q4_0, IQ4_NL).
+
+
+### Common ratio scale computation
+
+For each column n:
+- Compute S_col[n] = max_b(|scale_b|) over blocks in that column.
+- For each block b, compute:
+  - r_b = round( clamp(scale_b / S_col[n], -1, 1) * 127 )
+  - Store r_b as int8.
+
+The ratio allows reconstruction of per-block scale on the fly, while keeping the
+col_scale vector compatible with the existing applyScaling epilogue.
+
+**MANDATORY: 128/127 compensation factor.** The kernel reconstructs the per-block
+scale as `r_b / 128` (via `>> 7`), but `r_b` was computed with a denominator of
+127. Without compensation, this introduces a systematic -0.78% scale bias per
+block that compounds across 24+ layers. To correct this, the repacker applies:
+
+$S_{col}[n] := S_{col}[n] \cdot (128 / 127)$
+
+This ensures that `S_col[n] * (r_b >> 7) ≈ S_col_original[n] * r_b / 127`
+exactly, cancelling the integer division mismatch. The compensation is applied
+once during repacking and has zero runtime cost.
+
+
+### Repacker pseudo-code (format-agnostic)
+
+```cpp
+struct RatioVNNIHeader {
+    uint8_t bitwidth;       // 1,2,3,4
+    uint8_t codebook_id;    // 0 = linear, 1 = IQ1, 2 = IQ2, 3 = IQ3, 4 = IQ4
+    uint8_t has_min;        // 1 if asymmetric min/zero-point is used
+    uint8_t block_size;     // 32 (simple formats) or sub-block size for K-quants
+    uint16_t lut_entries;   // LUT size (0 for linear decode)
+    uint16_t reserved;
+};
+
+void repack_ratio_vnni(
+    const TensorBase* src,
+    uint8_t* dst_payload,
+    int8_t* dst_ratio,
+    float* dst_col_scale,
+    RatioVNNIHeader* hdr,
+    int N, int K)
+{
+    // Determine bitwidth, codebook_id from src->native_type()
+    // Compute blocks_per_row based on bitwidth and block size
+
+    // Pass 1: compute col scales
+    for (int n = 0; n < N; ++n) {
+        float max_abs = 0.0f;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            float scale_b = get_block_scale(src, n, b);
+            max_abs = std::max(max_abs, std::abs(scale_b));
+        }
+        dst_col_scale[n] = (max_abs > 0.0f) ? max_abs : 1.0f;
+    }
+
+    // Apply mandatory 128/127 compensation to col_scale
+    for (int n = 0; n < N; ++n) {
+        dst_col_scale[n] *= (128.0f / 127.0f);
+    }
+
+    // Pass 2: store payload + ratio interleaved by N
+    // Use IQuantizedTileAccessor to access native blocks directly,
+    // avoiding the FP32 dequant→requant round-trip.
+    for (int n = 0; n < N; ++n) {
+        const float inv_col = 127.0f / (dst_col_scale[n] * (127.0f / 128.0f));
+        for (int b = 0; b < blocks_per_row; ++b) {
+            PackedBlock pb;
+            unpack_block_to_packed(src, n, b, pb);
+
+            const int8_t r = static_cast<int8_t>(
+                std::round(std::clamp(pb.scale * inv_col, -127.0f, 127.0f)));
+
+            dst_ratio[b * N + n] = r;
+            write_payload_interleaved(dst_payload, b, n, pb);
+        }
+    }
+}
+```
+
+
+## Part 2: Kernel
+
+### 2a) How it supports all formats and LUTs
+
+The kernel supports all formats by decoding the compact payload according to
+bitwidth + codebook_id. A single kernel template can branch on:
+- bitwidth: 1, 2, 3, 4
+- codebook_id: linear vs IQ LUT
+- optional min/zero-point (asymmetric formats)
+
+The ratio byte r_b is always applied to the decoded int8 value before sdot4.
+Thus, all formats map to the same int8 sdot4 accumulation path.
+
+Required LUTs:
+- IQ4: kvalues_iq4nl_i8 (16 entries)
+- IQ3: kvalues_iq3* (format-specific tables)
+- IQ2: kvalues_iq2* (format-specific tables + optional sign tables)
+- IQ1: kvalues_iq1* (format-specific tables)
+
+These LUTs already exist in IQQuantTables.h and can be mirrored into HIP
+constant memory for fast access.
+
+**Constant memory budget (gfx906: 64KB `__constant__` cache)**:
+
+| Format | LUT Size | Entries | Fits in L1 Constant? |
+|--------|----------|---------|---------------------|
+| IQ4_NL | 16 bytes | 16 × int8 | Yes (trivially) |
+| IQ4_XS | 16 bytes | 16 × int8 | Yes |
+| IQ3_S | 256 bytes | 256 × int8 | Yes |
+| IQ3_XXS | 256 bytes | 256 × int8 | Yes |
+| IQ2_XXS | ~2 KB | 256 × 8 grid + sign tables | Yes |
+| IQ2_XS | ~2 KB | 256 × 8 grid + sign tables | Yes |
+| IQ2_S | ~2 KB | 256 × 8 grid + sign tables | Yes |
+| IQ1_S | ~4 KB | grid indices + sign permutation | Yes |
+| IQ1_M | ~4 KB | grid indices + sign permutation | Yes |
+| **Total (all formats loaded)** | **~15 KB** | | **Yes (< 64KB limit)** |
+
+All IQ format LUTs fit comfortably within gfx906's constant cache. Phase 1
+(IQ4_NL only) uses just 16 bytes.
+
+
+### 2b) Algorithm and equivalence to grid_kpar int32 atomicAdd
+
+#### High-level algorithm
+
+For each block (split across blockIdx.y for K-parallelism):
+1) Load activation int8 values (already quantized).
+2) Load compact payload bits for weights (coalesced by N).
+3) Decode payload bits into int8 values using LUT or linear mapping.
+4) Apply per-block ratio r_b (int8) to decoded values to get int8 weights.
+5) Accumulate dot products in int32 using sdot4.
+6) Use atomicAdd to write into int32 output buffer.
+
+This preserves the existing behavior of the INT8 VNNI grid_kpar kernel:
+- Same block and grid structure.
+- Same int32 accumulators.
+- Same atomicAdd reduction.
+- Same applyScaling epilogue with scaleA and col_scale.
+
+#### Mathematical equivalence
+
+Let decoded weight be:
+
+$w[k] = scale_b \cdot \text{decode}(payload_k)$
+
+We factor:
+
+$scale_b = S_{col}[n] \cdot r_b / 127$
+
+Then:
+
+$w[k] \approx S_{col}[n] \cdot (r_b / 127) \cdot \text{decode}(payload_k)$
+
+Define:
+
+$w'[k] = \text{round}((r_b / 127) \cdot \text{decode}(payload_k))$
+
+Then the kernel accumulates:
+
+$acc[n] = \sum_k a_{int8}[k] \cdot w'[k]$
+
+The epilogue applies:
+
+$out[n] = acc[n] \cdot scaleA \cdot S_{col}[n]$
+
+This matches the original quantization semantics, with only the expected
+rounding error from the ratio scaling step (no worse than typical INT8
+requantization).
+
+
+### Kernel pseudo-code (grid_kpar)
+
+```cpp
+template<int TILE_N, int CPT>
+__global__ void gemv_ratio_vnni_kpar_kernel(
+    const int8_t*  d_A_int8,   // [K]
+    const uint8_t* d_payload,  // compact bits (layout depends on bitwidth)
+    const int8_t*  d_ratio,    // [blocks][N]
+    int32_t*       d_C_int32,  // [N]
+    int N, int K, int kblocks,
+    RatioVNNIHeader hdr)
+{
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const int k_block = blockIdx.y;
+    if (n_base >= N) return;
+
+    const int blocks_per_row = K / 32;
+    const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
+    const int b_start = k_block * b_per;
+    const int b_end = min(b_start + b_per, blocks_per_row);
+
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+    for (int b = b_start; b < b_end; ++b)
+    {
+        const int32_t* a4 = reinterpret_cast<const int32_t*>(d_A_int8 + b * 32);
+
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            if (n >= N) continue;
+
+            const int8_t r = d_ratio[b * N + n];
+            // Decode payload -> int8 weights (4 at a time)
+            for (int g = 0; g < 8; ++g)
+            {
+                const int32_t a_packed = a4[g];
+                const int32_t w_packed = decode_payload_to_packed_i8(
+                    d_payload, hdr, b, n, g, r);
+                acc[c] = __builtin_amdgcn_sdot4(a_packed, w_packed, acc[c], false);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+        if (n_base + c < N)
+            atomicAdd(&d_C_int32[n_base + c], acc[c]);
+}
+```
+
+#### decode_payload_to_packed_i8
+
+For each bitwidth, decode 4 values from the payload into a packed int32 of 4
+int8 weights. The function reads only the bytes needed for the current group of
+4 elements, not the entire block.
+
+**4-bit (Phase 1)**:
+- Read 2 bytes from `payload[b][n][g*2 .. g*2+1]` (groups g=0..7, each 2 bytes
+  covers 4 nibbles)
+- Extract nibbles: `idx = (byte >> (4 * (i & 1))) & 0x0F`
+- For IQ4_NL: LUT lookup → `decoded = kvalues_iq4nl_i8[idx]`
+- For Q4_0 (linear): `decoded = (int8_t)(idx - 8)` (symmetric around 0)
+- Apply ratio: `w = (int8_t)((ratio * decoded + 64) >> 7)`
+- Pack 4 int8 into int32: `(w0) | (w1<<8) | (w2<<16) | (w3<<24)`
+
+**3-bit (Phase 2)**: Read from 12-byte block payload. For group g (4 values
+starting at element `g*4`), extract the specific 3-bit fields spanning at most
+2 bytes. NOT reading all 12 bytes per group — only the 2-3 bytes that contain
+the target 12 bits.
+
+**2-bit (Phase 2)**: Read 1 byte per group (4 × 2-bit = 8 bits = 1 byte).
+
+**1-bit (Phase 2)**: Read 1 byte per 2 groups (4 × 1-bit = 4 bits per group,
+8 groups share 4 bytes total).
+
+The ratio is applied as:
+
+```
+int8_t w = (int8_t)((ratio * decoded + 64) >> 7);
+```
+
+The `+ 64` provides rounding (half of 128). The `>> 7` divides by 128, which
+combined with the mandatory 128/127 compensation on `S_col`, exactly
+reconstructs the original per-block scale.
+
+This keeps weights in int8 and preserves int32 accumulation.
+
+
+## Part 3: Prefill Strategy (M > 1)
+
+The ratio-VNNI layout is optimized for decode (M=1 GEMV). For prefill (M > 1),
+CK GEMM requires row-major INT8 weights. Three strategies were considered:
+
+| Strategy | Description | Memory | Prefill Overhead |
+|----------|-------------|--------|-----------------|
+| A: Dual storage | Keep ratio-VNNI + INT8 VNNI on device | No savings during prefill | None |
+| B: Decode-on-fly | Ratio-VNNI → expand to row-major INT8 in workspace scratch | Full savings | ~65-200μs per projection |
+| C: Ratio-VNNI GEMM | Batch sdot4 with compact weights for M>1 | Full savings | Major kernel complexity |
+
+**Selected: Strategy B (decode-on-fly)**.
+
+The existing `d_B_rowmajor_scratch` workspace (sized to `max(N×K)` across all
+kernels, ~65MB for FFN Gate/Up) is reused. A new device kernel
+`expand_ratio_vnni_to_rowmajor()` decodes compact payload + ratio into INT8
+row-major format in the workspace buffer before each CK GEMM call.
+
+The expansion cost is amortized over the prefill sequence length (typically
+128-2048 tokens), making it negligible per-token. For a 3584×3584 projection,
+the expansion produces ~12.3MB of INT8 data — well within the 65MB scratch
+budget.
+
+```
+Prefill path:
+    ratio-VNNI (on device)
+        |
+        | expand_ratio_vnni_to_rowmajor() [device kernel]
+        v
+    INT8 row-major (in workspace scratch)
+        |
+        | CK GEMM (existing path)
+        v
+    FP32 output
+```
+
+This preserves the full VRAM savings of ratio-VNNI while reusing the existing
+CK GEMM infrastructure for prefill without modification.
+
+
+## Summary
+
+- The repacker is format-agnostic: it outputs the same ratio-VNNI container for
+  any <=4-bit format.
+- The kernel is grid_kpar compatible and keeps int32 atomicAdd.
+- The formats differ only in how their payload bits decode to int8 values, which
+  is handled by LUTs or linear decode paths.
+- No full INT8 expansion is required at repack time.
+- Prefill uses Strategy B: expand ratio-VNNI to row-major INT8 in workspace
+  scratch, then CK GEMM as before.
+- The existing compact IQ4_NL GEMV (`gemv_int8_iq4nl_fp32_kernel_t`) is
+  deprecated once ratio-VNNI is validated.
+- The mandatory 128/127 compensation factor eliminates systematic scale bias.
+
+
+## Implementation Plan
+
+### Phase 1: IQ4_NL + Q4_0 (symmetric 4-bit, 32-element blocks)
+
+1) **Define the ratio-VNNI container**
+    - Add `RatioVNNIHeader` with `bitwidth`, `codebook_id`, `has_min`,
+      `block_size`, `lut_entries`.
+    - Extend `ROCmPackedWeights` with new fields:
+      ```cpp
+      std::vector<uint8_t> ratio_vnni_payload;   // [blocks × N × payload_bytes]
+      std::vector<int8_t>  ratio_vnni_ratio;      // [blocks × N]
+      uint8_t* d_ratio_vnni_payload = nullptr;    // device
+      int8_t*  d_ratio_vnni_ratio = nullptr;      // device
+      RatioVNNIHeader ratio_vnni_header;
+      ```
+    - `col_scale` reuses the existing `d_scales` (same semantic: per-column FP32
+      scale applied in `applyScaling` epilogue).
+
+2) **Add format adapters for IQ4_NL and Q4_0**
+    - Implement `unpack_block_to_packed()` for each:
+      - IQ4_NL: copy 16 nibble bytes as-is, extract FP16 `d` as block scale.
+      - Q4_0: copy 16 nibble bytes as-is, extract FP16 `d` as block scale.
+    - Use `IQuantizedTileAccessor::get_raw_block()` and
+      `get_block_scale()` to access native blocks directly, avoiding the
+      FP32 dequant→requant round-trip in current `packWeightsToROCm()`.
+
+3) **Implement the repacker**
+    - Pass 1: compute `S_col[n] = max_b(|scale_b|)` via `get_block_scale()`.
+    - Apply mandatory 128/127 compensation: `S_col[n] *= 128.0f / 127.0f`.
+    - Pass 2: compute `ratio = round(scale_b / (S_col[n] * 127/128) * 127)`.
+    - Interleave payload and ratio by N for coalesced reads.
+    - Store `S_col` as the per-column scale for `applyScaling`.
+
+4) **Build the ratio-VNNI decode kernel**
+    - Template on `<TILE_N=128, CPT=2>` matching existing grid_kpar.
+    - Implement `decode_payload_to_packed_i8()` for 4-bit with:
+      - Linear path (Q4_0): `decoded = (int8_t)(nibble - 8)`
+      - LUT path (IQ4_NL): `decoded = kvalues_iq4nl_i8[nibble]`
+    - Keep grid_kpar structure and int32 atomicAdd.
+    - KB heuristic from existing grid_kpar (target ≥64 k-groups/wave).
+
+5) **Build the prefill expansion kernel**
+    - `expand_ratio_vnni_to_rowmajor()`: decode ratio-VNNI payload + ratio
+      into INT8 row-major in `d_B_rowmajor_scratch`.
+    - Grid: `ceil(N * blocks_per_row / 256)` blocks, 256 threads.
+    - Each thread expands one (n, block) pair = 32 elements.
+
+6) **Integrate dispatch in `ROCmQuantisedGemmKernel::multiply_tensor()`**
+    - Dispatch priority for M=1 decode:
+      ```
+      Priority 0: Ratio-VNNI GEMV
+                  (if d_ratio_vnni_payload != nullptr && M==1 && K%32==0)
+      Priority 1: Fused FP32→INT8 GEMV (INT8 VNNI fallback)
+      Priority 2: 3-kernel INT8 GEMV pipeline (INT8 VNNI fallback)
+      ```
+    - Dispatch for M>1 prefill:
+      ```
+      If ratio-VNNI available:
+          expand_ratio_vnni_to_rowmajor() → d_B_rowmajor_scratch
+          CK GEMM with d_B_rowmajor_scratch
+      Else:
+          repack_vnni_to_rowmajor() → d_B_rowmajor_scratch (existing path)
+          CK GEMM
+      ```
+    - Gate: `ROCmPackedWeights::d_ratio_vnni_payload != nullptr`.
+    - Fallback: INT8 VNNI when K not divisible by 32 or format not yet
+      supported by ratio-VNNI.
+
+7) **Validation (Phase 1)**
+    - **Unit test (round-trip)**: repack IQ4_NL/Q4_0 to ratio-VNNI, then
+      decode via `decode_payload_to_packed_i8()` and compare against
+      `decode_block_at()` output. Target: max absolute error ≤ 1 LSB per int8.
+    - **Parity test (GEMV)**: compare ratio-VNNI GEMV output against FP32
+      reference GEMM using existing `ParityTestBase` framework. Target:
+      cosine similarity > 0.999 per layer.
+    - **Parity test (end-to-end)**: greedy decode with ratio-VNNI vs INT8 VNNI.
+      Target: identical token predictions for first 50 tokens.
+    - **Bandwidth profiling**: `rocprof --stats` to measure actual bandwidth
+      utilization. Target: ≥ 55% of peak HBM2 bandwidth (> 480 × 0.55 ≈
+      264 GB/s).
+    - **Prefill parity**: CK GEMM via expanded ratio-VNNI vs CK GEMM via
+      existing VNNI repack. Target: bitwise-identical INT8 row-major weights.
+
+8) **Deprecate existing compact IQ4_NL GEMV**
+    - Once parity tests pass, remove `gemv_int8_iq4nl_fp32_kernel_t` dispatch.
+    - Remove `d_weights_native` (compact IQ4_NL blocks) from
+      `ROCmPackedWeights` and device uploads.
+    - Remove host-side `native_data` vector from `ROCmPackedWeights`.
+    - Update `packWeightsToROCm()` to skip INT8 VNNI packing when ratio-VNNI
+      is available (saves both host memory and H2D upload time).
+
+
+### Phase 2: Extended format support (after Phase 1 validation)
+
+9) **Asymmetric formats (Q4_1, Q5_1)**
+    - Implement `min_ratio` + `col_min` path (Section 1e).
+    - Add `has_min=1` branch in kernel decode.
+    - Separate parity tests for asymmetric formats.
+
+10) **K-quant formats (Q4_K, Q6_K, IQ4_XS)**
+    - Implement sub-block scale extraction for 256-element super-blocks.
+    - Q4_K: 8 sub-blocks × 32 elements, 6-bit scales from `d`, `dmin`,
+      `scales[12]`.
+    - Q6_K: complex bit-packed `ql[128]` + `qh[64]` + `scales[16]`.
+    - Each sub-block gets its own ratio byte.
+
+11) **3-bit formats (Q3_K, IQ3_S, IQ3_XXS)**
+    - Implement 3-bit payload decode in kernel.
+    - LUT tables for IQ3 variants (256 entries each, 256 bytes constant mem).
+
+12) **2-bit and 1-bit formats**
+    - Implement 2-bit and 1-bit payload decode.
+    - IQ2/IQ1 LUT tables (~2-4KB each, all fit in constant cache).
+    - For IQ1_S: grid indices + sign permutation decode (~20 instructions
+      per 8 weights — verify this doesn't push the kernel compute-bound).
+
+13) **Validation (Phase 2)**
+    - Run same validation suite as Phase 1 for each new format.
+    - Additional error budget analysis: for 1-2 bit formats where decoded
+      values are {-1, 0, +1}, the ratio multiply is essentially
+      sign+magnitude and error should be negligible.
+    - End-to-end perplexity comparison on WikiText-2 for each format.
