@@ -64,6 +64,19 @@ extern "C"
         int N, int K,
         int device_id, void *stream);
 
+    bool rocmGemv_int8_int8_fp32_vnni_scaled(
+        const int8_t *d_A_int8,
+        const int8_t *d_B_int8_vnni,
+        float *d_C_fp32,
+        const float *d_scale_A,
+        const float *d_scale_B,
+        int N, int K,
+        float alpha,
+        float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        int device_id, void *stream);
+
     void rocmGemv_int8_vnni_set_tuning_overrides(
         int tn,
         int kb);
@@ -378,9 +391,15 @@ namespace
             for (int i = 0; i < warmup_runs; ++i)
             {
                 rocmQuantGemm_quantizeActivations(d_A, d_A_int8, d_scale_A, 1, K, device_id_, nullptr);
-                rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_, nullptr);
-                rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
-                                           1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                bool fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
+                    d_A_int8, d_B_vnni, d_C, d_scale_A, d_scale,
+                    N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                if (!fused_scale)
+                {
+                    rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_, nullptr);
+                    rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,
+                                               1, N, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                }
             }
             hipDeviceSynchronize();
 
@@ -417,6 +436,7 @@ namespace
                 float quant_ms = 0.0f;
                 float gemv_ms = 0.0f;
                 float scale_ms = 0.0f;
+                bool fused_scale = false;
 
                 // Step 1: Quantize activations FP32 → INT8
                 hipEventRecord(quant_start, 0);
@@ -429,14 +449,20 @@ namespace
                 if (ok)
                 {
                     hipEventRecord(gemv_start, 0);
-                    ok = rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_, nullptr);
+                    fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
+                        d_A_int8, d_B_vnni, d_C, d_scale_A, d_scale,
+                        N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
+                    if (!fused_scale)
+                    {
+                        ok = rocmGemv_int8_int8_int32_vnni(d_A_int8, d_B_vnni, d_C_int32, N, K, device_id_, nullptr);
+                    }
                     hipEventRecord(gemv_stop, 0);
                     hipEventSynchronize(gemv_stop);
                     hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
                 }
 
                 // Step 3: Apply scaling INT32 → FP32
-                if (ok)
+                if (ok && !fused_scale)
                 {
                     hipEventRecord(scale_start, 0);
                     ok = rocmQuantGemm_applyScaling(d_C_int32, d_C, d_scale_A, d_scale,

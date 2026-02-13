@@ -401,6 +401,37 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 
 **Conclusion**: Keep this decode fast path enabled by default. It is isolated to the common M=1 decode case, preserves correctness, and reduces scaling overhead with modest but consistent end-to-end gain.
 
+### Entry 14: Reintroduced Non-Grid Scaling Fusion (LM Head win retained) (2026-02-13)
+
+**Context**: Session experiments were reverted to pre-fusion base. Reapplied only the previously positive part: non-grid INT8 VNNI scaling fusion.
+
+**Scope restored**:
+
+1. Added fused scaled kernels/API for non-grid paths in `ROCmGemvKernel.hip`:
+    - `gemv_int8_int8_vnni_scaled_kernel`
+    - `gemv_int8_int8_wide_vec4_vnni_scaled_kernel`
+    - `gemv_int8_int8_square_vnni_scaled_kernel`
+    - `rocmGemv_int8_int8_fp32_vnni_scaled(...)`
+2. Kept `grid_kpar` behavior unchanged by design:
+    - `rocmGemv_int8_int8_fp32_vnni_scaled(...)` returns `false` for `use_grid_kpar`
+    - Runtime falls back to existing `INT8→INT32 GEMV + rocmQuantGemm_applyScaling`
+3. Rewired fused-first/fallback in decode M=1 VNNI call paths (`ROCmQuantisedGemmKernel.cpp`) and in perf split benchmark (`Perf__ROCmGemvKernel.cpp`).
+
+**Validation**:
+
+- Build: `build_v2_integration` passes.
+- Test: `V2_Perf_ROCmGemvKernel` passes (correctness + perf suite).
+
+**Observed benchmark snapshot** (same run):
+
+- Qwen2.5-7B `Benchmark_Qwen7B_DecodeLayer`:
+   - `All 28 layers + LM`: **20.625 ms**
+   - Split table confirms fused-scale effect is retained where applicable:
+      - `LM Head` scale min: **0.000 ms** (scale stage eliminated on fused path)
+   - Grid-kpar shapes continue through legacy fallback path by design.
+
+**Decision**: Keep this non-grid scaling fusion enabled; do not re-enable fused grid-kpar variants (atomic/two-stage) unless a new approach demonstrates clear improvement over fallback on gfx906.
+
 ### Entry 9: GEMV Tile/Occupancy Tuning — CPT + KB Optimization (2026-02-10)
 
 **Target**: `grid_kpar_t<TN,CPT>` kernel in `ROCmGemvKernel.hip` — handles QKV, Wo, FFN Down projections (84 of 113 GEMV calls per decode token)

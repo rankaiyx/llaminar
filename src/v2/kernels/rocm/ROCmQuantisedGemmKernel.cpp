@@ -281,6 +281,19 @@ namespace llaminar2
                 int N, int K,
                 int device_id, void *stream);
 
+            bool rocmGemv_int8_int8_fp32_vnni_scaled(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                float *d_C_fp32,
+                const float *d_scale_A,
+                const float *d_scale_B,
+                int N, int K,
+                float alpha,
+                float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int device_id, void *stream);
+
             // Repack VNNI [K/4][N][4] → row-major [N×K] into scratch buffer
             // Used for CK GEMM prefill and legacy fp16/fp32 GEMV modes.
             // Cost: ~65-200μs for 18944×3584 (amortized over prefill).
@@ -1010,6 +1023,8 @@ namespace llaminar2
                             return false;
                         }
 
+                        const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
+                        bool fused_scale = false;
                         bool gemv_ok = false;
                         if (d_weights_ratio_payload && d_weights_ratio &&
                             impl_->ratio_vnni_bitwidth == 4 &&
@@ -1031,21 +1046,31 @@ namespace llaminar2
                         }
                         else if (d_weights_vnni)
                         {
-                            gemv_ok = rocmGemv_int8_int8_int32_vnni(
-                                impl_->d_A_int8, d_weights_vnni, impl_->d_C_int32,
-                                n, k, rocm_device_id_, gpu_stream_);
+                            fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
+                                impl_->d_A_int8, d_weights_vnni, d_output,
+                                impl_->d_scales_A, d_scales_B,
+                                n, k,
+                                alpha, beta,
+                                d_existing, d_bias,
+                                rocm_device_id_, gpu_stream_);
+
+                            if (!fused_scale)
+                            {
+                                gemv_ok = rocmGemv_int8_int8_int32_vnni(
+                                    impl_->d_A_int8, d_weights_vnni, impl_->d_C_int32,
+                                    n, k, rocm_device_id_, gpu_stream_);
+                            }
                         }
 
-                        if (!gemv_ok)
+                        if (!fused_scale && !gemv_ok)
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV (ratio/VNNI) failed");
                             return false;
                         }
 
-                        const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
-                        if (!rocmQuantGemm_applyScaling(
-                                impl_->d_C_int32, d_output, impl_->d_scales_A, d_scales_B,
-                                m, n, alpha, beta, d_existing, d_bias, rocm_device_id_, gpu_stream_))
+                        if (!fused_scale && !rocmQuantGemm_applyScaling(
+                                                impl_->d_C_int32, d_output, impl_->d_scales_A, d_scales_B,
+                                                m, n, alpha, beta, d_existing, d_bias, rocm_device_id_, gpu_stream_))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV scaling failed");
                             return false;
@@ -1921,6 +1946,7 @@ namespace llaminar2
                                                                                                  << " OLD GEMV M=1 N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
 
+                        bool fused_scale = false;
                         bool gemv_ok = false;
                         if (d_ratio_payload && d_ratio &&
                             rocm_kernel->impl_->ratio_vnni_bitwidth == 4 &&
@@ -1942,21 +1968,32 @@ namespace llaminar2
                         }
                         else if (d_vnni)
                         {
-                            gemv_ok = rocmGemv_int8_int8_int32_vnni(
-                                impl_->d_A_int8, d_vnni, rocm_kernel->impl_->d_CK_int32,
-                                n, k, rocm_device_id_, gpu_stream_);
+                            fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
+                                impl_->d_A_int8, d_vnni, d_output,
+                                impl_->d_scales_A, d_scales_B,
+                                n, k,
+                                1.0f, 0.0f,
+                                nullptr, d_bias,
+                                rocm_device_id_, gpu_stream_);
+
+                            if (!fused_scale)
+                            {
+                                gemv_ok = rocmGemv_int8_int8_int32_vnni(
+                                    impl_->d_A_int8, d_vnni, rocm_kernel->impl_->d_CK_int32,
+                                    n, k, rocm_device_id_, gpu_stream_);
+                            }
                         }
 
-                        if (!gemv_ok)
+                        if (!fused_scale && !gemv_ok)
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] GEMV failed for projection " << i);
                             all_success = false;
                             break;
                         }
 
-                        if (!rocmQuantGemm_applyScaling(
-                                rocm_kernel->impl_->d_CK_int32, d_output, impl_->d_scales_A, d_scales_B,
-                                m, n, 1.0f, 0.0f, nullptr, d_bias, rocm_device_id_, gpu_stream_))
+                        if (!fused_scale && !rocmQuantGemm_applyScaling(
+                                                rocm_kernel->impl_->d_CK_int32, d_output, impl_->d_scales_A, d_scales_B,
+                                                m, n, 1.0f, 0.0f, nullptr, d_bias, rocm_device_id_, gpu_stream_))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] GEMV scaling failed for projection " << i);
                             all_success = false;
@@ -2704,6 +2741,8 @@ namespace llaminar2
                         return false;
                     }
 
+                    const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
+                    bool fused_scale = false;
                     bool gemv_ok = false;
                     if (d_ratio_payload && d_ratio &&
                         impl_->ratio_vnni_bitwidth == 4 &&
@@ -2725,18 +2764,33 @@ namespace llaminar2
                     }
                     else if (d_vnni)
                     {
-                        gemv_ok = rocmGemv_int8_int8_int32_vnni(
-                            impl_->d_A_int8, d_vnni, impl_->d_C_int32,
-                            n, k, rocm_device_id_, gpu_stream_);
+                        fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
+                            impl_->d_A_int8, d_vnni, d_C,
+                            impl_->d_scales_A, d_s,
+                            n, k,
+                            alpha, beta,
+                            d_existing, nullptr,
+                            rocm_device_id_, gpu_stream_);
+
+                        if (!fused_scale)
+                        {
+                            gemv_ok = rocmGemv_int8_int8_int32_vnni(
+                                impl_->d_A_int8, d_vnni, impl_->d_C_int32,
+                                n, k, rocm_device_id_, gpu_stream_);
+                        }
                     }
 
-                    if (!gemv_ok)
+                    if (!fused_scale && !gemv_ok)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32] INT8 GEMV (ratio/VNNI) failed");
                         return false;
                     }
 
-                    const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
+                    if (fused_scale)
+                    {
+                        return true;
+                    }
+
                     return rocmQuantGemm_applyScaling(
                         impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
                         m, n, alpha, beta, d_existing, nullptr, rocm_device_id_, gpu_stream_);
@@ -2869,6 +2923,8 @@ namespace llaminar2
                         return false;
                     }
 
+                    const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
+                    bool fused_scale = false;
                     bool gemv_ok = false;
                     if (d_ratio_payload && d_ratio &&
                         impl_->ratio_vnni_bitwidth == 4 &&
@@ -2890,18 +2946,33 @@ namespace llaminar2
                     }
                     else if (d_vnni)
                     {
-                        gemv_ok = rocmGemv_int8_int8_int32_vnni(
-                            impl_->d_A_int8, d_vnni, impl_->d_C_int32,
-                            n, k, rocm_device_id_, gpu_stream_);
+                        fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
+                            impl_->d_A_int8, d_vnni, d_C,
+                            impl_->d_scales_A, d_s,
+                            n, k,
+                            alpha, beta,
+                            d_existing, d_bias,
+                            rocm_device_id_, gpu_stream_);
+
+                        if (!fused_scale)
+                        {
+                            gemv_ok = rocmGemv_int8_int8_int32_vnni(
+                                impl_->d_A_int8, d_vnni, impl_->d_C_int32,
+                                n, k, rocm_device_id_, gpu_stream_);
+                        }
                     }
 
-                    if (!gemv_ok)
+                    if (!fused_scale && !gemv_ok)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV (ratio/VNNI) failed");
                         return false;
                     }
 
-                    const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
+                    if (fused_scale)
+                    {
+                        return true;
+                    }
+
                     return rocmQuantGemm_applyScaling(
                         impl_->d_C_int32, d_C, impl_->d_scales_A, d_s,
                         m, n, alpha, beta, d_existing, d_bias, rocm_device_id_, gpu_stream_);

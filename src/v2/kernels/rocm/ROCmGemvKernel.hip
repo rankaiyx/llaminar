@@ -568,6 +568,170 @@ __global__ void gemv_int8_int8_square_vnni_kernel(
     d_C_int32[n] = acc;
 }
 
+__global__ void gemv_int8_int8_vnni_scaled_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scale_A,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float* __restrict__ d_C_existing,
+    const float* __restrict__ d_bias)
+{
+    const int n = blockIdx.x * GEMV_TILE_N + threadIdx.x;
+    if (n >= N) return;
+
+    int32_t acc = 0;
+    const int k_groups = K / 4;
+    for (int kg = 0; kg < k_groups; ++kg)
+    {
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+            d_B_int8_vnni + (static_cast<size_t>(kg) * N + n) * 4);
+        acc = __builtin_amdgcn_sdot4(a_packed, b_packed, acc, false);
+    }
+
+    float result = static_cast<float>(acc) * d_scale_A[0] * d_scale_B[n];
+    result *= alpha;
+    if (beta != 0.0f)
+    {
+        result += beta * d_C_existing[n];
+    }
+    if (d_bias)
+    {
+        result += d_bias[n];
+    }
+    d_C_fp32[n] = result;
+}
+
+__global__ void gemv_int8_int8_wide_vec4_vnni_scaled_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scale_A,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float* __restrict__ d_C_existing,
+    const float* __restrict__ d_bias)
+{
+    const int lane_n = threadIdx.x;
+    const int n4 = blockIdx.x * GEMV_INT8_VNNI_WIDE_TILE_N + lane_n * 4;
+    if (n4 >= N) return;
+
+    int4 acc = {0, 0, 0, 0};
+    const int k_groups = K / 4;
+    for (int kg = 0; kg < k_groups; ++kg)
+    {
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+
+        const int32_t p0 = *reinterpret_cast<const int32_t*>(
+            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 0)) * 4);
+        const int32_t p1 = *reinterpret_cast<const int32_t*>(
+            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 1)) * 4);
+        const int32_t p2 = *reinterpret_cast<const int32_t*>(
+            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 2)) * 4);
+        const int32_t p3 = *reinterpret_cast<const int32_t*>(
+            d_B_int8_vnni + (static_cast<size_t>(kg) * N + (n4 + 3)) * 4);
+
+        acc.x = __builtin_amdgcn_sdot4(a_packed, p0, acc.x, false);
+        acc.y = __builtin_amdgcn_sdot4(a_packed, p1, acc.y, false);
+        acc.z = __builtin_amdgcn_sdot4(a_packed, p2, acc.z, false);
+        acc.w = __builtin_amdgcn_sdot4(a_packed, p3, acc.w, false);
+    }
+
+    const float scale_a = d_scale_A[0];
+    float4 out;
+    out.x = static_cast<float>(acc.x) * scale_a * d_scale_B[n4 + 0];
+    out.y = static_cast<float>(acc.y) * scale_a * d_scale_B[n4 + 1];
+    out.z = static_cast<float>(acc.z) * scale_a * d_scale_B[n4 + 2];
+    out.w = static_cast<float>(acc.w) * scale_a * d_scale_B[n4 + 3];
+
+    out.x *= alpha;
+    out.y *= alpha;
+    out.z *= alpha;
+    out.w *= alpha;
+
+    if (beta != 0.0f)
+    {
+        out.x += beta * d_C_existing[n4 + 0];
+        out.y += beta * d_C_existing[n4 + 1];
+        out.z += beta * d_C_existing[n4 + 2];
+        out.w += beta * d_C_existing[n4 + 3];
+    }
+    if (d_bias)
+    {
+        out.x += d_bias[n4 + 0];
+        out.y += d_bias[n4 + 1];
+        out.z += d_bias[n4 + 2];
+        out.w += d_bias[n4 + 3];
+    }
+
+    d_C_fp32[n4 + 0] = out.x;
+    d_C_fp32[n4 + 1] = out.y;
+    d_C_fp32[n4 + 2] = out.z;
+    d_C_fp32[n4 + 3] = out.w;
+}
+
+__global__ void gemv_int8_int8_square_vnni_scaled_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scale_A,
+    const float* __restrict__ d_scale_B,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float* __restrict__ d_C_existing,
+    const float* __restrict__ d_bias)
+{
+    const int n = blockIdx.x * GEMV_INT8_VNNI_SQUARE_TILE_N + threadIdx.x;
+    if (n >= N) return;
+
+    int32_t acc = 0;
+    __shared__ int8_t sA[GEMV_INT8_VNNI_KPAR_TILE_K];
+
+    for (int k_base = 0; k_base < K; k_base += GEMV_INT8_VNNI_KPAR_TILE_K)
+    {
+        const int tile_k = min(GEMV_INT8_VNNI_KPAR_TILE_K, K - k_base);
+        for (int i = threadIdx.x; i < tile_k; i += blockDim.x)
+        {
+            sA[i] = d_A_int8[k_base + i];
+        }
+        __syncthreads();
+
+        const int tile_groups = tile_k / 4;
+        const int k_group_base = k_base / 4;
+        for (int kg = 0; kg < tile_groups; ++kg)
+        {
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + kg * 4);
+            const int global_kg = k_group_base + kg;
+            const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                d_B_int8_vnni + (static_cast<size_t>(global_kg) * N + n) * 4);
+            acc = __builtin_amdgcn_sdot4(a_packed, b_packed, acc, false);
+        }
+        __syncthreads();
+    }
+
+    float result = static_cast<float>(acc) * d_scale_A[0] * d_scale_B[n];
+    result *= alpha;
+    if (beta != 0.0f)
+    {
+        result += beta * d_C_existing[n];
+    }
+    if (d_bias)
+    {
+        result += d_bias[n];
+    }
+    d_C_fp32[n] = result;
+}
+
 // ============================================================================
 // Grid-level K-parallel VNNI kernel with atomicAdd reduction
 //
@@ -1199,6 +1363,84 @@ bool rocmGemv_int8_int8_int32_vnni(
     if (err != hipSuccess)
     {
         fprintf(stderr, "[rocmGemv_int8_int8_int32_vnni] Kernel launch failed: %s (N=%d K=%d)\n",
+                hipGetErrorString(err), N, K);
+        return false;
+    }
+
+    return true;
+}
+
+bool rocmGemv_int8_int8_fp32_vnni_scaled(
+    const int8_t* d_A_int8,
+    const int8_t* d_B_int8_vnni,
+    float* d_C_fp32,
+    const float* d_scale_A,
+    const float* d_scale_B,
+    int N, int K,
+    float alpha,
+    float beta,
+    const float* d_C_existing,
+    const float* d_bias,
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if ((K % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_scaled] K must be multiple of 4 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+
+    const bool use_vec4 = ((N % 4) == 0);
+    const bool use_wide_vec4 = (N >= 8 * K) && use_vec4 && (N >= GEMV_INT8_VNNI_WIDE_TILE_N);
+    const bool use_grid_kpar = !use_wide_vec4 && use_vec4 && (N >= GEMV_INT8_VNNI_GRID_KPAR_TILE_N);
+    const bool use_square = !use_wide_vec4 && !use_grid_kpar && (N >= GEMV_INT8_VNNI_SQUARE_TILE_N);
+
+    if (beta != 0.0f && d_C_existing == nullptr)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_scaled] d_C_existing required when beta != 0 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+
+    if (use_grid_kpar)
+    {
+        return false;
+    }
+
+    if (use_wide_vec4)
+    {
+        const int grid_n = (N + GEMV_INT8_VNNI_WIDE_TILE_N - 1) / GEMV_INT8_VNNI_WIDE_TILE_N;
+        dim3 block(GEMV_INT8_VNNI_WIDE_TILE_N / 4, 1, 1);
+        hipLaunchKernelGGL(
+            gemv_int8_int8_wide_vec4_vnni_scaled_kernel,
+            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B,
+            N, K, alpha, beta, d_C_existing, d_bias);
+    }
+    else if (use_square)
+    {
+        const int grid_n = (N + GEMV_INT8_VNNI_SQUARE_TILE_N - 1) / GEMV_INT8_VNNI_SQUARE_TILE_N;
+        dim3 block(GEMV_INT8_VNNI_SQUARE_TILE_N, 1, 1);
+        hipLaunchKernelGGL(
+            gemv_int8_int8_square_vnni_scaled_kernel,
+            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B,
+            N, K, alpha, beta, d_C_existing, d_bias);
+    }
+    else
+    {
+        const int grid_n = (N + GEMV_TILE_N - 1) / GEMV_TILE_N;
+        hipLaunchKernelGGL(
+            gemv_int8_int8_vnni_scaled_kernel,
+            dim3(grid_n), dim3(GEMV_TILE_N), 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A, d_scale_B,
+            N, K, alpha, beta, d_C_existing, d_bias);
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_scaled] Kernel launch failed: %s (N=%d K=%d)\n",
                 hipGetErrorString(err), N, K);
         return false;
     }
