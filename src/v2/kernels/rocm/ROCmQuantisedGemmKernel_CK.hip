@@ -731,35 +731,74 @@ __global__ void quantizeActivationsQ8_kernel(
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
 
-    // Shared memory for parallel reduction
-    __shared__ float s_max_abs[256];
+    // Shared memory for wavefront-level max merge (256 threads = 4 waves)
+    __shared__ float s_wave_max[4];
+    __shared__ float s_absmax;
 
     // Step 1: Find max absolute value in this row (parallel reduction)
     float local_max = 0.0f;
     const float *row_ptr = d_A_fp32 + static_cast<size_t>(row) * K;
+    const int vec_len = (K / 4) * 4;
+    const bool fp32_aligned16 = ((reinterpret_cast<uintptr_t>(row_ptr) & 0x0F) == 0);
 
-    for (int k = tid; k < K; k += block_size)
+    if (fp32_aligned16)
     {
-        float val = row_ptr[k];
-        float abs_val = fabsf(val);
-        local_max = fmaxf(local_max, abs_val);
+        for (int k4 = tid * 4; k4 < vec_len; k4 += block_size * 4)
+        {
+            const float4 v = *reinterpret_cast<const float4 *>(row_ptr + k4);
+            local_max = fmaxf(local_max, fabsf(v.x));
+            local_max = fmaxf(local_max, fabsf(v.y));
+            local_max = fmaxf(local_max, fabsf(v.z));
+            local_max = fmaxf(local_max, fabsf(v.w));
+        }
+        for (int k = vec_len + tid; k < K; k += block_size)
+        {
+            local_max = fmaxf(local_max, fabsf(row_ptr[k]));
+        }
+    }
+    else
+    {
+        for (int k = tid; k < K; k += block_size)
+        {
+            float val = row_ptr[k];
+            float abs_val = fabsf(val);
+            local_max = fmaxf(local_max, abs_val);
+        }
     }
 
-    s_max_abs[tid] = local_max;
+    // Wavefront reduction (wave64 on gfx906)
+    const int lane = tid & 63;
+    const int wave = tid >> 6;
+    #pragma unroll
+    for (int offset = 32; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+
+    if (lane == 0)
+    {
+        s_wave_max[wave] = local_max;
+    }
     __syncthreads();
 
-    // Parallel reduction in shared memory
-    for (int stride = block_size / 2; stride > 0; stride >>= 1)
+    // First wave merges the 4 wave maxima
+    if (wave == 0)
     {
-        if (tid < stride)
+        float v = (tid < 4) ? s_wave_max[tid] : 0.0f;
+        #pragma unroll
+        for (int offset = 32; offset > 0; offset >>= 1)
         {
-            s_max_abs[tid] = fmaxf(s_max_abs[tid], s_max_abs[tid + stride]);
+            v = fmaxf(v, __shfl_down(v, offset));
         }
-        __syncthreads();
+        if (tid == 0)
+        {
+            s_absmax = v;
+        }
     }
+    __syncthreads();
 
     // Step 2: Compute scale (thread 0 writes to global memory)
-    float max_abs = s_max_abs[0];
+    float max_abs = s_absmax;
     float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
     float inv_scale = 1.0f / scale;
 
@@ -770,20 +809,56 @@ __global__ void quantizeActivationsQ8_kernel(
 
     // Step 3: Quantize all elements in this row
     int8_t *out_row = d_A_int8 + static_cast<size_t>(row) * K;
+    const bool int8_aligned4 = ((reinterpret_cast<uintptr_t>(out_row) & 0x03) == 0);
 
-    for (int k = tid; k < K; k += block_size)
+    if (fp32_aligned16 && int8_aligned4)
     {
-        float val = row_ptr[k];
-        float scaled = val * inv_scale;
+        for (int k4 = tid * 4; k4 < vec_len; k4 += block_size * 4)
+        {
+            const float4 v = *reinterpret_cast<const float4 *>(row_ptr + k4);
 
-        // rintf() maps to v_rndne_f32 (1 instruction) instead of
-        // roundf() which decomposes to trunc+sub+cmp+cndmask+bfi+add (6 instructions).
-        // For int8 quantization, round-to-nearest-even vs round-half-away-from-zero
-        // has negligible quality impact (differs only at exact x.5 tie points).
-        int q = static_cast<int>(rintf(scaled));
-        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+            int q0 = static_cast<int>(rintf(v.x * inv_scale));
+            int q1 = static_cast<int>(rintf(v.y * inv_scale));
+            int q2 = static_cast<int>(rintf(v.z * inv_scale));
+            int q3 = static_cast<int>(rintf(v.w * inv_scale));
 
-        out_row[k] = static_cast<int8_t>(q);
+            q0 = (q0 < -127) ? -127 : ((q0 > 127) ? 127 : q0);
+            q1 = (q1 < -127) ? -127 : ((q1 > 127) ? 127 : q1);
+            q2 = (q2 < -127) ? -127 : ((q2 > 127) ? 127 : q2);
+            q3 = (q3 < -127) ? -127 : ((q3 > 127) ? 127 : q3);
+
+            const uint32_t packed =
+                static_cast<uint32_t>(static_cast<uint8_t>(q0)) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(q2)) << 16) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(q3)) << 24);
+
+            *reinterpret_cast<uint32_t *>(out_row + k4) = packed;
+        }
+
+        for (int k = vec_len + tid; k < K; k += block_size)
+        {
+            int q = static_cast<int>(rintf(row_ptr[k] * inv_scale));
+            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+            out_row[k] = static_cast<int8_t>(q);
+        }
+    }
+    else
+    {
+        for (int k = tid; k < K; k += block_size)
+        {
+            float val = row_ptr[k];
+            float scaled = val * inv_scale;
+
+            // rintf() maps to v_rndne_f32 (1 instruction) instead of
+            // roundf() which decomposes to trunc+sub+cmp+cndmask+bfi+add (6 instructions).
+            // For int8 quantization, round-to-nearest-even vs round-half-away-from-zero
+            // has negligible quality impact (differs only at exact x.5 tie points).
+            int q = static_cast<int>(rintf(scaled));
+            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+
+            out_row[k] = static_cast<int8_t>(q);
+        }
     }
 }
 
@@ -861,6 +936,44 @@ __global__ void applyScaling_full_kernel(
         }
 
         d_C_fp32[idx] = result;
+    }
+}
+
+// Decode-specialized scaling path (M=1, beta=0, no bias):
+//   C_fp32[n] = alpha * C_int32[n] * scale_A[0] * scale_B[n]
+// Uses 1D grid and vectorized x4 lanes to avoid the 16x16 underutilization
+// of applyScaling_full_kernel when only a single row is active.
+__global__ void applyScaling_m1_vec4_kernel(
+    const int32_t* __restrict__ d_C_int32,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scale_A,
+    const float* __restrict__ d_scale_B,
+    int N,
+    float alpha)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n4 = tid * 4;
+
+    const float row_scale = alpha * d_scale_A[0];
+
+    if (n4 + 3 < N)
+    {
+        const int4 v = *reinterpret_cast<const int4*>(d_C_int32 + n4);
+        const float4 sb = *reinterpret_cast<const float4*>(d_scale_B + n4);
+
+        float4 out;
+        out.x = static_cast<float>(v.x) * row_scale * sb.x;
+        out.y = static_cast<float>(v.y) * row_scale * sb.y;
+        out.z = static_cast<float>(v.z) * row_scale * sb.z;
+        out.w = static_cast<float>(v.w) * row_scale * sb.w;
+
+        *reinterpret_cast<float4*>(d_C_fp32 + n4) = out;
+        return;
+    }
+
+    for (int n = n4; n < N && n < n4 + 4; ++n)
+    {
+        d_C_fp32[n] = static_cast<float>(d_C_int32[n]) * row_scale * d_scale_B[n];
     }
 }
 
@@ -2184,6 +2297,31 @@ extern "C"
 
         if (!rocmQuantGemm_setDevice(rocm_device_id))
             return false;
+
+        // Decode-specialized fast path:
+        // M=1 dominates INT8 VNNI decode and the generic 16x16 kernel wastes
+        // 15/16 threads in this shape. Use a 1D vectorized kernel instead.
+        if (M == 1 && beta == 0.0f && d_C_existing == nullptr && d_bias == nullptr)
+        {
+            const int block_size = 256;
+            const int elems_per_thread = 4;
+            const int grid_size = (N + block_size * elems_per_thread - 1) / (block_size * elems_per_thread);
+
+            hipLaunchKernelGGL(
+                applyScaling_m1_vec4_kernel,
+                dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
+                d_C_int32, d_C_fp32, d_scales_A, d_scales_B, N, alpha);
+
+            (void)hipGetLastError();
+            hipError_t err = hipGetLastError();
+            if (err != hipSuccess)
+            {
+                fprintf(stderr, "[rocmQuantGemm_applyScaling] applyScaling_m1_vec4_kernel launch failed: %s "
+                        "(M=%d, N=%d)\n", hipGetErrorString(err), M, N);
+                return false;
+            }
+            return true;
+        }
 
         // Use 16×16 thread blocks for 2D grid (matches CUDA)
         dim3 block(16, 16);

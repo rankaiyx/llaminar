@@ -80,6 +80,7 @@
 - [x] **GEMV tile/occupancy tuning** — CPT=4→2 (full wavefront), KB formula tuned per shape; +0.4% decode (32.30→32.43 tok/s)
 - [x] **Kill wide2_gemv + adaptive KB** — Route FFN Gate/Up through grid_kpar (was 17% peak BW, now 48-63%); adaptive KB for large-N vs small-N shapes; **+74.8% decode (32.43→56.69 tok/s)**
 - [x] **Production profiling baseline** — Measured actual MI60 HBM BW (914 GB/s vs 1024 theoretical); production GEMV efficiency 35-88% of actual peak; quantize+scale overhead = 25% of GEMM pipeline
+- [x] **Quantize kernel vectorized IO** — `float4` loads + packed int8x4 stores in `quantizeActivationsQ8_kernel`; reduced quantize min-time across all decode shapes
 - [ ] **Multi-projection GEMV** — batch Q+K+V in one kernel launch to reduce launch overhead
 - [ ] **Quantize/Scale fusion** — eliminate separate quantize + scale kernels (25% of GEMM pipeline overhead)
 - [ ] **GEMM prefill repack overhead** — VNNI→row-major repack runs PER CK GEMM call (~65-200µs each)
@@ -270,6 +271,135 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 | **Correctness** | ✓ | ✓ | All 16 shapes pass (0.5B + 7B), cosine sim ≥ 0.99999 |
 
 **Why massive end-to-end impact**: FFN Gate and FFN Up are the two largest GEMV calls per layer (N=18944 > all other projections). With 28 layers in Qwen 7B, the per-layer savings of ~528 us × 28 layers = **14.8 ms/token**, cutting decode time from ~30.8 ms to ~18.3 ms per token.
+
+### Entry 10: Quantize Kernel Vectorized IO (2026-02-13)
+
+**Target**: `quantizeActivationsQ8_kernel` in `ROCmQuantisedGemmKernel_CK.hip` (first stage of decode GEMV pipeline)
+
+**Problem**: Quantization remained a consistent fixed overhead in the 3-stage decode path
+(`quantize -> GEMV -> scale`), and was scalar in both reduction traversal and output stores.
+
+**Change applied**:
+
+1. Added aligned `float4` vector loads in max-abs reduction.
+2. Added aligned `float4` vector loads in quantize traversal.
+3. Added packed int8x4 stores (`uint32_t`) for quantized output.
+4. Kept scalar fallback + tail handling for correctness on unaligned/tail cases.
+
+**Validation**: `V2_Perf_ROCmGemvKernel` full run before/after patch, same release target and decode benchmark flow.
+
+**Qwen2.5-7B split-timing deltas (min ms)**:
+
+| Shape | Quant (Before) | Quant (After) | Change |
+|---|---:|---:|---:|
+| Q proj (3584×3584) | 0.019 | 0.012 | -36.8% |
+| K proj (512×3584) | 0.019 | 0.012 | -36.8% |
+| V proj (512×3584) | 0.019 | 0.012 | -36.8% |
+| Wo proj (3584×3584) | 0.018 | 0.012 | -33.3% |
+| FFN Gate (18944×3584) | 0.016 | 0.011 | -31.3% |
+| FFN Up (18944×3584) | 0.016 | 0.011 | -31.3% |
+| FFN Down (3584×18944) | 0.052 | 0.021 | -59.6% |
+| LM Head (152064×3584) | 0.016 | 0.011 | -31.3% |
+
+**Observed end-to-end movement in same run**:
+
+- `All 28 layers + LM`: `22.714 ms -> 20.683 ms`
+- Throughput estimate: `44.0 -> 48.3 tok/s` (GEMV-only metric in benchmark output)
+
+**Conclusion**: This is now the default quantize path for INT8 VNNI decode. Quantization overhead is reduced materially without changing numerical behavior or requiring new runtime flags.
+
+### Entry 11: INT8 Q/Wo Shape Specialization + Autosweep Lock-in (2026-02-13)
+
+**Target**: INT8 VNNI `grid_kpar` dispatch in `ROCmGemvKernel.hip` for square-ish Q/Wo shapes.
+
+**What we added**:
+
+- INT8 tuning hooks for controlled sweeps:
+   - `rocmGemv_int8_vnni_set_tuning_overrides(tn, kb)`
+   - `rocmGemv_int8_vnni_reset_tuning_overrides()`
+- Env-gated autosweep benchmark in `Perf__ROCmGemvKernel.cpp`:
+   - `Benchmark_INT8VNNI_QWo_AutoSweep`
+   - `LLAMINAR_RUN_INT8_AUTOSWEEP=1`
+
+**Sweep space (Q/Wo 3584×3584)**:
+
+- `TN ∈ {128, 256}`
+- `KB ∈ {8, 10, 12, 14, 16, 20, 24}`
+
+**Result**:
+
+- Baseline GEMV min: `0.028640 ms`
+- Best config: `TN=256, KB=16`
+- Best GEMV min: `0.028480 ms` (`1.0056x` vs baseline)
+
+**Default lock-in**:
+
+- Square-ish INT8 path now defaults to `TN=256`, `KB=16`.
+
+**Confirmation (`Benchmark_GEMVvsCK`)**:
+
+- Wo (3584×3584): `0.078 ms`
+- FFN Gate (18944×3584): `0.147 ms`
+- FFN Down (3584×18944): `0.153 ms`
+
+**Conclusion**: This is a small but consistent improvement near the noise floor with no observed regression on neighboring INT8 decode shapes.
+
+### Entry 12: Quantize Max-Reduction A/B — Lock Wave-Reduction ON (2026-02-13)
+
+**Target**: max-abs reduction step inside `quantizeActivationsQ8_kernel` in `ROCmQuantisedGemmKernel_CK.hip`.
+
+**A/B tested** (same benchmark and session):
+
+- **OFF** (block shared-memory tree reduction):
+   - `All 28 layers + LM`: `20.337 ms`
+   - `Per-layer GEMV total`: `0.701 ms`
+- **ON** (wavefront shuffle reduction + 4-wave merge):
+   - `All 28 layers + LM`: `20.292 ms`
+   - `Per-layer GEMV total`: `0.699 ms`
+
+**Decision**: Keep wave-reduction **ON** as the default path.
+
+**Rationale**: The gain is small (~0.22%) and near noise floor, but the same-session A/B still favors ON with no downside in split timings.
+
+### Entry 13: Scaling Kernel Decode Fast Path (M=1) — Vectorized 1D Path (2026-02-13)
+
+**Target**: `rocmQuantGemm_applyScaling` in `ROCmQuantisedGemmKernel_CK.hip` (INT32→FP32 stage of INT8 VNNI decode pipeline).
+
+**Problem**: The generic epilogue kernel (`applyScaling_full_kernel`) uses a `16×16` 2D launch. For decode (`M=1`), only one row is active, so most threads are idle and scaling overhead remains non-trivial.
+
+**Change applied**:
+
+1. Added decode-specialized kernel: `applyScaling_m1_vec4_kernel`.
+2. Uses a 1D grid with 256 threads and 4 elements/thread.
+3. Vectorized path for reads/writes (`int4` from `d_C_int32`, `float4` from `d_scale_B`, `float4` store to output).
+4. Added dispatch guard in `rocmQuantGemm_applyScaling`:
+   - Fast path when `M==1 && beta==0 && d_C_existing==nullptr && d_bias==nullptr`.
+   - Falls back to existing full-epilogue kernel for all other cases.
+
+**Validation**:
+
+- `ROCmGemvPerfTest.Benchmark_Qwen7B_DecodeLayer` (same benchmark flow as prior tuning).
+- `ROCmGemvPerfTest.Correctness_Qwen7B` (all shapes pass).
+
+**Observed performance movement** (same-session run):
+
+- `All 28 layers + LM`: `20.292 ms -> 20.141 ms` (~`+0.75%` GEMV-only tok/s movement).
+- `Per-layer GEMV total`: `0.699 ms -> 0.695 ms`.
+
+**Split-timing highlights (min ms)**:
+
+| Shape | Scale (Before) | Scale (After) | Change |
+|---|---:|---:|---:|
+| Q proj (3584×3584) | 0.008 | 0.008 | ~0% |
+| K proj (512×3584) | 0.008 | 0.008 | ~0% |
+| V proj (512×3584) | 0.008 | 0.008 | ~0% |
+| Wo proj (3584×3584) | 0.008 | 0.008 | ~0% |
+| FFN Gate (18944×3584) | 0.011 | 0.008 | -27% |
+| FFN Up (18944×3584) | 0.010 | 0.007 | -30% |
+| FFN Down (3584×18944) | 0.007 | 0.007 | ~0% |
+| LM Head (152064×3584) | 0.034 | 0.010 | -71% |
+
+**Conclusion**: Keep this decode fast path enabled by default. It is isolated to the common M=1 decode case, preserves correctness, and reduces scaling overhead with modest but consistent end-to-end gain.
 
 ### Entry 9: GEMV Tile/Occupancy Tuning — CPT + KB Optimization (2026-02-10)
 

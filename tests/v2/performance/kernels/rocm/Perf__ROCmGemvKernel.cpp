@@ -23,6 +23,7 @@
 #include <random>
 #include <algorithm>
 #include <numeric>
+#include <limits>
 #include <string>
 #include <cctype>
 #include <cstdlib>
@@ -62,6 +63,12 @@ extern "C"
         int32_t *d_C_int32,
         int N, int K,
         int device_id, void *stream);
+
+    void rocmGemv_int8_vnni_set_tuning_overrides(
+        int tn,
+        int kb);
+
+    void rocmGemv_int8_vnni_reset_tuning_overrides();
 
     bool rocmQuantGemm_executeTwoKernel_cached(
         const int8_t *d_A_int8,
@@ -1097,6 +1104,82 @@ namespace
         }
 
         fprintf(stderr, "╚═══════════════════╩═══════╩═══════╩═══════════════════╩═══════════════════╩═════════════════╝\n\n");
+#endif
+    }
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_QWo_AutoSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_INT8_AUTOSWEEP");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_INT8_AUTOSWEEP=1 to run INT8 Q/Wo autosweep";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        const int N = kQwen7B.hidden;
+        const int K = kQwen7B.hidden;
+        const std::vector<int> tn_candidates = {128, 256};
+        const std::vector<int> kb_candidates = {8, 10, 12, 14, 16, 20, 24};
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+        const auto baseline = benchmarkGemvSplit(N, K, 5, 20);
+        ASSERT_TRUE(baseline.success);
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "TN" << "KB" << "Quant min(ms)" << "GEMV min(ms)" << "Scale min(ms)" << "Total min(ms)" << "GEMV speedup"
+              << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::right);
+        table.column(1).set_cell_text_align(fort::text_align::right);
+        for (int i = 2; i <= 6; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        double best_gemv_min = std::numeric_limits<double>::max();
+        int best_tn = -1;
+        int best_kb = -1;
+
+        for (const int tn : tn_candidates)
+        {
+            for (const int kb : kb_candidates)
+            {
+                rocmGemv_int8_vnni_set_tuning_overrides(tn, kb);
+                const auto r = benchmarkGemvSplit(N, K, 3, 15);
+                ASSERT_TRUE(r.success);
+
+                const double speedup = baseline.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+                table << tn
+                      << kb
+                      << formatMs(r.quant_min_ms)
+                      << formatMs(r.gemv_min_ms)
+                      << formatMs(r.scale_min_ms)
+                      << formatMs(r.total.min_ms)
+                      << formatMs(speedup)
+                      << fort::endr;
+
+                if (r.gemv_min_ms < best_gemv_min)
+                {
+                    best_gemv_min = r.gemv_min_ms;
+                    best_tn = tn;
+                    best_kb = kb;
+                }
+            }
+        }
+
+        rocmGemv_int8_vnni_reset_tuning_overrides();
+
+        const double best_speedup = baseline.gemv_min_ms / std::max(1e-9, best_gemv_min);
+        fprintf(stderr, "\nINT8 Q/Wo baseline GEMV min: %.6f ms\n", baseline.gemv_min_ms);
+        fprintf(stderr, "INT8 Q/Wo best config: TN=%d KB=%d GEMV min=%.6f ms speedup=%.4fx\n", best_tn, best_kb, best_gemv_min, best_speedup);
+        fprintf(stderr, "\nINT8 Q/Wo autosweep (N=%d, K=%d)\n%s\n", N, K, table.to_string().c_str());
 #endif
     }
 

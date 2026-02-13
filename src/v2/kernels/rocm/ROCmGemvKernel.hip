@@ -80,6 +80,8 @@ static std::atomic<int> g_ratio_linear_tn_override{-1};
 static std::atomic<int> g_ratio_linear_kb_override{-1};
 static std::atomic<int> g_ratio_iq4_tn_override{-1};
 static std::atomic<int> g_ratio_iq4_kb_override{-1};
+static std::atomic<int> g_int8_vnni_tn_override{-1};
+static std::atomic<int> g_int8_vnni_kb_override{-1};
 
 __device__ __constant__ int8_t k_ratio_vnni_iq4_lut_i8[16] = {
     -127, -104, -83, -65,
@@ -1030,6 +1032,19 @@ void rocmGemv_ratio_vnni_reset_tuning_overrides()
     rocmGemv_ratio_vnni_set_tuning_overrides(-1, -1, -1, -1);
 }
 
+void rocmGemv_int8_vnni_set_tuning_overrides(
+    int tn,
+    int kb)
+{
+    g_int8_vnni_tn_override.store(tn, std::memory_order_relaxed);
+    g_int8_vnni_kb_override.store(kb, std::memory_order_relaxed);
+}
+
+void rocmGemv_int8_vnni_reset_tuning_overrides()
+{
+    rocmGemv_int8_vnni_set_tuning_overrides(-1, -1);
+}
+
 bool rocmGemv_int8_int8_int32_vnni(
     const int8_t* d_A_int8,
     const int8_t* d_B_int8_vnni,
@@ -1054,6 +1069,11 @@ bool rocmGemv_int8_int8_int32_vnni(
     // Profiling: grid_kpar achieves 488-649 GB/s (48-63% peak) vs wide2's 176 GB/s.
     const bool use_grid_kpar = !use_wide_vec4 && use_vec4 && (N >= GEMV_INT8_VNNI_GRID_KPAR_TILE_N);
     const bool use_square = !use_wide_vec4 && !use_grid_kpar && (N >= GEMV_INT8_VNNI_SQUARE_TILE_N);
+    const int min_dim = min(N, K);
+    const int max_dim = max(N, K);
+    const bool is_squareish_shape = (min_dim >= 2048) && (max_dim * 100 <= min_dim * 140);
+    const int int8_tn_override = g_int8_vnni_tn_override.load(std::memory_order_relaxed);
+    const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
 
     if (use_wide_vec4)
     {
@@ -1084,9 +1104,24 @@ bool rocmGemv_int8_int8_int32_vnni(
         // waves/CU above TARGET_MIN_WAVES_PER_CU for latency hiding.
         constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
         constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
+        constexpr int TN_WIDE = GEMV_INT8_VNNI_WIDE_TILE_N;  // 256
         constexpr int NUM_CUS = 60;  // MI50
 
-        const int grid_n = (N + TN - 1) / TN;
+        int tn = TN;
+        if (is_squareish_shape)
+        {
+            tn = TN_WIDE;
+        }
+        if (int8_tn_override == TN_WIDE)
+        {
+            tn = TN_WIDE;
+        }
+        else if (int8_tn_override == TN)
+        {
+            tn = TN;
+        }
+
+        const int grid_n = (N + tn - 1) / tn;
         const int k_groups = K / 4;
 
         int kb;
@@ -1115,12 +1150,32 @@ bool rocmGemv_int8_int8_int32_vnni(
             kb = min(max(kb_for_kgroups, kb_for_occupancy), kb_max);
         }
 
+        if (is_squareish_shape)
+        {
+            kb = 16;
+        }
+
+        if (int8_kb_override > 0)
+        {
+            kb = int8_kb_override;
+        }
+
         hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));  // NOLINT(clang-diagnostic-unused-result)
 
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_vnni_kernel_t<TN, CPT>),
-            dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_B_int8_vnni, d_C_int32, N, K, kb);
+        if (tn == TN_WIDE)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_vnni_kernel_t<TN_WIDE, CPT>),
+                dim3(grid_n, kb), dim3(TN_WIDE / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_B_int8_vnni, d_C_int32, N, K, kb);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_int8_int8_grid_kpar_vnni_kernel_t<TN, CPT>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_B_int8_vnni, d_C_int32, N, K, kb);
+        }
     }
     else if (use_square)
     {
