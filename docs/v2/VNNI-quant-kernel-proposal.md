@@ -687,6 +687,69 @@ CK GEMM infrastructure for prefill without modification.
     - End-to-end perplexity comparison on WikiText-2 for each format.
 
 
+
+## C. 2026-02-13 Mode3 const-LUT 10-run A/B (Release)
+
+### C.1 Setup
+
+- Binary: `build_v2_release/tests/v2/v2_perf_rocm_ratio_vnni_kernel`
+- Test filter: `ROCmRatioVNNIPerfTest.Phase1Q4AndIQ4SpeedupVsInt8VNNI`
+- Fixed env:
+  - `LLAMINAR_RATIO_IQ4_DECODE_MODE=3`
+  - `LLAMINAR_RATIO_IQ4_CPT=1`
+  - `LLAMINAR_RATIO_IQ4_PREFETCH_NEXT=1`
+- A/B variable:
+  - A: `LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT=0`
+  - B: `LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT=1`
+- Logs: `/tmp/iq4_mode3_constlut_ab_10run_20260213_150931`
+
+
+### C.2 Results (Global ratio/int8 speedup)
+
+- A (`MODE3_CONST_LUT=0`):
+  - mean `1.37030x`, median `1.37360x`, min/max `1.32466x / 1.46412x`, std `0.03723`
+  - pass count: `10/10`
+- B (`MODE3_CONST_LUT=1`):
+  - mean `1.41430x`, median `1.41512x`, min/max `1.38818x / 1.44810x`, std `0.01468`
+  - pass count: `10/10`
+
+- Median uplift (B vs A): **`+3.02%`**
+
+
+### C.3 Takeaway
+
+- The const-LUT mode3 path improves release median throughput and reduces run-to-run variance in this 10-run sample.
+- Keeping mode3 const-LUT enabled by default is supported by this A/B evidence.
+
+
+### C.4 2026-02-13 Codegen-guided pass: register pressure + prefetch A/B
+
+Release codegen audit artifacts:
+- `/tmp/rocm_codegen_audit_20260213_155905/rocmgemv_release_gfx906.syms`
+- `/tmp/rocm_codegen_audit_20260213_155905/rocmgemv_release_gfx906.disasm`
+
+Hot mode3 (`IQ4_DECODE_MODE=3`, `CPT=1`) symbol metadata from `.syms`:
+- `...ELi3ELb0ELb1...` (`PREFETCH_NEXT=0`, `MODE3_CONST_LUT=1`): `vgpr=23`, `sgpr=24`, `private=0`
+- `...ELi3ELb1ELb1...` (`PREFETCH_NEXT=1`, `MODE3_CONST_LUT=1`): `vgpr=28`, `sgpr=50`, `private=0`
+
+This indicates prefetch-on materially increases register pressure for the mode3
+const-LUT variant.
+
+Release 10-run A/B (fixed: `LLAMINAR_RATIO_IQ4_CPT=1`, `LLAMINAR_RATIO_IQ4_DECODE_MODE=3`, `LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT=1`):
+- `LLAMINAR_RATIO_IQ4_PREFETCH_NEXT=0`:
+  - mean `1.42418x`, median `1.42506x`, std `0.02088`, pass `10/10`
+- `LLAMINAR_RATIO_IQ4_PREFETCH_NEXT=1`:
+  - mean `1.40387x`, median `1.39667x`, std `0.01512`, pass `10/10`
+
+Median delta (`prefetch=1` vs `prefetch=0`): **`-1.99%`**.
+
+Logs:
+- `/tmp/iq4_mode3_prefetch_ab10_20260213_155937`
+
+Conclusion:
+- For current mode3 const-LUT + dual-acc path, `PREFETCH_NEXT=0` performs better and aligns with lower VGPR/SGPR usage.
+
+
 ## Appendix A: Raw Binary Disassembly & ISA Audit Quick Reference
 
 This appendix captures the exact workflow used to verify release-build codegen
@@ -1007,35 +1070,95 @@ For each pass directory, keep:
 This is sufficient to reproduce and compare future tuning iterations.
 
 
-## C. 2026-02-13 Mode3 const-LUT 10-run A/B (Release)
+### B.9 Hot-loop disassembly findings (mode3 baseline)
 
-### C.1 Setup
+Targeted ISA extraction was performed from the embedded ROCm fatbin in the
+release binary for the mode3 decode hot family (`<128,1,true,...>`). The
+representative symbol disassembled was:
 
-- Binary: `build_v2_release/tests/v2/v2_perf_rocm_ratio_vnni_kernel`
-- Test filter: `ROCmRatioVNNIPerfTest.Phase1Q4AndIQ4SpeedupVsInt8VNNI`
-- Fixed env:
-  - `LLAMINAR_RATIO_IQ4_DECODE_MODE=3`
-  - `LLAMINAR_RATIO_IQ4_CPT=1`
-  - `LLAMINAR_RATIO_IQ4_PREFETCH_NEXT=1`
-- A/B variable:
-  - A: `LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT=0`
-  - B: `LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT=1`
-- Logs: `/tmp/iq4_mode3_constlut_ab_10run_20260213_150931`
+- `_Z34gemv_ratio_vnni_grid_kpar_kernel_tILi128ELi1ELb1EEvPKaPKhS1_Piiiih`
 
+Key static observations from the back-edge loop window (roughly `0x8500-0x8d30`):
 
-### C.2 Results (Global ratio/int8 speedup)
+- Total decoded instructions in window: `373`
+- Scalar (`s_*`) instructions in loop window: `11`
+- Vector (`v_*`) instructions in loop window: `360`
+- Global memory ops in loop window: `2` (`global_load_*`)
 
-- A (`MODE3_CONST_LUT=0`):
-  - mean `1.37030x`, median `1.37360x`, min/max `1.32466x / 1.46412x`, std `0.03723`
-  - pass count: `10/10`
-- B (`MODE3_CONST_LUT=1`):
-  - mean `1.41430x`, median `1.41512x`, min/max `1.38818x / 1.44810x`, std `0.01468`
-  - pass count: `10/10`
+Top opcode families in the loop window:
 
-- Median uplift (B vs A): **`+3.02%`**
+- `v_and_b32_e32` (90)
+- `v_cndmask_b32_e32` (64)
+- `v_lshrrev_b64` (32)
+- `v_lshrrev_b32_e32` (18)
+- `v_mul_i32_i24_e32` (16)
+- `v_cmp_gt_u16_e32` (16)
+- `v_lshlrev_b32_e32` (16)
 
+This indicates the hot loop is dominated by nibble/lane decode and pack logic,
+not by scalar control instructions alone.
 
-### C.3 Takeaway
+Loop-carried scalar/control sequence still present each iteration:
 
-- The const-LUT mode3 path improves release median throughput and reduces run-to-run variance in this 10-run sample.
-- Keeping mode3 const-LUT enabled by default is supported by this A/B evidence.
+- `s_ashr_i32` + `s_add_u32` + `s_addc_u32` (address update)
+- `s_load_dwordx8` (per-iteration scalar table/load block)
+- `s_add_i32` (loop counters)
+- `s_cmp_lt_i32` + `s_cbranch_scc1` (back-edge control)
+
+#### Elimination shortlist from ISA evidence
+
+1. **Reduce vector bit-manip chain in mode3 decode path**
+   - Target: repeated `v_and`/`v_cndmask`/`v_lshrrev`/`v_cmp` clusters.
+   - Approach: fold more decode into fewer permute-table operations (or wider
+     packed transforms) to lower total vector integer op count.
+
+2. **Trim loop-carried scalar address/control overhead**
+   - Target: per-iteration `s_ashr/s_add/s_addc/s_cmp/s_cbranch` sequence.
+   - Approach: unroll by 2 blocks (if register-safe) and amortize scalar pointer
+     and branch work over more decode-dot work.
+
+3. **Hoist/compact scalar setup where legality permits**
+   - Target: scalar constants/index setup that can be reused across iterations.
+   - Approach: keep invariant scalar setup outside the inner loop and reuse SGPR
+     state instead of regenerating equivalent forms.
+
+Cross-check with counter data from this same session:
+
+- Prefetch-on increased `SALUInsts` and `SALUBusy` materially, while runtime
+  did not improve.
+- Memory pressure remained moderate (`MemUnitBusy` around ~50%, low
+  `MemUnitStalled`), reinforcing decode/control efficiency as next lever.
+
+Quick follow-up experiment (`2026-02-13`):
+
+- Tried a low-risk mode3 `CPT=1` inner-loop unroll-by-2 variant (release build).
+- Hot-kernel check (`<128,1,true,3,...>`): `avg_us` moved from ~`35.61` to
+  ~`36.13` (regression), so the change was reverted.
+- Signal: reducing scalar back-edge overhead alone did not compensate for the
+  added vector/register-side pressure in this path.
+
+Second follow-up experiment (`2026-02-13`):
+
+- Hoisted loop-invariant address math in the inner `b` loop using running
+  pointers (`a4`, `payload16`, `ratio`) rather than recomputing linear offsets
+  each iteration.
+- Targeted hot-kernel profile (`<128,1,true,3,...>`) moved from ~`35.61us` to
+  ~`35.36us` (about `-0.7%`), with lower scalar pressure than the previous
+  unroll attempt.
+- This variant was later reverted in source after interleaved A/B validation.
+
+Interleaved validation pass (`2026-02-13`, 10 paired runs, release):
+
+- Method: alternating `A,B,A,B,...` sequence with fixed env (`DECODE_MODE=3`,
+  `CPT=1`, `MODE3_CONST_LUT=1`, `PREFETCH_NEXT=0`, `MODE3_KB_TUNE=0`).
+- Binaries:
+  - A = current hoist variant
+  - B = temporary baseline (hoist reverted)
+- Artifacts: `/tmp/iq4_interleaved_ab/run_20260213_165821`
+- Result (global ratio/int8 speedup):
+  - A mean/median: `1.42931x` / `1.42213x`
+  - B mean/median: `1.43380x` / `1.42796x`
+  - Paired delta (A-B): mean `-0.00450x` (`-0.31%`), median `-0.00580x`
+    (`-0.41%`)
+- Conclusion: under interleaved pairing, the hoist change is neutral-to-slightly
+  negative on this benchmark; no high-confidence throughput gain observed.
