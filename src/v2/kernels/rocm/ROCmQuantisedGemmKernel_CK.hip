@@ -695,6 +695,104 @@ static DeviceGemmInt8_NoScale_32x32& getCachedNoScaleKernel32x32(int device_id =
     return *devices[idx];
 }
 
+enum class QuantShapeClass
+{
+    ExtremeWide,
+    Wide,
+    Balanced,
+    Tall,
+};
+
+struct QuantAspectThresholds
+{
+    double extreme_wide;
+    double wide;
+    double balanced_min;
+};
+
+static QuantAspectThresholds getQuantAspectThresholds()
+{
+    static const QuantAspectThresholds thresholds = []() {
+        QuantAspectThresholds t{64.0, 8.0, 0.125};
+
+        if (const char* env_extreme = std::getenv("LLAMINAR_Q8_ASPECT_EXTREME_WIDE"))
+        {
+            const double v = std::atof(env_extreme);
+            if (v > 0.0)
+            {
+                t.extreme_wide = v;
+            }
+        }
+        if (const char* env_wide = std::getenv("LLAMINAR_Q8_ASPECT_WIDE"))
+        {
+            const double v = std::atof(env_wide);
+            if (v > 0.0)
+            {
+                t.wide = v;
+            }
+        }
+        if (const char* env_balanced = std::getenv("LLAMINAR_Q8_ASPECT_BALANCED_MIN"))
+        {
+            const double v = std::atof(env_balanced);
+            if (v > 0.0)
+            {
+                t.balanced_min = v;
+            }
+        }
+
+        if (t.extreme_wide < t.wide)
+        {
+            t.extreme_wide = t.wide;
+        }
+        if (t.wide < t.balanced_min)
+        {
+            t.wide = t.balanced_min;
+        }
+
+        return t;
+    }();
+
+    return thresholds;
+}
+
+static QuantShapeClass classifyQuantShape(int M, int K)
+{
+    const double safe_m = static_cast<double>(std::max(M, 1));
+    const double aspect_k_over_m = static_cast<double>(K) / safe_m;
+    const QuantAspectThresholds thresholds = getQuantAspectThresholds();
+
+    if (aspect_k_over_m >= thresholds.extreme_wide)
+    {
+        return QuantShapeClass::ExtremeWide;
+    }
+    if (aspect_k_over_m >= thresholds.wide)
+    {
+        return QuantShapeClass::Wide;
+    }
+    if (aspect_k_over_m >= thresholds.balanced_min)
+    {
+        return QuantShapeClass::Balanced;
+    }
+    return QuantShapeClass::Tall;
+}
+
+static int chooseQuantThreadsFromShape(int M, int K)
+{
+    switch (classifyQuantShape(M, K))
+    {
+        case QuantShapeClass::ExtremeWide:
+            return 512;
+        case QuantShapeClass::Wide:
+            return 256;
+        case QuantShapeClass::Balanced:
+            return 256;
+        case QuantShapeClass::Tall:
+            return 128;
+    }
+
+    return 256;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -710,7 +808,7 @@ static DeviceGemmInt8_NoScale_32x32& getCachedNoScaleKernel32x32(int device_id =
  *   3. int8_i = round(x_i / scale) clamped to [-127, 127]
  *
  * Grid: (M, 1, 1) blocks
- * Block: (256, 1, 1) threads (handles rows up to 256*k_per_thread elements)
+ * Block: shape-selected threads (128/256/512), chosen from matrix aspect ratio K/M
  *
  * @param d_A_fp32 Input FP32 matrix [M × K] RowMajor
  * @param d_A_int8 Output INT8 matrix [M × K] RowMajor
@@ -731,8 +829,9 @@ __global__ void quantizeActivationsQ8_kernel(
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
 
-    // Shared memory for wavefront-level max merge (256 threads = 4 waves)
-    __shared__ float s_wave_max[4];
+    // Shared memory for wavefront-level max merge.
+    // Largest launch uses 512 threads => 8 wave64 groups.
+    __shared__ float s_wave_max[8];
     __shared__ float s_absmax;
 
     // Step 1: Find max absolute value in this row (parallel reduction)
@@ -769,6 +868,7 @@ __global__ void quantizeActivationsQ8_kernel(
     // Wavefront reduction (wave64 on gfx906)
     const int lane = tid & 63;
     const int wave = tid >> 6;
+    const int wave_count = block_size >> 6;
     #pragma unroll
     for (int offset = 32; offset > 0; offset >>= 1)
     {
@@ -781,10 +881,10 @@ __global__ void quantizeActivationsQ8_kernel(
     }
     __syncthreads();
 
-    // First wave merges the 4 wave maxima
+    // First wave merges all per-wave maxima
     if (wave == 0)
     {
-        float v = (tid < 4) ? s_wave_max[tid] : 0.0f;
+        float v = (tid < wave_count) ? s_wave_max[tid] : 0.0f;
         #pragma unroll
         for (int offset = 32; offset > 0; offset >>= 1)
         {
@@ -1966,7 +2066,7 @@ extern "C"
     //
     // EXECUTION:
     //   - Grid: (M, 1, 1) - one block per row
-    //   - Block: (256, 1, 1) - 256 threads handle K elements in parallel
+    //   - Block: shape-driven (128/256/512) from aspect ratio K/M
     //   - Parallel reduction for max_abs finding
     //
     // =========================================================================
@@ -1984,8 +2084,9 @@ extern "C"
         if (M <= 0 || K <= 0)
             return true; // Nothing to do
 
-        // Launch kernel: one block per row, 256 threads per block
-        const int block_size = 256;
+        // Launch kernel: one block per row, thread count selected by shape class.
+        // Policy is based on aspect ratio K/M (row width vs row count), not fixed dimensions.
+        const int block_size = chooseQuantThreadsFromShape(M, K);
         dim3 grid(M, 1, 1);
         dim3 block(block_size, 1, 1);
 

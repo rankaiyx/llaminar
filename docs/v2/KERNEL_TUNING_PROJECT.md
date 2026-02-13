@@ -432,6 +432,27 @@ Ratio: 1.74× matches average ~1.7 sub-projections per fused call (QKV=3, GateUp
 
 **Decision**: Keep this non-grid scaling fusion enabled; do not re-enable fused grid-kpar variants (atomic/two-stage) unless a new approach demonstrates clear improvement over fallback on gfx906.
 
+### Entry 15: Quantization Aspect-Threshold Sweep (shape-policy lock-in) (2026-02-13)
+
+**Target**: shape-driven thread policy for `quantizeActivationsQ8_kernel` in `ROCmQuantisedGemmKernel_CK.hip`.
+
+**What changed**:
+
+- Added runtime threshold knobs for shape classification:
+   - `LLAMINAR_Q8_ASPECT_EXTREME_WIDE`
+   - `LLAMINAR_Q8_ASPECT_WIDE`
+   - `LLAMINAR_Q8_ASPECT_BALANCED_MIN`
+- Kept thread mapping policy unchanged:
+   - `ExtremeWide -> 512`, `Wide/Balanced -> 256`, `Tall -> 128`
+
+**Release perf sweep** (`V2_Perf_ROCmGemvKernel`, Qwen2.5-7B decode):
+
+- `EXTREME_WIDE=64` (default): **19.926 ms** (All 28 layers + LM)
+- `EXTREME_WIDE=4096`: **20.454 ms**
+- `EXTREME_WIDE=8192`: **20.420 ms**
+
+**Decision**: Keep default thresholds (`64 / 8 / 0.125`) — higher extreme-wide cutoffs regressed end-to-end decode timing on gfx906.
+
 ### Entry 9: GEMV Tile/Occupancy Tuning — CPT + KB Optimization (2026-02-10)
 
 **Target**: `grid_kpar_t<TN,CPT>` kernel in `ROCmGemvKernel.hip` — handles QKV, Wo, FFN Down projections (84 of 113 GEMV calls per decode token)
