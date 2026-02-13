@@ -152,16 +152,28 @@ namespace llaminar2
             std::vector<int8_t> int8_data;      ///< [K × N] RowMajor INT8 weights (host only, not uploaded to device)
             std::vector<int8_t> int8_data_vnni; ///< [K/4 × N × 4] VNNI layout (the sole device layout)
             std::vector<float> scales;          ///< [N] per-column (per-output-feature) scale factors
-            int K = 0;                          ///< Input features (rows in CK B matrix)
-            int N = 0;                          ///< Output features (cols in CK B matrix)
+
+            // Phase-1 ratio-VNNI compact container (IQ4_NL, Q4_0 only)
+            std::vector<uint8_t> ratio_vnni_payload; ///< [blocks × N × payload_bytes] compact nibble payload
+            std::vector<int8_t> ratio_vnni_ratio;    ///< [blocks × N] per-block int8 ratio
+            uint8_t ratio_vnni_bitwidth = 0;         ///< 4 for Phase-1
+            uint8_t ratio_vnni_codebook_id = 0;      ///< 0=linear(Q4_0), 4=IQ4(IQ4_NL)
+            uint8_t ratio_vnni_has_min = 0;          ///< 0 in Phase-1
+            uint8_t ratio_vnni_block_size = 0;       ///< 32 in Phase-1
+            uint16_t ratio_vnni_payload_bytes = 0;   ///< 16 in Phase-1
+
+            int K = 0; ///< Input features (rows in CK B matrix)
+            int N = 0; ///< Output features (cols in CK B matrix)
 
             // Device memory pointers (uploaded once, cached)
             // Option B: Only VNNI layout is uploaded to device. Row-major is repacked
             // on-demand into a shared workspace scratch buffer for CK GEMM prefill.
-            int8_t *d_int8_data_vnni = nullptr; ///< Device pointer to VNNI-packed weights (sole device copy)
-            float *d_scales = nullptr;          ///< Device pointer to scales
-            int rocm_device_id = -1;            ///< Device where data is uploaded
-            bool uploaded = false;              ///< Whether device memory is allocated
+            int8_t *d_int8_data_vnni = nullptr;      ///< Device pointer to VNNI-packed weights (sole device copy)
+            uint8_t *d_ratio_vnni_payload = nullptr; ///< Device pointer to compact ratio-VNNI payload
+            int8_t *d_ratio_vnni_ratio = nullptr;    ///< Device pointer to ratio-VNNI per-block ratios
+            float *d_scales = nullptr;               ///< Device pointer to scales
+            int rocm_device_id = -1;                 ///< Device where data is uploaded
+            bool uploaded = false;                   ///< Whether device memory is allocated
 
             ~ROCmPackedWeights();
         };

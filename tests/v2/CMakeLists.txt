@@ -7847,6 +7847,46 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm GEMV kernel performance benchmarks")
 
+    # Performance Test: ROCm Ratio-VNNI Kernel (Phase-1 Q4_0/IQ4_NL)
+    # Compares compact ratio-VNNI decode kernel against existing INT8 VNNI grid_kpar
+    add_executable(v2_perf_rocm_ratio_vnni_kernel
+        performance/kernels/rocm/Perf__ROCmRatioVNNIKernel.cpp
+    )
+    target_link_libraries(v2_perf_rocm_ratio_vnni_kernel
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmRatioVNNIKernel
+        COMMAND $<TARGET_FILE:v2_perf_rocm_ratio_vnni_kernel>
+        LABELS "V2;Performance;ROCm;GEMV;RatioVNNI;Q4_0;IQ4_NL;Decode;gfx906;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm ratio-VNNI performance benchmark")
+
+    # Performance Test: ROCm IQ4_NL Decode Microbenchmark
+    # Isolates IQ4_NL decode+dot strategy costs to compare kernel approach variants.
+    set_source_files_properties(
+        performance/kernels/rocm/Perf__ROCmIQ4DecodeMicrobench.hip
+        PROPERTIES LANGUAGE HIP
+    )
+    add_executable(v2_perf_rocm_iq4_decode_microbench
+        performance/kernels/rocm/Perf__ROCmIQ4DecodeMicrobench.hip
+    )
+    target_link_libraries(v2_perf_rocm_iq4_decode_microbench
+        hip::host
+        hip::device
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmIQ4DecodeMicrobench
+        COMMAND $<TARGET_FILE:v2_perf_rocm_iq4_decode_microbench>
+        LABELS "V2;Performance;ROCm;IQ4_NL;Decode;Microbenchmark;gfx906;Experiment"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm IQ4 decode microbenchmark")
+
     # NOTE: FP16 vs INT8 benchmark removed (January 2026) - INT8 proven faster for all sizes.
     # Results documented in changelog/2026-01-10-rocm-int8-gemm-optimization.md
 
