@@ -82,6 +82,7 @@ __device__ __constant__ int8_t k_ratio_vnni_iq4_lut_i8[16] = {
     53, 69, 89, 113};
 
 __device__ __constant__ uint32_t k_ratio_iq4_perm_lut_words[1024];
+__device__ __constant__ uint32_t k_ratio_linear_perm_lut_words[1024];
 
 static std::array<uint32_t, 1024> build_ratio_iq4_perm_lut_table_host()
 {
@@ -102,6 +103,40 @@ static std::array<uint32_t, 1024> build_ratio_iq4_perm_lut_table_host()
             const int8_t wi_lo_1 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 4]) + 64) >> 7);
             const int8_t wi_hi_0 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 8]) + 64) >> 7);
             const int8_t wi_hi_1 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 12]) + 64) >> 7);
+
+            lut0 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_0)) << (i * 8));
+            lut1 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_1)) << (i * 8));
+            lut2 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_hi_0)) << (i * 8));
+            lut3 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_hi_1)) << (i * 8));
+        }
+
+        table[base + 0] = lut0;
+        table[base + 1] = lut1;
+        table[base + 2] = lut2;
+        table[base + 3] = lut3;
+    }
+    return table;
+}
+
+static std::array<uint32_t, 1024> build_ratio_linear_perm_lut_table_host()
+{
+    std::array<uint32_t, 1024> table{};
+    for (int rb = 0; rb < 256; ++rb)
+    {
+        const int8_t ratio = static_cast<int8_t>(rb);
+        const int base = rb * 4;
+
+        uint32_t lut0 = 0;
+        uint32_t lut1 = 0;
+        uint32_t lut2 = 0;
+        uint32_t lut3 = 0;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            const int8_t wi_lo_0 = static_cast<int8_t>((static_cast<int>(ratio) * (i - 8) + 64) >> 7);
+            const int8_t wi_lo_1 = static_cast<int8_t>((static_cast<int>(ratio) * (i - 4) + 64) >> 7);
+            const int8_t wi_hi_0 = static_cast<int8_t>((static_cast<int>(ratio) * (i + 0) + 64) >> 7);
+            const int8_t wi_hi_1 = static_cast<int8_t>((static_cast<int>(ratio) * (i + 4) + 64) >> 7);
 
             lut0 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_0)) << (i * 8));
             lut1 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_1)) << (i * 8));
@@ -138,6 +173,35 @@ static bool ensure_ratio_iq4_perm_lut_table_on_device(int device_id)
     if (err != hipSuccess)
     {
         fprintf(stderr, "[rocmGemv_ratio_vnni_int8_int32] Failed to init mode3 LUT table on device %d: %s\n",
+                did, hipGetErrorString(err));
+        return false;
+    }
+
+    initialized[did] = true;
+    return true;
+}
+
+static bool ensure_ratio_linear_perm_lut_table_on_device(int device_id)
+{
+    static std::mutex init_mutex;
+    static bool initialized[16] = {false};
+    static const std::array<uint32_t, 1024> host_table = build_ratio_linear_perm_lut_table_host();
+
+    const int did = (device_id >= 0 && device_id < 16) ? device_id : 0;
+    std::lock_guard<std::mutex> lock(init_mutex);
+    if (initialized[did])
+    {
+        return true;
+    }
+
+    hipError_t err = hipMemcpyToSymbol(HIP_SYMBOL(k_ratio_linear_perm_lut_words),
+                                       host_table.data(),
+                                       host_table.size() * sizeof(uint32_t),
+                                       0,
+                                       hipMemcpyHostToDevice);
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_ratio_vnni_int8_int32] Failed to init linear mode3 LUT table on device %d: %s\n",
                 did, hipGetErrorString(err));
         return false;
     }
@@ -268,187 +332,6 @@ __device__ __forceinline__ void decode_q4_block8_to_packed_i8(
     out[7] = decode_q4_pack4_high<IQ4>(q12, q13, q14, q15, ratio);
 }
 
-__device__ __forceinline__ void decode_q4_block8_to_packed_i8_with_map(
-    const uint8_t* payload16,
-    const int8_t map16[16],
-    int32_t out[8])
-{
-    const uint4 packed = *reinterpret_cast<const uint4*>(payload16);
-    const uint32_t p0 = packed.x;
-    const uint32_t p1 = packed.y;
-    const uint32_t p2 = packed.z;
-    const uint32_t p3 = packed.w;
-
-    const uint8_t q0 = static_cast<uint8_t>(p0 & 0xFFu);
-    const uint8_t q1 = static_cast<uint8_t>((p0 >> 8) & 0xFFu);
-    const uint8_t q2 = static_cast<uint8_t>((p0 >> 16) & 0xFFu);
-    const uint8_t q3 = static_cast<uint8_t>((p0 >> 24) & 0xFFu);
-    const uint8_t q4 = static_cast<uint8_t>(p1 & 0xFFu);
-    const uint8_t q5 = static_cast<uint8_t>((p1 >> 8) & 0xFFu);
-    const uint8_t q6 = static_cast<uint8_t>((p1 >> 16) & 0xFFu);
-    const uint8_t q7 = static_cast<uint8_t>((p1 >> 24) & 0xFFu);
-    const uint8_t q8 = static_cast<uint8_t>(p2 & 0xFFu);
-    const uint8_t q9 = static_cast<uint8_t>((p2 >> 8) & 0xFFu);
-    const uint8_t q10 = static_cast<uint8_t>((p2 >> 16) & 0xFFu);
-    const uint8_t q11 = static_cast<uint8_t>((p2 >> 24) & 0xFFu);
-    const uint8_t q12 = static_cast<uint8_t>(p3 & 0xFFu);
-    const uint8_t q13 = static_cast<uint8_t>((p3 >> 8) & 0xFFu);
-    const uint8_t q14 = static_cast<uint8_t>((p3 >> 16) & 0xFFu);
-    const uint8_t q15 = static_cast<uint8_t>((p3 >> 24) & 0xFFu);
-
-    auto pack4 = [&](int a, int b, int c, int d) -> int32_t {
-        uint32_t packed4 = 0;
-        packed4 |= static_cast<uint32_t>(static_cast<uint8_t>(a));
-        packed4 |= (static_cast<uint32_t>(static_cast<uint8_t>(b)) << 8);
-        packed4 |= (static_cast<uint32_t>(static_cast<uint8_t>(c)) << 16);
-        packed4 |= (static_cast<uint32_t>(static_cast<uint8_t>(d)) << 24);
-        return static_cast<int32_t>(packed4);
-    };
-
-    out[0] = pack4(map16[q0 & 0x0Fu], map16[q1 & 0x0Fu], map16[q2 & 0x0Fu], map16[q3 & 0x0Fu]);
-    out[1] = pack4(map16[q4 & 0x0Fu], map16[q5 & 0x0Fu], map16[q6 & 0x0Fu], map16[q7 & 0x0Fu]);
-    out[2] = pack4(map16[q8 & 0x0Fu], map16[q9 & 0x0Fu], map16[q10 & 0x0Fu], map16[q11 & 0x0Fu]);
-    out[3] = pack4(map16[q12 & 0x0Fu], map16[q13 & 0x0Fu], map16[q14 & 0x0Fu], map16[q15 & 0x0Fu]);
-
-    out[4] = pack4(map16[q0 >> 4], map16[q1 >> 4], map16[q2 >> 4], map16[q3 >> 4]);
-    out[5] = pack4(map16[q4 >> 4], map16[q5 >> 4], map16[q6 >> 4], map16[q7 >> 4]);
-    out[6] = pack4(map16[q8 >> 4], map16[q9 >> 4], map16[q10 >> 4], map16[q11 >> 4]);
-    out[7] = pack4(map16[q12 >> 4], map16[q13 >> 4], map16[q14 >> 4], map16[q15 >> 4]);
-}
-
-__device__ __forceinline__ void decode_q4_low_high_pair_to_packed_i8_with_lut64(
-    uint8_t q0, uint8_t q1, uint8_t q2, uint8_t q3,
-    uint64_t lut_lo, uint64_t lut_hi,
-    int32_t& packed_low, int32_t& packed_high)
-{
-    auto lut_lookup = [&](uint8_t idx) -> uint8_t {
-        const uint64_t lut = (idx < 8) ? lut_lo : lut_hi;
-        const uint32_t sh = static_cast<uint32_t>(idx & 7u) * 8u;
-        return static_cast<uint8_t>((lut >> sh) & 0xFFu);
-    };
-
-    const uint8_t i0l = static_cast<uint8_t>(q0 & 0x0Fu);
-    const uint8_t i1l = static_cast<uint8_t>(q1 & 0x0Fu);
-    const uint8_t i2l = static_cast<uint8_t>(q2 & 0x0Fu);
-    const uint8_t i3l = static_cast<uint8_t>(q3 & 0x0Fu);
-
-    const uint8_t i0h = static_cast<uint8_t>(q0 >> 4);
-    const uint8_t i1h = static_cast<uint8_t>(q1 >> 4);
-    const uint8_t i2h = static_cast<uint8_t>(q2 >> 4);
-    const uint8_t i3h = static_cast<uint8_t>(q3 >> 4);
-
-    uint32_t low = 0;
-    low |= static_cast<uint32_t>(lut_lookup(i0l));
-    low |= (static_cast<uint32_t>(lut_lookup(i1l)) << 8);
-    low |= (static_cast<uint32_t>(lut_lookup(i2l)) << 16);
-    low |= (static_cast<uint32_t>(lut_lookup(i3l)) << 24);
-
-    uint32_t high = 0;
-    high |= static_cast<uint32_t>(lut_lookup(i0h));
-    high |= (static_cast<uint32_t>(lut_lookup(i1h)) << 8);
-    high |= (static_cast<uint32_t>(lut_lookup(i2h)) << 16);
-    high |= (static_cast<uint32_t>(lut_lookup(i3h)) << 24);
-
-    packed_low = static_cast<int32_t>(low);
-    packed_high = static_cast<int32_t>(high);
-}
-
-__device__ __forceinline__ void decode_q4_block8_to_packed_i8_with_lut64(
-    const uint8_t* payload16,
-    uint64_t lut_lo,
-    uint64_t lut_hi,
-    int32_t out[8])
-{
-    const uint4 packed = *reinterpret_cast<const uint4*>(payload16);
-    const uint32_t p0 = packed.x;
-    const uint32_t p1 = packed.y;
-    const uint32_t p2 = packed.z;
-    const uint32_t p3 = packed.w;
-
-    auto lut_lookup = [&](uint8_t idx) -> int8_t {
-        const uint64_t lut = (idx < 8) ? lut_lo : lut_hi;
-        const uint32_t sh = static_cast<uint32_t>(idx & 7u) * 8u;
-        return static_cast<int8_t>((lut >> sh) & 0xFFu);
-    };
-
-    auto pack4 = [&](uint8_t q0, uint8_t q1, uint8_t q2, uint8_t q3, bool high) -> int32_t {
-        const uint8_t i0 = high ? static_cast<uint8_t>(q0 >> 4) : static_cast<uint8_t>(q0 & 0x0Fu);
-        const uint8_t i1 = high ? static_cast<uint8_t>(q1 >> 4) : static_cast<uint8_t>(q1 & 0x0Fu);
-        const uint8_t i2 = high ? static_cast<uint8_t>(q2 >> 4) : static_cast<uint8_t>(q2 & 0x0Fu);
-        const uint8_t i3 = high ? static_cast<uint8_t>(q3 >> 4) : static_cast<uint8_t>(q3 & 0x0Fu);
-
-        const uint8_t w0 = static_cast<uint8_t>(lut_lookup(i0));
-        const uint8_t w1 = static_cast<uint8_t>(lut_lookup(i1));
-        const uint8_t w2 = static_cast<uint8_t>(lut_lookup(i2));
-        const uint8_t w3 = static_cast<uint8_t>(lut_lookup(i3));
-
-        uint32_t packed4 = 0;
-        packed4 |= static_cast<uint32_t>(w0);
-        packed4 |= (static_cast<uint32_t>(w1) << 8);
-        packed4 |= (static_cast<uint32_t>(w2) << 16);
-        packed4 |= (static_cast<uint32_t>(w3) << 24);
-        return static_cast<int32_t>(packed4);
-    };
-
-    const uint8_t q0 = static_cast<uint8_t>(p0 & 0xFFu);
-    const uint8_t q1 = static_cast<uint8_t>((p0 >> 8) & 0xFFu);
-    const uint8_t q2 = static_cast<uint8_t>((p0 >> 16) & 0xFFu);
-    const uint8_t q3 = static_cast<uint8_t>((p0 >> 24) & 0xFFu);
-    const uint8_t q4 = static_cast<uint8_t>(p1 & 0xFFu);
-    const uint8_t q5 = static_cast<uint8_t>((p1 >> 8) & 0xFFu);
-    const uint8_t q6 = static_cast<uint8_t>((p1 >> 16) & 0xFFu);
-    const uint8_t q7 = static_cast<uint8_t>((p1 >> 24) & 0xFFu);
-    const uint8_t q8 = static_cast<uint8_t>(p2 & 0xFFu);
-    const uint8_t q9 = static_cast<uint8_t>((p2 >> 8) & 0xFFu);
-    const uint8_t q10 = static_cast<uint8_t>((p2 >> 16) & 0xFFu);
-    const uint8_t q11 = static_cast<uint8_t>((p2 >> 24) & 0xFFu);
-    const uint8_t q12 = static_cast<uint8_t>(p3 & 0xFFu);
-    const uint8_t q13 = static_cast<uint8_t>((p3 >> 8) & 0xFFu);
-    const uint8_t q14 = static_cast<uint8_t>((p3 >> 16) & 0xFFu);
-    const uint8_t q15 = static_cast<uint8_t>((p3 >> 24) & 0xFFu);
-
-    out[0] = pack4(q0, q1, q2, q3, false);
-    out[1] = pack4(q4, q5, q6, q7, false);
-    out[2] = pack4(q8, q9, q10, q11, false);
-    out[3] = pack4(q12, q13, q14, q15, false);
-    out[4] = pack4(q0, q1, q2, q3, true);
-    out[5] = pack4(q4, q5, q6, q7, true);
-    out[6] = pack4(q8, q9, q10, q11, true);
-    out[7] = pack4(q12, q13, q14, q15, true);
-}
-
-__device__ __forceinline__ int32_t decode_q4_group_to_packed_i8_with_lut64(
-    const uint8_t* payload16,
-    int group,
-    uint64_t lut_lo,
-    uint64_t lut_hi)
-{
-    auto lut_lookup = [&](uint8_t idx) -> int8_t {
-        const uint64_t lut = (idx < 8) ? lut_lo : lut_hi;
-        const uint32_t sh = static_cast<uint32_t>(idx & 7u) * 8u;
-        return static_cast<int8_t>((lut >> sh) & 0xFFu);
-    };
-
-    const int byte_base = (group & 3) * 4;
-    const bool high = (group >= 4);
-
-    const uint8_t q0 = payload16[byte_base + 0];
-    const uint8_t q1 = payload16[byte_base + 1];
-    const uint8_t q2 = payload16[byte_base + 2];
-    const uint8_t q3 = payload16[byte_base + 3];
-
-    const uint8_t i0 = high ? static_cast<uint8_t>(q0 >> 4) : static_cast<uint8_t>(q0 & 0x0Fu);
-    const uint8_t i1 = high ? static_cast<uint8_t>(q1 >> 4) : static_cast<uint8_t>(q1 & 0x0Fu);
-    const uint8_t i2 = high ? static_cast<uint8_t>(q2 >> 4) : static_cast<uint8_t>(q2 & 0x0Fu);
-    const uint8_t i3 = high ? static_cast<uint8_t>(q3 >> 4) : static_cast<uint8_t>(q3 & 0x0Fu);
-
-    uint32_t packed = 0;
-    packed |= static_cast<uint32_t>(static_cast<uint8_t>(lut_lookup(i0)));
-    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(lut_lookup(i1))) << 8);
-    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(lut_lookup(i2))) << 16);
-    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(lut_lookup(i3))) << 24);
-    return static_cast<int32_t>(packed);
-}
 
 __device__ __forceinline__ void decode_q4_low_high_pair_to_packed_i8_with_perm_lut16(
     uint32_t p,
@@ -502,36 +385,6 @@ __device__ __forceinline__ void decode_q4_two_pairs_to_packed_i8_with_perm_lut16
     decode_q4_low_high_pair_to_packed_i8_with_perm_lut16(p1, lut0, lut1, lut2, lut3, out1_low, out1_high);
 }
 
-__device__ __forceinline__ void build_iq4_perm_lut_words_from_ratio(
-    int8_t ratio,
-    uint32_t& lut0,
-    uint32_t& lut1,
-    uint32_t& lut2,
-    uint32_t& lut3)
-{
-    lut0 = 0;
-    lut1 = 0;
-    lut2 = 0;
-    lut3 = 0;
-
-    #pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        const int8_t wi_lo = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i]) + 64) >> 7);
-        const int8_t wi_hi = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 8]) + 64) >> 7);
-        lut0 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo)) << (i * 8));
-        lut2 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_hi)) << (i * 8));
-    }
-
-    #pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        const int8_t wi_lo = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 4]) + 64) >> 7);
-        const int8_t wi_hi = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 12]) + 64) >> 7);
-        lut1 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo)) << (i * 8));
-        lut3 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_hi)) << (i * 8));
-    }
-}
 
 __device__ __forceinline__ void fetch_iq4_perm_lut_words_from_ratio_table(
     int8_t ratio,
@@ -545,6 +398,20 @@ __device__ __forceinline__ void fetch_iq4_perm_lut_words_from_ratio_table(
     lut1 = k_ratio_iq4_perm_lut_words[idx + 1];
     lut2 = k_ratio_iq4_perm_lut_words[idx + 2];
     lut3 = k_ratio_iq4_perm_lut_words[idx + 3];
+}
+
+__device__ __forceinline__ void fetch_linear_perm_lut_words_from_ratio_table(
+    int8_t ratio,
+    uint32_t& lut0,
+    uint32_t& lut1,
+    uint32_t& lut2,
+    uint32_t& lut3)
+{
+    const uint32_t idx = static_cast<uint32_t>(static_cast<uint8_t>(ratio)) * 4u;
+    lut0 = k_ratio_linear_perm_lut_words[idx + 0];
+    lut1 = k_ratio_linear_perm_lut_words[idx + 1];
+    lut2 = k_ratio_linear_perm_lut_words[idx + 2];
+    lut3 = k_ratio_linear_perm_lut_words[idx + 3];
 }
 
 __global__ void gemv_int8_int8_vnni_kernel(
@@ -792,6 +659,8 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
     int N, int K, int kblocks,
     uint8_t)
 {
+    static_assert(CPT == 1, "Canonical ratio-VNNI path requires CPT==1");
+
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
     const bool active = (n_base < N);
     const int kb = blockIdx.y;
@@ -855,51 +724,39 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
                 }
                 else
                 {
-                    int32_t w_packed[8];
-                    decode_q4_block8_to_packed_i8<false>(payload16, ratio, w_packed);
+                    const uint4 packed = *reinterpret_cast<const uint4*>(payload16);
+                    uint32_t lut0 = 0;
+                    uint32_t lut1 = 0;
+                    uint32_t lut2 = 0;
+                    uint32_t lut3 = 0;
+                    fetch_linear_perm_lut_words_from_ratio_table(ratio, lut0, lut1, lut2, lut3);
 
-                    #pragma unroll
-                    for (int g = 0; g < 8; ++g)
-                    {
-                        const int32_t a_packed = a4[g];
-                        acc[0] = __builtin_amdgcn_sdot4(a_packed, w_packed[g], acc[0], false);
-                    }
-                }
-            }
-            else
-            {
-                #pragma unroll
-                for (int c = 0; c < CPT; ++c)
-                {
-                    const int n = n_base + c;
-                    if (n >= N) continue;
+                    const int32_t a0 = a4[0];
+                    const int32_t a1 = a4[1];
+                    const int32_t a2 = a4[2];
+                    const int32_t a3 = a4[3];
+                    const int32_t a4v = a4[4];
+                    const int32_t a5 = a4[5];
+                    const int32_t a6 = a4[6];
+                    const int32_t a7 = a4[7];
 
-                    const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
-                    const uint8_t* payload16 = d_payload + linear * 16;
-                    const int8_t ratio = d_ratio[linear];
+                    int32_t acc0 = acc[0];
+                    int32_t acc1 = 0;
 
-                    if constexpr (IQ4)
-                    {
-                        #pragma unroll
-                        for (int g = 0; g < 8; ++g)
-                        {
-                            const int32_t a_packed = a4[g];
-                            const int32_t w_packed = decode_q4_group_to_packed_i8<true>(payload16, g, ratio);
-                            acc[c] = __builtin_amdgcn_sdot4(a_packed, w_packed, acc[c], false);
-                        }
-                    }
-                    else
-                    {
-                        int32_t w_packed[8];
-                        decode_q4_block8_to_packed_i8<false>(payload16, ratio, w_packed);
+                    int32_t w0_low, w0_high, w1_low, w1_high;
+                    decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.x, packed.y, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
+                    acc0 = __builtin_amdgcn_sdot4(a0, w0_low, acc0, false);
+                    acc1 = __builtin_amdgcn_sdot4(a4v, w0_high, acc1, false);
+                    acc0 = __builtin_amdgcn_sdot4(a1, w1_low, acc0, false);
+                    acc1 = __builtin_amdgcn_sdot4(a5, w1_high, acc1, false);
 
-                        #pragma unroll
-                        for (int g = 0; g < 8; ++g)
-                        {
-                            const int32_t a_packed = a4[g];
-                            acc[c] = __builtin_amdgcn_sdot4(a_packed, w_packed[g], acc[c], false);
-                        }
-                    }
+                    decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.z, packed.w, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
+                    acc0 = __builtin_amdgcn_sdot4(a2, w0_low, acc0, false);
+                    acc1 = __builtin_amdgcn_sdot4(a6, w0_high, acc1, false);
+                    acc0 = __builtin_amdgcn_sdot4(a3, w1_low, acc0, false);
+                    acc1 = __builtin_amdgcn_sdot4(a7, w1_high, acc1, false);
+
+                    acc[0] = acc0 + acc1;
                 }
             }
         }
@@ -1306,9 +1163,7 @@ bool rocmGemv_ratio_vnni_int8_int32(
 
     constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
     constexpr int TN_IQ4_WIDE = 256;
-    constexpr int CPT_DEFAULT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
 
-    const int grid_n = (N + TN - 1) / TN;
     const int blocks_per_row = K / 32;
 
     int kb;
@@ -1350,17 +1205,37 @@ bool rocmGemv_ratio_vnni_int8_int32(
     else
     {
         if (blocks_per_row > 256)
-            kb = min(32, max(4, blocks_per_row / 16));
+            kb = min(20, max(4, blocks_per_row / 16));
         else
-            kb = min(16, max(2, blocks_per_row / 8));
+            kb = min(12, max(2, blocks_per_row / 8));
 
         hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));
 
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, CPT_DEFAULT, false>),
-            dim3(grid_n, kb), dim3(TN / CPT_DEFAULT), 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_payload, d_ratio, d_C_int32,
-            N, K, kb, codebook_id);
+        const bool linear_use_wide_tile = (blocks_per_row > 256);
+        const int tn_linear = linear_use_wide_tile ? TN_IQ4_WIDE : TN;
+        const int grid_n_linear = (N + tn_linear - 1) / tn_linear;
+
+        if (!ensure_ratio_linear_perm_lut_table_on_device(device_id))
+        {
+            return false;
+        }
+
+        if (linear_use_wide_tile)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, false>),
+                dim3(grid_n_linear, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_payload, d_ratio, d_C_int32,
+                N, K, kb, codebook_id);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, false>),
+                dim3(grid_n_linear, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_payload, d_ratio, d_C_int32,
+                N, K, kb, codebook_id);
+        }
     }
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

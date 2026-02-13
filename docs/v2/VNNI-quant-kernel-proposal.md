@@ -1242,3 +1242,107 @@ if vals:
   print(f'max={max(vals):.6f}')
 PY
 ```
+
+### B.11 Addendum: Q4_0 canonicalization + post-prune verification (`2026-02-13`)
+
+We switched focus to the `Q4_0` path and made the same permute-based decode
+approach canonical there:
+
+- Added a linear-codebook ratio→perm LUT table (`k_ratio_linear_perm_lut_words`).
+- Routed `Q4_0` decode through the `__builtin_amdgcn_perm` low/high pair path.
+- Canonicalized ratio-VNNI kernel instantiation to `CPT=1` for both IQ4 and
+  linear codebooks.
+- Pruned dead Q4 legacy decode branches/helpers (old LUT64/map helper path and
+  stale CPT>1 logic in the ratio kernel body).
+
+Post-prune regression check (5 repeated runs, same release harness/env):
+
+- Global speedup mean/median: `1.60633x` / `1.60211x`
+- `Q4_0` means:
+  - Q/Wo `3584x3584`: `1.24197x`
+  - FFN Down `3584x18944`: `1.78673x`
+  - FFN Gate `18944x3584`: `1.82266x`
+  - 3-shape Q4 average mean/median: `1.61712x` / `1.61897x`
+
+Conclusion: no regression after pruning; performance is consistent with (and
+slightly above) the pre-prune tuned Q4_0 runs.
+
+#### Repro command (5-run Q4_0 + global summary)
+
+```bash
+python3 - << 'PY'
+import os, re, subprocess, statistics
+
+bin_path = '/workspaces/llaminar/build_v2_release/tests/v2/v2_perf_rocm_ratio_vnni_kernel'
+env = os.environ.copy()
+env.update({
+  'LLAMINAR_LOG_LEVEL': 'INFO',
+  'HWLOC_COMPONENTS': '-gl,-opencl',
+  'OMP_NUM_THREADS': '28',
+  'OMP_PLACES': 'sockets',
+  'OMP_PROC_BIND': 'close',
+  'OMP_NESTED': 'false',
+  'OMP_DYNAMIC': 'false',
+  'KMP_AFFINITY': 'granularity=fine,compact,1,0',
+  'KMP_BLOCKTIME': '0',
+  'OPENBLAS_NUM_THREADS': '28',
+  'GOTO_NUM_THREADS': '28',
+  'MKL_NUM_THREADS': '28',
+  'MKL_DYNAMIC': 'false',
+  'OMPI_MCA_mpi_leave_pinned': '1',
+  'OMPI_MCA_btl_vader_single_copy_mechanism': 'none',
+  'OMPI_MCA_btl_openib_allow_ib': '1',
+  'HSA_OVERRIDE_GFX_VERSION': '9.0.6',
+})
+
+cmd = [
+  'mpirun', '-np', '1', '--bind-to', 'socket', '--map-by', 'socket',
+  '--mca', 'mpi_leave_pinned', '1',
+  '--mca', 'btl_vader_single_copy_mechanism', 'none',
+  bin_path,
+]
+
+pat_global = re.compile(r'Average ratio/int8 speedup:\\s*([0-9.]+)x')
+pat_qwo = re.compile(r'Q4_0\\s+│\\s+Q/Wo 3584x3584\\s+│[^\\n]*?│\\s*([0-9.]+)\\s*║')
+pat_down = re.compile(r'Q4_0\\s+│\\s+FFN Down 3584x18944\\s+│[^\\n]*?│\\s*([0-9.]+)\\s*║')
+pat_gate = re.compile(r'Q4_0\\s+│\\s+FFN Gate 18944x3584\\s+│[^\\n]*?│\\s*([0-9.]+)\\s*║')
+
+gvals, qwo_vals, down_vals, gate_vals, qavg_vals = [], [], [], [], []
+
+for i in range(1, 6):
+  p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  out = p.stdout
+
+  mg = pat_global.search(out)
+  mq = pat_qwo.search(out)
+  md = pat_down.search(out)
+  mge = pat_gate.search(out)
+
+  gv = float(mg.group(1)) if mg else float('nan')
+  qwo = float(mq.group(1)) if mq else float('nan')
+  qdown = float(md.group(1)) if md else float('nan')
+  qgate = float(mge.group(1)) if mge else float('nan')
+
+  qvals = [v for v in (qwo, qdown, qgate) if v == v]
+  qavg = sum(qvals) / len(qvals) if qvals else float('nan')
+
+  if gv == gv: gvals.append(gv)
+  if qwo == qwo: qwo_vals.append(qwo)
+  if qdown == qdown: down_vals.append(qdown)
+  if qgate == qgate: gate_vals.append(qgate)
+  if qavg == qavg: qavg_vals.append(qavg)
+
+  print(f'run={i:02d} global={gv:.6f} q4_qwo={qwo:.6f} q4_down={qdown:.6f} q4_gate={qgate:.6f} q4_avg={qavg:.6f} rc={p.returncode}')
+
+if gvals:
+  print(f'global_mean={sum(gvals)/len(gvals):.6f} global_median={statistics.median(gvals):.6f}')
+if qwo_vals:
+  print(f'q4_qwo_mean={sum(qwo_vals)/len(qwo_vals):.6f}')
+if down_vals:
+  print(f'q4_down_mean={sum(down_vals)/len(down_vals):.6f}')
+if gate_vals:
+  print(f'q4_gate_mean={sum(gate_vals)/len(gate_vals):.6f}')
+if qavg_vals:
+  print(f'q4_avg_mean={sum(qavg_vals)/len(qavg_vals):.6f} q4_avg_median={statistics.median(qavg_vals):.6f}')
+PY
+```
