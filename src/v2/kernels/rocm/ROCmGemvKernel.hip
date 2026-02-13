@@ -783,7 +783,7 @@ __global__ void gemv_int8_int8_grid_kpar_vnni_kernel_t(
     }
 }
 
-template <int TILE_N, int CPT, bool IQ4, int IQ4_DECODE_MODE = 0, bool PREFETCH_NEXT = false, bool IQ4_CPT2_LUT64 = false>
+template <int TILE_N, int CPT, bool IQ4>
 __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
     const int8_t* __restrict__ d_A_int8,
     const uint8_t* __restrict__ d_payload,
@@ -811,17 +811,6 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
         {
             const int32_t* a4 = reinterpret_cast<const int32_t*>(d_A_int8 + b * 32);
 
-            if constexpr (PREFETCH_NEXT)
-            {
-                const int b_next = b + 1;
-                if (b_next < b_end)
-                {
-                    const size_t linear_next = static_cast<size_t>(b_next) * static_cast<size_t>(N) + static_cast<size_t>(n_base);
-                    __builtin_prefetch(d_payload + linear_next * 16, 0, 1);
-                    __builtin_prefetch(d_ratio + linear_next, 0, 1);
-                }
-            }
-
             if constexpr (CPT == 1)
             {
                 const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n_base);
@@ -830,205 +819,39 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
 
                 if constexpr (IQ4)
                 {
-                    uint64_t lut_lo = 0;
-                    uint64_t lut_hi = 0;
-                    constexpr bool MODE3_CONST_LUT = IQ4 && (IQ4_DECODE_MODE == 3) && IQ4_CPT2_LUT64;
-                    if constexpr (IQ4_DECODE_MODE != 4 && !MODE3_CONST_LUT)
-                    {
-                        #pragma unroll
-                        for (int i = 0; i < 8; ++i)
-                        {
-                            const int8_t wi_lo = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i]) + 64) >> 7);
-                            const int8_t wi_hi = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 8]) + 64) >> 7);
-                            lut_lo |= (static_cast<uint64_t>(static_cast<uint8_t>(wi_lo)) << (i * 8));
-                            lut_hi |= (static_cast<uint64_t>(static_cast<uint8_t>(wi_hi)) << (i * 8));
-                        }
-                    }
+                    const uint4 packed = *reinterpret_cast<const uint4*>(payload16);
+                    uint32_t lut0 = 0;
+                    uint32_t lut1 = 0;
+                    uint32_t lut2 = 0;
+                    uint32_t lut3 = 0;
+                    fetch_iq4_perm_lut_words_from_ratio_table(ratio, lut0, lut1, lut2, lut3);
 
-                    if constexpr (IQ4_DECODE_MODE == 1)
-                    {
-                        // Fused low/high pair: decode+dot interleaved per 4-byte group
-                        const uint4 packed = *reinterpret_cast<const uint4*>(payload16);
-                        const uint8_t q0  = static_cast<uint8_t>(packed.x & 0xFFu);
-                        const uint8_t q1  = static_cast<uint8_t>((packed.x >> 8) & 0xFFu);
-                        const uint8_t q2  = static_cast<uint8_t>((packed.x >> 16) & 0xFFu);
-                        const uint8_t q3  = static_cast<uint8_t>((packed.x >> 24) & 0xFFu);
-                        const uint8_t q4  = static_cast<uint8_t>(packed.y & 0xFFu);
-                        const uint8_t q5  = static_cast<uint8_t>((packed.y >> 8) & 0xFFu);
-                        const uint8_t q6  = static_cast<uint8_t>((packed.y >> 16) & 0xFFu);
-                        const uint8_t q7  = static_cast<uint8_t>((packed.y >> 24) & 0xFFu);
-                        const uint8_t q8  = static_cast<uint8_t>(packed.z & 0xFFu);
-                        const uint8_t q9  = static_cast<uint8_t>((packed.z >> 8) & 0xFFu);
-                        const uint8_t q10 = static_cast<uint8_t>((packed.z >> 16) & 0xFFu);
-                        const uint8_t q11 = static_cast<uint8_t>((packed.z >> 24) & 0xFFu);
-                        const uint8_t q12 = static_cast<uint8_t>(packed.w & 0xFFu);
-                        const uint8_t q13 = static_cast<uint8_t>((packed.w >> 8) & 0xFFu);
-                        const uint8_t q14 = static_cast<uint8_t>((packed.w >> 16) & 0xFFu);
-                        const uint8_t q15 = static_cast<uint8_t>((packed.w >> 24) & 0xFFu);
+                    const int32_t a0 = a4[0];
+                    const int32_t a1 = a4[1];
+                    const int32_t a2 = a4[2];
+                    const int32_t a3 = a4[3];
+                    const int32_t a4v = a4[4];
+                    const int32_t a5 = a4[5];
+                    const int32_t a6 = a4[6];
+                    const int32_t a7 = a4[7];
 
-                        int32_t w_low, w_high;
-                        decode_q4_low_high_pair_to_packed_i8_with_lut64(q0, q1, q2, q3, lut_lo, lut_hi, w_low, w_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[0], w_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[4], w_high, acc[0], false);
+                    int32_t acc0 = acc[0];
+                    int32_t acc1 = 0;
 
-                        decode_q4_low_high_pair_to_packed_i8_with_lut64(q4, q5, q6, q7, lut_lo, lut_hi, w_low, w_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[1], w_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[5], w_high, acc[0], false);
+                    int32_t w0_low, w0_high, w1_low, w1_high;
+                    decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.x, packed.y, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
+                    acc0 = __builtin_amdgcn_sdot4(a0, w0_low, acc0, false);
+                    acc1 = __builtin_amdgcn_sdot4(a4v, w0_high, acc1, false);
+                    acc0 = __builtin_amdgcn_sdot4(a1, w1_low, acc0, false);
+                    acc1 = __builtin_amdgcn_sdot4(a5, w1_high, acc1, false);
 
-                        decode_q4_low_high_pair_to_packed_i8_with_lut64(q8, q9, q10, q11, lut_lo, lut_hi, w_low, w_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[2], w_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[6], w_high, acc[0], false);
+                    decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.z, packed.w, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
+                    acc0 = __builtin_amdgcn_sdot4(a2, w0_low, acc0, false);
+                    acc1 = __builtin_amdgcn_sdot4(a6, w0_high, acc1, false);
+                    acc0 = __builtin_amdgcn_sdot4(a3, w1_low, acc0, false);
+                    acc1 = __builtin_amdgcn_sdot4(a7, w1_high, acc1, false);
 
-                        decode_q4_low_high_pair_to_packed_i8_with_lut64(q12, q13, q14, q15, lut_lo, lut_hi, w_low, w_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[3], w_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[7], w_high, acc[0], false);
-                    }
-                    else if constexpr (IQ4_DECODE_MODE == 3)
-                    {
-                        const uint4 packed = *reinterpret_cast<const uint4*>(payload16);
-                        uint32_t lut0 = 0;
-                        uint32_t lut1 = 0;
-                        uint32_t lut2 = 0;
-                        uint32_t lut3 = 0;
-                        if constexpr (MODE3_CONST_LUT)
-                        {
-                            fetch_iq4_perm_lut_words_from_ratio_table(ratio, lut0, lut1, lut2, lut3);
-                        }
-                        else
-                        {
-                            lut0 = static_cast<uint32_t>(lut_lo & 0xFFFFFFFFu);
-                            lut1 = static_cast<uint32_t>((lut_lo >> 32) & 0xFFFFFFFFu);
-                            lut2 = static_cast<uint32_t>(lut_hi & 0xFFFFFFFFu);
-                            lut3 = static_cast<uint32_t>((lut_hi >> 32) & 0xFFFFFFFFu);
-                        }
-
-                        const int32_t a0 = a4[0];
-                        const int32_t a1 = a4[1];
-                        const int32_t a2 = a4[2];
-                        const int32_t a3 = a4[3];
-                        const int32_t a4v = a4[4];
-                        const int32_t a5 = a4[5];
-                        const int32_t a6 = a4[6];
-                        const int32_t a7 = a4[7];
-
-                        int32_t acc0 = acc[0];
-                        int32_t acc1 = 0;
-
-                        int32_t w0_low, w0_high, w1_low, w1_high;
-                        decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.x, packed.y, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
-                        acc0 = __builtin_amdgcn_sdot4(a0, w0_low, acc0, false);
-                        acc1 = __builtin_amdgcn_sdot4(a4v, w0_high, acc1, false);
-                        acc0 = __builtin_amdgcn_sdot4(a1, w1_low, acc0, false);
-                        acc1 = __builtin_amdgcn_sdot4(a5, w1_high, acc1, false);
-
-                        decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.z, packed.w, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
-                        acc0 = __builtin_amdgcn_sdot4(a2, w0_low, acc0, false);
-                        acc1 = __builtin_amdgcn_sdot4(a6, w0_high, acc1, false);
-                        acc0 = __builtin_amdgcn_sdot4(a3, w1_low, acc0, false);
-                        acc1 = __builtin_amdgcn_sdot4(a7, w1_high, acc1, false);
-
-                        acc[0] = acc0 + acc1;
-                    }
-                    else if constexpr (IQ4_DECODE_MODE == 4)
-                    {
-                        const uint32_t lane = static_cast<uint32_t>(threadIdx.x) & 63u;
-                        const bool lane_odd = (lane & 1u) != 0u;
-
-                        uint32_t p0x = 0, p0y = 0, p0z = 0, p0w = 0;
-                        uint32_t p1x = 0, p1y = 0, p1z = 0, p1w = 0;
-                        uint32_t r0u = 0;
-                        uint32_t r1u = 0;
-
-                        uint32_t lut0_even = 0, lut1_even = 0, lut2_even = 0, lut3_even = 0;
-                        uint32_t lut0_odd = 0, lut1_odd = 0, lut2_odd = 0, lut3_odd = 0;
-
-                        if (!lane_odd)
-                        {
-                            const size_t linear_pair0 = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n_base);
-                            const uint8_t* payload0 = d_payload + linear_pair0 * 16;
-                            const uint4 v0 = *reinterpret_cast<const uint4*>(payload0);
-                            p0x = v0.x;
-                            p0y = v0.y;
-                            p0z = v0.z;
-                            p0w = v0.w;
-                            r0u = static_cast<uint32_t>(static_cast<uint8_t>(d_ratio[linear_pair0]));
-
-                            if (n_base + 1 < N)
-                            {
-                                const uint8_t* payload1 = payload0 + 16;
-                                const uint4 v1 = *reinterpret_cast<const uint4*>(payload1);
-                                p1x = v1.x;
-                                p1y = v1.y;
-                                p1z = v1.z;
-                                p1w = v1.w;
-                                r1u = static_cast<uint32_t>(static_cast<uint8_t>(d_ratio[linear_pair0 + 1]));
-                            }
-
-                            build_iq4_perm_lut_words_from_ratio(static_cast<int8_t>(r0u & 0xFFu), lut0_even, lut1_even, lut2_even, lut3_even);
-                            build_iq4_perm_lut_words_from_ratio(static_cast<int8_t>(r1u & 0xFFu), lut0_odd, lut1_odd, lut2_odd, lut3_odd);
-                        }
-
-                        uint32_t sx = p0x;
-                        uint32_t sy = p0y;
-                        uint32_t sz = p0z;
-                        uint32_t sw = p0w;
-                        uint32_t lut0 = lut0_even;
-                        uint32_t lut1 = lut1_even;
-                        uint32_t lut2 = lut2_even;
-                        uint32_t lut3 = lut3_even;
-
-                        if (lane_odd)
-                        {
-                            const uint32_t src_lane_byte = ((lane - 1u) & 63u) * 4u;
-                            sx = __builtin_amdgcn_ds_bpermute(src_lane_byte, p1x);
-                            sy = __builtin_amdgcn_ds_bpermute(src_lane_byte, p1y);
-                            sz = __builtin_amdgcn_ds_bpermute(src_lane_byte, p1z);
-                            sw = __builtin_amdgcn_ds_bpermute(src_lane_byte, p1w);
-                            lut0 = __builtin_amdgcn_ds_bpermute(src_lane_byte, lut0_odd);
-                            lut1 = __builtin_amdgcn_ds_bpermute(src_lane_byte, lut1_odd);
-                            lut2 = __builtin_amdgcn_ds_bpermute(src_lane_byte, lut2_odd);
-                            lut3 = __builtin_amdgcn_ds_bpermute(src_lane_byte, lut3_odd);
-                        }
-
-                        int32_t w_low, w_high;
-                        decode_q4_low_high_pair_to_packed_i8_with_perm_lut16(sx, lut0, lut1, lut2, lut3, w_low, w_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[0], w_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[4], w_high, acc[0], false);
-
-                        decode_q4_low_high_pair_to_packed_i8_with_perm_lut16(sy, lut0, lut1, lut2, lut3, w_low, w_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[1], w_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[5], w_high, acc[0], false);
-
-                        decode_q4_low_high_pair_to_packed_i8_with_perm_lut16(sz, lut0, lut1, lut2, lut3, w_low, w_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[2], w_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[6], w_high, acc[0], false);
-
-                        decode_q4_low_high_pair_to_packed_i8_with_perm_lut16(sw, lut0, lut1, lut2, lut3, w_low, w_high);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[3], w_low, acc[0], false);
-                        acc[0] = __builtin_amdgcn_sdot4(a4[7], w_high, acc[0], false);
-                    }
-                    else if constexpr (IQ4_DECODE_MODE == 2)
-                    {
-                        #pragma unroll
-                        for (int g = 0; g < 8; ++g)
-                        {
-                            const int32_t a_packed = a4[g];
-                            const int32_t w_packed = decode_q4_group_to_packed_i8_with_lut64(payload16, g, lut_lo, lut_hi);
-                            acc[0] = __builtin_amdgcn_sdot4(a_packed, w_packed, acc[0], false);
-                        }
-                    }
-                    else
-                    {
-                        int32_t w_packed[8];
-                        decode_q4_block8_to_packed_i8_with_lut64(payload16, lut_lo, lut_hi, w_packed);
-
-                        #pragma unroll
-                        for (int g = 0; g < 8; ++g)
-                        {
-                            const int32_t a_packed = a4[g];
-                            acc[0] = __builtin_amdgcn_sdot4(a_packed, w_packed[g], acc[0], false);
-                        }
-                    }
+                    acc[0] = acc0 + acc1;
                 }
                 else
                 {
@@ -1057,37 +880,12 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
 
                     if constexpr (IQ4)
                     {
-                        if constexpr (IQ4_CPT2_LUT64)
+                        #pragma unroll
+                        for (int g = 0; g < 8; ++g)
                         {
-                            uint64_t lut_lo = 0;
-                            uint64_t lut_hi = 0;
-                            #pragma unroll
-                            for (int i = 0; i < 8; ++i)
-                            {
-                                const int8_t wi_lo = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i]) + 64) >> 7);
-                                const int8_t wi_hi = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 8]) + 64) >> 7);
-                                lut_lo |= (static_cast<uint64_t>(static_cast<uint8_t>(wi_lo)) << (i * 8));
-                                lut_hi |= (static_cast<uint64_t>(static_cast<uint8_t>(wi_hi)) << (i * 8));
-                            }
-
-                            int32_t w_packed[8];
-                            decode_q4_block8_to_packed_i8_with_lut64(payload16, lut_lo, lut_hi, w_packed);
-                            #pragma unroll
-                            for (int g = 0; g < 8; ++g)
-                            {
-                                const int32_t a_packed = a4[g];
-                                acc[c] = __builtin_amdgcn_sdot4(a_packed, w_packed[g], acc[c], false);
-                            }
-                        }
-                        else
-                        {
-                            #pragma unroll
-                            for (int g = 0; g < 8; ++g)
-                            {
-                                const int32_t a_packed = a4[g];
-                                const int32_t w_packed = decode_q4_group_to_packed_i8<true>(payload16, g, ratio);
-                                acc[c] = __builtin_amdgcn_sdot4(a_packed, w_packed, acc[c], false);
-                            }
+                            const int32_t a_packed = a4[g];
+                            const int32_t w_packed = decode_q4_group_to_packed_i8<true>(payload16, g, ratio);
+                            acc[c] = __builtin_amdgcn_sdot4(a_packed, w_packed, acc[c], false);
                         }
                     }
                     else
@@ -1516,398 +1314,37 @@ bool rocmGemv_ratio_vnni_int8_int32(
     int kb;
     if (codebook_id == RATIO_VNNI_CODEBOOK_IQ4)
     {
-        int iq4_cpt = 1;
-        bool iq4_fused_pair = false;
-        int iq4_decode_mode = 0;  // 0=baseline block8 LUT64, 1=fused-pair LUT64, 2=fused-group LUT64, 3=perm-based pair LUT16, 4=wave-pair bpermute + perm LUT16
-        bool iq4_prefetch_next = false;
-        bool iq4_cpt2_lut64 = false;
-        bool iq4_mode3_const_lut = true;  // default on for mode3; env can override
-        int iq4_kb_mode = 0;      // 0=default, 1=min-atomic, 2=high-occupancy
-        if (const char* fp_env = std::getenv("LLAMINAR_RATIO_IQ4_FUSED_PAIR"))
-        {
-            iq4_fused_pair = (std::atoi(fp_env) != 0);
-        }
-        if (const char* decode_mode_env = std::getenv("LLAMINAR_RATIO_IQ4_DECODE_MODE"))
-        {
-            const int ov = std::atoi(decode_mode_env);
-            if (ov >= 0 && ov <= 4)
-            {
-                iq4_decode_mode = ov;
-            }
-        }
-        else if (iq4_fused_pair)
-        {
-            // Backward compatibility for the original toggle.
-            iq4_decode_mode = 1;
-        }
-        if (const char* pf_env = std::getenv("LLAMINAR_RATIO_IQ4_PREFETCH_NEXT"))
-        {
-            iq4_prefetch_next = (std::atoi(pf_env) != 0);
-        }
-        if (const char* cpt2_lut64_env = std::getenv("LLAMINAR_RATIO_IQ4_CPT2_LUT64"))
-        {
-            iq4_cpt2_lut64 = (std::atoi(cpt2_lut64_env) != 0);
-        }
-        if (const char* mode3_table_env = std::getenv("LLAMINAR_RATIO_IQ4_MODE3_CONST_LUT"))
-        {
-            iq4_mode3_const_lut = (std::atoi(mode3_table_env) != 0);
-        }
-        if (const char* kb_mode_env = std::getenv("LLAMINAR_RATIO_IQ4_KB_MODE"))
-        {
-            const int ov = std::atoi(kb_mode_env);
-            if (ov >= 0 && ov <= 2)
-            {
-                iq4_kb_mode = ov;
-            }
-        }
-        if (const char* cpt_override = std::getenv("LLAMINAR_RATIO_IQ4_CPT"))
-        {
-            const int ov = std::atoi(cpt_override);
-            if (ov == 1 || ov == 2)
-            {
-                iq4_cpt = ov;
-            }
-        }
-
-        if (iq4_kb_mode == 1)
-        {
-            // Fewer K-splits to reduce atomic contention, at some occupancy cost.
-            if (iq4_cpt == 2)
-            {
-                if (blocks_per_row > 256)
-                    kb = min(8, max(1, blocks_per_row / 20));
-                else
-                    kb = min(6, max(1, blocks_per_row / 10));
-            }
-            else
-            {
-                if (blocks_per_row > 256)
-                    kb = min(8, max(1, blocks_per_row / 24));
-                else
-                    kb = min(6, max(1, blocks_per_row / 12));
-            }
-        }
-        else if (iq4_kb_mode == 2)
-        {
-            // More K-splits for occupancy-heavy mode.
-            if (iq4_cpt == 2)
-            {
-                if (blocks_per_row > 256)
-                    kb = min(24, max(4, blocks_per_row / 8));
-                else
-                    kb = min(12, max(4, blocks_per_row / 5));
-            }
-            else
-            {
-                if (blocks_per_row > 256)
-                    kb = min(20, max(4, blocks_per_row / 10));
-                else
-                    kb = min(12, max(4, blocks_per_row / 6));
-            }
-        }
-        else if (iq4_cpt == 2)
-        {
-            if (blocks_per_row > 256)
-                kb = min(16, max(2, blocks_per_row / 12));
-            else
-                kb = min(10, max(2, blocks_per_row / 6));
-        }
+        if (blocks_per_row > 256)
+            kb = min(16, max(4, blocks_per_row / 16));
         else
-        {
-            if (blocks_per_row > 256)
-                kb = min(16, max(4, blocks_per_row / 16));
-            else
-                kb = min(12, max(2, blocks_per_row / 8));
-        }
-
-        if (const char* kb_override = std::getenv("LLAMINAR_RATIO_IQ4_KB_OVERRIDE"))
-        {
-            const int ov = std::atoi(kb_override);
-            if (ov > 0)
-            {
-                kb = ov;
-            }
-        }
+            kb = min(12, max(2, blocks_per_row / 8));
 
         hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));
 
-        const bool iq4_use_wide_tile = (iq4_cpt == 1) && (blocks_per_row > 256);
+        const bool iq4_use_wide_tile = (blocks_per_row > 256);
         const int tn_iq4 = iq4_use_wide_tile ? TN_IQ4_WIDE : TN;
         const int grid_n_iq4 = (N + tn_iq4 - 1) / tn_iq4;
 
-        if (iq4_cpt == 2)
+        if (!ensure_ratio_iq4_perm_lut_table_on_device(device_id))
         {
-            if (iq4_prefetch_next)
-            {
-                if (iq4_cpt2_lut64)
-                {
-                    hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 2, true, 0, true, true>),
-                        dim3(grid_n_iq4, kb), dim3(TN / 2), 0, static_cast<hipStream_t>(stream),
-                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                        N, K, kb, codebook_id);
-                }
-                else
-                {
-                    hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 2, true, 0, true, false>),
-                        dim3(grid_n_iq4, kb), dim3(TN / 2), 0, static_cast<hipStream_t>(stream),
-                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                        N, K, kb, codebook_id);
-                }
-            }
-            else
-            {
-                if (iq4_cpt2_lut64)
-                {
-                    hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 2, true, 0, false, true>),
-                        dim3(grid_n_iq4, kb), dim3(TN / 2), 0, static_cast<hipStream_t>(stream),
-                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                        N, K, kb, codebook_id);
-                }
-                else
-                {
-                    hipLaunchKernelGGL(
-                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 2, true, 0, false, false>),
-                        dim3(grid_n_iq4, kb), dim3(TN / 2), 0, static_cast<hipStream_t>(stream),
-                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                        N, K, kb, codebook_id);
-                }
-            }
+            return false;
+        }
+
+        if (iq4_use_wide_tile)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true>),
+                dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_payload, d_ratio, d_C_int32,
+                N, K, kb, codebook_id);
         }
         else
         {
-            const int iq4_mode = iq4_decode_mode;
-            if (iq4_mode == 3 && iq4_mode3_const_lut)
-            {
-                if (!ensure_ratio_iq4_perm_lut_table_on_device(device_id))
-                {
-                    return false;
-                }
-            }
-            if (iq4_prefetch_next)
-            {
-                if (iq4_use_wide_tile)
-                {
-                    if (iq4_mode == 2)
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 2, true, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                            else if (iq4_mode == 4)
-                            {
-                            hipLaunchKernelGGL(
-                                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 4, true, false>),
-                                dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                                d_A_int8, d_payload, d_ratio, d_C_int32,
-                                N, K, kb, codebook_id);
-                            }
-                            else if (iq4_mode == 3)
-                            {
-                                if (iq4_mode3_const_lut)
-                                {
-                                    hipLaunchKernelGGL(
-                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, true, true>),
-                                        dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                                        N, K, kb, codebook_id);
-                                }
-                                else
-                                {
-                                    hipLaunchKernelGGL(
-                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, true, false>),
-                                        dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                                        N, K, kb, codebook_id);
-                                }
-                            }
-                    else if (iq4_mode == 1)
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 1, true, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                    else
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 0, true, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                }
-                else
-                {
-                    if (iq4_mode == 2)
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 2, true, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                            else if (iq4_mode == 4)
-                            {
-                            hipLaunchKernelGGL(
-                                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 4, true, false>),
-                                dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                                d_A_int8, d_payload, d_ratio, d_C_int32,
-                                N, K, kb, codebook_id);
-                            }
-                            else if (iq4_mode == 3)
-                            {
-                                if (iq4_mode3_const_lut)
-                                {
-                                    hipLaunchKernelGGL(
-                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, true, true>),
-                                        dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                                        N, K, kb, codebook_id);
-                                }
-                                else
-                                {
-                                    hipLaunchKernelGGL(
-                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, true, false>),
-                                        dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                                        N, K, kb, codebook_id);
-                                }
-                            }
-                    else if (iq4_mode == 1)
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 1, true, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                    else
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 0, true, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                }
-            }
-            else
-            {
-                if (iq4_use_wide_tile)
-                {
-                    if (iq4_mode == 2)
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 2, false, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                            else if (iq4_mode == 4)
-                            {
-                            hipLaunchKernelGGL(
-                                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 4, false, false>),
-                                dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                                d_A_int8, d_payload, d_ratio, d_C_int32,
-                                N, K, kb, codebook_id);
-                            }
-                            else if (iq4_mode == 3)
-                            {
-                                if (iq4_mode3_const_lut)
-                                {
-                                    hipLaunchKernelGGL(
-                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, false, true>),
-                                        dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                                        N, K, kb, codebook_id);
-                                }
-                                else
-                                {
-                                    hipLaunchKernelGGL(
-                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 3, false, false>),
-                                        dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                                        N, K, kb, codebook_id);
-                                }
-                            }
-                    else if (iq4_mode == 1)
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 1, false, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                    else
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN_IQ4_WIDE, 1, true, 0, false, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN_IQ4_WIDE), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                }
-                else
-                {
-                    if (iq4_mode == 2)
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 2, false, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                            else if (iq4_mode == 4)
-                            {
-                            hipLaunchKernelGGL(
-                                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 4, false, false>),
-                                dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                                d_A_int8, d_payload, d_ratio, d_C_int32,
-                                N, K, kb, codebook_id);
-                            }
-                            else if (iq4_mode == 3)
-                            {
-                                if (iq4_mode3_const_lut)
-                                {
-                                    hipLaunchKernelGGL(
-                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, false, true>),
-                                        dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                                        N, K, kb, codebook_id);
-                                }
-                                else
-                                {
-                                    hipLaunchKernelGGL(
-                                        HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 3, false, false>),
-                                        dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                                        d_A_int8, d_payload, d_ratio, d_C_int32,
-                                        N, K, kb, codebook_id);
-                                }
-                            }
-                    else if (iq4_mode == 1)
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 1, false, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                    else
-                    {
-                        hipLaunchKernelGGL(
-                            HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true, 0, false, false>),
-                            dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
-                            d_A_int8, d_payload, d_ratio, d_C_int32,
-                            N, K, kb, codebook_id);
-                    }
-                }
-            }
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_ratio_vnni_grid_kpar_kernel_t<TN, 1, true>),
+                dim3(grid_n_iq4, kb), dim3(TN), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_payload, d_ratio, d_C_int32,
+                N, K, kb, codebook_id);
         }
     }
     else

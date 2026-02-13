@@ -1162,3 +1162,83 @@ Interleaved validation pass (`2026-02-13`, 10 paired runs, release):
     (`-0.41%`)
 - Conclusion: under interleaved pairing, the hoist change is neutral-to-slightly
   negative on this benchmark; no high-confidence throughput gain observed.
+
+### B.10 Addendum: post-cleanup noise check (`2026-02-13`)
+
+After canonicalizing the IQ4 mode3 path (removing experimental decode-mode/CPT
+branches in dispatch), we ran additional repeats to check whether a single
+`1.3899x` result was regression or noise.
+
+Six repeated runs (same release binary / same affinity and MPI settings):
+
+- `1.42254x`, `1.41783x`, `1.43116x`, `1.44540x`, `1.44748x`, `1.44725x`
+- Mean: `1.43528x`
+- Median: `1.43828x`
+- Stddev: `0.01210x`
+- Range: `[1.41783x, 1.44748x]`
+
+Comparison points:
+
+- Versus one-off `1.38996x`: `+3.26%`
+- Versus earlier 3-run post-revert baseline (`1.40580x`, `1.41667x`,
+  `1.41372x`, mean `1.41206x`): `+1.64%`
+
+Interpretation: the `1.3899x` value is most likely a low outlier/noise run,
+not evidence of sustained regression after cleanup.
+
+#### Repro command (6-run repeat + summary)
+
+```bash
+python3 - << 'PY'
+import os, re, statistics, subprocess
+
+bin_path = '/workspaces/llaminar/build_v2_release/tests/v2/v2_perf_rocm_ratio_vnni_kernel'
+env = os.environ.copy()
+env.update({
+  'LLAMINAR_LOG_LEVEL': 'INFO',
+  'HWLOC_COMPONENTS': '-gl,-opencl',
+  'OMP_NUM_THREADS': '28',
+  'OMP_PLACES': 'sockets',
+  'OMP_PROC_BIND': 'close',
+  'OMP_NESTED': 'false',
+  'OMP_DYNAMIC': 'false',
+  'KMP_AFFINITY': 'granularity=fine,compact,1,0',
+  'KMP_BLOCKTIME': '0',
+  'OPENBLAS_NUM_THREADS': '28',
+  'GOTO_NUM_THREADS': '28',
+  'MKL_NUM_THREADS': '28',
+  'MKL_DYNAMIC': 'false',
+  'OMPI_MCA_mpi_leave_pinned': '1',
+  'OMPI_MCA_btl_vader_single_copy_mechanism': 'none',
+  'OMPI_MCA_btl_openib_allow_ib': '1',
+  'HSA_OVERRIDE_GFX_VERSION': '9.0.6',
+})
+
+cmd = [
+  'mpirun', '-np', '1', '--bind-to', 'socket', '--map-by', 'socket',
+  '--mca', 'mpi_leave_pinned', '1',
+  '--mca', 'btl_vader_single_copy_mechanism', 'none',
+  bin_path,
+]
+pat = re.compile(r'Average ratio/int8 speedup:\\s*([0-9.]+)x')
+
+vals = []
+for i in range(1, 7):
+  p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  m = pat.search(p.stdout)
+  if not m:
+    print(f'run={i:02d} speedup=NaN rc={p.returncode}')
+    continue
+  v = float(m.group(1))
+  vals.append(v)
+  print(f'run={i:02d} speedup={v:.6f} rc={p.returncode}')
+
+if vals:
+  print('values=' + ','.join(f'{v:.6f}' for v in vals))
+  print(f'mean={sum(vals)/len(vals):.6f}')
+  print(f'median={statistics.median(vals):.6f}')
+  print(f'stdev={statistics.pstdev(vals) if len(vals) > 1 else 0.0:.6f}')
+  print(f'min={min(vals):.6f}')
+  print(f'max={max(vals):.6f}')
+PY
+```
