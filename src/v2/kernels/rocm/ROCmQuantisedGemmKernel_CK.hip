@@ -1520,24 +1520,83 @@ extern "C"
         }
         else
         {
-            // Large M, irregular: Use 128×128 kernel with GemmMNPadding
-            auto& device_gemm = getCachedNoScaleKernel128x128MNPadding(rocm_device_id);
-            auto argument = device_gemm.MakeArgument(
-                d_A_int8, d_weights_int8, p_ds, d_C_int32,
-                M, N, K,
-                K, K, strides_ds, N,
-                AElementOp{}, BElementOp{}, CDEElementOp_None{}
-            );
+            // Large M, irregular: choose between 128×128(MNPadding) and 64×64.
+            // Env override:
+            //   LLAMINAR_ROCM_CK_IRREGULAR_KERNEL=128  -> force 128×128 MNPadding
+            //   LLAMINAR_ROCM_CK_IRREGULAR_KERNEL=64   -> force 64×64
+            //   unset/other                           -> auto heuristic
+            static const int irregular_kernel_pref = []() {
+                const char* env = std::getenv("LLAMINAR_ROCM_CK_IRREGULAR_KERNEL");
+                if (!env) return 0;
+                if (std::strcmp(env, "64") == 0) return 64;
+                if (std::strcmp(env, "128") == 0) return 128;
+                return 0;
+            }();
 
-            if (!device_gemm.IsSupportedArgument(argument))
+            const int rem128 = M % 128;
+            const int rem64 = M % 64;
+            const int pad128 = (rem128 == 0) ? 0 : (128 - rem128);
+            const int pad64 = (rem64 == 0) ? 0 : (64 - rem64);
+
+            bool use_64 = false;
+            if (irregular_kernel_pref == 64)
             {
-                fprintf(stderr, "[rocmQuantGemm_executeNoScale] 128×128 MNPadding kernel doesn't support M=%d N=%d K=%d\n",
-                        M, N, K);
-                return false;
+                use_64 = true;
+            }
+            else if (irregular_kernel_pref == 128)
+            {
+                use_64 = false;
+            }
+            else
+            {
+                // Auto default: 128×128 MNPadding is generally faster for
+                // prefill-scale irregular M on gfx906. Keep 64×64 as opt-in
+                // via LLAMINAR_ROCM_CK_IRREGULAR_KERNEL=64.
+                (void)pad64;
+                (void)pad128;
+                use_64 = false;
             }
 
-            auto invoker = device_gemm.MakeInvoker();
-            invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
+            if (use_64)
+            {
+                auto& device_gemm = getCachedNoScaleKernel64x64(rocm_device_id);
+                auto argument = device_gemm.MakeArgument(
+                    d_A_int8, d_weights_int8, p_ds, d_C_int32,
+                    M, N, K,
+                    K, K, strides_ds, N,
+                    AElementOp{}, BElementOp{}, CDEElementOp_None{}
+                );
+
+                if (!device_gemm.IsSupportedArgument(argument))
+                {
+                    fprintf(stderr, "[rocmQuantGemm_executeNoScale] 64×64 irregular kernel doesn't support M=%d N=%d K=%d\n",
+                            M, N, K);
+                    return false;
+                }
+
+                auto invoker = device_gemm.MakeInvoker();
+                invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
+            }
+            else
+            {
+                auto& device_gemm = getCachedNoScaleKernel128x128MNPadding(rocm_device_id);
+                auto argument = device_gemm.MakeArgument(
+                    d_A_int8, d_weights_int8, p_ds, d_C_int32,
+                    M, N, K,
+                    K, K, strides_ds, N,
+                    AElementOp{}, BElementOp{}, CDEElementOp_None{}
+                );
+
+                if (!device_gemm.IsSupportedArgument(argument))
+                {
+                    fprintf(stderr, "[rocmQuantGemm_executeNoScale] 128×128 MNPadding kernel doesn't support M=%d N=%d K=%d\n",
+                            M, N, K);
+                    return false;
+                }
+
+                auto invoker = device_gemm.MakeInvoker();
+                invoker.Run(argument, StreamConfig{static_cast<hipStream_t>(stream), false});
+            }
         }
         
         // DEBUG: If timing enabled, sync and report actual GEMM execution time

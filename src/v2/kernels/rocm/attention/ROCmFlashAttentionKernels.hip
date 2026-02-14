@@ -374,13 +374,31 @@ namespace
         // =====================================================================
         // Load Q tile into LDS (done once per block)
         // =====================================================================
-        for (int i = tid; i < q_tile_rows * head_dim; i += threads_per_block)
+        if ((head_dim & 1) == 0)
         {
-            int local_row = i / head_dim;
-            int d = i % head_dim;
-            int global_row = q_block_start + local_row;
-            float val = Q_batch[global_row * n_heads * head_dim + head_idx * head_dim + d];
-            Q_tile[local_row * lds_layout.q_stride + d] = float_to_half(val);
+            const int head_dim_vec2 = head_dim / 2;
+            for (int i = tid; i < q_tile_rows * head_dim_vec2; i += threads_per_block)
+            {
+                int local_row = i / head_dim_vec2;
+                int d2 = i % head_dim_vec2;
+                int d = d2 * 2;
+                int global_row = q_block_start + local_row;
+
+                const float2 qv = *reinterpret_cast<const float2 *>(
+                    Q_batch + global_row * n_heads * head_dim + head_idx * head_dim + d);
+                reinterpret_cast<__half2 *>(Q_tile + local_row * lds_layout.q_stride + d)[0] = __float22half2_rn(qv);
+            }
+        }
+        else
+        {
+            for (int i = tid; i < q_tile_rows * head_dim; i += threads_per_block)
+            {
+                int local_row = i / head_dim;
+                int d = i % head_dim;
+                int global_row = q_block_start + local_row;
+                float val = Q_batch[global_row * n_heads * head_dim + head_idx * head_dim + d];
+                Q_tile[local_row * lds_layout.q_stride + d] = float_to_half(val);
+            }
         }
         __syncthreads();
 
@@ -397,17 +415,39 @@ namespace
             __half *K_dst = get_K_tile(0);
             __half *V_dst = get_V_tile(0);
 
-            for (int i = tid; i < actual_len * head_dim; i += threads_per_block)
+            if ((head_dim & 1) == 0)
             {
-                int local_row = i / head_dim;
-                int d = i % head_dim;
-                int global_row = kv_start + local_row;
+                const int head_dim_vec2 = head_dim / 2;
+                for (int i = tid; i < actual_len * head_dim_vec2; i += threads_per_block)
+                {
+                    int local_row = i / head_dim_vec2;
+                    int d2 = i % head_dim_vec2;
+                    int d = d2 * 2;
+                    int global_row = kv_start + local_row;
 
-                float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+                    const float2 kv = *reinterpret_cast<const float2 *>(
+                        K_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
+                    const float2 vv = *reinterpret_cast<const float2 *>(
+                        V_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
 
-                K_dst[local_row * lds_layout.kv_stride + d] = float_to_half(k_val);
-                V_dst[local_row * lds_layout.kv_stride + d] = float_to_half(v_val);
+                    reinterpret_cast<__half2 *>(K_dst + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(kv);
+                    reinterpret_cast<__half2 *>(V_dst + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(vv);
+                }
+            }
+            else
+            {
+                for (int i = tid; i < actual_len * head_dim; i += threads_per_block)
+                {
+                    int local_row = i / head_dim;
+                    int d = i % head_dim;
+                    int global_row = kv_start + local_row;
+
+                    float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+                    float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+
+                    K_dst[local_row * lds_layout.kv_stride + d] = float_to_half(k_val);
+                    V_dst[local_row * lds_layout.kv_stride + d] = float_to_half(v_val);
+                }
             }
         }
         __syncthreads();
@@ -446,17 +486,39 @@ namespace
                 __half *V_next = get_V_tile(next_stage);
 
                 // Cooperative load by all threads
-                for (int i = tid; i < next_len * head_dim; i += threads_per_block)
+                if ((head_dim & 1) == 0)
                 {
-                    int local_row = i / head_dim;
-                    int d = i % head_dim;
-                    int global_row = next_kv_start + local_row;
+                    const int head_dim_vec2 = head_dim / 2;
+                    for (int i = tid; i < next_len * head_dim_vec2; i += threads_per_block)
+                    {
+                        int local_row = i / head_dim_vec2;
+                        int d2 = i % head_dim_vec2;
+                        int d = d2 * 2;
+                        int global_row = next_kv_start + local_row;
 
-                    float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                    float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+                        const float2 kv = *reinterpret_cast<const float2 *>(
+                            K_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
+                        const float2 vv = *reinterpret_cast<const float2 *>(
+                            V_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
 
-                    K_next[local_row * lds_layout.kv_stride + d] = float_to_half(k_val);
-                    V_next[local_row * lds_layout.kv_stride + d] = float_to_half(v_val);
+                        reinterpret_cast<__half2 *>(K_next + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(kv);
+                        reinterpret_cast<__half2 *>(V_next + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(vv);
+                    }
+                }
+                else
+                {
+                    for (int i = tid; i < next_len * head_dim; i += threads_per_block)
+                    {
+                        int local_row = i / head_dim;
+                        int d = i % head_dim;
+                        int global_row = next_kv_start + local_row;
+
+                        float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+                        float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
+
+                        K_next[local_row * lds_layout.kv_stride + d] = float_to_half(k_val);
+                        V_next[local_row * lds_layout.kv_stride + d] = float_to_half(v_val);
+                    }
                 }
             }
 
@@ -482,18 +544,32 @@ namespace
 
                 // Vectorized dot product (process 2 FP16 elements at a time)
                 // On MI50, this maps to v_pk_fma_f16 for 2x throughput
-                for (int d = 0; d < head_dim; d += 2)
+                if ((head_dim & 1) == 0)
                 {
-                    // Manual unpacking since we're targeting GCN
-                    float q0 = half_to_float(Q_ptr[d]);
-                    float k0 = half_to_float(K_ptr[d]);
-                    score += q0 * k0;
-
-                    if (d + 1 < head_dim)
+                    const int head_dim_vec2 = head_dim / 2;
+                    const __half2 *Q_ptr2 = reinterpret_cast<const __half2 *>(Q_ptr);
+                    const __half2 *K_ptr2 = reinterpret_cast<const __half2 *>(K_ptr);
+                    for (int d2 = 0; d2 < head_dim_vec2; d2++)
                     {
-                        float q1 = half_to_float(Q_ptr[d + 1]);
-                        float k1 = half_to_float(K_ptr[d + 1]);
-                        score += q1 * k1;
+                        float2 qf = __half22float2(Q_ptr2[d2]);
+                        float2 kf = __half22float2(K_ptr2[d2]);
+                        score += qf.x * kf.x + qf.y * kf.y;
+                    }
+                }
+                else
+                {
+                    for (int d = 0; d < head_dim; d += 2)
+                    {
+                        float q0 = half_to_float(Q_ptr[d]);
+                        float k0 = half_to_float(K_ptr[d]);
+                        score += q0 * k0;
+
+                        if (d + 1 < head_dim)
+                        {
+                            float q1 = half_to_float(Q_ptr[d + 1]);
+                            float k1 = half_to_float(K_ptr[d + 1]);
+                            score += q1 * k1;
+                        }
                     }
                 }
 
@@ -719,7 +795,12 @@ namespace
         float *Q_shared = reinterpret_cast<float *>(smem);
 
         const float *Q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
-        for (int d = tid; d < head_dim; d += num_threads)
+        for (int d = tid * 2; d + 1 < head_dim; d += num_threads * 2)
+        {
+            const float2 qv = reinterpret_cast<const float2 *>(Q_ptr + d)[0];
+            reinterpret_cast<float2 *>(Q_shared + d)[0] = qv;
+        }
+        for (int d = (head_dim & ~1) + tid; d < head_dim; d += num_threads)
         {
             Q_shared[d] = Q_ptr[d];
         }
