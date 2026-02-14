@@ -33,6 +33,11 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <limits>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
@@ -99,11 +104,9 @@ namespace
     // Max splits supported by reduction kernel shared-memory staging
     constexpr int FD_MAX_SPLITS_SUPPORTED = 32;
 
-    inline int getEnvIntOrDefault(const char* name, int default_value)
-    {
-        const char* v = std::getenv(name);
-        return v ? std::atoi(v) : default_value;
-    }
+    constexpr int FD_TARGET_ELEMS_PER_SPLIT = 16384;
+    constexpr int FD_MIN_SPLITS = 1;
+    constexpr int FD_AUTOTUNE_MAX_TRIALS = 6;
 
     inline int clampInt(int v, int lo, int hi)
     {
@@ -122,18 +125,6 @@ namespace
 
     inline int chooseDecodeThreadsPerBlock(int head_dim, int kv_len, int effective_num_splits)
     {
-        const int env_tpb = getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_TPB", 0);
-        if (env_tpb == 128 || env_tpb == 256)
-        {
-            return env_tpb;
-        }
-
-        const bool auto_enabled = (getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_AUTO", 1) != 0);
-        if (!auto_enabled)
-        {
-            return FD_THREADS_PER_BLOCK;
-        }
-
         // Generic heuristic using work-per-split and split aspect.
         const int safe_head_dim = std::max(head_dim, 1);
         const int safe_splits = std::max(effective_num_splits, 1);
@@ -156,10 +147,9 @@ namespace
         const int safe_head_dim = std::max(head_dim, 1);
         const int64_t total_elements = static_cast<int64_t>(kv_len) * safe_head_dim;
 
-        // Target work-per-split (elements), configurable and architecture-agnostic.
-        const int target_default = 16384;
+        // Target work-per-split (elements), architecture-agnostic default.
         const int target_elements_per_split = clampInt(
-            getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_TARGET_ELEMS_PER_SPLIT", target_default),
+            FD_TARGET_ELEMS_PER_SPLIT,
             1024,
             1 << 20);
 
@@ -184,38 +174,240 @@ namespace
         // Prefer power-of-two split counts for predictable reduction behavior.
         int auto_splits = roundUpPow2Clamped(base_splits, max_allowed);
 
-        const int min_splits = clampInt(
-            getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_MIN_SPLITS", 1),
-            1,
-            max_allowed);
+        const int min_splits = clampInt(FD_MIN_SPLITS, 1, max_allowed);
         auto_splits = clampInt(auto_splits, min_splits, max_allowed);
         return auto_splits;
     }
 
     inline int chooseEffectiveDecodeSplits(int kv_len, int head_dim, int requested_num_splits)
     {
-        const int forced = getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_SPLITS", 0);
-        const bool auto_enabled = (getEnvIntOrDefault("LLAMINAR_FLASH_DECODE_AUTO", 1) != 0);
         const int workspace_limit = (requested_num_splits > 0)
             ? requested_num_splits
             : FD_MAX_SPLITS_SUPPORTED;
         const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
 
-        if (forced > 0)
-        {
-            return std::max(1, std::min(forced, max_allowed));
-        }
-
-        if (!auto_enabled)
-        {
-            const int requested = (requested_num_splits > 0)
-                ? requested_num_splits
-                : FD_DEFAULT_NUM_SPLITS;
-            return std::max(1, std::min(requested, max_allowed));
-        }
-
         const int auto_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed);
         return std::max(1, std::min(auto_splits, max_allowed));
+    }
+
+    struct DecodeLaunchConfig
+    {
+        int splits = FD_DEFAULT_NUM_SPLITS;
+        int tpb = FD_THREADS_PER_BLOCK;
+    };
+
+    struct DecodeAutotuneSelection
+    {
+        DecodeLaunchConfig config{};
+        bool should_time = false;
+        uint32_t key = 0;
+        int candidate_index = -1;
+    };
+
+    struct DecodeAutotuneState
+    {
+        std::vector<DecodeLaunchConfig> candidates;
+        int max_trials = 0;
+        int next_trial = 0;
+        bool has_best = false;
+        DecodeLaunchConfig best{};
+        float best_ms = std::numeric_limits<float>::infinity();
+    };
+
+    inline int ilog2Floor(int value)
+    {
+        int v = std::max(value, 1);
+        int lg = 0;
+        while (v > 1)
+        {
+            v >>= 1;
+            lg++;
+        }
+        return lg;
+    }
+
+    inline int bucketAspectRatio(int kv_len, int head_dim)
+    {
+        const int safe_hd = std::max(head_dim, 1);
+        const float ratio = static_cast<float>(kv_len) / static_cast<float>(safe_hd);
+        if (ratio <= 1.0f)
+            return 0;
+        if (ratio <= 2.0f)
+            return 1;
+        if (ratio <= 4.0f)
+            return 2;
+        if (ratio <= 8.0f)
+            return 3;
+        if (ratio <= 16.0f)
+            return 4;
+        if (ratio <= 32.0f)
+            return 5;
+        return 6;
+    }
+
+    inline uint32_t makeDecodeAutotuneKey(int kv_len, int head_dim, int max_allowed_splits)
+    {
+        const int64_t total_elements = static_cast<int64_t>(std::max(kv_len, 1)) * std::max(head_dim, 1);
+        const int elem_bucket = clampInt(ilog2Floor(static_cast<int>(std::min<int64_t>(total_elements, INT32_MAX))), 0, 31);
+        const int aspect_bucket = bucketAspectRatio(kv_len, head_dim); // 0..6
+        const int hd_bucket = clampInt(ilog2Floor(std::max(head_dim, 1)), 0, 15);
+        const int split_cap_bucket = clampInt(ilog2Floor(std::max(max_allowed_splits, 1)), 0, 15);
+
+        return static_cast<uint32_t>(
+            (elem_bucket & 0x1F) |
+            ((aspect_bucket & 0x07) << 5) |
+            ((hd_bucket & 0x0F) << 8) |
+            ((split_cap_bucket & 0x0F) << 12));
+    }
+
+    inline void addSplitCandidate(std::vector<int> &splits, int value, int max_allowed)
+    {
+        int clamped = clampInt(value, 1, max_allowed);
+        clamped = roundUpPow2Clamped(clamped, max_allowed);
+        if (std::find(splits.begin(), splits.end(), clamped) == splits.end())
+        {
+            splits.push_back(clamped);
+        }
+    }
+
+    inline std::vector<DecodeLaunchConfig> buildDecodeAutotuneCandidates(int kv_len, int head_dim, int max_allowed)
+    {
+        const int min_splits = clampInt(FD_MIN_SPLITS, 1, max_allowed);
+
+        const int base_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed);
+
+        std::vector<int> split_candidates;
+        split_candidates.reserve(6);
+        addSplitCandidate(split_candidates, min_splits, max_allowed);
+        addSplitCandidate(split_candidates, base_splits / 2, max_allowed);
+        addSplitCandidate(split_candidates, base_splits, max_allowed);
+        addSplitCandidate(split_candidates, base_splits * 2, max_allowed);
+        addSplitCandidate(split_candidates, 1, max_allowed);
+        addSplitCandidate(split_candidates, max_allowed, max_allowed);
+
+        std::sort(split_candidates.begin(), split_candidates.end());
+
+        const int preferred_tpb = chooseDecodeThreadsPerBlock(head_dim, kv_len, base_splits);
+        int alt_tpb = (preferred_tpb == 128) ? 256 : 128;
+
+        std::vector<DecodeLaunchConfig> candidates;
+        candidates.reserve(split_candidates.size() * 2 + 2);
+
+        auto addCandidate = [&](int splits, int tpb)
+        {
+            DecodeLaunchConfig cfg{splits, tpb};
+            auto it = std::find_if(candidates.begin(), candidates.end(), [&](const DecodeLaunchConfig &existing)
+                                   { return existing.splits == cfg.splits && existing.tpb == cfg.tpb; });
+            if (it == candidates.end())
+            {
+                candidates.push_back(cfg);
+            }
+        };
+
+        addCandidate(base_splits, preferred_tpb);
+        addCandidate(base_splits, alt_tpb);
+
+        for (int s : split_candidates)
+        {
+            addCandidate(s, preferred_tpb);
+            addCandidate(s, alt_tpb);
+        }
+
+        return candidates;
+    }
+
+    inline std::unordered_map<uint32_t, DecodeAutotuneState> &decodeAutotuneMap()
+    {
+        static std::unordered_map<uint32_t, DecodeAutotuneState> states;
+        return states;
+    }
+
+    inline std::mutex &decodeAutotuneMutex()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+
+    inline DecodeAutotuneSelection chooseDecodeLaunchConfig(int kv_len, int head_dim, int requested_num_splits)
+    {
+        DecodeAutotuneSelection selection;
+
+        const int heuristic_splits = chooseEffectiveDecodeSplits(kv_len, head_dim, requested_num_splits);
+        const int heuristic_tpb = chooseDecodeThreadsPerBlock(head_dim, kv_len, heuristic_splits);
+        selection.config = {heuristic_splits, heuristic_tpb};
+
+        const int workspace_limit = (requested_num_splits > 0)
+            ? requested_num_splits
+            : FD_MAX_SPLITS_SUPPORTED;
+        const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
+
+        const uint32_t key = makeDecodeAutotuneKey(kv_len, head_dim, max_allowed);
+
+        std::lock_guard<std::mutex> guard(decodeAutotuneMutex());
+        auto &states = decodeAutotuneMap();
+        auto &state = states[key];
+
+        if (state.candidates.empty())
+        {
+            state.candidates = buildDecodeAutotuneCandidates(kv_len, head_dim, max_allowed);
+            const int max_trials_env = clampInt(FD_AUTOTUNE_MAX_TRIALS, 1, 24);
+            state.max_trials = std::min<int>(max_trials_env, static_cast<int>(state.candidates.size()));
+            state.next_trial = 0;
+            state.has_best = false;
+            state.best_ms = std::numeric_limits<float>::infinity();
+            state.best = selection.config;
+        }
+
+        selection.key = key;
+
+        if (state.next_trial < state.max_trials)
+        {
+            selection.config = state.candidates[state.next_trial];
+            selection.should_time = true;
+            selection.candidate_index = state.next_trial;
+            state.next_trial++;
+            return selection;
+        }
+
+        if (state.has_best)
+        {
+            selection.config = state.best;
+        }
+        else
+        {
+            selection.config = state.best;
+        }
+
+        return selection;
+    }
+
+    inline void recordDecodeAutotuneResult(uint32_t key, int candidate_index, float elapsed_ms)
+    {
+        if (!(elapsed_ms > 0.0f))
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> guard(decodeAutotuneMutex());
+        auto &states = decodeAutotuneMap();
+        auto it = states.find(key);
+        if (it == states.end())
+        {
+            return;
+        }
+
+        auto &state = it->second;
+        if (candidate_index < 0 || candidate_index >= static_cast<int>(state.candidates.size()))
+        {
+            return;
+        }
+
+        if (!state.has_best || elapsed_ms < state.best_ms)
+        {
+            state.has_best = true;
+            state.best_ms = elapsed_ms;
+            state.best = state.candidates[candidate_index];
+        }
     }
 
     // =========================================================================
@@ -1035,6 +1227,13 @@ namespace
             block_m[wavefront_id] = m_local;
             block_l[wavefront_id] = l_local;
         }
+        if (head_dim == 128)
+        {
+            const int base = wavefront_id * 128;
+            block_O[base + lane_id] = O_lane[0];
+            block_O[base + lane_id + WAVEFRONT_SIZE] = O_lane[1];
+        }
+        else
         {
             int o_idx = 0;
             for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
@@ -1077,16 +1276,53 @@ namespace
         // Parallel output write — wavefront 0 lanes each handle their output dims
         if (wavefront_id == 0)
         {
-            for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+            const int base = (batch_idx * n_heads + head_idx) * head_dim;
+
+            if (head_dim == 128)
             {
-                float sum = 0.0f;
-                for (int w = 0; w < num_wavefronts; w++)
+                float sum0 = 0.0f;
+                float sum1 = 0.0f;
+
+                if (num_wavefronts == 4)
                 {
-                    sum += wf_scales[w] * block_O[w * head_dim + d];
+                    sum0 = wf_scales[0] * block_O[lane_id] +
+                           wf_scales[1] * block_O[128 + lane_id] +
+                           wf_scales[2] * block_O[256 + lane_id] +
+                           wf_scales[3] * block_O[384 + lane_id];
+
+                    const int lane1 = lane_id + WAVEFRONT_SIZE;
+                    sum1 = wf_scales[0] * block_O[lane1] +
+                           wf_scales[1] * block_O[128 + lane1] +
+                           wf_scales[2] * block_O[256 + lane1] +
+                           wf_scales[3] * block_O[384 + lane1];
                 }
-                const int base = (batch_idx * n_heads + head_idx) * head_dim;
-                const int idx = (base + d) * num_splits + split_idx;
-                O_partial[idx] = sum;
+                else
+                {
+                    for (int w = 0; w < num_wavefronts; w++)
+                    {
+                        const int wbase = w * head_dim;
+                        sum0 += wf_scales[w] * block_O[wbase + lane_id];
+                        sum1 += wf_scales[w] * block_O[wbase + lane_id + WAVEFRONT_SIZE];
+                    }
+                }
+
+                const int idx0 = (base + lane_id) * num_splits + split_idx;
+                const int idx1 = (base + lane_id + WAVEFRONT_SIZE) * num_splits + split_idx;
+                O_partial[idx0] = sum0;
+                O_partial[idx1] = sum1;
+            }
+            else
+            {
+                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                {
+                    float sum = 0.0f;
+                    for (int w = 0; w < num_wavefronts; w++)
+                    {
+                        sum += wf_scales[w] * block_O[w * head_dim + d];
+                    }
+                    const int idx = (base + d) * num_splits + split_idx;
+                    O_partial[idx] = sum;
+                }
             }
         }
     }
@@ -1318,8 +1554,29 @@ extern "C"
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-        const int effective_num_splits = chooseEffectiveDecodeSplits(kv_len, head_dim, num_splits);
-        const int decode_threads_per_block = chooseDecodeThreadsPerBlock(head_dim, kv_len, effective_num_splits);
+        const DecodeAutotuneSelection tuned = chooseDecodeLaunchConfig(kv_len, head_dim, num_splits);
+        const int effective_num_splits = tuned.config.splits;
+        const int decode_threads_per_block = tuned.config.tpb;
+
+        hipEvent_t tune_start = nullptr;
+        hipEvent_t tune_stop = nullptr;
+        const bool measure_tuning = tuned.should_time;
+        if (measure_tuning)
+        {
+            if (hipEventCreate(&tune_start) == hipSuccess && hipEventCreate(&tune_stop) == hipSuccess)
+            {
+                hipEventRecord(tune_start, hip_stream);
+            }
+            else
+            {
+                if (tune_start)
+                    hipEventDestroy(tune_start);
+                if (tune_stop)
+                    hipEventDestroy(tune_stop);
+                tune_start = nullptr;
+                tune_stop = nullptr;
+            }
+        }
 
         // Split-K kernel
         size_t smem_size = head_dim * sizeof(float); // Q in shared memory
@@ -1343,6 +1600,21 @@ extern "C"
             grid_reduce, block_reduce, 0, hip_stream,
             O_partial, m_partial, l_partial, O,
             n_heads, head_dim, effective_num_splits);
+
+        if (tune_start && tune_stop)
+        {
+            hipEventRecord(tune_stop, hip_stream);
+            if (hipEventSynchronize(tune_stop) == hipSuccess)
+            {
+                float elapsed_ms = 0.0f;
+                if (hipEventElapsedTime(&elapsed_ms, tune_start, tune_stop) == hipSuccess)
+                {
+                    recordDecodeAutotuneResult(tuned.key, tuned.candidate_index, elapsed_ms);
+                }
+            }
+            hipEventDestroy(tune_start);
+            hipEventDestroy(tune_stop);
+        }
 
         (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();

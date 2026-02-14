@@ -360,7 +360,7 @@ static constexpr auto GemmMNPadding = ck::tensor_operation::device::GemmSpeciali
 //
 // For production inference:
 //   - Default path: This kernel + applyScales_kernel (via executeTwoKernel)
-//   - Legacy path: DenseScale kernel (lower accuracy, use LLAMINAR_ROCM_GEMM_FUSED=1)
+//   - Legacy path: DenseScale kernel (lower accuracy, retained for compatibility)
 //
 // ============================================================================
 using DsDataType_None = ck::Tuple<>;  // No D tensors (empty tuple)
@@ -718,73 +718,14 @@ struct QuantLdsPolicy
 
 static QuantAspectThresholds getQuantAspectThresholds()
 {
-    static const QuantAspectThresholds thresholds = []() {
-        QuantAspectThresholds t{64.0, 8.0, 0.125};
-
-        if (const char* env_extreme = std::getenv("LLAMINAR_Q8_ASPECT_EXTREME_WIDE"))
-        {
-            const double v = std::atof(env_extreme);
-            if (v > 0.0)
-            {
-                t.extreme_wide = v;
-            }
-        }
-        if (const char* env_wide = std::getenv("LLAMINAR_Q8_ASPECT_WIDE"))
-        {
-            const double v = std::atof(env_wide);
-            if (v > 0.0)
-            {
-                t.wide = v;
-            }
-        }
-        if (const char* env_balanced = std::getenv("LLAMINAR_Q8_ASPECT_BALANCED_MIN"))
-        {
-            const double v = std::atof(env_balanced);
-            if (v > 0.0)
-            {
-                t.balanced_min = v;
-            }
-        }
-
-        if (t.extreme_wide < t.wide)
-        {
-            t.extreme_wide = t.wide;
-        }
-        if (t.wide < t.balanced_min)
-        {
-            t.wide = t.balanced_min;
-        }
-
-        return t;
-    }();
+    static const QuantAspectThresholds thresholds{64.0, 8.0, 0.125};
 
     return thresholds;
 }
 
 static QuantLdsPolicy getQuantLdsPolicy()
 {
-    static const QuantLdsPolicy policy = []() {
-        QuantLdsPolicy p{4096, 4};
-
-        if (const char* env_max_k = std::getenv("LLAMINAR_Q8_LDS_MAX_K"))
-        {
-            const int v = std::atoi(env_max_k);
-            if (v > 0)
-            {
-                p.max_k = v;
-            }
-        }
-        if (const char* env_min_m = std::getenv("LLAMINAR_Q8_LDS_MIN_M"))
-        {
-            const int v = std::atoi(env_min_m);
-            if (v > 0)
-            {
-                p.min_m = v;
-            }
-        }
-
-        return p;
-    }();
+    static const QuantLdsPolicy policy{4096, 4};
 
     return policy;
 }
@@ -1440,7 +1381,7 @@ extern "C"
         
         // DEBUG: Time the actual CK GEMM execution (including GPU work completion)
         // This adds a sync so we can measure ACTUAL kernel execution time
-        static thread_local bool debug_timing = (getenv("LLAMINAR_CK_GEMM_TIMING") != nullptr);
+        static constexpr bool debug_timing = false;
         auto t0 = std::chrono::high_resolution_clock::now();
 
         // =====================================================================
@@ -1520,42 +1461,8 @@ extern "C"
         }
         else
         {
-            // Large M, irregular: choose between 128×128(MNPadding) and 64×64.
-            // Env override:
-            //   LLAMINAR_ROCM_CK_IRREGULAR_KERNEL=128  -> force 128×128 MNPadding
-            //   LLAMINAR_ROCM_CK_IRREGULAR_KERNEL=64   -> force 64×64
-            //   unset/other                           -> auto heuristic
-            static const int irregular_kernel_pref = []() {
-                const char* env = std::getenv("LLAMINAR_ROCM_CK_IRREGULAR_KERNEL");
-                if (!env) return 0;
-                if (std::strcmp(env, "64") == 0) return 64;
-                if (std::strcmp(env, "128") == 0) return 128;
-                return 0;
-            }();
-
-            const int rem128 = M % 128;
-            const int rem64 = M % 64;
-            const int pad128 = (rem128 == 0) ? 0 : (128 - rem128);
-            const int pad64 = (rem64 == 0) ? 0 : (64 - rem64);
-
+            // Large M, irregular: keep 128×128(MNPadding) default on gfx906.
             bool use_64 = false;
-            if (irregular_kernel_pref == 64)
-            {
-                use_64 = true;
-            }
-            else if (irregular_kernel_pref == 128)
-            {
-                use_64 = false;
-            }
-            else
-            {
-                // Auto default: 128×128 MNPadding is generally faster for
-                // prefill-scale irregular M on gfx906. Keep 64×64 as opt-in
-                // via LLAMINAR_ROCM_CK_IRREGULAR_KERNEL=64.
-                (void)pad64;
-                (void)pad128;
-                use_64 = false;
-            }
 
             if (use_64)
             {
@@ -2184,7 +2091,7 @@ extern "C"
     //   - Fast-path dispatch:
     //       * NoTail when K % 4 == 0 (elides scalar tail loops)
     //       * LDS row staging when shape policy says rows are reusable
-    //         (K <= LLAMINAR_Q8_LDS_MAX_K and M >= LLAMINAR_Q8_LDS_MIN_M)
+    //         (K <= policy.max_k and M >= policy.min_m)
     //   - Parallel reduction for max_abs finding
     //
     // =========================================================================
