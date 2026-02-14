@@ -166,6 +166,10 @@ namespace
         return val;
     }
 
+    // exp2f(x * LOG2E) maps to hardware v_exp_f32 on GCN.
+    // Forward-declared here so both prefill and decode kernels can use it.
+    __device__ __forceinline__ float fast_expf(float x);
+
     /**
      * @brief Warp-level reduction of softmax state (m, l, O) for Flash Decoding
      *
@@ -299,6 +303,7 @@ namespace
         const int head_idx = blockIdx.x;
         const int q_tile_idx = blockIdx.y;
         const int tid = threadIdx.x;
+        const int threads_per_block = blockDim.x;
         const int wavefront_id = tid / WAVEFRONT_SIZE;
         const int lane_id = tid % WAVEFRONT_SIZE;
 
@@ -340,22 +345,24 @@ namespace
         // With 256 threads and tile_q=64, each thread handles 64/256 = 0.25 rows
         // So we use a strided pattern where thread t handles rows t, t+256, ...
 
-        // Per-row accumulators (each thread may handle multiple rows in small tiles)
-        const int rows_per_block = tile_q;
-        const int rows_per_thread = (rows_per_block + FA2_THREADS_PER_BLOCK - 1) / FA2_THREADS_PER_BLOCK;
+        // Use 4 threads per Q row so all 256 threads participate when tile_q=64.
+        // Each thread owns a disjoint subset of output dims for that row.
+        constexpr int THREADS_PER_ROW = 4;
+        const int local_q_row = tid / THREADS_PER_ROW;
+        const int row_lane = tid % THREADS_PER_ROW;
+        const bool thread_has_row = (local_q_row < q_tile_rows);
 
-        // Thread's assigned Q rows (strided assignment)
-        float O_acc[4][128]; // Support up to 4 rows per thread, head_dim up to 128
-        float m_i[4];        // Max score per row
-        float l_i[4];        // Sum of exp per row
+        // head_dim <= 128 and THREADS_PER_ROW=4 => max 32 dims per thread.
+        float O_acc[32];
+        float m_i = -FLT_MAX;
+        float l_i = 0.0f;
 
-        for (int r = 0; r < rows_per_thread && tid + r * FA2_THREADS_PER_BLOCK < q_tile_rows; r++)
+        if (thread_has_row)
         {
-            m_i[r] = -FLT_MAX;
-            l_i[r] = 0.0f;
-            for (int d = 0; d < head_dim; d++)
+            int d_local = 0;
+            for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
             {
-                O_acc[r][d] = 0.0f;
+                O_acc[d_local++] = 0.0f;
             }
         }
 
@@ -367,7 +374,7 @@ namespace
         // =====================================================================
         // Load Q tile into LDS (done once per block)
         // =====================================================================
-        for (int i = tid; i < q_tile_rows * head_dim; i += FA2_THREADS_PER_BLOCK)
+        for (int i = tid; i < q_tile_rows * head_dim; i += threads_per_block)
         {
             int local_row = i / head_dim;
             int d = i % head_dim;
@@ -390,7 +397,7 @@ namespace
             __half *K_dst = get_K_tile(0);
             __half *V_dst = get_V_tile(0);
 
-            for (int i = tid; i < actual_len * head_dim; i += FA2_THREADS_PER_BLOCK)
+            for (int i = tid; i < actual_len * head_dim; i += threads_per_block)
             {
                 int local_row = i / head_dim;
                 int d = i % head_dim;
@@ -439,7 +446,7 @@ namespace
                 __half *V_next = get_V_tile(next_stage);
 
                 // Cooperative load by all threads
-                for (int i = tid; i < next_len * head_dim; i += FA2_THREADS_PER_BLOCK)
+                for (int i = tid; i < next_len * head_dim; i += threads_per_block)
                 {
                     int local_row = i / head_dim;
                     int d = i % head_dim;
@@ -462,7 +469,7 @@ namespace
             // We distribute computation: thread t computes elements at stride
             const int total_score_elements = q_tile_rows * actual_kv_len;
 
-            for (int s_idx = tid; s_idx < total_score_elements; s_idx += FA2_THREADS_PER_BLOCK)
+            for (int s_idx = tid; s_idx < total_score_elements; s_idx += threads_per_block)
             {
                 int q_row = s_idx / actual_kv_len;
                 int kv_col = s_idx % actual_kv_len;
@@ -499,12 +506,8 @@ namespace
             // =================================================================
             // Each thread processes its assigned Q rows
 
-            for (int r = 0; r < rows_per_thread; r++)
+            if (thread_has_row)
             {
-                int local_q_row = tid + r * FA2_THREADS_PER_BLOCK;
-                if (local_q_row >= q_tile_rows)
-                    break;
-
                 int global_q_row = q_block_start + local_q_row;
                 float *my_scores = scores + local_q_row * lds_layout.scores_stride;
 
@@ -552,15 +555,16 @@ namespace
                 }
 
                 // Online softmax update
-                float m_i_new = fmaxf(m_i[r], m_ij);
-                float scale_old = expf(m_i[r] - m_i_new);
+                float m_i_new = fmaxf(m_i, m_ij);
+                float scale_old = fast_expf(m_i - m_i_new);
 
                 // Rescale previous accumulators
-                for (int d = 0; d < head_dim; d++)
+                int d_local = 0;
+                for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
                 {
-                    O_acc[r][d] *= scale_old;
+                    O_acc[d_local++] *= scale_old;
                 }
-                l_i[r] *= scale_old;
+                l_i *= scale_old;
 
                 // Accumulate P @ V for this tile
                 float l_ij = 0.0f;
@@ -569,20 +573,22 @@ namespace
                     float s = my_scores[j];
                     if (s > -FLT_MAX / 2)
                     {
-                        float p = expf(s - m_i_new);
+                        float p = fast_expf(s - m_i_new);
                         l_ij += p;
 
                         const __half *V_row = V_tile + j * lds_layout.kv_stride;
-                        for (int d = 0; d < head_dim; d++)
+                        int d_local = 0;
+                        for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
                         {
-                            O_acc[r][d] += p * half_to_float(V_row[d]);
+                            O_acc[d_local++] += p * half_to_float(V_row[d]);
                         }
                     }
                 }
 
-                l_i[r] += l_ij;
-                m_i[r] = m_i_new;
+                l_i += l_ij;
+                m_i = m_i_new;
             }
+
             __syncthreads();
         }
 
@@ -591,19 +597,16 @@ namespace
         // =====================================================================
         float *O_batch = O + batch_idx * seq_len * n_heads * head_dim;
 
-        for (int r = 0; r < rows_per_thread; r++)
+        if (thread_has_row)
         {
-            int local_q_row = tid + r * FA2_THREADS_PER_BLOCK;
-            if (local_q_row >= q_tile_rows)
-                break;
-
             int global_q_row = q_block_start + local_q_row;
-            float inv_l = (l_i[r] > 0.0f) ? (1.0f / l_i[r]) : 0.0f;
+            float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
 
             float *O_row = O_batch + global_q_row * n_heads * head_dim + head_idx * head_dim;
-            for (int d = 0; d < head_dim; d++)
+            int d_local = 0;
+            for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
             {
-                O_row[d] = O_acc[r][d] * inv_l;
+                O_row[d] = O_acc[d_local++] * inv_l;
             }
         }
     }
