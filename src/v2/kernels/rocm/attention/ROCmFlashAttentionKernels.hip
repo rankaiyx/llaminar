@@ -782,14 +782,19 @@ namespace
                 m_partial[partial_idx] = -FLT_MAX;
                 l_partial[partial_idx] = 0.0f;
             }
-            float *O_out = O_partial + partial_idx * head_dim;
             for (int d = tid * 2; d + 1 < head_dim; d += num_threads * 2)
             {
-                reinterpret_cast<float2 *>(O_out + d)[0] = make_float2(0.0f, 0.0f);
+                const int base = (batch_idx * n_heads + head_idx) * head_dim;
+                const int idx0 = (base + d + 0) * num_splits + split_idx;
+                const int idx1 = (base + d + 1) * num_splits + split_idx;
+                O_partial[idx0] = 0.0f;
+                O_partial[idx1] = 0.0f;
             }
             for (int d = (head_dim & ~1) + tid; d < head_dim; d += num_threads)
             {
-                O_out[d] = 0.0f;
+                const int base = (batch_idx * n_heads + head_idx) * head_dim;
+                const int idx = (base + d) * num_splits + split_idx;
+                O_partial[idx] = 0.0f;
             }
             return;
         }
@@ -949,7 +954,6 @@ namespace
         // Parallel output write — wavefront 0 lanes each handle their output dims
         if (wavefront_id == 0)
         {
-            float *O_out = O_partial + partial_idx * head_dim;
             for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
             {
                 float sum = 0.0f;
@@ -957,7 +961,9 @@ namespace
                 {
                     sum += wf_scales[w] * block_O[w * head_dim + d];
                 }
-                O_out[d] = sum;
+                const int base = (batch_idx * n_heads + head_idx) * head_dim;
+                const int idx = (base + d) * num_splits + split_idx;
+                O_partial[idx] = sum;
             }
         }
     }
@@ -1010,15 +1016,31 @@ namespace
 
         float inv_l = (global_l > 0.0f) ? (1.0f / global_l) : 0.0f;
         float *O_out = O + (batch_idx * n_heads + head_idx) * head_dim;
+        const int head_base = (batch_idx * n_heads + head_idx) * head_dim;
 
         // Combine partial outputs
-        for (int d = tid; d < head_dim; d += blockDim.x)
+        for (int d = tid * 2; d + 1 < head_dim; d += blockDim.x * 2)
         {
-            float O_sum = 0.0f;
+            float O_sum0 = 0.0f;
+            float O_sum1 = 0.0f;
+            const int split_base0 = (head_base + d + 0) * num_splits;
+            const int split_base1 = (head_base + d + 1) * num_splits;
             for (int s = 0; s < num_splits; s++)
             {
-                const float *O_s = O_partial + (base_idx + s) * head_dim;
-                O_sum += split_scales[s] * O_s[d];
+                const float scale = split_scales[s];
+                O_sum0 += scale * O_partial[split_base0 + s];
+                O_sum1 += scale * O_partial[split_base1 + s];
+            }
+            reinterpret_cast<float2 *>(O_out + d)[0] = make_float2(O_sum0 * inv_l, O_sum1 * inv_l);
+        }
+
+        for (int d = (head_dim & ~1) + tid; d < head_dim; d += blockDim.x)
+        {
+            float O_sum = 0.0f;
+            const int split_base = (head_base + d) * num_splits;
+            for (int s = 0; s < num_splits; s++)
+            {
+                O_sum += split_scales[s] * O_partial[split_base + s];
             }
             O_out[d] = O_sum * inv_l;
         }
