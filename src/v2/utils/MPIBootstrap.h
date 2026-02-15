@@ -54,6 +54,7 @@ namespace llaminar2
         bool use_physical_cores = true; ///< Restrict to physical cores only
         std::string omp_places = "sockets";
         std::string omp_proc_bind = "close";
+        std::string cpu_set; ///< Optional OpenMPI --cpu-set for explicit CPU NUMA targeting
     };
 
     /**
@@ -194,6 +195,19 @@ namespace llaminar2
          */
         static std::vector<std::pair<std::string, int>> parseHostfile(
             const std::string &hostfile_path);
+
+        /**
+         * @brief Read OpenMPI cpu-set mask string for a NUMA node (e.g., "28-55,84-111")
+         */
+        static std::string getCpuSetForNumaNode(int numa_node);
+
+        /**
+         * @brief Read physical-core-only OpenMPI cpu-set for a NUMA node.
+         *
+         * Uses thread_siblings topology to keep one logical CPU per physical core
+         * and returns a compact range list (e.g., "28-55").
+         */
+        static std::string getPhysicalCpuSetForNumaNode(int numa_node);
 
     private:
         /**

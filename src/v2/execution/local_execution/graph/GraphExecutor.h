@@ -437,6 +437,7 @@ namespace llaminar2
             bool capturable = true;                        ///< Whether this segment can be graph-captured
             std::unique_ptr<IGPUGraphCapture> capture;     ///< GPU graph (only for capturable segments)
             std::vector<IComputeStage *> replay_callbacks; ///< Stages needing onGraphReplayed() (precomputed)
+            uint64_t last_executed_step = 0;               ///< Last decode-step where this segment executed
         };
 
         /**
@@ -452,6 +453,7 @@ namespace llaminar2
             bool initialized = false;                 ///< Whether segments have been built
             bool needs_capture = false;               ///< True after warmup, before capture
             int consecutive_failures = 0;             ///< Segment-level failure counter
+            uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
             void *capture_stream = nullptr;           ///< Locally-created blocking stream for capture/replay
             void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
@@ -470,6 +472,7 @@ namespace llaminar2
                   initialized(other.initialized),
                   needs_capture(other.needs_capture),
                   consecutive_failures(other.consecutive_failures),
+                  decode_step(other.decode_step),
                   capture_stream(other.capture_stream),
                   sync_event(other.sync_event),
                   gpu_ctx_ref(other.gpu_ctx_ref)
@@ -488,6 +491,7 @@ namespace llaminar2
                     initialized = other.initialized;
                     needs_capture = other.needs_capture;
                     consecutive_failures = other.consecutive_failures;
+                    decode_step = other.decode_step;
                     capture_stream = other.capture_stream;
                     sync_event = other.sync_event;
                     gpu_ctx_ref = other.gpu_ctx_ref;
@@ -506,6 +510,7 @@ namespace llaminar2
                 initialized = false;
                 needs_capture = false;
                 consecutive_failures = 0;
+                decode_step = 0;
                 destroySyncEvent();
                 destroyCaptureStream();
             }

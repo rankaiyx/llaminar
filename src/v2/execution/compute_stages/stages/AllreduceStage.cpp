@@ -14,6 +14,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../utils/MPIContext.h"
 #include <mpi.h>
 #include <chrono>
@@ -52,6 +53,8 @@ namespace llaminar2
 
     bool AllreduceStage::executeViaCollectiveContext()
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ALLREDUCE);
+
         const auto &mpi_env = debugEnv().mpi_logging;
 
         size_t count = params_.count > 0 ? params_.count : params_.buffer->numel();
@@ -83,6 +86,8 @@ namespace llaminar2
 
     bool AllreduceStage::executeViaMPI()
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ALLREDUCE);
+
         const auto &mpi_env = debugEnv().mpi_logging;
 
         if (!params_.buffer)

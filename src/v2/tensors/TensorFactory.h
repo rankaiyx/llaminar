@@ -184,6 +184,34 @@ namespace llaminar2
                                                     const std::vector<uint8_t> &raw_data);
 
         /**
+         * @brief Ensure NUMA memory binding is active for the calling thread
+         *
+         * Sets numa_set_membind() so all subsequent allocations on this thread
+         * land on the NUMA node associated with this factory's MPI rank.
+         *
+         * Call this before allocating temporary buffers (e.g. file I/O scratch)
+         * that should be NUMA-local. The create* methods already call this
+         * internally, but callers who allocate their own buffers before
+         * passing data to the factory should call this first.
+         *
+         * No-op if NUMA is not available or the factory has no NUMA node.
+         */
+        void ensureNumaBinding();
+
+        /**
+         * @brief Parallel NUMA-aware memcpy for large buffers
+         *
+         * Uses OpenMP to copy data in parallel, ensuring destination pages are
+         * first-touched by threads bound to the correct NUMA node. Falls back
+         * to std::memcpy for small buffers (< 128 KB).
+         *
+         * @param dst  Destination buffer (should be allocated with NUMA binding)
+         * @param src  Source buffer
+         * @param bytes Number of bytes to copy
+         */
+        static void numaMemcpy(void *dst, const void *src, size_t bytes);
+
+        /**
          * @brief Get NUMA node for current MPI rank
          * @return NUMA node index, or -1 if NUMA not available
          */

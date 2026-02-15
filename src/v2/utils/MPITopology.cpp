@@ -14,6 +14,7 @@
 #include "MPITopology.h"
 #include "NUMATopology.h"
 #include "Logger.h"
+#include "DebugEnv.h"
 #include "../tensors/TensorSlice.h"
 #include "../execution/mpi_orchestration/PlacementStrategy.h"
 
@@ -418,10 +419,10 @@ namespace llaminar2
         placement_.devices.push_back(cpu_dev);
 
         // Check environment for CUDA devices
-        const char *cuda_visible = std::getenv("CUDA_VISIBLE_DEVICES");
-        if (cuda_visible && strlen(cuda_visible) > 0)
+        const auto &env = debugEnv();
+        if (!env.topology.cuda_visible_devices.empty())
         {
-            std::string devices(cuda_visible);
+            std::string devices(env.topology.cuda_visible_devices);
             std::stringstream ss(devices);
             std::string item;
             while (std::getline(ss, item, ','))
@@ -445,10 +446,9 @@ namespace llaminar2
         }
 
         // Check environment for ROCm devices
-        const char *hip_visible = std::getenv("HIP_VISIBLE_DEVICES");
-        if (hip_visible && strlen(hip_visible) > 0)
+        if (!env.topology.hip_visible_devices.empty())
         {
-            std::string devices(hip_visible);
+            std::string devices(env.topology.hip_visible_devices);
             std::stringstream ss(devices);
             std::string item;
             while (std::getline(ss, item, ','))

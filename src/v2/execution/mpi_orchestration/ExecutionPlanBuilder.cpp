@@ -773,14 +773,107 @@ namespace llaminar2
             }
         }
 
+        // Resolve rank-specific explicit device-map entry (if any)
+        std::optional<GlobalDeviceAddress> mapped_device_for_rank;
+        bool mapped_device_numa_explicit = false;
+        if (config.device_mode == DeviceAssignmentMode::EXPLICIT)
+        {
+            for (const auto &[mapped_rank, mapped_addr] : config.device_map)
+            {
+                if (mapped_rank == rank)
+                {
+                    mapped_device_for_rank = mapped_addr;
+                    break;
+                }
+            }
+            if (mapped_device_for_rank.has_value())
+            {
+                for (const auto &[mapped_rank, explicit_numa] : config.device_map_numa_explicit)
+                {
+                    if (mapped_rank == rank)
+                    {
+                        mapped_device_numa_explicit = explicit_numa;
+                        break;
+                    }
+                }
+            }
+        }
+
         // Primary device
         if (!plan.local_tp_devices.empty())
         {
             plan.primary_device = plan.local_tp_devices[0];
         }
+        else if (mapped_device_for_rank.has_value())
+        {
+            plan.primary_device = *mapped_device_for_rank;
+            plan.primary_device_numa_explicit = mapped_device_numa_explicit;
+
+            // For ambiguous short-form GPU specs from --device-map (e.g., "rocm:0"),
+            // pick first matching device across NUMA nodes, preferring lower NUMA IDs.
+            if (!mapped_device_numa_explicit && plan.primary_device.isGPU() &&
+                rank < static_cast<int>(cluster_inventory.ranks.size()))
+            {
+                const auto &rank_inv = cluster_inventory.ranks[rank];
+                std::vector<GlobalDeviceAddress> candidates;
+                for (const auto &gpu : rank_inv.gpus)
+                {
+                    if (gpu.type == plan.primary_device.device_type &&
+                        gpu.local_device_id == plan.primary_device.device_ordinal)
+                    {
+                        candidates.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                            DeviceId(gpu.type, gpu.local_device_id),
+                            rank_inv.hostname,
+                            gpu.numa_node >= 0 ? gpu.numa_node : 0));
+                    }
+                }
+
+                if (!candidates.empty())
+                {
+                    std::sort(candidates.begin(), candidates.end(),
+                              [](const GlobalDeviceAddress &a, const GlobalDeviceAddress &b)
+                              {
+                                  return a.numa_node < b.numa_node;
+                              });
+                    plan.primary_device = candidates.front();
+                }
+            }
+        }
         else if (config.device_for_this_rank.has_value() && cluster_inventory.world_size == 1)
         {
-            plan.primary_device = *config.device_for_this_rank;
+            const auto &requested = *config.device_for_this_rank;
+            plan.primary_device = requested;
+            plan.primary_device_numa_explicit = config.device_for_this_rank_numa_explicit;
+
+            // For ambiguous short-form GPU specs (e.g., "rocm:0"), pick the first
+            // matching device across NUMA nodes, preferring lower NUMA IDs.
+            if (!config.device_for_this_rank_numa_explicit && requested.isGPU() &&
+                rank < static_cast<int>(cluster_inventory.ranks.size()))
+            {
+                const auto &rank_inv = cluster_inventory.ranks[rank];
+                std::vector<GlobalDeviceAddress> candidates;
+                for (const auto &gpu : rank_inv.gpus)
+                {
+                    if (gpu.type == requested.device_type &&
+                        gpu.local_device_id == requested.device_ordinal)
+                    {
+                        candidates.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                            DeviceId(gpu.type, gpu.local_device_id),
+                            rank_inv.hostname,
+                            gpu.numa_node >= 0 ? gpu.numa_node : 0));
+                    }
+                }
+
+                if (!candidates.empty())
+                {
+                    std::sort(candidates.begin(), candidates.end(),
+                              [](const GlobalDeviceAddress &a, const GlobalDeviceAddress &b)
+                              {
+                                  return a.numa_node < b.numa_node;
+                              });
+                    plan.primary_device = candidates.front();
+                }
+            }
         }
         else if (rank < static_cast<int>(cluster_inventory.ranks.size()))
         {

@@ -572,6 +572,7 @@ namespace llaminar2
         // - RCCL for ROCm devices
         // - MPI fallback for CPU-only or heterogeneous setups
         // =====================================================================
+        const auto &env = debugEnv();
         const bool local_tp_collectives_enabled =
             (config.local_tp_ctx != nullptr && config.local_tp_ctx->degree() > 1);
 
@@ -607,8 +608,41 @@ namespace llaminar2
         else if (mpi_ctx && mpi_ctx->world_size() > 1)
         {
             // GLOBAL TP path: use MPI-based collectives from compute stages.
-            // Do not initialize LOCAL GPU-native collective context here.
-            LOG_DEBUG("[InferenceRunner] GLOBAL TP mode: GPU-native LOCAL collectives disabled");
+            // Optional experiment path: route collective stages through
+            // GraphExecutor intercept + MPI-backed CollectiveContext.
+            if (env.execution.force_mpi_collective_context)
+            {
+                // Build CPU-only world inventory to force MPI backend selection
+                // without triggering NCCL/RCCL pre-initialization in BackendRouter.
+                ClusterInventory cluster_inventory;
+                cluster_inventory.world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
+                cluster_inventory.ranks.resize(cluster_inventory.world_size);
+                for (int r = 0; r < cluster_inventory.world_size; ++r)
+                {
+                    auto &rank_inv = cluster_inventory.ranks[r];
+                    rank_inv.rank = r;
+                    rank_inv.node_id = 0;
+                    rank_inv.local_rank = r;
+                    rank_inv.hostname = "localhost";
+                }
+                cluster_inventory.buildNodeAggregations();
+
+                auto collective_ctx = CollectiveContextFactory::createIntraNode(cluster_inventory, mpi_ctx);
+                if (collective_ctx)
+                {
+                    orchestrator->setCollectiveContext(std::move(collective_ctx));
+                    LOG_INFO("[InferenceRunner] GLOBAL TP mode: forcing MPI-backed CollectiveContext via LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT=1");
+                }
+                else
+                {
+                    LOG_WARN("[InferenceRunner] GLOBAL TP mode: failed to create MPI-backed CollectiveContext, using stage MPI path");
+                }
+            }
+            else
+            {
+                // Default GLOBAL TP behavior: use MPI-based collectives from compute stages.
+                LOG_DEBUG("[InferenceRunner] GLOBAL TP mode: using stage MPI collectives (CollectiveContext disabled)");
+            }
         }
 
         LOG_DEBUG("[InferenceRunner] DeviceGraphOrchestrator created successfully");

@@ -76,6 +76,15 @@ namespace llaminar2
         MANUAL    ///< Manual layer assignment via --pp-stage
     };
 
+    /**
+     * @brief MPI bootstrap tuning profile
+     */
+    enum class MPIProfile
+    {
+        AUTO,  ///< Conservative defaults, auto-upgrade to tuned for explicit CPU intent
+        TUNED, ///< Force tuned CPU-centric bootstrap defaults
+    };
+
     // CollectiveBackendType is defined in CollectiveBackendType.h
 
     // =========================================================================
@@ -85,11 +94,13 @@ namespace llaminar2
     const char *tpScopeToString(TPScope scope);
     const char *deviceAssignmentModeToString(DeviceAssignmentMode mode);
     const char *ppSplitModeToString(PPSplitMode mode);
+    const char *mpiProfileToString(MPIProfile profile);
     // collectiveBackendTypeToString and parseCollectiveBackendType declared in CollectiveBackendType.h
 
     std::optional<TPScope> parseTpScope(const std::string &str);
     std::optional<DeviceAssignmentMode> parseDeviceAssignmentMode(const std::string &str);
     std::optional<PPSplitMode> parsePpSplitMode(const std::string &str);
+    std::optional<MPIProfile> parseMPIProfile(const std::string &str);
 
     // =========================================================================
     // DomainDefinition
@@ -229,8 +240,17 @@ namespace llaminar2
         /// Device for this specific rank (--device cuda:0)
         std::optional<GlobalDeviceAddress> device_for_this_rank;
 
+        /// True when --device explicitly includes NUMA (e.g., 1:rocm:0, host:1:rocm:0)
+        bool device_for_this_rank_numa_explicit = false;
+
+        /// True when --device cpu shorthand is used (CPU TP across local NUMA nodes)
+        bool cpu_global_tp_all_local = false;
+
         /// Explicit device map: rank -> device (--device-map "0=cuda:0,1=cuda:1")
         std::vector<std::pair<int, GlobalDeviceAddress>> device_map;
+
+        /// For device_map entries: rank -> whether NUMA was explicitly specified
+        std::vector<std::pair<int, bool>> device_map_numa_explicit;
 
         // =========================================================================
         // Named Domains (Complex Scenarios)
@@ -353,12 +373,13 @@ namespace llaminar2
         // MPI Bootstrap Configuration
         // =========================================================================
 
-        int mpi_procs = 0;              ///< MPI process count (0 = auto)
-        std::string hostfile;           ///< MPI hostfile path
-        bool mpi_dry_run = false;       ///< Print MPI config and exit
-        bool mpi_verbose = false;       ///< Verbose MPI output
-        bool mpi_no_bootstrap = false;  ///< Disable auto-bootstrap
-        bool mpi_oversubscribe = false; ///< Allow oversubscription
+        int mpi_procs = 0;                         ///< MPI process count (0 = auto)
+        std::string hostfile;                      ///< MPI hostfile path
+        bool mpi_dry_run = false;                  ///< Print MPI config and exit
+        bool mpi_verbose = false;                  ///< Verbose MPI output
+        bool mpi_no_bootstrap = false;             ///< Disable auto-bootstrap
+        bool mpi_oversubscribe = false;            ///< Allow oversubscription
+        MPIProfile mpi_profile = MPIProfile::AUTO; ///< MPI bootstrap profile (--mpi-profile auto|tuned)
 
         // =========================================================================
         // Verbosity and Debug

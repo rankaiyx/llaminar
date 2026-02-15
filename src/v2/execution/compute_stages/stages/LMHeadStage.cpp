@@ -6,6 +6,7 @@
 #include "LMHeadStage.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
@@ -24,6 +25,8 @@ namespace llaminar2
 
     bool LMHeadStage::execute(IDeviceContext *ctx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::LM_HEAD);
+
         LOG_DEBUG("[LMHeadStage] Execute: seq_len=" << params_.seq_len
                                                     << " d_model=" << params_.d_model
                                                     << " vocab_size=" << params_.vocab_size);

@@ -818,8 +818,8 @@ namespace llaminar2
         inventory.buildNodeAggregations();
 
         LOG_INFO("[gatherClusterInventory] Discovered " << inventory.total_gpus
-                                                         << " GPU(s) across " << world_size
-                                                         << " ranks on " << inventory.node_count << " node(s)");
+                                                        << " GPU(s) across " << world_size
+                                                        << " ranks on " << inventory.node_count << " node(s)");
         return inventory;
     }
 
@@ -1102,8 +1102,21 @@ namespace llaminar2
 
         // Validate that the requested device actually exists in hardware
         const auto &dm = DeviceManager::instance();
-        if (!dm.deviceExists(device))
+        const bool strict_numa = plan_.primary_device_numa_explicit;
+
+        const bool device_available = strict_numa
+                                          ? dm.deviceExists(plan_.primary_device, true)
+                                          : dm.deviceExists(device);
+
+        if (!device_available)
         {
+            if (strict_numa)
+            {
+                return setError("Requested device " + plan_.primary_device.toString() +
+                                " is not available on the specified NUMA node. Available devices: " +
+                                dm.availableDevicesString());
+            }
+
             return setError("Requested device " + device.toString() +
                             " is not available. Available devices: " +
                             dm.availableDevicesString());

@@ -9,10 +9,84 @@
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../tensors/FP16Utils.h"
 #include <cstring>
+#include <mutex>
 #include <type_traits>
+#include <unordered_map>
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        struct EmbedRepackCacheKey
+        {
+            const void *raw_ptr = nullptr;
+            size_t rows = 0;
+            int d_model = 0;
+            TensorType type = TensorType::FP32;
+
+            bool operator==(const EmbedRepackCacheKey &other) const
+            {
+                return raw_ptr == other.raw_ptr &&
+                       rows == other.rows &&
+                       d_model == other.d_model &&
+                       type == other.type;
+            }
+        };
+
+        struct EmbedRepackCacheKeyHash
+        {
+            size_t operator()(const EmbedRepackCacheKey &k) const
+            {
+                size_t h = std::hash<const void *>{}(k.raw_ptr);
+                h ^= std::hash<size_t>{}(k.rows) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<int>{}(k.d_model) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<int>{}(static_cast<int>(k.type)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
+
+        std::shared_ptr<const EmbedQ8RepackResult> getOrCreateCachedEmbeddingRepack(
+            const TensorBase *embed_table,
+            int d_model)
+        {
+            static std::mutex cache_mutex;
+            static std::unordered_map<EmbedRepackCacheKey,
+                                      std::shared_ptr<const EmbedQ8RepackResult>,
+                                      EmbedRepackCacheKeyHash>
+                cache;
+
+            const void *raw_ptr = embed_table->raw_data();
+            if (!raw_ptr)
+            {
+                raw_ptr = static_cast<const void *>(embed_table);
+            }
+
+            const EmbedRepackCacheKey key{
+                raw_ptr,
+                embed_table->rows(),
+                d_model,
+                embed_table->native_type()};
+
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                auto it = cache.find(key);
+                if (it != cache.end())
+                {
+                    return it->second;
+                }
+            }
+
+            auto repacked = std::make_shared<EmbedQ8RepackResult>(repackEmbeddingToQ8(embed_table, d_model));
+
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                cache[key] = repacked;
+            }
+
+            return repacked;
+        }
+    } // namespace
 
     template <typename TensorT>
     bool CPUEmbeddingKernelT<TensorT>::apply(
@@ -261,14 +335,14 @@ namespace llaminar2
         }
 
         // Cache the repacked EmbedQ8 data (one-time cost per embedding table)
-        if (cached_embed_table_ != embed_table)
+        if (cached_embed_table_ != embed_table || !cached_repack_)
         {
-            cached_repack_ = repackEmbeddingToQ8(embed_table, d_model);
+            cached_repack_ = getOrCreateCachedEmbeddingRepack(embed_table, d_model);
             cached_embed_table_ = embed_table;
         }
 
-        const EmbedQ8Block *blocks = reinterpret_cast<const EmbedQ8Block *>(cached_repack_.data.data());
-        const size_t blocks_per_row = cached_repack_.blocks_per_row;
+        const EmbedQ8Block *blocks = reinterpret_cast<const EmbedQ8Block *>(cached_repack_->data.data());
+        const size_t blocks_per_row = cached_repack_->blocks_per_row;
 
         if constexpr (std::is_same_v<TensorT, FP32Tensor>)
         {

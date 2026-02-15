@@ -83,6 +83,11 @@ namespace llaminar2
         RESIDUAL_ADD, ///< Residual connection add
         SOFTMAX,      ///< Standalone softmax
 
+        // Collective communication
+        ALLREDUCE,  ///< AllReduce collective
+        ALLGATHER,  ///< AllGather collective
+        ALLGATHERV, ///< AllGatherV collective
+
         COUNT ///< Sentinel for array sizing
     };
 
@@ -133,6 +138,12 @@ namespace llaminar2
             return "RESIDUAL_ADD";
         case KernelType::SOFTMAX:
             return "SOFTMAX";
+        case KernelType::ALLREDUCE:
+            return "ALLREDUCE";
+        case KernelType::ALLGATHER:
+            return "ALLGATHER";
+        case KernelType::ALLGATHERV:
+            return "ALLGATHERV";
         default:
             return "UNKNOWN";
         }

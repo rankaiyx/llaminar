@@ -276,6 +276,34 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_Device_ShortFlag)
     EXPECT_EQ(config.device_for_this_rank->device_ordinal, 1);
 }
 
+TEST(Test__OrchestrationConfigParser, ParseArgs_Device_CpuShorthand_EnablesGlobalCpuTpIntent)
+{
+    ArgvHelper args{"llaminar2", "-d", "cpu"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.device_for_this_rank.has_value());
+    EXPECT_EQ(config.device_for_this_rank->device_type, DeviceType::CPU);
+    EXPECT_EQ(config.device_for_this_rank->numa_node, 0);
+    EXPECT_FALSE(config.device_for_this_rank_numa_explicit);
+    EXPECT_TRUE(config.cpu_global_tp_all_local);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Device_CpuExplicitNuma)
+{
+    ArgvHelper args{"llaminar2", "-d", "cpu:1"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.device_for_this_rank.has_value());
+    EXPECT_EQ(config.device_for_this_rank->device_type, DeviceType::CPU);
+    EXPECT_EQ(config.device_for_this_rank->numa_node, 1);
+    EXPECT_TRUE(config.device_for_this_rank_numa_explicit);
+    EXPECT_FALSE(config.cpu_global_tp_all_local);
+}
+
 TEST(Test__OrchestrationConfigParser, ParseArgs_DeviceMode)
 {
     ArgvHelper args{"llaminar2", "--device-mode", "round_robin"};
@@ -300,6 +328,27 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_DeviceMap)
     EXPECT_EQ(config.device_map[1].first, 1);
     EXPECT_EQ(config.device_map[2].first, 2);
     EXPECT_EQ(config.device_map[2].second.device_type, DeviceType::ROCm);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_DeviceMap_CpuEntriesTrackNumaExplicitness)
+{
+    ArgvHelper args{"llaminar2", "--device-map", "0=cpu,1=cpu:1"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    ASSERT_EQ(config.device_map.size(), 2);
+    ASSERT_EQ(config.device_map_numa_explicit.size(), 2);
+
+    EXPECT_EQ(config.device_map[0].first, 0);
+    EXPECT_EQ(config.device_map[0].second.device_type, DeviceType::CPU);
+    EXPECT_EQ(config.device_map[0].second.numa_node, 0);
+    EXPECT_FALSE(config.device_map_numa_explicit[0].second);
+
+    EXPECT_EQ(config.device_map[1].first, 1);
+    EXPECT_EQ(config.device_map[1].second.device_type, DeviceType::CPU);
+    EXPECT_EQ(config.device_map[1].second.numa_node, 1);
+    EXPECT_TRUE(config.device_map_numa_explicit[1].second);
 }
 
 // ============================================================================

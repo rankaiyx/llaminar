@@ -27,6 +27,7 @@
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -310,10 +311,24 @@ namespace llaminar2
         auto cpu_dev = enumerate_cpu_device(local_numa_node >= 0 ? local_numa_node : 0);
         devices_.push_back(cpu_dev);
 
+        const char *cpu_only_env = std::getenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
+        const bool force_cpu_only_startup = (cpu_only_env && std::atoi(cpu_only_env) != 0);
+
         // Enumerate GPUs with optional NUMA filtering
-        auto cuda_devices = enumerate_cuda_devices();
-        auto rocm_devices = enumerate_rocm_devices();
-        auto vulkan_devices = enumerate_vulkan_devices();
+        std::vector<ComputeDevice> cuda_devices;
+        std::vector<ComputeDevice> rocm_devices;
+        std::vector<ComputeDevice> vulkan_devices;
+
+        if (!force_cpu_only_startup)
+        {
+            cuda_devices = enumerate_cuda_devices();
+            rocm_devices = enumerate_rocm_devices();
+            vulkan_devices = enumerate_vulkan_devices();
+        }
+        else
+        {
+            LOG_INFO("[DeviceManager] CPU-only startup fast-path active: skipping GPU enumeration");
+        }
 
         // Filter CUDA devices by NUMA affinity
         if (local_numa_node >= 0)
@@ -592,6 +607,58 @@ namespace llaminar2
         }
 
         return find_device(backend_type, device.ordinal) >= 0;
+    }
+
+    bool DeviceManager::deviceExists(const GlobalDeviceAddress &device, bool strict_numa) const
+    {
+        if (device.isCPU())
+        {
+            if (!strict_numa)
+            {
+                return true;
+            }
+
+            if (local_numa_node_ >= 0)
+            {
+                return device.numa_node == local_numa_node_;
+            }
+
+            const int total_numa = NUMATopology::getNumNUMANodes();
+            return device.numa_node >= 0 && device.numa_node < std::max(1, total_numa);
+        }
+
+        ComputeBackendType backend_type;
+        switch (device.device_type)
+        {
+        case DeviceType::CUDA:
+            backend_type = ComputeBackendType::GPU_CUDA;
+            break;
+        case DeviceType::ROCm:
+            backend_type = ComputeBackendType::GPU_ROCM;
+            break;
+        default:
+            return false;
+        }
+
+        for (const auto &dev : devices_)
+        {
+            if (dev.type != backend_type || dev.device_id != device.device_ordinal)
+            {
+                continue;
+            }
+
+            if (!strict_numa)
+            {
+                return true;
+            }
+
+            if (dev.numa_node < 0 || dev.numa_node == device.numa_node)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     std::string DeviceManager::availableDevicesString() const

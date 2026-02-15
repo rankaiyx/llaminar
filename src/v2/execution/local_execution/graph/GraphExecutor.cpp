@@ -641,6 +641,7 @@ namespace llaminar2
 #endif
 
         const auto &order = graph.getExecutionOrder();
+        const bool profile_full_node_path = config_.enable_profiling;
 
         bool collective_graph = (collective_nodes && !collective_nodes->empty());
         if (!collective_graph)
@@ -680,6 +681,20 @@ namespace llaminar2
                  stage_type == ComputeStageType::ALLGATHER_V);
             const bool is_collective_node =
                 (collective_nodes ? collective_nodes->count(name) > 0 : is_collective_type);
+
+            // Profiling mode: always route through executeNode() so stage timing,
+            // coherence overhead, transfer attribution, and callbacks are captured.
+            // Fast-path bypass remains unchanged when profiling is disabled.
+            if (profile_full_node_path)
+            {
+                if (!executeNode(*node, ctx))
+                {
+                    LOG_ERROR("[GraphExecutor] Fast decode profiled node failed: " << name);
+                    return false;
+                }
+                graph.markCompleted(name);
+                continue;
+            }
 
             // Collective-aware handling for TP collectives
             if (is_collective_node)
@@ -905,6 +920,11 @@ namespace llaminar2
         const auto &order = graph.getExecutionOrder();
         const bool has_collective_nodes = (collective_nodes && !collective_nodes->empty());
 
+        // Monotonic step counter for segmented mode. This enables explicit
+        // per-segment execution tracking across warmup/capture/replay phases.
+        segment_cache.decode_step++;
+        const uint64_t current_step = segment_cache.decode_step;
+
         auto is_collective_stage = [](ComputeStageType t)
         {
             return t == ComputeStageType::ALLREDUCE ||
@@ -926,6 +946,18 @@ namespace llaminar2
                 auto outputs = extractOutputBuffers(dump_info);
                 markOutputsDirty(outputs, stream);
             }
+        };
+
+        auto post_captured_segment_launch = [&](GraphSegment &seg, void *stream)
+        {
+            // Captured segments bypass executeNode(), so explicitly mark outputs
+            // device-authoritative, then run replay hooks in a single canonical order.
+            mark_segment_outputs_dirty(seg, stream);
+            for (auto *stage : seg.replay_callbacks)
+            {
+                stage->onGraphReplayed();
+            }
+            seg.last_executed_step = current_step;
         };
 
         auto cohere_segment_inputs = [&](const GraphSegment &seg) -> bool
@@ -989,28 +1021,8 @@ namespace llaminar2
         if (!segment_cache.initialized)
         {
             segment_cache.segments.clear();
-            static const std::vector<std::string> segmented_collective_capture_allow = []()
-            {
-                std::vector<std::string> out;
-                const char *raw = std::getenv("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW");
-                if (!raw || !*raw)
-                {
-                    return out;
-                }
-
-                std::stringstream ss(raw);
-                std::string token;
-                while (std::getline(ss, token, ','))
-                {
-                    token.erase(0, token.find_first_not_of(" \t"));
-                    token.erase(token.find_last_not_of(" \t") + 1);
-                    if (!token.empty())
-                    {
-                        out.push_back(token);
-                    }
-                }
-                return out;
-            }();
+            const auto &segmented_collective_capture_allow =
+                debugEnv().execution.gpu_graph_collective_segmented_capture_allow;
 
             auto stage_in_collective_allowlist = [&](const std::string &stage_name) -> bool
             {
@@ -1140,6 +1152,11 @@ namespace llaminar2
                                                          << capturable_stages << " stages) + " << manual_segments << " manual segments ("
                                                          << manual_stages << " stages)");
 
+            for (auto &seg : segment_cache.segments)
+            {
+                seg.last_executed_step = 0;
+            }
+
             // Warmup: execute all stages normally (no capture) to ensure
             // lazy kernel initialization and workspace allocation complete.
             segment_cache.initialized = true;
@@ -1164,6 +1181,21 @@ namespace llaminar2
                 return executeFastDecode(graph, ctx, collective_nodes);
             }
             void *capture_stream = segment_cache.capture_stream;
+
+            // Precompute replay callbacks before any Phase-2 captured-segment
+            // execution so callback ordering matches Phase-3 replay.
+            for (auto &seg : segment_cache.segments)
+            {
+                seg.replay_callbacks.clear();
+                if (!seg.capturable)
+                    continue;
+                for (const auto &stage_name : seg.stage_names)
+                {
+                    auto *node = graph.getNode(stage_name);
+                    if (node && node->stage && node->stage->needsOnGraphReplayed())
+                        seg.replay_callbacks.push_back(node->stage.get());
+                }
+            }
 
             for (auto &seg : segment_cache.segments)
             {
@@ -1216,7 +1248,11 @@ namespace llaminar2
                         return exec_ok;
                     }
 
-                    // Instantiate and launch immediately so subsequent segments have valid data
+                    // Instantiate captured graph. In collective segmented mode,
+                    // Phase-2 executes captured segments once via executeNode()
+                    // (normal semantics) to seed downstream segments. This avoids
+                    // relying on capture-time replay semantics for non-idempotent
+                    // stages while still preparing executable graphs for Phase-3.
                     if (seg.capture->nodeCount() > 0)
                     {
                         if (!seg.capture->instantiate())
@@ -1226,17 +1262,58 @@ namespace llaminar2
                             segment_cache.reset();
                             return false;
                         }
-                        if (!seg.capture->launch())
+
+                        if (has_collective_nodes)
                         {
-                            LOG_ERROR("[GraphExecutor] Segment initial launch failed");
-                            segment_cache.reset();
-                            return false;
+                            bool phase2_exec_ok = true;
+                            for (const auto &stage_name : seg.stage_names)
+                            {
+                                auto *node = graph.getNode(stage_name);
+                                if (!node || !node->stage)
+                                {
+                                    LOG_ERROR("[GraphExecutor] Capturable segment missing stage during Phase-2 execution: " << stage_name);
+                                    phase2_exec_ok = false;
+                                    break;
+                                }
+
+                                if (!executeNode(*node, ctx))
+                                {
+                                    LOG_ERROR("[GraphExecutor] Capturable segment stage failed during Phase-2 execution: " << stage_name);
+                                    phase2_exec_ok = false;
+                                    break;
+                                }
+                                graph.markCompleted(stage_name);
+                            }
+
+                            if (!phase2_exec_ok)
+                            {
+                                segment_cache.reset();
+                                return false;
+                            }
+
+                            for (auto *stage : seg.replay_callbacks)
+                            {
+                                stage->onGraphReplayed();
+                            }
+                            seg.last_executed_step = current_step;
+                            gpu_ctx->synchronize();
+                            LOG_DEBUG("[GraphExecutor] Segment captured+executed (Phase-2 semantics): " << seg.capture->nodeCount()
+                                                                                                        << " nodes, " << seg.stage_names.size() << " stages");
                         }
-                        mark_segment_outputs_dirty(seg, capture_stream);
-                        // Sync before moving to next segment
-                        gpu_ctx->synchronize();
-                        LOG_DEBUG("[GraphExecutor] Segment captured+launched: " << seg.capture->nodeCount()
-                                                                                << " nodes, " << seg.stage_names.size() << " stages");
+                        else
+                        {
+                            if (!seg.capture->launch())
+                            {
+                                LOG_ERROR("[GraphExecutor] Segment initial launch failed");
+                                segment_cache.reset();
+                                return false;
+                            }
+                            post_captured_segment_launch(seg, capture_stream);
+                            // Sync before moving to next segment
+                            gpu_ctx->synchronize();
+                            LOG_DEBUG("[GraphExecutor] Segment captured+launched: " << seg.capture->nodeCount()
+                                                                                    << " nodes, " << seg.stage_names.size() << " stages");
+                        }
                     }
                     else
                     {
@@ -1287,23 +1364,10 @@ namespace llaminar2
                         graph.markCompleted(stage_name);
                     }
 
+                    seg.last_executed_step = current_step;
+
                     // Sync before next graph segment
                     gpu_ctx->synchronize();
-                }
-            }
-
-            // Precompute replay_callbacks: cache pointers to stages that override
-            // onGraphReplayed(), avoiding per-step hash map lookups in Phase 3.
-            for (auto &seg : segment_cache.segments)
-            {
-                if (!seg.capturable)
-                    continue;
-                seg.replay_callbacks.clear();
-                for (const auto &stage_name : seg.stage_names)
-                {
-                    auto *node = graph.getNode(stage_name);
-                    if (node && node->stage && node->stage->needsOnGraphReplayed())
-                        seg.replay_callbacks.push_back(node->stage.get());
                 }
             }
 
@@ -1331,11 +1395,9 @@ namespace llaminar2
 
         // Stream-only mode: execute all stages on capture_stream WITHOUT graph capture.
         // Tests whether the non-default stream itself causes issues.
-        static const bool stream_only_mode = (std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY") &&
-                                              std::atoi(std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY")) != 0);
+        const bool stream_only_mode = exec_cfg.gpu_graph_stream_only;
         // Sub-mode: use default stream instead of capture_stream (control test)
-        static const bool stream_only_default = (std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT") &&
-                                                 std::atoi(std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT")) != 0);
+        const bool stream_only_default = exec_cfg.gpu_graph_stream_only_default;
         if (stream_only_mode)
         {
             void *use_stream = stream_only_default ? nullptr : capture_stream;
@@ -1448,7 +1510,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    mark_segment_outputs_dirty(seg, capture_stream);
+                    post_captured_segment_launch(seg, capture_stream);
 
                     gpu_ctx->synchronize();
 
@@ -1465,9 +1527,7 @@ namespace llaminar2
                             return false;
                         }
 
-                        mark_segment_outputs_dirty(seg, capture_stream);
-                        for (auto *stage : seg.replay_callbacks)
-                            stage->onGraphReplayed();
+                        post_captured_segment_launch(seg, capture_stream);
 
                         if (needs_segment_sync)
                         {
@@ -1492,9 +1552,7 @@ namespace llaminar2
                         LOG_ERROR("[GraphExecutor] Verify: graph launch failed, seg " << seg_idx);
                         return false;
                     }
-                    mark_segment_outputs_dirty(seg, capture_stream);
-                    for (auto *stage : seg.replay_callbacks)
-                        stage->onGraphReplayed();
+                    post_captured_segment_launch(seg, capture_stream);
                     gpu_ctx->synchronize();
 
                     // Step 2: Read output of EVERY stage after graph replay
@@ -1654,13 +1712,9 @@ namespace llaminar2
                         return executeFastDecode(graph, ctx, collective_nodes);
                     }
 
-                    // Captured segments bypass executeNode(), so explicitly mark
-                    // outputs device-authoritative before any manual/coherent stage.
-                    mark_segment_outputs_dirty(seg, capture_stream);
-
-                    // Run post-replay hooks via precomputed list (no hash lookups)
-                    for (auto *stage : seg.replay_callbacks)
-                        stage->onGraphReplayed();
+                    // Captured segments use the same post-launch coherence/hook
+                    // ordering across all segmented modes.
+                    post_captured_segment_launch(seg, capture_stream);
 
                     // NOTE: markCompleted is intentionally skipped for capturable
                     // segments — graph.reset() clears all flags at the start of
@@ -1747,6 +1801,7 @@ namespace llaminar2
                     }
                     // markCompleted skipped — graph.reset() clears at next step
                 }
+                seg.last_executed_step = current_step;
                 // CUDA workaround: sync stream after manual segment before next graph
                 if (needs_segment_sync)
                 {

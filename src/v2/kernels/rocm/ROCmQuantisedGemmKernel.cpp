@@ -109,15 +109,14 @@ namespace llaminar2
         // =====================================================================
         static bool isFusedGemvEnabled()
         {
-            static int s_val = -1;
-            if (s_val == -1)
+            const bool enabled = debugEnv().rocm.fused_gemv;
+            static bool logged_enabled_once = false;
+            if (enabled && !logged_enabled_once)
             {
-                const char *env = std::getenv("LLAMINAR_FUSED_GEMV");
-                s_val = (env && env[0] == '1') ? 1 : 0;
-                if (s_val)
-                    LOG_INFO("[ROCmQuantisedGemmKernel] Fused GEMV enabled via LLAMINAR_FUSED_GEMV=1");
+                LOG_INFO("[ROCmQuantisedGemmKernel] Fused GEMV enabled via DebugEnv (LLAMINAR_FUSED_GEMV=1)");
+                logged_enabled_once = true;
             }
-            return s_val != 0;
+            return enabled;
         }
 
         // =====================================================================

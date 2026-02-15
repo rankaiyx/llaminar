@@ -8,6 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../kernels/KernelFactory.h"
 #include <cstring>
@@ -90,6 +91,8 @@ namespace llaminar2
 
     bool EmbeddingStage::execute(IDeviceContext *ctx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::EMBEDDING);
+
         LOG_DEBUG("[EmbeddingStage] Execute: num_tokens=" << params_.num_tokens
                                                           << " d_model=" << params_.d_model
                                                           << " vocab_size=" << params_.vocab_size);

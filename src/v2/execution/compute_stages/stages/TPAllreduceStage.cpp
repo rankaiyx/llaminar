@@ -8,6 +8,7 @@
 #include "TPAllreduceStage.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 
 namespace llaminar2
 {
@@ -28,6 +29,8 @@ namespace llaminar2
 
     bool TPAllreduceStage::execute(IDeviceContext *ctx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ALLREDUCE);
+
         (void)ctx; // Device context not directly used - TP context handles devices
 
         // Validate parameters
@@ -54,12 +57,12 @@ namespace llaminar2
         const size_t effective_count = (params_.count > 0) ? params_.count : params_.tensor->numel();
 
         // Log scope-aware message
-        const char* scope_str = params_.tp_ctx->isGlobal() ? "GLOBAL" : "LOCAL";
+        const char *scope_str = params_.tp_ctx->isGlobal() ? "GLOBAL" : "LOCAL";
         LOG_DEBUG("TPAllreduceStage (" << scope_str << "): all-reduce across " << params_.tp_ctx->degree()
                                        << " devices using " << collectiveBackendTypeToString(params_.tp_ctx->backend())
                                        << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
-                                       << " count=" << effective_count 
-                                       << " (params_.count=" << params_.count 
+                                       << " count=" << effective_count
+                                       << " (params_.count=" << params_.count
                                        << ", tensor numel=" << params_.tensor->numel() << ")");
 
         // Use stage_name overload with count parameter
@@ -116,7 +119,7 @@ namespace llaminar2
             const size_t effective_count = (params_.count > 0) ? params_.count : params_.tensor->numel();
             const size_t cols = params_.tensor->cols();
             const size_t rows = (cols > 0) ? effective_count / cols : effective_count;
-            
+
             info.addInput("tensor", params_.tensor, rows, cols);
             info.addOutput("tensor", params_.tensor, rows, cols);
         }

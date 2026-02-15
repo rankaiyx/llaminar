@@ -7,6 +7,7 @@
 
 #include "MPIBootstrap.h"
 #include "Logger.h"
+#include "DebugEnv.h"
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
@@ -26,12 +27,7 @@ namespace llaminar2
 
     std::optional<std::string> MPIBootstrap::getEnv(const char *var)
     {
-        const char *value = std::getenv(var);
-        if (value && *value)
-        {
-            return std::string(value);
-        }
-        return std::nullopt;
+        return debugEnv().mpi_bootstrap.get(var);
     }
 
     // ========================================================================
@@ -243,6 +239,167 @@ namespace llaminar2
         return parseProcCpuinfo();
     }
 
+    std::string MPIBootstrap::getCpuSetForNumaNode(int numa_node)
+    {
+        if (numa_node < 0)
+        {
+            return "";
+        }
+
+        std::ifstream cpulist_file("/sys/devices/system/node/node" + std::to_string(numa_node) + "/cpulist");
+        if (!cpulist_file.is_open())
+        {
+            return "";
+        }
+
+        std::string cpulist;
+        std::getline(cpulist_file, cpulist);
+        return cpulist;
+    }
+
+    namespace
+    {
+        std::vector<int> parseCpuList(const std::string &cpulist)
+        {
+            std::vector<int> cpus;
+            std::stringstream ss(cpulist);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                if (token.empty())
+                {
+                    continue;
+                }
+                auto dash = token.find('-');
+                if (dash == std::string::npos)
+                {
+                    cpus.push_back(std::stoi(token));
+                    continue;
+                }
+                int start = std::stoi(token.substr(0, dash));
+                int end = std::stoi(token.substr(dash + 1));
+                if (end < start)
+                {
+                    std::swap(start, end);
+                }
+                for (int cpu = start; cpu <= end; ++cpu)
+                {
+                    cpus.push_back(cpu);
+                }
+            }
+            std::sort(cpus.begin(), cpus.end());
+            cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+            return cpus;
+        }
+
+        std::string formatCpuList(const std::vector<int> &cpus)
+        {
+            if (cpus.empty())
+            {
+                return "";
+            }
+
+            std::ostringstream out;
+            int range_start = cpus.front();
+            int prev = cpus.front();
+
+            auto emit_range = [&](int start, int end)
+            {
+                if (out.tellp() > 0)
+                {
+                    out << ",";
+                }
+                if (start == end)
+                {
+                    out << start;
+                }
+                else
+                {
+                    out << start << "-" << end;
+                }
+            };
+
+            for (size_t i = 1; i < cpus.size(); ++i)
+            {
+                int current = cpus[i];
+                if (current == prev + 1)
+                {
+                    prev = current;
+                    continue;
+                }
+                emit_range(range_start, prev);
+                range_start = prev = current;
+            }
+            emit_range(range_start, prev);
+            return out.str();
+        }
+
+        std::vector<int> readThreadSiblings(int cpu)
+        {
+            std::ifstream siblings_file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+            if (!siblings_file.is_open())
+            {
+                return {cpu};
+            }
+
+            std::string siblings_list;
+            std::getline(siblings_file, siblings_list);
+            auto siblings = parseCpuList(siblings_list);
+            if (siblings.empty())
+            {
+                siblings.push_back(cpu);
+            }
+            return siblings;
+        }
+    }
+
+    std::string MPIBootstrap::getPhysicalCpuSetForNumaNode(int numa_node)
+    {
+        const std::string full_cpulist = getCpuSetForNumaNode(numa_node);
+        if (full_cpulist.empty())
+        {
+            return "";
+        }
+
+        const auto node_cpus = parseCpuList(full_cpulist);
+        std::set<int> node_cpu_set(node_cpus.begin(), node_cpus.end());
+        std::vector<int> physical_cpus;
+        std::set<int> chosen_representatives;
+
+        for (int cpu : node_cpus)
+        {
+            auto siblings = readThreadSiblings(cpu);
+
+            int representative = INT_MAX;
+            for (int sibling : siblings)
+            {
+                if (node_cpu_set.count(sibling))
+                {
+                    representative = std::min(representative, sibling);
+                }
+            }
+
+            if (representative == INT_MAX)
+            {
+                representative = cpu;
+            }
+
+            if (!chosen_representatives.count(representative))
+            {
+                chosen_representatives.insert(representative);
+                physical_cpus.push_back(representative);
+            }
+        }
+
+        std::sort(physical_cpus.begin(), physical_cpus.end());
+        if (physical_cpus.empty())
+        {
+            return full_cpulist;
+        }
+
+        return formatCpuList(physical_cpus);
+    }
+
     // ========================================================================
     // OpenMP Environment Configuration
     // ========================================================================
@@ -426,6 +583,13 @@ namespace llaminar2
             cmd.push_back("socket");
         }
 
+        // Optional explicit CPU affinity set
+        if (!config.cpu_set.empty())
+        {
+            cmd.push_back("--cpu-set");
+            cmd.push_back(config.cpu_set);
+        }
+
         // Report bindings
         if (config.report_bindings)
         {
@@ -460,7 +624,7 @@ namespace llaminar2
             if (arg == "--mpi-bootstrap" ||
                 arg.rfind("--mpi-procs=", 0) == 0 ||
                 arg.rfind("--hostfile=", 0) == 0 ||
-                arg == "--dry-run")
+                arg == "--mpi-dry-run")
             {
                 continue;
             }
@@ -561,6 +725,11 @@ namespace llaminar2
         std::cout << "OpenMP: " << omp_threads << " threads/rank, "
                   << "places=" << config.omp_places << ", "
                   << "bind=" << config.omp_proc_bind << std::endl;
+
+        if (!config.cpu_set.empty())
+        {
+            std::cout << "CPU Set: " << config.cpu_set << std::endl;
+        }
 
         // MPI environment status
         if (env.is_mpi_process)

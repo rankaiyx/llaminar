@@ -8,6 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../kernels/KernelFactory.h"
 
 namespace llaminar2
@@ -18,13 +19,14 @@ namespace llaminar2
     // =============================================================================
 
     SwiGLUStage::SwiGLUStage(Params params)
-        : IComputeStage(params.device_id)
-        , params_(std::move(params))
+        : IComputeStage(params.device_id), params_(std::move(params))
     {
     }
 
     bool SwiGLUStage::execute(IDeviceContext *ctx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
+
         if (!ctx)
         {
             LOG_ERROR("[SwiGLUStage] Null device context");

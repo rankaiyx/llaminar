@@ -13,6 +13,7 @@
  */
 
 #include "utils/Logger.h"
+#include "utils/DebugEnv.h"
 #include "utils/MPIContext.h"
 #include "utils/MPIBootstrap.h"
 #include "utils/NUMATopology.h"
@@ -25,6 +26,8 @@
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include <mpi.h>
+#include <omp.h>
+#include <sched.h>
 #include <iostream>
 #include <climits>
 #include <vector>
@@ -33,8 +36,169 @@
 #include <cctype>
 #include <cstdlib>
 #include <sstream>
+#include <fstream>
+#include <set>
+#include <unordered_map>
+#include <filesystem>
 
 using namespace llaminar2;
+
+namespace
+{
+    std::vector<int> parseCpuList(const std::string &cpulist)
+    {
+        std::vector<int> cpus;
+        std::stringstream ss(cpulist);
+        std::string token;
+        while (std::getline(ss, token, ','))
+        {
+            if (token.empty())
+            {
+                continue;
+            }
+            auto dash = token.find('-');
+            if (dash == std::string::npos)
+            {
+                cpus.push_back(std::stoi(token));
+                continue;
+            }
+            int start = std::stoi(token.substr(0, dash));
+            int end = std::stoi(token.substr(dash + 1));
+            if (end < start)
+            {
+                std::swap(start, end);
+            }
+            for (int cpu = start; cpu <= end; ++cpu)
+            {
+                cpus.push_back(cpu);
+            }
+        }
+        std::sort(cpus.begin(), cpus.end());
+        cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+        return cpus;
+    }
+
+    int detectCpuNumaNode(int cpu)
+    {
+        const std::string cpu_path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/";
+        for (int node = 0; node < 256; ++node)
+        {
+            if (std::filesystem::exists(cpu_path + "node" + std::to_string(node)))
+            {
+                return node;
+            }
+        }
+        return -1;
+    }
+
+    int physicalRepresentativeForCpu(int cpu)
+    {
+        std::ifstream siblings_file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+        if (!siblings_file.is_open())
+        {
+            return cpu;
+        }
+
+        std::string siblings;
+        std::getline(siblings_file, siblings);
+        auto sibling_cpus = parseCpuList(siblings);
+        if (sibling_cpus.empty())
+        {
+            return cpu;
+        }
+        return *std::min_element(sibling_cpus.begin(), sibling_cpus.end());
+    }
+
+    bool verifyStartupThreadAffinity(int required_numa,
+                                     bool require_physical_only,
+                                     std::string &details)
+    {
+        const int max_threads = std::max(1, omp_get_max_threads());
+        std::vector<int> observed_cpu(max_threads, -1);
+
+#pragma omp parallel
+        {
+            const int tid = omp_get_thread_num();
+            if (tid >= 0 && tid < static_cast<int>(observed_cpu.size()))
+            {
+                observed_cpu[tid] = sched_getcpu();
+            }
+        }
+
+        std::set<int> numa_nodes;
+        std::unordered_map<int, int> physical_core_usage;
+
+        for (int cpu : observed_cpu)
+        {
+            if (cpu < 0)
+            {
+                details = "failed to sample CPU for one or more OpenMP threads";
+                return false;
+            }
+
+            const int numa = detectCpuNumaNode(cpu);
+            if (numa >= 0)
+            {
+                numa_nodes.insert(numa);
+            }
+
+            if (require_physical_only)
+            {
+                const int rep = physicalRepresentativeForCpu(cpu);
+                physical_core_usage[rep] += 1;
+            }
+        }
+
+        if (!numa_nodes.empty())
+        {
+            if (numa_nodes.size() > 1)
+            {
+                std::ostringstream oss;
+                oss << "threads are spread across NUMA nodes";
+                bool first = true;
+                oss << " [";
+                for (int n : numa_nodes)
+                {
+                    if (!first)
+                    {
+                        oss << ",";
+                    }
+                    first = false;
+                    oss << n;
+                }
+                oss << "]";
+                details = oss.str();
+                return false;
+            }
+
+            if (required_numa >= 0 && *numa_nodes.begin() != required_numa)
+            {
+                std::ostringstream oss;
+                oss << "threads are pinned to NUMA " << *numa_nodes.begin()
+                    << " but required NUMA is " << required_numa;
+                details = oss.str();
+                return false;
+            }
+        }
+
+        if (require_physical_only)
+        {
+            for (const auto &[rep, count] : physical_core_usage)
+            {
+                if (count > 1)
+                {
+                    std::ostringstream oss;
+                    oss << "multiple OpenMP threads share physical core representative CPU " << rep;
+                    details = oss.str();
+                    return false;
+                }
+            }
+        }
+
+        details = "ok";
+        return true;
+    }
+}
 
 void list_devices()
 {
@@ -131,6 +295,45 @@ int main(int argc, char *argv[])
         // Build launch configuration from config and topology
         MPILaunchConfig launch_config = MPIBootstrap::getDefaultConfig(cpu_topology);
 
+        const bool cpu_intent_bootstrap =
+            config.cpu_global_tp_all_local ||
+            (config.device_for_this_rank.has_value() && config.device_for_this_rank->isCPU());
+
+        // For self-bootstrapped CPU-only runs, instruct child ranks to skip GPU
+        // startup enumeration and factory registration. This avoids fixed startup
+        // overhead that is irrelevant for CPU execution.
+        if (cpu_intent_bootstrap)
+        {
+            setenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "1", 1);
+        }
+        else
+        {
+            unsetenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
+        }
+
+        const bool use_tuned_mpi_profile =
+            (config.mpi_profile == MPIProfile::TUNED) ||
+            (config.mpi_profile == MPIProfile::AUTO && cpu_intent_bootstrap);
+
+        if (use_tuned_mpi_profile)
+        {
+            // Tuned profile: one rank per local NUMA/socket by default, core-level OpenMP pinning,
+            // and physical-core thread count per rank.
+            if (config.mpi_procs <= 0)
+            {
+                launch_config.num_procs = std::max(1, cpu_topology.numa_nodes);
+            }
+            launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
+            launch_config.omp_places = "cores";
+            launch_config.omp_proc_bind = "close";
+            launch_config.bind_to_socket = true;
+            launch_config.map_by_socket = true;
+            launch_config.use_physical_cores = true;
+
+            LOG_INFO("[Main] MPI bootstrap profile: tuned"
+                     << (config.mpi_profile == MPIProfile::AUTO ? " (auto-selected for CPU intent)" : ""));
+        }
+
         // Override with user-specified values
         if (config.mpi_procs > 0)
         {
@@ -143,6 +346,60 @@ int main(int argc, char *argv[])
         launch_config.report_bindings = config.mpi_verbose || (config.verbose_level > 0);
         launch_config.verbose = config.mpi_verbose;
         launch_config.oversubscribe = config.mpi_oversubscribe;
+
+        // CPU shorthand semantics:
+        //   -d cpu   => CPU GLOBAL TP across all local NUMA nodes
+        //   -d cpu:N => single-rank CPU execution pinned to NUMA node N
+        if (config.cpu_global_tp_all_local)
+        {
+            if (config.mpi_procs <= 0)
+            {
+                launch_config.num_procs = std::max(1, cpu_topology.numa_nodes);
+            }
+            launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
+            launch_config.omp_places = "cores";
+            launch_config.omp_proc_bind = "close";
+            LOG_INFO("[Main] CPU shorthand detected: launching " << launch_config.num_procs
+                                                                 << " rank(s) for CPU GLOBAL TP across local NUMA nodes");
+        }
+        else if (config.device_for_this_rank.has_value() &&
+                 config.device_for_this_rank->isCPU() &&
+                 config.device_for_this_rank_numa_explicit)
+        {
+            if (config.mpi_procs <= 0)
+            {
+                launch_config.num_procs = 1;
+            }
+
+            // Explicit single-socket CPU placement should use physical cores
+            // from that socket only (not all system cores / hyperthreads).
+            launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
+            launch_config.omp_places = "cores";
+            launch_config.omp_proc_bind = "close";
+
+            // For explicit cpu:N in single-rank self-bootstrap, map-by socket alone
+            // always places rank 0 on the first socket. Use an explicit MPI cpu-set
+            // so cpu:1 resolves to NUMA node 1 as requested.
+            launch_config.bind_to_socket = false;
+            launch_config.map_by_socket = false;
+            launch_config.cpu_set = MPIBootstrap::getPhysicalCpuSetForNumaNode(config.device_for_this_rank->numa_node);
+
+            if (launch_config.cpu_set.empty())
+            {
+                launch_config.cpu_set = MPIBootstrap::getCpuSetForNumaNode(config.device_for_this_rank->numa_node);
+            }
+
+            if (!launch_config.cpu_set.empty())
+            {
+                LOG_INFO("[Main] Explicit CPU NUMA target " << config.device_for_this_rank->numa_node
+                                                            << " detected; applying MPI cpu-set='" << launch_config.cpu_set << "'");
+            }
+            else
+            {
+                LOG_WARN("[Main] Explicit CPU NUMA target " << config.device_for_this_rank->numa_node
+                                                            << " requested, but cpu-set lookup failed; relying on launcher defaults");
+            }
+        }
 
         // Handle dry-run: print config and exit
         if (config.mpi_dry_run)
@@ -171,7 +428,7 @@ int main(int argc, char *argv[])
     // OpenMPI vader's default CMA single-copy path can emit noisy
     // "Read -1, expected ..., errno = 1" warnings in containerized environments
     // where process_vm_readv is restricted. Keep user override if explicitly set.
-    if (mpi_env.is_mpi_process && std::getenv("OMPI_MCA_btl_vader_single_copy_mechanism") == nullptr)
+    if (mpi_env.is_mpi_process && debugEnv().mpi_bootstrap.ompi_mca_btl_vader_single_copy_mechanism.empty())
     {
         setenv("OMPI_MCA_btl_vader_single_copy_mechanism", "none", 0);
     }
@@ -183,17 +440,98 @@ int main(int argc, char *argv[])
     // Re-parse arguments (MPI_Init may modify argc/argv)
     config = parser.parseArgs(argc, argv);
 
-    // Configure OpenMP environment for this rank
-    MPILaunchConfig mpi_launch_config = MPIBootstrap::getDefaultConfig(cpu_topology);
-    if (config.mpi_procs > 0)
+    auto mpi_ctx = MPIContextFactory::global();
+
+    // MPI runtime should rely on launcher-provided affinity/thread settings
+    // (e.g. run_llaminar.sh + mpirun binding), not retune OpenMP internally.
+    if (std::getenv("OMP_NUM_THREADS") == nullptr)
     {
-        mpi_launch_config.num_procs = config.mpi_procs;
+        LOG_WARN("[Main] Running under MPI without OMP_NUM_THREADS set. For strict per-rank core pinning, "
+                 "launch with canonical wrapper or set OMP_NUM_THREADS/OMP_PLACES/OMP_PROC_BIND in the launcher.");
     }
-    MPIBootstrap::configureOpenMPEnvironment(cpu_topology, mpi_launch_config);
 
     // Detect NUMA node for MPI rank
     auto numa_info = NUMATopology::detectLocalNUMANode();
-    auto mpi_ctx = MPIContextFactory::global();
+
+    const bool cpu_explicit_numa_mode =
+        config.device_for_this_rank.has_value() &&
+        config.device_for_this_rank->isCPU() &&
+        config.device_for_this_rank_numa_explicit;
+
+    const bool cpu_global_mode = config.cpu_global_tp_all_local;
+
+    if (cpu_explicit_numa_mode || cpu_global_mode)
+    {
+        int required_numa = -1;
+        if (cpu_explicit_numa_mode)
+        {
+            required_numa = config.device_for_this_rank->numa_node;
+        }
+        else if (numa_info.detection_succeeded)
+        {
+            required_numa = numa_info.local_numa_node;
+        }
+
+        std::string affinity_details;
+        const bool affinity_ok = verifyStartupThreadAffinity(required_numa, true, affinity_details);
+
+        const bool strict_assert = []()
+        {
+            const char *value = std::getenv("LLAMINAR_ASSERT_THREAD_AFFINITY");
+            return value != nullptr && std::string(value) == "1";
+        }();
+
+        if (!affinity_ok)
+        {
+            const bool fail_fast = strict_assert || cpu_explicit_numa_mode;
+            if (fail_fast)
+            {
+                LOG_ERROR("[Main] Startup thread affinity verification failed: " << affinity_details);
+                LOG_ERROR("[Main] Fix launcher pinning (mpirun binding/cpu-set) or set LLAMINAR_ASSERT_THREAD_AFFINITY=0 to downgrade to warning");
+                return 1;
+            }
+
+            LOG_WARN("[Main] Startup thread affinity verification warning: " << affinity_details);
+        }
+        else
+        {
+            LOG_INFO("[Main] Startup thread affinity verification passed");
+        }
+    }
+
+    // CPU shorthand runtime semantics (inside MPI runtime):
+    // convert `-d cpu` into explicit per-rank CPU mapping and GLOBAL TP config.
+    if (config.cpu_global_tp_all_local)
+    {
+        int local_rank = 0;
+        MPI_Comm local_comm = MPI_COMM_NULL;
+        if (MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_ctx->rank(), MPI_INFO_NULL, &local_comm) == MPI_SUCCESS)
+        {
+            MPI_Comm_rank(local_comm, &local_rank);
+            MPI_Comm_free(&local_comm);
+        }
+
+        config.device_mode = DeviceAssignmentMode::EXPLICIT;
+        config.device_map.clear();
+        config.device_map.emplace_back(mpi_ctx->rank(), GlobalDeviceAddress::cpu(local_rank));
+        config.device_map_numa_explicit.clear();
+        config.device_map_numa_explicit.emplace_back(mpi_ctx->rank(), true);
+
+        if (config.tp_scope == TPScope::AUTO)
+        {
+            config.tp_scope = TPScope::GLOBAL;
+        }
+        if (config.tp_degree <= 1)
+        {
+            config.tp_degree = mpi_ctx->world_size();
+        }
+
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_INFO("[Main] CPU shorthand runtime mapping enabled: GLOBAL TP degree="
+                     << config.tp_degree << ", world_size=" << mpi_ctx->world_size());
+        }
+    }
 
     // Set logger rank for log output
     Logger::getInstance().setRank(mpi_ctx->rank());
@@ -212,8 +550,85 @@ int main(int argc, char *argv[])
     }
 
     // Initialize device manager with NUMA-aware filtering
+    // Exception: explicit/ambiguous GPU --device/--device-map should search all
+    // NUMA nodes so cross-NUMA GPU targets remain reachable.
+    int device_manager_numa_filter = numa_info.local_numa_node;
+
+    std::optional<GlobalDeviceAddress> mapped_device_for_rank;
+    bool mapped_device_numa_explicit = false;
+    for (const auto &[mapped_rank, mapped_addr] : config.device_map)
+    {
+        if (mapped_rank == mpi_ctx->rank())
+        {
+            mapped_device_for_rank = mapped_addr;
+            break;
+        }
+    }
+    if (mapped_device_for_rank.has_value())
+    {
+        for (const auto &[mapped_rank, explicit_numa] : config.device_map_numa_explicit)
+        {
+            if (mapped_rank == mpi_ctx->rank())
+            {
+                mapped_device_numa_explicit = explicit_numa;
+                break;
+            }
+        }
+    }
+
+    const bool has_gpu_device_request =
+        (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU()) ||
+        (mapped_device_for_rank.has_value() && mapped_device_for_rank->isGPU());
+
+    if (has_gpu_device_request)
+    {
+        device_manager_numa_filter = -1;
+
+        if (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU())
+        {
+            if (config.device_for_this_rank_numa_explicit)
+            {
+                LOG_INFO("[Main] Explicit GPU --device " << config.device_for_this_rank->toString()
+                                                         << " detected; searching all NUMA nodes and enforcing explicit NUMA at validation");
+            }
+            else
+            {
+                LOG_INFO("[Main] Ambiguous --device " << config.device_for_this_rank->toShortString()
+                                                      << " detected (no explicit NUMA); searching all NUMA nodes");
+            }
+        }
+
+        if (mapped_device_for_rank.has_value() && mapped_device_for_rank->isGPU())
+        {
+            if (mapped_device_numa_explicit)
+            {
+                LOG_INFO("[Main] Explicit --device-map entry for rank " << mpi_ctx->rank()
+                                                                        << " -> " << mapped_device_for_rank->toString()
+                                                                        << "; searching all NUMA nodes and enforcing explicit NUMA at validation");
+            }
+            else
+            {
+                LOG_INFO("[Main] Ambiguous --device-map entry for rank " << mpi_ctx->rank()
+                                                                         << " -> " << mapped_device_for_rank->toShortString()
+                                                                         << " (no explicit NUMA); searching all NUMA nodes");
+            }
+        }
+    }
+
     auto &dm = DeviceManager::instance();
-    dm.initialize(numa_info.local_numa_node);
+    dm.initialize(device_manager_numa_filter);
+
+    // Introspection dry-run mode should stop before model loading and inference,
+    // even when self-bootstrapped under MPI.
+    if (config.dry_run)
+    {
+        if (mpi_ctx->rank() == 0)
+        {
+            LOG_INFO("[Main] --dry-run requested: configuration validated, skipping model load/inference");
+        }
+        MPI_Finalize();
+        return 0;
+    }
 
     // Validate required arguments
     if (config.model_path.empty())

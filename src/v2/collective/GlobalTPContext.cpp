@@ -38,12 +38,13 @@ namespace llaminar2
         if (domain_comm_ != MPI_COMM_NULL)
         {
             backend_ = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
-            
+
             // Initialize the backend with a minimal device group for CPU TP
             DeviceGroup group;
             group.name = "global_tp_domain_" + std::to_string(domain_id);
             group.scope = CollectiveScope::LOCAL; // Cross-socket on same node
-            for (int i = 0; i < domain_size_; ++i) {
+            for (int i = 0; i < domain_size_; ++i)
+            {
                 group.devices.push_back(DeviceId::cpu());
             }
             backend_->initialize(group);
@@ -275,6 +276,13 @@ namespace llaminar2
 
     bool GlobalTPContext::allreduce(TensorBase *tensor)
     {
+        return allreduce(tensor, "", 0);
+    }
+
+    bool GlobalTPContext::allreduce(TensorBase *tensor, const std::string &stage_name, size_t count)
+    {
+        (void)stage_name; // Stage name currently not used by GLOBAL TP backend
+
         if (!tensor)
         {
             LOG_ERROR("GlobalTPContext::allreduce - tensor is null");
@@ -295,15 +303,24 @@ namespace llaminar2
             return false;
         }
 
-        size_t count = tensor->numel();
-        if (count == 0)
+        const size_t tensor_numel = tensor->numel();
+        const size_t effective_count = (count > 0) ? count : tensor_numel;
+
+        if (effective_count > tensor_numel)
+        {
+            LOG_ERROR("GlobalTPContext::allreduce - effective_count=" << effective_count
+                                                                      << " exceeds tensor numel=" << tensor_numel);
+            return false;
+        }
+
+        if (effective_count == 0)
         {
             LOG_WARN("GlobalTPContext::allreduce - tensor has zero elements");
             return true; // Nothing to reduce
         }
 
         // Delegate to UPI backend
-        return backend_->allreduce(data, count, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM);
+        return backend_->allreduce(data, effective_count, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM);
     }
 
     bool GlobalTPContext::broadcast(TensorBase *tensor, int source_index)
@@ -421,7 +438,7 @@ namespace llaminar2
     {
         // Get our world rank to construct the GlobalDeviceAddress
         int world_rank = 0;
-        if (!world_ranks_.empty() && my_rank_in_domain_ >= 0 && 
+        if (!world_ranks_.empty() && my_rank_in_domain_ >= 0 &&
             static_cast<size_t>(my_rank_in_domain_) < world_ranks_.size())
         {
             world_rank = world_ranks_[my_rank_in_domain_];
@@ -431,7 +448,7 @@ namespace llaminar2
             // Fallback: query MPI directly
             MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
         }
-        
+
         // Global TP is CPU-only, so return CPU device for this rank
         // Use "rank<N>" as hostname to uniquely identify each rank's CPU
         std::string hostname = "rank" + std::to_string(world_rank);

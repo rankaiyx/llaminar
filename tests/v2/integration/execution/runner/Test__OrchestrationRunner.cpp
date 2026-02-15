@@ -429,11 +429,66 @@ namespace
         // Verify ROCm devices are correctly preserved
         RankExecutionPlan plan = createSimplePlan();
         plan.primary_device = GlobalDeviceAddress::parse("0:rocm:0");
+        plan.primary_device_numa_explicit = true;
 
         OrchestrationRunner runner(OrchestrationConfig{}, plan);
 
         const auto &returned = runner.executionPlan();
         EXPECT_EQ(returned.primary_device.device_type, DeviceType::ROCm);
+        EXPECT_TRUE(returned.primary_device_numa_explicit)
+            << "Strict NUMA intent should be preserved in runner-facing execution plan";
+    }
+
+    TEST_F(Test__OrchestrationRunner, ExecutionPlanAmbiguousDevice_HasNumaExplicitFalse)
+    {
+        RankExecutionPlan plan = createSimplePlan();
+        plan.primary_device = GlobalDeviceAddress::parse("rocm:0");
+        plan.primary_device_numa_explicit = false;
+
+        OrchestrationRunner runner(OrchestrationConfig{}, plan);
+
+        const auto &returned = runner.executionPlan();
+        EXPECT_EQ(returned.primary_device.device_type, DeviceType::ROCm);
+        EXPECT_FALSE(returned.primary_device_numa_explicit)
+            << "Ambiguous device intent should remain non-explicit in runner-facing execution plan";
+    }
+
+    TEST_F(Test__OrchestrationRunner, CpuShorthandMappedPlan_ExposesGlobalTPFields)
+    {
+        // Simulate post-mapping runtime plan for `-d cpu` on rank 1 of world_size=2.
+        RankExecutionPlan plan = createSimplePlan();
+        plan.rank = 1;
+        plan.hostname = "localhost";
+        plan.numa_node = 1;
+        plan.primary_device = GlobalDeviceAddress::cpu(1, "localhost");
+        plan.primary_device_numa_explicit = true;
+
+        plan.tp_scope = TPScope::GLOBAL;
+        plan.global_tp_domain_id = 0;
+        plan.global_tp_rank_in_domain = 1;
+        plan.global_tp_domain_size = 2;
+
+        plan.local_tp_devices.clear();
+        plan.weight_shard.total_shards = 2;
+        plan.weight_shard.shard_index = 1;
+        plan.weight_shard.work_fraction = 0.5f;
+
+        OrchestrationRunner runner(OrchestrationConfig{}, plan);
+
+        const auto &returned = runner.executionPlan();
+        EXPECT_TRUE(returned.primary_device.isCPU());
+        EXPECT_EQ(returned.primary_device.numa_node, 1);
+        EXPECT_TRUE(returned.primary_device_numa_explicit);
+
+        EXPECT_EQ(returned.tp_scope, TPScope::GLOBAL);
+        EXPECT_TRUE(returned.usesGlobalTP());
+        EXPECT_FALSE(returned.usesLocalTP());
+        ASSERT_TRUE(returned.global_tp_domain_id.has_value());
+        EXPECT_EQ(*returned.global_tp_domain_id, 0);
+        EXPECT_EQ(returned.global_tp_rank_in_domain, 1);
+        EXPECT_EQ(returned.global_tp_domain_size, 2);
+        EXPECT_EQ(returned.weight_shard.total_shards, 2);
+        EXPECT_EQ(returned.weight_shard.shard_index, 1);
     }
 
     TEST_F(Test__OrchestrationRunner, LocalTPPlan_HasGPUDevices)

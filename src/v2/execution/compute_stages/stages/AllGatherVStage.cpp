@@ -14,6 +14,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../utils/MPIContext.h"
 #include <mpi.h>
 #include <chrono>
@@ -77,6 +78,8 @@ namespace llaminar2
 
     bool AllGatherVStage::executeViaCollectiveContext()
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ALLGATHERV);
+
         const auto &mpi_env = debugEnv().mpi_logging;
 
         // Get shapes
@@ -128,6 +131,8 @@ namespace llaminar2
 
     bool AllGatherVStage::executeViaMPI()
     {
+        KERNEL_PROFILE_SCOPE(KernelType::ALLGATHERV);
+
         const auto &mpi_env = debugEnv().mpi_logging;
 
         if (!params_.mpi_ctx)

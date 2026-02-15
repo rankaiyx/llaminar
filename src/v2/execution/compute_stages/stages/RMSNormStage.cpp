@@ -8,6 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../kernels/KernelFactory.h"
 
 namespace llaminar2
@@ -24,6 +25,8 @@ namespace llaminar2
 
     bool RMSNormStage::execute(IDeviceContext *ctx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::RMS_NORM);
+
         if (!ctx)
         {
             LOG_ERROR("[RMSNormStage] Null device context");

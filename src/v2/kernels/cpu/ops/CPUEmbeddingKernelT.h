@@ -19,6 +19,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../CPUKernelBase.h"
 #include "../../common/EmbedQ8Repack.h"
+#include <memory>
 
 namespace llaminar2
 {
@@ -113,7 +114,7 @@ namespace llaminar2
     private:
         /// Cached EmbedQ8 repack of quantized embedding table (avoids full FP32 dequant)
         mutable const TensorBase *cached_embed_table_ = nullptr;
-        mutable EmbedQ8RepackResult cached_repack_;
+        mutable std::shared_ptr<const EmbedQ8RepackResult> cached_repack_;
     };
 
     // Backward compatibility alias

@@ -20,6 +20,7 @@
 #pragma once
 
 #include "DeviceId.h"
+#include "GlobalDeviceAddress.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -380,6 +381,15 @@ public:
          * @return true if a matching device was found in the inventory
          */
         bool deviceExists(const DeviceId &device) const;
+
+        /**
+         * @brief Check if a global device address exists in current inventory
+         *
+         * @param device Global device address to validate
+         * @param strict_numa When true, require matching NUMA node as well as type+ordinal
+         * @return true if matching device exists
+         */
+        bool deviceExists(const GlobalDeviceAddress &device, bool strict_numa) const;
 
         /**
          * @brief Get a formatted string listing all available devices

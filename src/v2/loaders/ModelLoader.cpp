@@ -390,6 +390,14 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Ensure NUMA binding before allocating the temporary read buffer.
+        // This guarantees raw's pages land on the correct NUMA node even if
+        // membind was reset by an intervening library call or OpenMP region.
+        if (factory_)
+        {
+            factory_->ensureNumaBinding();
+        }
+
         // Read raw bytes from file (thread-safe section)
         std::vector<uint8_t> raw;
         {
@@ -480,17 +488,17 @@ namespace llaminar2
         switch (info->type)
         {
         case GGUFTensorType::F32:
-            // FP32: Copy raw bytes as float array
+            // FP32: Copy raw bytes as float array (NUMA-aware parallel copy)
             if (factory_)
             {
                 auto fp32_tensor = factory_->createFP32(shape);
-                std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
+                TensorFactory::numaMemcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
                 tensor = std::move(fp32_tensor);
             }
             else
             {
                 tensor = std::make_shared<FP32Tensor>(shape);
-                std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+                TensorFactory::numaMemcpy(tensor->mutable_data(), raw.data(), raw.size());
             }
             break;
 
@@ -835,6 +843,12 @@ namespace llaminar2
         LOG_TRACE("[ModelLoader] Row slice " << tensor_name << ": rows [" << row_start << ", " << row_end
                                              << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
 
+        // Ensure NUMA binding before allocating the temporary read buffer
+        if (factory_)
+        {
+            factory_->ensureNumaBinding();
+        }
+
         // Read only the slice bytes (thread-safe section)
         std::vector<uint8_t> raw;
         {
@@ -910,13 +924,13 @@ namespace llaminar2
             if (factory_)
             {
                 auto fp32_tensor = factory_->createFP32(slice_shape, device);
-                std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
+                TensorFactory::numaMemcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
                 tensor = std::move(fp32_tensor);
             }
             else
             {
                 tensor = std::make_shared<FP32Tensor>(slice_shape);
-                std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+                TensorFactory::numaMemcpy(tensor->mutable_data(), raw.data(), raw.size());
             }
             break;
 
@@ -1278,6 +1292,12 @@ namespace llaminar2
                                                 << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)"
                                                 << ", reading " << bytes_per_slice_row << " bytes from each of " << total_rows << " rows");
 
+        // Ensure NUMA binding before allocating the temporary read buffer
+        if (factory_)
+        {
+            factory_->ensureNumaBinding();
+        }
+
         // Allocate buffer for sliced data
         std::vector<uint8_t> raw(slice_bytes);
 
@@ -1361,13 +1381,13 @@ namespace llaminar2
             if (factory_)
             {
                 auto fp32_tensor = factory_->createFP32(slice_shape, device);
-                std::memcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
+                TensorFactory::numaMemcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
                 tensor = std::move(fp32_tensor);
             }
             else
             {
                 tensor = std::make_shared<FP32Tensor>(slice_shape);
-                std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+                TensorFactory::numaMemcpy(tensor->mutable_data(), raw.data(), raw.size());
             }
             break;
 
@@ -2307,6 +2327,12 @@ namespace llaminar2
         const std::vector<size_t> &shape,
         const std::vector<uint8_t> &raw)
     {
+        // Ensure NUMA binding before allocating temporary tensors
+        if (factory_)
+        {
+            factory_->ensureNumaBinding();
+        }
+
         // Step 1: Create temporary quantized tensor using factory
         std::unique_ptr<TensorBase> temp_unique;
 
@@ -2493,6 +2519,12 @@ namespace llaminar2
         const std::vector<size_t> &shape,
         const std::vector<uint8_t> &raw)
     {
+        // Ensure NUMA binding before allocating the dequantized output buffer
+        if (factory_)
+        {
+            factory_->ensureNumaBinding();
+        }
+
         // Calculate total elements
         size_t total_elements = 1;
         for (auto dim : shape)
@@ -2674,7 +2706,7 @@ namespace llaminar2
         }
 
         auto fp32_tensor = factory_->createFP32(shape);
-        std::memcpy(fp32_tensor->mutable_data(), fp32_data.data(), total_elements * sizeof(float));
+        TensorFactory::numaMemcpy(fp32_tensor->mutable_data(), fp32_data.data(), total_elements * sizeof(float));
 
         return fp32_tensor;
     }

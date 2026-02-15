@@ -281,6 +281,7 @@ namespace llaminar2
         // =====================================================================
 
         GlobalDeviceAddress primary_device;
+        bool primary_device_numa_explicit = false;
 
         // =====================================================================
         // Convenience Methods
@@ -470,6 +471,7 @@ namespace llaminar2
             ss << "    hostname: " << hostname << "\n";
             ss << "    numa_node: " << numa_node << "\n";
             ss << "    primary_device: " << primary_device.toString() << "\n";
+            ss << "    primary_device_numa_explicit: " << (primary_device_numa_explicit ? "true" : "false") << "\n";
 
             ss << "  Pipeline Parallelism:\n";
             ss << "    pp_stage_id: " << pp_stage_id << "\n";

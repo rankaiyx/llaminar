@@ -8,6 +8,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../local_execution/device/DeviceContext.h"
 #include "../../../kernels/KernelFactory.h"
@@ -26,6 +27,8 @@ namespace llaminar2
 
     bool ResidualAddStage::execute(IDeviceContext *ctx)
     {
+        KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
+
         if (!ctx)
         {
             LOG_ERROR("[ResidualAddStage] Null device context");
@@ -201,7 +204,7 @@ namespace llaminar2
 
         // Use apply_tensor() which handles GPU pointers correctly via active_data_ptr()
         bool ok = cached_kernel_->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
-                                       params_.device_id.toKernelDeviceIndex());
+                                               params_.device_id.toKernelDeviceIndex());
 
         if (Logger::getInstance().shouldLog(LogLevel::TRACE))
         {

@@ -73,6 +73,19 @@ namespace llaminar2
         }
     }
 
+    const char *mpiProfileToString(MPIProfile profile)
+    {
+        switch (profile)
+        {
+        case MPIProfile::AUTO:
+            return "auto";
+        case MPIProfile::TUNED:
+            return "tuned";
+        default:
+            return "unknown";
+        }
+    }
+
     // collectiveBackendTypeToString - now in CollectiveBackendType.cpp
 
     // =========================================================================
@@ -146,6 +159,16 @@ namespace llaminar2
             return PPSplitMode::WEIGHTED;
         if (lower == "manual")
             return PPSplitMode::MANUAL;
+        return std::nullopt;
+    }
+
+    std::optional<MPIProfile> parseMPIProfile(const std::string &str)
+    {
+        std::string lower = toLower(str);
+        if (lower == "auto")
+            return MPIProfile::AUTO;
+        if (lower == "tuned")
+            return MPIProfile::TUNED;
         return std::nullopt;
     }
 
@@ -668,6 +691,9 @@ namespace llaminar2
 
         // Backend
         oss << "  default_backend: " << collectiveBackendTypeToString(default_backend) << "\n";
+
+        // MPI bootstrap
+        oss << "  mpi_profile: " << mpiProfileToString(mpi_profile) << "\n";
 
         // Config file
         if (!config_file_path.empty())

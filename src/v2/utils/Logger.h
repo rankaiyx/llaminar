@@ -7,6 +7,7 @@
  */
 
 #include "LogLevel.h"
+#include "DebugEnv.h"
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -16,7 +17,6 @@
 #include <deque>
 #include <mutex>
 #include <vector>
-#include <cstdlib>
 
 namespace llaminar2
 {
@@ -212,20 +212,16 @@ namespace llaminar2
     private:
         Logger() : current_level_(LogLevel::INFO), rank_(0), has_rank_(false)
         {
-            // Check environment variable for log level override
-            const char *level_env = std::getenv("LLAMINAR_LOG_LEVEL");
-            if (level_env)
+            const auto &env = debugEnv();
+
+            if (!env.logger.log_level.empty())
             {
-                current_level_ = stringToLogLevel(std::string(level_env));
+                current_level_ = stringToLogLevel(env.logger.log_level);
             }
 
-            // Check environment variable for buffer size override
-            const char *buffer_env = std::getenv("LLAMINAR_LOG_BUFFER_LINES");
-            if (buffer_env)
+            if (env.logger.buffer_lines > 0)
             {
-                int lines = std::atoi(buffer_env);
-                if (lines > 0)
-                    max_buffer_ = static_cast<size_t>(lines);
+                max_buffer_ = static_cast<size_t>(env.logger.buffer_lines);
             }
         }
 
@@ -372,10 +368,10 @@ namespace llaminar2
  */
 inline void initializeLogging()
 {
-    const char *log_level_env = std::getenv("LLAMINAR_LOG_LEVEL");
-    if (log_level_env)
+    const auto &env = ::llaminar2::debugEnv();
+    if (!env.logger.log_level.empty())
     {
         ::llaminar2::Logger::getInstance().setLogLevel(
-            ::llaminar2::Logger::getInstance().stringToLogLevel(log_level_env));
+            ::llaminar2::Logger::getInstance().stringToLogLevel(env.logger.log_level));
     }
 }

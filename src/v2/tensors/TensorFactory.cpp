@@ -11,9 +11,12 @@
 #include "../backends/p2p/DirectP2P.h" // For BAR-backed tensor support
 #include <stdexcept>
 #include <sstream>
+#include <cstring> // For std::memcpy in numaMemcpy
+#include <omp.h>   // For parallel numaMemcpy
 
 #include <numa.h>
 #include <numaif.h>
+#include <sched.h> // For sched_getcpu() in NUMA node detection
 
 #if defined(HAVE_ROCM)
 #include <hip/hip_runtime.h>
@@ -281,6 +284,42 @@ namespace llaminar2
         }
     }
 
+    void TensorFactory::ensureNumaBinding()
+    {
+        if (numa_node_ >= 0)
+        {
+            bindToNumaNode();
+        }
+    }
+
+    void TensorFactory::numaMemcpy(void *dst, const void *src, size_t bytes)
+    {
+        // For small buffers, single-threaded memcpy is faster (avoids OMP overhead)
+        constexpr size_t PARALLEL_THRESHOLD = 128 * 1024; // 128 KB
+        if (bytes < PARALLEL_THRESHOLD)
+        {
+            std::memcpy(dst, src, bytes);
+            return;
+        }
+
+        // Parallel memcpy ensures destination pages are first-touched by
+        // multiple threads on the correct NUMA node (set via membind).
+        // Each thread copies a contiguous chunk, triggering page faults
+        // that place physical pages on the bound NUMA node.
+        auto *d = static_cast<char *>(dst);
+        const auto *s = static_cast<const char *>(src);
+
+#pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            int nthreads = omp_get_num_threads();
+            size_t chunk = bytes / nthreads;
+            size_t start = tid * chunk;
+            size_t end = (tid == nthreads - 1) ? bytes : start + chunk;
+            std::memcpy(d + start, s + start, end - start);
+        }
+    }
+
     bool TensorFactory::isNumaAvailable()
     {
         if (numa_available() < 0)
@@ -325,9 +364,28 @@ namespace llaminar2
             return -1; // Only one NUMA node
         }
 
-        // Simple round-robin mapping: rank % (max_node + 1)
-        // More sophisticated mapping could query actual CPU topology
-        return rank % (max_node + 1);
+        // Detect actual NUMA node from the CPU this thread is running on.
+        // This correctly handles cases where process binding doesn't follow
+        // rank order, e.g. `-d cpu:1` with a single rank bound to socket 1
+        // (rank=0 but NUMA node=1).  The old round-robin mapping
+        // (`rank % (max_node+1)`) would incorrectly return node 0.
+        int cpu = sched_getcpu();
+        if (cpu >= 0)
+        {
+            int node = numa_node_of_cpu(cpu);
+            if (node >= 0 && node <= max_node)
+            {
+                LOG_DEBUG("[TensorFactory] Detected NUMA node " << node
+                                                                << " for rank " << rank << " (cpu " << cpu << ")");
+                return node;
+            }
+        }
+
+        // Fallback: round-robin mapping (only reached if sched_getcpu fails)
+        int fallback = rank % (max_node + 1);
+        LOG_WARN("[TensorFactory] sched_getcpu() failed, using round-robin NUMA mapping: "
+                 << "rank " << rank << " -> node " << fallback);
+        return fallback;
     }
 
     // =========================================================================

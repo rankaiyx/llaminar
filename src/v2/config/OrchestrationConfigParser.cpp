@@ -139,16 +139,85 @@ namespace llaminar2
             }
 
             std::string device_spec = part.substr(eq_pos + 1);
-            auto addr = GlobalDeviceAddress::tryParse(device_spec);
-            if (!addr)
-            {
-                throw std::invalid_argument("Invalid device in device map: '" + device_spec + "'");
-            }
+            std::string lower = toLower(device_spec);
 
-            device_map.emplace_back(rank, *addr);
+            if (lower == "cpu")
+            {
+                device_map.emplace_back(rank, GlobalDeviceAddress::cpu(0));
+            }
+            else if (lower.rfind("cpu:", 0) == 0)
+            {
+                try
+                {
+                    int numa = std::stoi(device_spec.substr(4));
+                    if (numa < 0)
+                    {
+                        throw std::invalid_argument("negative NUMA");
+                    }
+                    device_map.emplace_back(rank, GlobalDeviceAddress::cpu(numa));
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid CPU device in device map: '" + device_spec + "' (expected cpu or cpu:<numa>)");
+                }
+            }
+            else
+            {
+                auto addr = GlobalDeviceAddress::tryParse(device_spec);
+                if (!addr)
+                {
+                    throw std::invalid_argument("Invalid device in device map: '" + device_spec + "'");
+                }
+
+                device_map.emplace_back(rank, *addr);
+            }
         }
 
         return device_map;
+    }
+
+    namespace
+    {
+        std::vector<std::pair<int, bool>> parseDeviceMapNumaExplicit(const std::string &spec)
+        {
+            std::vector<std::pair<int, bool>> explicitness;
+            auto parts = split(spec, ',');
+
+            for (const auto &part : parts)
+            {
+                size_t eq_pos = part.find('=');
+                if (eq_pos == std::string::npos)
+                {
+                    throw std::invalid_argument(
+                        "Invalid device map entry: '" + part + "'. Expected format: rank=device");
+                }
+
+                int rank;
+                try
+                {
+                    rank = std::stoi(part.substr(0, eq_pos));
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid rank in device map: '" + part.substr(0, eq_pos) + "'");
+                }
+
+                const std::string device_spec = part.substr(eq_pos + 1);
+                const std::string lower = toLower(device_spec);
+
+                if (lower.rfind("cpu:", 0) == 0)
+                {
+                    explicitness.emplace_back(rank, true);
+                }
+                else
+                {
+                    const size_t colon_count = static_cast<size_t>(std::count(device_spec.begin(), device_spec.end(), ':'));
+                    explicitness.emplace_back(rank, colon_count >= 2);
+                }
+            }
+
+            return explicitness;
+        }
     }
 
     bool OrchestrationConfigParser::matchesFlag(const std::string &arg,
@@ -509,6 +578,20 @@ namespace llaminar2
             {
                 config.mpi_oversubscribe = true;
             }
+            else if (matchesFlag(arg, "", "--mpi-profile"))
+            {
+                std::string value = getFlagValue(args, i);
+                if (value.empty())
+                {
+                    throw std::invalid_argument("--mpi-profile requires a value (auto|tuned)");
+                }
+                auto profile = parseMPIProfile(value);
+                if (!profile)
+                {
+                    throw std::invalid_argument("Invalid mpi profile: '" + value + "' (valid: auto, tuned)");
+                }
+                config.mpi_profile = *profile;
+            }
 
             // ===== Device assignment =====
             else if (matchesFlag(arg, "-d", "--device"))
@@ -518,12 +601,49 @@ namespace llaminar2
                 {
                     throw std::invalid_argument("--device requires a device specification");
                 }
-                auto addr = GlobalDeviceAddress::tryParse(value);
-                if (!addr)
+                const std::string lower = toLower(value);
+
+                // CPU shorthand semantics:
+                // - "cpu"   => all local NUMA CPU devices (global CPU TP intent)
+                // - "cpu:N" => explicit NUMA-node CPU target
+                if (lower == "cpu")
                 {
-                    throw std::invalid_argument("Invalid device specification: '" + value + "'");
+                    config.device_for_this_rank = GlobalDeviceAddress::cpu(0);
+                    config.device_for_this_rank_numa_explicit = false;
+                    config.cpu_global_tp_all_local = true;
                 }
-                config.device_for_this_rank = *addr;
+                else if (lower.rfind("cpu:", 0) == 0)
+                {
+                    try
+                    {
+                        int numa = std::stoi(value.substr(4));
+                        if (numa < 0)
+                        {
+                            throw std::invalid_argument("negative NUMA");
+                        }
+                        config.device_for_this_rank = GlobalDeviceAddress::cpu(numa);
+                        config.device_for_this_rank_numa_explicit = true;
+                        config.cpu_global_tp_all_local = false;
+                    }
+                    catch (const std::exception &)
+                    {
+                        throw std::invalid_argument("Invalid CPU device specification: '" + value + "' (expected cpu or cpu:<numa>)");
+                    }
+                }
+                else
+                {
+                    auto addr = GlobalDeviceAddress::tryParse(value);
+                    if (!addr)
+                    {
+                        throw std::invalid_argument("Invalid device specification: '" + value + "'");
+                    }
+                    config.device_for_this_rank = *addr;
+
+                    // Short form "type:ordinal" is NUMA-ambiguous; forms with >=3 fields are explicit.
+                    size_t colon_count = static_cast<size_t>(std::count(value.begin(), value.end(), ':'));
+                    config.device_for_this_rank_numa_explicit = (colon_count >= 2);
+                    config.cpu_global_tp_all_local = false;
+                }
             }
             else if (matchesFlag(arg, "", "--device-mode"))
             {
@@ -547,6 +667,7 @@ namespace llaminar2
                     throw std::invalid_argument("--device-map requires a mapping");
                 }
                 config.device_map = parseDeviceMap(value);
+                config.device_map_numa_explicit = parseDeviceMapNumaExplicit(value);
                 config.device_mode = DeviceAssignmentMode::EXPLICIT;
             }
 
@@ -739,6 +860,10 @@ namespace llaminar2
                 // Only override fields that weren't explicitly set via CLI
                 // For now, just use file config as base if we got this far
                 // (A more sophisticated merge would track which CLI flags were set)
+                if (config.mpi_profile == MPIProfile::AUTO && file_config.mpi_profile != MPIProfile::AUTO)
+                {
+                    config.mpi_profile = file_config.mpi_profile;
+                }
             }
 
             // ===== Topology Tree (Global PP Phase 8) =====
@@ -996,9 +1121,41 @@ namespace llaminar2
             }
             else if (key == "device")
             {
-                auto addr = GlobalDeviceAddress::tryParse(value);
-                if (addr)
-                    config.device_for_this_rank = *addr;
+                const std::string lower = toLower(value);
+                if (lower == "cpu")
+                {
+                    config.device_for_this_rank = GlobalDeviceAddress::cpu(0);
+                    config.device_for_this_rank_numa_explicit = false;
+                    config.cpu_global_tp_all_local = true;
+                }
+                else if (lower.rfind("cpu:", 0) == 0)
+                {
+                    try
+                    {
+                        int numa = std::stoi(value.substr(4));
+                        if (numa >= 0)
+                        {
+                            config.device_for_this_rank = GlobalDeviceAddress::cpu(numa);
+                            config.device_for_this_rank_numa_explicit = true;
+                            config.cpu_global_tp_all_local = false;
+                        }
+                    }
+                    catch (const std::exception &)
+                    {
+                        // Keep prior behavior for invalid entries (ignore in config-file parse path)
+                    }
+                }
+                else
+                {
+                    auto addr = GlobalDeviceAddress::tryParse(value);
+                    if (addr)
+                    {
+                        config.device_for_this_rank = *addr;
+                        size_t colon_count = static_cast<size_t>(std::count(value.begin(), value.end(), ':'));
+                        config.device_for_this_rank_numa_explicit = (colon_count >= 2);
+                        config.cpu_global_tp_all_local = false;
+                    }
+                }
             }
             else if (key == "tp_degree" || key == "tp")
             {
@@ -1077,6 +1234,14 @@ namespace llaminar2
             {
                 config.kv_cache_precision = value;
             }
+            else if (key == "mpi_profile" || key == "mpi-profile")
+            {
+                auto profile = parseMPIProfile(value);
+                if (profile)
+                {
+                    config.mpi_profile = *profile;
+                }
+            }
         }
 
         return config;
@@ -1132,6 +1297,7 @@ MPI Bootstrap:
   --mpi-verbose          Verbose MPI output
   --no-mpi-bootstrap     Disable automatic MPI bootstrap
   --mpi-oversubscribe    Allow MPI oversubscription
+    --mpi-profile <mode>   MPI bootstrap profile: auto (default), tuned
 
 Device Assignment:
   -d, --device <spec>    Device for this rank (e.g., cuda:0, rocm:0, cpu)
@@ -1170,6 +1336,7 @@ Introspection:
 
 Config File:
   --config <path>        Load configuration from YAML file
+                                                 (supports mpi_profile: auto|tuned)
 
 Topology Tree (Global PP):
   --topology <spec>      Inline topology: "PP(name, Device(cpu,0), Device(cpu,0))"

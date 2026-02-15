@@ -105,6 +105,7 @@
 #pragma once
 
 #include "../../tensors/TensorTypes.h"
+#include "../../utils/DebugEnv.h"
 #include "RuntimeConfig.h"
 
 namespace llaminar2
@@ -215,7 +216,7 @@ namespace llaminar2
                                TensorType actual_type,
                                TensorType expected_type)
         {
-            static bool enabled = std::getenv("LLAMINAR_HYBRIDQ16_TRACE") != nullptr;
+            const bool enabled = debugEnv().hybrid_q16.trace;
             if (!enabled)
                 return;
 

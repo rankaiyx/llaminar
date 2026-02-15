@@ -648,8 +648,37 @@ namespace llaminar2
             const bool has_collective_nodes = !forward_cache_.collective_nodes.empty();
             const bool allow_fast_decode = debugEnv().execution.fast_decode;
             const bool allow_collective_segmented = debugEnv().execution.gpu_graph_collective_segmented;
+            bool collective_segmented_backend_supported = true;
+            if (has_collective_nodes && allow_collective_segmented)
+            {
+                collective_segmented_backend_supported = false;
+
+                const auto &graph_cfg = graph_builder_->config();
+                const bool has_local_tp =
+                    graph_cfg.local_tp_ctx && graph_cfg.local_tp_ctx->degree() > 1;
+                const bool single_rank_collectives =
+                    injected_collective_ctx_ && injected_collective_ctx_->worldSize() == 1;
+
+                if (has_local_tp && single_rank_collectives)
+                {
+                    const auto backend = graph_cfg.local_tp_ctx->backend();
+                    collective_segmented_backend_supported =
+                        (backend == CollectiveBackendType::NCCL ||
+                         backend == CollectiveBackendType::RCCL);
+
+                    if (!collective_segmented_backend_supported)
+                    {
+                        LOG_DEBUG("[DeviceGraphOrchestrator] Disabling collective segmented GPU-graph replay for non-stream backend");
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Disabling collective segmented GPU-graph replay for cross-rank or non-local-TP collectives");
+                }
+            }
             const bool can_use_segmented_graph =
-                !has_collective_nodes || allow_collective_segmented;
+                !has_collective_nodes ||
+                (allow_collective_segmented && collective_segmented_backend_supported);
             if (allow_fast_decode &&
                 !debugEnv().execution.executor_profiling &&
                 !executor_.config().snapshot_callback)

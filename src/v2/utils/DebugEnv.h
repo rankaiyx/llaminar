@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstring>
+#include <optional>
 
 /**
  * @file DebugEnv.h
@@ -432,11 +434,11 @@ namespace llaminar2
         int flash_kv_tile_prefill = -1; ///< Override prefill kv tile (LLAMINAR_FLASH_ATTN_KV_TILE_PREFILL)
 
         // CPU flash attention prefill INT16 (12-bit effective) Q·K path
-        bool flash_prefill_i16_i12 = false;          ///< Enable prefill INT16(i12) Q·K path (LLAMINAR_FLASH_PREFILL_I16_I12)
-        int flash_prefill_i16_i12_min_seq = 128;     ///< Minimum seq_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_SEQ)
-        int flash_prefill_i16_i12_min_kv = 128;      ///< Minimum kv_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_KV)
-        int64_t flash_prefill_i16_i12_min_work = 0;  ///< Minimum seq_len*kv_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_WORK)
-        int flash_prefill_i16_i12_qmax = 2047;       ///< Effective quant range cap (LLAMINAR_FLASH_PREFILL_I16_I12_QMAX)
+        bool flash_prefill_i16_i12 = true;            ///< Enable prefill INT16(i12) Q·K path (LLAMINAR_FLASH_PREFILL_I16_I12)
+        int flash_prefill_i16_i12_min_seq = 128;      ///< Minimum seq_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_SEQ)
+        int flash_prefill_i16_i12_min_kv = 128;       ///< Minimum kv_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_KV)
+        int64_t flash_prefill_i16_i12_min_work = 0;   ///< Minimum seq_len*kv_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_WORK)
+        int flash_prefill_i16_i12_qmax = 2047;        ///< Effective quant range cap (LLAMINAR_FLASH_PREFILL_I16_I12_QMAX)
         int flash_prefill_i16_i12_max_head_dim = 256; ///< Max head_dim for safe INT32 accumulation (LLAMINAR_FLASH_PREFILL_I16_I12_MAX_HEAD_DIM)
 
         AttentionConfig()
@@ -593,8 +595,8 @@ namespace llaminar2
      *   LLAMINAR_AUTO_WEIGHT_TRANSFER      - Auto-transfer weights to target device (default: 1)
      *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use GraphBufferManager for buffers (default: 1 - ON)
      *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
-    *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Allow segmented GPU-graph replay for decode graphs
-    *                                        containing collectives (default: 0 - OFF, experimental)
+     *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Allow segmented GPU-graph replay for decode graphs
+     *                                        containing collectives (default: 0 - OFF, experimental)
      *
      * Device Placement / Heterogeneous Execution:
      *   LLAMINAR_CPU_PREFILL_PARTICIPATE   - Enable CPU participation in PREFILL phase (default: 0 - OFF)
@@ -624,19 +626,23 @@ namespace llaminar2
      */
     struct ExecutionConfig
     {
-        bool use_layer_executor = true;            ///< Master switch for LayerExecutor (default: ON)
-        std::string execution_mode = "sequential"; ///< Execution mode
-        bool executor_profiling = false;           ///< Enable stage profiling
-        bool executor_validation = false;          ///< Validate outputs after each stage
-        bool auto_weight_transfer = true;          ///< Auto-transfer weights to device
-        bool use_graph_buffer_management = true;   ///< Use GraphBufferManager for buffer allocation (default: ON)
-        bool exec_full_forward = true;             ///< Use orchestrator->executeForward() for complete inference (default: ON)
-        bool fast_decode = true;                   ///< Use fast decode path skipping coherence/debug overhead (default: ON, env: LLAMINAR_FAST_DECODE)
-        bool gpu_graphs = false;                   ///< Use GPU graph capture/replay for decode (default: OFF, env: LLAMINAR_GPU_GRAPHS)
-        bool gpu_graph_verify = false;             ///< Verify graph replay vs direct execution (default: OFF, env: LLAMINAR_GPU_GRAPH_VERIFY)
-        bool gpu_graph_recapture = false;          ///< Re-capture each decode step instead of replaying cached graph (default: OFF, env: LLAMINAR_GPU_GRAPH_RECAPTURE)
-        int gpu_graph_max_stages = 0;              ///< Max stages per capturable segment (0=unlimited, env: LLAMINAR_GPU_GRAPH_MAX_STAGES)
-        bool gpu_graph_collective_segmented = false; ///< Enable segmented replay for collective decode graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
+        bool use_layer_executor = true;                                        ///< Master switch for LayerExecutor (default: ON)
+        std::string execution_mode = "sequential";                             ///< Execution mode
+        bool executor_profiling = false;                                       ///< Enable stage profiling
+        bool executor_validation = false;                                      ///< Validate outputs after each stage
+        bool auto_weight_transfer = true;                                      ///< Auto-transfer weights to device
+        bool use_graph_buffer_management = true;                               ///< Use GraphBufferManager for buffer allocation (default: ON)
+        bool exec_full_forward = true;                                         ///< Use orchestrator->executeForward() for complete inference (default: ON)
+        bool fast_decode = true;                                               ///< Use fast decode path skipping coherence/debug overhead (default: ON, env: LLAMINAR_FAST_DECODE)
+        bool gpu_graphs = false;                                               ///< Use GPU graph capture/replay for decode (default: OFF, env: LLAMINAR_GPU_GRAPHS)
+        bool gpu_graph_verify = false;                                         ///< Verify graph replay vs direct execution (default: OFF, env: LLAMINAR_GPU_GRAPH_VERIFY)
+        bool gpu_graph_recapture = false;                                      ///< Re-capture each decode step instead of replaying cached graph (default: OFF, env: LLAMINAR_GPU_GRAPH_RECAPTURE)
+        int gpu_graph_max_stages = 0;                                          ///< Max stages per capturable segment (0=unlimited, env: LLAMINAR_GPU_GRAPH_MAX_STAGES)
+        bool gpu_graph_collective_segmented = false;                           ///< Enable segmented replay for collective decode graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
+        std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist for segmented collective capture (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
+        bool gpu_graph_stream_only = false;                                    ///< Execute segmented path on stream-only mode (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY)
+        bool gpu_graph_stream_only_default = false;                            ///< Stream-only mode uses default stream (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT)
+        bool force_mpi_collective_context = false;                             ///< Force MPI-backed CollectiveContext in GLOBAL TP (env: LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT)
 
         // =================================================================
         // Device Placement / Heterogeneous Execution
@@ -801,6 +807,41 @@ namespace llaminar2
             if (gpu_graph_collective_segmented_env)
             {
                 gpu_graph_collective_segmented = (std::atoi(gpu_graph_collective_segmented_env) != 0);
+            }
+
+            gpu_graph_collective_segmented_capture_allow.clear();
+            const char *gpu_graph_collective_segmented_allow_env = std::getenv("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW");
+            if (gpu_graph_collective_segmented_allow_env && *gpu_graph_collective_segmented_allow_env)
+            {
+                std::stringstream ss(gpu_graph_collective_segmented_allow_env);
+                std::string token;
+                while (std::getline(ss, token, ','))
+                {
+                    token.erase(0, token.find_first_not_of(" \t"));
+                    token.erase(token.find_last_not_of(" \t") + 1);
+                    if (!token.empty())
+                    {
+                        gpu_graph_collective_segmented_capture_allow.push_back(token);
+                    }
+                }
+            }
+
+            const char *gpu_graph_stream_only_env = std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY");
+            if (gpu_graph_stream_only_env)
+            {
+                gpu_graph_stream_only = (std::atoi(gpu_graph_stream_only_env) != 0);
+            }
+
+            const char *gpu_graph_stream_only_default_env = std::getenv("LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT");
+            if (gpu_graph_stream_only_default_env)
+            {
+                gpu_graph_stream_only_default = (std::atoi(gpu_graph_stream_only_default_env) != 0);
+            }
+
+            const char *force_mpi_collective_ctx_env = std::getenv("LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT");
+            if (force_mpi_collective_ctx_env)
+            {
+                force_mpi_collective_context = (std::atoi(force_mpi_collective_ctx_env) != 0);
             }
 
             // Model-level operation flags (embedding, lm_head)
@@ -1908,6 +1949,153 @@ namespace llaminar2
     };
 
     /**
+     * @brief Logger environment configuration
+     */
+    struct LoggerConfig
+    {
+        std::string log_level; ///< LLAMINAR_LOG_LEVEL (empty if unset)
+        int buffer_lines = 0;  ///< LLAMINAR_LOG_BUFFER_LINES (0 if unset/invalid)
+
+        LoggerConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            log_level.clear();
+            buffer_lines = 0;
+
+            const char *level_env = std::getenv("LLAMINAR_LOG_LEVEL");
+            if (level_env && *level_env)
+            {
+                log_level = level_env;
+            }
+
+            const char *buffer_env = std::getenv("LLAMINAR_LOG_BUFFER_LINES");
+            if (buffer_env)
+            {
+                int lines = std::atoi(buffer_env);
+                if (lines > 0)
+                {
+                    buffer_lines = lines;
+                }
+            }
+        }
+    };
+
+    /**
+     * @brief Topology-related environment configuration
+     */
+    struct TopologyEnvConfig
+    {
+        std::string cuda_visible_devices; ///< CUDA_VISIBLE_DEVICES
+        std::string hip_visible_devices;  ///< HIP_VISIBLE_DEVICES
+
+        TopologyEnvConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            cuda_visible_devices.clear();
+            hip_visible_devices.clear();
+
+            const char *cuda_visible = std::getenv("CUDA_VISIBLE_DEVICES");
+            if (cuda_visible && *cuda_visible)
+            {
+                cuda_visible_devices = cuda_visible;
+            }
+
+            const char *hip_visible = std::getenv("HIP_VISIBLE_DEVICES");
+            if (hip_visible && *hip_visible)
+            {
+                hip_visible_devices = hip_visible;
+            }
+        }
+    };
+
+    /**
+     * @brief MPI bootstrap environment snapshot
+     */
+    struct MPIBootstrapEnvConfig
+    {
+        std::string ompi_comm_world_size;
+        std::string ompi_comm_world_rank;
+        std::string pmi_size;
+        std::string pmi_rank;
+        std::string slurm_ntasks;
+        std::string slurm_procid;
+        std::string mpi_localrankid;
+        std::string ompi_comm_world_local_rank;
+        std::string ompi_mca_btl_vader_single_copy_mechanism;
+
+        MPIBootstrapEnvConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            auto read_env = [](const char *name) -> std::string
+            {
+                const char *val = std::getenv(name);
+                if (val && *val)
+                {
+                    return std::string(val);
+                }
+                return "";
+            };
+
+            ompi_comm_world_size = read_env("OMPI_COMM_WORLD_SIZE");
+            ompi_comm_world_rank = read_env("OMPI_COMM_WORLD_RANK");
+            pmi_size = read_env("PMI_SIZE");
+            pmi_rank = read_env("PMI_RANK");
+            slurm_ntasks = read_env("SLURM_NTASKS");
+            slurm_procid = read_env("SLURM_PROCID");
+            mpi_localrankid = read_env("MPI_LOCALRANKID");
+            ompi_comm_world_local_rank = read_env("OMPI_COMM_WORLD_LOCAL_RANK");
+            ompi_mca_btl_vader_single_copy_mechanism = read_env("OMPI_MCA_btl_vader_single_copy_mechanism");
+        }
+
+        std::optional<std::string> get(const char *name) const
+        {
+            const auto value = getRef(name);
+            if (!value.empty())
+            {
+                return value;
+            }
+            return std::nullopt;
+        }
+
+    private:
+        const std::string &getRef(const char *name) const
+        {
+            if (std::strcmp(name, "OMPI_COMM_WORLD_SIZE") == 0)
+                return ompi_comm_world_size;
+            if (std::strcmp(name, "OMPI_COMM_WORLD_RANK") == 0)
+                return ompi_comm_world_rank;
+            if (std::strcmp(name, "PMI_SIZE") == 0)
+                return pmi_size;
+            if (std::strcmp(name, "PMI_RANK") == 0)
+                return pmi_rank;
+            if (std::strcmp(name, "SLURM_NTASKS") == 0)
+                return slurm_ntasks;
+            if (std::strcmp(name, "SLURM_PROCID") == 0)
+                return slurm_procid;
+            if (std::strcmp(name, "MPI_LOCALRANKID") == 0)
+                return mpi_localrankid;
+            if (std::strcmp(name, "OMPI_COMM_WORLD_LOCAL_RANK") == 0)
+                return ompi_comm_world_local_rank;
+            if (std::strcmp(name, "OMPI_MCA_btl_vader_single_copy_mechanism") == 0)
+                return ompi_mca_btl_vader_single_copy_mechanism;
+            static const std::string empty;
+            return empty;
+        }
+    };
+
+    /**
      * @brief ROCm-specific debugging and instrumentation configuration
      *
      * Environment variables:
@@ -1926,6 +2114,7 @@ namespace llaminar2
         bool trace_coherence = false;    ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
         bool trace_kernels = false;      ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
         bool sync_after_kernel = false;  ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
+        bool fused_gemv = false;         ///< Enable fused GEMV path (LLAMINAR_FUSED_GEMV)
         std::string gemv_mode = "fp32";  ///< GEMV mode: fp32 (default), fp16, int8
         std::string gemv_layout = "row"; ///< GEMV weight layout: row (default), vnni
 
@@ -1939,6 +2128,7 @@ namespace llaminar2
             trace_coherence = false;
             trace_kernels = false;
             sync_after_kernel = false;
+            fused_gemv = false;
             gemv_mode = "fp32";
             gemv_layout = "row";
 
@@ -1958,6 +2148,12 @@ namespace llaminar2
             if (sync_env)
             {
                 sync_after_kernel = (std::atoi(sync_env) != 0);
+            }
+
+            const char *fused_gemv_env = std::getenv("LLAMINAR_FUSED_GEMV");
+            if (fused_gemv_env)
+            {
+                fused_gemv = (std::atoi(fused_gemv_env) != 0);
             }
 
             const char *gemv_env = std::getenv("LLAMINAR_ROCM_GEMV_MODE");
@@ -1981,6 +2177,29 @@ namespace llaminar2
     };
 
     /**
+     * @brief HybridQ16 debug configuration
+     */
+    struct HybridQ16Config
+    {
+        bool trace = false; ///< Enable HybridQ16 dataflow trace logs (LLAMINAR_HYBRIDQ16_TRACE)
+
+        HybridQ16Config()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            trace = false;
+            const char *trace_env = std::getenv("LLAMINAR_HYBRIDQ16_TRACE");
+            if (trace_env)
+            {
+                trace = (std::atoi(trace_env) != 0);
+            }
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
@@ -1998,8 +2217,12 @@ namespace llaminar2
         StageOutputPrintConfig stage_output_print; ///< Stage output debug printing
         ValidationConfig validation;               ///< Buffer validation configuration
         StreamingEnv streaming;                    ///< Weight streaming configuration (Option B)
+        HybridQ16Config hybrid_q16;                ///< HybridQ16 debug configuration
         ROCmConfig rocm;                           ///< ROCm-specific debugging configuration
         TransferTracingConfig transfer_tracing;    ///< Memory transfer tracing for H2D/D2H debugging
+        LoggerConfig logger;                       ///< Logger environment configuration
+        TopologyEnvConfig topology;                ///< Topology-related environment configuration
+        MPIBootstrapEnvConfig mpi_bootstrap;       ///< MPI bootstrap environment snapshot
 
         DebugEnv() = default;
 
@@ -2017,8 +2240,12 @@ namespace llaminar2
             stage_output_print.reload();
             validation.reload();
             streaming.reload();
+            hybrid_q16.reload();
             rocm.reload();
             transfer_tracing.reload();
+            logger.reload();
+            topology.reload();
+            mpi_bootstrap.reload();
         }
     };
 

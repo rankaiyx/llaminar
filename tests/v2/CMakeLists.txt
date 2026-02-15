@@ -2339,6 +2339,19 @@ add_v2_test(V2_Unit_CPUAttentionKernelT
     MPI_PROCS 1
 )
 
+# Test: CPUFlashAttentionKernelT (Flash attention accuracy: FP32, VNNI i16/i12, causal, GQA, window)
+add_executable(v2_test_cpu_flash_attention_kernel_t unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp)
+target_link_libraries(v2_test_cpu_flash_attention_kernel_t
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUFlashAttentionKernelT
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+    LABELS "V2;Unit;Kernels;Attention;FlashAttention;FP32;VNNI;CPU;Accuracy"
+    MPI_PROCS 1
+)
+
 # Test: AttentionComputeStage (Phase 9 - ComputeStage for attention via KernelFactory)
 add_executable(v2_test_attention_compute_stage unit/execution/compute_stages/stages/Test__AttentionComputeStage.cpp)
 target_link_libraries(v2_test_attention_compute_stage
