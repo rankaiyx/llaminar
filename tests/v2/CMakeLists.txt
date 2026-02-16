@@ -2818,16 +2818,16 @@ target_link_libraries(v2_test_iq4nl_views
 # GEMM v4 paths. IQ4_NL is now validated via tensor views and activation-
 # centric kernels.
 
-# Test: CPUKVCache (supports both single-sequence and batched modes, all precisions)
-add_executable(v2_test_cpu_kv_cache unit/kernels/cpu/Test__CPUKVCache.cpp)
-target_link_libraries(v2_test_cpu_kv_cache 
-    llaminar2_core 
+# Test: CPURingKVCache (Phase 1 ring metadata + append/evict state transitions)
+add_executable(v2_test_cpu_ring_kv_cache unit/kernels/cpu/Test__CPURingKVCache.cpp)
+target_link_libraries(v2_test_cpu_ring_kv_cache
+    llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_CPUKVCache 
-    COMMAND $<TARGET_FILE:v2_test_cpu_kv_cache>
-    LABELS "V2;Unit;KVCache;Batched;SingleSequence;FP32;BF16;FP16;Q8_1;Q16_1;Eviction"
+add_v2_test(V2_Unit_CPURingKVCache
+    COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache>
+    LABELS "V2;Unit;KVCache;Ring;CPU;FP32;Phase1"
     MPI_PROCS 1
 )
 

@@ -21,10 +21,9 @@
 #include "models/qwen/Qwen2Graph.h"
 #include "backends/ComputeBackend.h"
 #include "utils/Logger.h"
-#include "utils/DebugEnv.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
-#include "kernels/cpu/CPUKVCache.h"
+#include "kernels/cpu/CPURingKVCache.h"
 #include <memory>
 
 using namespace llaminar2;
@@ -641,6 +640,22 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_UsesPositionMajor)
     auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
     ASSERT_NE(cpu_cache, nullptr);
     EXPECT_EQ(cpu_cache->layout_mode(), KVCacheLayoutMode::POSITION_MAJOR);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32_DefaultsToRingCPUKVCache)
+{
+    auto fp32_config = config_;
+    fp32_config.activation_precision = ActivationPrecision::FP32;
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(fp32_config, nullptr);
+
+    ASSERT_TRUE(orchestrator->initializeInferenceState(1, 64, DeviceId::cpu()));
+    ASSERT_TRUE(orchestrator->hasInferenceState());
+
+    const auto &state = orchestrator->inferenceState();
+    ASSERT_NE(state.kv_cache, nullptr);
+    auto *cpu_cache = dynamic_cast<ICPUKVCache *>(state.kv_cache.get());
+    ASSERT_NE(cpu_cache, nullptr);
+    EXPECT_NE(dynamic_cast<CPURingKVCache<ActivationPrecision::FP32> *>(cpu_cache), nullptr);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_UsesPositionMajor)

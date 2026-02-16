@@ -34,7 +34,7 @@
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
 #include "kernels/cpu/attention/CPUAttentionKernelT.h"
-#include "kernels/cpu/CPUKVCache.h"
+#include "kernels/cpu/CPURingKVCache.h"
 #endif
 
 #include <vector>
@@ -852,7 +852,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
 
     // Build Q8_1 cache and gather consumed K/V through IKVCache path
     MPIContext local_mpi_ctx(0, 1, MPI_COMM_WORLD);
-    auto kv_cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+    auto kv_cache = std::make_unique<CPURingKVCache<ActivationPrecision::Q8_1>>(
         local_mpi_ctx,
         1,      // layers
         1,      // batch_size
@@ -980,7 +980,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_NonCaus
         false));
 
     MPIContext local_mpi_ctx(0, 1, MPI_COMM_WORLD);
-    auto kv_cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+    auto kv_cache = std::make_unique<CPURingKVCache<ActivationPrecision::Q8_1>>(
         local_mpi_ctx, 1, 1, kv_len, n_kv_heads, head_dim, DeviceId::cpu());
 
     auto k_q81 = Q8_1Tensor::quantize_from_fp32(

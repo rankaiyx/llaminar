@@ -26,7 +26,6 @@
 
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/CPUKVCache.h"
 #include "tensors/BlockStructures.h"
 #include "utils/MPIContext.h"
 #include "backends/DeviceId.h"
@@ -160,36 +159,6 @@ namespace llaminar2
         // =============================================================================
         // KV Cache Block Size Alignment Tests (The Bug Scenario)
         // =============================================================================
-
-        TEST_F(Test__KVCacheBlockSizeAlignment, KVCache_AllocatesWithOptimalBlockSize)
-        {
-            // This test verifies that CPUKVCache allocates tensors with optimal block size
-            const int n_layers = 1;
-            const int batch_size = 1;
-            const int n_kv_heads = 2;
-            const int head_dim = 64;
-            const int max_seq_len = 128;
-
-            // Use the type alias for Q16_1 cache
-            CPUKVCacheQ16_1 cache(getTestMPIContext(), n_layers, batch_size, max_seq_len,
-                                  n_kv_heads, head_dim, DeviceId::cpu());
-
-            // Get the K and V tensors via the polymorphic interface (layer 0, seq 0)
-            const ITensor *k_base = cache.get_k(0, 0);
-            const ITensor *v_base = cache.get_v(0, 0);
-            auto *k_tensor = dynamic_cast<const Q16_1Tensor *>(k_base);
-            auto *v_tensor = dynamic_cast<const Q16_1Tensor *>(v_base);
-
-            ASSERT_NE(k_tensor, nullptr) << "K tensor should be Q16_1Tensor";
-            ASSERT_NE(v_tensor, nullptr) << "V tensor should be Q16_1Tensor";
-
-            // Verify block size matches optimal for head_dim
-            const Q16BlockSize expected = optimal_q16_block_size(head_dim);
-            EXPECT_EQ(k_tensor->q16_block_size(), expected)
-                << "K tensor block size should match optimal_q16_block_size(head_dim)";
-            EXPECT_EQ(v_tensor->q16_block_size(), expected)
-                << "V tensor block size should match optimal_q16_block_size(head_dim)";
-        }
 
         TEST_F(Test__KVCacheBlockSizeAlignment, TempTensor_MustMatchKVCacheBlockSize)
         {

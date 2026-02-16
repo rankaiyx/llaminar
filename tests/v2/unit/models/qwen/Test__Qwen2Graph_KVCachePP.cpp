@@ -18,7 +18,7 @@
 
 #include <gtest/gtest.h>
 #include "models/qwen/Qwen2Graph.h"
-#include "kernels/cpu/CPUKVCache.h"
+#include "kernels/cpu/CPURingKVCache.h"
 #include "tensors/TensorFactory.h"
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/FusedAttentionWoStage.h"
@@ -79,10 +79,10 @@ namespace
         // =========================================================================
         // Create a CPUKVCache with n_layers and populate it with tokens
         // =========================================================================
-        std::unique_ptr<CPUKVCache<ActivationPrecision::FP32>> createPopulatedCache(
+        std::unique_ptr<CPURingKVCache<ActivationPrecision::FP32>> createPopulatedCache(
             int n_layers, int tokens_per_layer)
         {
-            auto cache = std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
+            auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::FP32>>(
                 *mpi_ctx_, n_layers, /*batch_size=*/1, MAX_SEQ_LEN,
                 N_KV_HEADS, HEAD_DIM);
 
@@ -443,7 +443,7 @@ namespace
         auto graph_builder = createGraph(PP_OFFSET);
 
         // Create an EMPTY 2-layer cache (prefill mode)
-        auto cache = std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
+        auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::FP32>>(
             *mpi_ctx_, /*n_layers=*/2, /*batch_size=*/1, MAX_SEQ_LEN,
             N_KV_HEADS, HEAD_DIM);
 
@@ -490,7 +490,7 @@ namespace
         auto graph_builder = createGraph(PP_OFFSET);
 
         // Create a 2-layer cache with different token counts per layer
-        auto cache = std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
+        auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::FP32>>(
             *mpi_ctx_, /*n_layers=*/2, /*batch_size=*/1, MAX_SEQ_LEN,
             N_KV_HEADS, HEAD_DIM);
 
@@ -570,7 +570,7 @@ namespace
         auto graph_builder = createGraph(PP_OFFSET);
 
         // Empty cache (prefill mode)
-        auto cache = std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
+        auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::FP32>>(
             *mpi_ctx_, /*n_layers=*/2, /*batch_size=*/1, MAX_SEQ_LEN,
             N_KV_HEADS, HEAD_DIM);
 

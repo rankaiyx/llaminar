@@ -75,17 +75,17 @@ Enable device-aware KVCache creation through `KernelFactory::createKVCache()`. C
 
 | Implementation | File | Precision Support |
 |---------------|------|-------------------|
-| `CPUKVCache<T>` | `src/v2/kv_cache/CPUKVCache.h` | FP32, BF16, FP16, Q8_1, Q16_1 |
+| `CPURingKVCache<T>` | `src/v2/kernels/cpu/CPURingKVCache.h` | FP32, BF16, FP16, Q8_1, Q16_1 |
 | `CUDARingKVCache<T>` | `src/v2/kernels/cuda/CUDARingKVCache.h` | FP32, BF16, FP16 |
-| `ShardedCPUKVCache<T>` | (via CPUKVCache constructors) | Same as CPU |
+| `ShardedCPURingKVCache<T>` | (via CPURingKVCache constructors) | Same as CPU |
 
 **Current Creation (GraphOrchestrator.cpp lines 1000-1060)**:
 ```cpp
 // Always creates CPU cache - no CUDA path!
 if (use_sharded_cache && mpi_ctx_->world_size() > 1) {
-    state_.kv_cache = createShardedCPUKVCache(...);
+    state_.kv_cache = createShardedCPURingKVCache(...);
 } else {
-    state_.kv_cache = createCPUKVCache(...);
+    state_.kv_cache = createCPURingKVCache(...);
 }
 ```
 
@@ -177,13 +177,13 @@ std::unique_ptr<ICPUKVCache> KernelFactory::createCPUKVCache(const KVCacheConfig
     }
     
     if (config.is_sharded()) {
-        return llaminar2::createShardedCPUKVCache(
+        return llaminar2::createShardedCPURingKVCache(
             config.precision, *config.mpi_ctx,
             config.n_layers, config.batch_size, config.max_seq_len,
             config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
             config.head_dim, config.device, config.layout_mode);
     } else {
-        return llaminar2::createCPUKVCache(
+        return llaminar2::createCPURingKVCache(
             config.precision, *config.mpi_ctx,
             config.n_layers, config.batch_size, config.max_seq_len,
             config.n_kv_heads, config.head_dim, config.device, config.layout_mode);

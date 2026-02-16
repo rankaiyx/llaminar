@@ -29,7 +29,7 @@ Location: `src/v2/kernels/cpu/`
 
 ```
 kernels/cpu/
-├── CPUKVCache.cpp/h          # KV cache for CPU layers
+├── CPURingKVCache.cpp/h      # Ring KV cache for CPU layers
 ├── CPUKernelBase.h           # Base class for CPU kernels
 ├── attention/                 # Attention kernels
 │   ├── CPUAttentionKernelT.h  # Template attention (FP32/BF16/FP16/Q8_1)

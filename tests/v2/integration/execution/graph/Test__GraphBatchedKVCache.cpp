@@ -18,7 +18,7 @@
 #include <cmath>
 #include <numeric>
 
-#include "v2/kernels/cpu/CPUKVCache.h"
+#include "v2/kernels/cpu/CPURingKVCache.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/models/qwen/Qwen2Graph.h"
 #include "v2/backends/DeviceId.h"
@@ -102,10 +102,10 @@ protected:
     /**
      * @brief Create an FP32 KV cache for testing
      */
-    std::unique_ptr<CPUKVCache<ActivationPrecision::FP32>> createTestKVCache(
+    std::unique_ptr<CPURingKVCache<ActivationPrecision::FP32>> createTestKVCache(
         int max_seq_len, int batch_size)
     {
-        return std::make_unique<CPUKVCache<ActivationPrecision::FP32>>(
+        return std::make_unique<CPURingKVCache<ActivationPrecision::FP32>>(
             *mpi_ctx_,
             n_layers_,
             batch_size,
@@ -172,7 +172,7 @@ protected:
      * @brief Verify cache contents match expected pattern for a specific sequence
      */
     void verifyCacheSequence(
-        CPUKVCache<ActivationPrecision::FP32> *cache,
+        CPURingKVCache<ActivationPrecision::FP32> *cache,
         int layer_idx,
         int seq_idx,
         int expected_batch_idx,
@@ -691,7 +691,7 @@ TEST_F(GraphBatchedKVCacheTest, KVCacheAppendStage_FP16Cache_ConvertsFromFP32Inp
     const int max_seq_len = 64;
     const int test_layer = 0;
 
-    auto cache = std::make_unique<CPUKVCache<ActivationPrecision::FP16>>(
+    auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::FP16>>(
         *mpi_ctx_,
         n_layers_,
         batch_size,
@@ -763,7 +763,7 @@ TEST_F(GraphBatchedKVCacheTest, KVCacheAppendStage_Q81Cache_BatchedConvertsFromF
     const int max_seq_len = 64;
     const int test_layer = 0;
 
-    auto cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+    auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::Q8_1>>(
         *mpi_ctx_,
         n_layers_,
         batch_size,
@@ -1174,7 +1174,7 @@ TEST_F(GraphBatchedKVCacheTest, KVCacheGatherStage_Q81Cache_GathersQuantizedOutp
     const int seq0_len = 3;
     const int seq1_len = 5;
 
-    auto cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+    auto cache = std::make_unique<CPURingKVCache<ActivationPrecision::Q8_1>>(
         *mpi_ctx_,
         n_layers_,
         batch_size,

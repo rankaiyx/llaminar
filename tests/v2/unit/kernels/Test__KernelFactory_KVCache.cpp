@@ -11,7 +11,7 @@
 
 #include <gtest/gtest.h>
 #include "kernels/KernelFactory.h"
-#include "kernels/cpu/CPUKVCache.h"
+#include "kernels/cpu/CPURingKVCache.h"
 #include "utils/MPIContext.h"
 #include "backends/DeviceId.h"
 #include "execution/config/RuntimeConfig.h"
@@ -31,16 +31,13 @@ namespace llaminar2::test
 
     class Test__KernelFactory_KVCache : public ::testing::Test
     {
-    protected:
-        void SetUp() override {}
-        void TearDown() override {}
     };
 
     // =============================================================================
     // Test: CPU KVCache Creation with FP32 precision
     // =============================================================================
 
-    TEST_F(Test__KernelFactory_KVCache, CreateCPUKVCache_FP32)
+    TEST_F(Test__KernelFactory_KVCache, CreateCPUKVCache_FP32_DefaultsToRing)
     {
         KVCacheConfig config;
         config.precision = ActivationPrecision::FP32;
@@ -62,6 +59,28 @@ namespace llaminar2::test
         EXPECT_EQ(cache->n_kv_heads(), 4);
         EXPECT_EQ(cache->local_n_kv_heads(), 4); // Non-sharded: local == total
         EXPECT_FALSE(cache->is_sharded());
+        EXPECT_NE(dynamic_cast<CPURingKVCache<ActivationPrecision::FP32> *>(cache.get()), nullptr);
+    }
+
+    TEST_F(Test__KernelFactory_KVCache, CreateShardedCPUKVCache_FP32)
+    {
+        KVCacheConfig config;
+        config.precision = ActivationPrecision::FP32;
+        config.device = DeviceId::cpu();
+        config.num_layers = 4;
+        config.batch_size = 1;
+        config.max_seq_len = 128;
+        config.n_kv_heads = 8;
+        config.local_n_kv_heads = 4;
+        config.kv_head_start = 0;
+        config.head_dim = 64;
+        config.mpi_ctx = &getTestMPIContext();
+
+        auto cache = KernelFactory::createCPUKVCache(config);
+
+        ASSERT_NE(cache, nullptr);
+        EXPECT_TRUE(cache->is_sharded());
+        EXPECT_NE(dynamic_cast<CPURingKVCache<ActivationPrecision::FP32> *>(cache.get()), nullptr);
     }
 
     // =============================================================================

@@ -982,7 +982,9 @@ namespace llaminar
                 /**
                  * @brief Create a CPU KV cache
                  *
-                 * Creates either a standard or sharded CPU KV cache based on config:
+                 * Creates a ring-buffer CPU KV cache implementation.
+                 *
+                 * Supports both standard and sharded modes based on config:
                  * - If config.is_sharded() → sharded cache for tensor parallelism
                  * - Otherwise → standard cache
                  *

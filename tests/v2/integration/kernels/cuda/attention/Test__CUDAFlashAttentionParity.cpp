@@ -26,7 +26,7 @@
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
 #include "utils/MPIContext.h"
-#include "kernels/cpu/CPUKVCache.h"
+#include "kernels/cpu/CPURingKVCache.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -654,7 +654,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
         true));
 
     MPIContext local_mpi_ctx(0, 1, MPI_COMM_WORLD);
-    auto kv_cache = std::make_unique<CPUKVCache<ActivationPrecision::Q8_1>>(
+    auto kv_cache = std::make_unique<CPURingKVCache<ActivationPrecision::Q8_1>>(
         local_mpi_ctx,
         1,
         1,

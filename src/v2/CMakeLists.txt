@@ -1261,7 +1261,7 @@ add_library(llaminar2_core STATIC
     tensors/IQ1_STensor.cpp
     tensors/IQ1_MTensor.cpp
     # KV Cache implementation (moved from tensors/)
-    kernels/cpu/CPUKVCache.cpp
+    kernels/cpu/CPURingKVCache.cpp
     # Vectorized primitives (ported from V1)
     kernels/cpu/primitives/RoPEPrimitives.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp

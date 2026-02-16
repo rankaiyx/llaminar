@@ -19,7 +19,7 @@
 #include "cpu/attention/CPUFlashAttentionKernelT.h"
 
 // KVCache includes
-#include "cpu/CPUKVCache.h"
+#include "cpu/CPURingKVCache.h"
 #ifdef HAVE_CUDA
 #include "cuda/kvcache/CUDARingKVCache.h"
 #endif
@@ -3985,7 +3985,7 @@ namespace llaminar
 
                 if (config.is_sharded())
                 {
-                    LOG_DEBUG("[KernelFactory] Creating sharded CPU KVCache: "
+                    LOG_DEBUG("[KernelFactory] Creating sharded CPU RingKVCache: "
                               << "precision=" << llaminar2::activationPrecisionToString(config.precision)
                               << ", layers=" << config.num_layers
                               << ", n_kv_heads=" << config.n_kv_heads
@@ -3994,7 +3994,7 @@ namespace llaminar
                               << ", head_dim=" << config.head_dim
                               << ", max_seq_len=" << config.max_seq_len);
 
-                    return llaminar2::createShardedCPUKVCache(
+                    return llaminar2::createShardedCPURingKVCache(
                         config.precision,
                         *config.mpi_ctx,
                         config.num_layers,
@@ -4009,14 +4009,14 @@ namespace llaminar
                 }
                 else
                 {
-                    LOG_DEBUG("[KernelFactory] Creating standard CPU KVCache: "
+                    LOG_DEBUG("[KernelFactory] Creating standard CPU RingKVCache: "
                               << "precision=" << llaminar2::activationPrecisionToString(config.precision)
                               << ", layers=" << config.num_layers
                               << ", n_kv_heads=" << config.n_kv_heads
                               << ", head_dim=" << config.head_dim
                               << ", max_seq_len=" << config.max_seq_len);
 
-                    return llaminar2::createCPUKVCache(
+                    return llaminar2::createCPURingKVCache(
                         config.precision,
                         *config.mpi_ctx,
                         config.num_layers,
