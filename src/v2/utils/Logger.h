@@ -13,6 +13,7 @@
 #include <string>
 #include <chrono>
 #include <iomanip>
+#include <cstdio>
 #include <ctime>
 #include <deque>
 #include <mutex>
@@ -203,10 +204,12 @@ namespace llaminar2
                           now.time_since_epoch()) %
                       1000;
 
-            std::ostringstream oss;
-            oss << std::put_time(std::localtime(&time_t), "%H:%M:%S");
-            oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
-            return oss.str();
+            char buf[16]; // "HH:MM:SS.mmm" = 12 chars + null
+            std::tm tm_buf;
+            std::strftime(buf, sizeof(buf), "%H:%M:%S", localtime_r(&time_t, &tm_buf));
+            // Append ".mmm"
+            std::snprintf(buf + 8, sizeof(buf) - 8, ".%03d", static_cast<int>(ms.count()));
+            return std::string(buf, 12);
         }
 
     private:
@@ -303,28 +306,37 @@ namespace llaminar2
 } // namespace llaminar2
 
 // Convenience macros for logging with file/line tracking
-#define LOG_ERROR(msg)                                                                                       \
-    do                                                                                                       \
-    {                                                                                                        \
-        std::ostringstream oss;                                                                              \
-        oss << msg;                                                                                          \
-        ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::ERROR, oss.str(), __FILE__, __LINE__); \
+#define LOG_ERROR(msg)                                                                                           \
+    do                                                                                                           \
+    {                                                                                                            \
+        if (::llaminar2::Logger::getInstance().shouldLog(::llaminar2::LogLevel::ERROR))                          \
+        {                                                                                                        \
+            std::ostringstream oss;                                                                              \
+            oss << msg;                                                                                          \
+            ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::ERROR, oss.str(), __FILE__, __LINE__); \
+        }                                                                                                        \
     } while (0)
 
-#define LOG_WARN(msg)                                                                                       \
-    do                                                                                                      \
-    {                                                                                                       \
-        std::ostringstream oss;                                                                             \
-        oss << msg;                                                                                         \
-        ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::WARN, oss.str(), __FILE__, __LINE__); \
+#define LOG_WARN(msg)                                                                                           \
+    do                                                                                                          \
+    {                                                                                                           \
+        if (::llaminar2::Logger::getInstance().shouldLog(::llaminar2::LogLevel::WARN))                          \
+        {                                                                                                       \
+            std::ostringstream oss;                                                                             \
+            oss << msg;                                                                                         \
+            ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::WARN, oss.str(), __FILE__, __LINE__); \
+        }                                                                                                       \
     } while (0)
 
-#define LOG_INFO(msg)                                                                                       \
-    do                                                                                                      \
-    {                                                                                                       \
-        std::ostringstream oss;                                                                             \
-        oss << msg;                                                                                         \
-        ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::INFO, oss.str(), __FILE__, __LINE__); \
+#define LOG_INFO(msg)                                                                                           \
+    do                                                                                                          \
+    {                                                                                                           \
+        if (::llaminar2::Logger::getInstance().shouldLog(::llaminar2::LogLevel::INFO))                          \
+        {                                                                                                       \
+            std::ostringstream oss;                                                                             \
+            oss << msg;                                                                                         \
+            ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::INFO, oss.str(), __FILE__, __LINE__); \
+        }                                                                                                       \
     } while (0)
 
 #define LOG_DEBUG(msg)                                                                                                     \
@@ -350,12 +362,15 @@ namespace llaminar2
     } while (0)
 
 // Simple logging without location info
-#define LOG(level, msg)                                           \
-    do                                                            \
-    {                                                             \
-        std::ostringstream oss;                                   \
-        oss << msg;                                               \
-        ::llaminar2::Logger::getInstance().log(level, oss.str()); \
+#define LOG(level, msg)                                               \
+    do                                                                \
+    {                                                                 \
+        if (::llaminar2::Logger::getInstance().shouldLog(level))      \
+        {                                                             \
+            std::ostringstream oss;                                   \
+            oss << msg;                                               \
+            ::llaminar2::Logger::getInstance().log(level, oss.str()); \
+        }                                                             \
     } while (0)
 
 /**

@@ -1,3 +1,55 @@
+/**
+ * @file CPUFlashAttentionKernelT.h
+ * @brief Flash Attention kernel for CPU, using tiled online softmax.
+ *
+ * ## What is Flash Attention?
+ *
+ * Standard attention computes `softmax(Q·K^T / √d) · V` by first materialising
+ * the full `seq_len × kv_len` score matrix, running softmax over every row, and
+ * then multiplying by V.  For long sequences this score matrix can be enormous
+ * (e.g. 4096² × sizeof(float) ≈ 64 MB per head) and thrashes the CPU cache.
+ *
+ * Flash Attention avoids ever materialising the full score matrix.  Instead it
+ * processes K/V in *tiles* of `kv_tile` positions at a time, computing a partial
+ * softmax that is corrected "on the fly" as new tiles arrive.  This is called
+ * **online softmax** (see Milakov & Gimelshein 2018).  Only a small tile of
+ * scores lives in L1/L2 at a time, giving a dramatic cache-locality win.
+ *
+ * ## Template parameter
+ *
+ * The kernel is templated on `ActivationPrecision` so the same code serves
+ * FP32, BF16, and FP16 builds.  When `Precision ≠ FP32`, the kernel delegates
+ * to a `CPUAttentionKernelT<Precision>` fallback that handles non-float paths.
+ *
+ * ## Integer quantised prefill path (I16/I12)
+ *
+ * For long prefill sequences the QK dot-products can optionally be computed in
+ * integer arithmetic using 16-bit quantisation with a 12-bit value range
+ * (qmax ≈ 2047).  When AVX-512 VNNI is available this uses the `VPDPWSSD`
+ * instruction which does 32 × int16 multiply-add per cycle.  Two consecutive K
+ * rows are packed into a single "pair" buffer so a single VNNI loop produces
+ * two dot-products at once.  This is a significant speedup for prefill where
+ * `seq_len × kv_len` can be in the millions.
+ *
+ * ## How this file is organised
+ *
+ * 1. `detail::CacheAwareFlashKVTilePolicy` – chooses the KV tile size based on
+ *    the CPU cache hierarchy and the actual working-set size.
+ * 2. `detail::FlashAttentionPrecisionToTensor` – maps `ActivationPrecision`
+ *    enum values to concrete tensor classes (FP32Tensor, BF16Tensor, …).
+ * 3. `CPUFlashAttentionKernelT<Precision>` – the main kernel class.
+ *    - Public API: `compute()`, `compute_batch()`, `compute_decode()`,
+ *      `compute_tensor()` – front-end methods matching the `ITensorAttention`
+ *      interface.
+ *    - Private helpers: SIMD dot-products, quantisation routines, and the
+ *      core `compute_flash_fp32()` tiled-softmax implementation.
+ *
+ * @see CPUAttentionKernelT  The non-flash fallback kernel used for non-FP32
+ *                           precisions and for sharded (tensor-parallel) heads.
+ * @see ITensorAttention     The polymorphic interface this class implements.
+ * @see AttentionCacheConfig  Cache-hierarchy model used by the tile policy.
+ */
+
 #pragma once
 
 #include "../../../tensors/TensorKernels.h"
@@ -28,6 +80,40 @@ namespace llaminar2
 {
     namespace detail
     {
+        /**
+         * @brief Cache-aware policy that decides how many KV positions to process per tile.
+         *
+         * ## Why tile size matters
+         *
+         * Flash Attention iterates over KV positions in tiles.  Each tile loads
+         * `kv_tile` rows of K *and* V into registers / L1 cache, computes the
+         * partial QK scores, runs partial softmax, and accumulates into the
+         * output.  A tile that is too large spills to L2/L3 and loses cache
+         * locality; a tile that is too small pays excessive loop overhead.
+         *
+         * This policy inspects the CPU cache hierarchy (L1/L2/L3 sizes fetched
+         * once from `AttentionCacheConfig`) and picks the largest power-of-two
+         * tile that keeps the per-tile working set within a target fraction of
+         * the relevant cache level.
+         *
+         * ## Template parameters
+         *
+         * @tparam DecodeTargetPct    Target percentage of the cache to use during
+         *                            decode (single-token generation).  Default 50%.
+         * @tparam PrefillTargetPct   Target percentage during prefill (multi-token).
+         *                            Default 37% – lower because prefill has more
+         *                            concurrent data (Q rows × K tile).
+         * @tparam DecodeMinTile      Minimum tile size for decode.  Must be ≥ 1.
+         * @tparam DecodeMaxTile      Maximum tile size for decode.
+         * @tparam PrefillMinTile     Minimum tile size for prefill.
+         * @tparam PrefillMaxTile     Maximum tile size for prefill.
+         *
+         * ## Environment overrides
+         *
+         * The tile size can be overridden at runtime with the debug environment
+         * variables `LLAMINAR_ATTN_FLASH_KV_TILE_DECODE` and
+         * `LLAMINAR_ATTN_FLASH_KV_TILE_PREFILL` (see `debugEnv()`).
+         */
         template <int DecodeTargetPct,
                   int PrefillTargetPct,
                   int DecodeMinTile,
@@ -39,6 +125,27 @@ namespace llaminar2
             static_assert(DecodeTargetPct > 0 && DecodeTargetPct <= 100, "DecodeTargetPct must be in (0, 100]");
             static_assert(PrefillTargetPct > 0 && PrefillTargetPct <= 100, "PrefillTargetPct must be in (0, 100]");
 
+            /**
+             * @brief Select the optimal KV tile size for the given attention parameters.
+             *
+             * The algorithm works as follows:
+             * 1. Check for a user-supplied override via the debug environment.
+             * 2. Build an `AttentionCacheConfig` to query the CPU cache hierarchy.
+             * 3. Compute the bytes needed per KV position in a tile
+             *    (one K row + one V row + one score float).
+             * 4. Pick the cache level that best matches the work size (SMALL → L1,
+             *    LARGE → L2, XL → L3/8).
+             * 5. Divide the usable cache budget by the per-position cost to get
+             *    the raw tile size, then clamp to the nearest power-of-two within
+             *    the [min, max] range.
+             *
+             * @param head_dim    Dimension per attention head (e.g. 64 or 128).
+             * @param n_kv_heads  Number of key/value heads (for GQA/MQA).
+             * @param kv_len      Current key/value sequence length.
+             * @param is_decode   True when generating one token at a time (decode),
+             *                    false during prompt prefill.
+             * @return Tile size as a power of two, in range [MinTile, MaxTile].
+             */
             static int choose(int head_dim, int n_kv_heads, int kv_len, bool is_decode)
             {
                 const int override_tile = tile_override(is_decode);
@@ -87,6 +194,18 @@ namespace llaminar2
             }
 
         private:
+            /**
+             * @brief Round a value down to the nearest power-of-two within [min_tile, max_tile].
+             *
+             * The flash-attention loop benefits from power-of-two tile sizes
+             * because the inner loops can be fully unrolled by the compiler and
+             * SIMD widths (16 floats for AVX-512) divide evenly.
+             *
+             * @param value     Raw (non-power-of-two) tile size estimate.
+             * @param min_tile  Floor – never return less than this.
+             * @param max_tile  Ceiling – never return more than this.
+             * @return The clamped power-of-two tile size.
+             */
             static int clamp_to_power2(int value, int min_tile, int max_tile)
             {
                 if (value <= 0)
@@ -111,6 +230,14 @@ namespace llaminar2
                 return std::max(1, p2);
             }
 
+            /**
+             * @brief Check for a user-supplied tile-size override from the debug environment.
+             *
+             * Returns 0 (meaning "no override") when the relevant env var is unset.
+             *
+             * @param is_decode  Whether we are in decode (true) or prefill (false).
+             * @return The override value, or 0 if none was set.
+             */
             static int tile_override(bool is_decode)
             {
                 const auto &env = debugEnv();
@@ -120,8 +247,28 @@ namespace llaminar2
             }
         };
 
+        /**
+         * @brief The default tile-size policy used by CPUFlashAttentionKernelT.
+         *
+         * Parameters:
+         * - Decode: target 50% of cache, tiles in [8, 32].
+         * - Prefill: target 37% of cache, tiles in [4, 32].
+         */
         using DefaultFlashKVTilePolicy = CacheAwareFlashKVTilePolicy<50, 37, 8, 32, 4, 32>;
 
+        /**
+         * @brief Compile-time map from ActivationPrecision → concrete tensor type.
+         *
+         * The flash attention kernel needs to know which tensor class
+         * corresponds to each precision enum value so it can declare typed
+         * aliases.  Each specialisation below simply defines a `Type` member.
+         *
+         * Example:
+         * @code
+         * using TensorT = FlashAttentionPrecisionToTensor<ActivationPrecision::FP32>::Type;
+         * // TensorT == FP32Tensor
+         * @endcode
+         */
         template <ActivationPrecision P>
         struct FlashAttentionPrecisionToTensor;
 
@@ -144,21 +291,103 @@ namespace llaminar2
         };
     }
 
+    /**
+     * @brief CPU Flash Attention kernel with tiled online softmax.
+     *
+     * This class implements the `ITensorAttention` interface using an
+     * *online-softmax flash-attention* algorithm on the CPU.  It is the
+     * primary attention kernel used during CPU inference in Llaminar V2.
+     *
+     * ## How online softmax works (simplified)
+     *
+     * Traditional softmax requires two passes over the score vector:
+     *   1. Find the maximum (for numerical stability).
+     *   2. Compute `exp(s - max)` and sum, then normalise.
+     *
+     * Online softmax fuses both passes into a single streaming pass by
+     * maintaining a *running maximum* (`running_m`) and a *running
+     * denominator* (`running_l`).  When a new tile of KV positions arrives
+     * with a new local maximum, the previously accumulated output and
+     * denominator are *rescaled* by `exp(old_max − new_max)` before the new
+     * tile's contributions are added.  At the end, the accumulated output is
+     * divided by `running_l` to produce the final normalised result.
+     *
+     * ## Precision handling
+     *
+     * When `Precision == FP32`, all work is done directly in this kernel.
+     * For BF16 and FP16, the kernel delegates to the `CPUAttentionKernelT`
+     * fallback which handles mixed-precision conversions.  This delegation
+     * is resolved entirely at compile time via `if constexpr`.
+     *
+     * ## Thread safety
+     *
+     * All parallel work is wrapped in `OMP_WORKSHARE_REGION()` so the kernel
+     * can participate in an outer parallel region without redundant thread
+     * fork/join overhead (see copilot-instructions.md § OpenMP).
+     *
+     * @tparam Precision  The activation storage format.  Currently FP32 is
+     *                    fully optimised; BF16/FP16 fall back to the non-flash
+     *                    implementation.
+     *
+     * @see CPUAttentionKernelT  The fallback kernel for non-FP32 precisions.
+     * @see CacheAwareFlashKVTilePolicy  Tile-size selection logic.
+     */
     template <ActivationPrecision Precision>
     class CPUFlashAttentionKernelT : public ITensorAttention
     {
     public:
+        /** @brief The concrete tensor class for this precision (e.g. FP32Tensor). */
         using TensorT = typename detail::FlashAttentionPrecisionToTensor<Precision>::Type;
+        /** @brief The scalar element type for this precision (e.g. float). */
         using ElementType = typename primitives::ActivationTraits<TensorT>::ElementType;
 
         CPUFlashAttentionKernelT() = default;
         ~CPUFlashAttentionKernelT() override = default;
 
+        /**
+         * @brief Reports whether this kernel can run on a given device.
+         *
+         * Flash attention is a CPU-only kernel, so it only supports device -1
+         * (the host / CPU device sentinel).
+         *
+         * @param device_idx  Device index to check (-1 = CPU).
+         * @return true if `device_idx == -1`, false otherwise.
+         */
         bool supports_device(int device_idx) const override
         {
             return device_idx == -1;
         }
 
+        /**
+         * @brief Compute attention for a single-batch, equal-length Q/KV input.
+         *
+         * This is the simplest entry point: `seq_len == kv_len`, batch size 1.
+         * Raw float pointers are expected in row-major layout:
+         *   - Q, K, V: `[seq_len, n_heads/n_kv_heads * head_dim]`
+         *   - output:   `[seq_len, n_heads * head_dim]`
+         *
+         * If the precision is not FP32, the call is forwarded to the
+         * `CPUAttentionKernelT` fallback.
+         *
+         * @param Q               Query matrix, shape [seq_len, n_heads * head_dim].
+         * @param K               Key matrix,   shape [seq_len, n_kv_heads * head_dim].
+         * @param V               Value matrix, shape [seq_len, n_kv_heads * head_dim].
+         * @param output          Output buffer, same shape as Q.
+         * @param seq_len         Number of query (and key/value) positions.
+         * @param n_heads         Number of query attention heads.
+         * @param n_kv_heads      Number of key/value heads (≤ n_heads; GQA when < n_heads).
+         * @param head_dim        Dimension per head (e.g. 64 or 128).
+         * @param causal          If true, positions can only attend to earlier positions.
+         * @param window_size     Sliding-window size (-1 = unlimited).
+         * @param workspace_scores  (unused) Pre-allocated score workspace.
+         * @param workspace_buffer  (unused) Pre-allocated scratch buffer.
+         * @param workspace_context (unused) Pre-allocated context buffer.
+         * @param workspace_mask  Optional additive mask [seq_len, kv_len].
+         * @param use_bf16        (unused) BF16 hint – precision is selected at compile time.
+         * @param mpi_ctx         (unused) MPI context.
+         * @param device_idx      (unused) Device index.
+         * @return true on success, false on failure.
+         */
         bool compute(
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int n_heads, int n_kv_heads, int head_dim,
@@ -197,6 +426,26 @@ namespace llaminar2
                                       mask);
         }
 
+        /**
+         * @brief Compute attention for multiple independent sequences (batch > 1).
+         *
+         * Each batch element is processed sequentially by calling
+         * `compute_flash_fp32()` with the appropriate pointer offsets.
+         * Parallelism happens *within* each batch element (over heads).
+         *
+         * @param Q           Query tensor, shape   [batch, seq_len, n_heads * head_dim].
+         * @param K           Key tensor,   shape   [batch, seq_len, n_kv_heads * head_dim].
+         * @param V           Value tensor, shape   [batch, seq_len, n_kv_heads * head_dim].
+         * @param output      Output tensor, shape  [batch, seq_len, n_heads * head_dim].
+         * @param batch_size  Number of independent sequences.
+         * @param seq_len     Positions per sequence (same for Q and KV here).
+         * @param n_heads     Number of query heads.
+         * @param n_kv_heads  Number of key/value heads.
+         * @param head_dim    Dimension per head.
+         * @param causal      Apply causal masking.
+         * @param window_size Sliding-window size (-1 = unlimited).
+         * @return true on success, false if any batch element fails.
+         */
         bool compute_batch(
             const float *Q, const float *K, const float *V, float *output,
             int batch_size, int seq_len, int n_heads, int n_kv_heads, int head_dim,
@@ -245,6 +494,28 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Compute attention for autoregressive decode (seq_len ≠ kv_len).
+         *
+         * During decode, typically `seq_len == 1` (the single new token) while
+         * `kv_len` is the accumulated context length from the KV cache.  The
+         * `position_offset` parameter tells the causal-mask logic what absolute
+         * position the first query token sits at (so the mask is
+         * `q_abs = position_offset + q_pos`).
+         *
+         * @param Q               Query, shape [seq_len, n_heads * head_dim].
+         * @param K               Keys from KV cache, shape [kv_len, n_kv_heads * head_dim].
+         * @param V               Values from KV cache, shape [kv_len, n_kv_heads * head_dim].
+         * @param output          Output, shape [seq_len, n_heads * head_dim].
+         * @param seq_len         Number of query positions (usually 1 in decode).
+         * @param kv_len          Number of cached key/value positions.
+         * @param n_heads         Number of query heads.
+         * @param n_kv_heads      Number of KV heads.
+         * @param head_dim        Dimension per head.
+         * @param causal          Apply causal masking (default true for decode).
+         * @param position_offset Absolute position of the first query token.
+         * @return true on success.
+         */
         bool compute_decode(
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
@@ -265,6 +536,46 @@ namespace llaminar2
                                       nullptr);
         }
 
+        /**
+         * @brief High-level tensor-based entry point used by compute stages.
+         *
+         * This method accepts polymorphic `ITensor` pointers (the common
+         * interface used by `DeviceGraphExecutor` and the compute-stage
+         * framework) and routes to the appropriate raw-pointer method.
+         *
+         * ### Fallback conditions
+         *
+         * The flash path is used only when *all* of the following hold:
+         * - Precision is FP32.
+         * - No head sharding (`head_start == 0`, `local_n_heads == -1`).
+         * - Q and output are FP32 tensors.
+         * - Raw `fp32_data()` pointers are obtainable.
+         *
+         * Otherwise, the call is delegated to the `CPUAttentionKernelT`
+         * fallback which handles mixed precision, sharded heads, and
+         * quantised KV caches.
+         *
+         * @param Q                 Query tensor.
+         * @param K                 Key tensor.
+         * @param V                 Value tensor.
+         * @param output            Output tensor (written in-place).
+         * @param batch_size        Batch dimension.
+         * @param seq_len           Query sequence length.
+         * @param kv_len            Key/Value sequence length.
+         * @param n_heads           Total number of query heads.
+         * @param n_kv_heads        Total number of KV heads.
+         * @param head_dim          Dimension per head.
+         * @param causal            Apply causal masking.
+         * @param window_size       Sliding-window size (-1 = unlimited).
+         * @param workspace_scores  Optional pre-allocated score workspace.
+         * @param workspace_mask    Optional additive mask tensor.
+         * @param mpi_ctx           MPI context (unused on this path).
+         * @param device_idx        Device index (unused, CPU only).
+         * @param head_start        First head index when sharded (0 = unsharded).
+         * @param local_n_heads     Local query heads (-1 = all).
+         * @param local_n_kv_heads  Local KV heads (-1 = all).
+         * @return true on success.
+         */
         bool compute_tensor(
             const ITensor *Q,
             const ITensor *K,
@@ -372,6 +683,13 @@ namespace llaminar2
                            false, mpi_ctx, device_idx);
         }
 
+        /**
+         * @brief Return metadata describing this kernel's I/O for the snapshot framework.
+         *
+         * The snapshot/dump system uses this to know what tensors to capture
+         * (Q, K, V, output) and what scalar parameters exist (seq_len, etc.)
+         * when `LLAMINAR_STAGE_DUMP_ENABLED=1`.
+         */
         KernelSnapshotInfo getKernelSnapshotInfo() const override
         {
             return KernelSnapshotInfo::attention()
@@ -388,8 +706,28 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Non-flash fallback kernel.
+         *
+         * Used for non-FP32 precisions and for sharded-head (tensor parallel)
+         * configurations that the flash path does not yet handle.
+         */
         CPUAttentionKernelT<Precision> fallback_;
 
+        // -----------------------------------------------------------------
+        // Dot-product helpers
+        // -----------------------------------------------------------------
+
+        /**
+         * @brief Scalar (no-SIMD) dot product of two FP32 vectors.
+         *
+         * Used as a fallback when AVX-512 is not available at compile time.
+         *
+         * @param a  First input vector.
+         * @param b  Second input vector.
+         * @param n  Number of elements.
+         * @return   The dot product `Σ a[i]*b[i]`.
+         */
         static float dot_fp32_scalar(const float *a, const float *b, int n)
         {
             float sum = 0.0f;
@@ -400,6 +738,18 @@ namespace llaminar2
             return sum;
         }
 
+        /**
+         * @brief AVX-512 vectorised dot product of two FP32 vectors.
+         *
+         * Processes 16 floats per iteration using `_mm512_fmadd_ps`, with a
+         * scalar tail loop for the remaining elements.  Falls back to the
+         * scalar version if AVX-512 is not available at compile time.
+         *
+         * @param a  First input vector.
+         * @param b  Second input vector.
+         * @param n  Number of elements.
+         * @return   The dot product `Σ a[i]*b[i]`.
+         */
         static float dot_fp32_avx512(const float *a, const float *b, int n)
         {
 #if defined(__AVX512F__)
@@ -422,6 +772,24 @@ namespace llaminar2
 #endif
         }
 
+        // -----------------------------------------------------------------
+        // Vector accumulation and scaling helpers
+        // -----------------------------------------------------------------
+
+        /**
+         * @brief Accumulate `weight * v[d]` into `out[d]` for each dimension.
+         *
+         * This is the inner loop of the V accumulation step:
+         * `out[d] += weight * V[k, d]` for one KV position k.
+         *
+         * Uses AVX-512 FMA when available (16 floats/cycle).
+         *
+         * @param out       Running output accumulator, length `head_dim`.
+         * @param v         Value row for this KV position, length `head_dim`.
+         * @param weight    Softmax probability for this KV position.
+         * @param head_dim  Number of dimensions per head.
+         * @param use_avx512 True if AVX-512 is available at runtime.
+         */
         static void accum_weighted_v(float *out, const float *v, float weight, int head_dim, bool use_avx512)
         {
 #if defined(__AVX512F__)
@@ -449,6 +817,18 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Multiply every element of `out` by a scalar `alpha`.
+         *
+         * Used during online softmax to rescale the running accumulator when a
+         * new tile's maximum exceeds the previous running maximum:
+         *   `out[d] *= exp(old_max − new_max)`
+         *
+         * @param out        Vector to scale in-place, length `head_dim`.
+         * @param alpha      Scalar multiplier.
+         * @param head_dim   Vector length.
+         * @param use_avx512 True if AVX-512 is available at runtime.
+         */
         static void scale_vec(float *out, float alpha, int head_dim, bool use_avx512)
         {
 #if defined(__AVX512F__)
@@ -475,8 +855,21 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Divide every element of `out` by `denom`.  No-op if denom ≤ 0.
+         *
+         * Called once at the end of the online softmax for each (head, query)
+         * pair to normalise the accumulated output by the softmax denominator.
+         *
+         * @param out        Vector to normalise in-place.
+         * @param denom      Softmax denominator (sum of exp(scores − max)).
+         * @param head_dim   Vector length.
+         * @param use_avx512 True if AVX-512 is available at runtime.
+         */
         static void div_vec(float *out, float denom, int head_dim, bool use_avx512)
         {
+            // Guard against division by zero or negative denominators which
+            // can occur when all scores were -infinity (completely masked).
             if (denom <= 0.0f)
             {
                 return;
@@ -484,6 +877,33 @@ namespace llaminar2
             scale_vec(out, 1.0f / denom, head_dim, use_avx512);
         }
 
+        // -----------------------------------------------------------------
+        // I16/I12 quantisation helpers for the integer prefill path
+        // -----------------------------------------------------------------
+        // These routines quantise FP32 rows into 16-bit integers using an
+        // absmax scheme with a configurable `qmax` (typically 2047, giving
+        // ~12 effective bits).  The resulting integers can be fed into the
+        // VNNI dot-product routines below for high-throughput QK scoring.
+        //
+        // The "packed pair" variants interleave two K rows into a single
+        // buffer so that a single VNNI loop can compute two dot-products
+        // simultaneously (doubling throughput for the QK phase).
+        // -----------------------------------------------------------------
+
+        /**
+         * @brief Quantise a single FP32 row to int16 using absmax scaling.
+         *
+         * 1. Find the absolute maximum of the row.
+         * 2. Compute `scale = max_abs / qmax`.
+         * 3. Quantise each element: `dst[i] = round(src[i] / scale)`.
+         *
+         * @param src   Source FP32 vector, length `n`.
+         * @param dst   Destination int16 vector, length `n`.
+         * @param n     Number of elements.
+         * @param qmax  Maximum quantised value (e.g. 2047 for "I12").
+         * @return The absmax scale factor.  Multiply `(int_dot * scale_q * scale_k)`
+         *         to recover the approximate FP32 dot product.
+         */
         static float quantize_row_i16_i12(const float *src, int16_t *dst, int n, int qmax)
         {
             float max_abs = 0.0f;
@@ -508,6 +928,20 @@ namespace llaminar2
             return scale;
         }
 
+        /**
+         * @brief Quantise with zero-padding to a multiple of the VNNI width.
+         *
+         * Same as `quantize_row_i16_i12()` but pads the output with zeros
+         * from index `n` to `padded_n - 1`.  The VNNI dot-product routines
+         * operate in 32-element blocks, so the row length must be rounded up.
+         *
+         * @param src       Source FP32 vector.
+         * @param dst       Destination int16 vector, length `padded_n`.
+         * @param n         Actual number of elements.
+         * @param padded_n  Padded length (multiple of 32).
+         * @param qmax      Maximum quantised value.
+         * @return The absmax scale factor.
+         */
         static float quantize_row_i16_i12_padded(const float *src, int16_t *dst, int n, int padded_n, int qmax)
         {
             const float scale = quantize_row_i16_i12(src, dst, n, qmax);
@@ -518,6 +952,28 @@ namespace llaminar2
             return scale;
         }
 
+        /**
+         * @brief Quantise into a "packed pair" buffer for dual-row VNNI.
+         *
+         * Two K rows share one contiguous buffer laid out as interleaved
+         * 32-element blocks:
+         *
+         *   [block0_row0 (32 int16)] [block0_row1 (32 int16)]
+         *   [block1_row0 (32 int16)] [block1_row1 (32 int16)]
+         *   …
+         *
+         * `row_sel` (0 or 1) selects which half of each 64-element block
+         * this call writes into.  The other half is expected to have been
+         * written by a prior call with the other `row_sel`.
+         *
+         * @param src       Source FP32 vector.
+         * @param pair_dst  Packed-pair destination buffer.
+         * @param n         Actual number of elements per row.
+         * @param padded_n  Padded length per row (multiple of 32).
+         * @param qmax      Maximum quantised value.
+         * @param row_sel   Which row slot (0 or 1) to write into.
+         * @return The absmax scale factor for this row.
+         */
         static float quantize_row_i16_i12_to_packedpair(
             const float *src,
             int16_t *pair_dst,
@@ -562,6 +1018,17 @@ namespace llaminar2
             return scale;
         }
 
+        // -----------------------------------------------------------------
+        // Integer dot-product routines (I16 × I16 → I32)
+        // -----------------------------------------------------------------
+        // These compute `Σ a[i]*b[i]` entirely in integer arithmetic.
+        // The VNNI variants use the AVX-512 VPDPWSSD instruction which
+        // performs 32 × (int16 × int16) → int32 accumulate per cycle.
+        // -----------------------------------------------------------------
+
+        /**
+         * @brief Scalar int16 dot product (fallback, no SIMD).
+         */
         static int32_t dot_i16_i16_i32_scalar(const int16_t *a, const int16_t *b, int n)
         {
             int32_t sum = 0;
@@ -572,6 +1039,12 @@ namespace llaminar2
             return sum;
         }
 
+        /**
+         * @brief VNNI-accelerated int16 dot product.
+         *
+         * Uses `_mm512_dpwssd_epi32` which computes 32 int16 multiply-adds
+         * per instruction.  Tail elements are handled by scalar code.
+         */
         static int32_t dot_i16_i16_i32_vnni(const int16_t *a, const int16_t *b, int n)
         {
 #if defined(__AVX512F__) && defined(__AVX512VNNI__)
@@ -602,6 +1075,13 @@ namespace llaminar2
 #endif
         }
 
+        /**
+         * @brief Dual-row VNNI dot product:  `out0 = q·k0` and `out1 = q·k1`.
+         *
+         * Computes two dot-products against two separate K rows in a single
+         * pass over the Q vector, exploiting instruction-level parallelism.
+         * The inner loop is unrolled 2× (64 elements / iteration) for ILP.
+         */
         static void dot_i16_i16_i32_vnni_2row(
             const int16_t *q,
             const int16_t *k0,
@@ -668,6 +1148,19 @@ namespace llaminar2
 #endif
         }
 
+        /**
+         * @brief Dual-row VNNI dot product from a *packed pair* K buffer.
+         *
+         * Like `dot_i16_i16_i32_vnni_2row()` but reads both K rows from a
+         * single interleaved buffer (see `quantize_row_i16_i12_to_packedpair`).
+         * Each 64-element chunk contains [row0_block, row1_block].
+         *
+         * @param q       Quantised query vector, length `n` (padded to 32).
+         * @param k_pair  Packed pair buffer holding two K rows interleaved.
+         * @param n       Padded row length.
+         * @param out0    (out) Dot product with the first K row.
+         * @param out1    (out) Dot product with the second K row.
+         */
         static void dot_i16_i16_i32_vnni_2row_packedpair(
             const int16_t *q,
             const int16_t *k_pair,
@@ -726,6 +1219,28 @@ namespace llaminar2
 #endif
         }
 
+        /**
+         * @brief Quad-row VNNI dot product from two packed-pair K buffers.
+         *
+         * Computes *four* dot-products in a single pass over Q:
+         *   - out0 = Q · K_pair0[row0]
+         *   - out1 = Q · K_pair0[row1]
+         *   - out2 = Q · K_pair1[row0]
+         *   - out3 = Q · K_pair1[row1]
+         *
+         * This is the widest variant and is used when ≥4 consecutive KV
+         * positions remain in the tile, achieving maximum ILP by keeping
+         * four independent accumulator chains active.
+         *
+         * @param q        Quantised query vector, length `n` (padded to 32).
+         * @param k_pair0  First packed-pair buffer (rows 0 and 1).
+         * @param k_pair1  Second packed-pair buffer (rows 2 and 3).
+         * @param n        Padded row length.
+         * @param out0     (out) Dot product with k_pair0, row 0.
+         * @param out1     (out) Dot product with k_pair0, row 1.
+         * @param out2     (out) Dot product with k_pair1, row 0.
+         * @param out3     (out) Dot product with k_pair1, row 1.
+         */
         static void dot_i16_i16_i32_vnni_4row_packedpair(
             const int16_t *q,
             const int16_t *k_pair0,
@@ -814,6 +1329,20 @@ namespace llaminar2
 #endif
         }
 
+        /**
+         * @brief Single-row VNNI dot product from one slot of a packed pair.
+         *
+         * Extracts and dot-products against only one of the two rows stored
+         * in a packed-pair buffer.  Used for the "tail" case when an odd
+         * number of KV positions remain in the tile (the last position has
+         * no partner to pair with).
+         *
+         * @param q        Quantised query vector, length `n`.
+         * @param k_pair   Packed-pair buffer containing two interleaved K rows.
+         * @param n        Padded row length.
+         * @param row_sel  Which row to read: 0 = first row, 1 = second row.
+         * @return The int32 dot product `Σ q[i] * k_pair[row_sel][i]`.
+         */
         static int32_t dot_i16_i16_i32_vnni_single_from_packedpair(
             const int16_t *q,
             const int16_t *k_pair,
@@ -857,6 +1386,61 @@ namespace llaminar2
 #endif
         }
 
+        // =================================================================
+        // Core flash-attention implementation
+        // =================================================================
+
+        /**
+         * @brief Core tiled flash-attention with online softmax (FP32 path).
+         *
+         * This is the heart of the flash attention kernel.  It computes:
+         *
+         *     output[q][h] = softmax( Q[q,h] · K[:,kv_h]^T / √d ) · V[:,kv_h]
+         *
+         * …without ever materialising the full `[seq_len × kv_len]` score matrix.
+         *
+         * ### Algorithm outline
+         *
+         * For each query head `h` and query position `q`:
+         *   1. Initialise `running_m = -∞` (running max) and `running_l = 0`
+         *      (running softmax denominator).
+         *   2. Iterate over KV-position tiles of size `kv_tile`.
+         *      a. Compute `score[k] = Q[q,h] · K[k, kv_h] / √d` for each
+         *         position k in the tile.  Optionally use I16/VNNI arithmetic
+         *         for the dot-product during prefill.
+         *      b. Find `block_max` = max score in this tile.
+         *      c. Compute `new_m = max(running_m, block_max)`.
+         *      d. **Rescale** the running output and denominator:
+         *         `out *= exp(running_m − new_m)` and
+         *         `running_l *= exp(running_m − new_m)`.
+         *      e. For each k in tile: `p = exp(score[k] − new_m)`,
+         *         `running_l += p`, `out += p * V[k, kv_h]`.
+         *      f. Update `running_m = new_m`.
+         *   3. Normalise: `out /= running_l`.
+         *
+         * ### Parallelism
+         *
+         * The outer loop over heads (`h`) is parallelised with OpenMP via
+         * `OMP_WORKSHARE_REGION`.  Each head is fully independent, so this
+         * achieves near-linear scaling across CPU cores.
+         *
+         * @param Q               Query data, row-major [seq_len, n_heads * head_dim].
+         * @param K               Key data,   row-major [kv_len, n_kv_heads * head_dim].
+         * @param V               Value data, row-major [kv_len, n_kv_heads * head_dim].
+         * @param output          Output buffer,       [seq_len, n_heads * head_dim].
+         * @param seq_len         Number of query positions.
+         * @param kv_len          Number of key/value positions.
+         * @param n_heads         Total query heads.
+         * @param n_kv_heads      Total KV heads (GQA: n_heads / n_kv_heads > 1).
+         * @param head_dim        Elements per head.
+         * @param causal          If true, position k is masked when k > q_abs.
+         * @param window_size     Sliding-window limit (-1 = unlimited).
+         * @param position_offset Absolute position of the first query token
+         *                        (non-zero during decode where q_pos 0 is not
+         *                        the beginning of the sequence).
+         * @param mask            Optional additive mask [seq_len, kv_len] or nullptr.
+         * @return true on success, false if pointers are null or dimensions invalid.
+         */
         static bool compute_flash_fp32(
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int kv_len,
@@ -866,6 +1450,7 @@ namespace llaminar2
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
+            // --- Input validation ---
             if (!Q || !K || !V || !output)
             {
                 return false;
@@ -874,46 +1459,86 @@ namespace llaminar2
             {
                 return false;
             }
+            // GQA requires n_heads to be a multiple of n_kv_heads (e.g. 32 Q heads / 8 KV heads = 4 Q heads per KV head).
             if (n_heads % n_kv_heads != 0)
             {
                 return false;
             }
 
+            // --- Pre-compute constants ---
             const bool use_avx512 = cpu_supports_avx512();
             const bool is_decode = (seq_len == 1 && kv_len >= 1);
+
+            // Choose the KV tile size based on cache hierarchy.
             const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(head_dim, n_kv_heads, kv_len, is_decode);
+
+            // For Grouped Query Attention: how many Q heads share one KV head.
             const int heads_per_kv = n_heads / n_kv_heads;
+
+            // Attention score scaling factor:  1/√d
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-            const int q_stride = n_heads * head_dim;
-            const int kv_stride = n_kv_heads * head_dim;
+
+            // Row strides in the flat [seq_len, heads*head_dim] layout.
+            const int q_stride = n_heads * head_dim;     // Q row = all Q heads concatenated
+            const int kv_stride = n_kv_heads * head_dim; // K/V row = all KV heads concatenated
+
+            // --- I16/VNNI quantisation layout parameters ---
+            // Pad head_dim up to a multiple of 32 (the VNNI block width).
             const int i16_row_stride = ((head_dim + 31) / 32) * 32;
-            const int i16_chunks = i16_row_stride / 32;
+            const int i16_chunks = i16_row_stride / 32; // Number of 32-element VNNI blocks per row
+
+            // Packed pairs: two K rows are interleaved into one buffer.
+            // This halves the number of outer loop iterations in the QK phase.
             const int kv_pair_count = (kv_len + 1) / 2;
+            // Each packed pair = i16_chunks blocks × 64 int16 elements (32 per row × 2 rows).
             const int k_pair_stride = i16_chunks * 64;
+
+            // Profiling: track QK dot-product and V accumulation times separately.
             const bool profiling_enabled = KernelProfiler::isEnabled();
             uint64_t qk_duration_ns = 0;
             uint64_t v_duration_ns = 0;
 
+            // --- Decide whether to use the I16/I12 integer dot-product path ---
+            // The integer path is faster for long prefill sequences on CPUs with
+            // VNNI support, because VPDPWSSD does 32 × int16 multiply-adds per
+            // cycle vs. 16 × FP32 FMAs.  We only enable it when the problem is
+            // large enough to amortise the quantisation overhead.
             const auto &env = debugEnv();
             const int64_t prefill_work = static_cast<int64_t>(seq_len) * static_cast<int64_t>(kv_len);
             const bool use_i16_i12_prefill =
                 !is_decode &&
-                env.attention.flash_prefill_i16_i12 &&
-                cpu_supports_avx512_vnni() &&
-                seq_len >= env.attention.flash_prefill_i16_i12_min_seq &&
-                kv_len >= env.attention.flash_prefill_i16_i12_min_kv &&
-                prefill_work >= env.attention.flash_prefill_i16_i12_min_work &&
-                head_dim <= env.attention.flash_prefill_i16_i12_max_head_dim;
+                env.attention.flash_prefill_i16_i12 &&                          // Feature flag from debugEnv
+                cpu_supports_avx512_vnni() &&                                   // Hardware must have VNNI
+                seq_len >= env.attention.flash_prefill_i16_i12_min_seq &&       // Minimum seq_len threshold
+                kv_len >= env.attention.flash_prefill_i16_i12_min_kv &&         // Minimum kv_len threshold
+                prefill_work >= env.attention.flash_prefill_i16_i12_min_work && // Minimum total work
+                head_dim <= env.attention.flash_prefill_i16_i12_max_head_dim;   // head_dim cap
 
+            // qmax controls the I12 quantisation range.  Typical value: 2047, giving
+            // ~12 effective bits of precision within 16-bit integer storage.
             const int qmax = std::max(1, std::min(env.attention.flash_prefill_i16_i12_qmax, 32767));
+
+            // Pre-quantised packed-pair K buffers and their per-row absmax scales.
+            // These are populated once (before the main attention loop) and reused
+            // for every Q row, amortising the quantisation cost.
             std::vector<int16_t> packed_k_pairs_i16;
             std::vector<float> packed_k_pair_scales;
 
+            // ---------------------------------------------------------------
+            // Phase 1 (optional): Pre-quantise all K rows into packed pairs
+            // ---------------------------------------------------------------
+            // This runs only during prefill when the I16 path is active.
+            // Each pair of consecutive K rows (k0, k1) is quantised into a
+            // single interleaved buffer so the VNNI dot-product loop can
+            // compute two scores per iteration.
             if (use_i16_i12_prefill)
             {
+                // Allocate: [n_kv_heads × kv_pair_count] packed-pair buffers.
                 packed_k_pairs_i16.resize(static_cast<size_t>(n_kv_heads) * static_cast<size_t>(kv_pair_count) * static_cast<size_t>(k_pair_stride));
+                // Two scale factors per pair (one per K row).
                 packed_k_pair_scales.resize(static_cast<size_t>(n_kv_heads) * static_cast<size_t>(kv_pair_count) * 2ULL, 0.0f);
 
+                // Parallel quantisation across KV heads and pair indices.
                 auto do_pack = [&]()
                 {
 #pragma omp for collapse(2) schedule(static)
@@ -921,12 +1546,15 @@ namespace llaminar2
                     {
                         for (int pair_idx = 0; pair_idx < kv_pair_count; ++pair_idx)
                         {
+                            // Each pair contains two consecutive KV positions.
                             const int k0 = pair_idx * 2;
                             const int k1 = k0 + 1;
 
+                            // Global index into the flat packed_k_pairs arrays.
                             const size_t pair_global = static_cast<size_t>(kv_h) * static_cast<size_t>(kv_pair_count) + static_cast<size_t>(pair_idx);
                             int16_t *pair_dst = packed_k_pairs_i16.data() + pair_global * static_cast<size_t>(k_pair_stride);
 
+                            // Quantise row 0 of the pair (slot 0 in the interleaved buffer).
                             float s0 = 0.0f;
                             float s1 = 0.0f;
                             if (k0 < kv_len)
@@ -936,6 +1564,7 @@ namespace llaminar2
                             }
                             else
                             {
+                                // Beyond the end of the KV sequence — zero-fill slot 0.
                                 for (int i = 0; i < i16_row_stride; ++i)
                                 {
                                     const size_t block = static_cast<size_t>(i / 32) * 64ULL;
@@ -944,6 +1573,7 @@ namespace llaminar2
                                 }
                             }
 
+                            // Quantise row 1 of the pair (slot 1 in the interleaved buffer).
                             if (k1 < kv_len)
                             {
                                 const float *k_src1 = K + static_cast<size_t>(k1) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
@@ -951,6 +1581,7 @@ namespace llaminar2
                             }
                             else
                             {
+                                // Beyond the end — zero-fill slot 1.
                                 for (int i = 0; i < i16_row_stride; ++i)
                                 {
                                     const size_t block = static_cast<size_t>(i / 32) * 64ULL;
@@ -959,6 +1590,9 @@ namespace llaminar2
                                 }
                             }
 
+                            // Store the absmax scale for each row so we can recover
+                            // the approximate FP32 dot product later:
+                            //   fp32_dot ≈ int32_dot × q_scale × k_scale
                             packed_k_pair_scales[pair_global * 2ULL + 0ULL] = s0;
                             packed_k_pair_scales[pair_global * 2ULL + 1ULL] = s1;
                         }
@@ -967,29 +1601,54 @@ namespace llaminar2
                 OMP_WORKSHARE_REGION(do_pack);
             }
 
+            // ---------------------------------------------------------------
+            // Phase 2: Main flash-attention loop (parallel over heads)
+            // ---------------------------------------------------------------
+            // Each head is completely independent, so we parallelise across
+            // heads with OpenMP.  Within each head, we iterate over all
+            // query positions and, for each query, stream through KV in
+            // tiles, maintaining the online softmax state.
             auto work = [&]()
             {
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int h = 0; h < n_heads; ++h)
                 {
+                    // GQA mapping: which KV head does this Q head read from?
                     const int kv_h = h / heads_per_kv;
+
+                    // Pointer to the pre-quantised packed-pair K data for this KV head
+                    // (nullptr when using the FP32 dot-product path).
                     const int16_t *k_head_pairs_i16 = use_i16_i12_prefill
-                                                       ? packed_k_pairs_i16.data() + static_cast<size_t>(kv_h) * static_cast<size_t>(kv_pair_count) * static_cast<size_t>(k_pair_stride)
-                                                       : nullptr;
+                                                          ? packed_k_pairs_i16.data() + static_cast<size_t>(kv_h) * static_cast<size_t>(kv_pair_count) * static_cast<size_t>(k_pair_stride)
+                                                          : nullptr;
                     const float *k_head_pair_scales = use_i16_i12_prefill
-                                                     ? packed_k_pair_scales.data() + static_cast<size_t>(kv_h) * static_cast<size_t>(kv_pair_count) * 2ULL
-                                                     : nullptr;
+                                                          ? packed_k_pair_scales.data() + static_cast<size_t>(kv_h) * static_cast<size_t>(kv_pair_count) * 2ULL
+                                                          : nullptr;
+
+                    // --- Loop over query positions for this head ---
                     for (int q_pos = 0; q_pos < seq_len; ++q_pos)
                     {
+                        // Pointer to this (q_pos, head) slice of the output buffer.
                         float *out = output + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
-                        std::fill(out, out + head_dim, 0.0f);
+                        std::fill(out, out + head_dim, 0.0f); // Zero-init the accumulator
 
+                        // Online softmax running state:
+                        //   running_m = max score seen so far (for numerical stability)
+                        //   running_l = sum of exp(score - running_m) seen so far (denominator)
                         float running_m = -std::numeric_limits<float>::infinity();
                         float running_l = 0.0f;
 
+                        // Raw Q pointer for this (q_pos, head) pair.
                         const float *q_ptr = Q + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
+
+                        // Absolute position of this query token in the full sequence
+                        // (needed for causal masking during decode).
                         const int q_abs = position_offset + q_pos;
+
+                        // Optional additive mask row for this query position.
                         const float *mask_row = mask ? (mask + static_cast<size_t>(q_pos) * kv_len) : nullptr;
+
+                        // Thread-local I16 quantised Q buffer, reused across q_pos iterations.
                         thread_local std::vector<int16_t> q_i16;
                         float q_scale_i16 = 0.0f;
                         if (use_i16_i12_prefill)
@@ -998,15 +1657,26 @@ namespace llaminar2
                             {
                                 q_i16.resize(static_cast<size_t>(i16_row_stride));
                             }
+                            // Quantise the Q row once; it will be dotted against every K pair.
                             q_scale_i16 = quantize_row_i16_i12_padded(q_ptr, q_i16.data(), head_dim, i16_row_stride, qmax);
                         }
 
+                        // ===================================================
+                        // KV tile loop — the heart of flash attention
+                        // ===================================================
+                        // We iterate over KV positions in tiles of `kv_tile`.
+                        // For each tile we:
+                        //   (a) compute QK scores (the "QK phase")
+                        //   (b) run the online softmax correction
+                        //   (c) accumulate weighted V into the output (the "V phase")
                         for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
                         {
-                            const int k1 = std::min(k0 + kv_tile, kv_len);
+                            const int k1 = std::min(k0 + kv_tile, kv_len); // End of this tile
                             float block_max = -std::numeric_limits<float>::infinity();
+
+                            // Thread-local score buffer, reused across tiles.
                             thread_local std::vector<float> block_scores;
-                            const int blk = k1 - k0;
+                            const int blk = k1 - k0; // Number of KV positions in this tile
                             if (static_cast<int>(block_scores.size()) < blk)
                             {
                                 block_scores.resize(blk);
@@ -1014,19 +1684,26 @@ namespace llaminar2
 
                             const auto qk_start = profiling_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
+                            // --- Compute the valid attention window within this tile ---
+                            // Positions outside [valid_start, valid_end) are masked to -inf
+                            // (they must not contribute to the softmax).
                             int valid_start = k0;
                             int valid_end = k1;
                             if (window_size > 0)
                             {
+                                // Sliding window: only attend to the most recent `window_size` positions.
                                 valid_start = std::max(valid_start, q_abs - window_size + 1);
                             }
                             if (causal)
                             {
+                                // Causal mask: cannot attend to future positions.
                                 valid_end = std::min(valid_end, q_abs + 1);
                             }
+                            // Clamp to tile boundaries.
                             valid_start = std::max(k0, std::min(valid_start, k1));
                             valid_end = std::max(k0, std::min(valid_end, k1));
 
+                            // Fill masked positions with -inf so exp(-inf) = 0.
                             for (int k = k0; k < valid_start; ++k)
                             {
                                 block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
@@ -1036,10 +1713,16 @@ namespace llaminar2
                                 block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
                             }
 
+                            // --- QK Phase: compute score[k] = Q · K[k] / √d ---
+                            // The code below dispatches to I16 VNNI or FP32 AVX-512
+                            // dot-products depending on settings.  The I16 path
+                            // processes 4, 2, or 1 KV positions at a time using the
+                            // packed-pair layout for maximum throughput.
                             for (int k = valid_start; k < valid_end;)
                             {
                                 if (use_i16_i12_prefill)
                                 {
+                                    // --- I16 fast path: try 4-at-a-time (two packed pairs) ---
                                     if (k + 3 < valid_end)
                                     {
                                         const int pair_idx0 = k / 2;
@@ -1080,6 +1763,7 @@ namespace llaminar2
                                         continue;
                                     }
 
+                                    // --- I16 fast path: try 2-at-a-time (one packed pair) ---
                                     if (k + 1 < valid_end)
                                     {
                                         const int pair_idx = k / 2;
@@ -1109,11 +1793,13 @@ namespace llaminar2
                                         continue;
                                     }
 
+                                    // --- I16 tail: single remaining position ---
                                     const int pair_idx = k / 2;
-                                    const int row_sel = (k & 1);
+                                    const int row_sel = (k & 1); // 0 = first row in pair, 1 = second
                                     const int16_t *k_pair = k_head_pairs_i16 + static_cast<size_t>(pair_idx) * static_cast<size_t>(k_pair_stride);
                                     const float k_scale = k_head_pair_scales[static_cast<size_t>(pair_idx) * 2ULL + static_cast<size_t>(row_sel)];
                                     const int32_t dot_i32 = dot_i16_i16_i32_vnni_single_from_packedpair(q_i16.data(), k_pair, i16_row_stride, row_sel);
+                                    // Recover approximate FP32 dot: int_dot × q_scale × k_scale
                                     float s = static_cast<float>(dot_i32) * (q_scale_i16 * k_scale);
                                     s *= scale;
 
@@ -1128,11 +1814,12 @@ namespace llaminar2
                                     continue;
                                 }
 
+                                // --- FP32 path: standard AVX-512 dot product ---
                                 float s = dot_fp32_avx512(
                                     q_ptr,
                                     K + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim,
                                     head_dim);
-                                s *= scale;
+                                s *= scale; // Apply attention scaling: score = (Q · K) / √d
 
                                 if (mask_row)
                                 {
@@ -1149,25 +1836,40 @@ namespace llaminar2
                                 qk_duration_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - qk_start).count());
                             }
 
+                            // --- Online softmax correction ---
+                            // The key insight: if a new tile has a higher max than what
+                            // we've seen, all previous contributions must be rescaled.
+                            //
+                            //   new_m = max(running_m, block_max)
+                            //   alpha = exp(running_m - new_m)      ← correction factor
+                            //   out   *= alpha                       ← rescale accumulated output
+                            //   running_l *= alpha                   ← rescale denominator
+                            //
+                            // If running_m was -inf (first tile), alpha = 0, which correctly
+                            // zeroes out any stale data in the accumulator.
                             const float new_m = std::max(running_m, block_max);
                             const float alpha = std::isfinite(running_m) ? std::exp(running_m - new_m) : 0.0f;
                             scale_vec(out, alpha, head_dim, use_avx512);
                             float new_l = running_l * alpha;
 
+                            // --- V Phase: accumulate weighted values ---
+                            // For each KV position in this tile, compute the unnormalised
+                            // softmax probability p = exp(score - new_m) and add p*V to out.
                             const auto v_start = profiling_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
                             for (int k = k0; k < k1; ++k)
                             {
                                 const float s = block_scores[static_cast<size_t>(k - k0)];
+                                // Skip masked positions (score == -inf → exp = 0).
                                 if (!std::isfinite(s))
                                 {
                                     continue;
                                 }
 
-                                const float p = std::exp(s - new_m);
-                                new_l += p;
+                                const float p = std::exp(s - new_m); // Unnormalised softmax weight
+                                new_l += p;                          // Accumulate into denominator
                                 const float *v_ptr = V + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
-                                accum_weighted_v(out, v_ptr, p, head_dim, use_avx512);
+                                accum_weighted_v(out, v_ptr, p, head_dim, use_avx512); // out += p * V[k]
                             }
 
                             if (profiling_enabled)
@@ -1175,16 +1877,25 @@ namespace llaminar2
                                 v_duration_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - v_start).count());
                             }
 
+                            // Advance running state for this query position.
                             running_m = new_m;
                             running_l = new_l;
-                        }
+                        } // end KV tile loop
 
+                        // --- Final normalisation ---
+                        // Divide the accumulated output by the softmax denominator
+                        // to get the true weighted average:  out = out / Σ exp(s - m).
                         div_vec(out, running_l, head_dim, use_avx512);
-                    }
-                }
+                    } // end q_pos loop
+                } // end head loop
             };
 
+            // Execute the work lambda inside an OMP workshare region.
+            // If we are already inside a parallel region (e.g. fused-layer
+            // execution), this avoids an expensive thread fork/join.
             OMP_WORKSHARE_REGION(work);
+
+            // Report profiling breakdown (QK vs V phase) if enabled.
             if (profiling_enabled)
             {
                 KernelProfiler::record(KernelType::ATTENTION_QK, qk_duration_ns);
